@@ -57,6 +57,29 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Build an in-memory identity from an existing signing key
+    /// without touching the anchor file. Useful for tests and for
+    /// embedders that manage their own key storage.
+    pub fn from_signing_key(signing_key: SigningKey, label: impl Into<String>) -> Self {
+        let public_id = BASE32_NOPAD
+            .encode(signing_key.verifying_key().as_bytes())
+            .to_lowercase();
+        Self {
+            signing_key,
+            public_id,
+            label: label.into(),
+        }
+    }
+
+    /// Generate a brand-new ephemeral identity from OS randomness.
+    /// Not persisted; the caller is responsible for storing the
+    /// signing key if they need it across runs.
+    pub fn ephemeral() -> Self {
+        let mut seed = [0u8; SECRET_KEY_LENGTH];
+        OsRng.fill_bytes(&mut seed);
+        Self::from_signing_key(SigningKey::from_bytes(&seed), String::new())
+    }
+
     /// Base32-lowercase encoding of the public key. This is the
     /// cryptographic identifier used on the wire — peers compare
     /// pubkeys by this value. Stable across launches.

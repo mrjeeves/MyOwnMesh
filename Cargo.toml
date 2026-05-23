@@ -23,15 +23,31 @@ myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "0.1.0" }
 myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.1.0" }
 
 # Async runtime
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal", "process"] }
+tokio-util = { version = "0.7", features = ["rt", "codec"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 futures-util = "0.3"
 async-trait = "0.1"
+pin-project-lite = "0.2"
+
+# WebRTC transport
+webrtc = "0.13"
+
+# WebSocket (Nostr signaling)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+# Cross-platform local IPC (control socket)
+interprocess = { version = "2", features = ["tokio"] }
+
+# Concurrent data structures
+dashmap = "6"
+parking_lot = "0.12"
 
 # Crypto + encoding
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.8"
 getrandom = "0.2"
 sha2 = "0.10"
 data-encoding = "2"
@@ -48,10 +64,19 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP (updater)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# secp256k1 + BIP-340 Schnorr (Nostr event signing)
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+
 # Bin
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 which = "6"
+
+# Test-only
+tempfile = "3"
 
 [profile.release]
 panic = "abort"

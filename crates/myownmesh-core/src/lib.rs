@@ -27,24 +27,34 @@
 //! voice/video at first-meeting time; thereafter the peer's pubkey is
 //! in the roster and auto-approved on reconnect.
 
+pub mod channels;
 pub mod config;
 pub mod dirs;
+pub mod engine;
 pub mod error;
 pub mod events;
+pub mod handle;
 pub mod identity;
 pub mod protocol;
 pub mod roster;
+pub mod rpc;
 pub mod signing;
 pub mod topology;
+pub mod transport;
 pub mod verification;
 
+pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
     AutoUpdateConfig, MeshConfig, NetworkConfig, StunServer, TopologyMode, TurnServer,
 };
+pub use engine::ladder::ConnectionTier;
 pub use error::{Error, Result};
-pub use events::{DiagEntry, DiagLevel, MeshEvent};
-pub use identity::{generate_network_id, normalize_network_id, Identity};
+pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
+pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
+pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
+pub use protocol::CapabilityAdvert;
 pub use roster::{AuthorizedPeer, Roster};
+pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use topology::Topology;
 
 /// Domain-separation tag prefixed to every signed handshake payload.

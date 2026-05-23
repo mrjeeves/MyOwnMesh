@@ -25,6 +25,8 @@
 
 pub mod defaults;
 pub mod denylist;
+pub mod driver;
+pub mod event;
 pub mod handle;
 pub mod relay;
 pub mod room;

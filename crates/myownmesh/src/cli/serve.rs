@@ -1,40 +1,111 @@
-//! `myownmesh serve` — run the daemon in the foreground until SIGINT
-//! or SIGTERM. The daemon owns:
+//! `myownmesh serve` — run the daemon in the foreground.
 //!
-//! - One [`myownmesh_core::Mesh`] (once the engine lands)
-//! - The updater tick loop (per [`myownmesh_updater::tick_forever`])
-//! - The control-socket listener that `myownmesh ctl …` clients talk to
-//!
-//! Skeleton today; the actual mesh start happens once the engine is
-//! filled in.
+//! Owns:
+//! - one [`myownmesh_core::Mesh`] instance bound to this device's
+//!   identity
+//! - a Nostr signaling driver per joined network
+//! - the updater tick loop
+//! - the control-socket listener that `myownmesh ctl …` talks to
+//! - signal handlers for clean shutdown
 
 use anyhow::{Context, Result};
-use myownmesh_core::MeshConfig;
-use tracing::info;
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+
+use crate::control;
 
 pub async fn run() -> Result<()> {
-    let cfg = MeshConfig::load().context("load config")?;
+    let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        identity_path = ?cfg.identity_path,
+        networks = cfg.networks.len(),
         "daemon starting"
     );
 
-    // Identity load (also generates on first run).
-    let identity = myownmesh_core::identity::load_or_create().context("identity load")?;
-    info!(device_id = %identity.display_id(), "identity ready");
+    let mesh = myownmesh_core::Mesh::open(cfg.clone())
+        .await
+        .context("open mesh")?;
+    info!(device_id = %mesh.identity().display_id(), "identity ready");
+
+    // Join each configured network and attach the Nostr signaling
+    // driver. The Mesh::join returns a JoinedNetwork that lives
+    // until leave() — we stash them so leave() runs on shutdown.
+    let mut joined = Vec::new();
+    let mut nostr_handles = Vec::new();
+    for net in cfg.networks.iter() {
+        match mesh.join(net.clone()).await {
+            Ok(joined_net) => {
+                info!(network = %net.network_id, "joined network");
+                let state = joined_net.state();
+                if let Some(handle) = myownmesh_core::engine::attach_nostr(&state) {
+                    nostr_handles.push(handle);
+                } else {
+                    warn!(network = %net.network_id, "nostr attach returned no handle");
+                }
+                joined.push(joined_net);
+            }
+            Err(e) => {
+                warn!(network = %net.network_id, "join failed: {e:#}");
+            }
+        }
+    }
 
     // Updater tick. Spawned even when disabled in config — the
-    // task just exits early; cheaper than building conditional
-    // task graphs.
+    // task just exits early.
     let _updater = tokio::spawn(myownmesh_updater::tick_forever());
 
-    // TODO(engine): start the mesh engine here once
-    // `myownmesh_core::handle::Mesh::open` exists. For now the
-    // daemon just sits on the signal handler so the process is
-    // observable and `myownmesh ctl status` returns "stopped".
+    // Control socket. Holds a clone of the mesh handle so ctl
+    // commands can address the daemon's state.
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let ctl_mesh = mesh.clone();
+    let ctl_shutdown = shutdown_tx.subscribe();
+    let ctl_socket = cfg.daemon.control_socket.clone();
+    let _ctl_handle = tokio::spawn(async move {
+        if let Err(e) = control::serve(ctl_mesh, ctl_socket, ctl_shutdown).await {
+            warn!("control socket exited with error: {e:#}");
+        }
+    });
 
-    tokio::signal::ctrl_c().await.context("await SIGINT")?;
+    // Wait for SIGINT (Ctrl-C) or SIGTERM.
+    wait_for_shutdown_signal().await;
     info!("shutdown requested");
+
+    let _ = shutdown_tx.send(());
+    for net in joined {
+        if let Err(e) = net.leave().await {
+            warn!("leave failed: {e:#}");
+        }
+    }
+    drop(nostr_handles);
+
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = sigint.recv().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
