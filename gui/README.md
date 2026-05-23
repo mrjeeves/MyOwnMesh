@@ -24,15 +24,18 @@ and lets you crash-restart the UI without touching the running mesh.
 
 ## Run
 
-```bash
-# In another shell:
-cd ../   # MyOwnMesh root
-cargo run -p myownmesh -- serve
+From the MyOwnMesh root:
 
-# Then back here:
-cd gui
-pnpm install
-pnpm tauri dev
+```bash
+just serve   # one shell — daemon + control socket
+just dev     # another shell — Tauri GUI with hot reload
+```
+
+Or without `just`:
+
+```bash
+cargo run -p myownmesh -- serve           # one shell
+cd gui && pnpm install && pnpm tauri dev  # another shell
 ```
 
 The dev server (vite) runs on port 1421 by default; `pnpm tauri dev`
