@@ -31,6 +31,19 @@ build:
 build-release:
     @cargo build --workspace --release
 
+# Run the daemon in the foreground with debug logging. There's no
+# GUI yet — when one lands this becomes "hot-reload GUI" and the
+# daemon-only flow moves to `just serve`.
+[unix]
+[doc("Run the daemon in foreground with debug logging.")]
+dev *ARGS:
+    @MYOWNMESH_LOG="debug,myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
+
+[windows]
+[doc("Run the daemon in foreground with debug logging.")]
+dev *ARGS:
+    @$env:MYOWNMESH_LOG = "debug,myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
+
 run *ARGS:
     @cargo run --release --bin myownmesh -- {{ARGS}}
 
