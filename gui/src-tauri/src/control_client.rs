@@ -19,6 +19,7 @@
 //! (daemon restart mid-session) harder for an embedder to reason
 //! about.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -75,20 +76,52 @@ pub struct Response {
     pub data: Option<serde_json::Value>,
 }
 
+/// Where the daemon's control socket lives. Unix uses a filesystem
+/// path under `~/.myownmesh/`; Windows uses a namespaced pipe segment
+/// in the local namespace. Mirrors `myownmesh::control::SocketTarget`
+/// so error messages and connect logic line up with the daemon side.
+#[derive(Debug, Clone)]
+enum SocketAddr {
+    Path(PathBuf),
+    #[allow(dead_code)] // Only constructed on Windows.
+    Name(String),
+}
+
+impl fmt::Display for SocketAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocketAddr::Path(p) => write!(f, "{}", p.display()),
+            SocketAddr::Name(n) => write!(f, "named pipe {n}"),
+        }
+    }
+}
+
 pub struct ControlClient {
-    socket_path: PathBuf,
+    addr: SocketAddr,
 }
 
 impl ControlClient {
     /// Build a client bound to the default daemon socket location.
-    /// Mirrors `myownmesh_core::dirs::data_dir().join("daemon.sock")`
-    /// — we recompute it locally rather than depending on
-    /// myownmesh-core so the GUI's build stays independent of the
-    /// engine workspace.
+    /// Mirrors `myownmesh::control::resolve_socket`: a unix-domain
+    /// socket file under `~/.myownmesh/` on Unix, a namespaced pipe
+    /// `myownmesh.sock` on Windows. We recompute the address locally
+    /// rather than depending on myownmesh-core so the GUI's build
+    /// stays independent of the engine workspace.
     pub fn new() -> Result<Self> {
-        let home = dirs::home_dir().context("no home dir")?;
-        let socket_path = home.join(".myownmesh").join("daemon.sock");
-        Ok(Self { socket_path })
+        #[cfg(unix)]
+        {
+            let home = dirs::home_dir().context("no home dir")?;
+            let socket_path = home.join(".myownmesh").join("daemon.sock");
+            Ok(Self {
+                addr: SocketAddr::Path(socket_path),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                addr: SocketAddr::Name("myownmesh.sock".to_string()),
+            })
+        }
     }
 
     /// One-shot request → response. The daemon writes exactly one
@@ -114,8 +147,8 @@ impl ControlClient {
         if n == 0 {
             bail!("daemon closed connection without a response");
         }
-        let resp: Response = serde_json::from_str(buf.trim())
-            .with_context(|| format!("parse response: {buf}"))?;
+        let resp: Response =
+            serde_json::from_str(buf.trim()).with_context(|| format!("parse response: {buf}"))?;
         Ok(resp)
     }
 
@@ -123,10 +156,7 @@ impl ControlClient {
     /// forwards each incoming line to `tx`. Returns immediately
     /// after the initial ack so the caller can wire `rx` into a
     /// Tauri event emitter.
-    pub async fn subscribe_events(
-        &self,
-        tx: mpsc::Sender<serde_json::Value>,
-    ) -> Result<()> {
+    pub async fn subscribe_events(&self, tx: mpsc::Sender<serde_json::Value>) -> Result<()> {
         let stream = self.connect().await?;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -189,19 +219,37 @@ impl ControlClient {
     }
 
     async fn connect(&self) -> Result<LocalSocketStream> {
-        #[cfg(unix)]
-        let name = self
-            .socket_path
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .context("socket path → fs_name")?;
-        #[cfg(not(unix))]
-        let name = "myownmesh.sock"
-            .to_ns_name::<GenericNamespaced>()
-            .context("default → ns_name")?;
+        let name = match &self.addr {
+            SocketAddr::Path(p) => {
+                #[cfg(unix)]
+                {
+                    p.as_path()
+                        .to_fs_name::<GenericFilePath>()
+                        .context("socket path → fs_name")?
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = p; // Path variant never constructed on non-Unix.
+                    unreachable!("SocketAddr::Path on non-Unix")
+                }
+            }
+            SocketAddr::Name(n) => {
+                #[cfg(not(unix))]
+                {
+                    n.as_str()
+                        .to_ns_name::<GenericNamespaced>()
+                        .context("socket name → ns_name")?
+                }
+                #[cfg(unix)]
+                {
+                    let _ = n; // Name variant never constructed on Unix.
+                    unreachable!("SocketAddr::Name on Unix")
+                }
+            }
+        };
         LocalSocketStream::connect(name).await.context(format!(
             "connect daemon socket at {} — is `myownmesh serve` running?",
-            self.socket_path.display()
+            self.addr
         ))
     }
 }

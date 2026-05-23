@@ -166,7 +166,10 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(256);
         match client.subscribe_events(tx).await {
             Ok(()) => {
-                let _ = app.emit("mesh://subscription", serde_json::json!({ "status": "live" }));
+                let _ = app.emit(
+                    "mesh://subscription",
+                    serde_json::json!({ "status": "live" }),
+                );
                 while let Some(value) = rx.recv().await {
                     let _ = app.emit("mesh://event", value);
                 }
@@ -189,8 +192,8 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
 }
 
 fn main() {
-    let log_level =
-        std::env::var("MYOWNMESH_GUI_LOG").unwrap_or_else(|_| "info,myownmesh_gui=info".to_string());
+    let log_level = std::env::var("MYOWNMESH_GUI_LOG")
+        .unwrap_or_else(|_| "info,myownmesh_gui=info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
         .with_target(false)
