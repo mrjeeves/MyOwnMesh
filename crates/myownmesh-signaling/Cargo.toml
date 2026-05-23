@@ -13,16 +13,20 @@ name = "myownmesh_signaling"
 path = "src/lib.rs"
 
 [dependencies]
-myownmesh-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 
 sha2 = { workspace = true }
 data-encoding = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
+rand = { workspace = true }
+secp256k1 = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

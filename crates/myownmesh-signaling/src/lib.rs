@@ -14,6 +14,7 @@
 //! limitations this implementation works around natively — without
 //! requiring users to apply patches.
 
+pub mod local;
 pub mod nostr;
 pub mod upstream;
 
@@ -23,7 +24,10 @@ use serde::{Deserialize, Serialize};
 /// One signaling message — either an offer/answer SDP exchange, an
 /// ICE candidate, or the periodic presence-announce. Each carries
 /// the sender's peer-id (Device ID) so receivers route correctly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Candidate payloads carry the full RTCIceCandidateInit-equivalent
+/// shape so the receiving WebRTC stack can apply them verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalingMessage {
     Announce {
@@ -41,8 +45,13 @@ pub enum SignalingMessage {
     },
     Candidate {
         peer_id: String,
-        offer_id: String,
-        sdp: String,
+        candidate: String,
+        #[serde(default)]
+        sdp_mid: Option<String>,
+        #[serde(default)]
+        sdp_mline_index: Option<u16>,
+        #[serde(default)]
+        username_fragment: Option<String>,
     },
 }
 

@@ -13,14 +13,24 @@ name = "myownmesh_core"
 path = "src/lib.rs"
 
 [dependencies]
+myownmesh-signaling = { workspace = true }
+
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
+futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
+pin-project-lite = { workspace = true }
+
+webrtc = { workspace = true }
+
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
+rand = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
 data-encoding = { workspace = true }
@@ -33,3 +43,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
