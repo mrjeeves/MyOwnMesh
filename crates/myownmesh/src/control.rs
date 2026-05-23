@@ -308,8 +308,7 @@ fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<Topology
     match name {
         "ring" => Ok(TopologyMode::Ring { n_preferred: None }),
         "star" => {
-            let hub = hub
-                .ok_or_else(|| "star topology requires --hub <device_id>".to_string())?;
+            let hub = hub.ok_or_else(|| "star topology requires --hub <device_id>".to_string())?;
             Ok(TopologyMode::Star {
                 hub: hub.to_string(),
             })
@@ -340,8 +339,7 @@ where
                 let line = serde_json::to_string(&serde_json::json!({
                     "kind": "event",
                     "event": event,
-                }))?
-                    + "\n";
+                }))? + "\n";
                 if writer.write_all(line.as_bytes()).await.is_err() {
                     return Ok(()); // client gone
                 }
@@ -355,8 +353,7 @@ where
                 let line = serde_json::to_string(&serde_json::json!({
                     "kind": "lagged",
                     "skipped": n,
-                }))?
-                    + "\n";
+                }))? + "\n";
                 if writer.write_all(line.as_bytes()).await.is_err() {
                     return Ok(());
                 }

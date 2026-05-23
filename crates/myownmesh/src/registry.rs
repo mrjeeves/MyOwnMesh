@@ -107,12 +107,7 @@ impl NetworkRegistry {
     /// engine driver will be aborted via process termination rather
     /// than a clean leave.
     pub fn take_all(&self) -> Vec<JoinedNetwork> {
-        let drained: Vec<Arc<JoinedNetwork>> = self
-            .inner
-            .write()
-            .drain()
-            .map(|(_, v)| v)
-            .collect();
+        let drained: Vec<Arc<JoinedNetwork>> = self.inner.write().drain().map(|(_, v)| v).collect();
         // Drop alias duplicates first so try_unwrap can succeed.
         let mut by_ptr: HashMap<*const JoinedNetwork, Arc<JoinedNetwork>> = HashMap::new();
         for arc in drained {
