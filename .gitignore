@@ -1,0 +1,12 @@
+/target
+/Cargo.lock.bak
+**/*.rs.bk
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local config / state — never check in
+/.myownmesh/
