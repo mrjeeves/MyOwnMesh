@@ -1,0 +1,27 @@
+[package]
+name = "myownmesh"
+description = "MyOwnMesh daemon and CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "myownmesh"
+path = "src/main.rs"
+
+[dependencies]
+myownmesh-core = { workspace = true }
+myownmesh-signaling = { workspace = true }
+myownmesh-updater = { workspace = true }
+
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
