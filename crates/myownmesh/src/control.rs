@@ -1,11 +1,17 @@
 //! Daemon control protocol — line-delimited JSON over a local
 //! interprocess socket (unix-domain socket on Unix, named pipe on
-//! Windows). `myownmesh ctl …` clients talk to the running
-//! daemon via this socket.
+//! Windows). `myownmesh ctl …` clients and the GUI both talk to the
+//! running daemon via this socket.
 //!
 //! Wire shape: one JSON object per line. Requests have `op` plus
 //! op-specific fields; responses have `ok` (bool) plus
 //! op-specific payload, or `error: string` on failure.
+//!
+//! Most ops are single-shot request → response. The exception is
+//! [`Request::EventsSubscribe`], which converts the connection into a
+//! one-way server-push stream: the daemon writes one JSON event per
+//! line until the client disconnects. The GUI's Tauri backend uses
+//! this to forward live mesh events into the frontend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,12 +20,14 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::{
     tokio::prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions,
 };
-use myownmesh_core::MeshHandle;
+use myownmesh_core::{MeshHandle, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+use crate::registry::NetworkRegistry;
 
 /// Default control socket name (Unix abstract or Windows named-pipe
 /// segment). Overridable via `config.daemon.control_socket`.
@@ -54,6 +62,12 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    /// Subscribe to the live event stream. The connection becomes a
+    /// one-way server-push channel after this op; the daemon writes
+    /// one JSON-encoded `MeshEvent` (or framing wrapper) per line
+    /// until the client closes. Used by the GUI to render live peer
+    /// state changes without polling.
+    EventsSubscribe,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +128,7 @@ enum SocketTarget {
 /// broadcast fires.
 pub async fn serve(
     mesh: MeshHandle,
+    registry: Arc<NetworkRegistry>,
     custom: Option<PathBuf>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -121,7 +136,7 @@ pub async fn serve(
     let listener = bind_listener(&target)?;
     info!(?target, "control socket listening");
 
-    let state = Arc::new(ControlState { mesh });
+    let state = Arc::new(ControlState { mesh, registry });
 
     loop {
         tokio::select! {
@@ -176,6 +191,7 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
 
 struct ControlState {
     mesh: MeshHandle,
+    registry: Arc<NetworkRegistry>,
 }
 
 async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> Result<()> {
@@ -192,6 +208,19 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 continue;
             }
         };
+        // EventsSubscribe converts the connection into a one-way
+        // stream. Dispatch directly so we can write multiple lines
+        // without going through `Response`, and break out of the
+        // request loop when it returns (client disconnected).
+        if matches!(request, Request::EventsSubscribe) {
+            // Initial ack so the client knows the subscription is
+            // live before the first real event arrives.
+            let ack = Response::ok(serde_json::json!({ "subscribed": true }));
+            let line = serde_json::to_string(&ack)? + "\n";
+            writer.write_all(line.as_bytes()).await?;
+            run_events_stream(&state, &mut writer).await?;
+            break;
+        }
         let resp = dispatch(&state, request).await;
         let line = serde_json::to_string(&resp)? + "\n";
         writer.write_all(line.as_bytes()).await?;
@@ -211,41 +240,128 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             "pubkey": state.mesh.identity().public_id(),
             "label": state.mesh.identity().label(),
         })),
-        Request::NetworksList => Response::ok(serde_json::json!({
-            "networks": state.mesh.joined_network_ids(),
-        })),
-        Request::PeersList { network } => {
-            // For v1 we don't keep per-network MeshHandles addressable
-            // from here — the ctl client gets the network id list,
-            // and per-network peer detail is a follow-up. Returning
-            // a structured "not yet wired" is more useful than
-            // silently empty.
-            Response::err(format!(
-                "peers list for network '{network}' not wired in v1 — coming with the JoinedNetwork registry"
-            ))
+        Request::NetworksList => {
+            // Enriched payload: each network includes its phase,
+            // topology, and labelling info. The CLI prints whatever
+            // it gets; the GUI binds rich fields directly.
+            let summaries = state.registry.summaries();
+            Response::ok(serde_json::json!({ "networks": summaries }))
         }
-        Request::RosterList { network } => {
-            Response::err(format!("roster list ({network}) not wired in v1"))
-        }
+        Request::PeersList { network } => match state.registry.get(&network) {
+            Some(net) => Response::ok(serde_json::json!({ "peers": net.peers() })),
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::RosterList { network } => match state.registry.get(&network) {
+            Some(net) => match net.roster_list().await {
+                Ok(list) => Response::ok(serde_json::json!({ "roster": list })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
         Request::RosterApprove {
             network,
             device_id,
             label,
-        } => {
-            let _ = (network, device_id, label);
-            Response::err("roster approve not wired in v1")
-        }
-        Request::RosterRemove { network, device_id } => {
-            let _ = (network, device_id);
-            Response::err("roster remove not wired in v1")
-        }
+        } => match state.registry.get(&network) {
+            Some(net) => match net
+                .roster_approve(&device_id, label.as_deref().unwrap_or(""))
+                .await
+            {
+                Ok(_) => Response::ok(serde_json::json!({ "approved": device_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::RosterRemove { network, device_id } => match state.registry.get(&network) {
+            Some(net) => match net.roster_remove(&device_id).await {
+                Ok(_) => Response::ok(serde_json::json!({ "removed": device_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
         Request::TopologySet {
             network,
             topology,
             hub,
         } => {
-            let _ = (network, topology, hub);
-            Response::err("topology set not wired in v1")
+            let mode = match parse_topology(&topology, hub.as_deref()) {
+                Ok(m) => m,
+                Err(msg) => return Response::err(msg),
+            };
+            match state.registry.get(&network) {
+                Some(net) => match net.set_topology(mode).await {
+                    Ok(_) => Response::ok(serde_json::json!({ "topology": topology })),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                None => Response::err(format!("unknown network: {network}")),
+            }
+        }
+        Request::EventsSubscribe => {
+            // Handled by `handle_client` before reaching dispatch.
+            // If we somehow get here, surface the bug.
+            Response::err("events_subscribe must be handled upstream")
+        }
+    }
+}
+
+fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {
+    match name {
+        "ring" => Ok(TopologyMode::Ring { n_preferred: None }),
+        "star" => {
+            let hub = hub
+                .ok_or_else(|| "star topology requires --hub <device_id>".to_string())?;
+            Ok(TopologyMode::Star {
+                hub: hub.to_string(),
+            })
+        }
+        "full_mesh" | "fullmesh" => Ok(TopologyMode::FullMesh),
+        other => Err(format!(
+            "unknown topology '{other}' — expected ring | star | full_mesh"
+        )),
+    }
+}
+
+/// Stream mesh events to one connected subscriber. Returns when the
+/// underlying writer breaks (client disconnected) or the engine's
+/// broadcast channel closes (daemon shutting down).
+async fn run_events_stream<W>(state: &Arc<ControlState>, writer: &mut W) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut rx = state.mesh.events();
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                // Each event is framed with kind=event so the
+                // subscriber can multiplex against other server
+                // pushes in the future. The `event` field carries
+                // the original `MeshEvent` JSON (peer / phase /
+                // diag, internally tagged).
+                let line = serde_json::to_string(&serde_json::json!({
+                    "kind": "event",
+                    "event": event,
+                }))?
+                    + "\n";
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    return Ok(()); // client gone
+                }
+                if writer.flush().await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                // Slow subscriber; surface the gap so the GUI can
+                // resync via a peers_list snapshot.
+                let line = serde_json::to_string(&serde_json::json!({
+                    "kind": "lagged",
+                    "skipped": n,
+                }))?
+                    + "\n";
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
 }

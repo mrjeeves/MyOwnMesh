@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 
 mod cli;
 mod control;
+mod registry;
 
 #[derive(Parser, Debug)]
 #[command(name = "myownmesh", version, about, long_about = None)]

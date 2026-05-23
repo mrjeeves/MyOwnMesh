@@ -5,7 +5,10 @@
 //!   identity
 //! - a Nostr signaling driver per joined network
 //! - the updater tick loop
-//! - the control-socket listener that `myownmesh ctl …` talks to
+//! - the network registry (so the control socket can address
+//!   per-network operations)
+//! - the control-socket listener that `myownmesh ctl …` + the GUI
+//!   talk to
 //! - signal handlers for clean shutdown
 
 use anyhow::{Context, Result};
@@ -13,6 +16,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::control;
+use crate::registry::NetworkRegistry;
 
 pub async fn run() -> Result<()> {
     let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
@@ -27,10 +31,10 @@ pub async fn run() -> Result<()> {
         .context("open mesh")?;
     info!(device_id = %mesh.identity().display_id(), "identity ready");
 
-    // Join each configured network and attach the Nostr signaling
-    // driver. The Mesh::join returns a JoinedNetwork that lives
-    // until leave() — we stash them so leave() runs on shutdown.
-    let mut joined = Vec::new();
+    // The registry holds every JoinedNetwork so the control socket
+    // can address them by id without serve.rs threading a handle
+    // through every dispatch arm.
+    let registry = NetworkRegistry::new();
     let mut nostr_handles = Vec::new();
     for net in cfg.networks.iter() {
         match mesh.join(net.clone()).await {
@@ -42,7 +46,7 @@ pub async fn run() -> Result<()> {
                 } else {
                     warn!(network = %net.network_id, "nostr attach returned no handle");
                 }
-                joined.push(joined_net);
+                registry.insert(joined_net);
             }
             Err(e) => {
                 warn!(network = %net.network_id, "join failed: {e:#}");
@@ -54,14 +58,15 @@ pub async fn run() -> Result<()> {
     // task just exits early.
     let _updater = tokio::spawn(myownmesh_updater::tick_forever());
 
-    // Control socket. Holds a clone of the mesh handle so ctl
-    // commands can address the daemon's state.
+    // Control socket. Holds clones of the mesh handle + the registry
+    // so ctl commands can address the daemon's state.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let ctl_mesh = mesh.clone();
+    let ctl_registry = registry.clone();
     let ctl_shutdown = shutdown_tx.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
     let _ctl_handle = tokio::spawn(async move {
-        if let Err(e) = control::serve(ctl_mesh, ctl_socket, ctl_shutdown).await {
+        if let Err(e) = control::serve(ctl_mesh, ctl_registry, ctl_socket, ctl_shutdown).await {
             warn!("control socket exited with error: {e:#}");
         }
     });
@@ -71,7 +76,12 @@ pub async fn run() -> Result<()> {
     info!("shutdown requested");
 
     let _ = shutdown_tx.send(());
-    for net in joined {
+    // Drain the registry — `take_all` returns owned `JoinedNetwork`s
+    // for those that aren't still held by an in-flight control
+    // request. Anything still pinned by a control client will tear
+    // down via process exit; the engine driver task observes its
+    // command sender drop and shuts down.
+    for net in registry.take_all() {
         if let Err(e) = net.leave().await {
             warn!("leave failed: {e:#}");
         }

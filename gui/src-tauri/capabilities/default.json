@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/capabilities/2",
+  "identifier": "default",
+  "description": "Default capabilities for MyOwnMesh GUI",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "shell:allow-open",
+    "dialog:default"
+  ]
+}
