@@ -131,6 +131,25 @@ impl Rpc {
         }
     }
 
+    /// Attach (or look up) the RPC dispatcher for a network. Use
+    /// this when you've spun up the engine directly via
+    /// [`crate::engine::spawn_network`] and want to register
+    /// handlers or make calls. The [`crate::JoinedNetwork`] facade
+    /// attaches automatically — this is the lower-level
+    /// equivalent.
+    ///
+    /// Idempotent: subsequent calls return a fresh `Rpc` handle
+    /// over the same underlying state, so previously-registered
+    /// handlers remain in effect.
+    pub fn attach(network: &Arc<NetworkState>) -> Self {
+        if let Some(existing) = network.rpc.read().clone() {
+            return Self { inner: existing };
+        }
+        let rpc = Self::new(network.clone());
+        *network.rpc.write() = Some(rpc.inner.clone());
+        rpc
+    }
+
     /// Register a single-shot handler under `method`. Replaces any
     /// previous handler for the same name.
     pub fn serve<F, Fut>(&self, method: &str, handler: F)

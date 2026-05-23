@@ -1249,6 +1249,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "webrtc",
 ]
 

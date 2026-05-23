@@ -1,7 +1,46 @@
 //! MyOwnMesh — peer-to-peer mesh networking runtime.
 //!
 //! `myownmesh-core` is the only crate embedding apps need to depend on.
-//! It exposes:
+//! It exposes everything from identity through the connection engine
+//! and the high-level [`Mesh`] / [`MeshHandle`] / [`JoinedNetwork`]
+//! facade.
+//!
+//! # Quick tour
+//!
+//! ```no_run
+//! # async fn _ex() -> Result<(), Box<dyn std::error::Error>> {
+//! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
+//!
+//! // Load (or create) the local identity + open the WebRTC stack.
+//! let mesh = Mesh::open(MeshConfig::default()).await?;
+//! println!("device id: {}", mesh.identity().display_id());
+//!
+//! // Join a named network. Returns a per-network handle.
+//! let net = mesh.join(NetworkConfig {
+//!     id: "home".into(),
+//!     network_id: "my-mesh".into(),
+//!     label: "Home".into(),
+//!     topology: TopologyMode::default(),
+//!     signaling: Default::default(),
+//!     stun_servers: Default::default(),
+//!     turn_servers: Default::default(),
+//!     roster_path: None,
+//!     auto_approve: false,
+//! }).await?;
+//!
+//! // Attach a signaling driver.
+//! let _nostr = myownmesh_core::engine::attach_nostr(&net.state());
+//!
+//! // Subscribe to events.
+//! let mut events = mesh.events();
+//! while let Ok(event) = events.recv().await {
+//!     println!("{event:?}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # What's in this crate
 //!
 //! - [`Identity`] — long-lived ed25519 device identity persisted at
 //!   `~/.myownmesh/.secrets/identity.json` (mode 0600 on Unix). The
@@ -9,23 +48,42 @@
 //! - [`Roster`] — per-network list of approved peer Device IDs.
 //!   Reconnects from rostered peers auto-allow without re-prompting
 //!   the user.
-//! - The wire [`protocol`] — `hello` / `auth_response` / `approve` /
-//!   `deny` / `ping` / `pong` / `shelve` / `unshelve` /
-//!   `capabilities_update` / generic RPC frames.
-//! - Pluggable [`topology`] selectors — Ring (default), Star, FullMesh.
+//! - [`protocol`] — wire format: `hello` / `auth_response` / `approve`
+//!   / `deny` / `ping` / `pong` / `shelve` / `unshelve` /
+//!   `capabilities_update` / generic RPC frames. See `docs/PROTOCOL.md`.
+//! - [`topology`] selectors — Ring (default), Star, FullMesh.
+//! - [`transport`] — webrtc-rs wrapper; one [`PeerSession`](transport::PeerSession)
+//!   per peer with an event mpsc the engine drains.
+//! - [`engine`] — connection engine: hello state machine, heartbeat,
+//!   the 7-tier reconnection ladder, topology shelving. See
+//!   `CONNECTION-ENGINE.md`.
+//! - [`Channel<T>`] — typed publish/subscribe between peers.
+//! - [`Rpc`] — generic request/response with streaming.
 //!
-//! The connection engine, transport, channels, RPC, and high-level
-//! [`MeshHandle`] facade build on top of these primitives.
+//! # Trust model
 //!
-//! Trust model: each device owns a long-lived ed25519 keypair. The
-//! `hello` handshake commits both sides to a shared nonce; the
+//! Each device owns a long-lived ed25519 keypair. The `hello`
+//! handshake commits both sides to a shared nonce; the
 //! `auth_response` is an ed25519 signature over
-//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id` —
-//! domain separation prevents a signature obtained for one protocol
-//! step from being replayed in another. A user-visible 6-char
-//! verification code lets a human eyeball-confirm the handshake over
-//! voice/video at first-meeting time; thereafter the peer's pubkey is
-//! in the roster and auto-approved on reconnect.
+//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id`.
+//! Domain separation prevents a signature obtained for one
+//! protocol step from being replayed in another.
+//!
+//! A user-visible 6-char verification code lets a human
+//! eyeball-confirm the handshake over voice/video at first-meeting
+//! time; thereafter the peer's pubkey is in the roster and
+//! auto-approved on reconnect.
+//!
+//! # Where to look next
+//!
+//! - `docs/QUICKSTART.md` — the narrative walkthrough.
+//! - `docs/PROTOCOL.md` — every wire frame.
+//! - `CONNECTION-ENGINE.md` — every tunable, every edge case.
+//! - `examples/` — runnable demos
+//!   (`cargo run --example two_peer_chat -p myownmesh-core`,
+//!   `echo_rpc`, `roster_demo`).
+//! - `tests/two_peer_handshake.rs` — the end-to-end integration
+//!   test doubles as an executable spec.
 
 pub mod channels;
 pub mod config;

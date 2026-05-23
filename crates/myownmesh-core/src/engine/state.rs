@@ -329,20 +329,15 @@ impl NetworkState {
         rx.await.unwrap_or(0)
     }
 
-    /// Approve a peer into the roster (engine side: persists the
-    /// roster file and emits the `approve` frame if a session is
-    /// up).
+    /// Persist `device_id` into the per-network roster. Does NOT
+    /// transition any active session — call
+    /// [`crate::engine::handshake::send_local_approve`] (or the
+    /// higher-level [`crate::JoinedNetwork::roster_approve`])
+    /// to actually emit the `approve` frame.
     pub async fn approve_roster(&self, device_id: &str, label: &str) -> Result<()> {
         let mut roster = self.roster.write();
         crate::roster::add_peer_in(&mut roster, device_id, label);
         crate::roster::save(&roster)?;
-        drop(roster);
-        // If the peer is connected, fire the approve.
-        if let Some(peer) = self.peers.get(device_id) {
-            let mut data = peer.state.write();
-            data.local_approve_sent = true;
-            drop(data);
-        }
         Ok(())
     }
 
