@@ -8,6 +8,7 @@
     PeerInfo,
   } from "../../types";
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+  import { exportNetworkSettings } from "../../network-settings";
   import AddNetworkModal from "./AddNetworkModal.svelte";
 
   const {
@@ -150,10 +151,12 @@
     }
   }
 
-  /** Pull the full NetworkConfig from the daemon's saved config
-   *  (richer than the in-memory registry summary, which omits
-   *  signaling/STUN/TURN) and write it to a JSON file the user
-   *  picks via the save dialog. */
+  /** Export the selected network as a shareable JSON envelope. We
+   *  pull the full NetworkConfig from the daemon's on-disk config
+   *  (the registry summary omits signaling/STUN/TURN) and rewrap
+   *  it as a `NetworkSettingsExport` — the same wire shape MyOwnLLM
+   *  uses, with the local internal `id` stripped so the same blob
+   *  can be applied on multiple devices without colliding. */
   async function exportNetwork() {
     if (!selected) return;
     busy = true;
@@ -168,12 +171,13 @@
         actionError = "Network is live but not present in saved config.";
         return;
       }
+      const envelope = exportNetworkSettings(net);
       const path = await saveDialog({
-        defaultPath: `${net.id}.json`,
+        defaultPath: `${envelope.network_id || net.id}.json`,
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (!path) return; // user cancelled
-      await meshClient.exportNetworkFile(path, net);
+      await meshClient.exportNetworkFile(path, envelope);
     } catch (e) {
       actionError = String(e);
     } finally {

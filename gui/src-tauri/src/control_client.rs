@@ -63,6 +63,10 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    NetworkIdGenerate,
+    NetworkIdNormalize {
+        input: String,
+    },
     ConfigShow,
     NetworkAdd {
         config: serde_json::Value,

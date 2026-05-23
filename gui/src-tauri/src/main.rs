@@ -166,6 +166,29 @@ async fn mesh_topology_set(
 }
 
 #[tauri::command]
+async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::NetworkIdGenerate)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_network_id_normalize(
+    state: State<'_, AppState>,
+    input: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::NetworkIdNormalize { input })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
 async fn mesh_config_show(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let resp = state
         .client
@@ -201,22 +224,10 @@ async fn mesh_network_remove(
     unwrap_response(resp)
 }
 
-/// Read a NetworkConfig from a JSON file on disk. The GUI uses this
-/// for the "Import network from file" flow: the Tauri side opens a
-/// dialog via the dialog plugin from JS, hands us the chosen path,
-/// and we return the parsed JSON for the renderer to display in the
-/// AddNetworkModal before the user confirms.
-#[tauri::command]
-async fn mesh_network_import_file(path: String) -> Result<serde_json::Value, String> {
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))?;
-    Ok(parsed)
-}
-
-/// Write a NetworkConfig to a JSON file. Pretty-printed so the
-/// exported file matches the hand-editable shape of config.json
-/// entries.
+/// Write a `NetworkSettingsExport` envelope to disk. Pretty-printed
+/// so the file is easy to inspect by hand. Import goes through a
+/// native `<input type="file">` on the renderer side (matches the
+/// MyOwnLLM pattern), so there's no symmetric `mesh_network_import_file`.
 #[tauri::command]
 async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Result<(), String> {
     let body = serde_json::to_string_pretty(&config).map_err(|e| format!("serialise: {e}"))?;
@@ -285,10 +296,11 @@ fn main() {
             mesh_roster_approve,
             mesh_roster_remove,
             mesh_topology_set,
+            mesh_network_id_generate,
+            mesh_network_id_normalize,
             mesh_config_show,
             mesh_network_add,
             mesh_network_remove,
-            mesh_network_import_file,
             mesh_network_export_file,
         ])
         .setup(move |app| {

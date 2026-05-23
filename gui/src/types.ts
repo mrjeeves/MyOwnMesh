@@ -53,18 +53,24 @@ export function buildTopology(
 // `#[serde(default)]` on the Rust side, so the GUI only sets what
 // the user actually edited; missing fields fill from defaults.
 
+// These mirror the engine's on-disk shapes — see
+// `crates/myownmesh-core/src/config.rs`. The user-facing import /
+// export envelope (`NetworkSettingsExport`) flattens these to plain
+// URL strings; conversion lives in `network-settings.ts`.
+
 export interface SignalingConfig {
-  app_id?: string | null;
-  relays?: string[];
-  relay_denylist?: string[];
+  strategy?: string;
+  servers?: string[];
+  redundancy?: number;
+  denylist?: string[];
 }
 
 export interface StunServer {
-  url: string;
+  urls: string[];
 }
 
 export interface TurnServer {
-  url: string;
+  urls: string[];
   username?: string | null;
   credential?: string | null;
 }

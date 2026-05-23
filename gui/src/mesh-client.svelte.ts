@@ -161,18 +161,10 @@ function createMeshClient() {
     await refreshNetworks();
   }
 
-  /** Read a NetworkConfig JSON file off disk and return its parsed
-   *  contents. Does NOT add it — the caller (the AddNetworkModal)
-   *  pre-fills the form with this for the user to review before
-   *  confirming. */
-  async function importNetworkFile(path: string): Promise<NetworkConfigInput> {
-    return (await invoke("mesh_network_import_file", { path })) as NetworkConfigInput;
-  }
-
-  async function exportNetworkFile(
-    path: string,
-    config: NetworkConfigInput,
-  ): Promise<void> {
+  /** Accept any JSON-shaped value — the GUI exports the
+   *  shareable `NetworkSettingsExport` envelope, not the raw
+   *  `NetworkConfig`, so the type here is intentionally loose. */
+  async function exportNetworkFile(path: string, config: unknown): Promise<void> {
     await invoke("mesh_network_export_file", { path, config });
   }
 
@@ -287,7 +279,6 @@ function createMeshClient() {
     configShow,
     networkAdd,
     networkRemove,
-    importNetworkFile,
     exportNetworkFile,
   };
 }

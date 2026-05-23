@@ -62,6 +62,18 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    /// Generate a fresh random Network ID — base36, 8 chars by
+    /// default. Stateless utility; the GUI's "Generate" button on
+    /// the AddNetworkModal calls this so we don't replicate the
+    /// alphabet / RNG choice in JS.
+    NetworkIdGenerate,
+    /// Canonicalise a user-typed Network ID. Trims, lowercases,
+    /// and validates length / charset; returns the normalised
+    /// form. Errors flow through the standard `Response::err`
+    /// path so the GUI shows them inline.
+    NetworkIdNormalize {
+        input: String,
+    },
     /// Return the full on-disk `MeshConfig`. Used by the GUI's
     /// import/export flow to surface saved networks (and read-only
     /// fields the registry summary doesn't carry — signaling
@@ -313,6 +325,15 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                     Err(e) => Response::err(e.to_string()),
                 },
                 None => Response::err(format!("unknown network: {network}")),
+            }
+        }
+        Request::NetworkIdGenerate => Response::ok(serde_json::json!({
+            "network_id": myownmesh_core::identity::generate_network_id(),
+        })),
+        Request::NetworkIdNormalize { input } => {
+            match myownmesh_core::identity::normalize_network_id(&input) {
+                Ok(n) => Response::ok(serde_json::json!({ "network_id": n })),
+                Err(e) => Response::err(e.to_string()),
             }
         }
         Request::ConfigShow => match MeshConfig::load() {
