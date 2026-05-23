@@ -1,13 +1,22 @@
 <script lang="ts">
   import { meshClient } from "../../mesh-client.svelte";
   import { topologyName, topologyHub } from "../../types";
-  import type { AuthorizedPeer, NetworkSummary, PeerInfo } from "../../types";
+  import type {
+    AuthorizedPeer,
+    NetworkConfigInput,
+    NetworkSummary,
+    PeerInfo,
+  } from "../../types";
+  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+  import AddNetworkModal from "./AddNetworkModal.svelte";
 
   const {
     focusedConfigId,
   }: {
     focusedConfigId: string | null;
   } = $props();
+
+  let showAddModal = $state(false);
 
   type SubTab = "status" | "connections" | "roster";
 
@@ -119,6 +128,59 @@
     }
   }
 
+  /** Remove the selected network from the daemon (leave + persist).
+   *  Confirmation lives inline rather than via a separate modal
+   *  since the operation is reversible (re-add from config.json or
+   *  via the add modal). */
+  let confirmingRemoveNetwork = $state(false);
+  async function removeNetwork() {
+    if (!selected) return;
+    busy = true;
+    actionError = null;
+    try {
+      await meshClient.networkRemove(selected.config_id);
+      confirmingRemoveNetwork = false;
+      // selectedConfigId is reactive on the underlying networks list
+      // and will reseed via the existing $effect once the network
+      // disappears from meshClient.networks.
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** Pull the full NetworkConfig from the daemon's saved config
+   *  (richer than the in-memory registry summary, which omits
+   *  signaling/STUN/TURN) and write it to a JSON file the user
+   *  picks via the save dialog. */
+  async function exportNetwork() {
+    if (!selected) return;
+    busy = true;
+    actionError = null;
+    try {
+      const cfg = await meshClient.configShow();
+      const net = cfg.networks.find(
+        (n: NetworkConfigInput) =>
+          n.id === selected!.config_id || n.network_id === selected!.network_id,
+      );
+      if (!net) {
+        actionError = "Network is live but not present in saved config.";
+        return;
+      }
+      const path = await saveDialog({
+        defaultPath: `${net.id}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!path) return; // user cancelled
+      await meshClient.exportNetworkFile(path, net);
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
   function shortId(id: string): string {
     if (id.length <= 16) return id;
     return id.slice(0, 8) + "…" + id.slice(-6);
@@ -149,10 +211,13 @@
     {#if meshClient.networks.length === 0}
       <div class="placeholder">
         <p>No networks joined yet.</p>
+        <button class="primary" onclick={() => (showAddModal = true)}>
+          + Add network
+        </button>
         <p class="hint">
-          Add one to <code>~/.myownmesh/config.json</code> under
-          <code>networks: []</code>, then restart <code>myownmesh serve</code>.
-          A future build will let you add networks directly from this panel.
+          Networks are saved to <code>~/.myownmesh/config.json</code> as plain
+          JSON. The add dialog can also import from a file or paste, and you
+          can export any existing network back to JSON from the Status tab.
         </p>
       </div>
     {:else}
@@ -163,6 +228,9 @@
             <option value={n.config_id}>{n.config_id} — {n.network_id}</option>
           {/each}
         </select>
+        <button class="add" onclick={() => (showAddModal = true)}>
+          + Add network
+        </button>
       </div>
 
       {#if actionError}
@@ -231,6 +299,36 @@
               <dt>Peers</dt>
               <dd>{peers.length} tracked</dd>
             </dl>
+            <div class="card-actions">
+              <button class="row-btn" onclick={exportNetwork} disabled={busy}>
+                Export JSON…
+              </button>
+              {#if confirmingRemoveNetwork}
+                <button
+                  class="row-btn danger"
+                  onclick={removeNetwork}
+                  disabled={busy}
+                  title="Click again to confirm"
+                >
+                  Confirm remove
+                </button>
+                <button
+                  class="row-btn"
+                  onclick={() => (confirmingRemoveNetwork = false)}
+                  disabled={busy}
+                >
+                  Cancel
+                </button>
+              {:else}
+                <button
+                  class="row-btn danger"
+                  onclick={() => (confirmingRemoveNetwork = true)}
+                  disabled={busy}
+                >
+                  Remove network…
+                </button>
+              {/if}
+            </div>
           </div>
         {:else if tab === "connections"}
           <div class="card">
@@ -333,6 +431,16 @@
     {/if}
   </div>
 </div>
+
+{#if showAddModal}
+  <AddNetworkModal
+    onClose={() => (showAddModal = false)}
+    onAdded={(configId: string) => {
+      showAddModal = false;
+      selectedConfigId = configId;
+    }}
+  />
+{/if}
 
 <style>
   .section {
@@ -579,5 +687,44 @@
     font-style: italic;
     padding: 0.6rem 0;
     font-size: 0.85rem;
+  }
+  .placeholder .primary {
+    margin-top: 0.5rem;
+    padding: 0.4rem 1rem;
+    background: #2a2a55;
+    border: 1px solid #4a4a85;
+    border-radius: 5px;
+    color: #e8e8ff;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 500;
+  }
+  .placeholder .primary:hover {
+    background: #3a3a70;
+    border-color: #6e6ef7;
+  }
+  .picker .add {
+    margin-left: auto;
+    padding: 0.3rem 0.7rem;
+    background: #1a1a22;
+    border: 1px solid #2a2a35;
+    border-radius: 5px;
+    color: #ccc;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.78rem;
+  }
+  .picker .add:hover {
+    border-color: #6e6ef7;
+    color: #b8b8ff;
+  }
+  .card-actions {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.85rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid #1e1e25;
+    flex-wrap: wrap;
   }
 </style>

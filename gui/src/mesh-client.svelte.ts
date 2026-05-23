@@ -15,6 +15,8 @@ import type {
   DaemonStatus,
   DiagEntry,
   IdentityInfo,
+  MeshConfigSnapshot,
+  NetworkConfigInput,
   NetworkSummary,
   PeerInfo,
   StreamFrame,
@@ -134,6 +136,46 @@ function createMeshClient() {
     await refreshPeers(network);
   }
 
+  // ---- network add / remove / import / export ------------------------
+
+  /** Fetch the on-disk MeshConfig. The GUI uses this for the export
+   *  flow (it pulls the full NetworkConfig including STUN/TURN /
+   *  signaling that the registry summary doesn't carry). */
+  async function configShow(): Promise<MeshConfigSnapshot> {
+    const resp = (await invoke("mesh_config_show")) as {
+      config: MeshConfigSnapshot;
+    };
+    return resp.config;
+  }
+
+  async function networkAdd(config: NetworkConfigInput) {
+    await invoke("mesh_network_add", { config });
+    await refreshNetworks();
+    // Refresh peers for the new network so its sidebar row populates
+    // immediately rather than waiting on the next poll tick.
+    await refreshAllPeers();
+  }
+
+  async function networkRemove(network: string) {
+    await invoke("mesh_network_remove", { network });
+    await refreshNetworks();
+  }
+
+  /** Read a NetworkConfig JSON file off disk and return its parsed
+   *  contents. Does NOT add it — the caller (the AddNetworkModal)
+   *  pre-fills the form with this for the user to review before
+   *  confirming. */
+  async function importNetworkFile(path: string): Promise<NetworkConfigInput> {
+    return (await invoke("mesh_network_import_file", { path })) as NetworkConfigInput;
+  }
+
+  async function exportNetworkFile(
+    path: string,
+    config: NetworkConfigInput,
+  ): Promise<void> {
+    await invoke("mesh_network_export_file", { path, config });
+  }
+
   // ---- event stream handling ------------------------------------------
 
   function ingestEvent(frame: StreamFrame) {
@@ -242,6 +284,11 @@ function createMeshClient() {
     rosterRemove,
     rosterList,
     topologySet,
+    configShow,
+    networkAdd,
+    networkRemove,
+    importNetworkFile,
+    exportNetworkFile,
   };
 }
 

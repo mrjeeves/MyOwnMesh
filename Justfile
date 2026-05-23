@@ -31,17 +31,21 @@ build:
 build-release:
     @cargo build --workspace --release
 
-# Run the GUI (Tauri + Svelte) with hot reload. Talks to the daemon
-# over the local control socket — start it separately in another
-# shell with `just serve` (or any `myownmesh serve`).
+# Run the GUI (Tauri + Svelte) with hot reload. The GUI auto-spawns
+# the daemon as a child process, so this is the only command you
+# need for a normal dev session. We pre-build the daemon binary so
+# the GUI's spawn step finds something ready to launch; subsequent
+# runs hit cargo's incremental cache and finish in seconds.
 [unix]
-[doc("Run the GUI with hot reload. Needs `just serve` running.")]
+[doc("Run the GUI with hot reload. Auto-spawns the daemon.")]
 dev *ARGS:
+    @cargo build -p myownmesh
     @cd gui && pnpm install --silent && pnpm tauri dev {{ARGS}}
 
 [windows]
-[doc("Run the GUI with hot reload. Needs `just serve` running.")]
+[doc("Run the GUI with hot reload. Auto-spawns the daemon.")]
 dev *ARGS:
+    @cargo build -p myownmesh
     @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
 
 # Run the daemon in the foreground with debug logging. The GUI's

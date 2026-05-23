@@ -20,14 +20,14 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::{
     tokio::prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions,
 };
-use myownmesh_core::{MeshHandle, TopologyMode};
+use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::registry::NetworkRegistry;
+use crate::registry::{NetworkRegistry, RemoveResult};
 
 /// Default control socket name (Unix abstract or Windows named-pipe
 /// segment). Overridable via `config.daemon.control_socket`.
@@ -62,6 +62,25 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    /// Return the full on-disk `MeshConfig`. Used by the GUI's
+    /// import/export flow to surface saved networks (and read-only
+    /// fields the registry summary doesn't carry — signaling
+    /// relays, STUN/TURN servers, auto-approve).
+    ConfigShow,
+    /// Add a network: persist to config.json, join via the live
+    /// `Mesh` handle, attach signaling, register. Returns the new
+    /// network's summary. Fails if either the `id` or `network_id`
+    /// already exists in the running daemon.
+    NetworkAdd {
+        config: NetworkConfig,
+    },
+    /// Remove a network: take it out of the registry, `leave()` the
+    /// engine driver, drop the signaling handle, and persist the
+    /// updated config.json. Idempotent — removing an unknown id is
+    /// reported as success-with-warning.
+    NetworkRemove {
+        network: String,
+    },
     /// Subscribe to the live event stream. The connection becomes a
     /// one-way server-push channel after this op; the daemon writes
     /// one JSON-encoded `MeshEvent` (or framing wrapper) per line
@@ -296,12 +315,143 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 None => Response::err(format!("unknown network: {network}")),
             }
         }
+        Request::ConfigShow => match MeshConfig::load() {
+            Ok(cfg) => Response::ok(serde_json::json!({ "config": cfg })),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::NetworkAdd { config } => network_add(state, config).await,
+        Request::NetworkRemove { network } => network_remove(state, &network).await,
         Request::EventsSubscribe => {
             // Handled by `handle_client` before reaching dispatch.
             // If we somehow get here, surface the bug.
             Response::err("events_subscribe must be handled upstream")
         }
     }
+}
+
+/// Join a fresh network through the live mesh, attach signaling,
+/// register the result, and persist the new config to disk. Each
+/// step that mutates daemon-visible state is reversible up to the
+/// last point we touch the on-disk config — config.json is updated
+/// after the join + attach succeeds so a failed join leaves the
+/// saved config untouched.
+async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Response {
+    // Reject duplicates against the running registry. We rely on
+    // the registry's two-key indexing — checking both the local
+    // config id and the wire-level network id covers the user
+    // trying to add the same network twice (under any alias).
+    if state.registry.contains(&config.id) {
+        return Response::err(format!("config id '{}' already in use", config.id));
+    }
+    if state.registry.contains(&config.network_id) {
+        return Response::err(format!(
+            "network id '{}' already joined under a different config",
+            config.network_id
+        ));
+    }
+
+    // Join the live mesh first — if the engine refuses (bad
+    // network id, etc.) we want to know before we touch disk.
+    let joined = match state.mesh.join(config.clone()).await {
+        Ok(j) => j,
+        Err(e) => return Response::err(format!("join: {e}")),
+    };
+
+    // Take a summary BEFORE handing ownership to the registry so we
+    // can return it in the response payload without re-locking.
+    let summary = serde_json::json!({
+        "config_id": joined.config_id(),
+        "network_id": joined.network_id(),
+        "phase": joined.current_phase(),
+        "topology": joined.current_topology(),
+    });
+
+    // Attach the production signaling driver. A `None` here means
+    // the bridge declined (e.g. signaling disabled in config); the
+    // network still works for in-process drivers attached by tests.
+    let nostr = {
+        let net_state = joined.state();
+        myownmesh_core::engine::attach_nostr(&net_state)
+    };
+    if nostr.is_none() {
+        warn!(network = %config.network_id, "nostr attach returned no handle");
+    }
+    state.registry.insert(joined, nostr);
+
+    // Persist to disk. We re-load the config rather than rely on
+    // the in-memory copy from startup so concurrent edits (a user
+    // hand-editing config.json) survive — we append to whatever's
+    // on disk now. Best-effort: if save fails, the network is live
+    // but won't re-join on next daemon restart. Surface the disk
+    // error to the caller so the GUI can show it.
+    if let Err(e) = persist_network_add(&config) {
+        return Response::err(format!("network joined but config.json save failed: {e}"));
+    }
+
+    Response::ok(serde_json::json!({ "added": summary }))
+}
+
+/// Leave a live network and remove it from the on-disk config. The
+/// remove call returns ownership of the `JoinedNetwork`; we run its
+/// `leave()` to flush the engine driver cleanly. The signaling
+/// driver dropped inside `registry.remove` tears down its own
+/// tasks.
+async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
+    let key_owned = key.to_string();
+    match state.registry.remove(key) {
+        RemoveResult::Removed(joined) => {
+            let config_id = joined.config_id().to_string();
+            let network_id = joined.network_id().to_string();
+            if let Err(e) = joined.leave().await {
+                warn!("leave({key_owned}) returned error: {e:#}");
+            }
+            if let Err(e) = persist_network_remove(&config_id, &network_id) {
+                return Response::err(format!("network left but config.json save failed: {e}"));
+            }
+            Response::ok(serde_json::json!({ "removed": config_id }))
+        }
+        RemoveResult::StillBorrowed => {
+            // Engine driver will exit on command-channel drop; we
+            // still need to update disk so a restart doesn't
+            // re-join. We don't know the network_id since we
+            // couldn't unwrap; persist by the key we were given
+            // and let the persist helper handle either alias.
+            if let Err(e) = persist_network_remove(&key_owned, &key_owned) {
+                return Response::err(format!("network removed but config.json save failed: {e}"));
+            }
+            Response::ok(
+                serde_json::json!({ "removed": key_owned, "warning": "engine teardown deferred — request was in flight" }),
+            )
+        }
+        RemoveResult::NotFound => Response::err(format!("unknown network: {key_owned}")),
+    }
+}
+
+fn persist_network_add(net: &NetworkConfig) -> Result<()> {
+    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
+    // Append only if not already present — covers the case where
+    // the user edited config.json by hand between daemon start and
+    // this add, and added the same network there too.
+    if !cfg
+        .networks
+        .iter()
+        .any(|n| n.id == net.id || n.network_id == net.network_id)
+    {
+        cfg.networks.push(net.clone());
+    }
+    cfg.save().map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn persist_network_remove(config_id: &str, network_id: &str) -> Result<()> {
+    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
+    let before = cfg.networks.len();
+    cfg.networks
+        .retain(|n| n.id != config_id && n.network_id != network_id);
+    if cfg.networks.len() != before {
+        cfg.save().map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {

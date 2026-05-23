@@ -16,22 +16,80 @@ export type MeshPhase =
   | "stopped";
 
 // ---- topology ---------------------------------------------------------
+//
+// TopologyMode is internally tagged in the Rust source — every
+// variant carries a `kind` field with the snake_case discriminant.
+// See `crates/myownmesh-core/src/config.rs` (the `topology_serde_tags_by_kind`
+// test pins this shape down).
 
 export type TopologyMode =
-  | { Ring: { n_preferred: number | null } }
-  | { Star: { hub: string } }
-  | "FullMesh";
+  | { kind: "ring"; n_preferred: number | null }
+  | { kind: "star"; hub: string }
+  | { kind: "full_mesh" };
 
 export function topologyName(t: TopologyMode): "ring" | "star" | "full_mesh" {
-  if (typeof t === "string") return "full_mesh";
-  if ("Ring" in t) return "ring";
-  return "star";
+  return t.kind;
 }
 
 export function topologyHub(t: TopologyMode): string | null {
-  if (typeof t === "string") return null;
-  if ("Star" in t) return t.Star.hub;
-  return null;
+  return t.kind === "star" ? t.hub : null;
+}
+
+/** Build a TopologyMode value from the picker primitives the UI
+ *  collects (a discriminant + optional hub). Centralised so add /
+ *  set-topology paths share the same construction. */
+export function buildTopology(
+  name: "ring" | "star" | "full_mesh",
+  hub?: string | null,
+): TopologyMode {
+  if (name === "ring") return { kind: "ring", n_preferred: null };
+  if (name === "full_mesh") return { kind: "full_mesh" };
+  return { kind: "star", hub: hub ?? "" };
+}
+
+// ---- network config (write shape — sent into NetworkAdd) -------------
+//
+// Mirrors `myownmesh_core::NetworkConfig`. Most fields are
+// `#[serde(default)]` on the Rust side, so the GUI only sets what
+// the user actually edited; missing fields fill from defaults.
+
+export interface SignalingConfig {
+  app_id?: string | null;
+  relays?: string[];
+  relay_denylist?: string[];
+}
+
+export interface StunServer {
+  url: string;
+}
+
+export interface TurnServer {
+  url: string;
+  username?: string | null;
+  credential?: string | null;
+}
+
+export interface NetworkConfigInput {
+  id: string;
+  network_id: string;
+  label?: string;
+  topology?: TopologyMode;
+  signaling?: SignalingConfig;
+  stun_servers?: StunServer[];
+  turn_servers?: TurnServer[];
+  roster_path?: string | null;
+  auto_approve?: boolean;
+}
+
+// ---- mesh config (read-only shape from ConfigShow) -------------------
+
+export interface MeshConfigSnapshot {
+  version: number;
+  identity_path?: string | null;
+  networks: NetworkConfigInput[];
+  // Other fields (auto_update, auto_cleanup, daemon) exist on the
+  // wire but aren't surfaced in the UI yet; ignore them.
+  [key: string]: unknown;
 }
 
 // ---- peer status / tier ----------------------------------------------

@@ -63,6 +63,13 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    ConfigShow,
+    NetworkAdd {
+        config: serde_json::Value,
+    },
+    NetworkRemove {
+        network: String,
+    },
     EventsSubscribe,
 }
 

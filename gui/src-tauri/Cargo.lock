@@ -1875,6 +1875,7 @@ dependencies = [
  "anyhow",
  "dirs 5.0.1",
  "interprocess",
+ "parking_lot",
  "serde",
  "serde_json",
  "tauri",

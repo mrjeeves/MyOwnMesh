@@ -31,22 +31,21 @@ pub async fn run() -> Result<()> {
         .context("open mesh")?;
     info!(device_id = %mesh.identity().display_id(), "identity ready");
 
-    // The registry holds every JoinedNetwork so the control socket
-    // can address them by id without serve.rs threading a handle
-    // through every dispatch arm.
+    // The registry holds every JoinedNetwork + its signaling driver
+    // handle so the control socket can address them by id (peers
+    // list, roster ops, topology, add/remove) without serve.rs
+    // threading handles through every dispatch arm.
     let registry = NetworkRegistry::new();
-    let mut nostr_handles = Vec::new();
     for net in cfg.networks.iter() {
         match mesh.join(net.clone()).await {
             Ok(joined_net) => {
                 info!(network = %net.network_id, "joined network");
                 let state = joined_net.state();
-                if let Some(handle) = myownmesh_core::engine::attach_nostr(&state) {
-                    nostr_handles.push(handle);
-                } else {
+                let nostr = myownmesh_core::engine::attach_nostr(&state);
+                if nostr.is_none() {
                     warn!(network = %net.network_id, "nostr attach returned no handle");
                 }
-                registry.insert(joined_net);
+                registry.insert(joined_net, nostr);
             }
             Err(e) => {
                 warn!(network = %net.network_id, "join failed: {e:#}");
@@ -86,7 +85,6 @@ pub async fn run() -> Result<()> {
             warn!("leave failed: {e:#}");
         }
     }
-    drop(nostr_handles);
 
     Ok(())
 }
