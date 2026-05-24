@@ -31,17 +31,33 @@ build:
 build-release:
     @cargo build --workspace --release
 
-# Run the daemon in the foreground with debug logging. There's no
-# GUI yet — when one lands this becomes "hot-reload GUI" and the
-# daemon-only flow moves to `just serve`.
+# Run the GUI (Tauri + Svelte) with hot reload. The GUI auto-spawns
+# the daemon as a child process, so this is the only command you
+# need for a normal dev session. We pre-build the daemon binary so
+# the GUI's spawn step finds something ready to launch; subsequent
+# runs hit cargo's incremental cache and finish in seconds.
+[unix]
+[doc("Run the GUI with hot reload. Auto-spawns the daemon.")]
+dev *ARGS:
+    @cargo build -p myownmesh
+    @cd gui && pnpm install --silent && pnpm tauri dev {{ARGS}}
+
+[windows]
+[doc("Run the GUI with hot reload. Auto-spawns the daemon.")]
+dev *ARGS:
+    @cargo build -p myownmesh
+    @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
+
+# Run the daemon in the foreground with debug logging. The GUI's
+# `just dev` connects to this over the control socket.
 [unix]
 [doc("Run the daemon in foreground with debug logging.")]
-dev *ARGS:
+serve *ARGS:
     @MYOWNMESH_LOG="debug,myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
 
 [windows]
 [doc("Run the daemon in foreground with debug logging.")]
-dev *ARGS:
+serve *ARGS:
     @$env:MYOWNMESH_LOG = "debug,myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
 run *ARGS:
