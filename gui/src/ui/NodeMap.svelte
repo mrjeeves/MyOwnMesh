@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { NetworkSummary, PeerInfo } from "../types";
   import { networkDisplayName, topologyName, topologyHub } from "../types";
+  import { meshClient } from "../mesh-client.svelte";
 
   const {
     network,
@@ -17,6 +18,73 @@
     selectedPeerId: string | null;
     onSelectPeer: (id: string | null) => void;
   } = $props();
+
+  /** Pending-action descriptor for a peer. `null` means there's
+   *  nothing actionable about this peer right now. Anything else
+   *  drives both the node badge in the graph and the action row at
+   *  the top of the detail panel — single source of truth so the
+   *  badge can never disagree with the inline actions. */
+  type PendingAction =
+    | { kind: "approve"; description: string }
+    | null;
+
+  function pendingActionFor(peer: PeerInfo | null): PendingAction {
+    if (!peer) return null;
+    if (peer.status === "pending_approval") {
+      return {
+        kind: "approve",
+        description: "Peer authenticated — approve to start exchanging app traffic.",
+      };
+    }
+    return null;
+  }
+
+  // Inline action state. Scoped to the currently-selected peer; we
+  // reset both whenever the selection changes via the $effect below
+  // so a stale error from one peer doesn't bleed into the next.
+  let actionBusy = $state(false);
+  let actionError = $state<string | null>(null);
+
+  $effect(() => {
+    // Reset action state when the selected peer changes.
+    void selectedPeerId;
+    actionBusy = false;
+    actionError = null;
+  });
+
+  async function approveSelected() {
+    if (!selectedPeer || actionBusy) return;
+    actionBusy = true;
+    actionError = null;
+    try {
+      await meshClient.rosterApprove(
+        network.config_id,
+        selectedPeer.device_id,
+        selectedPeer.label,
+      );
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      actionBusy = false;
+    }
+  }
+
+  async function denySelected() {
+    if (!selectedPeer || actionBusy) return;
+    actionBusy = true;
+    actionError = null;
+    try {
+      // Roster-remove on a not-yet-approved peer drops the in-flight
+      // session and refuses re-approval until the user explicitly
+      // approves again. Matches the Roster tab's Remove action.
+      await meshClient.rosterRemove(network.config_id, selectedPeer.device_id);
+      onSelectPeer(null);
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      actionBusy = false;
+    }
+  }
 
   // Canvas dimensions are reactive so the layout recomputes on
   // window resize. We track the SVG element's actual size via a
@@ -359,11 +427,35 @@
             stroke-width="1.5"
           />
         {/if}
+        {#if pendingActionFor(node.peer)}
+          <!-- Pending-action badge: pulsing ring + "!" glyph on the
+               top-right of the node, mirroring the Approve / Deny
+               row in the detail panel. Visible at a glance so the
+               user knows which node needs them before drilling in. -->
+          <circle
+            class="pending-pulse"
+            cx="-16"
+            cy="-16"
+            r="6"
+            fill="#a78bfa"
+            stroke="#0d0d0d"
+            stroke-width="1.5"
+          />
+          <text
+            x="-16"
+            y="-13"
+            text-anchor="middle"
+            class="pending-badge-glyph"
+          >
+            !
+          </text>
+        {/if}
       </g>
     {/each}
   </svg>
 
   {#if selectedPeer}
+    {@const pending = pendingActionFor(selectedPeer)}
     <div class="detail" role="dialog" aria-label="Peer detail">
       <div class="detail-head">
         <div class="detail-title">
@@ -380,6 +472,32 @@
       <div class="detail-id" title={selectedPeer.device_id}>
         {selectedPeer.device_id}
       </div>
+      {#if pending}
+        <div class="pending-action">
+          <div class="pending-line">{pending.description}</div>
+          {#if pending.kind === "approve"}
+            <div class="pending-buttons">
+              <button
+                class="btn-approve"
+                onclick={approveSelected}
+                disabled={actionBusy}
+              >
+                {actionBusy ? "Approving…" : "Approve"}
+              </button>
+              <button
+                class="btn-deny"
+                onclick={denySelected}
+                disabled={actionBusy}
+              >
+                Deny
+              </button>
+            </div>
+          {/if}
+          {#if actionError}
+            <div class="pending-error">{actionError}</div>
+          {/if}
+        </div>
+      {/if}
       <dl class="detail-grid">
         <dt>status</dt>
         <dd>{selectedPeer.status.replace("_", " ")}</dd>
@@ -555,5 +673,84 @@
   }
   .detail-grid dd {
     color: #e0e0e0;
+  }
+  .pending-action {
+    margin: 0.5rem 0 0.6rem 0;
+    padding: 0.55rem 0.65rem;
+    background: #1a1530;
+    border: 1px solid #3a2a55;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .pending-line {
+    font-size: 0.78rem;
+    color: #d6c8ff;
+    line-height: 1.4;
+  }
+  .pending-buttons {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .btn-approve,
+  .btn-deny {
+    flex: 1;
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 0.3rem 0.55rem;
+    border-radius: 5px;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .btn-approve {
+    background: #5b4ad7;
+    color: #fff;
+    border-color: #6e5cf0;
+  }
+  .btn-approve:hover:not(:disabled) {
+    background: #6e5cf0;
+  }
+  .btn-deny {
+    background: transparent;
+    color: #c0b6e0;
+    border-color: #3a2a55;
+  }
+  .btn-deny:hover:not(:disabled) {
+    background: #25193a;
+    color: #fff;
+  }
+  .btn-approve:disabled,
+  .btn-deny:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .pending-error {
+    font-size: 0.72rem;
+    color: #ffb4b4;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    word-break: break-word;
+  }
+  .pending-badge-glyph {
+    fill: #0d0d0d;
+    font-size: 9px;
+    font-weight: 700;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    pointer-events: none;
+    user-select: none;
+  }
+  .pending-pulse {
+    animation: pending-pulse 1.6s ease-in-out infinite;
+    transform-origin: center;
+  }
+  @keyframes pending-pulse {
+    0%, 100% {
+      opacity: 1;
+      r: 6;
+    }
+    50% {
+      opacity: 0.55;
+      r: 7.5;
+    }
   }
 </style>
