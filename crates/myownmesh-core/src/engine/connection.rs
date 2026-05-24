@@ -64,6 +64,15 @@ pub struct PeerStateData {
     pub handshake_started_at: Option<Instant>,
     pub hello_attempt: u32,
     pub rehandshake_attempt: u32,
+    /// Consecutive `ICE failed` events since the last successful
+    /// transition to Active. Drives the no-TURN diagnostic: after
+    /// a few failures with zero relay candidates we tell the user
+    /// their setup will never work without TURN.
+    pub ice_failed_count: u32,
+    /// One-shot guard so we don't re-emit the no-TURN diagnostic
+    /// every time the ladder cycles. Reset when the peer becomes
+    /// Active again.
+    pub no_turn_diag_emitted: bool,
     pub diag: PeerDiag,
 }
 
@@ -91,6 +100,8 @@ impl Default for PeerStateData {
             handshake_started_at: None,
             hello_attempt: 0,
             rehandshake_attempt: 0,
+            ice_failed_count: 0,
+            no_turn_diag_emitted: false,
             diag: PeerDiag::default(),
         }
     }

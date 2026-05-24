@@ -23,6 +23,7 @@ pub mod handshake;
 pub mod heartbeat;
 pub mod ice_watchdog;
 pub mod ladder;
+pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod scheduler;
@@ -105,6 +106,10 @@ pub async fn run_driver(
     let mut ice_poll =
         tokio::time::interval(Duration::from_millis(scheduler::ICE_POLL_INTERVAL_MS));
     ice_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut network_watch_tick =
+        tokio::time::interval(Duration::from_millis(scheduler::NETWORK_WATCH_POLL_MS));
+    network_watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut network_watch = network_watch::NetworkWatch::new().await;
     let mut wake_detector = wake::WakeDetector::new();
 
     loop {
@@ -145,6 +150,10 @@ pub async fn run_driver(
 
             _ = ice_poll.tick() => {
                 ice_watchdog::poll_all(&state).await;
+            }
+
+            _ = network_watch_tick.tick() => {
+                network_watch.poll(&state).await;
             }
         }
     }
