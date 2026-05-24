@@ -162,10 +162,39 @@ export interface AuthorizedPeer {
 // ---- network summary (from NetworksList) -----------------------------
 
 export interface NetworkSummary {
+  /** Auto-generated local config record id (`net_<rand>_<stamp>`).
+   *  Stable key for control-protocol ops — NOT the friendly display
+   *  name. Use [`networkDisplayName`] for anything user-facing. */
   config_id: string;
+  /** Wire-level rendezvous handle that peers share to find each
+   *  other (e.g. `home-mesh`). Falls back to this when `label` is
+   *  empty. */
   network_id: string;
+  /** Cosmetic display name picked at create time. Empty string when
+   *  the user didn't pick one. */
+  label: string;
   phase: MeshPhase;
   topology: TopologyMode;
+}
+
+/** What to show the human for a network. Mirrors MyOwnLLM's pattern:
+ *  prefer the user-picked cosmetic `label`, fall back to the
+ *  human-typed `network_id` (e.g. `home-mesh`), and only as a last
+ *  resort fall back to the auto-generated `config_id` (the
+ *  `net_<rand>_<stamp>` blob the user never sees in MyOwnLLM).
+ *  Anywhere the GUI used to render `config_id` as a label should go
+ *  through this. The raw ids stay available for tooltips / debug
+ *  chips. */
+export function networkDisplayName(net: {
+  label?: string;
+  network_id?: string;
+  config_id?: string;
+}): string {
+  const label = net.label?.trim();
+  if (label) return label;
+  const netId = net.network_id?.trim();
+  if (netId) return netId;
+  return net.config_id ?? "";
 }
 
 // ---- identity ---------------------------------------------------------

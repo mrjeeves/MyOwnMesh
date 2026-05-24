@@ -73,6 +73,13 @@ pub const REDISCOVERY_REJOIN_GAP_MS: u64 = 1_500;
 /// status to the UI.
 pub const SIGNALING_DIAG_HEARTBEAT_MS: u64 = 5 * 60 * 1000;
 
+/// Network-change watcher poll cadence. Cheap (one UDP bind +
+/// connect per network per tick, microseconds of work) so we run
+/// it often — 3 s gets us inside the WebRTC consent-freshness
+/// window so the user sees recovery in seconds rather than waiting
+/// 30 s for ICE to notice the network moved.
+pub const NETWORK_WATCH_POLL_MS: u64 = 3_000;
+
 /// Diag log ring buffer cap per network.
 pub const DIAG_MAX: usize = 80;
 

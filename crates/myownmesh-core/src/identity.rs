@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
+use parking_lot::RwLock;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -50,10 +51,16 @@ struct Anchor {
 /// In-memory view of the device's identity. Holds the secret key for
 /// signing operations and a precomputed encoded public key for cheap
 /// display.
+///
+/// The `label` is interior-mutable so the daemon can update it at
+/// runtime (the GUI's Identity tab and `myownmesh identity set-label`
+/// both write through to disk via [`set_label`] and into this slot
+/// via [`Identity::set_label`]) without rebuilding the shared
+/// `Arc<Identity>` held by every joined network.
 pub struct Identity {
     signing_key: SigningKey,
     public_id: String,
-    label: String,
+    label: RwLock<String>,
 }
 
 impl Identity {
@@ -67,7 +74,7 @@ impl Identity {
         Self {
             signing_key,
             public_id,
-            label: label.into(),
+            label: RwLock::new(label.into()),
         }
     }
 
@@ -102,8 +109,20 @@ impl Identity {
         format!("{}-{}", self.public_id(), suffix)
     }
 
-    pub fn label(&self) -> &str {
-        &self.label
+    /// Current human-readable label. Cloned out of the interior
+    /// `RwLock` so callers never hold the lock across an await — the
+    /// label is short (free-form, typically under 64 chars) so the
+    /// clone is cheap.
+    pub fn label(&self) -> String {
+        self.label.read().clone()
+    }
+
+    /// Update the in-memory label. The on-disk anchor is the source
+    /// of truth across restarts; persist via [`set_label`] in
+    /// addition to this when the change should survive a daemon
+    /// reboot.
+    pub fn set_label(&self, new_label: &str) {
+        *self.label.write() = new_label.to_string();
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {
@@ -195,7 +214,7 @@ fn create_new(path: &Path) -> Result<Identity> {
     Ok(Identity {
         signing_key,
         public_id: anchor.public_key,
-        label: anchor.label,
+        label: RwLock::new(anchor.label),
     })
 }
 
@@ -226,7 +245,7 @@ fn decode_anchor(anchor: Anchor) -> Result<Identity> {
     Ok(Identity {
         signing_key,
         public_id: anchor.public_key,
-        label: anchor.label,
+        label: RwLock::new(anchor.label),
     })
 }
 

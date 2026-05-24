@@ -8,21 +8,31 @@ just release 0.2.0
 
 That recipe:
 
-1. Bumps `[workspace.package].version` in the root `Cargo.toml`
-   via `scripts/bump-version.sh`.
-2. Refreshes `Cargo.lock`.
-3. Commits + tags `v0.2.0` + pushes with `--follow-tags`.
+1. Bumps the version in every manifest that pins it via
+   `scripts/bump-version.sh` — root `Cargo.toml`
+   (`[workspace.package].version` + the matching pins under
+   `[workspace.dependencies]`), `gui/src-tauri/Cargo.toml`,
+   `gui/src-tauri/Cargo.lock`, and `gui/package.json`.
+2. Refreshes the root `Cargo.lock`.
+3. Commits the version bumps, pushes the branch, then triggers
+   `release.yml` via `gh workflow run` with `tag=v0.2.0`.
 
-CI's release workflow (when it lands) will pick up the tag and:
+The release workflow runs on `push: tags: v*` and on
+`workflow_dispatch` (which is what step 3 uses), then for each of
+`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64`,
+`windows-x86_64`:
 
-- Build for `linux-x86_64`, `linux-aarch64`, `macos-aarch64`,
-  `macos-x86_64`, `windows-x86_64`.
-- Strip on Unix, SHA-256 each binary, upload sidecar `.sha256`
-  files.
-- Attach archives to the GitHub release.
+- Verifies the tag matches every manifest version (catches the
+  case where a maintainer pushed a tag without running
+  `just release`).
+- Builds the headless `myownmesh` daemon and packages it as
+  `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar.
+- Builds the Tauri GUI bundle (.deb / .AppImage / .dmg / .msi /
+  .exe) via `tauri-action`.
+- Uploads everything to the GitHub release.
 
 The matrix mirrors MyOwnLLM's `release.yml` so behaviour is
-consistent.
+consistent across both apps.
 
 ## Versioning
 

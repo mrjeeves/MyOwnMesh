@@ -244,6 +244,12 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         if active {
             data.status = PeerStatus::Active;
             data.tier = ConnectionTier::Steady;
+            // Successful Active reset: clear the no-TURN diagnostic
+            // guards so a future failure cycle gets a fresh chance
+            // to emit (and so the failure count doesn't carry over
+            // from a previous bad spell).
+            data.ice_failed_count = 0;
+            data.no_turn_diag_emitted = false;
         }
         (active, data.label.clone())
     };

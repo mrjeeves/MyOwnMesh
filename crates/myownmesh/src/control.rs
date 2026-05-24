@@ -62,6 +62,13 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    /// Update the device label. Persists to the on-disk identity
+    /// anchor and updates the running daemon's in-memory copy so the
+    /// next handshake advertises the new label immediately (no
+    /// restart needed). Free-form string; empty clears it.
+    IdentitySetLabel {
+        label: String,
+    },
     /// Generate a fresh random Network ID — base36, 8 chars by
     /// default. Stateless utility; the GUI's "Generate" button on
     /// the AddNetworkModal calls this so we don't replicate the
@@ -271,6 +278,20 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             "pubkey": state.mesh.identity().public_id(),
             "label": state.mesh.identity().label(),
         })),
+        Request::IdentitySetLabel { label } => {
+            // Persist first; if the disk write fails we want the
+            // in-memory copy to still reflect the on-disk reality, so
+            // we don't update the live `Identity` on error.
+            if let Err(e) = myownmesh_core::identity::set_label(&label) {
+                return Response::err(e.to_string());
+            }
+            state.mesh.identity().set_label(&label);
+            Response::ok(serde_json::json!({
+                "device_id": state.mesh.identity().display_id(),
+                "pubkey": state.mesh.identity().public_id(),
+                "label": state.mesh.identity().label(),
+            }))
+        }
         Request::NetworksList => {
             // Enriched payload: each network includes its phase,
             // topology, and labelling info. The CLI prints whatever
@@ -383,6 +404,7 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     let summary = serde_json::json!({
         "config_id": joined.config_id(),
         "network_id": joined.network_id(),
+        "label": joined.label(),
         "phase": joined.current_phase(),
         "topology": joined.current_topology(),
     });

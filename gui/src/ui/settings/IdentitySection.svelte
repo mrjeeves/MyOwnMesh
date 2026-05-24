@@ -1,6 +1,62 @@
 <script lang="ts">
   import { meshClient } from "../../mesh-client.svelte";
 
+  /** Inline edit state for the label. Starts in "view" mode; the
+   *  user clicks "Edit" to swap to the input, then "Save" persists
+   *  through the daemon and "Cancel" reverts. */
+  let editing = $state(false);
+  let draft = $state("");
+  let saving = $state(false);
+  let saveError = $state<string | null>(null);
+
+  function startEditing() {
+    draft = meshClient.identity?.label ?? "";
+    saveError = null;
+    editing = true;
+  }
+
+  function cancelEditing() {
+    editing = false;
+    saveError = null;
+  }
+
+  async function save() {
+    if (saving) return;
+    saving = true;
+    saveError = null;
+    try {
+      // Trim whitespace before persisting — labels are user-facing
+      // strings and trailing spaces look like file-system grime.
+      // Empty after trim clears the label (the daemon accepts "").
+      await meshClient.identitySetLabel(draft.trim());
+      editing = false;
+    } catch (e) {
+      saveError = String(e);
+    } finally {
+      saving = false;
+    }
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void save();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEditing();
+    }
+  }
+
+  /** Svelte action: focuses the bound element when it mounts.
+   *  Lets the inline edit input grab focus on open without using
+   *  the static `autofocus` attribute (which Svelte's a11y rules
+   *  flag — `autofocus` on initial render disorients screen-reader
+   *  users; firing focus from a user-triggered swap is fine). */
+  function focusOnMount(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -17,7 +73,33 @@
     <div class="card">
       <dl class="grid">
         <dt>Label</dt>
-        <dd>{meshClient.identity.label || "—"}</dd>
+        <dd>
+          {#if editing}
+            <input
+              class="label-input"
+              type="text"
+              maxlength="128"
+              placeholder="e.g. laptop, kitchen-pi"
+              bind:value={draft}
+              onkeydown={onKeydown}
+              disabled={saving}
+              use:focusOnMount
+            />
+            <button class="copy" onclick={save} disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button class="copy" onclick={cancelEditing} disabled={saving}>
+              Cancel
+            </button>
+          {:else}
+            <span class="label-view">{meshClient.identity.label || "—"}</span>
+            <button class="copy" onclick={startEditing}>Edit</button>
+          {/if}
+        </dd>
+        {#if saveError}
+          <dt></dt>
+          <dd class="err">{saveError}</dd>
+        {/if}
         <dt>Device ID</dt>
         <dd class="mono break">
           {meshClient.identity.device_id}
@@ -118,6 +200,37 @@
   .copy:hover {
     border-color: #4a4a55;
     color: #e8e8e8;
+  }
+  .copy:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .label-view {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .label-input {
+    flex: 1;
+    min-width: 0;
+    background: #0d0d12;
+    border: 1px solid #2a2a35;
+    border-radius: 4px;
+    color: #e8e8e8;
+    font: inherit;
+    font-size: 0.82rem;
+    padding: 0.25rem 0.45rem;
+  }
+  .label-input:focus {
+    outline: none;
+    border-color: #6e6ef7;
+  }
+  .err {
+    color: #ffb4b4;
+    font-size: 0.72rem;
+    font-family: ui-monospace, SFMono-Regular, monospace;
   }
   .hint {
     color: #888;

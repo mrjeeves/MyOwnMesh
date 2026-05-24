@@ -54,8 +54,38 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    let log_level =
-        std::env::var("MYOWNMESH_LOG").unwrap_or_else(|_| "info,myownmesh=info".to_string());
+    // Default log filter. We let our own crates speak at INFO and
+    // downgrade every webrtc-rs sibling crate to ERROR — they emit
+    // floods of WARN/INFO during normal ICE flow (every link-local
+    // IPv6 address that won't bind, every `pingAllCandidates`
+    // wakeup, every SRTP/SCTP teardown after a flapping connection)
+    // that swamp the real signal. The meaningful state transitions
+    // (`peer ACTIVE`, `ICE failed — Tier 4 immediately`, relay
+    // connect/recovery) all come from our own code, so silencing
+    // the sibling crates doesn't hide anything we care about.
+    //
+    // Power-user override: set `MYOWNMESH_LOG` to anything (e.g.
+    // `info,webrtc_ice=debug`) to see the underlying chatter while
+    // debugging a connectivity problem.
+    let default_filter = concat!(
+        "info,",
+        "myownmesh=info,",
+        "myownmesh_core=info,",
+        "myownmesh_signaling=info,",
+        "myownmesh_updater=info,",
+        "webrtc=error,",
+        "webrtc_ice=error,",
+        "webrtc_mdns=error,",
+        "webrtc_dtls=error,",
+        "webrtc_sctp=error,",
+        "webrtc_srtp=error,",
+        "webrtc_data=error,",
+        "webrtc_util=error,",
+        "webrtc_media=error,",
+        "interceptor=error,",
+        "stun=error",
+    );
+    let log_level = std::env::var("MYOWNMESH_LOG").unwrap_or_else(|_| default_filter.to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
         .with_target(false)

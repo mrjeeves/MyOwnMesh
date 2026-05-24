@@ -20,6 +20,18 @@
     if (c === "disconnected") return "no daemon";
     return "connecting…";
   });
+
+  // Tooltip for the daemon-connection pill — the colored dot + label
+  // tracks the GUI's socket to the local `myownmesh` daemon, not the
+  // health of any particular mesh network. Spelling it out keeps
+  // users from misreading it as "online with peers".
+  const phaseTooltip = $derived(() => {
+    const c = meshClient.connected;
+    if (c === "live") return "Connected to the local myownmesh daemon.";
+    if (c === "disconnected")
+      return "Can't reach the local myownmesh daemon socket.";
+    return "Opening the local myownmesh daemon socket…";
+  });
 </script>
 
 <div class="topbar">
@@ -42,7 +54,7 @@
 
   <div class="brand">MyOwnMesh</div>
 
-  <div class="status" data-status={meshClient.connected}>
+  <div class="status" data-status={meshClient.connected} title={phaseTooltip()}>
     <span class="dot"></span>
     <span class="status-label">{phaseLabel()}</span>
   </div>

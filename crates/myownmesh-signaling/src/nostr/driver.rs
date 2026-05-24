@@ -190,13 +190,32 @@ async fn run_relay(
 ) {
     let mut backoff_attempt = 0u32;
     let mut replay = SubscriptionReplay::new();
+    // Tracks consecutive connect failures so we can dampen the log
+    // spam from chronically-broken public relays (DNS no-such-host,
+    // 403s, TLS handshake timeouts). Without this, a single bad
+    // relay floods stderr with one WARN every 1/2/4/8/16/32/60s
+    // forever — drowning out everything else. We surface the first
+    // failure of a streak at WARN, drop subsequent failures to
+    // DEBUG, then announce recovery at INFO once the relay starts
+    // accepting again. Mirrors the rationale behind MyOwnLLM's
+    // Trystero-patch noise suppression.
+    let mut consecutive_failures = 0u32;
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         match tokio_tungstenite::connect_async(&url).await {
             Ok((stream, _)) => {
-                info!(relay = %short(&url), "relay connected");
+                if consecutive_failures > 0 {
+                    info!(
+                        relay = %short(&url),
+                        attempts = consecutive_failures,
+                        "relay recovered after failed attempts"
+                    );
+                } else {
+                    info!(relay = %short(&url), "relay connected");
+                }
+                consecutive_failures = 0;
                 backoff_attempt = 0;
                 let outcome =
                     run_relay_session(&url, stream, &shared, &inbound_tx, &mut replay, &cancel)
@@ -204,7 +223,16 @@ async fn run_relay(
                 trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
             }
             Err(e) => {
-                warn!(relay = %short(&url), "relay connect failed: {e}");
+                if consecutive_failures == 0 {
+                    warn!(relay = %short(&url), "relay connect failed: {e}");
+                } else {
+                    debug!(
+                        relay = %short(&url),
+                        attempt = consecutive_failures + 1,
+                        "relay still failing: {e}"
+                    );
+                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
             }
         }
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {

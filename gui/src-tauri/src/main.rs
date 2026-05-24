@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use control_client::{ControlClient, Request, Response};
 use parking_lot::Mutex;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::mpsc;
 
 /// Shared state that every Tauri command pulls from. One
@@ -72,6 +72,19 @@ async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, 
     let resp = state
         .client
         .request(&Request::IdentityShow)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_identity_set_label(
+    state: State<'_, AppState>,
+    label: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::IdentitySetLabel { label })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -290,6 +303,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             mesh_status,
             mesh_identity,
+            mesh_identity_set_label,
             mesh_networks,
             mesh_peers,
             mesh_roster_list,
@@ -336,6 +350,32 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running MyOwnMesh GUI");
+        .build(tauri::generate_context!())
+        .expect("error while building MyOwnMesh GUI")
+        .run(|app, event| {
+            // RunEvent::Exit fires after the last window closes (or
+            // after we explicitly call `app.exit()`). Drop the
+            // managed daemon child here so it's killed deterministically
+            // — relying on `DaemonChild::Drop` alone wasn't enough
+            // in practice: Tauri's process tear-down on Windows
+            // can short-circuit destructors on managed state, which
+            // left the spawned `myownmesh serve` orphaned every
+            // time the user closed the GUI. Pull it out explicitly
+            // so its Drop impl runs before we return from this
+            // closure (and the OS reaps us).
+            if let RunEvent::Exit = event {
+                // Pull `take()` out of the `if let` scrutinee — under
+                // Rust 2021 if-let temporary-scope rules the
+                // `MutexGuard` lives until the end of the enclosing
+                // block, which means past `state` going out of scope,
+                // and the borrow checker rejects that. As a regular
+                // `let` statement the guard drops at the `;`, leaving
+                // a plain `Option<DaemonChild>` for the match.
+                let state = app.state::<AppState>();
+                let child = state.daemon_child.lock().take();
+                if let Some(c) = child {
+                    drop(c);
+                }
+            }
+        });
 }
