@@ -364,9 +364,17 @@ fn main() {
             // so its Drop impl runs before we return from this
             // closure (and the OS reaps us).
             if let RunEvent::Exit = event {
+                // Pull `take()` out of the `if let` scrutinee — under
+                // Rust 2021 if-let temporary-scope rules the
+                // `MutexGuard` lives until the end of the enclosing
+                // block, which means past `state` going out of scope,
+                // and the borrow checker rejects that. As a regular
+                // `let` statement the guard drops at the `;`, leaving
+                // a plain `Option<DaemonChild>` for the match.
                 let state = app.state::<AppState>();
-                if let Some(child) = state.daemon_child.lock().take() {
-                    drop(child);
+                let child = state.daemon_child.lock().take();
+                if let Some(c) = child {
+                    drop(c);
                 }
             }
         });
