@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use control_client::{ControlClient, Request, Response};
 use parking_lot::Mutex;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::mpsc;
 
 /// Shared state that every Tauri command pulls from. One
@@ -350,6 +350,24 @@ fn main() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running MyOwnMesh GUI");
+        .build(tauri::generate_context!())
+        .expect("error while building MyOwnMesh GUI")
+        .run(|app, event| {
+            // RunEvent::Exit fires after the last window closes (or
+            // after we explicitly call `app.exit()`). Drop the
+            // managed daemon child here so it's killed deterministically
+            // — relying on `DaemonChild::Drop` alone wasn't enough
+            // in practice: Tauri's process tear-down on Windows
+            // can short-circuit destructors on managed state, which
+            // left the spawned `myownmesh serve` orphaned every
+            // time the user closed the GUI. Pull it out explicitly
+            // so its Drop impl runs before we return from this
+            // closure (and the OS reaps us).
+            if let RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                if let Some(child) = state.daemon_child.lock().take() {
+                    drop(child);
+                }
+            }
+        });
 }
