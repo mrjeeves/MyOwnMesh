@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import { getVersion } from "@tauri-apps/api/app";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { meshClient } from "../mesh-client.svelte";
   import TopBar from "./TopBar.svelte";
   import Sidebar from "./Sidebar.svelte";
@@ -52,6 +54,18 @@
   }
 
   onMount(() => {
+    // Stamp the version into the window title so users can tell at
+    // a glance which build they're running (matches MyOwnLLM). The
+    // version comes from the Tauri runtime — single source of truth
+    // is gui/src-tauri/Cargo.toml, kept in sync by bump-version.sh.
+    getVersion()
+      .then((v) => {
+        getCurrentWindow()
+          .setTitle(`MyOwnMesh ${v}`)
+          .catch(() => {});
+      })
+      .catch(() => {});
+
     meshClient.init().catch((e) => {
       console.error("mesh client init failed:", e);
     });
@@ -106,8 +120,11 @@
           {:else if meshClient.networks.length === 0}
             <div class="empty-title">No networks yet</div>
             <div class="empty-sub">
-              Add one via <code>myownmesh config edit</code>, then restart the
-              daemon. A future build will let you add networks from here.
+              Use <button class="empty-link" onclick={() => openSettings("networks")}>
+                Networks settings
+              </button>
+              to add or import one — or click the
+              <strong>+</strong> button in the sidebar header.
             </div>
           {:else}
             <div class="empty-title">Loading…</div>
@@ -213,5 +230,17 @@
     font-family: ui-monospace, SFMono-Regular, monospace;
     max-width: 40rem;
     word-break: break-all;
+  }
+  .empty-link {
+    background: none;
+    border: none;
+    color: #8b8bff;
+    cursor: pointer;
+    font: inherit;
+    padding: 0;
+    text-decoration: underline;
+  }
+  .empty-link:hover {
+    color: #b9b9ff;
   }
 </style>
