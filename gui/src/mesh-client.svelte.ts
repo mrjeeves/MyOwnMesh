@@ -66,6 +66,14 @@ function createMeshClient() {
     }
   }
 
+  async function identitySetLabel(label: string) {
+    // The daemon writes the label to disk + updates its in-memory
+    // copy in one shot and echoes the resulting IdentityInfo back,
+    // so we can replace the cached value without a follow-up
+    // refresh.
+    identity = (await invoke("mesh_identity_set_label", { label })) as IdentityInfo;
+  }
+
   async function refreshNetworks() {
     try {
       const resp = (await invoke("mesh_networks")) as { networks: NetworkSummary[] };
@@ -272,6 +280,7 @@ function createMeshClient() {
     refreshAll,
     refreshPeers,
     refreshNetworks,
+    identitySetLabel,
     rosterApprove,
     rosterRemove,
     rosterList,

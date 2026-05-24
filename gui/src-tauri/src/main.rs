@@ -78,6 +78,19 @@ async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, 
 }
 
 #[tauri::command]
+async fn mesh_identity_set_label(
+    state: State<'_, AppState>,
+    label: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::IdentitySetLabel { label })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
 async fn mesh_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let resp = state
         .client
@@ -290,6 +303,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             mesh_status,
             mesh_identity,
+            mesh_identity_set_label,
             mesh_networks,
             mesh_peers,
             mesh_roster_list,

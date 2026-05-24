@@ -63,6 +63,9 @@ pub enum Request {
         hub: Option<String>,
     },
     IdentityShow,
+    IdentitySetLabel {
+        label: String,
+    },
     NetworkIdGenerate,
     NetworkIdNormalize {
         input: String,
