@@ -94,10 +94,16 @@ pub struct Response {
 /// path under `~/.myownmesh/`; Windows uses a namespaced pipe segment
 /// in the local namespace. Mirrors `myownmesh::control::SocketTarget`
 /// so error messages and connect logic line up with the daemon side.
+///
+/// Each variant is dead code on exactly one platform — `Path` is
+/// never built on Windows, `Name` is never built on Unix — so each
+/// gets its own conditional `allow(dead_code)` to keep the build
+/// warning-free on both sides.
 #[derive(Debug, Clone)]
 enum SocketAddr {
+    #[cfg_attr(not(unix), allow(dead_code))]
     Path(PathBuf),
-    #[allow(dead_code)] // Only constructed on Windows.
+    #[cfg_attr(unix, allow(dead_code))]
     Name(String),
 }
 
