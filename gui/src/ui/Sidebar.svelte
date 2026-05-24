@@ -1,6 +1,6 @@
 <script lang="ts">
   import { meshClient } from "../mesh-client.svelte";
-  import { topologyName } from "../types";
+  import { networkDisplayName, topologyName } from "../types";
   import type { NetworkSummary, PeerInfo } from "../types";
 
   const {
@@ -110,8 +110,11 @@
                 <path fill="currentColor" d="M8 6l8 6-8 6z" />
               </svg>
             </span>
-            <span class="net-name" title={net.network_id}>
-              {net.config_id}
+            <span
+              class="net-name"
+              title="Network ID: {net.network_id}&#10;Local config id: {net.config_id}"
+            >
+              {networkDisplayName(net)}
             </span>
             <span class="net-phase" data-phase={net.phase}>{phaseLabel(net)}</span>
           </button>

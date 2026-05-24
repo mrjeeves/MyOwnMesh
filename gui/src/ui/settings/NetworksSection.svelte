@@ -1,6 +1,6 @@
 <script lang="ts">
   import { meshClient } from "../../mesh-client.svelte";
-  import { topologyName, topologyHub } from "../../types";
+  import { networkDisplayName, topologyName, topologyHub } from "../../types";
   import type {
     AuthorizedPeer,
     NetworkConfigInput,
@@ -229,7 +229,7 @@
         <label for="net-picker">Network</label>
         <select id="net-picker" bind:value={selectedConfigId}>
           {#each meshClient.networks as n}
-            <option value={n.config_id}>{n.config_id} — {n.network_id}</option>
+            <option value={n.config_id}>{networkDisplayName(n)}</option>
           {/each}
         </select>
         <button class="add" onclick={() => (showAddModal = true)}>
@@ -244,10 +244,12 @@
       {#if selected}
         {#if tab === "status"}
           <div class="card">
-            <div class="card-title">{selected.config_id}</div>
+            <div class="card-title">{networkDisplayName(selected)}</div>
             <dl class="grid">
               <dt>Network ID</dt>
               <dd class="mono break">{selected.network_id}</dd>
+              <dt>Local config id</dt>
+              <dd class="mono break">{selected.config_id}</dd>
               <dt>Phase</dt>
               <dd>
                 <span class="phase" data-phase={selected.phase}>

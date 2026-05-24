@@ -152,6 +152,7 @@ impl MeshHandle {
             state,
             rpc: Arc::new(rpc),
             config_id: config.id,
+            label: config.label,
         })
     }
 
@@ -173,6 +174,7 @@ pub struct JoinedNetwork {
     state: Arc<NetworkState>,
     rpc: Arc<Rpc>,
     config_id: String,
+    label: String,
 }
 
 impl JoinedNetwork {
@@ -184,6 +186,12 @@ impl JoinedNetwork {
     /// saved entries for the same wire-level network).
     pub fn config_id(&self) -> &str {
         &self.config_id
+    }
+
+    /// Cosmetic display name. Empty when the user didn't pick one
+    /// at create time — the GUI falls back to `network_id`.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Snapshot the per-network rollup.

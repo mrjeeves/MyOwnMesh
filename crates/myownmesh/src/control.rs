@@ -404,6 +404,7 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     let summary = serde_json::json!({
         "config_id": joined.config_id(),
         "network_id": joined.network_id(),
+        "label": joined.label(),
         "phase": joined.current_phase(),
         "topology": joined.current_topology(),
     });

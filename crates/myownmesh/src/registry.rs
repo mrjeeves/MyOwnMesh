@@ -37,10 +37,17 @@ use parking_lot::RwLock;
 /// `JoinedNetwork`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NetworkSummary {
-    /// User-chosen config record id (unique per device).
+    /// User-chosen config record id (unique per device). Auto-generated
+    /// (`net_<rand>_<stamp>`) at create time and used as a stable
+    /// key for control-protocol ops — not the friendly display name.
     pub config_id: String,
-    /// Wire-level network rendezvous handle.
+    /// Wire-level network rendezvous handle. Human-typed at create
+    /// time (e.g. `cpjeeves-home`); the GUI falls back to this when
+    /// no cosmetic `label` is set.
     pub network_id: String,
+    /// Cosmetic display name picked at create time. Empty falls
+    /// back to `network_id`.
+    pub label: String,
     /// Coarse-grained phase: joining / alone / discovering / active / degraded / stopped.
     pub phase: myownmesh_core::MeshPhase,
     /// Current topology mode. Serialised with serde-internal tagging so
@@ -119,6 +126,7 @@ impl NetworkRegistry {
             out.push(NetworkSummary {
                 config_id: j.config_id().to_string(),
                 network_id: j.network_id().to_string(),
+                label: j.label().to_string(),
                 phase: j.current_phase(),
                 topology: j.current_topology(),
             });

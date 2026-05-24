@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { NetworkSummary, PeerInfo } from "../types";
-  import { topologyName, topologyHub } from "../types";
+  import { networkDisplayName, topologyName, topologyHub } from "../types";
 
   const {
     network,
@@ -254,7 +254,12 @@
 <div class="map">
   <div class="map-header">
     <div class="title">
-      <span class="net">{network.config_id}</span>
+      <span
+        class="net"
+        title="Network ID: {network.network_id}&#10;Local config id: {network.config_id}"
+      >
+        {networkDisplayName(network)}
+      </span>
       <span class="topo">topology · {topologyName(network.topology)}</span>
     </div>
     <div class="legend">
