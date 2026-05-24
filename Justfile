@@ -77,16 +77,18 @@ check:
     @cargo clippy --workspace --all-targets -- -D warnings
     @cargo test --workspace --no-fail-fast
 
-# Cut a release: bump every crate's version, commit, push, tag.
-# Bash script — release flow runs from a Linux/macOS box. Adding a
-# Windows variant is fine when a maintainer needs one.
+# Cut a release: bump every crate's version, commit, push, trigger
+# the workflow. Mirrors MyOwnLLM's flow — the user runs
+# `just release 0.2.0` and the release.yml workflow runs to verify
+# manifests, build per-platform bundles, and publish the GitHub
+# release. Bash script — release flow runs from a Linux/macOS box.
 [unix]
-[doc("Cut a release: bump versions, commit, tag, push.")]
+[doc("Cut a release: bump versions, commit, push, trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
-    @if ! git diff --quiet Cargo.toml Cargo.lock; then \
-        git add Cargo.toml Cargo.lock crates/*/Cargo.toml; \
+    @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; then \
+        git add Cargo.toml Cargo.lock crates/*/Cargo.toml gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; \
         git commit -m "chore(release): {{VERSION}}"; \
     fi
-    @git tag v{{VERSION}}
-    @git push --follow-tags
+    @git push
+    @gh workflow run release.yml -f tag=v{{VERSION}}
