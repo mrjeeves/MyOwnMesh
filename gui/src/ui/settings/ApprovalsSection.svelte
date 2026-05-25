@@ -96,6 +96,29 @@
     if (id.length <= 14) return id;
     return `${id.slice(0, 10)}…${id.slice(-4)}`;
   }
+
+  /** Bilateral-approval state per row. The engine keeps both halves
+   *  (`local_approve_sent`, `remote_approve_seen`) and only flips
+   *  status to Active when both are true — so a peer in
+   *  pending_approval can be in three distinct sub-states the UI
+   *  needs to render differently:
+   *
+   *   - fresh: neither side has approved yet. Show the full
+   *     bilateral confirmation grid + Approve/Deny.
+   *   - waiting-peer: we've approved, peer hasn't. Show "waiting
+   *     for peer …" with a Revoke escape hatch (drops them from
+   *     the roster and tears down).
+   *   - confirm-needed: peer approved first, we haven't. Stronger
+   *     callout ("peer authorised you — confirm to finish") plus
+   *     the same confirmation tiles and Approve/Deny.
+   *
+   *   Inspired by MyOwnLLM's `approver_role` flag, which collapses
+   *   the same two booleans into one. */
+  function approvalState(p: PeerInfo): "fresh" | "waiting-peer" | "confirm-needed" {
+    if (p.local_approve_sent && !p.remote_approve_seen) return "waiting-peer";
+    if (!p.local_approve_sent && p.remote_approve_seen) return "confirm-needed";
+    return "fresh";
+  }
 </script>
 
 <div class="content">
@@ -146,7 +169,8 @@
     <div class="list">
       {#each pending as row (row.peer.device_id + ":" + row.network.config_id)}
         {@const busy = busyPeer === row.peer.device_id}
-        <div class="row">
+        {@const state = approvalState(row.peer)}
+        <div class="row" data-state={state}>
           <div class="row-head">
             <div class="label-line">
               <span class="peer-label">{row.peer.label || "Unnamed device"}</span>
@@ -156,6 +180,15 @@
               <span class="net-chip" title="Network this request is on">
                 on <strong>{networkDisplayName(row.network)}</strong>
               </span>
+              {#if state === "waiting-peer"}
+                <span class="state-pill waiting" title="You approved this peer. The connection becomes live once they approve on their side.">
+                  ✓ approved · waiting for peer
+                </span>
+              {:else if state === "confirm-needed"}
+                <span class="state-pill confirm" title="The peer authorised the join from their side. Approve here to complete the handshake.">
+                  peer authorised you · confirm
+                </span>
+              {/if}
             </div>
             <code class="pubkey" title={row.peer.device_id}>
               {shortPubkey(row.peer.device_id)}
@@ -221,12 +254,27 @@
           </div>
 
           <div class="actions">
-            <button class="btn primary" disabled={busy} onclick={() => approve(row)}>
-              {busy ? "Approving…" : "Approve"}
-            </button>
-            <button class="btn ghost" disabled={busy} onclick={() => deny(row)}>
-              Deny
-            </button>
+            {#if state === "waiting-peer"}
+              <!-- We've already approved; the only useful action
+                   left is to back out. Calling deny on an
+                   already-approved peer revokes via the same
+                   roster_remove path. -->
+              <button class="btn ghost" disabled={busy} onclick={() => deny(row)}
+                title="Revoke this approval and tear down the half-handshaken session.">
+                Revoke
+              </button>
+            {:else}
+              <button class="btn primary" disabled={busy} onclick={() => approve(row)}>
+                {busy
+                  ? "Approving…"
+                  : state === "confirm-needed"
+                    ? "Confirm"
+                    : "Approve"}
+              </button>
+              <button class="btn ghost" disabled={busy} onclick={() => deny(row)}>
+                Deny
+              </button>
+            {/if}
           </div>
         </div>
       {/each}
@@ -336,6 +384,36 @@
     display: flex;
     flex-direction: column;
     gap: 0.6rem;
+  }
+  /* Already-approved-by-us: dim the row + green border so it
+     visually settles into the background while the user waits on
+     the peer. "confirm-needed" gets a louder amber border — the
+     user needs to act, this should pull the eye. */
+  .row[data-state="waiting-peer"] {
+    border-color: #1c4a30;
+    background: #0f1812;
+  }
+  .row[data-state="confirm-needed"] {
+    border-color: #4a3a18;
+    background: #1a1610;
+  }
+  .state-pill {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .state-pill.waiting {
+    color: #b9f5cc;
+    background: #112a1c;
+    border: 1px solid #1c4a30;
+  }
+  .state-pill.confirm {
+    color: #ffd166;
+    background: #2a2210;
+    border: 1px solid #4a3a18;
   }
   .row-head {
     display: flex;

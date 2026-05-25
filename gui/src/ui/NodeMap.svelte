@@ -20,23 +20,45 @@
   } = $props();
 
   /** Pending-action descriptor for a peer. `null` means there's
-   *  nothing actionable about this peer right now. Anything else
-   *  drives both the node badge in the graph and the action row at
-   *  the top of the detail panel — single source of truth so the
-   *  badge can never disagree with the inline actions. */
+   *  nothing actionable about this peer right now. The `kind`
+   *  picks which buttons render and what copy the description
+   *  carries — the badge in the graph stays the same (a pending
+   *  marker is a pending marker), but the popup needs to explain
+   *  which half of the bilateral approval is missing.
+   *
+   *   - approve       — fresh: neither side has approved yet.
+   *   - confirm       — peer approved first; user's confirm
+   *                     completes the handshake.
+   *   - waiting-peer  — user has already approved; nothing to do
+   *                     but wait (or revoke). Buttons collapse to
+   *                     just Revoke. */
   type PendingAction =
     | { kind: "approve"; description: string }
+    | { kind: "confirm"; description: string }
+    | { kind: "waiting-peer"; description: string }
     | null;
 
   function pendingActionFor(peer: PeerInfo | null): PendingAction {
     if (!peer) return null;
-    if (peer.status === "pending_approval") {
+    if (peer.status !== "pending_approval") return null;
+    if (peer.local_approve_sent && !peer.remote_approve_seen) {
       return {
-        kind: "approve",
-        description: "Peer authenticated — approve to start exchanging app traffic.",
+        kind: "waiting-peer",
+        description:
+          "You approved this peer. The connection becomes live once they approve on their side.",
       };
     }
-    return null;
+    if (!peer.local_approve_sent && peer.remote_approve_seen) {
+      return {
+        kind: "confirm",
+        description:
+          "The peer already approved you from their side. Confirm here to complete the handshake.",
+      };
+    }
+    return {
+      kind: "approve",
+      description: "Peer authenticated — approve to start exchanging app traffic.",
+    };
   }
 
   // Inline action state. Scoped to the currently-selected peer; we
@@ -501,7 +523,7 @@
       {#if pending}
         <div class="pending-action">
           <div class="pending-line">{pending.description}</div>
-          {#if pending.kind === "approve"}
+          {#if pending.kind === "approve" || pending.kind === "confirm"}
             <!-- Bilateral confirmation: shows both sides' suffix +
                  code so the user reads all four out-of-band before
                  approving. Mirrors the Approvals settings tab so
@@ -545,14 +567,31 @@
               </div>
             </div>
           {/if}
-          {#if pending.kind === "approve"}
+          {#if pending.kind === "waiting-peer"}
+            <!-- Local approve already sent; only the revoke escape
+                 hatch remains until the peer approves their side. -->
+            <div class="pending-buttons">
+              <button
+                class="btn-deny"
+                onclick={denySelected}
+                disabled={actionBusy}
+                title="Revoke this approval and tear down the half-handshaken session."
+              >
+                Revoke
+              </button>
+            </div>
+          {:else if pending.kind === "approve" || pending.kind === "confirm"}
             <div class="pending-buttons">
               <button
                 class="btn-approve"
                 onclick={approveSelected}
                 disabled={actionBusy}
               >
-                {actionBusy ? "Approving…" : "Approve"}
+                {actionBusy
+                  ? "Approving…"
+                  : pending.kind === "confirm"
+                    ? "Confirm"
+                    : "Approve"}
               </button>
               <button
                 class="btn-deny"

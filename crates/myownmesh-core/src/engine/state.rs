@@ -436,6 +436,8 @@ impl NetworkState {
                     device_suffix,
                     verification_code_received: data.verification_code_received.clone(),
                     verification_code_sent: data.verification_code_sent.clone(),
+                    local_approve_sent: data.local_approve_sent,
+                    remote_approve_seen: data.remote_approve_seen,
                 }
             })
             .collect()
@@ -461,6 +463,8 @@ impl NetworkState {
             device_suffix,
             verification_code_received: data.verification_code_received.clone(),
             verification_code_sent: data.verification_code_sent.clone(),
+            local_approve_sent: data.local_approve_sent,
+            remote_approve_seen: data.remote_approve_seen,
         })
     }
 

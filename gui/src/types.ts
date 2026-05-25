@@ -166,6 +166,16 @@ export interface PeerInfo {
    *  symmetric and the connection is truly bilateral. `null` until
    *  our handshake has fired. */
   verification_code_sent: string | null;
+  /** True once we've sent our local Approve to this peer. Pairs
+   *  with `remote_approve_seen`; the engine transitions the peer
+   *  to Active only when BOTH are true. The approval UI uses this
+   *  to flip the row from "review and approve" to "awaiting peer
+   *  approval" once the local user has clicked Approve. */
+  local_approve_sent: boolean;
+  /** True once the peer has sent us their Approve. When set while
+   *  `local_approve_sent` is still false, the UI surfaces "the
+   *  peer has already approved you — confirm to complete." */
+  remote_approve_seen: boolean;
 }
 
 // ---- roster -----------------------------------------------------------
