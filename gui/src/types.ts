@@ -176,6 +176,79 @@ export interface PeerInfo {
    *  `local_approve_sent` is still false, the UI surfaces "the
    *  peer has already approved you — confirm to complete." */
   remote_approve_seen: boolean;
+  /** Engine has decided the peer is unreachable without a TURN
+   *  relay — repeated ICE failures and zero relay candidates on
+   *  either side. The graph paints a "needs TURN" badge on these
+   *  so the user doesn't have to grep the Activity log to learn
+   *  why the data pipe never comes up. */
+  needs_turn: boolean;
+  /** Counts of ICE candidate kinds we gathered locally for this
+   *  peer. The graph uses them to decide how to draw the link —
+   *  host-host pairs sit next to "you" as LAN; anything with srflx
+   *  or relay sits on the far side of the Internet node. */
+  local_candidates: IceCandidateStats;
+  /** Same as `local_candidates`, for candidates the peer sent us.
+   *  Both sides have to advertise a host candidate before we call
+   *  the link LAN-direct. */
+  remote_candidates: IceCandidateStats;
+}
+
+export interface IceCandidateStats {
+  host: number;
+  server_reflexive: number;
+  peer_reflexive: number;
+  relay: number;
+  unknown: number;
+}
+
+/** Coarse classification of the link to a peer — drives where the
+ *  peer node is placed on the graph and how the edge is drawn.
+ *
+ *   - `lan`     direct: both sides surfaced a host candidate, no
+ *               STUN / TURN inferred. Peer sits next to "you".
+ *   - `stun`    server-reflexive in use: peer reached via a public
+ *               internet path discovered through STUN. Routed
+ *               through the Internet node.
+ *   - `turn`    a relay candidate is in the mix on at least one
+ *               side: data path runs through a TURN server.
+ *   - `blocked` `needs_turn` flag is set — signaling sees the peer
+ *               but ICE can't punch through and there's no relay.
+ *   - `unknown` ICE hasn't gathered enough to classify yet, or the
+ *               peer is offline/sighted-only. */
+export type LinkKind = "lan" | "stun" | "turn" | "blocked" | "unknown";
+
+/** Infer the link kind from a peer's candidate stats + flags. We
+ *  prefer the strongest signal:
+ *    1. `needs_turn` → `blocked` (signaling visible, data pipe stuck).
+ *    2. Any relay candidate on either side → `turn`.
+ *    3. Both sides advertised host candidates and we're at least
+ *       handshaking → `lan` (best effort — we don't have the
+ *       actual selected-pair from webrtc-rs yet).
+ *    4. Either side surfaced a server-reflexive candidate → `stun`.
+ *    5. Otherwise `unknown` (sighted, offline, brand-new). */
+export function linkKindOf(p: PeerInfo): LinkKind {
+  if (p.needs_turn) return "blocked";
+  const lc = p.local_candidates;
+  const rc = p.remote_candidates;
+  if ((lc?.relay ?? 0) > 0 || (rc?.relay ?? 0) > 0) return "turn";
+  const live =
+    p.status === "active" ||
+    p.status === "shelved" ||
+    p.status === "handshaking" ||
+    p.status === "pending_approval";
+  if (live && (lc?.host ?? 0) > 0 && (rc?.host ?? 0) > 0) {
+    // If neither side has gathered srflx/relay it really is LAN-only.
+    const noExternal =
+      (lc?.server_reflexive ?? 0) === 0 &&
+      (rc?.server_reflexive ?? 0) === 0 &&
+      (lc?.relay ?? 0) === 0 &&
+      (rc?.relay ?? 0) === 0;
+    if (noExternal) return "lan";
+  }
+  if ((lc?.server_reflexive ?? 0) > 0 || (rc?.server_reflexive ?? 0) > 0) {
+    return "stun";
+  }
+  return "unknown";
 }
 
 // ---- roster -----------------------------------------------------------

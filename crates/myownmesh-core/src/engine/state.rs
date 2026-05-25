@@ -438,6 +438,9 @@ impl NetworkState {
                     verification_code_sent: data.verification_code_sent.clone(),
                     local_approve_sent: data.local_approve_sent,
                     remote_approve_seen: data.remote_approve_seen,
+                    needs_turn: data.no_turn_diag_emitted,
+                    local_candidates: data.diag.local_candidates.clone(),
+                    remote_candidates: data.diag.remote_candidates.clone(),
                 }
             })
             .collect()
@@ -465,6 +468,9 @@ impl NetworkState {
             verification_code_sent: data.verification_code_sent.clone(),
             local_approve_sent: data.local_approve_sent,
             remote_approve_seen: data.remote_approve_seen,
+            needs_turn: data.no_turn_diag_emitted,
+            local_candidates: data.diag.local_candidates.clone(),
+            remote_candidates: data.diag.remote_candidates.clone(),
         })
     }
 
