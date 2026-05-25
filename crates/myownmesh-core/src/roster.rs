@@ -147,6 +147,97 @@ pub fn is_authorized(roster: &Roster, device_id: &str) -> bool {
         .any(|p| p.device_id == pubkey)
 }
 
+/// Most-recent `approved_at` across every entry. Used as the
+/// tie-breaker in [`crate::protocol::RosterSummaryMessage`] when
+/// roots disagree but neither side knows which is ahead. Returns 0
+/// for an empty roster.
+pub fn last_edit_ts(roster: &Roster) -> u64 {
+    roster
+        .authorized_devices
+        .iter()
+        .map(|p| p.approved_at)
+        .max()
+        .unwrap_or(0)
+}
+
+// ---- merkle root for gossip ----------------------------------------
+//
+// The root is the deterministic hash of every entry in the roster.
+// Two peers with the same set of authorised devices (regardless of
+// insertion order or label whitespace) produce the same root; any
+// add/remove/role-change flips it. Used by `RosterSummaryMessage`
+// for cheap "are we in sync?" detection on every ACTIVE transition.
+//
+// v1 layout (subject to upgrade — bump `ROSTER_MERKLE_V` to break
+// compat):
+//   - Entries sorted by `device_id` (the canonical pubkey).
+//   - Each entry hashes to `sha256("v1|" || device_id || "|" || label ||
+//     "|" || approved_at || "|" || role)`. Field separators ensure no
+//     concatenation collision between adjacent entries.
+//   - Root = `sha256(v1_tag || concat(leaf_hashes))`, base32-lowercase.
+//
+// Role is part of the leaf so a role grant flips the root — every
+// peer's gossip will trigger a roster_request next round, which is
+// exactly the behaviour we want. Labels are hashed because relabels
+// should propagate even though they're cosmetic; a future
+// optimisation can exclude them if relabel-induced churn becomes
+// load-bearing.
+
+const ROSTER_MERKLE_V: &str = "v1";
+
+fn role_tag(r: crate::network_state::Role) -> &'static str {
+    match r {
+        crate::network_state::Role::Member => "member",
+        crate::network_state::Role::Controller => "controller",
+        crate::network_state::Role::Owner => "owner",
+    }
+}
+
+fn leaf_hash(entry: &AuthorizedPeer) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ROSTER_MERKLE_V.as_bytes());
+    h.update(b"|");
+    h.update(entry.device_id.as_bytes());
+    h.update(b"|");
+    h.update(entry.label.as_bytes());
+    h.update(b"|");
+    h.update(entry.approved_at.to_string().as_bytes());
+    h.update(b"|");
+    h.update(role_tag(entry.role).as_bytes());
+    h.finalize().into()
+}
+
+/// Deterministic Merkle root over the roster's entries. Returns
+/// base32-lowercase 52 chars (52 == ceil(32 bytes / 5 bits/char)).
+/// Empty rosters produce a sentinel root distinct from any non-empty
+/// roster (just `sha256(version_tag)`) so a fresh peer's broadcast
+/// is comparable cleanly.
+pub fn merkle_root(roster: &Roster) -> String {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<&AuthorizedPeer> = roster.authorized_devices.iter().collect();
+    entries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
+    let mut h = Sha256::new();
+    h.update(ROSTER_MERKLE_V.as_bytes());
+    for e in entries {
+        h.update(leaf_hash(e));
+    }
+    let digest = h.finalize();
+    data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
+}
+
+/// Build a wire-shape summary for this roster, ready to drop into a
+/// `MeshMessage::RosterSummary` frame. Convenience over the
+/// individual helpers for the common "summarise + emit" path.
+pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
+    crate::protocol::RosterSummaryMessage {
+        root: merkle_root(roster),
+        count: roster.authorized_devices.len() as u32,
+        last_edit_ts: last_edit_ts(roster),
+    }
+}
+
 // ---- filesystem wrappers ------------------------------------------------
 
 /// Load the roster scoped to the given Network ID. If the on-disk
@@ -363,5 +454,98 @@ mod tests {
             r.authorized_devices[0].role,
             crate::network_state::Role::Owner
         );
+    }
+
+    // ---- merkle root + summary ----------------------------------------
+
+    #[test]
+    fn merkle_root_is_stable_across_insertion_order() {
+        let mut a = empty_for("net-a");
+        add_peer_in(&mut a, "peer1", "Laptop");
+        // Stamp a known approved_at so the hash is reproducible
+        // across `now_unix()` drift between adds.
+        a.authorized_devices[0].approved_at = 100;
+        add_peer_in(&mut a, "peer2", "Phone");
+        a.authorized_devices[1].approved_at = 200;
+
+        let mut b = empty_for("net-a");
+        add_peer_in(&mut b, "peer2", "Phone");
+        b.authorized_devices[0].approved_at = 200;
+        add_peer_in(&mut b, "peer1", "Laptop");
+        b.authorized_devices[1].approved_at = 100;
+
+        assert_eq!(merkle_root(&a), merkle_root(&b));
+    }
+
+    #[test]
+    fn merkle_root_changes_on_role_grant() {
+        let mut a = empty_for("net-a");
+        add_peer_in(&mut a, "peer1", "Laptop");
+        a.authorized_devices[0].approved_at = 100;
+        let before = merkle_root(&a);
+        set_role_in(&mut a, "peer1", crate::network_state::Role::Controller);
+        assert_ne!(merkle_root(&a), before);
+    }
+
+    #[test]
+    fn merkle_root_changes_on_label_edit() {
+        let mut a = empty_for("net-a");
+        add_peer_in(&mut a, "peer1", "Laptop");
+        a.authorized_devices[0].approved_at = 100;
+        let before = merkle_root(&a);
+        a.authorized_devices[0].label = "Renamed".into();
+        assert_ne!(merkle_root(&a), before);
+    }
+
+    #[test]
+    fn empty_root_is_distinct_from_one_entry_root() {
+        let empty = empty_for("net-a");
+        let mut one = empty_for("net-a");
+        add_peer_in(&mut one, "peer1", "Laptop");
+        one.authorized_devices[0].approved_at = 100;
+        assert_ne!(merkle_root(&empty), merkle_root(&one));
+    }
+
+    #[test]
+    fn root_is_base32_lowercase() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        let root = merkle_root(&r);
+        // base32-lowercase with no padding — sha256 → 52 chars.
+        assert_eq!(root.len(), 52);
+        assert!(root
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn last_edit_ts_takes_the_max() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        r.authorized_devices[0].approved_at = 100;
+        add_peer_in(&mut r, "peer2", "Phone");
+        r.authorized_devices[1].approved_at = 250;
+        add_peer_in(&mut r, "peer3", "Tablet");
+        r.authorized_devices[2].approved_at = 50;
+        assert_eq!(last_edit_ts(&r), 250);
+    }
+
+    #[test]
+    fn summary_round_trips_through_wire() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        r.authorized_devices[0].approved_at = 100;
+        let s = summary(&r);
+        let json =
+            serde_json::to_string(&crate::protocol::MeshMessage::RosterSummary(s.clone())).unwrap();
+        let back: crate::protocol::MeshMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            crate::protocol::MeshMessage::RosterSummary(b) => {
+                assert_eq!(b.root, s.root);
+                assert_eq!(b.count, 1);
+                assert_eq!(b.last_edit_ts, 100);
+            }
+            _ => panic!("did not round-trip as RosterSummary"),
+        }
     }
 }
