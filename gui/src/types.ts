@@ -149,6 +149,16 @@ export interface PeerInfo {
   local_shelved: boolean;
   remote_shelved: boolean;
   authenticated: boolean;
+  /** 5-char UPPERCASE-HEX display tag derived from the peer's
+   *  pubkey. Surfaced separately so the GUI can render it in a
+   *  distinct "suffix" tile during pending-approval, where users
+   *  read it aloud to confirm the right device is on the other end. */
+  device_suffix: string;
+  /** Verification code the peer sent us in their `hello`. 6 chars
+   *  `[a-z0-9]`. `null` until we receive a hello. Shown prominently
+   *  during pending-approval so the user can confirm out-of-band
+   *  before approving. */
+  verification_code: string | null;
 }
 
 // ---- roster -----------------------------------------------------------
@@ -277,10 +287,19 @@ export type PhaseEvent = {
   next: MeshPhase;
 };
 
+/** Top-level mesh event. The outer family discriminator is
+ *  `event_kind` (not `kind`) because both `PeerEvent` and
+ *  `PhaseEvent` use `kind` for their internal variant tag — a
+ *  single `kind` on both layers produced duplicate JSON keys where
+ *  the inner one silently won the parse, leaving the GUI unable to
+ *  tell families apart. With distinct tag names a consumer first
+ *  branches on `event_kind` (peer | phase | diag) and then on
+ *  `kind` (the variant within). Pinned by `events::wire_tests` on
+ *  the Rust side. */
 export type MeshEvent =
-  | { kind: "peer"; [k: string]: unknown }
-  | { kind: "phase"; [k: string]: unknown }
-  | { kind: "diag"; [k: string]: unknown };
+  | { event_kind: "peer"; kind: string; [k: string]: unknown }
+  | { event_kind: "phase"; kind: string; [k: string]: unknown }
+  | { event_kind: "diag"; [k: string]: unknown };
 
 // Wrapper emitted by the daemon's event stream — distinguishes a
 // regular event from a "lagged" notification (slow subscriber).

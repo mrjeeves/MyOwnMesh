@@ -1,45 +1,39 @@
 <script lang="ts">
   import { meshClient } from "../mesh-client.svelte";
 
+  // Hamburger and gear both open Settings — keeping both gives the
+  // user two equally-discoverable affordances (hamburger reads as
+  // "menu" to most users, gear as "preferences"). The sidebar isn't
+  // hideable: networks belong in the navigation column at all times,
+  // so a toggle would just give the user a worse view of their own
+  // setup. Daemon-connection health is surfaced on the empty canvas
+  // and in the Activity tab — not as a header pill, which kept
+  // reading as "online with peers" to people opening the app for
+  // the first time.
   const {
     onOpenSettings,
-    onToggleSidebar,
+    onOpenIdentity,
   }: {
+    /** Hamburger + gear — opens the Settings panel on its default
+     *  tab (Approvals, since that's the most likely first action). */
     onOpenSettings: () => void;
-    onToggleSidebar: () => void;
+    /** Identity chip — jumps straight to the Identity tab so the
+     *  user lands where the rendered chip's label / device id lives. */
+    onOpenIdentity: () => void;
   } = $props();
 
   // Show the bare pubkey + display-suffix that the daemon hands us
   // as `device_id`. It's already truncated for human use; we just
   // chunk it visually for a "shortened fingerprint" feel.
   const idChip = $derived(meshClient.identity?.device_id ?? "—");
-
-  const phaseLabel = $derived(() => {
-    const c = meshClient.connected;
-    if (c === "live") return "connected";
-    if (c === "disconnected") return "no daemon";
-    return "connecting…";
-  });
-
-  // Tooltip for the daemon-connection pill — the colored dot + label
-  // tracks the GUI's socket to the local `myownmesh` daemon, not the
-  // health of any particular mesh network. Spelling it out keeps
-  // users from misreading it as "online with peers".
-  const phaseTooltip = $derived(() => {
-    const c = meshClient.connected;
-    if (c === "live") return "Connected to the local myownmesh daemon.";
-    if (c === "disconnected")
-      return "Can't reach the local myownmesh daemon socket.";
-    return "Opening the local myownmesh daemon socket…";
-  });
 </script>
 
 <div class="topbar">
   <button
     class="iconbtn"
-    onclick={onToggleSidebar}
-    aria-label="Toggle sidebar"
-    title="Toggle sidebar"
+    onclick={onOpenSettings}
+    aria-label="Settings"
+    title="Settings"
   >
     <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
       <path
@@ -54,17 +48,12 @@
 
   <div class="brand">MyOwnMesh</div>
 
-  <div class="status" data-status={meshClient.connected} title={phaseTooltip()}>
-    <span class="dot"></span>
-    <span class="status-label">{phaseLabel()}</span>
-  </div>
-
   <div class="spacer"></div>
 
   {#if meshClient.identity}
     <button
       class="id-chip"
-      onclick={onOpenSettings}
+      onclick={onOpenIdentity}
       title="Open settings — identity"
     >
       <span class="id-label">{meshClient.identity.label || "device"}</span>
@@ -122,41 +111,6 @@
   .iconbtn:hover {
     background: #1a1a1a;
     color: #e8e8e8;
-  }
-  .status {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    font-size: 0.75rem;
-    color: #888;
-    padding: 0.15rem 0.5rem;
-    border-radius: 999px;
-    background: #131318;
-    border: 1px solid #1e1e25;
-  }
-  .status .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #888;
-  }
-  .status[data-status="live"] .dot {
-    background: #4ade80;
-    box-shadow: 0 0 6px rgba(74, 222, 128, 0.6);
-  }
-  .status[data-status="live"] .status-label {
-    color: #b9f5cc;
-  }
-  .status[data-status="disconnected"] .dot {
-    background: #ef4444;
-    box-shadow: 0 0 6px rgba(239, 68, 68, 0.6);
-  }
-  .status[data-status="disconnected"] .status-label {
-    color: #fca5a5;
-  }
-  .status[data-status="connecting"] .dot {
-    background: #fbbf24;
-    box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
   }
   .spacer {
     flex: 1;

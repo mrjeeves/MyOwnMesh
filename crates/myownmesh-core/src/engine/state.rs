@@ -419,9 +419,12 @@ impl NetworkState {
         self.peers
             .iter()
             .map(|e| {
+                let device_id = e.key().clone();
                 let data = e.value().state.read();
+                let pubkey = crate::signing::pubkey_part(&device_id);
+                let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
                 crate::handle::PeerInfo {
-                    device_id: e.key().clone(),
+                    device_id: device_id.clone(),
                     status: data.status,
                     tier: data.tier,
                     rtt_ms: data.rtt_ms,
@@ -430,6 +433,8 @@ impl NetworkState {
                     local_shelved: data.local_shelved,
                     remote_shelved: data.remote_shelved,
                     authenticated: data.authenticated,
+                    device_suffix,
+                    verification_code: data.verification_code_received.clone(),
                 }
             })
             .collect()
@@ -440,6 +445,8 @@ impl NetworkState {
     pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
         let peer = self.peers.get(device_id)?;
         let data = peer.state.read();
+        let pubkey = crate::signing::pubkey_part(device_id);
+        let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
         Some(crate::handle::PeerInfo {
             device_id: device_id.to_string(),
             status: data.status,
@@ -450,6 +457,8 @@ impl NetworkState {
             local_shelved: data.local_shelved,
             remote_shelved: data.remote_shelved,
             authenticated: data.authenticated,
+            device_suffix,
+            verification_code: data.verification_code_received.clone(),
         })
     }
 

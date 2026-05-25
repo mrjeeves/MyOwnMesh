@@ -335,4 +335,15 @@ pub struct PeerInfo {
     pub local_shelved: bool,
     pub remote_shelved: bool,
     pub authenticated: bool,
+    /// 5-char UPPERCASE-HEX display tag derived from the peer's
+    /// pubkey. Same scheme as `Identity::display_id` — peers compare
+    /// suffixes to confirm "yes, this is the right device" without
+    /// reading the full pubkey aloud. Surfaced separately so the GUI
+    /// can render it in a distinct tile during pending-approval.
+    pub device_suffix: String,
+    /// Verification code the peer sent us in their `hello`. Surfaced
+    /// during pending-approval so the user can read it back to the
+    /// other side out-of-band before approving. `None` until we
+    /// receive a hello from the peer.
+    pub verification_code: Option<String>,
 }

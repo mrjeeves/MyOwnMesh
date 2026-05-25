@@ -23,8 +23,10 @@
 
   /** Sub-tab strip mirrors MyOwnLLM's CloudMeshSection — Status is
    *  the everyday surface (network list + topology selector),
-   *  Connections is the per-peer detail, Roster lets the user
-   *  approve / remove authorized devices. */
+   *  Connections is the per-peer detail for already-approved peers,
+   *  Roster is the long-lived authorized-devices list. Pending
+   *  approvals live in the top-level Approvals tab, not here:
+   *  Connections is intentionally just for connections. */
   // svelte-ignore state_referenced_locally
   let tab = $state<SubTab>("status");
 
@@ -94,20 +96,6 @@
     actionError = null;
     try {
       await meshClient.topologySet(selected.config_id, topo, hub);
-    } catch (e) {
-      actionError = String(e);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function approve(deviceId: string, label?: string) {
-    if (!selected) return;
-    busy = true;
-    actionError = null;
-    try {
-      await meshClient.rosterApprove(selected.config_id, deviceId, label);
-      await refreshRoster();
     } catch (e) {
       actionError = String(e);
     } finally {
@@ -338,6 +326,16 @@
           </div>
         {:else if tab === "connections"}
           <div class="card">
+            <!-- Connections is for connections only — every row here
+                 represents a peer the engine is actively tracking.
+                 Pending approvals are handled in the top-level
+                 Approvals tab so the "how do I add a device?"
+                 surface stays distinct from "what's connected right
+                 now?". Connection peers that aren't yet approved
+                 still appear in this table (with their pending
+                 status) so the user can confirm the engine has
+                 sighted them; the actual approve / deny buttons
+                 live in Approvals. -->
             {#if peers.length === 0}
               <div class="empty">No peers yet — waiting for sightings.</div>
             {:else}
@@ -349,7 +347,6 @@
                     <th>Auth</th>
                     <th>RTT</th>
                     <th>Shelved</th>
-                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -374,16 +371,6 @@
                             : p.remote_shelved
                               ? "by peer"
                               : "—"}
-                      </td>
-                      <td>
-                        <button
-                          class="row-btn"
-                          disabled={busy || !p.authenticated}
-                          onclick={() => approve(p.device_id, p.label)}
-                          title="Approve into the roster"
-                        >
-                          Approve
-                        </button>
                       </td>
                     </tr>
                   {/each}

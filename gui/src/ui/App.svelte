@@ -8,9 +8,9 @@
   import NodeMap from "./NodeMap.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
 
-  let sidebarOpen = $state(true);
   let settingsOpen = $state(false);
-  let settingsInitialTab = $state<"networks" | "identity" | "diagnostics">("networks");
+  let settingsInitialTab =
+    $state<"approvals" | "networks" | "identity" | "diagnostics">("approvals");
 
   /** The config_id of the network the node-map + sidebar are
    *  currently focused on. `null` means "show the first one we
@@ -48,7 +48,15 @@
       : [],
   );
 
-  function openSettings(tab: "networks" | "identity" | "diagnostics" = "networks") {
+  /** Open the settings panel on a specific tab. Defaults to
+   *  "approvals" because that's where new users go to bring a peer
+   *  online for the first time — the most discoverable surface for
+   *  the most common first-time question ("how do I connect this
+   *  device?"). Other call sites pass an explicit tab when they
+   *  know the user wants Networks (sidebar +) or Identity. */
+  function openSettings(
+    tab: "approvals" | "networks" | "identity" | "diagnostics" = "approvals",
+  ) {
     settingsInitialTab = tab;
     settingsOpen = true;
   }
@@ -78,23 +86,25 @@
 
 <div class="app">
   <TopBar
-    onOpenSettings={() => openSettings("networks")}
-    onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
+    onOpenSettings={() => openSettings("approvals")}
+    onOpenIdentity={() => openSettings("identity")}
   />
 
   <div class="layout">
-    {#if sidebarOpen}
-      <Sidebar
-        focusedConfigId={focusedConfigId}
-        selectedPeerId={selectedPeerId}
-        onSelectNetwork={(id) => {
-          focusedConfigId = id;
-          selectedPeerId = null;
-        }}
-        onSelectPeer={(deviceId) => (selectedPeerId = deviceId)}
-        onOpenNetworksSettings={() => openSettings("networks")}
-      />
-    {/if}
+    <!-- Sidebar is always visible: the networks column is the
+         primary navigation surface, hiding it would just degrade
+         the view of the user's own setup. Settings (hamburger /
+         gear) is where users go for collapse-style actions. -->
+    <Sidebar
+      focusedConfigId={focusedConfigId}
+      selectedPeerId={selectedPeerId}
+      onSelectNetwork={(id) => {
+        focusedConfigId = id;
+        selectedPeerId = null;
+      }}
+      onSelectPeer={(deviceId) => (selectedPeerId = deviceId)}
+      onOpenNetworksSettings={() => openSettings("networks")}
+    />
 
     <div class="canvas">
       {#if focusedNetwork}

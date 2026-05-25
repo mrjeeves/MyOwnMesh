@@ -459,7 +459,19 @@
     <div class="detail" role="dialog" aria-label="Peer detail">
       <div class="detail-head">
         <div class="detail-title">
-          {selectedPeer.label || shortId(selectedPeer.device_id)}
+          <span class="detail-label">
+            {selectedPeer.label || shortId(selectedPeer.device_id)}
+          </span>
+          {#if selectedPeer.device_suffix}
+            <!-- Inline suffix pill on the title row. Always visible
+                 (not just during approval) so the user can read the
+                 stable display tag back to a peer at any time —
+                 picking the right device out of a crowded peers
+                 list, debugging an approval mix-up, etc. -->
+            <span class="detail-suffix" title="Stable display tag derived from the peer's pubkey">
+              -{selectedPeer.device_suffix}
+            </span>
+          {/if}
         </div>
         <button
           class="close"
@@ -475,6 +487,26 @@
       {#if pending}
         <div class="pending-action">
           <div class="pending-line">{pending.description}</div>
+          {#if pending.kind === "approve" && (selectedPeer.device_suffix || selectedPeer.verification_code)}
+            <!-- Same tile pair as the Approvals settings tab: the
+                 stable suffix (blue) and the per-session
+                 verification code (amber). Two colours so the user
+                 doesn't read them back in the wrong order. -->
+            <div class="confirm-row">
+              {#if selectedPeer.device_suffix}
+                <div class="confirm-tile suffix-tile" title="Stable display tag — should match the suffix the peer sees for themselves.">
+                  <span class="confirm-label">suffix</span>
+                  <span class="confirm-value">{selectedPeer.device_suffix}</span>
+                </div>
+              {/if}
+              {#if selectedPeer.verification_code}
+                <div class="confirm-tile code-tile" title="Per-session code the peer generated — confirms freshness on top of the suffix's 'right device' claim.">
+                  <span class="confirm-label">code</span>
+                  <span class="confirm-value">{selectedPeer.verification_code}</span>
+                </div>
+              {/if}
+            </div>
+          {/if}
           {#if pending.kind === "approve"}
             <div class="pending-buttons">
               <button
@@ -640,6 +672,32 @@
   .detail-title {
     font-weight: 600;
     font-size: 0.92rem;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .detail-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  /* Inline suffix pill — different shape from the approval tile
+     below so the user reads "always-visible identifier" vs
+     "actively-confirming for approval" at a glance. */
+  .detail-suffix {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    letter-spacing: 0.06em;
+    background: #131820;
+    border: 1px solid #2a3a55;
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    user-select: all;
   }
   .close {
     background: none;
@@ -688,6 +746,59 @@
     font-size: 0.78rem;
     color: #d6c8ff;
     line-height: 1.4;
+  }
+  .confirm-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    margin: 0.1rem 0 0.1rem 0;
+  }
+  /* Mirrors ApprovalsSection's tile pair so the user reads the
+     same confirmation in two places without re-learning the
+     colour code. Blue = stable identity; amber = per-session
+     freshness. */
+  .confirm-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    padding: 0.28rem 0.7rem;
+    min-width: 5rem;
+  }
+  .confirm-tile.suffix-tile {
+    background: #131820;
+    border: 1px solid #2a3a55;
+  }
+  .confirm-tile.code-tile {
+    background: #2a2210;
+    border: 1px solid #4a3a18;
+  }
+  .confirm-label {
+    font-size: 0.55rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    opacity: 0.6;
+  }
+  .confirm-tile.suffix-tile .confirm-label {
+    color: #6a7a99;
+  }
+  .confirm-tile.code-tile .confirm-label {
+    color: #a88d4a;
+  }
+  .confirm-value {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.98rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    user-select: all;
+  }
+  .confirm-tile.suffix-tile .confirm-value {
+    color: #b9c9ee;
+  }
+  .confirm-tile.code-tile .confirm-value {
+    color: #ffd166;
   }
   .pending-buttons {
     display: flex;
