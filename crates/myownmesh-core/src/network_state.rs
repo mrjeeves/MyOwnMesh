@@ -559,10 +559,18 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
     match &t.variant {
         TransitionVariant::KindChange { to } => {
             state.kind = *to;
-            // Founder self-election on open → closed: the sole
-            // signer becomes the founding owner.
-            if matches!(to, NetworkKind::Closed) && t.signers.len() == 1 {
-                state.roles.insert(t.signers[0].clone(), Role::Owner);
+            // Founder election on `open → closed`: the *proposer*
+            // becomes founder-owner, regardless of how many
+            // co-signers there are. The signer set's first entry
+            // is the proposer by convention (the engine always
+            // self-signs at issue time and appends co-signers
+            // afterward). Co-signers consent to the close + to the
+            // proposer's ownership; they don't acquire ownership
+            // themselves.
+            if matches!(to, NetworkKind::Closed) {
+                if let Some(founder) = t.signers.first() {
+                    state.roles.insert(founder.clone(), Role::Owner);
+                }
             }
         }
         TransitionVariant::RoleGrant { target, role } => {

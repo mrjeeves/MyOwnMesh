@@ -246,6 +246,12 @@ pub async fn deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Resul
         signature,
     });
     broadcast(state, msg).await;
+    // Symmetric with `sign_proposal`: call try_ratify so the
+    // denier's own pending list drops the proposal right away
+    // (the inbound ack handler does this for receivers, but the
+    // denier herself wouldn't otherwise clean up until the next
+    // mutation).
+    let _ = try_ratify(state, proposal_id).await;
     broadcast_state(state).await;
     diag(
         state,
