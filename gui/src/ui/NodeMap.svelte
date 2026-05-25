@@ -317,6 +317,20 @@
   const selectedPeer = $derived(
     selectedPeerId ? peers.find((p) => p.device_id === selectedPeerId) ?? null : null,
   );
+
+  /** This device's own display suffix, parsed from the daemon's
+   *  `device_id` (which is `{pubkey}-{5-char hex}`; see
+   *  `Identity::display_id` in the engine). Surfaced during pending
+   *  approval so the popup shows both sides — ours + theirs — for
+   *  bilateral confirmation. */
+  const ourSuffix = $derived.by(() => {
+    const id = meshClient.identity?.device_id ?? "";
+    const dash = id.lastIndexOf("-");
+    if (dash === -1) return "";
+    const tail = id.slice(dash + 1);
+    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) return tail;
+    return "";
+  });
 </script>
 
 <div class="map">
@@ -487,24 +501,48 @@
       {#if pending}
         <div class="pending-action">
           <div class="pending-line">{pending.description}</div>
-          {#if pending.kind === "approve" && (selectedPeer.device_suffix || selectedPeer.verification_code)}
-            <!-- Same tile pair as the Approvals settings tab: the
-                 stable suffix (blue) and the per-session
-                 verification code (amber). Two colours so the user
-                 doesn't read them back in the wrong order. -->
-            <div class="confirm-row">
-              {#if selectedPeer.device_suffix}
-                <div class="confirm-tile suffix-tile" title="Stable display tag — should match the suffix the peer sees for themselves.">
-                  <span class="confirm-label">suffix</span>
-                  <span class="confirm-value">{selectedPeer.device_suffix}</span>
+          {#if pending.kind === "approve"}
+            <!-- Bilateral confirmation: shows both sides' suffix +
+                 code so the user reads all four out-of-band before
+                 approving. Mirrors the Approvals settings tab so
+                 confirmation works the same way regardless of which
+                 surface the user opens. -->
+            <div class="confirm-grid">
+              <div class="confirm-col">
+                <div class="confirm-side-label">this device</div>
+                <div class="confirm-pair">
+                  {#if ourSuffix}
+                    <div class="confirm-tile suffix-tile" title="OUR suffix — read aloud to the peer; they should see this in their 'peer' column.">
+                      <span class="confirm-label">suffix</span>
+                      <span class="confirm-value">{ourSuffix}</span>
+                    </div>
+                  {/if}
+                  {#if selectedPeer.verification_code_sent}
+                    <div class="confirm-tile code-tile" title="OUR per-session code — read aloud to the peer; they should see this in their 'peer' column.">
+                      <span class="confirm-label">code</span>
+                      <span class="confirm-value">{selectedPeer.verification_code_sent}</span>
+                    </div>
+                  {/if}
                 </div>
-              {/if}
-              {#if selectedPeer.verification_code}
-                <div class="confirm-tile code-tile" title="Per-session code the peer generated — confirms freshness on top of the suffix's 'right device' claim.">
-                  <span class="confirm-label">code</span>
-                  <span class="confirm-value">{selectedPeer.verification_code}</span>
+              </div>
+              <div class="confirm-divider" aria-hidden="true">↔</div>
+              <div class="confirm-col">
+                <div class="confirm-side-label">peer</div>
+                <div class="confirm-pair">
+                  {#if selectedPeer.device_suffix}
+                    <div class="confirm-tile suffix-tile" title="PEER'S suffix — should match what they read aloud to you (in their 'this device' column).">
+                      <span class="confirm-label">suffix</span>
+                      <span class="confirm-value">{selectedPeer.device_suffix}</span>
+                    </div>
+                  {/if}
+                  {#if selectedPeer.verification_code_received}
+                    <div class="confirm-tile code-tile" title="PEER'S per-session code — should match what they read aloud to you.">
+                      <span class="confirm-label">code</span>
+                      <span class="confirm-value">{selectedPeer.verification_code_received}</span>
+                    </div>
+                  {/if}
                 </div>
-              {/if}
+              </div>
             </div>
           {/if}
           {#if pending.kind === "approve"}
@@ -747,12 +785,46 @@
     color: #d6c8ff;
     line-height: 1.4;
   }
-  .confirm-row {
-    display: flex;
-    align-items: center;
+  /* Bilateral confirmation grid: matches ApprovalsSection's
+     layout so the user sees the same shape in both surfaces. Two
+     columns ("this device" / "peer"), each a suffix + code pair,
+     separated by a ↔ glyph that reads as "these should match". */
+  .confirm-grid {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     gap: 0.45rem;
+    align-items: center;
+    background: #0d0d12;
+    border: 1px solid #1e1e25;
+    border-radius: 6px;
+    padding: 0.45rem 0.55rem;
+    margin: 0.1rem 0;
+  }
+  .confirm-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+  }
+  .confirm-side-label {
+    font-size: 0.58rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: center;
+  }
+  .confirm-pair {
+    display: flex;
+    gap: 0.35rem;
     flex-wrap: wrap;
-    margin: 0.1rem 0 0.1rem 0;
+    justify-content: center;
+  }
+  .confirm-divider {
+    color: #555;
+    font-size: 0.95rem;
+    user-select: none;
+    align-self: end;
+    padding-bottom: 0.35rem;
   }
   /* Mirrors ApprovalsSection's tile pair so the user reads the
      same confirmation in two places without re-learning the

@@ -434,7 +434,8 @@ impl NetworkState {
                     remote_shelved: data.remote_shelved,
                     authenticated: data.authenticated,
                     device_suffix,
-                    verification_code: data.verification_code_received.clone(),
+                    verification_code_received: data.verification_code_received.clone(),
+                    verification_code_sent: data.verification_code_sent.clone(),
                 }
             })
             .collect()
@@ -458,7 +459,8 @@ impl NetworkState {
             remote_shelved: data.remote_shelved,
             authenticated: data.authenticated,
             device_suffix,
-            verification_code: data.verification_code_received.clone(),
+            verification_code_received: data.verification_code_received.clone(),
+            verification_code_sent: data.verification_code_sent.clone(),
         })
     }
 

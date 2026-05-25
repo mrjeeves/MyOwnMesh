@@ -341,9 +341,16 @@ pub struct PeerInfo {
     /// reading the full pubkey aloud. Surfaced separately so the GUI
     /// can render it in a distinct tile during pending-approval.
     pub device_suffix: String,
-    /// Verification code the peer sent us in their `hello`. Surfaced
-    /// during pending-approval so the user can read it back to the
-    /// other side out-of-band before approving. `None` until we
-    /// receive a hello from the peer.
-    pub verification_code: Option<String>,
+    /// Verification code the peer sent us in their `hello` — i.e.
+    /// the peer's own code that we should be displaying as "theirs"
+    /// in the approval UI. `None` until we receive a hello.
+    pub verification_code_received: Option<String>,
+    /// Verification code WE sent the peer in our `hello` — i.e. our
+    /// own code that we should be displaying as "ours" in the
+    /// approval UI. Both ends generate one (independent random
+    /// strings), and the bilateral approval flow asks each user to
+    /// confirm all four values match what the other side reads
+    /// back: this device's suffix + code, the peer's suffix + code.
+    /// `None` until our handshake has fired.
+    pub verification_code_sent: Option<String>,
 }

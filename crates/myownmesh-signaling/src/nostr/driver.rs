@@ -28,7 +28,7 @@ use super::event::{make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EV
 use super::handle::derive_room_handle;
 use super::relay::SubscriptionReplay;
 use super::shuffle::select_top_n;
-use crate::upstream::ANNOUNCE_INTERVAL_MS;
+use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS};
 use crate::SignalingMessage;
 
 /// Configuration for one driver instance.
@@ -143,6 +143,18 @@ pub fn start(
     cancellers.push(cancel_token);
     tokio::spawn(async move {
         run_outbound_pump(shared_for_outbound, cancel_token_for_task).await;
+    });
+
+    // Spawn the global announce task. Single ticker per driver
+    // instance (NOT per relay) — fans out via `publish_tx`. See
+    // `upstream.rs` item 7 for the schedule rationale and the
+    // earlier "N-relay = N-publish" bug it fixes.
+    let shared_for_announce = shared.clone();
+    let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_token_for_task = cancel_token.clone();
+    cancellers.push(cancel_token);
+    tokio::spawn(async move {
+        run_announcer(shared_for_announce, cancel_token_for_task).await;
     });
 
     NostrDriverHandle { cancellers }
@@ -311,9 +323,23 @@ async fn run_relay_session(
     replay.record_replay();
 
     // Subscribe to the broadcast so outbound events fan to this socket.
+    // Announce ticking lives in `run_announcer` — one shared task
+    // per driver instance, not one per relay — so the per-cycle
+    // publish rate doesn't scale with relay count.
     let mut publish_rx = shared.publish_tx.subscribe();
-    let mut announce_timer = tokio::time::interval(Duration::from_millis(ANNOUNCE_INTERVAL_MS));
-    announce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // One-shot "hello, I'm on this relay" publish so a freshly
+    // (re)connected relay immediately learns we're here, rather
+    // than waiting up to ANNOUNCE_STEADY_MS for the next global
+    // tick. Cheap — the relay-side dedup (by event id) means a
+    // tick that fires shortly after is harmless.
+    {
+        let event = build_announce_event(shared);
+        let frame = serde_json::json!(["EVENT", event]).to_string();
+        if let Err(e) = write.send(WsMessage::Text(frame)).await {
+            return RelaySessionOutcome::Error(format!("send open-announce: {e}"));
+        }
+    }
 
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -352,13 +378,50 @@ async fn run_relay_session(
                     }
                 }
             }
-            _ = announce_timer.tick() => {
-                let event = build_announce_event(shared);
-                let frame = serde_json::json!(["EVENT", event]).to_string();
-                if let Err(e) = write.send(WsMessage::Text(frame)).await {
-                    return RelaySessionOutcome::Error(format!("send announce: {e}"));
-                }
+        }
+    }
+}
+
+/// Global announce ticker. One instance per driver; publishes
+/// presence events via `publish_tx` on the schedule defined by
+/// [`ANNOUNCE_BACKOFF_MS`] / [`ANNOUNCE_STEADY_MS`].
+///
+/// The first announce fires immediately on driver start (a fresh
+/// joiner wants to be visible to existing peers without delay).
+/// Subsequent waits follow the curve in `upstream.rs` item 7:
+/// dense at startup, settling to a 60s steady-state heartbeat.
+async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
+    let mut count: usize = 0;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let event = build_announce_event(&shared);
+        // `publish_tx` is a broadcast — every connected relay's
+        // run_relay loop receives this on its `publish_rx` and
+        // writes it to its own socket. One tick → one publish →
+        // N writes (one per relay), independent of how many
+        // relays are currently connected.
+        let _ = shared.publish_tx.send(Arc::new(event));
+
+        let wait_ms = ANNOUNCE_BACKOFF_MS
+            .get(count)
+            .copied()
+            .unwrap_or(ANNOUNCE_STEADY_MS);
+        count = count.saturating_add(1);
+
+        // Cancellation-aware sleep: chunked at 1s so a stop()
+        // call doesn't have to wait a full 60s tick to take
+        // effect. Bounded by `chunk` since wait_ms can exceed it.
+        let mut remaining = wait_ms;
+        const CHUNK_MS: u64 = 1_000;
+        while remaining > 0 {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
             }
+            let step = remaining.min(CHUNK_MS);
+            sleep(Duration::from_millis(step)).await;
+            remaining = remaining.saturating_sub(step);
         }
     }
 }

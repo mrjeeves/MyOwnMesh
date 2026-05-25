@@ -266,10 +266,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 Role::Answerer
             };
             // Cross-relay dedup happens at the Nostr driver layer
-            // (see `upstream.rs` item 5 + the driver's
+            // (see `upstream.rs` item 6 + the driver's
             // `seen_event_ids`), so this fires once per actual
             // periodic re-announce — not once per relay-delivery
-            // copy of the same announce.
+            // copy of the same announce. Every announce lands in
+            // the log so the user can see signaling is alive even
+            // for peers already in steady state; redundant work
+            // (re-opening the peer slot) is short-circuited inside
+            // `ensure_peer_session` without affecting the log.
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
                 "signaling",

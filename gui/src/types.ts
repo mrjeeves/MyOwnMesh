@@ -154,11 +154,18 @@ export interface PeerInfo {
    *  distinct "suffix" tile during pending-approval, where users
    *  read it aloud to confirm the right device is on the other end. */
   device_suffix: string;
-  /** Verification code the peer sent us in their `hello`. 6 chars
-   *  `[a-z0-9]`. `null` until we receive a hello. Shown prominently
-   *  during pending-approval so the user can confirm out-of-band
-   *  before approving. */
-  verification_code: string | null;
+  /** Verification code the PEER sent us in their `hello` — i.e.
+   *  the peer's own code, displayed as "theirs" in the approval
+   *  UI. 6 chars `[a-z0-9]`. `null` until we receive their hello. */
+  verification_code_received: string | null;
+  /** Verification code WE sent the peer in our `hello` — i.e. our
+   *  own code, displayed as "ours" in the approval UI. The pair
+   *  (received, sent) is what the user reads aloud to the other
+   *  side: both sides display the same four values (this device's
+   *  suffix + code, the peer's suffix + code) so confirmation is
+   *  symmetric and the connection is truly bilateral. `null` until
+   *  our handshake has fired. */
+  verification_code_sent: string | null;
 }
 
 // ---- roster -----------------------------------------------------------

@@ -27,6 +27,22 @@
 
   type PendingRow = { network: NetworkSummary; peer: PeerInfo };
 
+  /** Our own display suffix, derived from the daemon-reported
+   *  `device_id`. Identity display IDs are `{pubkey}-{5-char hex}`
+   *  (see `Identity::display_id` on the Rust side); we split on the
+   *  last `-` and take the tail. Surfaced during approval so the
+   *  user can read all four values back symmetrically — both
+   *  suffixes and both codes — matching what the peer sees on their
+   *  screen. */
+  const ourSuffix = $derived.by(() => {
+    const id = meshClient.identity?.device_id ?? "";
+    const dash = id.lastIndexOf("-");
+    if (dash === -1) return "";
+    const tail = id.slice(dash + 1);
+    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) return tail;
+    return "";
+  });
+
   /** Flatten pending approvals across every joined network. We sort
    *  by network display name then label so a steady stream of
    *  requests stays visually anchored — new requests slot in where
@@ -121,10 +137,11 @@
     </div>
   {:else}
     <div class="hint">
-      Read the <strong>suffix</strong> and <strong>code</strong> back to the
-      peer out-of-band before approving — anyone who guesses your network ID
-      lands in the same room, so visual confirmation is what binds the
-      connection to a real device.
+      Read all four values back to the peer out-of-band before approving.
+      Both sides see the same four — <strong>this device's</strong> suffix +
+      code, the <strong>peer's</strong> suffix + code — so a true bilateral
+      match confirms there's no impostor on either end. The peer must also
+      approve on their side before the connection goes live.
     </div>
     <div class="list">
       {#each pending as row (row.peer.device_id + ":" + row.network.config_id)}
@@ -145,27 +162,61 @@
             </code>
           </div>
 
-          <div class="confirm-row">
-            {#if row.peer.device_suffix}
-              <div
-                class="confirm-tile suffix-tile"
-                title="Stable display tag derived from the peer's pubkey — should match the suffix this peer sees for themselves."
-              >
-                <span class="confirm-label">suffix</span>
-                <span class="confirm-value">{row.peer.device_suffix}</span>
+          <!-- Bilateral confirmation grid: each side shows the same
+               four values. The "ours" column is what THIS device
+               reads to the peer; the "theirs" column is what the
+               peer reads to us. Match all four out-of-band before
+               approving. Blue tiles = stable per-device identity
+               (suffix). Amber tiles = per-session freshness (code). -->
+          <div class="confirm-grid">
+            <div class="confirm-col">
+              <div class="confirm-side-label">this device</div>
+              <div class="confirm-pair">
+                {#if ourSuffix}
+                  <div
+                    class="confirm-tile suffix-tile"
+                    title="OUR stable display tag — derived from this device's pubkey. Read this aloud to the peer; they should see the same value in the 'peer' column on their screen."
+                  >
+                    <span class="confirm-label">suffix</span>
+                    <span class="confirm-value">{ourSuffix}</span>
+                  </div>
+                {/if}
+                {#if row.peer.verification_code_sent}
+                  <div
+                    class="confirm-tile code-tile"
+                    title="OUR per-session verification code — generated freshly when this handshake started. Read this aloud to the peer; they should see the same value in their 'peer' column."
+                  >
+                    <span class="confirm-label">code</span>
+                    <span class="confirm-value">{row.peer.verification_code_sent}</span>
+                  </div>
+                {/if}
               </div>
-            {/if}
-            {#if row.peer.verification_code}
-              <div
-                class="confirm-tile code-tile"
-                title="Per-session verification code the peer generated — confirms freshness on top of the device identity."
-              >
-                <span class="confirm-label">code</span>
-                <span class="confirm-value">{row.peer.verification_code}</span>
+            </div>
+
+            <div class="confirm-divider" aria-hidden="true">↔</div>
+
+            <div class="confirm-col">
+              <div class="confirm-side-label">peer</div>
+              <div class="confirm-pair">
+                {#if row.peer.device_suffix}
+                  <div
+                    class="confirm-tile suffix-tile"
+                    title="PEER'S stable display tag — derived from their pubkey. Should match what they read aloud to you (in their 'this device' column)."
+                  >
+                    <span class="confirm-label">suffix</span>
+                    <span class="confirm-value">{row.peer.device_suffix}</span>
+                  </div>
+                {/if}
+                {#if row.peer.verification_code_received}
+                  <div
+                    class="confirm-tile code-tile"
+                    title="PEER'S per-session verification code — generated when they started this handshake. Should match what they read aloud to you."
+                  >
+                    <span class="confirm-label">code</span>
+                    <span class="confirm-value">{row.peer.verification_code_received}</span>
+                  </div>
+                {/if}
               </div>
-            {/if}
-            <div class="confirm-help">
-              Both should match what the peer reads to you before you approve.
             </div>
           </div>
 
@@ -324,11 +375,46 @@
     color: #666;
     user-select: all;
   }
-  .confirm-row {
-    display: flex;
+  /* Bilateral confirmation grid: two columns ("this device" and
+     "peer"), each with a suffix + code tile pair, separated by a
+     horizontal arrow to communicate "these should match across".
+     Both peers see the same four values; that symmetry is the
+     guarantee both sides are talking to the right device. */
+  .confirm-grid {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 0.6rem;
     align-items: center;
-    gap: 0.55rem;
+    background: #0d0d12;
+    border: 1px solid #1e1e25;
+    border-radius: 7px;
+    padding: 0.6rem 0.7rem;
+  }
+  .confirm-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+  .confirm-side-label {
+    font-size: 0.62rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: center;
+  }
+  .confirm-pair {
+    display: flex;
+    gap: 0.45rem;
     flex-wrap: wrap;
+    justify-content: center;
+  }
+  .confirm-divider {
+    color: #555;
+    font-size: 1.05rem;
+    user-select: none;
+    align-self: end;
+    padding-bottom: 0.45rem;
   }
   /* Two tiles intentionally styled differently: suffix is the
      stable identity claim (blue), code is the per-session freshness
@@ -375,14 +461,6 @@
   }
   .confirm-tile.code-tile .confirm-value {
     color: #ffd166;
-  }
-  .confirm-help {
-    font-size: 0.72rem;
-    color: #888;
-    flex: 1;
-    min-width: 12rem;
-    font-style: italic;
-    line-height: 1.4;
   }
   .actions {
     display: flex;
