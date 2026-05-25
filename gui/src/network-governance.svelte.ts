@@ -69,6 +69,21 @@ function emptyState(): NetworkStateView {
   };
 }
 
+/** Shared "empty" snapshot returned by `stateFor()` when the
+ *  network has never been mutated through the governance store.
+ *  Reusing a single instance keeps repeated `stateFor()` calls
+ *  referentially stable, so derived computations don't re-fire on
+ *  every read. The supported mutation path is via the store's
+ *  methods, which always create fresh objects via `set()` —
+ *  callers should treat this snapshot as read-only. */
+const EMPTY_STATE: NetworkStateView = {
+  kind: "open",
+  roles: {},
+  transitions: [],
+  pending: [],
+  splits: [],
+};
+
 function newProposalId(): string {
   return `prop_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
 }
@@ -160,10 +175,17 @@ function createGovernanceStore() {
   }
 
   function get(configId: string): NetworkStateView {
-    if (!byConfigId[configId]) {
-      byConfigId[configId] = emptyState();
-    }
-    return byConfigId[configId];
+    // No write-on-read: if the network has never been mutated by a
+    // governance op, return the shared empty snapshot. Returning a
+    // *frozen* shared instance keeps callers from accidentally
+    // mutating it through the returned reference (the supported
+    // mutation path is via the store's methods, which all go
+    // through `set()` and create fresh objects). Writing in a
+    // getter would re-trigger every `$derived` and `$effect` that
+    // reads via `stateFor`, which is what froze the UI on first
+    // build: each render of the Sidebar mutated the map, the
+    // mutation re-fired the effect, and so on.
+    return byConfigId[configId] ?? EMPTY_STATE;
   }
 
   function set(configId: string, next: NetworkStateView) {
@@ -485,11 +507,19 @@ function createGovernanceStore() {
    *  by the mesh client when a network is observed in the live
    *  registry. Keyed on `network_id` (the wire-level handle) so a
    *  retry that picks a fresh local `config_id` still clears the
-   *  orphan. */
+   *  orphan.
+   *
+   *  Critical: this is called from a `$effect` that transitively
+   *  reads `orphans`. We must only reassign when something
+   *  actually changed — a noop reassignment to a new (equivalent)
+   *  array still trips Svelte 5's reactivity and re-fires the
+   *  caller, which is what froze the UI in the first cut. */
   function reconcileOrphans(liveNetworkIds: Set<string>) {
-    const before = orphans.length;
-    orphans = orphans.filter((o) => !liveNetworkIds.has(o.network_id));
-    if (orphans.length !== before) persistOrphans();
+    if (orphans.length === 0) return;
+    const next = orphans.filter((o) => !liveNetworkIds.has(o.network_id));
+    if (next.length === orphans.length) return;
+    orphans = next;
+    persistOrphans();
   }
 
   // ---- initialisation ------------------------------------------------
