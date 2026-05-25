@@ -1,10 +1,9 @@
 # Network types: open and closed
 
-**Status: design — not yet implemented.** `PROPOSED` markers below
-flag default choices awaiting confirmation; everything else is the
-agreed model. See [Open questions](#open-questions) at the bottom
-for the four decisions reviewers should sign off before any code
-lands.
+**Status: design — not yet implemented.** All four foundational
+decisions (sync algorithm, deadlock resolution, fork semantics,
+wire shape) are settled — see [Decisions](#decisions) at the bottom.
+The doc is the contract; implementation lands in a follow-up PR.
 
 ## Why
 
@@ -61,9 +60,7 @@ see [Wire protocol](#wire-protocol).
 Deletes are tombstones (entry with `tombstoned_at` timestamp,
 expires after `TOMBSTONE_TTL`). Without tombstones, a peer who
 didn't see your delete would re-add the entry on the next gossip
-round and the delete would never converge. `PROPOSED — Merkle-root
-+ tombstones, not OR-Set CRDT. Simpler, matches the current append-
-mostly file shape, and the partition risk in a friend-mesh is low.`
+round and the delete would never converge.
 
 ## Closed networks
 
@@ -124,51 +121,112 @@ Verification: a peer accepts a `network_state` from another peer
 only when the chain of transitions back to the founder is fully
 signed by the right authorities at each step.
 
-### Quorum for "unanimous member consent"
+### Resolving a stuck close proposal
 
-A strict unanimous-of-currently-rostered rule deadlocks every time
-one device is offline. `PROPOSED — unanimous-of-online at proposal
-time, plus an automatic "do you agree to the close that happened
-while you were offline?" prompt on the next online of each missing
-signer. The closer's view is "pending" until every offline member
-either signs or denies; if any denies, the transition is invalidated
-and the network reverts to "open" from that peer's signed view.`
+Unanimous consent is the ceiling; voluntary participation is the
+floor. The lifecycle:
 
-The deny case is the interesting edge: a denying member produces a
-*signed* `network_state_ack { decision: "deny" }`, which the closer
-must accept. The closer's local view then rewinds to open and
-removes the pending close from the transition log. This means the
-window between "close proposed" and "all offline members back
-online" carries some uncertainty — the UX surfaces this with a
-`pending` badge and disables operations that depend on the chosen
-state (e.g. role-restricted approvals) until the quorum resolves.
+1. **Propose.** The would-be owner publishes a
+   `network_state_propose { transition: { to: "closed" } }`. Every
+   currently-rostered member sees it as a pending Approvals-tab
+   card.
+2. **Unanimous sign → clean close.** Every member returns
+   `network_state_ack { decision: "sign" }`; the transition lands
+   network-wide. Done.
+3. **Any deny → proposal dead.** A signed
+   `network_state_ack { decision: "deny" }` from any current member
+   invalidates the proposal. The closer's local view rewinds to
+   open and the close is removed from the pending log. The closer
+   can re-propose later or never.
+4. **Timeout with partial signatures → split.** After
+   `STATE_PROPOSAL_TIMEOUT_S` (default 24 h, tunable per-network)
+   some members are still silent — typically offline. The closer
+   can publish a `network_state_split` carrying the signers it has
+   so far. That message spawns a new closed network derived from
+   the original; the signers + closer form its initial roster with
+   the closer as `owner` (and the signers as the role each agreed
+   to in their original ack — controllers and members carry across).
 
-## Forks (rogue-close scenarios)
+The split is not the closer's first move — it's the fallback for
+when getting everyone aligned is taking longer than they're
+willing to wait. Step 2 stays the happy path; step 4 stays a
+deliberate "I'm proceeding without the silent members" decision.
 
-A peer that locally writes `kind = closed` and tries to push it
-without the unanimous signoff produces a signed `network_state` that
-fails verification on every other member. Two things happen:
+### Splits in detail
 
-1. **Non-signers ignore the would-be close.** They keep treating
-   the network as `open` and continue peering with the rogue node.
-2. **The Activity log surfaces the attempt.** Every member sees
-   `peer X proposed close — rejected (you did not sign)`, and X's
-   row in the Connections tab carries a small `!` warning badge
-   that persists until the user dismisses it.
+A split's wire effect is to **spawn a new network**, not to mutate
+the original. The new network's id is derived deterministically
+from the original's id and the signer set:
 
-`PROPOSED — non-signers continue to peer with the rogue, treating
-its close-proposal as advisory. The alternative (hard-partition
-non-signers) is safer if you assume the close-attempt is
-adversarial, but breaks the friend-mesh case where someone's GUI
-glitch published a stale state — and "potential threats" in the
-spec is about visibility, not isolation.`
+```
+new_network_id = base32_lowercase(SHA-256(
+    "myownmesh-split-v1:" ||
+    original_network_id   ||
+    "|" || sorted_signer_pubkeys_joined("|")
+))
+```
 
-The rogue node's *own* view says the network is closed and only it
-is an owner; data channels to peers that don't recognise its closed
-state will keep working at the peer level, but the rogue's UI will
-show "1 peer in this closed network" while every honest member's
-UI will show the rogue under its open network with the
-rejected-close badge. Two ground truths, neither hidden.
+The closer becomes the new network's founder-owner; the original
+network is untouched. Members who didn't sign stay where they are,
+in the original network, under its existing rules — they're not
+ejected, demoted, or otherwise harmed. They simply aren't members
+of the new closed network.
+
+The new network shares signaling discovery with the original (same
+Trystero app id; the derived `new_network_id` lands in a sibling
+Nostr room), so members who join both see both in their network
+list. Peer connections established under the original network keep
+working — see [Forks](#forks-governance-not-connectivity).
+
+## Forks: governance, not connectivity
+
+A fork is what happens when not everyone agrees on the rules. It
+is **only a matter of controlling power dispute** — never a
+suggestion to members about whether they should drop the private
+connections that the network's signaling layer originally brought
+them together over.
+
+Concretely:
+
+- The roster, the kind, the transition log, and the role
+  assignments are **per-network** state. A fork means two networks
+  exist with overlapping membership but distinct state.
+- Peer-to-peer data channels, RPCs, and typed channels live at the
+  **peer layer**, below the network layer. Two peers that are both
+  in network *A* and that have an active connection don't lose it
+  because one of them later joins network *A-split* and the other
+  doesn't.
+
+So the practical model after a split:
+
+- Alice closes-via-split with Bob + Carol. They're now members of
+  the new closed network *N'*.
+- Dave was offline. He comes back to find the original network *N*
+  unchanged in his roster, and a new network *N'* in his
+  "available to join" list (advertised by Alice in *N*'s gossip).
+- Dave, Alice, Bob, Carol can all still talk to each other over
+  any channel established in *N* — those connections are theirs,
+  not the network's.
+- If Dave wants the closed-network governance, he asks an owner
+  of *N'* to add him.
+
+### What does that mean for "potential threats"?
+
+Visibility, not isolation. The Activity log surfaces every
+split-spawn (`network *N'* spawned from *N* by Alice with [Bob,
+Carol] — you are not a member`) and Dave's *N* view shows Alice's
+row carrying a small chip indicating "also runs *N'*". Dave can
+choose to drop his connections to Alice or remove her from *N*'s
+roster (under *N*'s open rules he has authority to do so for
+himself) — but the engine doesn't do it for him. A split is not
+an attack; it's a choice the engine surfaces honestly.
+
+The only case the engine *does* refuse outright is an unsigned
+`network_state` claim — i.e. someone publishing a transition log
+that doesn't verify against the chain of authorities. Those frames
+are dropped silently at the protocol layer and logged as
+`malformed network_state from <peer> — signature chain broken`.
+That's not a fork; that's just a bad frame.
 
 ## UX requirements
 
@@ -188,9 +246,16 @@ rejected-close badge. Two ground truths, neither hidden.
   signature), the network row shows an amber dot and the Approvals
   tab gets a "Network kind change requested by X" card with the
   proposed state diff inline. Approve / Deny live there.
-- **Rejected-close warning.** Peers who pushed a close that didn't
-  pass surface with a small `!` badge in the Connections tab until
-  the user dismisses or removes them.
+- **Split spawned card.** When a `network_state_split` arrives for
+  a network you're in but didn't sign, the Approvals tab gets a
+  "*N'* spawned from *N* by X (without your signature)" card. It's
+  informational; the call-to-action is "Join *N'*" (asks an owner
+  to add you) or "Dismiss". The original network is unaffected.
+- **"Also runs *N'*" peer chip.** In the original network's
+  Connections tab, peers who joined a split spawned from this
+  network carry a small chip noting the derived network's short
+  id. Hover reveals the full id and the signer list. Visibility,
+  not isolation.
 - **Role chip on Connections row.** Every peer row in a closed
   network carries an `owner` / `controller` / `member` chip so the
   local user can see at a glance who can do what.
@@ -199,17 +264,14 @@ rejected-close badge. Two ground truths, neither hidden.
 
 Net-new message kinds, all gated by the `network_state_v1` feature
 flag so old peers (and bare-MyOwnLLM peers on the pre-closed-network
-build) silently ignore them. `PROPOSED — net-new wire kinds rather
-than a generic signed-event channel. Closer to the existing
-discriminated-kind shape in` [`PROTOCOL.md`](PROTOCOL.md)`; the
-generic-channel path becomes worthwhile only when we have a second
-feature riding the same envelope.`
+build) silently ignore them.
 
 | Kind | Direction | Purpose |
 |---|---|---|
 | `network_state` | broadcast on ACTIVE | "This is what I think the network looks like." Carries `kind`, transition log, and the roster Merkle root. |
 | `network_state_propose` | targeted | "I propose this transition" — closed-network kind change or role grant. Signed by the proposer. |
 | `network_state_ack` | targeted | "I sign / deny your proposal." Co-signature by another authorised role; the `decision` field is `"sign"` or `"deny"`. |
+| `network_state_split` | targeted | "Stuck close — I'm spawning a derived closed network from the signers I have." Signed by the proposer + every signer who's opted in. Receivers verify, then add the new network to their available-to-join list. |
 | `roster_summary` | broadcast on ACTIVE | Merkle root + count + last-edit-ts of the sender's current roster view. |
 | `roster_request` | targeted | "Send me the entries under hash X." Merkle-tree diff walk. |
 | `roster_entries` | targeted | The requested entries; receiver merges into local roster after authority verification. |
@@ -220,26 +282,34 @@ from the per-peer auth tag `myownmesh-mesh-auth-v1:` so a handshake
 signature cannot be replayed as a state-transition signature or
 vice-versa.
 
-## Open questions
+## Decisions
 
-These are the four decisions the design depends on. The `PROPOSED`
-default in each section is my recommendation; reviewers should
-confirm or push back before turning any of this into code.
+The four foundational choices, settled:
 
-1. **Roster sync algorithm.** `PROPOSED:` Merkle-root + tombstones.
-   `Alt:` OR-Set CRDT (delete-safe across partitions, heavier wire,
-   different file shape).
-2. **Quorum for "unanimous member consent" on open→closed.**
-   `PROPOSED:` unanimous-of-online with offline backfill on
-   reconnect. `Alts:` strict-unanimous-of-rostered (offline =
-   blocks), or M-of-N owners after bootstrap (no unanimous needed).
-3. **Fork visibility.** `PROPOSED:` soft fork — non-signers ignore
-   the close and keep peering, with the rejected-close badge as
-   feedback. `Alt:` hard partition — non-signers refuse data-channel
-   traffic with the rogue.
-4. **Wire shape.** `PROPOSED:` net-new message kinds. `Alt:`
-   generic signed-event channel (`network_event { topic, payload,
-   sig }`) that this layer rides on.
+1. **Roster sync algorithm — Merkle-root + tombstones.** Simpler
+   than OR-Set CRDT, matches the existing append-mostly roster
+   file shape, and the partition risk in the deployments this
+   targets (friend-mesh / office-mesh) is low.
+2. **Resolving a stuck close — proposer-initiated split.**
+   Unanimous-of-rostered is the ceiling. If silent members stall
+   the proposal past `STATE_PROPOSAL_TIMEOUT_S`, the proposer can
+   publish a `network_state_split` that spawns a derived closed
+   network from the signers it has. Nodes that want the closed
+   governance join the split; nodes that don't, stay where they
+   are. No automatic-on-reconnect prompt, no M-of-N override — the
+   close either gets everyone or it splits.
+3. **Forks are governance scope, not connectivity scope.** A
+   fork's existence does not break the peer connections that the
+   original network's signaling brought together. Two peers in
+   network *N* who end up on opposite sides of an *N → N'* split
+   keep their data channels, their channels, and their RPCs.
+   "Threats" are surfaced (Activity log, peer chip noting "also
+   runs *N'*"), not enforced (no auto-disconnect, no
+   hard-partition).
+4. **Wire shape — net-new message kinds.** Discriminated-kind
+   matches the existing protocol shape; a generic signed-event
+   envelope is worth doing only once a second feature wants the
+   same plumbing.
 
 ## Out of scope for this design
 
@@ -268,7 +338,12 @@ When this becomes code, the touch points are:
 - `crates/myownmesh-core/src/protocol/` — net-new message kinds
   above, gated by `features::network_state_v1`.
 - `crates/myownmesh-core/src/` (new) `network_state.rs` — the
-  `NetworkState` struct, transition log, signature verification.
+  `NetworkState` struct, transition log, signature verification,
+  and the `derive_split_network_id()` helper.
+- `crates/myownmesh-core/src/handle.rs` — `Mesh::join_split()` for
+  the "I want in on the spawned derived network" flow; the
+  signaling subsystem already discovers the new id via the
+  original network's gossip.
 - `crates/myownmesh-core/src/dirs.rs` — `states_dir()` for the new
   per-network signed-state files.
 - `crates/myownmesh-core/src/engine/` — gossip driver for
