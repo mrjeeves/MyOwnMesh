@@ -12,7 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::CapabilityAdvert;
-use crate::transport::{PeerDiag, PeerSession};
+use crate::transport::{PeerDiag, PeerSession, SelectedCandidatePair};
 
 use super::ladder::ConnectionTier;
 
@@ -73,6 +73,12 @@ pub struct PeerStateData {
     /// every time the ladder cycles. Reset when the peer becomes
     /// Active again.
     pub no_turn_diag_emitted: bool,
+    /// The ICE candidate pair actually in use, once the agent has
+    /// nominated one. The graph uses this to classify the link as
+    /// LAN (host↔host), STUN (srflx involved), or TURN (relay
+    /// involved) without relying on heuristics over the gathered-
+    /// candidate counts. `None` until ICE reaches Connected.
+    pub selected_pair: Option<SelectedCandidatePair>,
     pub diag: PeerDiag,
 }
 
@@ -102,6 +108,7 @@ impl Default for PeerStateData {
             rehandshake_attempt: 0,
             ice_failed_count: 0,
             no_turn_diag_emitted: false,
+            selected_pair: None,
             diag: PeerDiag::default(),
         }
     }

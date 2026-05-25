@@ -48,6 +48,18 @@
       : [],
   );
 
+  const focusedRoster = $derived(
+    focusedNetwork
+      ? meshClient.rostersByNetwork[focusedNetwork.config_id] ?? []
+      : [],
+  );
+
+  const focusedNetworkChangeTs = $derived(
+    focusedNetwork
+      ? meshClient.networkChangeTsByNetwork[focusedNetwork.config_id] ?? 0
+      : 0,
+  );
+
   /** Open the settings panel on a specific tab. Defaults to
    *  "approvals" because that's where new users go to bring a peer
    *  online for the first time — the most discoverable surface for
@@ -111,6 +123,8 @@
         <NodeMap
           network={focusedNetwork}
           peers={focusedPeers}
+          roster={focusedRoster}
+          networkChangeTs={focusedNetworkChangeTs}
           selfDeviceId={meshClient.identity?.pubkey ?? ""}
           selfLabel={meshClient.identity?.label ?? ""}
           selectedPeerId={selectedPeerId}

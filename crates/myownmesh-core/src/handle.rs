@@ -25,7 +25,7 @@ use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
-use crate::transport::Transport;
+use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
@@ -365,4 +365,28 @@ pub struct PeerInfo {
     /// transitions the peer to Active. Either alone means the
     /// handshake is half-complete and waiting on the other end.
     pub remote_approve_seen: bool,
+    /// True when the engine has decided this peer is unreachable
+    /// without a TURN relay (multiple ICE failures, zero relay
+    /// candidates on either side). Mirrors the one-shot
+    /// `no_turn_diag_emitted` flag the ICE watchdog sets — the GUI
+    /// uses it to surface "we can see them on signaling but the data
+    /// pipe never comes up" without making the user grep the
+    /// Activity log. Reset when the peer recovers to Active.
+    pub needs_turn: bool,
+    /// Counts of locally-gathered ICE candidates by type. The GUI
+    /// uses these to infer the link kind for the layout: `host`-only
+    /// pairs are LAN neighbours and sit directly next to "you",
+    /// while `server_reflexive` / `relay` pairs sit on the far side
+    /// of the Internet node. Zeroed until ICE starts gathering.
+    pub local_candidates: IceCandidateStats,
+    /// Counts of ICE candidates the peer sent us. Same layout role
+    /// as `local_candidates` — both sides have to surface a host
+    /// candidate before we treat the link as LAN-direct.
+    pub remote_candidates: IceCandidateStats,
+    /// The ICE candidate pair the agent actually selected for
+    /// sending packets, once known. Authoritative input for the
+    /// graph's LAN/STUN/TURN classification — the counts above only
+    /// describe what was tried, this describes what's in use. `None`
+    /// until ICE reaches Connected/Completed.
+    pub selected_pair: Option<SelectedCandidatePair>,
 }

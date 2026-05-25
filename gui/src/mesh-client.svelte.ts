@@ -12,6 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AuthorizedPeer,
   DaemonStatus,
   DiagEntry,
   IdentityInfo,
@@ -34,7 +35,16 @@ function createMeshClient() {
   let networks = $state<NetworkSummary[]>([]);
   // Per-network peer snapshots, keyed by config_id.
   let peersByNetwork = $state<Record<string, PeerInfo[]>>({});
+  // Per-network rosters (authorised peers persisted on disk). The
+  // graph merges these with `peersByNetwork` so peers we've ever
+  // connected to stay visible even when offline / not in signaling.
+  let rostersByNetwork = $state<Record<string, AuthorizedPeer[]>>({});
   let diags = $state<DiagEntry[]>([]);
+  // Wall-clock ms of the most recent "network change" diag, per
+  // network. The NodeMap animates the self↔internet edge for a few
+  // seconds after this bumps so the user sees that the engine
+  // noticed a network shift.
+  let networkChangeTsByNetwork = $state<Record<string, number>>({});
 
   // Tracks the live state of the long-lived event subscription. The
   // SettingsPanel surfaces this so users can tell when the daemon is
@@ -106,25 +116,42 @@ function createMeshClient() {
     await Promise.all(networks.map((n) => refreshPeers(n.config_id)));
   }
 
+  async function refreshRoster(configId: string) {
+    try {
+      const resp = (await invoke("mesh_roster_list", { network: configId })) as {
+        roster: AuthorizedPeer[];
+      };
+      rostersByNetwork[configId] = resp.roster ?? [];
+    } catch (e) {
+      // Same non-fatal handling as `refreshPeers` — the roster is a
+      // best-effort overlay, not a blocker for the rest of the UI.
+      lastError = String(e);
+    }
+  }
+
+  async function refreshAllRosters() {
+    await Promise.all(networks.map((n) => refreshRoster(n.config_id)));
+  }
+
   /** Refresh every snapshot. Called on startup, after major state
    *  changes (topology set, roster approve), and whenever the event
    *  stream signals a lag so we can resync from the daemon's
    *  ground truth. */
   async function refreshAll() {
     await Promise.all([refreshStatus(), refreshIdentity(), refreshNetworks()]);
-    await refreshAllPeers();
+    await Promise.all([refreshAllPeers(), refreshAllRosters()]);
   }
 
   // ---- mutations ------------------------------------------------------
 
   async function rosterApprove(network: string, deviceId: string, label?: string) {
     await invoke("mesh_roster_approve", { network, deviceId, label: label ?? null });
-    await refreshPeers(network);
+    await Promise.all([refreshPeers(network), refreshRoster(network)]);
   }
 
   async function rosterRemove(network: string, deviceId: string) {
     await invoke("mesh_roster_remove", { network, deviceId });
-    await refreshPeers(network);
+    await Promise.all([refreshPeers(network), refreshRoster(network)]);
   }
 
   async function rosterList(network: string) {
@@ -192,7 +219,16 @@ function createMeshClient() {
       // The DiagEntry fields are spread alongside `event_kind`; strip
       // the family tag to land back at a clean DiagEntry shape.
       const { event_kind: _ek, ...rest } = event as Record<string, unknown>;
-      pushDiag(rest as unknown as DiagEntry);
+      const entry = rest as unknown as DiagEntry;
+      pushDiag(entry);
+      // Side-effect: stamp the network-change timestamp so the
+      // NodeMap can pulse the self↔internet edge. Cheap to do on
+      // every diag; the keyed lookup makes the per-network animation
+      // self-contained.
+      if (entry.category === "network" && entry.network_id) {
+        const cfg = networks.find((n) => n.network_id === entry.network_id);
+        if (cfg) networkChangeTsByNetwork[cfg.config_id] = entry.ts || Date.now();
+      }
       return;
     }
     if (family === "peer" || family === "phase") {
@@ -363,6 +399,12 @@ function createMeshClient() {
     if (pollTimer) return;
     pollTimer = setInterval(() => {
       void refreshAllPeers();
+      // Rosters don't change as often as peer state, but they DO
+      // change without an obvious event we can hook (a peer
+      // approving us from their side will refresh ours via the
+      // approve flow — but a manual edit on the host wouldn't),
+      // so piggy-back on the same poll cadence.
+      void refreshAllRosters();
     }, POLL_INTERVAL_MS);
   }
 
@@ -399,6 +441,12 @@ function createMeshClient() {
     get peersByNetwork() {
       return peersByNetwork;
     },
+    get rostersByNetwork() {
+      return rostersByNetwork;
+    },
+    get networkChangeTsByNetwork() {
+      return networkChangeTsByNetwork;
+    },
     get diags() {
       return diags;
     },
@@ -413,6 +461,7 @@ function createMeshClient() {
     dispose,
     refreshAll,
     refreshPeers,
+    refreshRoster,
     refreshNetworks,
     identitySetLabel,
     rosterApprove,

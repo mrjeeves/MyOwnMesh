@@ -176,6 +176,92 @@ export interface PeerInfo {
    *  `local_approve_sent` is still false, the UI surfaces "the
    *  peer has already approved you — confirm to complete." */
   remote_approve_seen: boolean;
+  /** Engine has decided the peer is unreachable without a TURN
+   *  relay — repeated ICE failures and zero relay candidates on
+   *  either side. The graph paints a "needs TURN" badge on these
+   *  so the user doesn't have to grep the Activity log to learn
+   *  why the data pipe never comes up. */
+  needs_turn: boolean;
+  /** Counts of ICE candidate kinds we gathered locally for this
+   *  peer. The graph uses them to decide how to draw the link —
+   *  host-host pairs sit next to "you" as LAN; anything with srflx
+   *  or relay sits on the far side of the Internet node. */
+  local_candidates: IceCandidateStats;
+  /** Same as `local_candidates`, for candidates the peer sent us.
+   *  Both sides have to advertise a host candidate before we call
+   *  the link LAN-direct. */
+  remote_candidates: IceCandidateStats;
+  /** The ICE candidate pair the agent actually selected for sending
+   *  packets. Set once ICE reaches Connected. Authoritative input
+   *  for link classification — supersedes the heuristic over
+   *  `local_candidates` / `remote_candidates`. */
+  selected_pair: SelectedCandidatePair | null;
+}
+
+export type IceCandidateKindStr =
+  | "host"
+  | "server_reflexive"
+  | "peer_reflexive"
+  | "relay"
+  | "unknown";
+
+export interface SelectedCandidatePair {
+  local: IceCandidateKindStr;
+  remote: IceCandidateKindStr;
+}
+
+export interface IceCandidateStats {
+  host: number;
+  server_reflexive: number;
+  peer_reflexive: number;
+  relay: number;
+  unknown: number;
+}
+
+/** Coarse classification of the link to a peer — drives where the
+ *  peer node is placed on the graph and how the edge is drawn.
+ *
+ *   - `lan`     direct: both sides surfaced a host candidate, no
+ *               STUN / TURN inferred. Peer sits next to "you".
+ *   - `stun`    server-reflexive in use: peer reached via a public
+ *               internet path discovered through STUN. Routed
+ *               through the Internet node.
+ *   - `turn`    a relay candidate is in the mix on at least one
+ *               side: data path runs through a TURN server.
+ *   - `blocked` `needs_turn` flag is set — signaling sees the peer
+ *               but ICE can't punch through and there's no relay.
+ *   - `unknown` ICE hasn't gathered enough to classify yet, or the
+ *               peer is offline/sighted-only. */
+export type LinkKind = "lan" | "stun" | "turn" | "blocked" | "unknown";
+
+/** Infer the link kind from a peer's selected ICE pair + flags.
+ *  The selected pair (populated once ICE reaches Connected) is the
+ *  authoritative input — gathered-candidate counts only tell us what
+ *  was tried. We only fall back to candidate counts when ICE hasn't
+ *  reported a selection yet.
+ *
+ *    1. `needs_turn`                      → `blocked`
+ *    2. selected_pair has any relay       → `turn`
+ *    3. selected_pair is host ↔ host      → `lan`
+ *    4. selected_pair otherwise present   → `stun`
+ *    5. no pair yet but relay candidates  → `turn` (best guess)
+ *    6. no pair yet, srflx gathered       → `stun`
+ *    7. otherwise                         → `unknown` */
+export function linkKindOf(p: PeerInfo): LinkKind {
+  if (p.needs_turn) return "blocked";
+  const sp = p.selected_pair;
+  if (sp) {
+    if (sp.local === "relay" || sp.remote === "relay") return "turn";
+    if (sp.local === "host" && sp.remote === "host") return "lan";
+    return "stun";
+  }
+  const lc = p.local_candidates;
+  const rc = p.remote_candidates;
+  if ((lc?.relay ?? 0) > 0 || (rc?.relay ?? 0) > 0) return "turn";
+  if ((lc?.server_reflexive ?? 0) > 0 || (rc?.server_reflexive ?? 0) > 0) {
+    return "stun";
+  }
+  return "unknown";
 }
 
 // ---- roster -----------------------------------------------------------

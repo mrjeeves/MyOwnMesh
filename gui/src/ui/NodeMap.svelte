@@ -1,11 +1,18 @@
 <script lang="ts">
-  import type { NetworkSummary, PeerInfo } from "../types";
-  import { networkDisplayName, topologyName, topologyHub } from "../types";
+  import type { AuthorizedPeer, NetworkSummary, PeerInfo, LinkKind } from "../types";
+  import {
+    linkKindOf,
+    networkDisplayName,
+    topologyName,
+    topologyHub,
+  } from "../types";
   import { meshClient } from "../mesh-client.svelte";
 
   const {
     network,
     peers,
+    roster,
+    networkChangeTs,
     selfDeviceId,
     selfLabel,
     selectedPeerId,
@@ -13,6 +20,17 @@
   }: {
     network: NetworkSummary;
     peers: PeerInfo[];
+    /** On-disk authorised peers. Merged with `peers` so the graph
+     *  always shows someone we've ever connected to, even if they
+     *  aren't online or visible in signaling right now — once we've
+     *  meshed with a device we know its id, we should be able to
+     *  see it on the map. */
+    roster: AuthorizedPeer[];
+    /** Unix-ms timestamp of the most recent "primary network
+     *  interface changed" diag for this network. Bumped from the
+     *  mesh client; the self↔internet edge pulses for a few
+     *  seconds afterwards so the user sees the engine noticed. */
+    networkChangeTs: number;
     selfDeviceId: string;
     selfLabel: string;
     selectedPeerId: string | null;
@@ -129,38 +147,241 @@
     return () => ro.disconnect();
   });
 
+  // ---- pan / zoom -----------------------------------------------------
+  //
+  // The graph is meant to be a visualisation that "just fits" by
+  // default. We auto-fit the layout's bounding box into the SVG on
+  // mount and whenever the set of nodes changes substantially (count
+  // up / down). Once the user manually pans or zooms we switch to a
+  // manual transform; the "fit" button on the legend bar re-engages
+  // auto-fit. Wheel = zoom (centred on the cursor); drag on empty
+  // canvas = pan; nodes are clickable as before.
+  let panX = $state(0);
+  let panY = $state(0);
+  let zoom = $state(1);
+  let userTransformed = $state(false);
+  let dragging = $state(false);
+  let dragStart = $state<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
+  const MIN_ZOOM = 0.25;
+  const MAX_ZOOM = 4;
+  const FIT_MARGIN = 40;
+  /** Radius the layout reserves around any peer/internet/self node;
+   *  used to pad the auto-fit bbox so node circles don't clip the
+   *  canvas edges. The largest node currently drawn is the
+   *  self/hub circle at r=32 plus its label below. */
+  const NODE_HALO = 50;
+
+  /** Compute (pan, zoom) that fits every layout node within the
+   *  current SVG dimensions, with some breathing room. Returns the
+   *  identity transform when there are no nodes (the empty-network
+   *  branch already short-circuited above by then). */
+  function fitTransform(nodes: { x: number; y: number }[]) {
+    if (nodes.length === 0) return { panX: 0, panY: 0, zoom: 1 };
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      if (n.x - NODE_HALO < minX) minX = n.x - NODE_HALO;
+      if (n.x + NODE_HALO > maxX) maxX = n.x + NODE_HALO;
+      if (n.y - NODE_HALO < minY) minY = n.y - NODE_HALO;
+      if (n.y + NODE_HALO > maxY) maxY = n.y + NODE_HALO;
+    }
+    const bboxW = Math.max(1, maxX - minX);
+    const bboxH = Math.max(1, maxY - minY);
+    const avail = {
+      w: Math.max(1, width - FIT_MARGIN * 2),
+      h: Math.max(1, height - FIT_MARGIN * 2),
+    };
+    const scale = Math.min(avail.w / bboxW, avail.h / bboxH, MAX_ZOOM);
+    const clampedScale = Math.max(MIN_ZOOM, scale);
+    // Centre the bbox in the canvas after scaling.
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    return {
+      panX: width / 2 - cx * clampedScale,
+      panY: height / 2 - cy * clampedScale,
+      zoom: clampedScale,
+    };
+  }
+
+  function applyFit() {
+    const t = fitTransform(layout.nodes);
+    panX = t.panX;
+    panY = t.panY;
+    zoom = t.zoom;
+    userTransformed = false;
+  }
+
+  // Re-fit automatically while the user hasn't taken control: this
+  // handles initial mount, peer add/remove, and network resize.
+  // Watching width/height + node count keeps the dependency narrow
+  // enough that we don't re-fit on every status flip (which would
+  // be jarring while the user is reading the graph).
+  $effect(() => {
+    void width;
+    void height;
+    void layout.nodes.length;
+    if (!userTransformed) {
+      const t = fitTransform(layout.nodes);
+      panX = t.panX;
+      panY = t.panY;
+      zoom = t.zoom;
+    }
+  });
+
+  function onWheel(e: WheelEvent) {
+    e.preventDefault();
+    const rect = canvas?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    // Zoom factor — exponential so successive wheel notches feel
+    // consistent at any current zoom level.
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
+    if (next === zoom) return;
+    // Keep the point under the cursor stationary by adjusting pan.
+    const ratio = next / zoom;
+    panX = cx - (cx - panX) * ratio;
+    panY = cy - (cy - panY) * ratio;
+    zoom = next;
+    userTransformed = true;
+  }
+
+  function onPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    // Only initiate a pan when the user clicks on empty canvas —
+    // clicking nodes still selects them (the node group calls
+    // stopPropagation).
+    dragging = true;
+    dragStart = { x: e.clientX, y: e.clientY, panX, panY };
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (!dragging || !dragStart) return;
+    panX = dragStart.panX + (e.clientX - dragStart.x);
+    panY = dragStart.panY + (e.clientY - dragStart.y);
+    userTransformed = true;
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    dragging = false;
+    dragStart = null;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+  }
+
   /** Visible peers excluded from the graph. We keep peers that
    *  represent real engine state — sighted onward — and skip purely
    *  "offline" rows so the graph doesn't fill up with ghosts. The
    *  Connections settings panel lists them all. */
-  const visiblePeers = $derived(
+  const enginePeersForGraph = $derived(
     peers.filter(
       (p) => p.status !== "offline" || p.local_shelved || p.remote_shelved,
     ),
   );
+
+  /** Synthetic peers for roster entries that aren't in the engine
+   *  snapshot at all — peers we've meshed with before but who aren't
+   *  currently visible on signaling. Rendered as dim "offline"
+   *  nodes; the user knows the peer exists even when they're not
+   *  around. Pubkey lookup matches `pubkey_part` on the Rust side:
+   *  the roster stores the canonical pubkey, and PeerInfo.device_id
+   *  is `{pubkey}-{suffix}`, so we compare on the pubkey prefix. */
+  const rosteredOfflinePeers = $derived.by((): PeerInfo[] => {
+    const knownPubkeys = new Set<string>();
+    for (const p of peers) {
+      knownPubkeys.add(pubkeyPart(p.device_id));
+    }
+    const synthetic: PeerInfo[] = [];
+    for (const r of roster) {
+      const pk = pubkeyPart(r.device_id);
+      if (knownPubkeys.has(pk)) continue;
+      synthetic.push({
+        device_id: r.device_id,
+        status: "offline",
+        tier: "Steady",
+        rtt_ms: null,
+        label: r.label || "",
+        capabilities: null,
+        local_shelved: false,
+        remote_shelved: false,
+        authenticated: false,
+        device_suffix: "",
+        verification_code_received: null,
+        verification_code_sent: null,
+        local_approve_sent: false,
+        remote_approve_seen: false,
+        needs_turn: false,
+        local_candidates: zeroCandidates(),
+        remote_candidates: zeroCandidates(),
+        selected_pair: null,
+      });
+    }
+    return synthetic;
+  });
+
+  const visiblePeers = $derived([
+    ...enginePeersForGraph,
+    ...rosteredOfflinePeers,
+  ]);
+
+  function pubkeyPart(deviceId: string): string {
+    const dash = deviceId.lastIndexOf("-");
+    return dash === -1 ? deviceId : deviceId.slice(0, dash);
+  }
+
+  function zeroCandidates() {
+    return { host: 0, server_reflexive: 0, peer_reflexive: 0, relay: 0, unknown: 0 };
+  }
 
   type LaidOutNode = {
     id: string;
     label: string;
     x: number;
     y: number;
-    role: "self" | "peer" | "hub";
+    role: "self" | "peer" | "hub" | "internet";
     peer: PeerInfo | null;
+    /** Link-kind classification for peer nodes — drives colour and
+     *  badge rendering. `null` for self / internet / hub roles. */
+    link: LinkKind | null;
   };
 
   type LaidOutEdge = {
     from: string;
     to: string;
-    state: "active" | "shelved" | "transient";
+    /** Visual state of the edge. `active` / `shelved` / `transient`
+     *  match the prior topology semantics for peer↔hub / peer↔self
+     *  links; `internet`, `lan`, `stun`, `turn`, `blocked` capture
+     *  the new link-kind routing (self↔internet, and any peer routed
+     *  via internet vs. direct). */
+    state:
+      | "active"
+      | "shelved"
+      | "transient"
+      | "internet"
+      | "lan"
+      | "stun"
+      | "turn"
+      | "blocked";
   };
 
+  const INTERNET_NODE_ID = "__internet__";
+
   /** Compute (x,y) for every node + an edge list, based on the
-   *  current topology. Pure function of (peers, topology,
-   *  width, height) — recomputes whenever any input changes. */
+   *  current topology AND each peer's link kind. Self sits at the
+   *  centre as before; the Internet node hovers above. Peers whose
+   *  data path goes through the public internet (STUN, TURN, or
+   *  signaling-visible-but-unreachable) sit on a ring AROUND the
+   *  Internet node and route through it; LAN peers (host↔host) sit
+   *  on a ring around "you" directly. The topology selector still
+   *  decides peer↔peer chord/ring decoration. Pure function of
+   *  (peers, topology, width, height). */
   const layout = $derived.by((): { nodes: LaidOutNode[]; edges: LaidOutEdge[] } => {
     const cx = width / 2;
-    const cy = height / 2;
-    const radius = Math.max(80, Math.min(width, height) / 2 - 90);
+    const cy = height / 2 + 40; // shift self down to leave room for Internet above
     const topo = topologyName(network.topology);
     const hub = topologyHub(network.topology);
 
@@ -174,95 +395,127 @@
       y: cy,
       role: "self",
       peer: null,
+      link: null,
     };
 
+    // Internet node — always rendered, sits above self. Position is
+    // proportional to canvas height so it stays visually anchored
+    // when the user resizes.
+    const internetNode: LaidOutNode = {
+      id: INTERNET_NODE_ID,
+      label: "internet",
+      x: cx,
+      y: Math.max(50, cy - Math.min(width, height) / 2 + 10),
+      role: "internet",
+      peer: null,
+      link: null,
+    };
+    nodes.push(internetNode);
+    nodes.push(selfNode);
+    edges.push({
+      from: internetNode.id,
+      to: selfNode.id,
+      state: "internet",
+    });
+
     if (visiblePeers.length === 0) {
-      nodes.push(selfNode);
       return { nodes, edges };
     }
 
-    if (topo === "star" && hub) {
-      // Star: hub at center, every other node on a ring around it.
-      // If we are the hub, self stays in the middle; otherwise the
-      // hub takes center stage and we sit on the ring.
-      const peersOnRing: PeerInfo[] = [];
-      let hubPeer: PeerInfo | null = null;
-      for (const p of visiblePeers) {
-        if (p.device_id === hub) hubPeer = p;
-        else peersOnRing.push(p);
-      }
-      const weAreHub = hub === selfDeviceId;
-      const centerNode: LaidOutNode = weAreHub
-        ? selfNode
-        : hubPeer
-          ? {
-              id: hubPeer.device_id,
-              label: hubPeer.label || shortId(hubPeer.device_id),
-              x: cx,
-              y: cy,
-              role: "hub",
-              peer: hubPeer,
-            }
-          : selfNode;
-      nodes.push(centerNode);
+    // Classify each peer's link kind. LAN peers sit on a ring
+    // directly around self; everything else sits above on a ring
+    // around the Internet node so the user can read "this peer
+    // talks to me via the public internet" at a glance.
+    const lanPeers: PeerInfo[] = [];
+    const netPeers: PeerInfo[] = [];
+    for (const p of visiblePeers) {
+      const kind = linkKindOf(p);
+      if (kind === "lan") lanPeers.push(p);
+      else netPeers.push(p);
+    }
 
-      const ringMembers: LaidOutNode[] = [];
-      if (!weAreHub) {
-        ringMembers.push({ ...selfNode, x: 0, y: 0 });
-      }
-      for (const p of peersOnRing) {
-        ringMembers.push({
-          id: p.device_id,
-          label: p.label || shortId(p.device_id),
-          x: 0,
-          y: 0,
-          role: "peer",
-          peer: p,
+    // Star topology: if the configured hub is one of the peers we
+    // can see, anchor IT in the centre instead of self — same
+    // behaviour as before so we don't regress the topology view.
+    // The internet node still hovers above; LAN/external routing
+    // still applies for non-hub peers.
+    let centerNode: LaidOutNode = selfNode;
+    if (topo === "star" && hub) {
+      const hubPeer = visiblePeers.find((p) => p.device_id === hub);
+      const weAreHub = hub === selfDeviceId;
+      if (!weAreHub && hubPeer) {
+        // Hub takes centre stage; remove from peer rings so it
+        // isn't double-placed.
+        const hubIdxLan = lanPeers.findIndex((p) => p.device_id === hub);
+        if (hubIdxLan >= 0) lanPeers.splice(hubIdxLan, 1);
+        const hubIdxNet = netPeers.findIndex((p) => p.device_id === hub);
+        if (hubIdxNet >= 0) netPeers.splice(hubIdxNet, 1);
+        centerNode = {
+          id: hubPeer.device_id,
+          label: hubPeer.label || shortId(hubPeer.device_id),
+          x: cx,
+          y: cy,
+          role: "hub",
+          peer: hubPeer,
+          link: linkKindOf(hubPeer),
+        };
+        nodes.push(centerNode);
+        edges.push({
+          from: centerNode.id,
+          to: selfNode.id,
+          state: edgeStateFor(hubPeer),
         });
       }
-      // Distribute around the circle.
-      const total = ringMembers.length;
-      ringMembers.forEach((node, i) => {
-        const angle = (i / total) * Math.PI * 2 - Math.PI / 2;
-        node.x = cx + Math.cos(angle) * radius;
-        node.y = cy + Math.sin(angle) * radius;
+    }
+
+    // Lay out LAN peers around the centre. Small radius so they
+    // visually cluster — "near" you in network terms.
+    const lanRadius = Math.max(60, Math.min(width, height) / 5);
+    placeOnArc(
+      lanPeers,
+      centerNode.x,
+      centerNode.y,
+      lanRadius,
+      Math.PI * 0.25,
+      Math.PI * 0.75,
+      (node, peer) => {
+        node.role = "peer";
+        node.link = linkKindOf(peer);
         nodes.push(node);
         edges.push({
           from: centerNode.id,
           to: node.id,
-          state: edgeStateFor(node.peer),
+          state: linkEdgeState(node.link, peer),
         });
-      });
-      return { nodes, edges };
-    }
+      },
+    );
 
-    // Ring / FullMesh / fallback: self in center, peers on a ring.
-    nodes.push(selfNode);
-    visiblePeers.forEach((p, i) => {
-      const angle = (i / visiblePeers.length) * Math.PI * 2 - Math.PI / 2;
-      const node: LaidOutNode = {
-        id: p.device_id,
-        label: p.label || shortId(p.device_id),
-        x: cx + Math.cos(angle) * radius,
-        y: cy + Math.sin(angle) * radius,
-        role: "peer",
-        peer: p,
-      };
-      nodes.push(node);
-      edges.push({
-        from: selfNode.id,
-        to: node.id,
-        state: edgeStateFor(p),
-      });
-    });
+    // Lay out internet-routed peers in a wider arc around the
+    // Internet node. Includes anyone classified as stun/turn/blocked/unknown.
+    const netRadius = Math.max(90, Math.min(width, height) / 3.2);
+    placeOnArc(
+      netPeers,
+      internetNode.x,
+      internetNode.y,
+      netRadius,
+      -Math.PI * 0.85,
+      -Math.PI * 0.15,
+      (node, peer) => {
+        node.role = "peer";
+        node.link = linkKindOf(peer);
+        nodes.push(node);
+        edges.push({
+          from: internetNode.id,
+          to: node.id,
+          state: linkEdgeState(node.link, peer),
+        });
+      },
+    );
 
+    // Topology decoration on peer↔peer edges. Same caveat as
+    // before: we don't actually know peer-to-peer link state from
+    // here, the dashed edges are illustrative.
     if (topo === "full_mesh") {
-      // Add peer-to-peer edges so the visualisation reflects the
-      // shape. We treat them as "transient" since we don't actually
-      // know peer-to-peer link state from here — the daemon only
-      // surfaces our half of the mesh. The edges are decorative
-      // but make the topology distinguishable from a ring at a
-      // glance.
       const peerNodes = nodes.filter((n) => n.role === "peer");
       for (let i = 0; i < peerNodes.length; i++) {
         for (let j = i + 1; j < peerNodes.length; j++) {
@@ -273,23 +526,67 @@
           });
         }
       }
-    } else if (topo === "ring" && nodes.length > 2) {
-      // Decorative chord edges around the ring — peers route along
-      // the ring in steady state. Same caveat as full-mesh: we
-      // don't see the actual peer-to-peer link state.
+    } else if (topo === "ring") {
       const peerNodes = nodes.filter((n) => n.role === "peer");
-      for (let i = 0; i < peerNodes.length; i++) {
-        const next = peerNodes[(i + 1) % peerNodes.length];
-        edges.push({
-          from: peerNodes[i].id,
-          to: next.id,
-          state: "transient",
-        });
+      if (peerNodes.length > 2) {
+        for (let i = 0; i < peerNodes.length; i++) {
+          const next = peerNodes[(i + 1) % peerNodes.length];
+          edges.push({
+            from: peerNodes[i].id,
+            to: next.id,
+            state: "transient",
+          });
+        }
       }
     }
 
     return { nodes, edges };
   });
+
+  /** Place peers on an arc and push the (mutable) `LaidOutNode`
+   *  into the provided callback so the caller can finalise role /
+   *  link / edges. We span an arc rather than a full ring so the
+   *  LAN cluster (around self) and the external cluster (around
+   *  internet) don't overlap visually. */
+  function placeOnArc(
+    list: PeerInfo[],
+    cx: number,
+    cy: number,
+    radius: number,
+    startAngle: number,
+    endAngle: number,
+    push: (node: LaidOutNode, peer: PeerInfo) => void,
+  ) {
+    if (list.length === 0) return;
+    const span = endAngle - startAngle;
+    const step = list.length === 1 ? 0 : span / (list.length - 1);
+    list.forEach((p, i) => {
+      const angle = startAngle + step * i;
+      const node: LaidOutNode = {
+        id: p.device_id,
+        label: p.label || shortId(p.device_id),
+        x: cx + Math.cos(angle) * radius,
+        y: cy + Math.sin(angle) * radius,
+        role: "peer",
+        peer: p,
+        link: null,
+      };
+      push(node, p);
+    });
+  }
+
+  /** Map the inferred link kind to an edge state — but fall back
+   *  to the standard active/shelved/transient when the peer is
+   *  alive on a normal data path (so we don't paint everything as
+   *  "lan/stun/turn" when the user is reading the green/yellow
+   *  active/shelved language). */
+  function linkEdgeState(link: LinkKind | null, peer: PeerInfo): LaidOutEdge["state"] {
+    if (link === "blocked") return "blocked";
+    if (link === "turn") return "turn";
+    if (link === "stun") return "stun";
+    if (link === "lan") return "lan";
+    return edgeStateFor(peer);
+  }
 
   function edgeStateFor(p: PeerInfo | null): "active" | "shelved" | "transient" {
     if (!p) return "transient";
@@ -326,18 +623,65 @@
   }
 
   function edgeStroke(state: LaidOutEdge["state"]): string {
-    if (state === "active") return "#4ade80";
-    if (state === "shelved") return "#6b7280";
-    return "#2a2a3a";
+    switch (state) {
+      case "active":
+      case "lan":
+        return "#4ade80";
+      case "shelved":
+        return "#6b7280";
+      case "stun":
+        return "#60a5fa";
+      case "turn":
+        return "#f59e0b";
+      case "blocked":
+        return "#ef4444";
+      case "internet":
+        return "#7d8aff";
+      default:
+        return "#2a2a3a";
+    }
   }
 
   function edgeDash(state: LaidOutEdge["state"]): string | undefined {
     if (state === "transient" || state === "shelved") return "4 4";
+    if (state === "turn" || state === "blocked" || state === "stun") return "5 4";
     return undefined;
   }
 
+  function edgeOpacity(state: LaidOutEdge["state"]): number {
+    if (state === "transient") return 0.45;
+    if (state === "internet") return internetEdgeOpacity;
+    return 0.9;
+  }
+
+  // ---- self↔internet edge pulse ---------------------------------------
+
+  /** Wall-clock ms tracked reactively so the network-change pulse
+   *  fades over a fixed window even when no other state updates. */
+  let nowMs = $state(Date.now());
+  $effect(() => {
+    const t = setInterval(() => (nowMs = Date.now()), 250);
+    return () => clearInterval(t);
+  });
+
+  const PULSE_WINDOW_MS = 4_000;
+
+  const internetPulseActive = $derived(
+    networkChangeTs > 0 && nowMs - networkChangeTs < PULSE_WINDOW_MS,
+  );
+
+  // Brighten the internet edge briefly after a network-change diag
+  // so the user sees that the engine noticed. Outside the window it
+  // sits at a calm default opacity.
+  const internetEdgeOpacity = $derived(internetPulseActive ? 1 : 0.55);
+
   const selectedPeer = $derived(
-    selectedPeerId ? peers.find((p) => p.device_id === selectedPeerId) ?? null : null,
+    // Look across the merged set so clicking a roster-only / offline
+    // node still surfaces its detail panel — selecting from the
+    // engine-only list would return null for known-but-not-here peers.
+    selectedPeerId
+      ? visiblePeers.find((p) => p.device_id === selectedPeerId) ?? null
+      : null,
   );
 
   /** This device's own display suffix, parsed from the daemon's
@@ -367,11 +711,54 @@
       <span class="topo">topology · {topologyName(network.topology)}</span>
     </div>
     <div class="legend">
-      <span><span class="sw" style="background:#4ade80"></span> active</span>
-      <span><span class="sw" style="background:#facc15"></span> shelved</span>
+      <span><span class="sw" style="background:#4ade80"></span> lan</span>
+      <span><span class="sw sw-line" style="background:#60a5fa"></span> stun</span>
+      <span><span class="sw sw-line" style="background:#f59e0b"></span> turn</span>
+      <span><span class="sw sw-line" style="background:#ef4444"></span> needs turn</span>
       <span><span class="sw" style="background:#a78bfa"></span> pending</span>
-      <span><span class="sw" style="background:#60a5fa"></span> handshaking</span>
-      <span><span class="sw" style="background:#94a3b8"></span> sighted</span>
+      <span><span class="sw" style="background:#6b7280"></span> offline</span>
+    </div>
+    <div class="zoom-controls" role="group" aria-label="Zoom controls">
+      <button
+        type="button"
+        class="zoom-btn"
+        title="Zoom out"
+        onclick={() => {
+          const next = Math.max(MIN_ZOOM, zoom / 1.25);
+          if (next === zoom) return;
+          const ratio = next / zoom;
+          panX = width / 2 - (width / 2 - panX) * ratio;
+          panY = height / 2 - (height / 2 - panY) * ratio;
+          zoom = next;
+          userTransformed = true;
+        }}
+      >
+        −
+      </button>
+      <button
+        type="button"
+        class="zoom-btn zoom-fit"
+        title="Fit graph to view"
+        onclick={applyFit}
+      >
+        {userTransformed ? `${Math.round(zoom * 100)}%` : "fit"}
+      </button>
+      <button
+        type="button"
+        class="zoom-btn"
+        title="Zoom in"
+        onclick={() => {
+          const next = Math.min(MAX_ZOOM, zoom * 1.25);
+          if (next === zoom) return;
+          const ratio = next / zoom;
+          panX = width / 2 - (width / 2 - panX) * ratio;
+          panY = height / 2 - (height / 2 - panY) * ratio;
+          zoom = next;
+          userTransformed = true;
+        }}
+      >
+        +
+      </button>
     </div>
   </div>
 
@@ -380,17 +767,26 @@
   <svg
     bind:this={canvas}
     class="canvas"
+    class:dragging
     {width}
     {height}
     viewBox="0 0 {width} {height}"
     onclick={(e) => {
       if (e.target === e.currentTarget) onSelectPeer(null);
     }}
+    onwheel={onWheel}
+    onpointerdown={onPointerDown}
+    onpointermove={onPointerMove}
+    onpointerup={onPointerUp}
+    onpointercancel={onPointerUp}
     role="img"
     aria-label="Mesh node graph"
   >
     <!-- Subtle dot grid in the background. Helps anchor the eye
-         when nodes move and reinforces the canvas affordance. -->
+         when nodes move and reinforces the canvas affordance. The
+         grid lives outside the pan/zoom group so it stays anchored
+         to the canvas (a moving grid behind a moving graph would be
+         visual noise). -->
     <defs>
       <pattern
         id="grid"
@@ -403,6 +799,8 @@
     </defs>
     <rect x="0" y="0" {width} {height} fill="url(#grid)" />
 
+    <g class="viewport" transform="translate({panX} {panY}) scale({zoom})">
+
     <!-- Edges. -->
     {#each layout.edges as edge}
       {@const a = layout.nodes.find((n) => n.id === edge.from)}
@@ -414,9 +812,10 @@
           x2={b.x}
           y2={b.y}
           stroke={edgeStroke(edge.state)}
-          stroke-width="1.5"
+          stroke-width={edge.state === "internet" && internetPulseActive ? 2.2 : 1.5}
           stroke-dasharray={edgeDash(edge.state)}
-          opacity={edge.state === "transient" ? 0.45 : 0.9}
+          opacity={edgeOpacity(edge.state)}
+          class:internet-pulse={edge.state === "internet" && internetPulseActive}
         />
       {/if}
     {/each}
@@ -424,10 +823,14 @@
     <!-- Nodes. -->
     {#each layout.nodes as node}
       {@const selected = node.peer && node.peer.device_id === selectedPeerId}
+      {@const offlineRoster =
+        node.peer && node.peer.status === "offline" && node.role === "peer"}
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <g
         class="node"
         class:selected
+        class:offline-roster={offlineRoster}
+        class:internet={node.role === "internet"}
         transform="translate({node.x},{node.y})"
         onclick={(e) => {
           e.stopPropagation();
@@ -440,10 +843,30 @@
           }
         }}
         role="button"
-        tabindex="0"
+        tabindex={node.peer ? 0 : -1}
         aria-label={node.label}
       >
-        {#if node.role === "self" || node.role === "hub"}
+        {#if node.role === "internet"}
+          <!-- Internet node: small cloud-ish capsule. Renders even
+               when no peers are visible so the user always sees the
+               link to the outside world. Stroke pulses with the
+               edge when network_watch reports a change. -->
+          <rect
+            x="-34"
+            y="-14"
+            width="68"
+            height="28"
+            rx="14"
+            ry="14"
+            fill="#0d0d18"
+            stroke={internetPulseActive ? "#a5b4ff" : "#5a6cd6"}
+            stroke-width={internetPulseActive ? 2.2 : 1.5}
+            class:internet-pulse={internetPulseActive}
+          />
+          <text y="4" text-anchor="middle" class="node-label internet-label">
+            {node.label}
+          </text>
+        {:else if node.role === "self" || node.role === "hub"}
           <circle r="32" fill="#0d0d1a" stroke={nodeColor(node)} stroke-width="2" />
           <text y="-6" text-anchor="middle" class="node-role">
             {node.role === "self" ? "you" : "hub"}
@@ -462,6 +885,19 @@
             stroke="#4ade80"
             stroke-width="1.5"
           />
+        {/if}
+        {#if node.peer?.needs_turn}
+          <!-- "Needs TURN" badge: small relay icon on the bottom-
+               right. Tells the user at a glance that signaling has
+               surfaced this peer but the data pipe is stuck because
+               we can't reach them directly and there's no relay
+               configured. The full diagnostic lands in the Activity
+               log via the existing ICE diag. -->
+          <g class="turn-badge" transform="translate(16, 16)">
+            <circle r="7" fill="#0d0d0d" stroke="#f59e0b" stroke-width="1.5" />
+            <text y="3" text-anchor="middle" class="turn-badge-glyph">⇆</text>
+            <title>Needs TURN — direct connectivity blocked (symmetric NAT?)</title>
+          </g>
         {/if}
         {#if pendingActionFor(node.peer)}
           <!-- Pending-action badge: pulsing ring + "!" glyph on the
@@ -488,6 +924,7 @@
         {/if}
       </g>
     {/each}
+    </g>
   </svg>
 
   {#if selectedPeer}
@@ -701,6 +1138,36 @@
     width: 100%;
     height: 100%;
     min-height: 0;
+    cursor: grab;
+    touch-action: none;
+  }
+  .canvas.dragging {
+    cursor: grabbing;
+  }
+  .zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+  }
+  .zoom-btn {
+    font: inherit;
+    font-size: 0.78rem;
+    line-height: 1;
+    color: #aaa;
+    background: #131318;
+    border: 1px solid #222226;
+    padding: 0.18rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    min-width: 1.8rem;
+  }
+  .zoom-btn:hover {
+    background: #1a1a22;
+    color: #e8e8e8;
+  }
+  .zoom-fit {
+    min-width: 3rem;
+    font-variant-numeric: tabular-nums;
   }
   .node {
     cursor: pointer;
@@ -974,5 +1441,61 @@
       opacity: 0.55;
       r: 7.5;
     }
+  }
+
+  /* Roster-only / offline peers: dim circle + greyed label so the
+     user reads "known but not here" at a glance without the node
+     competing with live peers for attention. */
+  .node.offline-roster :global(circle) {
+    opacity: 0.45;
+  }
+  .node.offline-roster :global(.node-label) {
+    fill: #888;
+  }
+
+  .node.internet {
+    cursor: default;
+  }
+  .node.internet:hover :global(rect) {
+    filter: brightness(1.18);
+  }
+  .internet-label {
+    fill: #b9c2ff;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    pointer-events: none;
+  }
+  /* Brief glow when network_watch detects a primary IP change.
+     Mirrors the stroke-width bump set on the edge in markup so the
+     two halves of the visual move together. */
+  .internet-pulse {
+    animation: internet-pulse 1.4s ease-in-out 2;
+  }
+  @keyframes internet-pulse {
+    0%, 100% {
+      filter: drop-shadow(0 0 0 rgba(165, 180, 255, 0));
+    }
+    50% {
+      filter: drop-shadow(0 0 6px rgba(165, 180, 255, 0.85));
+    }
+  }
+
+  .turn-badge {
+    pointer-events: none;
+  }
+  .turn-badge-glyph {
+    fill: #f59e0b;
+    font-size: 8px;
+    font-weight: 700;
+    text-anchor: middle;
+  }
+
+  /* Solid swatch = node colour key; line swatch = edge-style key
+     (so STUN/TURN/needs-turn read as edge types, not node states). */
+  .sw-line {
+    width: 14px;
+    height: 2px;
+    border-radius: 1px;
   }
 </style>

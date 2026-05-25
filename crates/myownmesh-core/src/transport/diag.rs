@@ -7,13 +7,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IceCandidateKind {
     Host,
     ServerReflexive,
     PeerReflexive,
     Relay,
+    #[default]
     Unknown,
 }
 
@@ -40,6 +41,18 @@ impl IceCandidateStats {
     pub fn total(&self) -> u32 {
         self.host + self.server_reflexive + self.peer_reflexive + self.relay + self.unknown
     }
+}
+
+/// The ICE candidate pair the agent ultimately picked for sending
+/// packets. Authoritative classification of how a peer's data is
+/// actually flowing — host↔host is LAN, anything with a relay is
+/// TURN, anything else (srflx / prflx involved) is STUN. Populated
+/// from `RTCIceTransport::get_selected_candidate_pair` once ICE
+/// reaches Connected/Completed; remains `None` until then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedCandidatePair {
+    pub local: IceCandidateKind,
+    pub remote: IceCandidateKind,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

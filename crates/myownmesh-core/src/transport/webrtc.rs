@@ -404,6 +404,51 @@ impl PeerSession {
         self.pc.connection_state()
     }
 
+    /// Ask the underlying ICE agent which candidate pair it actually
+    /// selected for sending packets. This is the authoritative
+    /// answer to "is this a LAN link or going through STUN/TURN" —
+    /// gathered candidate counts only tell us what was tried, not
+    /// what's in use. Returns `None` until ICE has settled
+    /// (Connected / Completed) and the agent has nominated a pair.
+    ///
+    /// Implementation note: webrtc-rs's `get_selected_candidate_pair`
+    /// returns a struct with private fields and no accessors (as of
+    /// 0.13), so we go through the stats API instead — the candidate-
+    /// pair stats expose `nominated` plus ids that resolve to local /
+    /// remote candidate stats with public `candidate_type` fields.
+    pub async fn selected_candidate_pair(&self) -> Option<super::diag::SelectedCandidatePair> {
+        use webrtc::ice::candidate::CandidateType;
+        use webrtc::stats::StatsReportType;
+        let report = self.pc.get_stats().await;
+        // Find the nominated pair. There can be several pair entries
+        // (one per checklist combination); only the nominated one is
+        // currently carrying packets.
+        let (local_id, remote_id) = report.reports.values().find_map(|r| match r {
+            StatsReportType::CandidatePair(p) if p.nominated => {
+                Some((p.local_candidate_id.clone(), p.remote_candidate_id.clone()))
+            }
+            _ => None,
+        })?;
+        fn map(t: CandidateType) -> super::diag::IceCandidateKind {
+            match t {
+                CandidateType::Host => super::diag::IceCandidateKind::Host,
+                CandidateType::ServerReflexive => super::diag::IceCandidateKind::ServerReflexive,
+                CandidateType::PeerReflexive => super::diag::IceCandidateKind::PeerReflexive,
+                CandidateType::Relay => super::diag::IceCandidateKind::Relay,
+                CandidateType::Unspecified => super::diag::IceCandidateKind::Unknown,
+            }
+        }
+        let local = report.reports.values().find_map(|r| match r {
+            StatsReportType::LocalCandidate(c) if c.id == local_id => Some(map(c.candidate_type)),
+            _ => None,
+        })?;
+        let remote = report.reports.values().find_map(|r| match r {
+            StatsReportType::RemoteCandidate(c) if c.id == remote_id => Some(map(c.candidate_type)),
+            _ => None,
+        })?;
+        Some(super::diag::SelectedCandidatePair { local, remote })
+    }
+
     /// Close the connection. Idempotent — subsequent close calls
     /// no-op, and dropping the session calls close implicitly via
     /// `RTCPeerConnection::drop`.
