@@ -3,16 +3,18 @@
 A pure-Rust peer-to-peer mesh networking stack on
 [webrtc-rs](https://github.com/webrtc-rs/webrtc).
 
-MyOwnMesh ships as both a **binary** (daemon + CLI) and a **library**
-(`myownmesh-core`), so other apps embed the mesh without inheriting a
-GUI or HTTP updater. ed25519 mutual auth with out-of-band verification
-codes, per-network rosters, selectable topologies (Ring / Star /
-FullMesh), Trystero-wire-compatible Nostr signaling, self-update with
+MyOwnMesh ships three ways: a **binary** (daemon + CLI), a **library**
+(`myownmesh-core`) that other apps embed without inheriting a GUI or
+HTTP updater, and an optional **desktop GUI** (Tauri + Svelte) that
+talks to the daemon over its local control socket. ed25519 mutual
+auth with out-of-band verification codes, per-network rosters,
+selectable topologies (Ring / Star / FullMesh),
+Trystero-wire-compatible Nostr signaling, self-update with
 configurable release feed.
 
 Status: connection engine, WebRTC transport, typed channels, RPC, and
 both in-process and Nostr signaling drivers are in. Two-peer
-integration test exercises the full stack end-to-end (88 tests pass).
+integration test exercises the full stack end-to-end (96 tests pass).
 
 ## Workspace
 
@@ -22,6 +24,8 @@ crates/
 ├── myownmesh-signaling    # lib  — Nostr signaling driver + local-broker for embedding
 ├── myownmesh-updater      # lib  — self-update with configurable release feed
 └── myownmesh              # bin  — daemon + CLI
+
+gui/                       # Tauri + Svelte 5 desktop frontend (client of the daemon)
 ```
 
 ## Quick start (embedder)
@@ -68,6 +72,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 See `examples/` for runnable demos and `docs/QUICKSTART.md` for the
 narrative walkthrough.
 
+## Desktop GUI
+
+A standalone Tauri + Svelte 5 frontend lives in `gui/`. It runs as a
+**client** of the daemon — it talks to `myownmesh serve` over the
+local control socket and never embeds `myownmesh-core` directly, so
+crashing the UI never disturbs the running mesh.
+
+What it gives you on top of the CLI:
+
+- **Node graph** — self at the centre, peers laid out by topology,
+  click a node for detail (label, stable display suffix, status,
+  RTT, capabilities). During pending approval the popup surfaces
+  the suffix + the 6-char verification code as colour-coded tiles
+  for out-of-band confirmation.
+- **Approvals tab** (first / default in Settings) — pending peer
+  requests from every joined network flatten into one list with
+  Approve / Deny buttons. The first thing a new user needs to do
+  is the first thing they see.
+- **Networks** — Status (topology selector + per-network rollup) ·
+  Connections (live peer table) · Roster (approved devices).
+- **Activity** — unified event log: peer state transitions, phase
+  changes, ICE / handshake / signaling diagnostics. Quiet toggle
+  suppresses info-level chatter; warns and errors always land.
+
+Run alongside the daemon:
+
+```bash
+just serve   # one shell — daemon + control socket
+just dev     # another shell — Tauri GUI with hot reload
+```
+
+See `gui/README.md` for the full layout, run instructions, and the
+wire protocol the GUI uses to talk to the daemon.
+
 ## Build
 
 ```
@@ -93,6 +131,7 @@ just dev         # run the daemon in foreground with debug logging
 - **`CONNECTION-ENGINE.md`** — the 7-tier reconnection ladder, every tunable constant, every edge case the engine handles.
 - **`CONTRIBUTING.md`** — local setup, code conventions, testing.
 - **`RELEASE.md`** — cutting a release.
+- **`gui/README.md`** — Tauri + Svelte desktop GUI: layout, tabs, run instructions, control-protocol wire shape.
 - **Per-crate `README.md`** in each `crates/*/` directory.
 - **`crates/myownmesh-signaling/src/upstream.rs`** — catalogue of upstream-Trystero fixes baked into our Nostr driver natively.
 - Rustdoc: `cargo doc --workspace --open`.
