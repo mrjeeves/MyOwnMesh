@@ -34,6 +34,18 @@ pub struct AuthorizedPeer {
     pub label: String,
     /// Unix-seconds timestamp of approval. Informational.
     pub approved_at: u64,
+    /// Authority tier within this network's governance. Defaults to
+    /// [`Role::Member`] so rosters written before the
+    /// `network_state_v1` feature shipped keep loading cleanly — and
+    /// so open networks (where the field is cosmetic) don't need to
+    /// stamp every entry.
+    ///
+    /// Source of truth for *enforced* authority on a closed network
+    /// is the `roles` map on [`crate::NetworkState`] — this field is
+    /// the locally-cached projection for fast peer-row rendering.
+    /// They are kept in sync by the engine on every signed transition.
+    #[serde(default)]
+    pub role: crate::network_state::Role,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -80,7 +92,9 @@ pub fn empty_for(network_id: &str) -> Roster {
 /// Add or refresh a peer in the roster. Idempotent — re-approving an
 /// existing peer updates their label but doesn't bump `approved_at`,
 /// so the user-facing "approved on …" reflects the original moment
-/// of trust.
+/// of trust. The existing peer's `role` is preserved through a
+/// re-approval (use [`set_role_in`] or
+/// [`crate::network_state::apply_transition`] to change it).
 pub fn add_peer_in(roster: &mut Roster, device_id: &str, label: &str) {
     let pubkey = crate::signing::pubkey_part(device_id).to_string();
     if let Some(existing) = roster
@@ -94,8 +108,27 @@ pub fn add_peer_in(roster: &mut Roster, device_id: &str, label: &str) {
             device_id: pubkey,
             label: label.to_string(),
             approved_at: now_unix(),
+            role: crate::network_state::Role::default(),
         });
     }
+}
+
+/// Update a roster entry's role tag. No-op if the peer isn't in the
+/// roster (callers should add first). Returns whether a row was
+/// changed so the caller can short-circuit a no-op disk write.
+pub fn set_role_in(roster: &mut Roster, device_id: &str, role: crate::network_state::Role) -> bool {
+    let pubkey = crate::signing::pubkey_part(device_id);
+    if let Some(existing) = roster
+        .authorized_devices
+        .iter_mut()
+        .find(|p| p.device_id == pubkey)
+    {
+        if existing.role != role {
+            existing.role = role;
+            return true;
+        }
+    }
+    false
 }
 
 pub fn remove_peer_in(roster: &mut Roster, device_id: &str) {
@@ -253,5 +286,82 @@ mod tests {
         assert_eq!(r.version, ROSTER_VERSION);
         assert_eq!(r.network_id, "net-x");
         assert!(r.authorized_devices.is_empty());
+    }
+
+    #[test]
+    fn default_role_is_member() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        assert_eq!(
+            r.authorized_devices[0].role,
+            crate::network_state::Role::Member
+        );
+    }
+
+    #[test]
+    fn old_roster_without_role_field_parses_with_member_default() {
+        // Schema before `network_state_v1` shipped. Loading it must
+        // keep working — `role` defaults to Member via #[serde(default)]
+        // and the existing peer keeps its `approved_at` intact.
+        let old_json = r#"{
+            "version": 1,
+            "network_id": "net-a",
+            "authorized_devices": [
+                { "device_id": "peer1", "label": "Old laptop", "approved_at": 1700000000 }
+            ]
+        }"#;
+        let r: Roster = serde_json::from_str(old_json).unwrap();
+        assert_eq!(r.authorized_devices.len(), 1);
+        let p = &r.authorized_devices[0];
+        assert_eq!(p.device_id, "peer1");
+        assert_eq!(p.label, "Old laptop");
+        assert_eq!(p.approved_at, 1700000000);
+        assert_eq!(p.role, crate::network_state::Role::Member);
+    }
+
+    #[test]
+    fn set_role_changes_existing_entry() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        assert!(set_role_in(
+            &mut r,
+            "peer1",
+            crate::network_state::Role::Controller
+        ));
+        assert_eq!(
+            r.authorized_devices[0].role,
+            crate::network_state::Role::Controller
+        );
+        // Idempotent — same role is a no-op.
+        assert!(!set_role_in(
+            &mut r,
+            "peer1",
+            crate::network_state::Role::Controller
+        ));
+    }
+
+    #[test]
+    fn set_role_is_noop_on_missing_peer() {
+        let mut r = empty_for("net-a");
+        assert!(!set_role_in(
+            &mut r,
+            "ghost",
+            crate::network_state::Role::Owner
+        ));
+        assert!(r.authorized_devices.is_empty());
+    }
+
+    #[test]
+    fn add_peer_preserves_existing_role() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        set_role_in(&mut r, "peer1", crate::network_state::Role::Owner);
+        // Re-add with a new label — role stays.
+        add_peer_in(&mut r, "peer1", "Laptop-renamed");
+        assert_eq!(r.authorized_devices[0].label, "Laptop-renamed");
+        assert_eq!(
+            r.authorized_devices[0].role,
+            crate::network_state::Role::Owner
+        );
     }
 }

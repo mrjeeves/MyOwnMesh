@@ -23,6 +23,7 @@ fn cfg(label: &str, auto_approve: bool) -> NetworkConfig {
         id: label.into(),
         network_id: "roster-demo".into(),
         label: label.into(),
+        kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),

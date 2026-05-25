@@ -18,6 +18,7 @@ fn fresh_network(id: &str) -> NetworkConfig {
         id: id.to_string(),
         network_id: format!("two-peer-test-{id}"),
         label: id.to_string(),
+        kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),

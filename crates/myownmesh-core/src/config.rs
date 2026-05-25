@@ -160,6 +160,21 @@ pub struct NetworkConfig {
     /// Cosmetic display name. Empty falls back to `network_id`.
     #[serde(default)]
     pub label: String,
+    /// Initial governance kind for this network. Open is the
+    /// default and matches the engine's behaviour through every
+    /// release before `network_state_v1` shipped. Closed sets up
+    /// the per-network signed state log so the founder
+    /// self-elects as `Owner` on first attach. Configs written by
+    /// older builds parse via #[serde(default)] without an
+    /// explicit field.
+    ///
+    /// At runtime, the *authoritative* kind is the one in the
+    /// signed [`crate::NetworkState`] log; this field is only the
+    /// initial value used to bootstrap the log on first attach.
+    /// Subsequent kind changes happen via signed transitions, not
+    /// by editing config.json.
+    #[serde(default)]
+    pub kind: crate::network_state::NetworkKind,
     #[serde(default)]
     pub topology: TopologyMode,
     #[serde(default)]
