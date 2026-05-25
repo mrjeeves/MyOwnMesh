@@ -78,6 +78,44 @@ pub enum Request {
         network: String,
     },
     EventsSubscribe,
+
+    // ---- closed-network governance --------------------------------
+    GovernanceState {
+        network: String,
+    },
+    GovernanceProposeKindChange {
+        network: String,
+        /// `"open"` or `"closed"`. The daemon's NetworkKind enum
+        /// serialises snake_case so we keep this stringly-typed on
+        /// the GUI side rather than re-deriving the enum here.
+        to: String,
+    },
+    GovernanceProposeRoleGrant {
+        network: String,
+        target: String,
+        /// `"member"` | `"controller"` | `"owner"`.
+        role: String,
+    },
+    GovernanceProposeRoleRevoke {
+        network: String,
+        target: String,
+    },
+    GovernanceSign {
+        network: String,
+        proposal_id: String,
+    },
+    GovernanceDeny {
+        network: String,
+        proposal_id: String,
+    },
+    GovernanceWithdraw {
+        network: String,
+        proposal_id: String,
+    },
+    GovernanceSpawnSplit {
+        network: String,
+        proposal_id: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]

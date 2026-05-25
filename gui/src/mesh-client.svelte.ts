@@ -39,6 +39,14 @@ function createMeshClient() {
   // graph merges these with `peersByNetwork` so peers we've ever
   // connected to stay visible even when offline / not in signaling.
   let rostersByNetwork = $state<Record<string, AuthorizedPeer[]>>({});
+  /** Per-network signed governance snapshot — kind, roles,
+   *  transition log, pending proposals, splits. Mirrors the daemon's
+   *  `crate::network_state::NetworkState`. Polled on the same cadence
+   *  as peers + rosters; refreshed eagerly after each governance
+   *  mutation so the UI sees its own writes immediately. Loosely
+   *  typed because we don't currently mirror every field in
+   *  `types.ts` — the Governance tab reads what it needs by key. */
+  let governanceByNetwork = $state<Record<string, unknown>>({});
   let diags = $state<DiagEntry[]>([]);
   // Wall-clock ms of the most recent "network change" diag, per
   // network. The NodeMap animates the self↔internet edge for a few
@@ -139,7 +147,11 @@ function createMeshClient() {
    *  ground truth. */
   async function refreshAll() {
     await Promise.all([refreshStatus(), refreshIdentity(), refreshNetworks()]);
-    await Promise.all([refreshAllPeers(), refreshAllRosters()]);
+    await Promise.all([
+      refreshAllPeers(),
+      refreshAllRosters(),
+      refreshAllGovernance(),
+    ]);
   }
 
   // ---- mutations ------------------------------------------------------
@@ -201,6 +213,102 @@ function createMeshClient() {
    *  `NetworkConfig`, so the type here is intentionally loose. */
   async function exportNetworkFile(path: string, config: unknown): Promise<void> {
     await invoke("mesh_network_export_file", { path, config });
+  }
+
+  // ---- governance (closed networks) ----------------------------------
+  //
+  // Daemon-backed governance state. Each call below proxies through
+  // the corresponding `mesh_governance_*` Tauri command which round-
+  // trips to the daemon, signs (where applicable), and persists.
+  // After every mutation we refresh the cached state so the UI
+  // re-renders.
+
+  async function governanceState(network: string): Promise<unknown> {
+    const resp = (await invoke("mesh_governance_state", { network })) as {
+      state: unknown;
+    };
+    return resp.state;
+  }
+
+  async function refreshGovernance(network: string) {
+    try {
+      const s = await governanceState(network);
+      governanceByNetwork[network] = s;
+    } catch (e) {
+      // Daemon may not yet have this network in its registry, or
+      // we're racing a remove. Keep the prior cached state.
+      lastError = String(e);
+    }
+  }
+
+  async function refreshAllGovernance() {
+    await Promise.all(networks.map((n) => refreshGovernance(n.config_id)));
+  }
+
+  async function governanceProposeKindChange(
+    network: string,
+    to: "open" | "closed",
+  ): Promise<string> {
+    const resp = (await invoke("mesh_governance_propose_kind_change", {
+      network,
+      to,
+    })) as { proposal_id: string };
+    await refreshGovernance(network);
+    return resp.proposal_id;
+  }
+
+  async function governanceProposeRoleGrant(
+    network: string,
+    target: string,
+    role: "member" | "controller" | "owner",
+  ): Promise<string> {
+    const resp = (await invoke("mesh_governance_propose_role_grant", {
+      network,
+      target,
+      role,
+    })) as { proposal_id: string };
+    await refreshGovernance(network);
+    return resp.proposal_id;
+  }
+
+  async function governanceProposeRoleRevoke(
+    network: string,
+    target: string,
+  ): Promise<string> {
+    const resp = (await invoke("mesh_governance_propose_role_revoke", {
+      network,
+      target,
+    })) as { proposal_id: string };
+    await refreshGovernance(network);
+    return resp.proposal_id;
+  }
+
+  async function governanceSign(network: string, proposalId: string) {
+    await invoke("mesh_governance_sign", { network, proposalId });
+    await refreshGovernance(network);
+    await refreshRoster(network);
+  }
+
+  async function governanceDeny(network: string, proposalId: string) {
+    await invoke("mesh_governance_deny", { network, proposalId });
+    await refreshGovernance(network);
+  }
+
+  async function governanceWithdraw(network: string, proposalId: string) {
+    await invoke("mesh_governance_withdraw", { network, proposalId });
+    await refreshGovernance(network);
+  }
+
+  async function governanceSpawnSplit(
+    network: string,
+    proposalId: string,
+  ): Promise<string> {
+    const resp = (await invoke("mesh_governance_spawn_split", {
+      network,
+      proposalId,
+    })) as { new_network_id: string };
+    await refreshGovernance(network);
+    return resp.new_network_id;
   }
 
   // ---- event stream handling ------------------------------------------
@@ -405,6 +513,11 @@ function createMeshClient() {
       // approve flow — but a manual edit on the host wouldn't),
       // so piggy-back on the same poll cadence.
       void refreshAllRosters();
+      // Same logic for governance state: it changes via peer-
+      // initiated proposals / acks / splits, and there's no event
+      // surface for those yet. Polled cheap; the daemon returns a
+      // small JSON.
+      void refreshAllGovernance();
     }, POLL_INTERVAL_MS);
   }
 
@@ -444,6 +557,9 @@ function createMeshClient() {
     get rostersByNetwork() {
       return rostersByNetwork;
     },
+    get governanceByNetwork() {
+      return governanceByNetwork;
+    },
     get networkChangeTsByNetwork() {
       return networkChangeTsByNetwork;
     },
@@ -472,6 +588,17 @@ function createMeshClient() {
     networkAdd,
     networkRemove,
     exportNetworkFile,
+
+    // governance
+    governanceState,
+    refreshGovernance,
+    governanceProposeKindChange,
+    governanceProposeRoleGrant,
+    governanceProposeRoleRevoke,
+    governanceSign,
+    governanceDeny,
+    governanceWithdraw,
+    governanceSpawnSplit,
   };
 }
 

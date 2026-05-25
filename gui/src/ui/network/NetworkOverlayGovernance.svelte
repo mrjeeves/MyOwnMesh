@@ -45,7 +45,7 @@
     }
     busy = true;
     actionError = null;
-    const r = governance.proposeKindChange(network.config_id, selfPubkey, to);
+    const r = await governance.proposeKindChange(network.config_id, selfPubkey, to);
     if (!r.ok) actionError = r.reason ?? "Couldn't float proposal.";
     busy = false;
   }
@@ -54,7 +54,7 @@
     if (!selfPubkey) return;
     busy = true;
     actionError = null;
-    const r = governance.signProposal(network.config_id, selfPubkey, p.id);
+    const r = await governance.signProposal(network.config_id, selfPubkey, p.id);
     if (!r.ok) actionError = r.reason ?? "Couldn't sign.";
     busy = false;
   }
@@ -63,7 +63,7 @@
     if (!selfPubkey) return;
     busy = true;
     actionError = null;
-    const r = governance.denyProposal(network.config_id, selfPubkey, p.id);
+    const r = await governance.denyProposal(network.config_id, selfPubkey, p.id);
     if (!r.ok) actionError = r.reason ?? "Couldn't deny.";
     busy = false;
   }
@@ -72,7 +72,7 @@
     if (!selfPubkey) return;
     busy = true;
     actionError = null;
-    const r = governance.withdrawProposal(network.config_id, selfPubkey, p.id);
+    const r = await governance.withdrawProposal(network.config_id, selfPubkey, p.id);
     if (!r.ok) actionError = r.reason ?? "Couldn't withdraw.";
     busy = false;
   }
@@ -122,19 +122,12 @@
 </script>
 
 <div class="tab">
-  <div class="preview-banner" role="status">
-    <strong>Preview mode</strong>
-    <span>
-      Governance is designed to be enforced <strong>at the engine
-      layer</strong>: every transition rides as a signed
-      <code>network_state</code> frame and peers drop frames whose
-      signer set doesn't satisfy the quorum table. Until that ships
-      (design at <code>docs/NETWORK-TYPES.md</code>), the kind
-      toggle and role grants on this tab live only in this browser's
-      <code>localStorage</code> — useful for exploring the surface
-      and for downstream embedders implementing the design, but the
-      daemon isn't checking signatures yet.
-    </span>
+  <div class="info-banner" role="status">
+    Governance is enforced at the engine: every transition rides as
+    a signed <code>network_state</code> frame, peers verify each
+    signature, and the daemon drops frames whose signer set doesn't
+    satisfy the quorum table. See
+    <code>docs/NETWORK-TYPES.md</code> for the spec.
   </div>
 
   {#if actionError}
@@ -362,26 +355,20 @@
     flex-direction: column;
     gap: 0.85rem;
   }
-  .preview-banner {
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    background: #1f1a0c;
-    border: 1px solid #4a3a14;
-    color: #fbbf24;
-    padding: 0.6rem 0.8rem;
+  .info-banner {
+    background: #131820;
+    border: 1px solid #1c2630;
+    color: #b8c5d0;
+    padding: 0.55rem 0.7rem;
     border-radius: 6px;
     font-size: 0.78rem;
     line-height: 1.45;
   }
-  .preview-banner strong {
-    color: #fde68a;
-  }
-  .preview-banner code {
-    background: #2a200c;
+  .info-banner code {
+    background: #1a1a22;
     padding: 0.02rem 0.3rem;
     border-radius: 3px;
-    font-size: 0.74rem;
+    font-size: 0.72rem;
   }
   .err {
     background: #3a1717;

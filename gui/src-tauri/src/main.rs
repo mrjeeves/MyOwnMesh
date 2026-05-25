@@ -279,6 +279,141 @@ fn mesh_subscription_state(state: State<'_, AppState>) -> serde_json::Value {
     state.last_subscription_status.lock().clone()
 }
 
+// ---- closed-network governance ----------------------------------------
+//
+// Thin wrappers around the daemon's governance ops. The GUI calls
+// these via `invoke(...)` and gets back the same shape the control
+// protocol's `Response` carries — Ok branch is the JSON `data` payload,
+// Err branch is the `error` string.
+
+#[tauri::command]
+async fn mesh_governance_state(
+    state: State<'_, AppState>,
+    network: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceState { network })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_propose_kind_change(
+    state: State<'_, AppState>,
+    network: String,
+    to: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceProposeKindChange { network, to })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_propose_role_grant(
+    state: State<'_, AppState>,
+    network: String,
+    target: String,
+    role: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceProposeRoleGrant {
+            network,
+            target,
+            role,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_propose_role_revoke(
+    state: State<'_, AppState>,
+    network: String,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceProposeRoleRevoke { network, target })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_sign(
+    state: State<'_, AppState>,
+    network: String,
+    proposal_id: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceSign {
+            network,
+            proposal_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_deny(
+    state: State<'_, AppState>,
+    network: String,
+    proposal_id: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceDeny {
+            network,
+            proposal_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_withdraw(
+    state: State<'_, AppState>,
+    network: String,
+    proposal_id: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceWithdraw {
+            network,
+            proposal_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_spawn_split(
+    state: State<'_, AppState>,
+    network: String,
+    proposal_id: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceSpawnSplit {
+            network,
+            proposal_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
 /// Background task that owns the daemon's event subscription. Each
 /// incoming line becomes a `mesh://event` Tauri event on the frontend.
 /// On disconnect we wait a beat and re-subscribe — the daemon may be
@@ -343,6 +478,14 @@ fn main() {
             mesh_network_remove,
             mesh_network_export_file,
             mesh_subscription_state,
+            mesh_governance_state,
+            mesh_governance_propose_kind_change,
+            mesh_governance_propose_role_grant,
+            mesh_governance_propose_role_revoke,
+            mesh_governance_sign,
+            mesh_governance_deny,
+            mesh_governance_withdraw,
+            mesh_governance_spawn_split,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
