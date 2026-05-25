@@ -809,6 +809,21 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(state, device_id, channel, payload).await
         }
+        // Closed-network governance + roster gossip arrive here once
+        // the engine handlers in `engine::governance` are wired in
+        // the next commit on this branch. For now the variants are
+        // accepted at the wire layer so the protocol module + tests
+        // compile, but no enforcement runs — the GUI's preview-mode
+        // governance store still owns the state until then.
+        MeshMessage::NetworkState(_)
+        | MeshMessage::NetworkStatePropose(_)
+        | MeshMessage::NetworkStateAck(_)
+        | MeshMessage::NetworkStateSplit(_)
+        | MeshMessage::RosterSummary(_)
+        | MeshMessage::RosterRequest(_)
+        | MeshMessage::RosterEntries(_) => {
+            trace!(peer = %device_id, "network_state_v1 frame received; handler not yet wired");
+        }
         MeshMessage::Unknown => {
             trace!(peer = %device_id, "discarding unknown frame variant");
         }

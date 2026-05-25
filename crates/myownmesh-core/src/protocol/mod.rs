@@ -32,12 +32,18 @@
 //! with frames they'll discard.
 
 pub mod features;
+pub mod governance;
 pub mod handshake;
 pub mod keepalive;
 pub mod rpc;
 pub mod topology;
 
 pub use features::{Feature, ADVERTISED_FEATURES};
+pub use governance::{
+    AckDecision, NetworkStateAckMessage, NetworkStateBroadcast, NetworkStateProposeMessage,
+    NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
+    RosterSummaryMessage,
+};
 pub use handshake::{ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage};
 pub use keepalive::{PingMessage, PongMessage};
 pub use rpc::{
@@ -69,6 +75,33 @@ pub enum MeshMessage {
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),
     RpcStreamEnd(RpcStreamEndMessage),
+
+    // -- closed-network governance (gated by `network_state_v1`) --
+    /// Sender's snapshot of the network's governance state.
+    /// Broadcast on ACTIVE; receivers compare against their own to
+    /// detect drift.
+    NetworkState(NetworkStateBroadcast),
+    /// In-flight transition awaiting signatures. The proposer signs
+    /// at issue time; co-signers respond with `NetworkStateAck`.
+    NetworkStatePropose(NetworkStateProposeMessage),
+    /// Sign-or-deny response to a `NetworkStatePropose`.
+    NetworkStateAck(NetworkStateAckMessage),
+    /// Proposer-initiated split fallback after the consent timeout
+    /// expires on a stuck close. Spawns a derived closed network
+    /// containing the signers the proposer had so far.
+    NetworkStateSplit(NetworkStateSplitMessage),
+
+    // -- roster gossip (gated by `network_state_v1`) --
+    /// Merkle-root summary of the sender's roster. Triggers a
+    /// `RosterRequest` from receivers whose root disagrees.
+    RosterSummary(RosterSummaryMessage),
+    /// "Send me the entries I'm missing." Carried alone on a
+    /// targeted reply to a `RosterSummary`.
+    RosterRequest(RosterRequestMessage),
+    /// Roster entries the responder is sharing. Receivers verify
+    /// each entry's authority chain before merging.
+    RosterEntries(RosterEntriesMessage),
+
     /// Application payload on a user-defined typed channel. The
     /// `channel` name is the embedder's identifier; `payload` is the
     /// raw serialized message body. Receivers route to the matching
@@ -122,5 +155,106 @@ mod tests {
             }
             _ => panic!("did not round-trip as Hello"),
         }
+    }
+
+    #[test]
+    fn network_state_broadcast_round_trips() {
+        use crate::network_state::NetworkKind;
+        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
+            kind: NetworkKind::Closed,
+            transitions_count: 4,
+            roster_root: "abcdefghij".into(),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: MeshMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            MeshMessage::NetworkState(b) => {
+                assert_eq!(b.kind, NetworkKind::Closed);
+                assert_eq!(b.transitions_count, 4);
+                assert_eq!(b.roster_root, "abcdefghij");
+            }
+            _ => panic!("did not round-trip as NetworkState"),
+        }
+    }
+
+    #[test]
+    fn network_state_kind_discriminator_is_snake_case() {
+        // Wire-level kind tag must be snake_case so the JS GUI's
+        // existing dispatch tables don't need a special case for
+        // these. Pinning here so a future #[serde(rename_all)]
+        // tweak doesn't silently break interop.
+        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
+            kind: crate::network_state::NetworkKind::Open,
+            transitions_count: 0,
+            roster_root: "x".into(),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""kind":"network_state""#));
+    }
+
+    #[test]
+    fn ack_decision_round_trips() {
+        let msg = MeshMessage::NetworkStateAck(NetworkStateAckMessage {
+            proposal_id: "prop_x".into(),
+            signer: "alice".into(),
+            decision: AckDecision::Deny,
+            at: 42,
+            signature: "sig".into(),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""decision":"deny""#));
+        let back: MeshMessage = serde_json::from_str(&s).unwrap();
+        match back {
+            MeshMessage::NetworkStateAck(a) => {
+                assert_eq!(a.decision, AckDecision::Deny);
+                assert_eq!(a.signer, "alice");
+            }
+            _ => panic!("did not round-trip as NetworkStateAck"),
+        }
+    }
+
+    #[test]
+    fn roster_summary_round_trips() {
+        let msg = MeshMessage::RosterSummary(RosterSummaryMessage {
+            root: "merkle_root".into(),
+            count: 3,
+            last_edit_ts: 1700000000,
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: MeshMessage = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, MeshMessage::RosterSummary(_)));
+    }
+
+    #[test]
+    fn roster_request_defaults_clean() {
+        // include_all + subtree_hashes are #[serde(default)] so an
+        // empty request frame parses without per-field nulls. v1
+        // peers send `{ "kind": "roster_request" }` literally.
+        let raw = r#"{"kind":"roster_request"}"#;
+        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
+        match msg {
+            MeshMessage::RosterRequest(r) => {
+                assert!(!r.include_all);
+                assert!(r.subtree_hashes.is_empty());
+            }
+            _ => panic!("did not parse as RosterRequest"),
+        }
+    }
+
+    #[test]
+    fn old_peer_drops_governance_frame_as_unknown() {
+        // A v0 peer (no `network_state_v1` flag) receiving one of
+        // these frames just sees an Unknown variant — its dispatch
+        // loop logs and drops without errors. The sender side gates
+        // emission on the peer's advertised features, but receivers
+        // belt-and-braces handle the case.
+        let raw = r#"{"kind":"network_state_propose","proposal_id":"x","variant":{"kind":"role_grant","target":"a","role":"member"},"proposer":"b","created_at":0,"signature":"s"}"#;
+        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
+        assert!(matches!(msg, MeshMessage::NetworkStatePropose(_)));
+        // And the inverse — a future kind a v1 doesn't know about
+        // still hits Unknown.
+        let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
+        let msg: MeshMessage = serde_json::from_str(raw_future).unwrap();
+        assert!(matches!(msg, MeshMessage::Unknown));
     }
 }
