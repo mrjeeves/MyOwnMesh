@@ -216,13 +216,36 @@ function createMeshClient() {
       ingestEvent(evt.payload);
     });
     unsubStatus = await listen<SubscriptionStatus>("mesh://subscription", (evt) => {
-      connected = evt.payload.status === "live" ? "live" : "disconnected";
-      if (evt.payload.error) lastError = evt.payload.error;
-      if (evt.payload.status === "live") {
-        // Subscription just (re-)connected; resync from snapshot APIs.
-        void refreshAll();
-      }
+      applySubscriptionStatus(evt.payload);
     });
+    // Race-safety: the backend emits `mesh://subscription` exactly
+    // once per subscribe cycle, which on a fast machine can fire
+    // before `listen()` registers our handler. The backend caches
+    // the most recent payload; pull it now so we pick up the
+    // current state regardless of whether we missed the emit.
+    try {
+      const current = (await invoke("mesh_subscription_state")) as SubscriptionStatus;
+      applySubscriptionStatus(current);
+    } catch (e) {
+      // If the backend doesn't have the command (older build) just
+      // fall through — the event-driven path still works once a
+      // status change actually fires.
+      console.warn("mesh_subscription_state query failed:", e);
+    }
+  }
+
+  function applySubscriptionStatus(payload: SubscriptionStatus) {
+    const wasLive = connected === "live";
+    connected = payload.status === "live" ? "live" : "disconnected";
+    if (payload.error) lastError = payload.error;
+    if (connected === "live") {
+      // Clear stale error once we're back up.
+      lastError = null;
+      // Subscription just (re-)connected; resync from snapshot APIs.
+      // Skip if we were already live to avoid double-refresh when
+      // the cached state happens to match an event we also got.
+      if (!wasLive) void refreshAll();
+    }
   }
 
   function startPolling() {

@@ -13,7 +13,7 @@ use tracing::trace;
 use crate::channels::RawChannelFrame;
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
-use crate::events::{DropReason, MeshEvent, MeshPhase, PhaseEvent};
+use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::roster::Roster;
@@ -213,6 +213,53 @@ impl NetworkState {
         let _ = self.events_tx.send(event);
     }
 
+    /// Emit a structured diagnostic — both to the tracing layer
+    /// (visible in daemon stderr) and to the broadcast channel as
+    /// a [`MeshEvent::Diag`] (consumed by the GUI's Activity tab).
+    /// Prefer this over a bare `tracing::info!`/`warn!` for events
+    /// the user should see in the UI; the helper writes to both
+    /// surfaces so operators reading logs and users watching the
+    /// GUI stay in sync.
+    pub fn log_diag(&self, level: DiagLevel, category: &str, message: impl Into<String>) {
+        self.log_diag_with(level, category, message, serde_json::Value::Null);
+    }
+
+    /// Variant of [`log_diag`] that carries a structured `detail`
+    /// payload alongside the message. Use for events where the GUI
+    /// might want to drill into fields (peer id, error code, etc.)
+    /// rather than just render the human-readable line.
+    pub fn log_diag_with(
+        &self,
+        level: DiagLevel,
+        category: &str,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) {
+        let message = message.into();
+        match level {
+            DiagLevel::Debug => {
+                tracing::debug!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Info => {
+                tracing::info!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Warn => {
+                tracing::warn!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Error => {
+                tracing::error!(network = %self.network_id, category = %category, "{message}")
+            }
+        }
+        self.emit(MeshEvent::Diag(DiagEntry {
+            ts: now_unix_ms(),
+            network_id: self.network_id.clone(),
+            level,
+            category: category.to_string(),
+            message,
+            detail,
+        }));
+    }
+
     /// Update the per-network phase and emit on change.
     pub fn set_phase(&self, next: MeshPhase) {
         let mut current = self.current_phase.write();
@@ -227,6 +274,11 @@ impl NetworkState {
             prev,
             next,
         }));
+        self.log_diag(
+            DiagLevel::Info,
+            "phase",
+            format!("phase: {prev:?} → {next:?}"),
+        );
     }
 
     /// Subscribe to a named user channel. Returns a fresh
@@ -414,4 +466,16 @@ impl NetworkState {
         }
         self.peers.clear();
     }
+}
+
+/// Unix epoch milliseconds. Stamped on every [`DiagEntry`] so the
+/// GUI's Activity log can render a per-entry HH:MM:SS clock — wall
+/// time, not monotonic: the user cares what time it actually was
+/// when something happened, not how long after process start.
+pub(crate) fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

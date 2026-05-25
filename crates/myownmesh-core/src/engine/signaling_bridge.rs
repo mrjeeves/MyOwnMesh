@@ -161,7 +161,22 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         denylist: cfg.signaling.denylist.clone(),
         redundancy: cfg.signaling.redundancy as usize,
     };
+    let redundancy = nostr_cfg.redundancy;
     drop(cfg);
+
+    let room_handle = myownmesh_signaling::nostr::handle::derive_room_handle(
+        &nostr_cfg.app_id,
+        &nostr_cfg.network_id,
+    );
+    state.log_diag(
+        crate::events::DiagLevel::Info,
+        "signaling",
+        format!(
+            "online — listening for peers in room {}… ({} relays)",
+            &room_handle[..room_handle.len().min(12)],
+            redundancy,
+        ),
+    );
 
     let (out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<NostrInbound>();

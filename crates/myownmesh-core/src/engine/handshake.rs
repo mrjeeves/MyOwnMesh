@@ -27,7 +27,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::events::{DropReason, MeshEvent, PeerEvent};
 use crate::protocol::{
@@ -140,7 +140,12 @@ fn schedule_watchdog(state: Arc<NetworkState>, device_id: String) {
                     .unwrap_or(false)
         };
         if should_fail {
-            warn!(peer = %device_id, "handshake watchdog fired — tearing down");
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "handshake",
+                format!("handshake watchdog fired for {device_id} — tearing down"),
+                serde_json::json!({ "peer": device_id }),
+            );
             super::drop_peer(&state, &device_id, DropReason::HeartbeatTimeout).await;
         }
     });
@@ -253,6 +258,28 @@ pub async fn on_auth_response(
         )
     };
 
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "handshake",
+        format!(
+            "auth ok with {device_id} ({})",
+            if auto_approve {
+                if rostered {
+                    "rostered → auto-approve"
+                } else {
+                    "auto-approve enabled"
+                }
+            } else {
+                "awaiting user approval"
+            }
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "rostered": rostered,
+            "auto_approve": auto_approve,
+        }),
+    );
+
     state.emit(MeshEvent::Peer(PeerEvent::Authenticated {
         network_id: state.network_id.clone(),
         device_id: device_id.to_string(),
@@ -288,7 +315,12 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         (active, data.label.clone())
     };
     if now_active {
-        info!(peer = %device_id, "peer ACTIVE");
+        state.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "peer",
+            format!("peer active: {device_id}"),
+            serde_json::json!({ "peer": device_id }),
+        );
         state.emit(MeshEvent::Peer(PeerEvent::Approved {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
@@ -300,7 +332,12 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
 }
 
 pub async fn on_deny(state: &Arc<NetworkState>, device_id: &str, deny: DenyMessage) {
-    warn!(peer = %device_id, reason = ?deny.reason, "peer denied us");
+    state.log_diag_with(
+        crate::events::DiagLevel::Warn,
+        "auth",
+        format!("peer denied us: {device_id} (reason: {:?})", deny.reason),
+        serde_json::json!({ "peer": device_id, "reason": format!("{:?}", deny.reason) }),
+    );
     super::drop_peer(state, device_id, DropReason::Denied).await;
 }
 

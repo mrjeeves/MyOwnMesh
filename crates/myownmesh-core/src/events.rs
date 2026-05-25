@@ -49,6 +49,10 @@ pub enum DiagLevel {
 /// duplicating the engine's classification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagEntry {
+    /// Unix epoch milliseconds when the entry was produced. The GUI
+    /// renders this as HH:MM:SS in the Activity log so a user can
+    /// correlate entries with what they were doing.
+    pub ts: u64,
     pub network_id: String,
     pub level: DiagLevel,
     /// Short categorical tag, e.g. `"signaling"`, `"ice"`,

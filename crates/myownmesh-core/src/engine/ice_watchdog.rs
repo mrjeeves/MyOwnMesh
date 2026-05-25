@@ -90,7 +90,12 @@ async fn try_restart_ice(state: &Arc<NetworkState>, device_id: &str) {
         };
     }
     if let Err(e) = session.restart_ice().await {
-        warn!(peer = %device_id, "restart_ice failed: {e}");
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "ice",
+            format!("restart_ice failed for {device_id}: {e}"),
+            serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+        );
     }
 
     // Schedule the recovery check. After `ICE_RESTART_RECOVERY_MS`
@@ -109,7 +114,12 @@ async fn try_restart_ice(state: &Arc<NetworkState>, device_id: &str) {
             !matches!(data.tier, ConnectionTier::Steady)
         };
         if still_failing {
-            warn!(peer = %device_id, "ICE restart did not recover — escalating to Tier 4");
+            state_clone.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "ice",
+                format!("ICE restart did not recover for {device_id} — escalating to Tier 4"),
+                serde_json::json!({ "peer": device_id }),
+            );
             super::ladder::escalate_to_rehandshake(&state_clone, &device_id).await;
         }
     });
@@ -119,7 +129,12 @@ async fn try_restart_ice(state: &Arc<NetworkState>, device_id: &str) {
 /// reports `Failed`. Skips the watchdog window — we know the
 /// connection is gone.
 pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
-    warn!(peer = %device_id, "ICE failed — Tier 4 immediately");
+    state.log_diag_with(
+        crate::events::DiagLevel::Warn,
+        "ice",
+        format!("ICE failed for {device_id} — Tier 4 immediately"),
+        serde_json::json!({ "peer": device_id }),
+    );
     maybe_emit_no_turn_diag(state, device_id);
     super::ladder::escalate_to_rehandshake(state, device_id).await;
 }
@@ -176,6 +191,7 @@ fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
         "no TURN configured and ICE keeps failing"
     );
     state.emit(MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
         network_id: state.network_id.clone(),
         level: DiagLevel::Warn,
         category: "ice".to_string(),
