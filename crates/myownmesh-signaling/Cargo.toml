@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["nostr", "signaling", "webrtc", "trystero", "mesh"]
+categories = ["network-programming", "asynchronous"]
 
 [lib]
 name = "myownmesh_signaling"

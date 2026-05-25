@@ -10,13 +10,22 @@ instead: `cargo install --path crates/myownmesh` then
 
 ## 1. Dependencies
 
+The library crates aren't on crates.io yet — pin them to a release
+tag via git:
+
 ```toml
 [dependencies]
-myownmesh-core = "0.1"
-myownmesh-signaling = "0.1"   # only if you want the Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }  # only if you want the Nostr driver
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
+
+`tag = "v0.1.0"` gets reproducible builds; switch to
+`branch = "main"` if you're tracking the latest work. Both crates
+resolve out of the same checkout because cargo dedupes git deps by
+URL. See [`../RELEASE.md`](../RELEASE.md) for the published-artifact
+catalogue.
 
 ## 2. Open the mesh
 

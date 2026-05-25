@@ -1,17 +1,28 @@
 # myownmesh
 
-The MyOwnMesh daemon + CLI.
+The MyOwnMesh daemon + CLI. Headless. Embedders should depend on
+[`myownmesh-core`](../myownmesh-core/) instead — this crate is the
+shipped binary, not a library.
 
 ## Install
 
+Pre-built binaries from [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases):
+
+```bash
+# macOS / Linux — replace the platform suffix as needed
+curl -fsSL https://github.com/mrjeeves/MyOwnMesh/releases/latest/download/myownmesh-linux-x86_64.tar.gz | tar -xz
+./myownmesh serve
+```
+
 From source:
 
+```bash
+git clone https://github.com/mrjeeves/MyOwnMesh
+cd MyOwnMesh
+cargo install --path crates/myownmesh        # daemon + CLI on $PATH
+# or run without installing:
+cargo run -p myownmesh -- serve
 ```
-cargo install --path crates/myownmesh
-```
-
-(Pre-built releases land via `RELEASE.md`'s pipeline once it's
-wired.)
 
 ## Usage
 
@@ -35,7 +46,7 @@ for `myownmesh ctl …` clients on a local socket
 ## Logging
 
 `MYOWNMESH_LOG=debug,myownmesh=trace` — recommended when diagnosing
-a network issue. See `CONTRIBUTING.md`.
+a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## Config snippet
 

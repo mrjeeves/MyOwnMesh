@@ -34,6 +34,30 @@ The release workflow runs on `push: tags: v*` and on
 The matrix mirrors MyOwnLLM's `release.yml` so behaviour is
 consistent across both apps.
 
+## What's published, what isn't
+
+| Artifact | Where | Audience |
+|---|---|---|
+| `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` | [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases) | End users running the headless daemon; the self-updater consumes the same artifacts. |
+| Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app. |
+| `myownmesh-core`, `myownmesh-signaling`, `myownmesh-updater` source | Git tag `vX.Y.Z` | Embedders, via `git = …, tag = "vX.Y.Z"` in their `Cargo.toml`. |
+
+The three library crates are **not on crates.io yet** — embedders
+pull them as git dependencies pinned to a release tag. The first
+crates.io publish is gated on a public-API freeze; until then the
+git-tag pin is the supported integration path (and gives downstream
+projects exact reproducibility because the tag content is
+immutable).
+
+The order of operations to add crates.io later is straightforward —
+`cargo publish -p myownmesh-signaling` first, then `-p myownmesh-core`
+(which depends on signaling), then `-p myownmesh-updater` (depends on
+core), then `-p myownmesh` (depends on all three). The workspace
+dependency table already pins each inter-crate edge with `version =
+"X.Y.Z"` alongside the path entry, which is exactly the shape
+`cargo publish` requires. When the time comes, add `cargo publish`
+steps to `release.yml` after the GitHub-release upload.
+
 ## Versioning
 
 Semver. `MAJOR.MINOR.PATCH`:
