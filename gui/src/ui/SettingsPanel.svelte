@@ -1,12 +1,18 @@
 <script lang="ts">
+  import ApprovalsSection from "./settings/ApprovalsSection.svelte";
   import NetworksSection from "./settings/NetworksSection.svelte";
   import IdentitySection from "./settings/IdentitySection.svelte";
   import DiagnosticsSection from "./settings/DiagnosticsSection.svelte";
 
-  type Tab = "networks" | "identity" | "diagnostics";
+  /** Approvals lives first because that's the first thing a new
+   *  user needs to do — every cross-device peering starts with a
+   *  pending approval. Connections (under Networks) is for
+   *  already-approved peers; Identity / Diagnostics are
+   *  housekeeping. */
+  type Tab = "approvals" | "networks" | "identity" | "diagnostics";
 
   const {
-    initialTab = "networks",
+    initialTab = "approvals",
     focusedConfigId,
     onClose,
   }: {
@@ -19,9 +25,10 @@
   let active = $state<Tab>(initialTab);
 
   const tabs: Array<{ id: Tab; label: string }> = [
+    { id: "approvals", label: "Approvals" },
     { id: "networks", label: "Networks" },
     { id: "identity", label: "Identity" },
-    { id: "diagnostics", label: "Diagnostics" },
+    { id: "diagnostics", label: "Activity" },
   ];
 </script>
 
@@ -57,7 +64,9 @@
     </nav>
 
     <div class="content">
-      {#if active === "networks"}
+      {#if active === "approvals"}
+        <ApprovalsSection />
+      {:else if active === "networks"}
         <NetworksSection {focusedConfigId} />
       {:else if active === "identity"}
         <IdentitySection />

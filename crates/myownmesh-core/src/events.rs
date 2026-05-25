@@ -169,10 +169,99 @@ pub enum PhaseEvent {
 
 /// Top-level event stream. Embedders consume via
 /// `MeshHandle::events()`.
+///
+/// Tagged with `event_kind` (not `kind`) so the discriminator
+/// doesn't collide with the inner `PeerEvent` / `PhaseEvent` tags —
+/// those use `kind`, and a single `kind` for both layers produced
+/// JSON with duplicate keys (the inner one would win on
+/// `JSON.parse`, dropping the outer discriminator on the floor).
+/// The two-layer shape lets a consumer dispatch on event family
+/// (`event_kind`) and then on the specific variant (`kind`) without
+/// ambiguity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "event_kind")]
 pub enum MeshEvent {
     Peer(PeerEvent),
     Phase(PhaseEvent),
     Diag(DiagEntry),
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use crate::protocol::CapabilityAdvert;
+
+    /// Pin the outer tag name so adding a new event family doesn't
+    /// silently collide with the inner `kind` tag again. The GUI's
+    /// `mesh-client.svelte.ts` dispatches on `event_kind`; flipping
+    /// this would silently route every event to the fallback branch.
+    #[test]
+    fn outer_tag_is_event_kind_no_kind_collision() {
+        let ev = MeshEvent::Peer(PeerEvent::Sighted {
+            network_id: "home".into(),
+            device_id: "abc".into(),
+        });
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("event_kind").and_then(|v| v.as_str()), Some("peer"));
+        assert_eq!(obj.get("kind").and_then(|v| v.as_str()), Some("sighted"));
+    }
+
+    /// Diag has no inner enum, so only the outer `event_kind` tag
+    /// shows up. The inner `category` field is plain data, not a
+    /// discriminator.
+    #[test]
+    fn diag_carries_only_event_kind() {
+        let ev = MeshEvent::Diag(DiagEntry {
+            ts: 0,
+            network_id: "home".into(),
+            level: DiagLevel::Info,
+            category: "ice".into(),
+            message: "hi".into(),
+            detail: serde_json::Value::Null,
+        });
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("event_kind").and_then(|v| v.as_str()), Some("diag"));
+        assert!(obj.get("kind").is_none());
+        assert_eq!(obj.get("category").and_then(|v| v.as_str()), Some("ice"));
+    }
+
+    /// Phase's inner `Changed` variant lands at `kind` alongside the
+    /// outer `event_kind` — both visible, no clobbering.
+    #[test]
+    fn phase_changed_serializes_both_tags() {
+        let ev = MeshEvent::Phase(PhaseEvent::Changed {
+            network_id: "home".into(),
+            prev: MeshPhase::Alone,
+            next: MeshPhase::Active,
+        });
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("event_kind").and_then(|v| v.as_str()),
+            Some("phase")
+        );
+        assert_eq!(obj.get("kind").and_then(|v| v.as_str()), Some("changed"));
+    }
+
+    /// Authenticated carries the verification code the GUI shows in
+    /// the approval tile. Pin its presence so dropping the field
+    /// from PeerEvent is caught here.
+    #[test]
+    fn authenticated_carries_verification_code() {
+        let ev = MeshEvent::Peer(PeerEvent::Authenticated {
+            network_id: "home".into(),
+            device_id: "abc".into(),
+            label: "Phone".into(),
+            verification_code: "ab12cd".into(),
+            capabilities: CapabilityAdvert::default(),
+            rostered: false,
+        });
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v.get("verification_code").and_then(|v| v.as_str()),
+            Some("ab12cd")
+        );
+    }
 }

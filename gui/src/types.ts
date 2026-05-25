@@ -149,6 +149,33 @@ export interface PeerInfo {
   local_shelved: boolean;
   remote_shelved: boolean;
   authenticated: boolean;
+  /** 5-char UPPERCASE-HEX display tag derived from the peer's
+   *  pubkey. Surfaced separately so the GUI can render it in a
+   *  distinct "suffix" tile during pending-approval, where users
+   *  read it aloud to confirm the right device is on the other end. */
+  device_suffix: string;
+  /** Verification code the PEER sent us in their `hello` — i.e.
+   *  the peer's own code, displayed as "theirs" in the approval
+   *  UI. 6 chars `[a-z0-9]`. `null` until we receive their hello. */
+  verification_code_received: string | null;
+  /** Verification code WE sent the peer in our `hello` — i.e. our
+   *  own code, displayed as "ours" in the approval UI. The pair
+   *  (received, sent) is what the user reads aloud to the other
+   *  side: both sides display the same four values (this device's
+   *  suffix + code, the peer's suffix + code) so confirmation is
+   *  symmetric and the connection is truly bilateral. `null` until
+   *  our handshake has fired. */
+  verification_code_sent: string | null;
+  /** True once we've sent our local Approve to this peer. Pairs
+   *  with `remote_approve_seen`; the engine transitions the peer
+   *  to Active only when BOTH are true. The approval UI uses this
+   *  to flip the row from "review and approve" to "awaiting peer
+   *  approval" once the local user has clicked Approve. */
+  local_approve_sent: boolean;
+  /** True once the peer has sent us their Approve. When set while
+   *  `local_approve_sent` is still false, the UI surfaces "the
+   *  peer has already approved you — confirm to complete." */
+  remote_approve_seen: boolean;
 }
 
 // ---- roster -----------------------------------------------------------
@@ -277,10 +304,19 @@ export type PhaseEvent = {
   next: MeshPhase;
 };
 
+/** Top-level mesh event. The outer family discriminator is
+ *  `event_kind` (not `kind`) because both `PeerEvent` and
+ *  `PhaseEvent` use `kind` for their internal variant tag — a
+ *  single `kind` on both layers produced duplicate JSON keys where
+ *  the inner one silently won the parse, leaving the GUI unable to
+ *  tell families apart. With distinct tag names a consumer first
+ *  branches on `event_kind` (peer | phase | diag) and then on
+ *  `kind` (the variant within). Pinned by `events::wire_tests` on
+ *  the Rust side. */
 export type MeshEvent =
-  | { kind: "peer"; [k: string]: unknown }
-  | { kind: "phase"; [k: string]: unknown }
-  | { kind: "diag"; [k: string]: unknown };
+  | { event_kind: "peer"; kind: string; [k: string]: unknown }
+  | { event_kind: "phase"; kind: string; [k: string]: unknown }
+  | { event_kind: "diag"; [k: string]: unknown };
 
 // Wrapper emitted by the daemon's event stream — distinguishes a
 // regular event from a "lagged" notification (slow subscriber).

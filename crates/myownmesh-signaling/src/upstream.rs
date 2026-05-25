@@ -80,6 +80,65 @@
 //! (`fresh → offering → connected → disconnected → recovering`) and
 //! on stuck thresholds (15s / 30s / 60s of waiting for an answer).
 //! Raw per-event logs are suppressed by default.
+//!
+//! # 6. Cross-relay event deduplication
+//!
+//! **Problem:** A peer publishes one Nostr event (announce / offer /
+//! answer / candidate) but every relay subscribed by both ends
+//! delivers it once — so the engine receives N copies of the same
+//! event, where N is the redundancy count (typically 4-5). For
+//! announces this is cosmetic spam in the log. For Offer / Answer
+//! it is **functional**: WebRTC's `RTCPeerConnection::set_remote_description`
+//! is not idempotent — applying the same SDP twice once the
+//! signaling state has advanced wedges the connection at
+//! `Stable → HaveRemoteOffer` and ICE never starts. Peers reach
+//! `Sighted` and never advance — the exact "they just sit there"
+//! symptom users hit in the field.
+//!
+//! **Our fix:** Track inbound event IDs (sha256, already present on
+//! every NIP-01 event) in a bounded ring per driver instance. The
+//! first relay to deliver an event wins; subsequent copies via
+//! other relays drop at the driver boundary, so the engine sees
+//! each signaling event exactly once.
+//!
+//! Implementation: `seen_event_ids` field on the Nostr driver's
+//! `DriverShared`, capacity [`SEEN_EVENT_CAPACITY`].
+//!
+//! Sized at 2048 entries × ~64 bytes = ~128 KB max — trivial, and
+//! large enough that two peers slowly trickling candidates over a
+//! long handshake never wrap (a typical handshake produces
+//! 5-20 events per side).
+//!
+//! # 7. Adaptive announce cadence
+//!
+//! **Problem:** Trystero's flat 5.333s announce interval
+//! ([`ANNOUNCE_INTERVAL_MS`]) makes new-peer discovery snappy at
+//! startup, but two devices that never grow their mesh keep
+//! pinging at the same rate forever — one line per peer per ~5s
+//! in the Activity log, indefinitely. Discovery latency drops at
+//! the cost of long-term log + relay traffic, and the trade-off
+//! is fixed.
+//!
+//! **Also a separate bug**: each relay session ran its own
+//! `tokio::time::interval`, so an N-relay setup fired N
+//! independent announce events per cycle (different timestamps →
+//! different sha256 ids → not deduped by item 6). With N=5, the
+//! room saw 5× the intended publish rate.
+//!
+//! **Our fix:** A single global announcer task per driver instance
+//! runs the schedule in [`ANNOUNCE_BACKOFF_MS`]: dense at startup
+//! (5s × 5, then 10s × 3, then 15s × 4, then 30s × 2 — total
+//! ~3 min of fast cadence), then steady-state at
+//! [`ANNOUNCE_STEADY_MS`] (60s). Per-relay timers go away;
+//! each tick publishes once via the shared broadcast channel and
+//! every connected relay writes the same event from its existing
+//! publish-pump.
+//!
+//! Net effect: a freshly-joined peer is still discovered within
+//! ~5s, but once both ends have settled the announce rate drops
+//! 12× (5s → 60s steady) — and that 12× compounds with the relay
+//! deduplication of item 6, giving a roughly 60× reduction in
+//! observed Activity-log spam vs. the pre-fix behavior.
 
 /// Inbound-message staleness threshold for zombie clearing — see
 /// item 3. Picked at ~5× Trystero's 5.333s announce cadence, well
@@ -100,10 +159,49 @@ pub const RESUBSCRIBE_BACKOFF_MS: &[u64] = &[5_000, 10_000, 15_000, 30_000, 60_0
 /// pay the cap on the next blip.
 pub const BACKOFF_RESET_AFTER_MS: u64 = 60_000;
 
+/// Inbound event-ID dedup ring size — see item 6. Bounded so the
+/// driver never grows unbounded on a long-lived mesh; sized to
+/// comfortably cover the busiest realistic handshake.
+pub const SEEN_EVENT_CAPACITY: usize = 2048;
+
 /// Disconnected-peer grace window before the engine tears down the
 /// connection. Matches Trystero's `disconnectedPeerGraceMs`.
 pub const DISCONNECTED_PEER_GRACE_MS: u64 = 7_500;
 
-/// Periodic presence-announce cadence. Matches Trystero's
-/// `announceIntervalMs`.
+/// Legacy flat-cadence announce interval, retained as a reference
+/// value for tests that still want the upstream-Trystero behavior.
+/// Production paths use the adaptive schedule below.
 pub const ANNOUNCE_INTERVAL_MS: u64 = 5_333;
+
+/// Adaptive announce schedule — see `upstream.rs` item 7.
+///
+/// Each entry is the wait (ms) before the NEXT announce, given how
+/// many we've already fired. Index = post-first announce count;
+/// once exhausted, all subsequent waits use [`ANNOUNCE_STEADY_MS`].
+///
+/// Curve:
+///   - announce 1 fires at t=0 (no wait, daemon startup)
+///   - 5s × 5  → announces 2-6  at t = 5, 10, 15, 20, 25
+///   - 10s × 3 → announces 7-9  at t = 35, 45, 55
+///   - 15s × 4 → announces 10-13 at t = 70, 85, 100, 115
+///   - 30s × 2 → announces 14-15 at t = 145, 175
+///   - 60s …   → announces 16+ at t = 235, 295, 355, …
+///
+/// Rationale: a brand-new join wants to be discovered immediately
+/// by anyone already in the room (relays don't keep ephemeral
+/// signaling events, so a third device joining 2 minutes from now
+/// only sees us if our announce arrives after their subscription).
+/// Once we've been broadcasting for ~3 minutes everyone who's going
+/// to find us will have, so we drop to a 60s heartbeat — enough to
+/// keep peer-side liveness detection happy without flooding either
+/// the relays or the user's Activity log.
+pub const ANNOUNCE_BACKOFF_MS: &[u64] = &[
+    5_000, 5_000, 5_000, 5_000, 5_000, // 5s × 5
+    10_000, 10_000, 10_000, // 10s × 3
+    15_000, 15_000, 15_000, 15_000, // 15s × 4
+    30_000, 30_000, // 30s × 2
+];
+
+/// Steady-state announce cadence, used once
+/// [`ANNOUNCE_BACKOFF_MS`] is exhausted.
+pub const ANNOUNCE_STEADY_MS: u64 = 60_000;

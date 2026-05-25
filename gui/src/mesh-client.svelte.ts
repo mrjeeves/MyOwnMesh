@@ -187,15 +187,15 @@ function createMeshClient() {
     }
     const event = frame.event;
     if (!event || typeof event !== "object") return;
-    if (event.kind === "diag") {
-      // The DiagEntry fields are spread alongside `kind` — the
-      // daemon's MeshEvent uses an internally-tagged enum. Strip
-      // `kind` to land back at a clean DiagEntry shape.
-      const { kind: _kind, ...rest } = event as Record<string, unknown>;
-      diags = [rest as unknown as DiagEntry, ...diags].slice(0, MAX_DIAG_ENTRIES);
+    const family = (event as { event_kind?: string }).event_kind;
+    if (family === "diag") {
+      // The DiagEntry fields are spread alongside `event_kind`; strip
+      // the family tag to land back at a clean DiagEntry shape.
+      const { event_kind: _ek, ...rest } = event as Record<string, unknown>;
+      pushDiag(rest as unknown as DiagEntry);
       return;
     }
-    if (event.kind === "peer" || event.kind === "phase") {
+    if (family === "peer" || family === "phase") {
       // Refresh affected network's snapshot. Cheap enough to refresh
       // all networks on any state change — the daemon trims its
       // response to whatever we own, and connections are local.
@@ -206,9 +206,120 @@ function createMeshClient() {
         // set rather than mapping wire-id → config-id since the cost
         // is negligible against a local socket.
         void refreshAllPeers();
-        if (event.kind === "phase") void refreshNetworks();
+        if (family === "phase") void refreshNetworks();
       }
+      // Mirror peer + phase events into the activity log as synthetic
+      // diag entries. Matches MyOwnLLM's Activity tab, where every
+      // mesh-relevant transition lands in one chronological feed —
+      // users debugging "why isn't this peer showing up" don't have
+      // to know which subsystem fired which transition.
+      const synthetic = synthesizeDiagFromEvent(family, event as Record<string, unknown>);
+      if (synthetic) pushDiag(synthetic);
     }
+  }
+
+  /** Prepend a diag entry to the in-memory log, capped to the
+   *  configured backlog. Single call site so the dedup / cap policy
+   *  lives in one place. */
+  function pushDiag(entry: DiagEntry) {
+    diags = [entry, ...diags].slice(0, MAX_DIAG_ENTRIES);
+  }
+
+  /** Turn a peer / phase event into a `DiagEntry` so it shows up in
+   *  the Activity tab alongside the explicit `MeshEvent::Diag`
+   *  entries the engine emits. Branches on the inner `kind` tag,
+   *  which (after the outer rename to `event_kind`) is unambiguously
+   *  the variant within the family. */
+  function synthesizeDiagFromEvent(
+    family: "peer" | "phase",
+    event: Record<string, unknown>,
+  ): DiagEntry | null {
+    const ts = Date.now();
+    const network_id = typeof event.network_id === "string" ? event.network_id : "";
+    const variant = typeof event.kind === "string" ? event.kind : "";
+
+    if (family === "phase") {
+      // Only PhaseEvent::Changed exists today.
+      const prev = String(event.prev ?? "?");
+      const next = String(event.next ?? "?");
+      return {
+        ts,
+        network_id,
+        level: "info",
+        category: "phase",
+        message: `phase: ${prev} → ${next}`,
+        detail: null,
+      };
+    }
+
+    const peer = typeof event.device_id === "string" ? shortPeerId(event.device_id) : "peer";
+    const label =
+      typeof event.label === "string" && event.label ? `${event.label} (${peer})` : peer;
+
+    // Skip variants the engine already emits a paired `log_diag`
+    // for — duplicating them here would put two rows in the
+    // activity log for one event. Pairs (engine-side diag):
+    //   sighted        → "peer sighted: …" (engine/mod.rs)
+    //   authenticated  → "auth ok with …" (handshake.rs)
+    //   approved       → "peer active: …" (handshake.rs)
+    //   dropped        → "peer dropped: …" (engine/mod.rs)
+    // Remaining variants (shelved / unshelved / capabilities_changed)
+    // have no engine-side diag pair, so the GUI synthesis is the
+    // only thing that surfaces them in the log.
+    switch (variant) {
+      case "sighted":
+      case "authenticated":
+      case "approved":
+      case "dropped":
+        return null;
+      case "shelved": {
+        const by_us = (event as { by_us?: boolean }).by_us === true;
+        return {
+          ts,
+          network_id,
+          level: "info",
+          category: "topology",
+          message: by_us ? `shelved ${label}` : `peer shelved us: ${label}`,
+          detail: null,
+        };
+      }
+      case "unshelved": {
+        const by_us = (event as { by_us?: boolean }).by_us === true;
+        return {
+          ts,
+          network_id,
+          level: "info",
+          category: "topology",
+          message: by_us ? `unshelved ${label}` : `peer unshelved us: ${label}`,
+          detail: null,
+        };
+      }
+      case "capabilities_changed":
+        return {
+          ts,
+          network_id,
+          level: "info",
+          category: "peer",
+          message: `capabilities changed: ${label}`,
+          detail: null,
+        };
+      default:
+        // Unknown peer-event variant — render a generic line so it's
+        // still visible in the log rather than silently dropped.
+        return {
+          ts,
+          network_id,
+          level: "info",
+          category: "peer",
+          message: `${variant || "event"}: ${label}`,
+          detail: null,
+        };
+    }
+  }
+
+  function shortPeerId(id: string): string {
+    if (id.length <= 12) return id;
+    return `${id.slice(0, 6)}…${id.slice(-4)}`;
   }
 
   async function startEventSubscription() {

@@ -335,4 +335,34 @@ pub struct PeerInfo {
     pub local_shelved: bool,
     pub remote_shelved: bool,
     pub authenticated: bool,
+    /// 5-char UPPERCASE-HEX display tag derived from the peer's
+    /// pubkey. Same scheme as `Identity::display_id` — peers compare
+    /// suffixes to confirm "yes, this is the right device" without
+    /// reading the full pubkey aloud. Surfaced separately so the GUI
+    /// can render it in a distinct tile during pending-approval.
+    pub device_suffix: String,
+    /// Verification code the peer sent us in their `hello` — i.e.
+    /// the peer's own code that we should be displaying as "theirs"
+    /// in the approval UI. `None` until we receive a hello.
+    pub verification_code_received: Option<String>,
+    /// Verification code WE sent the peer in our `hello` — i.e. our
+    /// own code that we should be displaying as "ours" in the
+    /// approval UI. Both ends generate one (independent random
+    /// strings), and the bilateral approval flow asks each user to
+    /// confirm all four values match what the other side reads
+    /// back: this device's suffix + code, the peer's suffix + code.
+    /// `None` until our handshake has fired.
+    pub verification_code_sent: Option<String>,
+    /// True once we've sent an `Approve` to this peer — either via
+    /// the user clicking Approve in the GUI, or via auto-approve
+    /// because the peer is already in the roster. Surfaced so the
+    /// approval UI can flip the row from "review and approve" to
+    /// "waiting for peer to approve their side" — the connection
+    /// doesn't transition to Active until both ends have approved.
+    pub local_approve_sent: bool,
+    /// True once we've received an `Approve` from this peer. Pairs
+    /// with `local_approve_sent`: when both are true the engine
+    /// transitions the peer to Active. Either alone means the
+    /// handshake is half-complete and waiting on the other end.
+    pub remote_approve_seen: bool,
 }

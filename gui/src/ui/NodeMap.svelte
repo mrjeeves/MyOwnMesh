@@ -20,23 +20,45 @@
   } = $props();
 
   /** Pending-action descriptor for a peer. `null` means there's
-   *  nothing actionable about this peer right now. Anything else
-   *  drives both the node badge in the graph and the action row at
-   *  the top of the detail panel — single source of truth so the
-   *  badge can never disagree with the inline actions. */
+   *  nothing actionable about this peer right now. The `kind`
+   *  picks which buttons render and what copy the description
+   *  carries — the badge in the graph stays the same (a pending
+   *  marker is a pending marker), but the popup needs to explain
+   *  which half of the bilateral approval is missing.
+   *
+   *   - approve       — fresh: neither side has approved yet.
+   *   - confirm       — peer approved first; user's confirm
+   *                     completes the handshake.
+   *   - waiting-peer  — user has already approved; nothing to do
+   *                     but wait (or revoke). Buttons collapse to
+   *                     just Revoke. */
   type PendingAction =
     | { kind: "approve"; description: string }
+    | { kind: "confirm"; description: string }
+    | { kind: "waiting-peer"; description: string }
     | null;
 
   function pendingActionFor(peer: PeerInfo | null): PendingAction {
     if (!peer) return null;
-    if (peer.status === "pending_approval") {
+    if (peer.status !== "pending_approval") return null;
+    if (peer.local_approve_sent && !peer.remote_approve_seen) {
       return {
-        kind: "approve",
-        description: "Peer authenticated — approve to start exchanging app traffic.",
+        kind: "waiting-peer",
+        description:
+          "You approved this peer. The connection becomes live once they approve on their side.",
       };
     }
-    return null;
+    if (!peer.local_approve_sent && peer.remote_approve_seen) {
+      return {
+        kind: "confirm",
+        description:
+          "The peer already approved you from their side. Confirm here to complete the handshake.",
+      };
+    }
+    return {
+      kind: "approve",
+      description: "Peer authenticated — approve to start exchanging app traffic.",
+    };
   }
 
   // Inline action state. Scoped to the currently-selected peer; we
@@ -317,6 +339,20 @@
   const selectedPeer = $derived(
     selectedPeerId ? peers.find((p) => p.device_id === selectedPeerId) ?? null : null,
   );
+
+  /** This device's own display suffix, parsed from the daemon's
+   *  `device_id` (which is `{pubkey}-{5-char hex}`; see
+   *  `Identity::display_id` in the engine). Surfaced during pending
+   *  approval so the popup shows both sides — ours + theirs — for
+   *  bilateral confirmation. */
+  const ourSuffix = $derived.by(() => {
+    const id = meshClient.identity?.device_id ?? "";
+    const dash = id.lastIndexOf("-");
+    if (dash === -1) return "";
+    const tail = id.slice(dash + 1);
+    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) return tail;
+    return "";
+  });
 </script>
 
 <div class="map">
@@ -459,7 +495,19 @@
     <div class="detail" role="dialog" aria-label="Peer detail">
       <div class="detail-head">
         <div class="detail-title">
-          {selectedPeer.label || shortId(selectedPeer.device_id)}
+          <span class="detail-label">
+            {selectedPeer.label || shortId(selectedPeer.device_id)}
+          </span>
+          {#if selectedPeer.device_suffix}
+            <!-- Inline suffix pill on the title row. Always visible
+                 (not just during approval) so the user can read the
+                 stable display tag back to a peer at any time —
+                 picking the right device out of a crowded peers
+                 list, debugging an approval mix-up, etc. -->
+            <span class="detail-suffix" title="Stable display tag derived from the peer's pubkey">
+              -{selectedPeer.device_suffix}
+            </span>
+          {/if}
         </div>
         <button
           class="close"
@@ -475,14 +523,75 @@
       {#if pending}
         <div class="pending-action">
           <div class="pending-line">{pending.description}</div>
-          {#if pending.kind === "approve"}
+          {#if pending.kind === "approve" || pending.kind === "confirm"}
+            <!-- Bilateral confirmation: shows both sides' suffix +
+                 code so the user reads all four out-of-band before
+                 approving. Mirrors the Approvals settings tab so
+                 confirmation works the same way regardless of which
+                 surface the user opens. -->
+            <div class="confirm-grid">
+              <div class="confirm-col">
+                <div class="confirm-side-label">this device</div>
+                <div class="confirm-pair">
+                  {#if ourSuffix}
+                    <div class="confirm-tile suffix-tile" title="OUR suffix — read aloud to the peer; they should see this in their 'peer' column.">
+                      <span class="confirm-label">suffix</span>
+                      <span class="confirm-value">{ourSuffix}</span>
+                    </div>
+                  {/if}
+                  {#if selectedPeer.verification_code_sent}
+                    <div class="confirm-tile code-tile" title="OUR per-session code — read aloud to the peer; they should see this in their 'peer' column.">
+                      <span class="confirm-label">code</span>
+                      <span class="confirm-value">{selectedPeer.verification_code_sent}</span>
+                    </div>
+                  {/if}
+                </div>
+              </div>
+              <div class="confirm-divider" aria-hidden="true">↔</div>
+              <div class="confirm-col">
+                <div class="confirm-side-label">peer</div>
+                <div class="confirm-pair">
+                  {#if selectedPeer.device_suffix}
+                    <div class="confirm-tile suffix-tile" title="PEER'S suffix — should match what they read aloud to you (in their 'this device' column).">
+                      <span class="confirm-label">suffix</span>
+                      <span class="confirm-value">{selectedPeer.device_suffix}</span>
+                    </div>
+                  {/if}
+                  {#if selectedPeer.verification_code_received}
+                    <div class="confirm-tile code-tile" title="PEER'S per-session code — should match what they read aloud to you.">
+                      <span class="confirm-label">code</span>
+                      <span class="confirm-value">{selectedPeer.verification_code_received}</span>
+                    </div>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          {/if}
+          {#if pending.kind === "waiting-peer"}
+            <!-- Local approve already sent; only the revoke escape
+                 hatch remains until the peer approves their side. -->
+            <div class="pending-buttons">
+              <button
+                class="btn-deny"
+                onclick={denySelected}
+                disabled={actionBusy}
+                title="Revoke this approval and tear down the half-handshaken session."
+              >
+                Revoke
+              </button>
+            </div>
+          {:else if pending.kind === "approve" || pending.kind === "confirm"}
             <div class="pending-buttons">
               <button
                 class="btn-approve"
                 onclick={approveSelected}
                 disabled={actionBusy}
               >
-                {actionBusy ? "Approving…" : "Approve"}
+                {actionBusy
+                  ? "Approving…"
+                  : pending.kind === "confirm"
+                    ? "Confirm"
+                    : "Approve"}
               </button>
               <button
                 class="btn-deny"
@@ -640,6 +749,32 @@
   .detail-title {
     font-weight: 600;
     font-size: 0.92rem;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .detail-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  /* Inline suffix pill — different shape from the approval tile
+     below so the user reads "always-visible identifier" vs
+     "actively-confirming for approval" at a glance. */
+  .detail-suffix {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.74rem;
+    font-weight: 700;
+    color: #b9c9ee;
+    letter-spacing: 0.06em;
+    background: #131820;
+    border: 1px solid #2a3a55;
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    user-select: all;
   }
   .close {
     background: none;
@@ -688,6 +823,93 @@
     font-size: 0.78rem;
     color: #d6c8ff;
     line-height: 1.4;
+  }
+  /* Bilateral confirmation grid: matches ApprovalsSection's
+     layout so the user sees the same shape in both surfaces. Two
+     columns ("this device" / "peer"), each a suffix + code pair,
+     separated by a ↔ glyph that reads as "these should match". */
+  .confirm-grid {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 0.45rem;
+    align-items: center;
+    background: #0d0d12;
+    border: 1px solid #1e1e25;
+    border-radius: 6px;
+    padding: 0.45rem 0.55rem;
+    margin: 0.1rem 0;
+  }
+  .confirm-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+  }
+  .confirm-side-label {
+    font-size: 0.58rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: center;
+  }
+  .confirm-pair {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .confirm-divider {
+    color: #555;
+    font-size: 0.95rem;
+    user-select: none;
+    align-self: end;
+    padding-bottom: 0.35rem;
+  }
+  /* Mirrors ApprovalsSection's tile pair so the user reads the
+     same confirmation in two places without re-learning the
+     colour code. Blue = stable identity; amber = per-session
+     freshness. */
+  .confirm-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    padding: 0.28rem 0.7rem;
+    min-width: 5rem;
+  }
+  .confirm-tile.suffix-tile {
+    background: #131820;
+    border: 1px solid #2a3a55;
+  }
+  .confirm-tile.code-tile {
+    background: #2a2210;
+    border: 1px solid #4a3a18;
+  }
+  .confirm-label {
+    font-size: 0.55rem;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    opacity: 0.6;
+  }
+  .confirm-tile.suffix-tile .confirm-label {
+    color: #6a7a99;
+  }
+  .confirm-tile.code-tile .confirm-label {
+    color: #a88d4a;
+  }
+  .confirm-value {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.98rem;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    user-select: all;
+  }
+  .confirm-tile.suffix-tile .confirm-value {
+    color: #b9c9ee;
+  }
+  .confirm-tile.code-tile .confirm-value {
+    color: #ffd166;
   }
   .pending-buttons {
     display: flex;

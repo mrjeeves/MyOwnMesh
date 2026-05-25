@@ -187,8 +187,13 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
     let mut outbound_rx = state.take_signaling_outbound_rx()?;
     let device_id_for_out = device_id.clone();
     tokio::spawn(async move {
-        // Send a single explicit announce on join.
-        let _ = out_tx.send(NostrOutbound::Announce);
+        // No explicit startup announce here — the Nostr driver's
+        // `run_announcer` fires immediately at t=0 and then follows
+        // the adaptive backoff schedule (see
+        // `upstream.rs` item 7). A second announce from the bridge
+        // would just publish a duplicate event (different timestamp
+        // → distinct sha256 id, so receiver-side dedup wouldn't
+        // collapse it) — wasted relay bandwidth for no benefit.
         while let Some(outbound) = outbound_rx.recv().await {
             let translated = match outbound {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
