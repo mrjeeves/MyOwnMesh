@@ -99,8 +99,13 @@ jobs:
       # No `version:` — pnpm/action-setup@v4 reads the version from
       # gui/package.json's `packageManager` field. Pinning a
       # different `version:` here causes pnpm 10+ to refuse to run
-      # with ERR_PNPM_BAD_PM_VERSION.
+      # with ERR_PNPM_BAD_PM_VERSION. There is no root package.json
+      # in this repo, so point the action at the GUI manifest
+      # explicitly — otherwise it fails with "No pnpm version is
+      # specified".
       - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: gui/package.json
 
       - uses: actions/setup-node@v4
         with:
