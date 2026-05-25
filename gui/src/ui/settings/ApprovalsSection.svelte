@@ -104,7 +104,12 @@
       const selfPubkey = meshClient.identity?.pubkey ?? null;
       if (role !== "member" && selfPubkey) {
         const peerPub = strippedPubkey(row.peer.device_id);
-        governance.setPeerRole(row.network.config_id, selfPubkey, peerPub, role);
+        await governance.setPeerRole(
+          row.network.config_id,
+          selfPubkey,
+          peerPub,
+          role,
+        );
       }
     } catch (e) {
       actionError = String(e);

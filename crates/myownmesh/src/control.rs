@@ -106,6 +106,56 @@ pub enum Request {
     /// until the client closes. Used by the GUI to render live peer
     /// state changes without polling.
     EventsSubscribe,
+
+    // ---- closed-network governance --------------------------------
+    /// Snapshot the per-network signed governance state — kind,
+    /// roles, transition log, pending proposals, splits. The GUI
+    /// polls this to render its Governance tab + per-network kind
+    /// badge.
+    GovernanceState {
+        network: String,
+    },
+    /// Float a kind-change proposal (`open → closed` or
+    /// `closed → open`). Engine signs with the local identity,
+    /// broadcasts to peers, attempts immediate ratification if the
+    /// quorum is already met. Returns the new proposal id.
+    GovernanceProposeKindChange {
+        network: String,
+        /// Target kind. Must differ from the current one.
+        to: myownmesh_core::NetworkKind,
+    },
+    /// Float a role-grant proposal.
+    GovernanceProposeRoleGrant {
+        network: String,
+        target: String,
+        role: myownmesh_core::Role,
+    },
+    /// Float a role-revoke proposal.
+    GovernanceProposeRoleRevoke {
+        network: String,
+        target: String,
+    },
+    /// Sign a pending proposal.
+    GovernanceSign {
+        network: String,
+        proposal_id: String,
+    },
+    /// Deny a pending proposal. Single-shot kill switch.
+    GovernanceDeny {
+        network: String,
+        proposal_id: String,
+    },
+    /// Withdraw a proposal the local device floated.
+    GovernanceWithdraw {
+        network: String,
+        proposal_id: String,
+    },
+    /// Spawn a proposer-initiated split. Returns the derived
+    /// network id of the new closed network.
+    GovernanceSpawnSplit {
+        network: String,
+        proposal_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -368,6 +418,93 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // If we somehow get here, surface the bug.
             Response::err("events_subscribe must be handled upstream")
         }
+
+        // ---- governance ----
+        Request::GovernanceState { network } => match state.registry.get(&network) {
+            Some(net) => match net.governance_state().await {
+                Ok(s) => Response::ok(serde_json::json!({ "state": s })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceProposeKindChange { network, to } => {
+            match state.registry.get(&network) {
+                Some(net) => match net
+                    .propose_transition(myownmesh_core::TransitionVariant::KindChange { to })
+                    .await
+                {
+                    Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                None => Response::err(format!("unknown network: {network}")),
+            }
+        }
+        Request::GovernanceProposeRoleGrant {
+            network,
+            target,
+            role,
+        } => match state.registry.get(&network) {
+            Some(net) => match net
+                .propose_transition(myownmesh_core::TransitionVariant::RoleGrant { target, role })
+                .await
+            {
+                Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceProposeRoleRevoke { network, target } => {
+            match state.registry.get(&network) {
+                Some(net) => match net
+                    .propose_transition(myownmesh_core::TransitionVariant::RoleRevoke { target })
+                    .await
+                {
+                    Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                None => Response::err(format!("unknown network: {network}")),
+            }
+        }
+        Request::GovernanceSign {
+            network,
+            proposal_id,
+        } => match state.registry.get(&network) {
+            Some(net) => match net.sign_proposal(&proposal_id).await {
+                Ok(_) => Response::ok(serde_json::json!({ "signed": proposal_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceDeny {
+            network,
+            proposal_id,
+        } => match state.registry.get(&network) {
+            Some(net) => match net.deny_proposal(&proposal_id).await {
+                Ok(_) => Response::ok(serde_json::json!({ "denied": proposal_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceWithdraw {
+            network,
+            proposal_id,
+        } => match state.registry.get(&network) {
+            Some(net) => match net.withdraw_proposal(&proposal_id).await {
+                Ok(_) => Response::ok(serde_json::json!({ "withdrawn": proposal_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceSpawnSplit {
+            network,
+            proposal_id,
+        } => match state.registry.get(&network) {
+            Some(net) => match net.spawn_split(&proposal_id).await {
+                Ok(new_id) => Response::ok(serde_json::json!({ "new_network_id": new_id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
     }
 }
 

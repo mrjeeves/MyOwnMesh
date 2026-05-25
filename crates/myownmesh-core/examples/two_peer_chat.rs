@@ -30,6 +30,7 @@ fn cfg(label: &str) -> NetworkConfig {
         id: label.into(),
         network_id: "two-peer-chat".into(),
         label: label.into(),
+        kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),

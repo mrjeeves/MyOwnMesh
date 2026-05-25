@@ -20,6 +20,7 @@
 //!     id: "home".into(),
 //!     network_id: "my-mesh".into(),
 //!     label: "Home".into(),
+//!     kind: Default::default(),                            // Open (default)
 //!     topology: TopologyMode::default(),
 //!     signaling: Default::default(),
 //!     stun_servers: Default::default(),
@@ -93,6 +94,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
+pub mod network_state;
 pub mod protocol;
 pub mod roster;
 pub mod rpc;
@@ -110,6 +112,10 @@ pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
+pub use network_state::{
+    NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
+    SIGN_DOMAIN_TAG_STATE,
+};
 pub use protocol::CapabilityAdvert;
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};

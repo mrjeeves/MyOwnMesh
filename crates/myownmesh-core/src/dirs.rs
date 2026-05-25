@@ -52,6 +52,16 @@ pub fn rosters_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("mesh").join("rosters"))
 }
 
+/// Directory holding per-network signed governance-state files.
+/// Mirrors the roster layout — one file per network, keyed on the
+/// canonical network_id, mode 0600 on Unix. Distinct from the
+/// roster file so the governance log isn't bundled with the
+/// approval list (a roster wipe / restore shouldn't replay the
+/// signed transition chain, and vice-versa).
+pub fn states_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("mesh").join("states"))
+}
+
 /// Directory holding the identity anchor and any other secret-key
 /// material. Mode 0700 on Unix.
 pub fn secrets_dir() -> Result<PathBuf> {

@@ -80,6 +80,55 @@ pub enum NetworkCmd {
         device_id: String,
         event: TransportEvent,
     },
+
+    // ---- governance (closed networks) ----
+    /// Float a new signed transition. The engine signs with the
+    /// local identity, persists the proposal to the governance
+    /// state's pending list, and broadcasts a
+    /// `NetworkStatePropose` to every active peer that supports
+    /// `network_state_v1`. Reply carries the new proposal id so
+    /// the caller can correlate acks.
+    ProposeTransition {
+        variant: crate::network_state::TransitionVariant,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// Sign an existing pending proposal. Verifies the local user
+    /// has authority for the variant + that the proposal hasn't
+    /// already been signed by this device, then signs and
+    /// broadcasts a `NetworkStateAck { decision: Sign }`. If the
+    /// signature satisfies the quorum, the engine ratifies the
+    /// transition in the same step.
+    SignProposal {
+        proposal_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Deny a pending proposal. Any single deny invalidates the
+    /// proposal — the engine drops it from pending and broadcasts
+    /// the signed deny.
+    DenyProposal {
+        proposal_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Withdraw a proposal the local device floated. No
+    /// broadcast — peers see the proposal disappear via the
+    /// next `NetworkState` snapshot.
+    WithdrawProposal {
+        proposal_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Proposer-initiated split fallback. Spawns a derived closed
+    /// network from the signers the proposer has so far. Reply
+    /// carries the derived `network_id` so the caller can join
+    /// the new network straight away.
+    SpawnSplit {
+        proposal_id: String,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    /// Snapshot of the current governance state. Used by the
+    /// control protocol to surface live state to the GUI.
+    GovernanceSnapshot {
+        reply: oneshot::Sender<crate::network_state::NetworkState>,
+    },
 }
 
 /// Inbound signaling messages from the signaling task.
@@ -139,6 +188,17 @@ pub struct NetworkState {
 
     pub peers: DashMap<String, Arc<PeerConnection>>,
     pub roster: RwLock<Roster>,
+    /// Signed governance state — kind + role assignments + the
+    /// append-only signed transition log + pending proposals.
+    /// Authority on a `closed` network derives from this; on an
+    /// `open` network it's a no-op tracker that ratifies the
+    /// open→closed transition if one ever fires.
+    ///
+    /// The on-disk projection lives at
+    /// `~/.myownmesh/mesh/states/{network_id}.json` (per-network,
+    /// 0600 on Unix). Loaded once on construction; the engine
+    /// persists after every signed transition that lands.
+    pub governance_state: RwLock<crate::network_state::NetworkState>,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
@@ -171,6 +231,22 @@ impl NetworkState {
     )> {
         let topology_impl = crate::topology::from_mode(&config.topology);
         let roster = crate::roster::load(&config.network_id)?;
+        // Load (or initialise) the per-network signed state log. If
+        // the config requests Closed kind but the on-disk log says
+        // Open (or vice-versa), the on-disk log wins — kind is
+        // authoritatively a signed-state property, not a config one.
+        // The config field only seeds new networks at first attach.
+        let governance_state = {
+            let mut s = crate::network_state::load(&config.network_id)?;
+            if s.transitions.is_empty() && s.kind == crate::network_state::NetworkKind::Open {
+                // Brand-new state log — adopt the config's initial
+                // kind. (For the open default, this is a no-op; for
+                // Closed, the engine emits the founder-self-election
+                // transition on first ACTIVE.)
+                s.kind = config.kind;
+            }
+            s
+        };
         let (events_tx, _) = broadcast::channel(256);
         let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -184,6 +260,7 @@ impl NetworkState {
             topology_impl: RwLock::new(topology_impl),
             peers: DashMap::new(),
             roster: RwLock::new(roster),
+            governance_state: RwLock::new(governance_state),
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             channel_subscribers: DashMap::new(),

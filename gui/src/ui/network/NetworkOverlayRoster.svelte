@@ -101,8 +101,8 @@
     actionError = null;
     const peerPub = devicePubkey(peer.device_id);
     const result = role === "member"
-      ? governance.clearPeerRole(network.config_id, selfPubkey, peerPub)
-      : governance.setPeerRole(network.config_id, selfPubkey, peerPub, role);
+      ? await governance.clearPeerRole(network.config_id, selfPubkey, peerPub)
+      : await governance.setPeerRole(network.config_id, selfPubkey, peerPub, role);
     if (!result.ok) {
       actionError = result.reason ?? "Couldn't change role.";
     }

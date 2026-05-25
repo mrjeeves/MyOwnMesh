@@ -19,6 +19,7 @@
 //! without understanding the corresponding field-discovered bug.
 
 pub mod connection;
+pub mod governance;
 pub mod handshake;
 pub mod heartbeat;
 pub mod ice_watchdog;
@@ -248,6 +249,31 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         }
         NetworkCmd::TransportEvent { device_id, event } => {
             handle_transport_event(state, device_id, event).await;
+        }
+
+        // ---- governance ops ----
+        NetworkCmd::ProposeTransition { variant, reply } => {
+            let result = governance::propose(state, variant).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::SignProposal { proposal_id, reply } => {
+            let result = governance::sign_proposal(state, &proposal_id).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::DenyProposal { proposal_id, reply } => {
+            let result = governance::deny_proposal(state, &proposal_id).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::WithdrawProposal { proposal_id, reply } => {
+            let result = governance::withdraw_proposal(state, &proposal_id).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::SpawnSplit { proposal_id, reply } => {
+            let result = governance::spawn_split(state, &proposal_id).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::GovernanceSnapshot { reply } => {
+            let _ = reply.send(governance::snapshot(state));
         }
     }
     true
@@ -808,6 +834,20 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
         MeshMessage::RpcStreamEnd(e) => on_rpc_stream_end(state, device_id, e).await,
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(state, device_id, channel, payload).await
+        }
+        MeshMessage::NetworkState(b) => governance::on_state_broadcast(state, device_id, b).await,
+        MeshMessage::NetworkStatePropose(m) => governance::on_propose(state, device_id, m).await,
+        MeshMessage::NetworkStateAck(m) => governance::on_ack(state, device_id, m).await,
+        MeshMessage::NetworkStateSplit(m) => governance::on_split(state, device_id, m).await,
+        MeshMessage::RosterSummary(_)
+        | MeshMessage::RosterRequest(_)
+        | MeshMessage::RosterEntries(_) => {
+            // Roster gossip dispatch lives in a later commit on this
+            // branch. Until then, governance + state broadcasts handle
+            // role-change convergence; pure adds/removes on a `closed`
+            // network still flow through the existing roster-approve
+            // path on the originator side.
+            trace!(peer = %device_id, "roster gossip frame received; handler not yet wired");
         }
         MeshMessage::Unknown => {
             trace!(peer = %device_id, "discarding unknown frame variant");

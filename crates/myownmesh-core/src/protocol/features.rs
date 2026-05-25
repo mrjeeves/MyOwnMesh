@@ -28,6 +28,16 @@ impl Feature {
     /// advertised capabilities change. Receivers that lack this
     /// only see the snapshot included in `hello`.
     pub const CAPABILITIES_UPDATE: &'static str = "capabilities_update";
+
+    /// Peer speaks the closed-network governance wire — emits and
+    /// honours `network_state`, `network_state_propose`,
+    /// `network_state_ack`, `network_state_split`, and the
+    /// `roster_summary` / `roster_request` / `roster_entries`
+    /// triad. Senders only emit these frames against peers that
+    /// advertise this flag, since older peers would drop them via
+    /// the `Unknown` catch-all. See
+    /// [`docs/NETWORK-TYPES.md`](../../../../docs/NETWORK-TYPES.md).
+    pub const NETWORK_STATE_V1: &'static str = "network_state_v1";
 }
 
 /// The set of features this build advertises to peers. Embedders
@@ -38,6 +48,7 @@ pub const ADVERTISED_FEATURES: &[&str] = &[
     Feature::GENERIC_RPC,
     Feature::TYPED_CHANNELS,
     Feature::CAPABILITIES_UPDATE,
+    Feature::NETWORK_STATE_V1,
 ];
 
 /// Test whether a peer's advertised feature list contains `feature`.
