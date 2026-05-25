@@ -702,6 +702,65 @@ async fn handle_ice_state_change(
     if escalate_failed {
         ice_watchdog::on_failed(state, device_id).await;
     }
+    // Once ICE settles, ask the agent which candidate pair it
+    // actually chose so the GUI can paint the link type from real
+    // data instead of guessing from gathered-candidate counts. We
+    // also clear it on Disconnected/Failed/Closed so a stale
+    // selection doesn't claim "LAN" while the connection is dead.
+    match ice {
+        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
+            record_selected_pair(state, device_id).await;
+        }
+        RTCIceConnectionState::Disconnected
+        | RTCIceConnectionState::Failed
+        | RTCIceConnectionState::Closed => {
+            if let Some(peer) = state.peers.get(device_id) {
+                peer.state.write().selected_pair = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Ask the peer's ICE agent for its nominated candidate pair and
+/// stash it on the peer state. Quiet on `None` — the agent is
+/// allowed not to know yet (renegotiation in flight, agent torn
+/// down, etc.) and the next state change will re-query.
+async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
+    // Same DashMap-Ref + MutexGuard scoping pattern as the watchdog:
+    // pull the cloned `Arc<PeerSession>` into a named local before
+    // the inner block returns so the guard drops before the `Ref`
+    // does. Without the named binding Rust 2021's trailing-
+    // expression scoping keeps the guard alive across the outer
+    // borrow check.
+    let session = {
+        let Some(peer) = state.peers.get(device_id) else {
+            return;
+        };
+        let session = peer.session.lock().clone();
+        session
+    };
+    let Some(session) = session else { return };
+    let pair = session.selected_candidate_pair().await;
+    let Some(pair) = pair else { return };
+    if let Some(peer) = state.peers.get(device_id) {
+        peer.state.write().selected_pair = Some(pair);
+    }
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "ice",
+        format!(
+            "selected pair for {}: local={:?} remote={:?}",
+            short_peer(device_id),
+            pair.local,
+            pair.remote,
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "local": format!("{:?}", pair.local),
+            "remote": format!("{:?}", pair.remote),
+        }),
+    );
 }
 
 async fn handle_pc_state_change(

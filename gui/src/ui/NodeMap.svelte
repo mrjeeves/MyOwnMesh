@@ -147,6 +147,132 @@
     return () => ro.disconnect();
   });
 
+  // ---- pan / zoom -----------------------------------------------------
+  //
+  // The graph is meant to be a visualisation that "just fits" by
+  // default. We auto-fit the layout's bounding box into the SVG on
+  // mount and whenever the set of nodes changes substantially (count
+  // up / down). Once the user manually pans or zooms we switch to a
+  // manual transform; the "fit" button on the legend bar re-engages
+  // auto-fit. Wheel = zoom (centred on the cursor); drag on empty
+  // canvas = pan; nodes are clickable as before.
+  let panX = $state(0);
+  let panY = $state(0);
+  let zoom = $state(1);
+  let userTransformed = $state(false);
+  let dragging = $state(false);
+  let dragStart = $state<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
+  const MIN_ZOOM = 0.25;
+  const MAX_ZOOM = 4;
+  const FIT_MARGIN = 40;
+  /** Radius the layout reserves around any peer/internet/self node;
+   *  used to pad the auto-fit bbox so node circles don't clip the
+   *  canvas edges. The largest node currently drawn is the
+   *  self/hub circle at r=32 plus its label below. */
+  const NODE_HALO = 50;
+
+  /** Compute (pan, zoom) that fits every layout node within the
+   *  current SVG dimensions, with some breathing room. Returns the
+   *  identity transform when there are no nodes (the empty-network
+   *  branch already short-circuited above by then). */
+  function fitTransform(nodes: { x: number; y: number }[]) {
+    if (nodes.length === 0) return { panX: 0, panY: 0, zoom: 1 };
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const n of nodes) {
+      if (n.x - NODE_HALO < minX) minX = n.x - NODE_HALO;
+      if (n.x + NODE_HALO > maxX) maxX = n.x + NODE_HALO;
+      if (n.y - NODE_HALO < minY) minY = n.y - NODE_HALO;
+      if (n.y + NODE_HALO > maxY) maxY = n.y + NODE_HALO;
+    }
+    const bboxW = Math.max(1, maxX - minX);
+    const bboxH = Math.max(1, maxY - minY);
+    const avail = {
+      w: Math.max(1, width - FIT_MARGIN * 2),
+      h: Math.max(1, height - FIT_MARGIN * 2),
+    };
+    const scale = Math.min(avail.w / bboxW, avail.h / bboxH, MAX_ZOOM);
+    const clampedScale = Math.max(MIN_ZOOM, scale);
+    // Centre the bbox in the canvas after scaling.
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    return {
+      panX: width / 2 - cx * clampedScale,
+      panY: height / 2 - cy * clampedScale,
+      zoom: clampedScale,
+    };
+  }
+
+  function applyFit() {
+    const t = fitTransform(layout.nodes);
+    panX = t.panX;
+    panY = t.panY;
+    zoom = t.zoom;
+    userTransformed = false;
+  }
+
+  // Re-fit automatically while the user hasn't taken control: this
+  // handles initial mount, peer add/remove, and network resize.
+  // Watching width/height + node count keeps the dependency narrow
+  // enough that we don't re-fit on every status flip (which would
+  // be jarring while the user is reading the graph).
+  $effect(() => {
+    void width;
+    void height;
+    void layout.nodes.length;
+    if (!userTransformed) {
+      const t = fitTransform(layout.nodes);
+      panX = t.panX;
+      panY = t.panY;
+      zoom = t.zoom;
+    }
+  });
+
+  function onWheel(e: WheelEvent) {
+    e.preventDefault();
+    const rect = canvas?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    // Zoom factor — exponential so successive wheel notches feel
+    // consistent at any current zoom level.
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const next = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * factor));
+    if (next === zoom) return;
+    // Keep the point under the cursor stationary by adjusting pan.
+    const ratio = next / zoom;
+    panX = cx - (cx - panX) * ratio;
+    panY = cy - (cy - panY) * ratio;
+    zoom = next;
+    userTransformed = true;
+  }
+
+  function onPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    // Only initiate a pan when the user clicks on empty canvas —
+    // clicking nodes still selects them (the node group calls
+    // stopPropagation).
+    dragging = true;
+    dragStart = { x: e.clientX, y: e.clientY, panX, panY };
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (!dragging || !dragStart) return;
+    panX = dragStart.panX + (e.clientX - dragStart.x);
+    panY = dragStart.panY + (e.clientY - dragStart.y);
+    userTransformed = true;
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    dragging = false;
+    dragStart = null;
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+  }
+
   /** Visible peers excluded from the graph. We keep peers that
    *  represent real engine state — sighted onward — and skip purely
    *  "offline" rows so the graph doesn't fill up with ghosts. The
@@ -191,6 +317,7 @@
         needs_turn: false,
         local_candidates: zeroCandidates(),
         remote_candidates: zeroCandidates(),
+        selected_pair: null,
       });
     }
     return synthetic;
@@ -591,6 +718,48 @@
       <span><span class="sw" style="background:#a78bfa"></span> pending</span>
       <span><span class="sw" style="background:#6b7280"></span> offline</span>
     </div>
+    <div class="zoom-controls" role="group" aria-label="Zoom controls">
+      <button
+        type="button"
+        class="zoom-btn"
+        title="Zoom out"
+        onclick={() => {
+          const next = Math.max(MIN_ZOOM, zoom / 1.25);
+          if (next === zoom) return;
+          const ratio = next / zoom;
+          panX = width / 2 - (width / 2 - panX) * ratio;
+          panY = height / 2 - (height / 2 - panY) * ratio;
+          zoom = next;
+          userTransformed = true;
+        }}
+      >
+        −
+      </button>
+      <button
+        type="button"
+        class="zoom-btn zoom-fit"
+        title="Fit graph to view"
+        onclick={applyFit}
+      >
+        {userTransformed ? `${Math.round(zoom * 100)}%` : "fit"}
+      </button>
+      <button
+        type="button"
+        class="zoom-btn"
+        title="Zoom in"
+        onclick={() => {
+          const next = Math.min(MAX_ZOOM, zoom * 1.25);
+          if (next === zoom) return;
+          const ratio = next / zoom;
+          panX = width / 2 - (width / 2 - panX) * ratio;
+          panY = height / 2 - (height / 2 - panY) * ratio;
+          zoom = next;
+          userTransformed = true;
+        }}
+      >
+        +
+      </button>
+    </div>
   </div>
 
   <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -598,17 +767,26 @@
   <svg
     bind:this={canvas}
     class="canvas"
+    class:dragging
     {width}
     {height}
     viewBox="0 0 {width} {height}"
     onclick={(e) => {
       if (e.target === e.currentTarget) onSelectPeer(null);
     }}
+    onwheel={onWheel}
+    onpointerdown={onPointerDown}
+    onpointermove={onPointerMove}
+    onpointerup={onPointerUp}
+    onpointercancel={onPointerUp}
     role="img"
     aria-label="Mesh node graph"
   >
     <!-- Subtle dot grid in the background. Helps anchor the eye
-         when nodes move and reinforces the canvas affordance. -->
+         when nodes move and reinforces the canvas affordance. The
+         grid lives outside the pan/zoom group so it stays anchored
+         to the canvas (a moving grid behind a moving graph would be
+         visual noise). -->
     <defs>
       <pattern
         id="grid"
@@ -620,6 +798,8 @@
       </pattern>
     </defs>
     <rect x="0" y="0" {width} {height} fill="url(#grid)" />
+
+    <g class="viewport" transform="translate({panX} {panY}) scale({zoom})">
 
     <!-- Edges. -->
     {#each layout.edges as edge}
@@ -744,6 +924,7 @@
         {/if}
       </g>
     {/each}
+    </g>
   </svg>
 
   {#if selectedPeer}
@@ -957,6 +1138,36 @@
     width: 100%;
     height: 100%;
     min-height: 0;
+    cursor: grab;
+    touch-action: none;
+  }
+  .canvas.dragging {
+    cursor: grabbing;
+  }
+  .zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+  }
+  .zoom-btn {
+    font: inherit;
+    font-size: 0.78rem;
+    line-height: 1;
+    color: #aaa;
+    background: #131318;
+    border: 1px solid #222226;
+    padding: 0.18rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    min-width: 1.8rem;
+  }
+  .zoom-btn:hover {
+    background: #1a1a22;
+    color: #e8e8e8;
+  }
+  .zoom-fit {
+    min-width: 3rem;
+    font-variant-numeric: tabular-nums;
   }
   .node {
     cursor: pointer;

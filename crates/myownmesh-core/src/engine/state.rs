@@ -441,6 +441,7 @@ impl NetworkState {
                     needs_turn: data.no_turn_diag_emitted,
                     local_candidates: data.diag.local_candidates.clone(),
                     remote_candidates: data.diag.remote_candidates.clone(),
+                    selected_pair: data.selected_pair,
                 }
             })
             .collect()
@@ -471,6 +472,7 @@ impl NetworkState {
             needs_turn: data.no_turn_diag_emitted,
             local_candidates: data.diag.local_candidates.clone(),
             remote_candidates: data.diag.remote_candidates.clone(),
+            selected_pair: data.selected_pair,
         })
     }
 

@@ -191,6 +191,23 @@ export interface PeerInfo {
    *  Both sides have to advertise a host candidate before we call
    *  the link LAN-direct. */
   remote_candidates: IceCandidateStats;
+  /** The ICE candidate pair the agent actually selected for sending
+   *  packets. Set once ICE reaches Connected. Authoritative input
+   *  for link classification — supersedes the heuristic over
+   *  `local_candidates` / `remote_candidates`. */
+  selected_pair: SelectedCandidatePair | null;
+}
+
+export type IceCandidateKindStr =
+  | "host"
+  | "server_reflexive"
+  | "peer_reflexive"
+  | "relay"
+  | "unknown";
+
+export interface SelectedCandidatePair {
+  local: IceCandidateKindStr;
+  remote: IceCandidateKindStr;
 }
 
 export interface IceCandidateStats {
@@ -217,34 +234,30 @@ export interface IceCandidateStats {
  *               peer is offline/sighted-only. */
 export type LinkKind = "lan" | "stun" | "turn" | "blocked" | "unknown";
 
-/** Infer the link kind from a peer's candidate stats + flags. We
- *  prefer the strongest signal:
- *    1. `needs_turn` → `blocked` (signaling visible, data pipe stuck).
- *    2. Any relay candidate on either side → `turn`.
- *    3. Both sides advertised host candidates and we're at least
- *       handshaking → `lan` (best effort — we don't have the
- *       actual selected-pair from webrtc-rs yet).
- *    4. Either side surfaced a server-reflexive candidate → `stun`.
- *    5. Otherwise `unknown` (sighted, offline, brand-new). */
+/** Infer the link kind from a peer's selected ICE pair + flags.
+ *  The selected pair (populated once ICE reaches Connected) is the
+ *  authoritative input — gathered-candidate counts only tell us what
+ *  was tried. We only fall back to candidate counts when ICE hasn't
+ *  reported a selection yet.
+ *
+ *    1. `needs_turn`                      → `blocked`
+ *    2. selected_pair has any relay       → `turn`
+ *    3. selected_pair is host ↔ host      → `lan`
+ *    4. selected_pair otherwise present   → `stun`
+ *    5. no pair yet but relay candidates  → `turn` (best guess)
+ *    6. no pair yet, srflx gathered       → `stun`
+ *    7. otherwise                         → `unknown` */
 export function linkKindOf(p: PeerInfo): LinkKind {
   if (p.needs_turn) return "blocked";
+  const sp = p.selected_pair;
+  if (sp) {
+    if (sp.local === "relay" || sp.remote === "relay") return "turn";
+    if (sp.local === "host" && sp.remote === "host") return "lan";
+    return "stun";
+  }
   const lc = p.local_candidates;
   const rc = p.remote_candidates;
   if ((lc?.relay ?? 0) > 0 || (rc?.relay ?? 0) > 0) return "turn";
-  const live =
-    p.status === "active" ||
-    p.status === "shelved" ||
-    p.status === "handshaking" ||
-    p.status === "pending_approval";
-  if (live && (lc?.host ?? 0) > 0 && (rc?.host ?? 0) > 0) {
-    // If neither side has gathered srflx/relay it really is LAN-only.
-    const noExternal =
-      (lc?.server_reflexive ?? 0) === 0 &&
-      (rc?.server_reflexive ?? 0) === 0 &&
-      (lc?.relay ?? 0) === 0 &&
-      (rc?.relay ?? 0) === 0;
-    if (noExternal) return "lan";
-  }
   if ((lc?.server_reflexive ?? 0) > 0 || (rc?.server_reflexive ?? 0) > 0) {
     return "stun";
   }

@@ -25,7 +25,7 @@ use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
-use crate::transport::{IceCandidateStats, Transport};
+use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
@@ -383,4 +383,10 @@ pub struct PeerInfo {
     /// as `local_candidates` — both sides have to surface a host
     /// candidate before we treat the link as LAN-direct.
     pub remote_candidates: IceCandidateStats,
+    /// The ICE candidate pair the agent actually selected for
+    /// sending packets, once known. Authoritative input for the
+    /// graph's LAN/STUN/TURN classification — the counts above only
+    /// describe what was tried, this describes what's in use. `None`
+    /// until ICE reaches Connected/Completed.
+    pub selected_pair: Option<SelectedCandidatePair>,
 }
