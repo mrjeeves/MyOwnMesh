@@ -80,6 +80,34 @@
 //! (`fresh → offering → connected → disconnected → recovering`) and
 //! on stuck thresholds (15s / 30s / 60s of waiting for an answer).
 //! Raw per-event logs are suppressed by default.
+//!
+//! # 6. Cross-relay event deduplication
+//!
+//! **Problem:** A peer publishes one Nostr event (announce / offer /
+//! answer / candidate) but every relay subscribed by both ends
+//! delivers it once — so the engine receives N copies of the same
+//! event, where N is the redundancy count (typically 4-5). For
+//! announces this is cosmetic spam in the log. For Offer / Answer
+//! it is **functional**: WebRTC's `RTCPeerConnection::set_remote_description`
+//! is not idempotent — applying the same SDP twice once the
+//! signaling state has advanced wedges the connection at
+//! `Stable → HaveRemoteOffer` and ICE never starts. Peers reach
+//! `Sighted` and never advance — the exact "they just sit there"
+//! symptom users hit in the field.
+//!
+//! **Our fix:** Track inbound event IDs (sha256, already present on
+//! every NIP-01 event) in a bounded ring per driver instance. The
+//! first relay to deliver an event wins; subsequent copies via
+//! other relays drop at the driver boundary, so the engine sees
+//! each signaling event exactly once.
+//!
+//! Implementation: `seen_event_ids` field on the Nostr driver's
+//! `DriverShared`, capacity [`SEEN_EVENT_CAPACITY`].
+//!
+//! Sized at 2048 entries × ~64 bytes = ~128 KB max — trivial, and
+//! large enough that two peers slowly trickling candidates over a
+//! long handshake never wrap (a typical handshake produces
+//! 5-20 events per side).
 
 /// Inbound-message staleness threshold for zombie clearing — see
 /// item 3. Picked at ~5× Trystero's 5.333s announce cadence, well
@@ -99,6 +127,11 @@ pub const RESUBSCRIBE_BACKOFF_MS: &[u64] = &[5_000, 10_000, 15_000, 30_000, 60_0
 /// to 0. Picked at the max backoff so a long-stable socket doesn't
 /// pay the cap on the next blip.
 pub const BACKOFF_RESET_AFTER_MS: u64 = 60_000;
+
+/// Inbound event-ID dedup ring size — see item 6. Bounded so the
+/// driver never grows unbounded on a long-lived mesh; sized to
+/// comfortably cover the busiest realistic handshake.
+pub const SEEN_EVENT_CAPACITY: usize = 2048;
 
 /// Disconnected-peer grace window before the engine tears down the
 /// connection. Matches Trystero's `disconnectedPeerGraceMs`.

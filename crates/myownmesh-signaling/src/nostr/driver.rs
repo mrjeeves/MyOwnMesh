@@ -108,6 +108,9 @@ pub fn start(
         relays: Mutex::new(Vec::new()),
         outbound: tokio::sync::Mutex::new(Some(outbound_rx)),
         publish_tx,
+        seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
+            SEEN_EVENT_CAPACITY,
+        )),
     });
     {
         let mut relays = shared.relays.lock();
@@ -174,7 +177,26 @@ struct DriverShared {
     relays: Mutex<Vec<RelayHandle>>,
     outbound: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<NostrOutbound>>>,
     publish_tx: broadcast::Sender<Arc<NostrEvent>>,
+    /// Cross-relay event-ID dedupe ring. Each Nostr event has a
+    /// sha256 `id`; the same event published once to N relays
+    /// arrives N times if we don't dedupe. Without this, the engine
+    /// receives every announce N× (cosmetic log spam) AND every
+    /// Offer / Answer N× (functional: calling
+    /// `set_remote_description` twice on the same peer connection
+    /// puts WebRTC into an unrecoverable state and stalls the
+    /// handshake at Sighted — exactly the "they just sit there"
+    /// symptom users hit in the field). 2048 entries covers the
+    /// busiest realistic mesh comfortably without growing
+    /// unboundedly.
+    seen_event_ids: Mutex<std::collections::VecDeque<String>>,
 }
+
+/// Window size of `seen_event_ids` — re-exported from
+/// [`crate::upstream`] which catalogues the rationale alongside the
+/// other upstream-Trystero fixes. The dedup itself lives here in
+/// the driver where the relay-fanout happens; the constant lives
+/// there with the rest of the tuning surface.
+use crate::upstream::SEEN_EVENT_CAPACITY;
 
 #[allow(dead_code)]
 struct RelayHandle {
@@ -359,6 +381,31 @@ fn handle_inbound_frame(
             if event.pubkey == shared.identity.pubkey_hex() {
                 return Ok(());
             }
+            // Cross-relay dedup. The same Nostr event (same sha256
+            // `id`) gets delivered by every relay that has it — with
+            // `signaling.redundancy` typically 4-5, that's a 4-5×
+            // amplification on every announce, offer, answer, and
+            // candidate. The engine layer above us is mostly
+            // idempotent on announces (`ensure_peer_session`
+            // short-circuits) but NOT on Offer/Answer:
+            // `set_remote_description` on an already-stable
+            // RTCPeerConnection puts WebRTC into a permanently
+            // wedged state — exactly the "they just sit there"
+            // symptom users see when peers reach Sighted and
+            // nothing advances. Filtering by event ID here is the
+            // canonical fix per `upstream.rs` item 5: signaling-layer
+            // concerns belong in signaling-layer code, not bolted
+            // into every engine handler.
+            {
+                let mut seen = shared.seen_event_ids.lock();
+                if seen.iter().any(|id| id == &event.id) {
+                    return Ok(()); // already delivered via another relay
+                }
+                if seen.len() >= SEEN_EVENT_CAPACITY {
+                    seen.pop_front();
+                }
+                seen.push_back(event.id.clone());
+            }
             // Pull our envelope out of the content.
             let envelope: SignalingEnvelope =
                 serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
@@ -478,4 +525,147 @@ fn short(url: &str) -> &str {
         .split('/')
         .next()
         .unwrap_or(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nostr::event::NostrIdentity;
+
+    fn fixture_shared() -> Arc<DriverShared> {
+        let identity = NostrIdentity::generate();
+        let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(16);
+        let (_out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
+        Arc::new(DriverShared {
+            identity,
+            room_handle: "test-room".into(),
+            device_id: "self-device".into(),
+            relays: Mutex::new(Vec::new()),
+            outbound: tokio::sync::Mutex::new(Some(out_rx)),
+            publish_tx,
+            seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
+                SEEN_EVENT_CAPACITY,
+            )),
+        })
+    }
+
+    /// Build a Nostr `EVENT` frame carrying an Announce envelope
+    /// from a fixed peer. The event ID is whatever the signer
+    /// produced; we wrap it the same way a relay would so
+    /// `handle_inbound_frame` parses it exactly like in production.
+    fn announce_frame_for(peer: &str, signer: &NostrIdentity) -> (String, String) {
+        let envelope = SignalingEnvelope {
+            from: peer.into(),
+            to: None,
+            msg: SignalingMessage::Announce {
+                peer_id: peer.into(),
+            },
+        };
+        let content = serde_json::to_string(&envelope).unwrap();
+        let event = crate::nostr::event::make_event(
+            signer,
+            SIGNALING_EVENT_KIND,
+            vec![vec!["r".into(), "test-room".into()]],
+            content,
+            1_700_000_000,
+        );
+        let frame =
+            serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string();
+        (frame, event.id)
+    }
+
+    /// Same event delivered twice (simulating two relays carrying
+    /// the same Nostr event) should produce exactly one inbound
+    /// announce on the engine-facing channel. This is the canonical
+    /// "Offer-applied-twice wedges WebRTC" regression — see
+    /// `upstream.rs` item 6.
+    #[test]
+    fn duplicate_event_id_only_fires_inbound_once() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let (frame, event_id) = announce_frame_for(&peer_pub, &peer_signer);
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+        handle_inbound_frame("wss://relay-b", &frame, &shared, &tx).expect("dup parses");
+        handle_inbound_frame("wss://relay-c", &frame, &shared, &tx).expect("dup parses");
+
+        let first = rx.try_recv().expect("first delivery lands");
+        match first {
+            NostrInbound::PeerAnnounced { device_id } => assert_eq!(device_id, peer_pub),
+            other => panic!("expected PeerAnnounced, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no second delivery for same event id");
+
+        let seen = shared.seen_event_ids.lock();
+        assert!(
+            seen.iter().any(|id| id == &event_id),
+            "event id recorded in dedupe ring"
+        );
+    }
+
+    /// Different events from the same peer (e.g. periodic re-announces)
+    /// must NOT be deduped — each one is a fresh signal that signaling
+    /// is alive. Only relay-replays of the SAME event id should drop.
+    #[test]
+    fn distinct_events_each_fire_inbound() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let (frame1, id1) = announce_frame_for(&peer_pub, &peer_signer);
+
+        // Bump the timestamp so the second event hashes to a
+        // different id (NIP-01 events are content-addressed).
+        let envelope = SignalingEnvelope {
+            from: peer_pub.clone(),
+            to: None,
+            msg: SignalingMessage::Announce {
+                peer_id: peer_pub.clone(),
+            },
+        };
+        let ev2 = crate::nostr::event::make_event(
+            &peer_signer,
+            SIGNALING_EVENT_KIND,
+            vec![vec!["r".into(), "test-room".into()]],
+            serde_json::to_string(&envelope).unwrap(),
+            1_700_000_005,
+        );
+        let frame2 = serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&ev2).unwrap()])
+            .to_string();
+        assert_ne!(id1, ev2.id, "test fixture: events must have distinct ids");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        handle_inbound_frame("wss://relay-a", &frame1, &shared, &tx).expect("frame 1 parses");
+        handle_inbound_frame("wss://relay-a", &frame2, &shared, &tx).expect("frame 2 parses");
+
+        assert!(matches!(
+            rx.try_recv().expect("first announce"),
+            NostrInbound::PeerAnnounced { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("second announce"),
+            NostrInbound::PeerAnnounced { .. }
+        ));
+    }
+
+    /// The dedup ring is bounded so a long-lived mesh doesn't grow
+    /// without bound. Past `SEEN_EVENT_CAPACITY` the oldest entries
+    /// roll off — a very old event could legitimately re-deliver,
+    /// which is fine: at that age it's effectively a fresh event.
+    #[test]
+    fn seen_ring_bounded_at_capacity() {
+        let shared = fixture_shared();
+        {
+            let mut seen = shared.seen_event_ids.lock();
+            for i in 0..SEEN_EVENT_CAPACITY + 50 {
+                if seen.len() >= SEEN_EVENT_CAPACITY {
+                    seen.pop_front();
+                }
+                seen.push_back(format!("id-{i}"));
+            }
+        }
+        let seen = shared.seen_event_ids.lock();
+        assert_eq!(seen.len(), SEEN_EVENT_CAPACITY);
+    }
 }
