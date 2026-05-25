@@ -569,8 +569,8 @@ mod tests {
             content,
             1_700_000_000,
         );
-        let frame =
-            serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string();
+        let frame = serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()])
+            .to_string();
         (frame, event.id)
     }
 
@@ -596,7 +596,10 @@ mod tests {
             NostrInbound::PeerAnnounced { device_id } => assert_eq!(device_id, peer_pub),
             other => panic!("expected PeerAnnounced, got {other:?}"),
         }
-        assert!(rx.try_recv().is_err(), "no second delivery for same event id");
+        assert!(
+            rx.try_recv().is_err(),
+            "no second delivery for same event id"
+        );
 
         let seen = shared.seen_event_ids.lock();
         assert!(
@@ -631,8 +634,8 @@ mod tests {
             serde_json::to_string(&envelope).unwrap(),
             1_700_000_005,
         );
-        let frame2 = serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&ev2).unwrap()])
-            .to_string();
+        let frame2 =
+            serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&ev2).unwrap()]).to_string();
         assert_ne!(id1, ev2.id, "test fixture: events must have distinct ids");
 
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
