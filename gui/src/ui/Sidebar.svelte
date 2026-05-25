@@ -2,7 +2,7 @@
   import { meshClient } from "../mesh-client.svelte";
   import { networkDisplayName, topologyName } from "../types";
   import type { NetworkSummary, PeerInfo } from "../types";
-  import { governance } from "../network-governance.svelte";
+  import { governance, type OrphanNetwork } from "../network-governance.svelte";
   import NetworkKindBadge from "./network/NetworkKindBadge.svelte";
 
   const {
@@ -70,6 +70,43 @@
 
   function phaseLabel(net: NetworkSummary): string {
     return net.phase.replace("_", " ");
+  }
+
+  // ---- orphan recovery (failed-save networks) -----------------------
+
+  /** Reconcile every render: any orphan whose `network_id` now
+   *  shows up in the live registry was recovered out-of-band and
+   *  should drop off the failed-saves list automatically. */
+  $effect(() => {
+    governance.reconcileOrphans(
+      new Set(meshClient.networks.map((n) => n.network_id)),
+    );
+  });
+
+  let busyOrphan = $state<string | null>(null);
+  let orphanError = $state<string | null>(null);
+
+  async function retryOrphan(o: OrphanNetwork) {
+    busyOrphan = o.network_id;
+    orphanError = null;
+    try {
+      // The original config carries the same wire-level
+      // `network_id` but may have an outdated internal `id`
+      // (especially if the user has since added other networks).
+      // Mint a fresh internal id so we don't collide with an
+      // unrelated record the daemon already holds.
+      const cfg = { ...o.config, id: `net_retry_${Date.now().toString(36)}` };
+      await meshClient.networkAdd(cfg);
+      governance.discardOrphan(o.network_id);
+    } catch (e) {
+      orphanError = `Retry failed for "${o.network_id}": ${String(e)}`;
+    } finally {
+      busyOrphan = null;
+    }
+  }
+
+  function discardOrphan(o: OrphanNetwork) {
+    governance.discardOrphan(o.network_id);
   }
 </script>
 
@@ -185,6 +222,55 @@
           {/if}
         </div>
       {/each}
+    {/if}
+
+    {#if governance.orphans.length > 0}
+      <div class="orphan-section">
+        <div class="orphan-head">
+          <svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M12 2 1 21h22L12 2zm0 5 7.5 13h-15L12 7zm-1 4v4h2v-4h-2zm0 5v2h2v-2h-2z"
+            />
+          </svg>
+          <span>Failed saves</span>
+        </div>
+        {#if orphanError}
+          <div class="orphan-err">{orphanError}</div>
+        {/if}
+        {#each governance.orphans as o (o.network_id)}
+          {@const busy = busyOrphan === o.network_id}
+          <div class="orphan">
+            <div class="orphan-row">
+              <span class="orphan-name" title={o.reason}>
+                {o.label || o.network_id}
+              </span>
+              <span class="orphan-tag">failed</span>
+            </div>
+            <div class="orphan-meta" title={o.reason}>
+              <code class="mono">{o.network_id}</code>
+            </div>
+            <div class="orphan-actions">
+              <button
+                class="orphan-btn"
+                disabled={busy}
+                onclick={() => retryOrphan(o)}
+                title="Re-apply the snapshot saved before the failed edit."
+              >
+                {busy ? "Retrying…" : "Retry"}
+              </button>
+              <button
+                class="orphan-btn danger"
+                disabled={busy}
+                onclick={() => discardOrphan(o)}
+                title="Forget this failed-save record. The network won't reappear unless you add it again from scratch."
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 </aside>
@@ -430,5 +516,104 @@
     font-size: 0.75rem;
     padding: 0.2rem 0.5rem;
     font-style: italic;
+  }
+  .orphan-section {
+    margin-top: 0.85rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid #2a1818;
+  }
+  .orphan-head {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.25rem 0.85rem 0.35rem;
+    color: #fb923c;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .orphan-err {
+    color: #fca5a5;
+    background: #2a1414;
+    border: 1px solid #4a2222;
+    border-radius: 4px;
+    padding: 0.35rem 0.5rem;
+    margin: 0 0.85rem 0.5rem;
+    font-size: 0.7rem;
+    line-height: 1.35;
+  }
+  .orphan {
+    margin: 0 0.5rem 0.4rem;
+    padding: 0.4rem 0.55rem;
+    background: #1d1614;
+    border: 1px solid #3a2018;
+    border-radius: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .orphan-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .orphan-name {
+    flex: 1;
+    color: #f5d0a0;
+    font-size: 0.8rem;
+    font-weight: 500;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .orphan-tag {
+    font-size: 0.58rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #fb923c;
+    background: #2a1a0c;
+    border: 1px solid #4a3214;
+    padding: 0.05rem 0.35rem;
+    border-radius: 999px;
+    line-height: 1;
+  }
+  .orphan-meta {
+    color: #88736b;
+    font-size: 0.66rem;
+  }
+  .orphan-meta .mono {
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    word-break: break-all;
+  }
+  .orphan-actions {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .orphan-btn {
+    flex: 1;
+    background: #1a1a22;
+    border: 1px solid #3a2a1a;
+    color: #f5d0a0;
+    font: inherit;
+    font-size: 0.7rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .orphan-btn:hover:not(:disabled) {
+    border-color: #6a4a2a;
+    background: #2a1a14;
+  }
+  .orphan-btn.danger {
+    color: #fca5a5;
+    border-color: #4a2222;
+  }
+  .orphan-btn.danger:hover:not(:disabled) {
+    background: #2a1414;
+  }
+  .orphan-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 </style>

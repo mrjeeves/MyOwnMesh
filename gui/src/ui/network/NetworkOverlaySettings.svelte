@@ -12,10 +12,13 @@
    *  atomic `mesh_network_update` is a follow-up — this gets users
    *  the affordance immediately without engine work. */
 
+  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { meshClient } from "../../mesh-client.svelte";
+  import { governance } from "../../network-governance.svelte";
   import {
     buildNetworkConfig,
     DEFAULT_NETWORK_STUN,
+    exportNetworkSettings,
     type TurnEntry,
   } from "../../network-settings";
   import {
@@ -45,6 +48,11 @@
   let busy = $state(false);
   let actionError = $state<string | null>(null);
   let savedAt = $state<number | null>(null);
+  /** Last-known full config from the daemon. Snapshotted on load
+   *  so the save flow can roll back to it if the new config fails
+   *  to apply (and so an orphan record can carry it forward if
+   *  the rollback itself fails — see `save()`). */
+  let originalConfig = $state<NetworkConfigInput | null>(null);
 
   /** Seed the draft from the daemon's current config the first time
    *  we render. Re-seed when the user switches to a different
@@ -59,8 +67,12 @@
           (n: NetworkConfigInput) =>
             n.id === network.config_id || n.network_id === network.network_id,
         );
-        if (net) seedFrom(net);
-        else seedDefaults();
+        if (net) {
+          originalConfig = net;
+          seedFrom(net);
+        } else {
+          seedDefaults();
+        }
       } catch (e) {
         actionError = `couldn't load current config: ${String(e)}`;
         seedDefaults();
@@ -167,11 +179,12 @@
     if (busy) return;
     busy = true;
     actionError = null;
+    let newCfg: NetworkConfigInput;
     try {
       // Build the new wire payload first so we don't tear down the
       // current network just to find the inputs invalid.
       const topo = buildTopology(topology, starHub || null);
-      const newCfg = buildNetworkConfig({
+      newCfg = buildNetworkConfig({
         networkId: network.network_id,
         label: labelDraft,
         topology: topo,
@@ -180,17 +193,127 @@
         turnEntries: turnDraft,
         autoApprove,
       });
+    } catch (e) {
+      actionError = `Invalid config: ${String(e)}`;
+      busy = false;
+      return;
+    }
 
-      // Edit = remove + re-add. Roster is keyed by `network_id` on
-      // disk so it survives the round-trip. A proper atomic update
-      // call (`mesh_network_update`) is a follow-up; this gets the
-      // user the affordance immediately without engine work and
-      // every peer reconnects within a few seconds.
+    // Edit = remove + re-add. The roster file lives at
+    // `~/.myownmesh/mesh/rosters/{network_id}.json` on disk and is
+    // keyed by network_id (not the local config record id), so it
+    // survives the round-trip. The risk is the add step failing
+    // (e.g. bad TURN URL the daemon rejects on parse) — without
+    // care, that leaves the user with no network and no surface
+    // to recover from. We snapshot the original on load, attempt
+    // remove + new add, fall back to re-adding the original, and
+    // record an orphan if even that fails.
+    //
+    // A proper atomic `mesh_network_update` would be cleaner. This
+    // gets the user the affordance immediately without engine work.
+    try {
       await meshClient.networkRemove(network.config_id);
+    } catch (e) {
+      actionError = `Couldn't remove existing config: ${String(e)}`;
+      busy = false;
+      return;
+    }
+
+    try {
       await meshClient.networkAdd(newCfg);
       savedAt = Date.now();
+    } catch (addErr) {
+      // New config rejected by the daemon — try to put the user
+      // back where they were.
+      if (originalConfig) {
+        try {
+          await meshClient.networkAdd(originalConfig);
+          actionError = `Save failed; rolled back to previous config. (${String(addErr)})`;
+        } catch (rollbackErr) {
+          // Both failed. Stash the original so the user can retry
+          // from the sidebar's orphan section instead of losing
+          // the network entirely.
+          governance.recordOrphan({
+            config_id: network.config_id,
+            network_id: network.network_id,
+            label: network.label,
+            failed_at: Date.now(),
+            reason: `save: ${String(addErr)} · rollback: ${String(rollbackErr)}`,
+            config: originalConfig,
+          });
+          actionError =
+            `Save failed AND rollback failed. The network has been removed ` +
+            `from the daemon and is recoverable from the "Failed saves" ` +
+            `section in the sidebar.\n\n` +
+            `save: ${String(addErr)}\nrollback: ${String(rollbackErr)}`;
+        }
+      } else {
+        actionError = `Save failed and no rollback snapshot was available: ${String(addErr)}`;
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ---- remove (danger zone) ------------------------------------------
+
+  /** Two-click remove: the first click expands a confirm-shaped row.
+   *  Modelled on the legacy NetworksSection pattern so users moving
+   *  between the two surfaces don't relearn the muscle memory. */
+  let confirmingRemove = $state(false);
+
+  async function removeNetwork() {
+    if (busy) return;
+    busy = true;
+    actionError = null;
+    try {
+      await meshClient.networkRemove(network.config_id);
+      // Drop any orphan tracking we had for this network — the
+      // user has explicitly chosen to forget it.
+      governance.discardOrphan(network.network_id);
+      // The overlay's parent watches `meshClient.networks`; when
+      // this config_id disappears, the overlay closes itself
+      // (via the "network not found" empty state). No explicit
+      // onClose call needed.
     } catch (e) {
-      actionError = String(e);
+      actionError = `Remove failed: ${String(e)}`;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // ---- export (share network settings to another device) --------------
+
+  async function exportNetwork() {
+    if (busy) return;
+    busy = true;
+    actionError = null;
+    try {
+      // Pull from the daemon so the export carries the live
+      // signaling/STUN/TURN — not the user's unsaved drafts.
+      // (If the user wants to share their pending edits before
+      // saving, they save first, then export. Two clicks; cleaner
+      // mental model than "export draft state.")
+      const cfg = await meshClient.configShow();
+      const net = cfg.networks.find(
+        (n: NetworkConfigInput) =>
+          n.id === network.config_id || n.network_id === network.network_id,
+      );
+      if (!net) {
+        actionError =
+          "Network is live in the registry but the daemon has no saved " +
+          "config to export. Save first, then export.";
+        return;
+      }
+      const envelope = exportNetworkSettings(net);
+      const path = await saveDialog({
+        defaultPath: `${envelope.network_id || net.id}.network-settings.json`,
+        filters: [{ name: "MyOwnMesh network settings", extensions: ["json"] }],
+      });
+      if (!path) return; // user cancelled
+      await meshClient.exportNetworkFile(path, envelope);
+    } catch (e) {
+      actionError = `Export failed: ${String(e)}`;
     } finally {
       busy = false;
     }
@@ -392,11 +515,77 @@
       </label>
     </div>
 
-    <!-- Save -->
+    <!-- Save / Export -->
     <div class="actions">
+      <button
+        class="btn ghost"
+        disabled={busy}
+        onclick={exportNetwork}
+        title="Export this network's settings as a JSON file another device can import to join the same network."
+      >
+        Export…
+      </button>
       <button class="btn primary" disabled={busy} onclick={save}>
         {busy ? "Saving…" : "Save changes"}
       </button>
+    </div>
+
+    <div class="hint subtle bottom-hint">
+      <strong>Sharing this network.</strong> Use <strong>Export…</strong>
+      to write a <code>.network-settings.json</code> file you can
+      send to another device — they import it via
+      <em>Sidebar → + → Import…</em> to join the same network. For
+      out-of-band pre-authorisation (so a new device's first
+      connection is auto-approved), use the
+      <strong>Approval</strong> action on a rostered peer in the
+      Roster tab.
+    </div>
+
+    <!-- Danger zone: a clear, sticky path to remove a network from
+         the daemon. Lives at the bottom so it's hard to miss but
+         also hard to hit by accident; the two-click confirm-then-
+         commit shape mirrors the existing legacy Networks tab. -->
+    <div class="danger-zone">
+      <div class="danger-title">Danger zone</div>
+      {#if confirmingRemove}
+        <div class="danger-row">
+          <span class="danger-text">
+            Remove this network from the daemon? The local roster
+            file is preserved on disk and a re-add with the same
+            network ID will pick it up again.
+          </span>
+          <div class="danger-actions">
+            <button
+              class="btn danger"
+              disabled={busy}
+              onclick={removeNetwork}
+            >
+              {busy ? "Removing…" : "Confirm remove"}
+            </button>
+            <button
+              class="btn ghost"
+              disabled={busy}
+              onclick={() => (confirmingRemove = false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      {:else}
+        <div class="danger-row">
+          <span class="danger-text">
+            Stop joining this network and drop it from the daemon's
+            registry. Roster file on disk is preserved.
+          </span>
+          <button
+            class="btn danger"
+            disabled={busy}
+            onclick={() => (confirmingRemove = true)}
+          >
+            Remove network…
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -647,8 +836,61 @@
     background: #3a3a70;
     border-color: #6e6ef7;
   }
+  .btn.ghost {
+    background: none;
+  }
   .btn:disabled {
     opacity: 0.5;
     cursor: default;
+  }
+  .bottom-hint {
+    margin-top: 0.5rem;
+  }
+  .bottom-hint code {
+    background: #131318;
+    padding: 0.02rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.74rem;
+  }
+  .danger-zone {
+    margin-top: 1.2rem;
+    background: #1d1414;
+    border: 1px solid #3a1f1f;
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem;
+  }
+  .danger-title {
+    color: #fca5a5;
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+  }
+  .danger-row {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    flex-wrap: wrap;
+  }
+  .danger-text {
+    flex: 1;
+    color: #ccc;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    min-width: 14rem;
+  }
+  .danger-actions {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .btn.danger {
+    background: #2a1414;
+    border-color: #5a2424;
+    color: #fca5a5;
+  }
+  .btn.danger:hover:not(:disabled) {
+    background: #3a1717;
+    border-color: #7a3434;
   }
 </style>

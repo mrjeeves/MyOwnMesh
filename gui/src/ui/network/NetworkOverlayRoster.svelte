@@ -9,10 +9,28 @@
    *  anyone, controllers can grant up to `controller`, owners can
    *  grant anything. */
 
+  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { meshClient } from "../../mesh-client.svelte";
   import { governance } from "../../network-governance.svelte";
-  import type { AuthorizedPeer, NetworkSummary, Role } from "../../types";
+  import type {
+    AuthorizedPeer,
+    NetworkConfigInput,
+    NetworkSummary,
+    Role,
+  } from "../../types";
   import { canGrant, ROLE_RANK } from "../../types";
+  import {
+    exportNetworkSettings,
+  } from "../../network-settings";
+  import {
+    buildApprovalExport,
+    buildIdentityExport,
+    isIdentityExport,
+    suggestedFilename,
+    tryParsePortable,
+    writePortableFile,
+    type IdentityExport,
+  } from "../../identity-portable";
   import RoleChip from "./RoleChip.svelte";
   import NetworkKindBadge from "./NetworkKindBadge.svelte";
 
@@ -104,6 +122,114 @@
     }
   }
 
+  // ---- identity import (pre-authorise a peer) -------------------------
+
+  let importBusy = $state(false);
+  let importInfo = $state<string | null>(null);
+  let fileInput = $state<HTMLInputElement | null>(null);
+
+  function clickImport() {
+    fileInput?.click();
+  }
+
+  function onFilePicked(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files && input.files.length > 0 ? input.files[0] : null;
+    input.value = "";
+    if (!file) return;
+    file
+      .text()
+      .then((text) => importIdentity(text))
+      .catch((e) => {
+        actionError = `Couldn't read file: ${String(e)}`;
+      });
+  }
+
+  async function importIdentity(text: string) {
+    actionError = null;
+    importInfo = null;
+    const parsed = tryParsePortable(text);
+    if (!parsed) {
+      actionError =
+        'File doesn\'t look like a MyOwnMesh identity export. Expected JSON with "kind": "myownmesh.identity".';
+      return;
+    }
+    // Both `myownmesh.identity` and `myownmesh.approval` carry a
+    // pubkey we can roster-approve. Identity is the common path;
+    // approval bundles work too (we lift the `approver` block).
+    const id: IdentityExport =
+      parsed.kind === "identity"
+        ? parsed.value
+        : parsed.value.approver;
+    if (!isIdentityExport(id) && parsed.kind !== "approval") {
+      actionError = "Imported file's identity block is malformed.";
+      return;
+    }
+
+    importBusy = true;
+    try {
+      // `roster_approve` accepts any device_id — when no live
+      // session exists yet, the approval is persisted to the
+      // on-disk roster file and the daemon auto-approves on the
+      // peer's first handshake. Exactly the pre-auth flow we want.
+      await meshClient.rosterApprove(
+        network.config_id,
+        id.pubkey,
+        id.label ?? "",
+      );
+      importInfo = `Pre-approved ${id.label || id.pubkey.slice(0, 12)}… on this network. ` +
+        `They'll auto-approve on first connection.`;
+      await refresh();
+    } catch (e) {
+      actionError = `Pre-approval failed: ${String(e)}`;
+    } finally {
+      importBusy = false;
+    }
+  }
+
+  // ---- approval export (issue out-of-band approval for a roster entry) ----
+
+  async function exportApproval(peer: AuthorizedPeer) {
+    if (!meshClient.identity) {
+      actionError = "Local identity not loaded yet.";
+      return;
+    }
+    busy = peer.device_id;
+    actionError = null;
+    try {
+      const cfg = await meshClient.configShow();
+      const net = cfg.networks.find(
+        (n: NetworkConfigInput) =>
+          n.id === network.config_id || n.network_id === network.network_id,
+      );
+      if (!net) {
+        actionError =
+          "Network has no saved config to bundle into the approval.";
+        return;
+      }
+      const envelope = buildApprovalExport({
+        network: exportNetworkSettings(net),
+        approver: buildIdentityExport({
+          pubkey: meshClient.identity.pubkey,
+          deviceId: meshClient.identity.device_id,
+          label: meshClient.identity.label,
+        }),
+        approvedPubkey: devicePubkey(peer.device_id),
+        approvedLabel: peer.label,
+      });
+      const path = await saveDialog({
+        defaultPath: suggestedFilename(envelope),
+        filters: [{ name: "MyOwnMesh approval", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await writePortableFile(path, envelope);
+    } catch (e) {
+      actionError = `Approval export failed: ${String(e)}`;
+    } finally {
+      busy = null;
+    }
+  }
+
   function whyDisabled(target: Role): string | null {
     if (govView.kind === "open") return null;
     if (!canGrant(myRole, target)) {
@@ -136,11 +262,37 @@
   {#if actionError}
     <div class="err">⚠ {actionError}</div>
   {/if}
+  {#if importInfo}
+    <div class="ok">{importInfo}</div>
+  {/if}
+
+  <div class="import-row">
+    <button
+      class="row-btn"
+      disabled={importBusy}
+      onclick={clickImport}
+      title="Import a .identity.json file from another device to pre-authorise them on this network. The next time they connect, they auto-approve without the verification-code dance."
+    >
+      {importBusy ? "Importing…" : "+ Import identity…"}
+    </button>
+    <span class="hint">
+      Pre-authorise a peer before they connect.
+    </span>
+    <input
+      bind:this={fileInput}
+      type="file"
+      accept=".json,application/json"
+      onchange={onFilePicked}
+      style="display: none"
+    />
+  </div>
 
   {#if roster.length === 0}
     <div class="empty">
       No approved devices yet. Approvals land here once you accept
-      a pending peer in the <strong>Approvals</strong> tab.
+      a pending peer in the <strong>Approvals</strong> tab — or
+      import an identity file (above) to pre-authorise a peer that
+      hasn't connected yet.
     </div>
   {:else}
     <table class="peers">
@@ -184,13 +336,23 @@
             </td>
             <td class="muted">{fmtDate(r.approved_at)}</td>
             <td>
-              <button
-                class="row-btn danger"
-                disabled={isBusy}
-                onclick={() => removePeer(r)}
-              >
-                Remove
-              </button>
+              <div class="row-actions">
+                <button
+                  class="row-btn"
+                  disabled={isBusy}
+                  onclick={() => exportApproval(r)}
+                  title="Issue an out-of-band approval bundle for this peer. Writes a .approval.json containing this network's settings + your identity + the peer's pubkey. They import it elsewhere to join the same network with you already in their roster."
+                >
+                  Approval…
+                </button>
+                <button
+                  class="row-btn danger"
+                  disabled={isBusy}
+                  onclick={() => removePeer(r)}
+                >
+                  Remove
+                </button>
+              </div>
             </td>
           </tr>
         {/each}
@@ -235,6 +397,28 @@
     border-radius: 5px;
     padding: 0.45rem 0.6rem;
     font-size: 0.78rem;
+  }
+  .ok {
+    background: #112a1c;
+    color: #b9f5cc;
+    border: 1px solid #1c4a30;
+    border-radius: 5px;
+    padding: 0.45rem 0.6rem;
+    font-size: 0.78rem;
+  }
+  .import-row {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    flex-wrap: wrap;
+  }
+  .import-row .hint {
+    color: #888;
+    font-size: 0.74rem;
+  }
+  .row-actions {
+    display: flex;
+    gap: 0.35rem;
   }
   .empty {
     color: #888;

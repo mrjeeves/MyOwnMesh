@@ -22,12 +22,42 @@
 // shape and method signatures stay.
 
 import { ROLE_RANK, type NetworkKind, type NetworkStateView, type PendingProposal, type PendingProposalVariant, type Role, type SplitRecord } from "./types";
+import type { NetworkConfigInput } from "./types";
 
 const STORAGE_KEY = "myownmesh.governance-preview.v1";
+const ORPHAN_STORAGE_KEY = "myownmesh.orphan-networks.v1";
 
 /** Time before a stuck close proposal becomes splittable. Matches
  *  the `STATE_PROPOSAL_TIMEOUT_S` constant in the design doc. */
 export const STATE_PROPOSAL_TIMEOUT_S = 24 * 60 * 60;
+
+/** An orphan network is a saved network that was removed from the
+ *  daemon (typically by a failed remove+re-add edit) but whose
+ *  original config the GUI has snapshotted, so the user can either
+ *  retry the add or explicitly discard the record.
+ *
+ *  Without this, a failed save would silently delete the network
+ *  from the GUI's view — the user would have to know to look at
+ *  `~/.myownmesh/config.json` to find out it was gone. Surfacing
+ *  the orphan in the sidebar keeps the broken state visible and
+ *  the recovery path one click away. */
+export interface OrphanNetwork {
+  /** The local config record id the daemon used. Stable per-device. */
+  config_id: string;
+  /** Wire-level network id (e.g. `home-mesh`). The friendly value
+   *  the user typed when they joined; survives the orphan so a
+   *  retry restores the same handle. */
+  network_id: string;
+  /** Cosmetic label, if any. */
+  label: string;
+  /** Wall-clock ms the failure happened. */
+  failed_at: number;
+  /** Human-readable error from the daemon. Surfaced in the sidebar
+   *  on hover and in the retry confirmation. */
+  reason: string;
+  /** Last-known full config. The retry button reapplies this. */
+  config: NetworkConfigInput;
+}
 
 function emptyState(): NetworkStateView {
   return {
@@ -86,17 +116,30 @@ function createGovernanceStore() {
   // ---- persistence ----------------------------------------------------
 
   let byConfigId = $state<Record<string, NetworkStateView>>({});
+  let orphans = $state<OrphanNetwork[]>([]);
 
   function load() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        byConfigId = parsed as Record<string, NetworkStateView>;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          byConfigId = parsed as Record<string, NetworkStateView>;
+        }
       }
     } catch (e) {
-      console.warn("governance-preview: load failed", e);
+      console.warn("governance-preview: load governance failed", e);
+    }
+    try {
+      const raw = localStorage.getItem(ORPHAN_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          orphans = parsed as OrphanNetwork[];
+        }
+      }
+    } catch (e) {
+      console.warn("governance-preview: load orphans failed", e);
     }
   }
 
@@ -104,7 +147,15 @@ function createGovernanceStore() {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(byConfigId));
     } catch (e) {
-      console.warn("governance-preview: persist failed", e);
+      console.warn("governance-preview: persist governance failed", e);
+    }
+  }
+
+  function persistOrphans() {
+    try {
+      localStorage.setItem(ORPHAN_STORAGE_KEY, JSON.stringify(orphans));
+    } catch (e) {
+      console.warn("governance-preview: persist orphans failed", e);
     }
   }
 
@@ -410,6 +461,37 @@ function createGovernanceStore() {
     return get(configId).splits;
   }
 
+  // ---- orphan tracking -----------------------------------------------
+
+  /** Record an orphan when an edit-save flow leaves the daemon
+   *  without the network the user expected. The original
+   *  pre-edit config is snapshotted so a retry can reapply it. */
+  function recordOrphan(o: OrphanNetwork) {
+    // Replace any existing orphan with the same network_id so
+    // repeated failures don't pile up duplicates.
+    orphans = [
+      ...orphans.filter((e) => e.network_id !== o.network_id),
+      o,
+    ];
+    persistOrphans();
+  }
+
+  function discardOrphan(networkId: string) {
+    orphans = orphans.filter((o) => o.network_id !== networkId);
+    persistOrphans();
+  }
+
+  /** Clear orphans whose network has come back to life — called
+   *  by the mesh client when a network is observed in the live
+   *  registry. Keyed on `network_id` (the wire-level handle) so a
+   *  retry that picks a fresh local `config_id` still clears the
+   *  orphan. */
+  function reconcileOrphans(liveNetworkIds: Set<string>) {
+    const before = orphans.length;
+    orphans = orphans.filter((o) => !liveNetworkIds.has(o.network_id));
+    if (orphans.length !== before) persistOrphans();
+  }
+
   // ---- initialisation ------------------------------------------------
 
   load();
@@ -417,6 +499,9 @@ function createGovernanceStore() {
   return {
     get byConfigId() {
       return byConfigId;
+    },
+    get orphans() {
+      return orphans;
     },
     /** Reactive accessor — components read this rather than the map
      *  directly so Svelte 5 tracks the dependency correctly. */
@@ -431,6 +516,9 @@ function createGovernanceStore() {
     withdrawProposal,
     spawnSplit,
     splitsFor,
+    recordOrphan,
+    discardOrphan,
+    reconcileOrphans,
   };
 }
 
