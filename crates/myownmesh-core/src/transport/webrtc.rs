@@ -38,8 +38,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::error::{Error, Result};
 
-use super::diag::IceCandidateKind;
-use super::ice::{build_rtc_configuration, classify_candidate_sdp};
+use super::ice::build_rtc_configuration;
 
 /// Stable label for the application data channel. Receivers can
 /// filter the incoming [`on_data_channel`] event on this so other
@@ -403,11 +402,6 @@ impl PeerSession {
     /// Read the overall connection state (DTLS + ICE composite).
     pub fn connection_state(&self) -> RTCPeerConnectionState {
         self.pc.connection_state()
-    }
-
-    /// Classify a candidate from the peer for diagnostics.
-    pub fn classify_inbound_candidate(&self, sdp: &str) -> IceCandidateKind {
-        classify_candidate_sdp(sdp)
     }
 
     /// Close the connection. Idempotent — subsequent close calls
