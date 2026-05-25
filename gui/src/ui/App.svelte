@@ -7,10 +7,17 @@
   import Sidebar from "./Sidebar.svelte";
   import NodeMap from "./NodeMap.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
+  import NetworkOverlay from "./network/NetworkOverlay.svelte";
 
   let settingsOpen = $state(false);
   let settingsInitialTab =
     $state<"approvals" | "networks" | "identity" | "diagnostics">("approvals");
+
+  /** Per-network overlay state. When non-null, the
+   *  `NetworkOverlay` slides over the right side of the graph,
+   *  scoped to a single network. Triggered by the gear icon on
+   *  each sidebar row. */
+  let networkOverlayConfigId = $state<string | null>(null);
 
   /** The config_id of the network the node-map + sidebar are
    *  currently focused on. `null` means "show the first one we
@@ -116,6 +123,14 @@
       }}
       onSelectPeer={(deviceId) => (selectedPeerId = deviceId)}
       onOpenNetworksSettings={() => openSettings("networks")}
+      onOpenNetworkOverlay={(id) => {
+        // Focus the overlay's target network on the graph too —
+        // keeps the canvas behind the panel relevant to what the
+        // user is editing.
+        focusedConfigId = id;
+        selectedPeerId = null;
+        networkOverlayConfigId = id;
+      }}
     />
 
     <div class="canvas">
@@ -154,6 +169,18 @@
             <div class="empty-title">Loading…</div>
           {/if}
         </div>
+      {/if}
+
+      <!-- Per-network overlay lives *inside* the canvas so it fills
+           only the graph area; the sidebar stays visible and
+           interactive, and the user keeps their place in the
+           network list while editing. Rendered after NodeMap so the
+           stacking order puts it on top within the canvas. -->
+      {#if networkOverlayConfigId}
+        <NetworkOverlay
+          configId={networkOverlayConfigId}
+          onClose={() => (networkOverlayConfigId = null)}
+        />
       {/if}
     </div>
   </div>
@@ -221,6 +248,10 @@
     display: flex;
     flex-direction: column;
     background: #0a0a0a;
+    /* Anchor for the per-network overlay's absolute positioning so
+       it fills the graph area exactly and doesn't bleed under the
+       sidebar. */
+    position: relative;
   }
   .empty {
     flex: 1;

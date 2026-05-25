@@ -32,6 +32,10 @@
     type NetworkSettingsExport,
     type TurnEntry,
   } from "../../network-settings";
+  import {
+    tryParsePortable,
+    type IdentityExport,
+  } from "../../identity-portable";
   import { buildTopology } from "../../types";
 
   const {
@@ -64,6 +68,12 @@
   let importDraft = $state<NetworkSettingsExport | null>(null);
   let importExpanded = $state(false);
   let fileInput = $state<HTMLInputElement | null>(null);
+
+  /** When the import was an approval bundle, hold the approver's
+   *  identity so we can pre-authorise them on the local roster
+   *  after the network is added. The actual `rosterApprove` call
+   *  runs inside `save()` after `networkAdd` returns. */
+  let pendingApprover = $state<IdentityExport | null>(null);
 
   /** True once the user has touched any advanced/import field.
    *  Drives the save-button label so the user knows whether they're
@@ -108,14 +118,43 @@
     file
       .text()
       .then((text) => {
+        // Three accepted file kinds, sniffed in this order so a
+        // well-formed envelope wins over a malformed lookalike:
+        //
+        //   1. .approval.json  — network settings + approver
+        //      identity. Adopts the network and remembers the
+        //      approver to pre-authorise after save.
+        //   2. .identity.json  — a peer's pubkey alone. Useless
+        //      for adding a network (no settings); surface a
+        //      clear "you also need the network" message rather
+        //      than silently accepting and producing an empty
+        //      network row.
+        //   3. .network-settings.json — the legacy path.
+        const portable = tryParsePortable(text);
+        if (portable?.kind === "approval") {
+          error = "";
+          adoptImport(portable.value.network);
+          pendingApprover = portable.value.approver;
+          return;
+        }
+        if (portable?.kind === "identity") {
+          error =
+            "That's an identity file (a peer's pubkey). To join a network you " +
+            "need either a network-settings file or an approval bundle. The " +
+            "identity file by itself only pre-authorises a peer on a network " +
+            "you've already joined — open Networks → Roster → Import identity.";
+          return;
+        }
         const parsed = tryParseNetworkSettings(text);
         if (!parsed) {
           error =
-            'File doesn\'t contain a MyOwnMesh network-settings blob (missing the \'"kind": "myownmesh.network-settings"\' marker).';
+            'File doesn\'t contain a MyOwnMesh network-settings blob ' +
+            '(expected `"kind": "myownmesh.network-settings"` or `"myownmesh.approval"`).';
           return;
         }
         error = "";
         adoptImport(parsed);
+        pendingApprover = null;
       })
       .catch((e) => {
         error = `Couldn't read file: ${String(e)}`;
@@ -124,6 +163,7 @@
 
   function clearImport() {
     importDraft = null;
+    pendingApprover = null;
     // Don't wipe network_id / advanced drafts — toggling import on
     // and off shouldn't be destructive.
   }
@@ -177,6 +217,28 @@
         turnEntries: turnDraft.filter((t) => t.url.trim() !== ""),
       });
       await meshClient.networkAdd(config);
+
+      // If the import was an approval bundle, the approver pre-
+      // authorised this device on their side — reciprocate by
+      // landing their pubkey in our roster so their first
+      // connection auto-approves here too. Non-fatal: a failure
+      // doesn't roll back the add; the user can still add them
+      // through the normal Approve flow when they appear.
+      if (pendingApprover) {
+        try {
+          await meshClient.rosterApprove(
+            config.id,
+            pendingApprover.pubkey,
+            pendingApprover.label ?? "",
+          );
+        } catch (approveErr) {
+          console.warn(
+            "Failed to pre-approve approver from imported bundle:",
+            approveErr,
+          );
+        }
+      }
+
       onAdded(config.id);
     } catch (e) {
       error = String(e);
@@ -411,13 +473,18 @@
     >
       <span class="disclosure-chevron">{importExpanded ? "▾" : "▸"}</span>
       Import from JSON
-      {#if importDraft}<span class="import-pill">applied</span>{/if}
+      {#if importDraft}<span class="import-pill">{pendingApprover ? "approval" : "applied"}</span>{/if}
     </button>
     {#if importExpanded}
       <div class="advanced">
         {#if importDraft}
           <div class="import-card">
-            <div class="import-card-head">Imported network settings</div>
+            <div class="import-card-head">
+              Imported network settings
+              {#if pendingApprover}
+                <span class="approval-tag">via approval bundle</span>
+              {/if}
+            </div>
             <dl class="import-summary">
               <dt>network_id</dt>
               <dd><code>{importDraft.network_id}</code></dd>
@@ -439,6 +506,20 @@
                   ? "(none)"
                   : importDraft.turn_servers.map((t) => t.url).join(", ")}
               </dd>
+              {#if pendingApprover}
+                <dt>approver</dt>
+                <dd>
+                  {pendingApprover.label || "—"}
+                  <code class="approver-pubkey">
+                    {pendingApprover.pubkey.slice(0, 12)}…
+                  </code>
+                  <div class="approver-hint">
+                    Will be added to this network's roster automatically
+                    after save — their first connection skips the
+                    verification-code dance.
+                  </div>
+                </dd>
+              {/if}
             </dl>
             <button class="btn-small ghost" onclick={clearImport}>
               Discard import
@@ -447,9 +528,11 @@
         {:else}
           <p class="advanced-hint">
             Pick a <code>.json</code> file exported from another device.
-            The envelope must carry
-            <code>"kind": "myownmesh.network-settings"</code> so we don't
-            try to import an unrelated blob by accident.
+            Accepted shapes:
+            <code>"myownmesh.network-settings"</code> (settings only) or
+            <code>"myownmesh.approval"</code> (settings + the approver's
+            identity, which lands on this network's roster pre-approved
+            after save).
           </p>
           <div class="import-actions">
             <button class="btn-small" onclick={() => fileInput?.click()}>
@@ -784,6 +867,34 @@
     font-size: 0.75rem;
     color: #c0c0c0;
     font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .approval-tag {
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #b9f5cc;
+    background: #112a1c;
+    border: 1px solid #1c4a30;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    line-height: 1;
+  }
+  .approver-pubkey {
+    font-size: 0.7rem;
+    background: #131318;
+    padding: 0.02rem 0.3rem;
+    border-radius: 3px;
+    margin-left: 0.3rem;
+  }
+  .approver-hint {
+    color: #888;
+    font-size: 0.7rem;
+    line-height: 1.4;
+    margin-top: 0.2rem;
   }
   .import-summary {
     display: grid;

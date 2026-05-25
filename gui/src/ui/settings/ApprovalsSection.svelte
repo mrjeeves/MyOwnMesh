@@ -22,8 +22,10 @@
    *  here until the user approves, denies, or the connection drops. */
 
   import { meshClient } from "../../mesh-client.svelte";
-  import type { NetworkSummary, PeerInfo } from "../../types";
-  import { networkDisplayName } from "../../types";
+  import { governance } from "../../network-governance.svelte";
+  import type { NetworkSummary, PeerInfo, Role } from "../../types";
+  import { canGrant, networkDisplayName, ROLE_RANK } from "../../types";
+  import NetworkKindBadge from "../network/NetworkKindBadge.svelte";
 
   type PendingRow = { network: NetworkSummary; peer: PeerInfo };
 
@@ -59,6 +61,32 @@
   let busyPeer = $state<string | null>(null);
   let actionError = $state<string | null>(null);
 
+  /** Per-row role selection. Default is `member`; the user picks
+   *  `controller` or `owner` on the row before approving when the
+   *  network is `closed`. For `open` networks the role tag is
+   *  cosmetic (the engine doesn't gate on it yet), but we still
+   *  let the user pick so the affordance is consistent and the
+   *  governance store has a record of intent. */
+  let pendingRoleByPeer = $state<Record<string, Role>>({});
+
+  function roleFor(deviceId: string): Role {
+    return pendingRoleByPeer[deviceId] ?? "member";
+  }
+
+  function pickRole(deviceId: string, role: Role) {
+    pendingRoleByPeer = { ...pendingRoleByPeer, [deviceId]: role };
+  }
+
+  function strippedPubkey(deviceId: string): string {
+    const dash = deviceId.lastIndexOf("-");
+    if (dash === -1) return deviceId;
+    const tail = deviceId.slice(dash + 1);
+    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) {
+      return deviceId.slice(0, dash);
+    }
+    return deviceId;
+  }
+
   async function approve(row: PendingRow) {
     busyPeer = row.peer.device_id;
     actionError = null;
@@ -68,6 +96,16 @@
         row.peer.device_id,
         row.peer.label,
       );
+      // Stamp the chosen role into the governance preview store.
+      // For open networks this is cosmetic; for closed networks the
+      // role determines what the peer can do in the future when
+      // the engine starts enforcing.
+      const role = roleFor(row.peer.device_id);
+      const selfPubkey = meshClient.identity?.pubkey ?? null;
+      if (role !== "member" && selfPubkey) {
+        const peerPub = strippedPubkey(row.peer.device_id);
+        governance.setPeerRole(row.network.config_id, selfPubkey, peerPub, role);
+      }
     } catch (e) {
       actionError = String(e);
     } finally {
@@ -252,6 +290,42 @@
               </div>
             </div>
           </div>
+
+          {#if state !== "waiting-peer"}
+            {@const netState = governance.stateFor(row.network.config_id)}
+            {@const selfPubkey = meshClient.identity?.pubkey ?? null}
+            {@const myRole = governance.localRole(row.network.config_id, selfPubkey)}
+            {@const chosen = roleFor(row.peer.device_id)}
+            <!-- Role selector is only meaningful on closed networks
+                 where the engine gates roster authority. On open
+                 networks it'd be a noisy cosmetic — every peer is
+                 a member and that's load-bearing — so we hide it. -->
+            {#if netState.kind === "closed"}
+              <div class="role-picker">
+                <div class="role-label">
+                  <NetworkKindBadge kind={netState.kind} size={11} />
+                  <span>Approve as</span>
+                </div>
+                <div class="role-radios">
+                  {#each ["member", "controller", "owner"] as r}
+                    {@const role = r as Role}
+                    {@const disabled = !canGrant(myRole, role)}
+                    <button
+                      class="role-radio"
+                      class:active={chosen === role}
+                      {disabled}
+                      title={disabled
+                        ? `Your role (${myRole}) can't grant ${role} in a closed network.`
+                        : `Grant the ${role} role on approval.`}
+                      onclick={() => pickRole(row.peer.device_id, role)}
+                    >
+                      {role}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          {/if}
 
           <div class="actions">
             {#if state === "waiting-peer"}
@@ -539,6 +613,53 @@
   }
   .confirm-tile.code-tile .confirm-value {
     color: #ffd166;
+  }
+  .role-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.45rem;
+    padding: 0.45rem 0.6rem;
+    background: #0d0d12;
+    border: 1px solid #1e1e25;
+    border-radius: 6px;
+  }
+  .role-label {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.74rem;
+    color: #ccc;
+  }
+  .role-radios {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .role-radio {
+    flex: 1;
+    background: #1a1a22;
+    border: 1px solid #2a2a35;
+    color: #888;
+    font: inherit;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.3rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .role-radio.active {
+    background: #1a1a2a;
+    border-color: #6e6ef7;
+    color: #b8b8ff;
+  }
+  .role-radio:hover:not(:disabled):not(.active) {
+    border-color: #4a4a55;
+    color: #ccc;
+  }
+  .role-radio:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
   }
   .actions {
     display: flex;

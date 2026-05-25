@@ -1,5 +1,11 @@
 <script lang="ts">
+  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { meshClient } from "../../mesh-client.svelte";
+  import {
+    buildIdentityExport,
+    suggestedFilename,
+    writePortableFile,
+  } from "../../identity-portable";
 
   /** Inline edit state for the label. Starts in "view" mode; the
    *  user clicks "Edit" to swap to the input, then "Save" persists
@@ -64,6 +70,41 @@
       console.warn("clipboard write failed:", e);
     }
   }
+
+  let exporting = $state(false);
+  let exportError = $state<string | null>(null);
+
+  /** Export this device's identity as a shareable `.identity.json`
+   *  file. The receiving side imports it via *Network → Roster →
+   *  Import identity* to pre-authorise this device without an
+   *  out-of-band verification-code exchange — when the local
+   *  identity later actually joins, the receiver's daemon
+   *  auto-approves from its roster.
+   *
+   *  Only public material is written (pubkey, display id, label).
+   *  The secret key never leaves `~/.myownmesh/.secrets/`. */
+  async function exportIdentity() {
+    if (!meshClient.identity || exporting) return;
+    exporting = true;
+    exportError = null;
+    try {
+      const envelope = buildIdentityExport({
+        pubkey: meshClient.identity.pubkey,
+        deviceId: meshClient.identity.device_id,
+        label: meshClient.identity.label,
+      });
+      const path = await saveDialog({
+        defaultPath: suggestedFilename(envelope),
+        filters: [{ name: "MyOwnMesh identity", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await writePortableFile(path, envelope);
+    } catch (e) {
+      exportError = String(e);
+    } finally {
+      exporting = false;
+    }
+  }
 </script>
 
 <div class="content">
@@ -115,6 +156,24 @@
           </button>
         </dd>
       </dl>
+      <div class="export-row">
+        <button
+          class="export-btn"
+          disabled={exporting}
+          onclick={exportIdentity}
+        >
+          {exporting ? "Exporting…" : "Export identity…"}
+        </button>
+        <span class="export-hint">
+          Writes a <code>.identity.json</code> file (pubkey + label only —
+          no secret material). Share with someone already on a network
+          you want to join; they can import it to pre-authorise this
+          device without the verification-code dance.
+        </span>
+      </div>
+      {#if exportError}
+        <div class="err">{exportError}</div>
+      {/if}
     </div>
 
     <h3 class="sub">Daemon</h3>
@@ -238,5 +297,43 @@
     line-height: 1.6;
     margin-top: 1rem;
     max-width: 36rem;
+  }
+  .export-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    margin-top: 0.85rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid #1e1e25;
+  }
+  .export-btn {
+    flex-shrink: 0;
+    padding: 0.35rem 0.85rem;
+    background: #1a1a22;
+    border: 1px solid #2a2a35;
+    border-radius: 5px;
+    color: #ccc;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.78rem;
+  }
+  .export-btn:hover:not(:disabled) {
+    border-color: #4a4a85;
+    color: #b8b8ff;
+  }
+  .export-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .export-hint {
+    color: #888;
+    font-size: 0.74rem;
+    line-height: 1.45;
+  }
+  .export-hint code {
+    background: #1a1a22;
+    padding: 0.02rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.7rem;
   }
 </style>

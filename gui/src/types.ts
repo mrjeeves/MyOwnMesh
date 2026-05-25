@@ -270,6 +270,130 @@ export interface AuthorizedPeer {
   device_id: string;
   label: string;
   approved_at: number;
+  /** Role this peer holds in the network's governance model. The
+   *  field exists on every roster entry so the same on-disk shape
+   *  works for `open` (everyone is `member`, the field is unused)
+   *  and `closed` networks (the field gates roster-edit authority).
+   *
+   *  Optional in the wire shape — entries written before
+   *  `network_state_v1` shipped don't carry the field and the GUI
+   *  treats `undefined` as `"member"`. See
+   *  [`docs/NETWORK-TYPES.md`](../../docs/NETWORK-TYPES.md).
+   *
+   *  **Preview-mode**: the engine doesn't honour this field yet —
+   *  the GUI persists it to local state via `network-governance.svelte.ts`
+   *  so the surfaces work end-to-end while the design is implemented. */
+  role?: Role;
+}
+
+// ---- governance (closed networks) ------------------------------------
+//
+// All of this is *preview-mode* surface — the engine doesn't yet
+// emit, accept, or persist the closed-network state log. The GUI
+// scaffolds the shapes so downstream embedders implementing the
+// design from `docs/NETWORK-TYPES.md` have a reference, and so the
+// transition from "preview" to "real" is a one-line swap from
+// `network-governance.svelte.ts` to a Tauri invoke().
+
+/** Network kind. `open` is the default and matches the engine's
+ *  current behaviour. `closed` adds role-based roster authority +
+ *  signed network-state transitions. */
+export type NetworkKind = "open" | "closed";
+
+/** Three role tiers in a closed network. Members can only propose;
+ *  controllers can add members; owners can add anything and approve
+ *  network-kind transitions. */
+export type Role = "owner" | "controller" | "member";
+
+/** Per-role authority levels, exposed for UI gating logic. Pure
+ *  function of the role enum; centralised so the role-radio,
+ *  propose-button-disabled checks, and "why disabled" hints all
+ *  agree. */
+export const ROLE_RANK: Record<Role, number> = {
+  owner: 3,
+  controller: 2,
+  member: 1,
+};
+
+export function canGrant(local: Role, target: Role): boolean {
+  return ROLE_RANK[local] >= ROLE_RANK[target] && local !== "member";
+}
+
+export function roleColor(r: Role): string {
+  switch (r) {
+    case "owner":
+      return "#fbbf24";
+    case "controller":
+      return "#60a5fa";
+    case "member":
+      return "#94a3b8";
+  }
+}
+
+/** A pending signed-state proposal on a network. Carried in the
+ *  governance store + surfaced as Approvals-tab cards on every
+ *  member who needs to sign. */
+export interface PendingProposal {
+  id: string;
+  /** Wall-clock ms the proposer floated the proposal. */
+  created_at: number;
+  /** Pubkey of the member who issued the proposal. */
+  proposer: string;
+  variant: PendingProposalVariant;
+  /** Signers who've already ack'd `sign`. Always includes the proposer. */
+  signers: string[];
+  /** Members who've ack'd `deny`. Non-empty = proposal dead. */
+  deniers: string[];
+  /** True once the proposer has fired the split fallback. */
+  split_spawned: boolean;
+}
+
+export type PendingProposalVariant =
+  | { kind: "kind_change"; to: NetworkKind }
+  | { kind: "role_grant"; target: string; to: Role }
+  | { kind: "role_revoke"; target: string }
+  | {
+      kind: "split";
+      /** Deterministic id of the network spawned by this split. */
+      new_network_id: string;
+      /** Members the proposer is bringing into the new closed network. */
+      members: string[];
+    };
+
+/** Snapshot of a network's signed governance state — the kind, the
+ *  per-peer role map, the transition log, and any in-flight
+ *  proposals. Local-only in preview-mode; the engine will own and
+ *  emit this in the real implementation. */
+export interface NetworkStateView {
+  kind: NetworkKind;
+  /** Pubkey → role assignments. Pubkeys not in this map default to
+   *  `member`. Open networks keep this empty (the role tag is
+   *  cosmetic when no closed-network rules are enforced). */
+  roles: Record<string, Role>;
+  /** Append-only signed log of every transition this network has
+   *  gone through. Most recent last. Empty on open networks that
+   *  have never gone through a kind change. */
+  transitions: NetworkTransition[];
+  /** Proposals awaiting signatures or in deny/split-fallback. */
+  pending: PendingProposal[];
+  /** Last-known split derivations from this network (each spawning
+   *  a new closed network with the listed members). Used to render
+   *  the "also runs *N'*" chip on the Connections tab. */
+  splits: SplitRecord[];
+}
+
+export interface NetworkTransition {
+  at: number;
+  variant: PendingProposalVariant;
+  /** Pubkeys that signed this transition. */
+  signers: string[];
+}
+
+export interface SplitRecord {
+  new_network_id: string;
+  spawned_at: number;
+  spawned_by: string;
+  members: string[];
 }
 
 // ---- network summary (from NetworksList) -----------------------------
@@ -288,6 +412,11 @@ export interface NetworkSummary {
   label: string;
   phase: MeshPhase;
   topology: TopologyMode;
+  /** Optional governance kind. Field is intentionally optional so a
+   *  pre-`network_state_v1` daemon can return the same JSON shape
+   *  without emitting the field; the GUI treats `undefined` as
+   *  `"open"`. */
+  kind?: NetworkKind;
 }
 
 /** What to show the human for a network. Mirrors MyOwnLLM's pattern:
