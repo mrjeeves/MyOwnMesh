@@ -27,9 +27,15 @@ import type { NetworkConfigInput } from "./types";
 const STORAGE_KEY = "myownmesh.governance-preview.v1";
 const ORPHAN_STORAGE_KEY = "myownmesh.orphan-networks.v1";
 
-/** Time before a stuck close proposal becomes splittable. Matches
- *  the `STATE_PROPOSAL_TIMEOUT_S` constant in the design doc. */
-export const STATE_PROPOSAL_TIMEOUT_S = 24 * 60 * 60;
+/** Time before a stuck close proposal becomes splittable. Short
+ *  by intent: a close proposal that's lingered past a few minutes
+ *  is either getting consensus or it isn't, and a 24-hour wait
+ *  would have the would-be owner staring at a "pending" badge
+ *  long after they'd given up on it. 3 minutes is enough for
+ *  every online member to see + decide, and short enough that
+ *  the split feels like a sibling action to the close itself
+ *  rather than a separate session. */
+export const STATE_PROPOSAL_TIMEOUT_S = 3 * 60;
 
 /** An orphan network is a saved network that was removed from the
  *  daemon (typically by a failed remove+re-add edit) but whose

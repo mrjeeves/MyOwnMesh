@@ -170,6 +170,18 @@
           {/if}
         </div>
       {/if}
+
+      <!-- Per-network overlay lives *inside* the canvas so it fills
+           only the graph area; the sidebar stays visible and
+           interactive, and the user keeps their place in the
+           network list while editing. Rendered after NodeMap so the
+           stacking order puts it on top within the canvas. -->
+      {#if networkOverlayConfigId}
+        <NetworkOverlay
+          configId={networkOverlayConfigId}
+          onClose={() => (networkOverlayConfigId = null)}
+        />
+      {/if}
     </div>
   </div>
 
@@ -178,13 +190,6 @@
       initialTab={settingsInitialTab}
       focusedConfigId={focusedConfigId}
       onClose={() => (settingsOpen = false)}
-    />
-  {/if}
-
-  {#if networkOverlayConfigId}
-    <NetworkOverlay
-      configId={networkOverlayConfigId}
-      onClose={() => (networkOverlayConfigId = null)}
     />
   {/if}
 </div>
@@ -243,6 +248,10 @@
     display: flex;
     flex-direction: column;
     background: #0a0a0a;
+    /* Anchor for the per-network overlay's absolute positioning so
+       it fills the graph area exactly and doesn't bleed under the
+       sidebar. */
+    position: relative;
   }
   .empty {
     flex: 1;

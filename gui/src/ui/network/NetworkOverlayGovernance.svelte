@@ -125,12 +125,15 @@
   <div class="preview-banner" role="status">
     <strong>Preview mode</strong>
     <span>
-      Closed-network governance is the design proposal in
-      <code>docs/NETWORK-TYPES.md</code>. The engine doesn't yet
-      emit signed state transitions — everything on this tab is
-      browser-local and shared only between tabs of this build. The
-      surface is here so downstream embedders implementing the
-      design have a reference.
+      Governance is designed to be enforced <strong>at the engine
+      layer</strong>: every transition rides as a signed
+      <code>network_state</code> frame and peers drop frames whose
+      signer set doesn't satisfy the quorum table. Until that ships
+      (design at <code>docs/NETWORK-TYPES.md</code>), the kind
+      toggle and role grants on this tab live only in this browser's
+      <code>localStorage</code> — useful for exploring the surface
+      and for downstream embedders implementing the design, but the
+      daemon isn't checking signatures yet.
     </span>
   </div>
 
@@ -278,11 +281,11 @@
             <div class="prop-explain">
               {#if p.variant.kind === "kind_change" && p.variant.to === "closed"}
                 Every current member must sign before the close
-                lands. If some are offline past
-                <code>{STATE_PROPOSAL_TIMEOUT_S / 3600}h</code>, the
-                proposer can spawn a derived closed network with the
-                signers it has — non-signers stay in the original
-                open network.
+                lands. If some are silent past
+                <code>{Math.round(STATE_PROPOSAL_TIMEOUT_S / 60)} min</code>,
+                the would-be owner (proposer) can spawn a derived
+                closed network with the signers they have —
+                non-signers stay in the original open network.
               {:else if p.variant.kind === "kind_change" && p.variant.to === "open"}
                 Every current owner must sign. A single deny
                 invalidates the proposal.
@@ -334,7 +337,7 @@
     <div class="card-title">Mesh quorum reference</div>
     <dl class="quorum">
       <dt>open → closed</dt>
-      <dd>unanimous of current members (split fallback after {STATE_PROPOSAL_TIMEOUT_S / 3600}h)</dd>
+      <dd>unanimous of current members (proposer-initiated split fallback after {Math.round(STATE_PROPOSAL_TIMEOUT_S / 60)} min)</dd>
       <dt>closed → open</dt>
       <dd>unanimous of current owners</dd>
       <dt>grant owner</dt>

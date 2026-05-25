@@ -296,36 +296,35 @@
             {@const selfPubkey = meshClient.identity?.pubkey ?? null}
             {@const myRole = governance.localRole(row.network.config_id, selfPubkey)}
             {@const chosen = roleFor(row.peer.device_id)}
-            {@const closed = netState.kind === "closed"}
-            <div class="role-picker">
-              <div class="role-label">
-                <NetworkKindBadge kind={netState.kind} size={11} />
-                <span>Approve as</span>
-                {#if !closed}
-                  <span class="role-hint">
-                    · role is cosmetic on this open network until it
-                    closes
-                  </span>
-                {/if}
+            <!-- Role selector is only meaningful on closed networks
+                 where the engine gates roster authority. On open
+                 networks it'd be a noisy cosmetic — every peer is
+                 a member and that's load-bearing — so we hide it. -->
+            {#if netState.kind === "closed"}
+              <div class="role-picker">
+                <div class="role-label">
+                  <NetworkKindBadge kind={netState.kind} size={11} />
+                  <span>Approve as</span>
+                </div>
+                <div class="role-radios">
+                  {#each ["member", "controller", "owner"] as r}
+                    {@const role = r as Role}
+                    {@const disabled = !canGrant(myRole, role)}
+                    <button
+                      class="role-radio"
+                      class:active={chosen === role}
+                      {disabled}
+                      title={disabled
+                        ? `Your role (${myRole}) can't grant ${role} in a closed network.`
+                        : `Grant the ${role} role on approval.`}
+                      onclick={() => pickRole(row.peer.device_id, role)}
+                    >
+                      {role}
+                    </button>
+                  {/each}
+                </div>
               </div>
-              <div class="role-radios">
-                {#each ["member", "controller", "owner"] as r}
-                  {@const role = r as Role}
-                  {@const disabled = closed && !canGrant(myRole, role)}
-                  <button
-                    class="role-radio"
-                    class:active={chosen === role}
-                    {disabled}
-                    title={disabled
-                      ? `Your role (${myRole}) can't grant ${role} in a closed network.`
-                      : `Grant the ${role} role on approval.`}
-                    onclick={() => pickRole(row.peer.device_id, role)}
-                  >
-                    {role}
-                  </button>
-                {/each}
-              </div>
-            </div>
+            {/if}
           {/if}
 
           <div class="actions">
@@ -631,10 +630,6 @@
     gap: 0.35rem;
     font-size: 0.74rem;
     color: #ccc;
-  }
-  .role-hint {
-    color: #888;
-    font-size: 0.7rem;
   }
   .role-radios {
     display: flex;

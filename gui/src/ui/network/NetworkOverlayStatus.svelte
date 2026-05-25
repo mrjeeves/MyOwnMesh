@@ -82,15 +82,12 @@
       <dt>Peers</dt>
       <dd>{peers.length} tracked</dd>
 
-      <dt>Your role</dt>
-      <dd>
-        <RoleChip role={myRole} size="md" />
-        {#if kind === "open"}
-          <span class="muted-inline">
-            · roles are cosmetic in open networks
-          </span>
-        {/if}
-      </dd>
+      {#if kind === "closed"}
+        <dt>Your role</dt>
+        <dd>
+          <RoleChip role={myRole} size="md" />
+        </dd>
+      {/if}
     </dl>
   </div>
 
@@ -224,10 +221,6 @@
     color: #fca5a5;
     background: #2a1414;
     border-color: #4a2222;
-  }
-  .muted-inline {
-    color: #888;
-    font-size: 0.78rem;
   }
   .splits {
     list-style: none;

@@ -19,6 +19,34 @@ file. `open` is the default and still does what it does today;
 closed networks layer onto the same primitives without forking the
 embedder API.
 
+## Enforcement is at the network layer
+
+Authority — who can add to the roster, who can change the kind, who
+can grant roles — is enforced **at the engine / daemon level**, not
+in any one client. The `network_state.json` sibling file is a signed
+log: every transition (kind change, role grant, role revoke, split)
+carries the ed25519 signatures of the members whose authority makes
+it valid. A peer that receives a `network_state_propose` it didn't
+ask for, or whose signer set doesn't satisfy the quorum table for
+its operation, drops the frame at the protocol layer. Same for
+inbound `roster_entries` — a controller can author a member-add,
+but a member who tries to author a controller-add produces a frame
+that fails verification on every honest receiver.
+
+The GUI's role checks (`canGrant()`, the disabled role-radio
+buttons, the propose-close button gating) are convenience —
+keeping a user from issuing a request the engine would just reject.
+A determined adversary holding the control socket can bypass the
+GUI; what they can't bypass is the cryptographic verification on
+the other side. **The wire, not the UI, is the security boundary.**
+
+During the preview-mode window — where the GUI scaffolds these
+surfaces while the engine half lands — every governance mutation
+lives entirely in `localStorage` on the issuer's machine, and the
+preview banner on the Governance tab is explicit about that. None
+of the closed-network claims have wire enforcement until
+`network_state_v1` ships in the engine.
+
 ## Two kinds
 
 | Kind | Who can add to the roster | Roster sync |
@@ -139,18 +167,29 @@ floor. The lifecycle:
    open and the close is removed from the pending log. The closer
    can re-propose later or never.
 4. **Timeout with partial signatures → split.** After
-   `STATE_PROPOSAL_TIMEOUT_S` (default 24 h, tunable per-network)
-   some members are still silent — typically offline. The closer
-   can publish a `network_state_split` carrying the signers it has
-   so far. That message spawns a new closed network derived from
-   the original; the signers + closer form its initial roster with
-   the closer as `owner` (and the signers as the role each agreed
-   to in their original ack — controllers and members carry across).
+   `STATE_PROPOSAL_TIMEOUT_S` (default **3 minutes**, tunable
+   per-network) some members are still silent. **Only the
+   would-be owner of the closed network — i.e. the original
+   proposer — can fire the split**: they publish
+   `network_state_split` carrying the signers they have so far.
+   That message spawns a new closed network derived from the
+   original; the proposer is its founder-owner. Co-signers join
+   automatically with the role they ack'd to in the original
+   close (default `member`); non-signers stay in the original
+   network unchanged.
 
 The split is not the closer's first move — it's the fallback for
 when getting everyone aligned is taking longer than they're
 willing to wait. Step 2 stays the happy path; step 4 stays a
-deliberate "I'm proceeding without the silent members" decision.
+deliberate "I'm proceeding without the silent members" decision,
+made by the person whose ownership the close was about in the
+first place.
+
+Three minutes (not 24 hours) is deliberate: a proposal that's
+lingered past a few minutes is either getting consensus or it
+isn't, and a longer wait would have the would-be owner staring
+at a "pending" badge long after they'd given up. Short enough
+that the split feels like a sibling action to the close itself.
 
 ### Splits in detail
 
@@ -290,14 +329,17 @@ The four foundational choices, settled:
    than OR-Set CRDT, matches the existing append-mostly roster
    file shape, and the partition risk in the deployments this
    targets (friend-mesh / office-mesh) is low.
-2. **Resolving a stuck close — proposer-initiated split.**
+2. **Resolving a stuck close — would-be-owner-initiated split.**
    Unanimous-of-rostered is the ceiling. If silent members stall
-   the proposal past `STATE_PROPOSAL_TIMEOUT_S`, the proposer can
-   publish a `network_state_split` that spawns a derived closed
-   network from the signers it has. Nodes that want the closed
-   governance join the split; nodes that don't, stay where they
-   are. No automatic-on-reconnect prompt, no M-of-N override — the
-   close either gets everyone or it splits.
+   the proposal past `STATE_PROPOSAL_TIMEOUT_S` (default 3
+   minutes), **only the original proposer — the would-be founder
+   owner — can fire the split.** Publishing
+   `network_state_split` spawns a derived closed network from the
+   signers they have. Nodes that want the closed governance join
+   the split; nodes that don't, stay where they are. No
+   automatic-on-reconnect prompt, no M-of-N override — the close
+   either gets everyone or it splits, and the new closed network
+   is governed by the person who wanted it that way.
 3. **Forks are governance scope, not connectivity scope.** A
    fork's existence does not break the peer connections that the
    original network's signaling brought together. Two peers in

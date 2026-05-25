@@ -250,9 +250,6 @@
     <div class="head-meta">
       <NetworkKindBadge kind={govView.kind} size={13} />
       <span>{roster.length} approved {roster.length === 1 ? "device" : "devices"}</span>
-      {#if govView.kind === "open"}
-        <span class="muted">· roles preview · cosmetic until closed</span>
-      {/if}
     </div>
   </div>
 
@@ -299,7 +296,9 @@
       <thead>
         <tr>
           <th>Device</th>
-          <th>Role</th>
+          {#if govView.kind === "closed"}
+            <th>Role</th>
+          {/if}
           <th>Approved</th>
           <th></th>
         </tr>
@@ -315,25 +314,27 @@
                 {shortId(r.device_id)}
               </div>
             </td>
-            <td>
-              <div class="role-cell">
-                <RoleChip {role} size="sm" />
-                <div class="role-menu">
-                  {#each ["owner", "controller", "member"] as r2}
-                    {@const disabled = !!whyDisabled(r2 as Role)}
-                    <button
-                      class="role-opt"
-                      class:active={role === r2}
-                      {disabled}
-                      title={whyDisabled(r2 as Role) ?? `Set role to ${r2}`}
-                      onclick={() => setRole(r, r2 as Role)}
-                    >
-                      {r2}
-                    </button>
-                  {/each}
+            {#if govView.kind === "closed"}
+              <td>
+                <div class="role-cell">
+                  <RoleChip {role} size="sm" />
+                  <div class="role-menu">
+                    {#each ["owner", "controller", "member"] as r2}
+                      {@const disabled = !!whyDisabled(r2 as Role)}
+                      <button
+                        class="role-opt"
+                        class:active={role === r2}
+                        {disabled}
+                        title={whyDisabled(r2 as Role) ?? `Set role to ${r2}`}
+                        onclick={() => setRole(r, r2 as Role)}
+                      >
+                        {r2}
+                      </button>
+                    {/each}
+                  </div>
                 </div>
-              </div>
-            </td>
+              </td>
+            {/if}
             <td class="muted">{fmtDate(r.approved_at)}</td>
             <td>
               <div class="row-actions">

@@ -49,7 +49,6 @@
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="backdrop" onclick={onClose} role="presentation"></div>
 <aside class="panel" aria-label="Network settings">
   <header class="head">
     {#if network}
@@ -126,23 +125,17 @@
 </aside>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.45);
-    z-index: 39;
-    backdrop-filter: blur(1px);
-  }
   .panel {
-    position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: clamp(420px, 38vw, 640px);
+    /* Fills the canvas (= graph area) only; the sidebar stays
+       visible and interactive while the panel is open, so the
+       user can still see + switch between networks. Anchored to
+       the parent canvas's `position: relative`. */
+    position: absolute;
+    inset: 0;
     background: #0f0f14;
     border-left: 1px solid #1e1e25;
     box-shadow: -8px 0 24px rgba(0, 0, 0, 0.4);
-    z-index: 40;
+    z-index: 5;
     display: flex;
     flex-direction: column;
     overflow: hidden;
