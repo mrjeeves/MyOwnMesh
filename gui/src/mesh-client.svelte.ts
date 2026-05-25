@@ -256,36 +256,22 @@ function createMeshClient() {
     const label =
       typeof event.label === "string" && event.label ? `${event.label} (${peer})` : peer;
 
+    // Skip variants the engine already emits a paired `log_diag`
+    // for — duplicating them here would put two rows in the
+    // activity log for one event. Pairs (engine-side diag):
+    //   sighted        → "peer sighted: …" (engine/mod.rs)
+    //   authenticated  → "auth ok with …" (handshake.rs)
+    //   approved       → "peer active: …" (handshake.rs)
+    //   dropped        → "peer dropped: …" (engine/mod.rs)
+    // Remaining variants (shelved / unshelved / capabilities_changed)
+    // have no engine-side diag pair, so the GUI synthesis is the
+    // only thing that surfaces them in the log.
     switch (variant) {
       case "sighted":
-        return {
-          ts,
-          network_id,
-          level: "info",
-          category: "peer",
-          message: `sighted ${peer}`,
-          detail: null,
-        };
-      case "authenticated": {
-        const rostered = (event as { rostered?: boolean }).rostered ? " · rostered" : "";
-        return {
-          ts,
-          network_id,
-          level: "info",
-          category: "handshake",
-          message: `authenticated ${label}${rostered}`,
-          detail: null,
-        };
-      }
+      case "authenticated":
       case "approved":
-        return {
-          ts,
-          network_id,
-          level: "info",
-          category: "peer",
-          message: `approved ${label}`,
-          detail: null,
-        };
+      case "dropped":
+        return null;
       case "shelved": {
         const by_us = (event as { by_us?: boolean }).by_us === true;
         return {
@@ -317,21 +303,6 @@ function createMeshClient() {
           message: `capabilities changed: ${label}`,
           detail: null,
         };
-      case "dropped": {
-        const reason = (event as { reason?: Record<string, unknown> }).reason;
-        const reasonKind =
-          reason && typeof reason === "object" && "kind" in reason
-            ? String((reason as { kind: unknown }).kind)
-            : "unknown";
-        return {
-          ts,
-          network_id,
-          level: "warn",
-          category: "peer",
-          message: `dropped ${label} (${reasonKind})`,
-          detail: null,
-        };
-      }
       default:
         // Unknown peer-event variant — render a generic line so it's
         // still visible in the log rather than silently dropped.

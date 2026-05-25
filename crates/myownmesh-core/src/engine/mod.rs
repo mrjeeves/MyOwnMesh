@@ -91,6 +91,31 @@ pub async fn run_driver(
         "engine",
         "engine driver starting",
     );
+    // Surface the ICE-server configuration so users can confirm at
+    // a glance whether they have any relay coverage. Mirrors
+    // MyOwnLLM's pattern: when peers get stuck at ICE-checking with
+    // 0 relay candidates, this line is the first thing to point at.
+    {
+        let cfg = state.config.read();
+        let stun_count: usize = cfg.stun_servers.iter().map(|s| s.urls.len()).sum();
+        let turn_count: usize = cfg.turn_servers.iter().map(|s| s.urls.len()).sum();
+        let turn_summary = if turn_count == 0 {
+            "no TURN configured (CGNAT / phone-hotspot will fail to connect)".to_string()
+        } else {
+            format!("{turn_count} TURN URL(s)")
+        };
+        state.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "engine",
+            format!("ICE servers: {stun_count} STUN URL(s), {turn_summary}"),
+            serde_json::json!({
+                "stun_count": stun_count,
+                "turn_count": turn_count,
+                "auto_approve": cfg.auto_approve,
+            }),
+        );
+        drop(cfg);
+    }
 
     // Top-level interval ticks. We hold them across the loop so
     // sleeping happens inside `tokio::select!` — no separate
@@ -240,11 +265,26 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             } else {
                 Role::Answerer
             };
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "signaling",
+                format!(
+                    "peer announced: {} (we are {role:?})",
+                    short_peer(&device_id)
+                ),
+                serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
+            );
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
             // If we didn't already start an answerer, do so now.
             let role = Role::Answerer;
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "signaling",
+                format!("offer received from {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
+            );
             ensure_peer_session(state, device_id.clone(), role).await;
             apply_remote_sdp(state, &device_id, RTCSdpType::Offer, sdp).await;
             // Build the answer. Extract the session under the lock,
@@ -257,16 +297,36 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             if let Some(session) = session {
                 match session.create_answer().await {
                     Ok(desc) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Info,
+                            "signaling",
+                            format!("answer sent to {}", short_peer(&device_id)),
+                            serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
+                        );
                         let _ = state.signaling_tx.send(SignalingOutbound::Answer {
                             device_id: device_id.clone(),
                             sdp: desc.sdp,
                         });
                     }
-                    Err(e) => warn!(peer = %device_id, "create_answer failed: {e}"),
+                    Err(e) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Error,
+                            "signaling",
+                            format!("create_answer failed for {}: {e}", short_peer(&device_id)),
+                            serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+                        );
+                        warn!(peer = %device_id, "create_answer failed: {e}");
+                    }
                 }
             }
         }
         SignalingInbound::Answer { device_id, sdp } => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "signaling",
+                format!("answer received from {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
+            );
             apply_remote_sdp(state, &device_id, RTCSdpType::Answer, sdp).await;
         }
         SignalingInbound::Candidate {
@@ -287,14 +347,46 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             };
             if let Some(session) = session {
                 if let Err(e) = session.add_ice_candidate(candidate).await {
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Warn,
+                        "ice",
+                        format!(
+                            "remote {kind:?} candidate rejected by {}: {e}",
+                            short_peer(&device_id)
+                        ),
+                        serde_json::json!({
+                            "peer": device_id,
+                            "kind": format!("{kind:?}"),
+                            "error": e.to_string(),
+                        }),
+                    );
                     warn!(peer = %device_id, "add_ice_candidate failed: {e}");
                 }
             }
         }
         SignalingInbound::PeerLeft { device_id } => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "signaling",
+                format!("peer left signaling: {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id }),
+            );
             drop_peer(state, &device_id, DropReason::UserLeft).await;
         }
     }
+}
+
+/// First-and-last-N chars of a peer pubkey for log readability. Long
+/// base32 ids drown out the actual message; the prefix + suffix
+/// preserves visual identity (same peer always renders the same
+/// snippet) without taking up the entire line. `pub(crate)` so the
+/// handshake / ladder / watchdog modules render peer IDs in their
+/// diag entries the same way.
+pub(crate) fn short_peer(id: &str) -> String {
+    if id.len() <= 12 {
+        return id.to_string();
+    }
+    format!("{}…{}", &id[..6], &id[id.len() - 4..])
 }
 
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
@@ -309,6 +401,12 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     {
         Ok(p) => p,
         Err(e) => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Error,
+                "transport",
+                format!("open_peer failed for {}: {e}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+            );
             warn!(peer = %device_id, "open_peer failed: {e}");
             return;
         }
@@ -327,7 +425,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     state.log_diag_with(
         crate::events::DiagLevel::Info,
         "peer",
-        format!("peer sighted: {device_id} (role: {role:?})"),
+        format!("peer sighted: {} (role: {role:?})", short_peer(&device_id)),
         serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
     );
 
@@ -335,12 +433,26 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     if role == Role::Offerer {
         match session.create_offer().await {
             Ok(desc) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Info,
+                    "signaling",
+                    format!("offer sent to {}", short_peer(&device_id)),
+                    serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
+                );
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.clone(),
                     sdp: desc.sdp,
                 });
             }
-            Err(e) => warn!(peer = %device_id, "create_offer failed: {e}"),
+            Err(e) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Error,
+                    "signaling",
+                    format!("create_offer failed for {}: {e}", short_peer(&device_id)),
+                    serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+                );
+                warn!(peer = %device_id, "create_offer failed: {e}");
+            }
         }
     }
 
@@ -374,7 +486,18 @@ async fn apply_remote_sdp(
         let peer = state.peers.get(device_id);
         peer.and_then(|p| p.session.lock().clone())
     };
-    let Some(session) = session else { return };
+    let Some(session) = session else {
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "signaling",
+            format!(
+                "remote {sdp_type:?} for {} ignored — no session",
+                short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
+        );
+        return;
+    };
     let desc = match sdp_type {
         RTCSdpType::Offer => RTCSessionDescription::offer(sdp).ok(),
         RTCSdpType::Answer => RTCSessionDescription::answer(sdp).ok(),
@@ -382,8 +505,31 @@ async fn apply_remote_sdp(
     };
     if let Some(desc) = desc {
         if let Err(e) = session.set_remote_description(desc).await {
+            state.log_diag_with(
+                crate::events::DiagLevel::Error,
+                "signaling",
+                format!(
+                    "set_remote_description({sdp_type:?}) failed for {}: {e}",
+                    short_peer(device_id)
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "sdp_type": format!("{sdp_type:?}"),
+                    "error": e.to_string(),
+                }),
+            );
             warn!(peer = %device_id, "set_remote_description failed: {e}");
         }
+    } else {
+        state.log_diag_with(
+            crate::events::DiagLevel::Error,
+            "signaling",
+            format!(
+                "remote SDP from {} unparseable as {sdp_type:?}",
+                short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
+        );
     }
 }
 
@@ -402,29 +548,103 @@ async fn handle_transport_event(
             if let Some(peer) = state.peers.get(&device_id) {
                 peer.state.write().diag.local_candidates.record(kind);
             }
+            // Debug-level: candidates are noisy (one per
+            // host/srflx/relay), so the per-candidate detail lands
+            // here and gets summarised when ICE eventually settles.
+            // Surfacing them at info would drown out the higher-level
+            // state transitions the user actually cares about.
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "ice",
+                format!("local {kind:?} candidate → {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
+            );
             let _ = state.signaling_tx.send(SignalingOutbound::Candidate {
                 device_id: device_id.clone(),
                 candidate: cand,
             });
         }
         TransportEvent::LocalIceCandidate(None) => {
-            // Gathering complete sentinel; signal the peer via a
-            // null-candidate marker so they can finalize ICE
-            // their side without waiting on a watchdog.
-            // (Skipped on the wire today; many implementations
-            // tolerate the gathering-complete signal being implicit.)
+            // Gathering complete sentinel. Surface as a single info
+            // line with a summary of what we ended up offering — if
+            // the peer never connects we want the user to see at a
+            // glance "we sent 3 host, 1 srflx, 0 relay candidates"
+            // so the TURN-needed diagnosis is one read away.
+            let (h, s, r) = if let Some(peer) = state.peers.get(&device_id) {
+                let data = peer.state.read();
+                (
+                    data.diag.local_candidates.host,
+                    data.diag.local_candidates.server_reflexive,
+                    data.diag.local_candidates.relay,
+                )
+            } else {
+                (0, 0, 0)
+            };
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "ice",
+                format!(
+                    "local gathering complete for {} — {h} host · {s} srflx · {r} relay",
+                    short_peer(&device_id)
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "host": h,
+                    "srflx": s,
+                    "relay": r,
+                }),
+            );
         }
         TransportEvent::IceConnectionStateChanged(ice_state) => {
+            // Every ICE state lands in the log — these are the
+            // single biggest signal of whether NAT traversal is
+            // working. "checking → connected" is the happy path;
+            // "checking → disconnected → failed" is the no-TURN
+            // signature; "new" never advancing means the signaling
+            // layer never delivered candidates.
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "ice",
+                format!("ICE → {ice_state:?} for {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "state": format!("{ice_state:?}") }),
+            );
             handle_ice_state_change(state, &device_id, ice_state).await;
         }
         TransportEvent::PeerConnectionStateChanged(pc_state) => {
+            // Peer connection state is the higher-level view of the
+            // same NAT traversal — useful when ICE reports Connected
+            // but PC sticks at Connecting (DTLS handshake issue)
+            // or vice versa.
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "transport",
+                format!("PC → {pc_state:?} for {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "state": format!("{pc_state:?}") }),
+            );
             handle_pc_state_change(state, &device_id, pc_state).await;
         }
         TransportEvent::DataChannelOpen => {
-            trace!(peer = %device_id, "data channel open");
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "transport",
+                format!(
+                    "data channel open with {} — starting handshake",
+                    short_peer(&device_id)
+                ),
+                serde_json::json!({ "peer": device_id }),
+            );
             handshake::initiate(state, &device_id).await;
         }
         TransportEvent::DataChannelClosed => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "transport",
+                format!(
+                    "data channel closed with {} — dropping peer",
+                    short_peer(&device_id)
+                ),
+                serde_json::json!({ "peer": device_id }),
+            );
             drop_peer(state, &device_id, DropReason::IceFailed).await;
         }
         TransportEvent::Message(bytes) => {

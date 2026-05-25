@@ -79,13 +79,28 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         let mut data = peer.state.write();
         data.status = PeerStatus::Handshaking;
         data.nonce_sent = Some(nonce);
-        data.verification_code_sent = Some(code);
+        data.verification_code_sent = Some(code.clone());
         data.handshake_started_at = Some(Instant::now());
         data.hello_attempt = 1;
         data.diag.hellos_sent += 1;
     }
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "handshake",
+        format!(
+            "sending hello to {} (code: {code})",
+            super::short_peer(device_id)
+        ),
+        serde_json::json!({ "peer": device_id, "code": code }),
+    );
     let hello_msg = MeshMessage::Hello(hello);
     if let Err(e) = send_to_peer(state, device_id, &hello_msg).await {
+        state.log_diag_with(
+            crate::events::DiagLevel::Error,
+            "handshake",
+            format!("send hello to {} failed: {e}", super::short_peer(device_id)),
+            serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+        );
         warn!(peer = %device_id, "send hello failed: {e}");
     }
     schedule_hello_retries(state.clone(), device_id.to_string(), hello_msg);
@@ -158,6 +173,19 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
     // signature check would catch this anyway, but failing early
     // surfaces a clearer diagnostic.
     if signing::pubkey_part(&hello.device_id) != signing::pubkey_part(device_id) {
+        state.log_diag_with(
+            crate::events::DiagLevel::Error,
+            "handshake",
+            format!(
+                "hello from {} claimed a different id ({}) — dropping",
+                super::short_peer(device_id),
+                super::short_peer(&hello.device_id)
+            ),
+            serde_json::json!({
+                "connection_peer": device_id,
+                "claimed_peer": hello.device_id,
+            }),
+        );
         warn!(
             peer = %device_id,
             claimed = %hello.device_id,
@@ -178,6 +206,22 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
         }
     }
 
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "handshake",
+        format!(
+            "hello received from {} (label: {:?}, code: {})",
+            super::short_peer(device_id),
+            hello.label,
+            hello.verification_code,
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "label": hello.label,
+            "code": hello.verification_code,
+        }),
+    );
+
     // Build the signed payload and reply.
     let payload = signing::handshake_payload(
         &hello.nonce,
@@ -192,6 +236,15 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
     )
     .await
     {
+        state.log_diag_with(
+            crate::events::DiagLevel::Error,
+            "handshake",
+            format!(
+                "send auth_response to {} failed: {e}",
+                super::short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "error": e.to_string() }),
+        );
         warn!(peer = %device_id, "send auth_response failed: {e}");
         return;
     }
