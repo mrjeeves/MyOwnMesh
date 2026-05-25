@@ -43,8 +43,20 @@
 
   {#if meshClient.connected !== "live"}
     <div class="banner">
-      Event stream is <strong>{meshClient.connected}</strong>. Diagnostics will
-      populate once the daemon is reachable.
+      <div>
+        Event stream is <strong>{meshClient.connected}</strong>. Diagnostics will
+        populate once the daemon is reachable.
+      </div>
+      {#if meshClient.lastError}
+        <div class="banner-err">{meshClient.lastError}</div>
+        {#if meshClient.lastError.includes("couldn't find") || meshClient.lastError.includes("daemon auto-spawn failed")}
+          <div class="banner-hint">
+            Try: <code>cargo build -p myownmesh</code> from the repo root, or
+            set the <code>MYOWNMESH_BIN</code> env var to the daemon binary
+            path before launching the GUI.
+          </div>
+        {/if}
+      {/if}
     </div>
   {/if}
 
@@ -109,6 +121,24 @@
     padding: 0.5rem 0.7rem;
     font-size: 0.8rem;
     margin-bottom: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .banner-err {
+    color: #ffb4b4;
+    background: #3a1717;
+    border: 1px solid #5a2424;
+    padding: 0.35rem 0.55rem;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 0.75rem;
+    word-break: break-all;
+  }
+  .banner-hint {
+    color: #cfcfcf;
+    font-size: 0.75rem;
+    line-height: 1.45;
   }
   .log {
     flex: 1;

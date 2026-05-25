@@ -42,9 +42,30 @@ use tokio::sync::mpsc;
 /// already had a daemon running, in which case we use that instead
 /// of spawning a duplicate. Dropping the wrapped value at app exit
 /// kills the child via its `Drop` impl.
+///
+/// `last_subscription_status` mirrors the most recent
+/// `mesh://subscription` payload. The Tauri event system is
+/// fire-and-forget — emits before the frontend's `listen()` is
+/// registered are silently dropped. The Svelte client queries this
+/// cache via `mesh_subscription_state` right after registering its
+/// listener so it picks up the current state even if the "live"
+/// event fired before it was ready. Initialised to `connecting` so
+/// a query before the first emit returns the same value the UI is
+/// already showing.
 struct AppState {
     client: Arc<ControlClient>,
     daemon_child: Mutex<Option<daemon_spawn::DaemonChild>>,
+    last_subscription_status: Mutex<serde_json::Value>,
+}
+
+/// Cache `value` and emit it as a `mesh://subscription` event. All
+/// updates to the subscription state must go through here so the
+/// `mesh_subscription_state` command always returns the most recent
+/// payload regardless of listener timing.
+fn update_subscription_status(handle: &AppHandle, value: serde_json::Value) {
+    let state = handle.state::<AppState>();
+    *state.last_subscription_status.lock() = value.clone();
+    let _ = handle.emit("mesh://subscription", value);
 }
 
 /// Helper: turn a daemon `Response` into a result the JS side can
@@ -248,6 +269,16 @@ async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Re
     Ok(())
 }
 
+/// Return the most recent `mesh://subscription` payload. The Svelte
+/// client calls this on init — right after registering the
+/// `mesh://subscription` listener — so it picks up the current state
+/// even if the backend's "live" emit fired before the listener was
+/// registered (Tauri events are fire-and-forget and aren't replayed).
+#[tauri::command]
+fn mesh_subscription_state(state: State<'_, AppState>) -> serde_json::Value {
+    state.last_subscription_status.lock().clone()
+}
+
 /// Background task that owns the daemon's event subscription. Each
 /// incoming line becomes a `mesh://event` Tauri event on the frontend.
 /// On disconnect we wait a beat and re-subscribe — the daemon may be
@@ -258,23 +289,17 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(256);
         match client.subscribe_events(tx).await {
             Ok(()) => {
-                let _ = app.emit(
-                    "mesh://subscription",
-                    serde_json::json!({ "status": "live" }),
-                );
+                update_subscription_status(&app, serde_json::json!({ "status": "live" }));
                 while let Some(value) = rx.recv().await {
                     let _ = app.emit("mesh://event", value);
                 }
                 // Subscription channel closed — daemon disconnected.
-                let _ = app.emit(
-                    "mesh://subscription",
-                    serde_json::json!({ "status": "disconnected" }),
-                );
+                update_subscription_status(&app, serde_json::json!({ "status": "disconnected" }));
             }
             Err(e) => {
                 tracing::warn!("event subscribe failed: {e} — will retry");
-                let _ = app.emit(
-                    "mesh://subscription",
+                update_subscription_status(
+                    &app,
                     serde_json::json!({ "status": "disconnected", "error": e.to_string() }),
                 );
             }
@@ -299,6 +324,7 @@ fn main() {
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
+            last_subscription_status: Mutex::new(serde_json::json!({ "status": "connecting" })),
         })
         .invoke_handler(tauri::generate_handler![
             mesh_status,
@@ -316,6 +342,7 @@ fn main() {
             mesh_network_add,
             mesh_network_remove,
             mesh_network_export_file,
+            mesh_subscription_state,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -337,8 +364,8 @@ fn main() {
                     }
                     Err(e) => {
                         tracing::error!("daemon auto-spawn failed: {e:#}");
-                        let _ = handle.emit(
-                            "mesh://subscription",
+                        update_subscription_status(
+                            &handle,
                             serde_json::json!({
                                 "status": "disconnected",
                                 "error": format!("daemon auto-spawn failed: {e}"),
