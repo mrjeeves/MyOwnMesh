@@ -289,6 +289,112 @@ impl JoinedNetwork {
         self.rpc.advertise(caps);
     }
 
+    // ---- governance (closed networks) ---------------------------------
+    //
+    // These wrap the engine's `NetworkCmd::*` variants for the
+    // proposal lifecycle. Every method except `governance_state()`
+    // round-trips through the driver loop so mutations stay serialised
+    // with the rest of the engine's per-network operations.
+
+    /// Snapshot the current signed governance state — kind + role
+    /// assignments + the append-only transition log + pending
+    /// proposals + spawned splits. Read-only.
+    pub async fn governance_state(&self) -> Result<crate::network_state::NetworkState> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::GovernanceSnapshot { reply })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped snapshot reply".into()))
+    }
+
+    /// Float a new signed transition. Returns the new proposal id
+    /// so the caller can correlate with subsequent acks. The engine
+    /// signs the canonical payload with the local identity,
+    /// persists to pending, and broadcasts to active peers in one
+    /// step; if the local signer set already satisfies the variant's
+    /// quorum (e.g. founder self-election), the proposal ratifies
+    /// before this call returns.
+    pub async fn propose_transition(
+        &self,
+        variant: crate::network_state::TransitionVariant,
+    ) -> Result<String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ProposeTransition { variant, reply })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped propose reply".into()))?
+    }
+
+    /// Sign a pending proposal floated by another peer (or by this
+    /// device). The engine broadcasts the signed ack and attempts
+    /// ratification atomically.
+    pub async fn sign_proposal(&self, proposal_id: &str) -> Result<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::SignProposal {
+                proposal_id: proposal_id.to_string(),
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped sign reply".into()))?
+    }
+
+    /// Deny a pending proposal. A single deny invalidates the
+    /// proposal across the whole network; the engine signs the deny
+    /// + broadcasts so other peers see the kill switch fire.
+    pub async fn deny_proposal(&self, proposal_id: &str) -> Result<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::DenyProposal {
+                proposal_id: proposal_id.to_string(),
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped deny reply".into()))?
+    }
+
+    /// Withdraw a proposal the local device floated. Engine drops
+    /// from pending without broadcasting a deny; peers see the
+    /// proposal disappear via the next state snapshot.
+    pub async fn withdraw_proposal(&self, proposal_id: &str) -> Result<()> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::WithdrawProposal {
+                proposal_id: proposal_id.to_string(),
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped withdraw reply".into()))?
+    }
+
+    /// Fire the proposer-initiated split fallback for a stuck close.
+    /// Returns the deterministically-derived network id of the new
+    /// closed network; the caller typically `join`s it straight
+    /// away. Only callable by the proposer of the original
+    /// open→closed proposal.
+    pub async fn spawn_split(&self, proposal_id: &str) -> Result<String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::SpawnSplit {
+                proposal_id: proposal_id.to_string(),
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped split reply".into()))?
+    }
+
     /// Stop the network. Tears down all peer sessions, signals
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.
