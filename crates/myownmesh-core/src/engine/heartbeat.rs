@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::protocol::keepalive::{PingMessage, PongMessage};
 use crate::protocol::MeshMessage;
@@ -58,7 +58,12 @@ pub async fn tick(state: &Arc<NetworkState>) {
         })
         .collect();
     for peer_id in stale {
-        warn!(peer = %peer_id, "peer silent past heartbeat timeout — escalating to Tier 4");
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "heartbeat",
+            format!("peer silent past heartbeat timeout — escalating to Tier 4: {peer_id}"),
+            serde_json::json!({ "peer": peer_id }),
+        );
         super::ladder::escalate_to_rehandshake(state, &peer_id).await;
     }
 }

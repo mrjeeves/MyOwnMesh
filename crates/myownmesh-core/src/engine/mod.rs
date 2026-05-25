@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
@@ -86,7 +86,11 @@ pub async fn run_driver(
     mut signaling_inbound: mpsc::UnboundedReceiver<SignalingInbound>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetworkCmd>,
 ) {
-    info!(network = %state.network_id, "engine driver starting");
+    state.log_diag(
+        crate::events::DiagLevel::Info,
+        "engine",
+        "engine driver starting",
+    );
 
     // Top-level interval ticks. We hold them across the loop so
     // sleeping happens inside `tokio::select!` — no separate
@@ -158,7 +162,11 @@ pub async fn run_driver(
         }
     }
 
-    info!(network = %state.network_id, "engine driver stopping");
+    state.log_diag(
+        crate::events::DiagLevel::Info,
+        "engine",
+        "engine driver stopping",
+    );
     state.shutdown().await;
 }
 
@@ -316,6 +324,12 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         network_id: state.network_id.clone(),
         device_id: device_id.clone(),
     }));
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "peer",
+        format!("peer sighted: {device_id} (role: {role:?})"),
+        serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
+    );
 
     // For offerer, kick off SDP exchange immediately.
     if role == Role::Offerer {
@@ -859,9 +873,15 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
-            reason,
+            reason: reason.clone(),
             grace_window_ms: scheduler::RECONNECTING_GRACE_MS,
         }));
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "peer",
+            format!("peer dropped: {device_id} ({reason:?})"),
+            serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
+        );
     }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
