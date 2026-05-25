@@ -41,7 +41,7 @@ use crate::PROTOCOL_VERSION;
 
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
-use super::scheduler::HANDSHAKE_TIMEOUT_MS;
+use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer};
 
@@ -84,10 +84,44 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         data.hello_attempt = 1;
         data.diag.hellos_sent += 1;
     }
-    if let Err(e) = send_to_peer(state, device_id, &MeshMessage::Hello(hello)).await {
+    let hello_msg = MeshMessage::Hello(hello);
+    if let Err(e) = send_to_peer(state, device_id, &hello_msg).await {
         warn!(peer = %device_id, "send hello failed: {e}");
     }
+    schedule_hello_retries(state.clone(), device_id.to_string(), hello_msg);
     schedule_watchdog(state.clone(), device_id.to_string());
+}
+
+/// Re-send the same hello at each tick of
+/// [`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`] until the peer authenticates
+/// or the watchdog tears down. Replaying the hello is safe: the
+/// receiver overwrites its `nonce_received` slot unconditionally and
+/// the signature in `auth_response` is deterministic, so a duplicate
+/// just yields a duplicate (idempotent) reply.
+fn schedule_hello_retries(state: Arc<NetworkState>, device_id: String, hello: MeshMessage) {
+    tokio::spawn(async move {
+        for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let still_handshaking = {
+                let Some(peer) = state.peers.get(&device_id) else {
+                    return;
+                };
+                let data = peer.state.read();
+                matches!(data.status, PeerStatus::Handshaking) && !data.authenticated
+            };
+            if !still_handshaking {
+                return;
+            }
+            if let Err(e) = send_to_peer(&state, &device_id, &hello).await {
+                debug!(peer = %device_id, "hello retry send failed: {e}");
+            }
+            if let Some(peer) = state.peers.get(&device_id) {
+                let mut data = peer.state.write();
+                data.hello_attempt = data.hello_attempt.saturating_add(1);
+                data.diag.hellos_sent = data.diag.hellos_sent.saturating_add(1);
+            }
+        }
+    });
 }
 
 fn schedule_watchdog(state: Arc<NetworkState>, device_id: String) {

@@ -65,6 +65,30 @@ pub struct StunServer {
     pub urls: Vec<String>,
 }
 
+/// Built-in STUN URLs applied when a deserialized `NetworkConfig`
+/// omits `stun_servers`. Three vendors so any single provider's
+/// outage still leaves NAT traversal working. Mirrors MyOwnLLM's
+/// `DEFAULT_NETWORK_STUN`. Users can opt out by writing an explicit
+/// empty array (`"stun_servers": []`) — `default_stun_servers` only
+/// fires when the field is absent.
+pub const DEFAULT_NETWORK_STUN: &[&str] = &[
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478",
+];
+
+/// Build the default STUN server list. Exposed so embedders that
+/// construct `NetworkConfig` programmatically can call
+/// `default_stun_servers()` instead of repeating the URL list.
+pub fn default_stun_servers() -> Vec<StunServer> {
+    vec![StunServer {
+        urls: DEFAULT_NETWORK_STUN
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    }]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TurnServer {
     pub urls: Vec<String>,
@@ -140,7 +164,7 @@ pub struct NetworkConfig {
     pub topology: TopologyMode,
     #[serde(default)]
     pub signaling: SignalingConfig,
-    #[serde(default)]
+    #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<StunServer>,
     /// TURN servers are never bundled — user-supplied only. ICE
     /// works without TURN for most cases; the engine surfaces a
@@ -359,5 +383,40 @@ mod tests {
         let s = serde_json::to_string(&cfg).unwrap();
         let back: MeshConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn network_config_omits_stun_field_picks_up_defaults() {
+        // A user writing a minimal network config without
+        // mentioning stun_servers should get the built-in defaults
+        // rather than launching with zero ICE servers.
+        let json = r#"{
+            "id": "n1",
+            "network_id": "test-net"
+        }"#;
+        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.stun_servers, default_stun_servers());
+        assert!(!cfg.stun_servers.is_empty());
+        assert!(cfg.stun_servers[0]
+            .urls
+            .iter()
+            .any(|u| u.contains("google")));
+        assert!(cfg.stun_servers[0]
+            .urls
+            .iter()
+            .any(|u| u.contains("cloudflare")));
+    }
+
+    #[test]
+    fn network_config_empty_stun_array_opts_out() {
+        // Writing an explicit empty list must remain empty — the
+        // defaults only fire when the field is absent.
+        let json = r#"{
+            "id": "n1",
+            "network_id": "test-net",
+            "stun_servers": []
+        }"#;
+        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.stun_servers.is_empty());
     }
 }

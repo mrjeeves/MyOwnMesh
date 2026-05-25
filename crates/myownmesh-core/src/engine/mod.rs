@@ -265,9 +265,17 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             device_id,
             candidate,
         } => {
-            let session = {
-                let peer = state.peers.get(&device_id);
-                peer.and_then(|p| p.session.lock().clone())
+            // Classify the inbound candidate so the no-TURN
+            // diagnostic has accurate remote-side counts. Record
+            // before adding to the session — recording is cheap and
+            // the add_ice_candidate await must happen without the
+            // peer lock held.
+            let kind = crate::transport::classify_candidate_sdp(&candidate.candidate);
+            let session = if let Some(peer) = state.peers.get(&device_id) {
+                peer.state.write().diag.remote_candidates.record(kind);
+                peer.session.lock().clone()
+            } else {
+                None
             };
             if let Some(session) = session {
                 if let Err(e) = session.add_ice_candidate(candidate).await {
@@ -372,30 +380,18 @@ async fn handle_transport_event(
 ) {
     match event {
         TransportEvent::LocalIceCandidate(Some(cand)) => {
+            // Classify before moving `cand` into the signaling
+            // message so the no-TURN diagnostic
+            // (`ice_watchdog::maybe_emit_no_turn_diag`) has accurate
+            // host/srflx/relay counts to report.
+            let kind = crate::transport::classify_candidate_sdp(&cand.candidate);
+            if let Some(peer) = state.peers.get(&device_id) {
+                peer.state.write().diag.local_candidates.record(kind);
+            }
             let _ = state.signaling_tx.send(SignalingOutbound::Candidate {
                 device_id: device_id.clone(),
                 candidate: cand,
             });
-            if let Some(peer) = state.peers.get(&device_id) {
-                let kind = crate::transport::classify_candidate_sdp(
-                    &state
-                        .peers
-                        .get(&device_id)
-                        .and_then(|p| {
-                            p.session
-                                .lock()
-                                .as_ref()
-                                .map(|s| s.classify_inbound_candidate(""))
-                        })
-                        .map(|_| String::new())
-                        .unwrap_or_default(),
-                );
-                drop(peer);
-                // Stats are recorded inline in the engine so the
-                // diag layer can report them later. The
-                // classification is best-effort.
-                let _ = kind;
-            }
         }
         TransportEvent::LocalIceCandidate(None) => {
             // Gathering complete sentinel; signal the peer via a
