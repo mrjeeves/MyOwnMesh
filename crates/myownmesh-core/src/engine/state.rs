@@ -13,7 +13,7 @@ use tracing::trace;
 use crate::channels::RawChannelFrame;
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
-use crate::events::{DropReason, MeshEvent, MeshPhase, PhaseEvent};
+use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::roster::Roster;
@@ -211,6 +211,52 @@ impl NetworkState {
     /// than spam on every emit.
     pub fn emit(&self, event: MeshEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    /// Emit a structured diagnostic — both to the tracing layer
+    /// (visible in daemon stderr) and to the broadcast channel as
+    /// a [`MeshEvent::Diag`] (consumed by the GUI's Activity tab).
+    /// Prefer this over a bare `tracing::info!`/`warn!` for events
+    /// the user should see in the UI; the helper writes to both
+    /// surfaces so operators reading logs and users watching the
+    /// GUI stay in sync.
+    pub fn log_diag(&self, level: DiagLevel, category: &str, message: impl Into<String>) {
+        self.log_diag_with(level, category, message, serde_json::Value::Null);
+    }
+
+    /// Variant of [`log_diag`] that carries a structured `detail`
+    /// payload alongside the message. Use for events where the GUI
+    /// might want to drill into fields (peer id, error code, etc.)
+    /// rather than just render the human-readable line.
+    pub fn log_diag_with(
+        &self,
+        level: DiagLevel,
+        category: &str,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) {
+        let message = message.into();
+        match level {
+            DiagLevel::Debug => {
+                tracing::debug!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Info => {
+                tracing::info!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Warn => {
+                tracing::warn!(network = %self.network_id, category = %category, "{message}")
+            }
+            DiagLevel::Error => {
+                tracing::error!(network = %self.network_id, category = %category, "{message}")
+            }
+        }
+        self.emit(MeshEvent::Diag(DiagEntry {
+            network_id: self.network_id.clone(),
+            level,
+            category: category.to_string(),
+            message,
+            detail,
+        }));
     }
 
     /// Update the per-network phase and emit on change.

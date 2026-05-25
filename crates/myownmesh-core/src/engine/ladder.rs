@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace};
 
 use crate::events::MeshEvent;
 
@@ -147,7 +147,12 @@ pub async fn escalate_to_rehandshake(state: &Arc<NetworkState>, device_id: &str)
         };
         let mut data = peer.state.write();
         if data.rehandshake_attempt >= REHANDSHAKE_RESCUE_ATTEMPTS {
-            warn!(peer = %device_id, "rehandshake attempts exhausted — escalating to Tier 5");
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "ladder",
+                format!("rehandshake attempts exhausted for {device_id} — escalating to Tier 5"),
+                serde_json::json!({ "peer": device_id }),
+            );
             data.tier = ConnectionTier::RoomRejoin {
                 attempt: 1,
                 next_at: Instant::now(),
@@ -185,7 +190,12 @@ pub async fn escalate_to_rehandshake(state: &Arc<NetworkState>, device_id: &str)
             }
         };
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        info!(peer = %device_id, attempt, "Tier 4 — re-handshake");
+        state_clone.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "ladder",
+            format!("Tier 4 re-handshake attempt {attempt} for {device_id}"),
+            serde_json::json!({ "peer": device_id, "attempt": attempt }),
+        );
         super::handshake::initiate(&state_clone, &device_id).await;
     });
 }
