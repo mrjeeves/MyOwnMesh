@@ -125,6 +125,7 @@ async fn on_network_change(
     );
 
     state.emit(MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
         network_id: state.network_id.clone(),
         level: DiagLevel::Info,
         category: "network".to_string(),

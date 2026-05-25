@@ -218,6 +218,9 @@ export interface DaemonStatus {
 export type DiagLevel = "debug" | "info" | "warn" | "error";
 
 export interface DiagEntry {
+  /** Unix epoch milliseconds — the time the daemon produced the
+   *  entry, rendered as HH:MM:SS in the Activity log. */
+  ts: number;
   network_id: string;
   level: DiagLevel;
   category: string;

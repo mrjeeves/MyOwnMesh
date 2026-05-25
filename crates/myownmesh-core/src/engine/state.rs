@@ -251,6 +251,7 @@ impl NetworkState {
             }
         }
         self.emit(MeshEvent::Diag(DiagEntry {
+            ts: now_unix_ms(),
             network_id: self.network_id.clone(),
             level,
             category: category.to_string(),
@@ -273,6 +274,11 @@ impl NetworkState {
             prev,
             next,
         }));
+        self.log_diag(
+            DiagLevel::Info,
+            "phase",
+            format!("phase: {prev:?} → {next:?}"),
+        );
     }
 
     /// Subscribe to a named user channel. Returns a fresh
@@ -460,4 +466,16 @@ impl NetworkState {
         }
         self.peers.clear();
     }
+}
+
+/// Unix epoch milliseconds. Stamped on every [`DiagEntry`] so the
+/// GUI's Activity log can render a per-entry HH:MM:SS clock — wall
+/// time, not monotonic: the user cares what time it actually was
+/// when something happened, not how long after process start.
+pub(crate) fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

@@ -191,6 +191,7 @@ fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
         "no TURN configured and ICE keeps failing"
     );
     state.emit(MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
         network_id: state.network_id.clone(),
         level: DiagLevel::Warn,
         category: "ice".to_string(),

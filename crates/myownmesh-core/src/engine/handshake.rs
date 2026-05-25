@@ -258,6 +258,28 @@ pub async fn on_auth_response(
         )
     };
 
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "handshake",
+        format!(
+            "auth ok with {device_id} ({})",
+            if auto_approve {
+                if rostered {
+                    "rostered → auto-approve"
+                } else {
+                    "auto-approve enabled"
+                }
+            } else {
+                "awaiting user approval"
+            }
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "rostered": rostered,
+            "auto_approve": auto_approve,
+        }),
+    );
+
     state.emit(MeshEvent::Peer(PeerEvent::Authenticated {
         network_id: state.network_id.clone(),
         device_id: device_id.to_string(),
