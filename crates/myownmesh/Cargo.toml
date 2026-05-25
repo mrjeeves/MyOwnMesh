@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["mesh", "p2p", "webrtc", "nostr", "daemon"]
+categories = ["command-line-utilities", "network-programming"]
+# Binary crate, not for crates.io. Distribution path is the GitHub
+# Releases matrix (`myownmesh-<platform>.{tar.gz,zip}`); see RELEASE.md.
+publish = false
 
 [[bin]]
 name = "myownmesh"

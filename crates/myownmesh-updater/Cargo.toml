@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["update", "self-update", "release", "mesh"]
+categories = ["development-tools"]
 
 [lib]
 name = "myownmesh_updater"

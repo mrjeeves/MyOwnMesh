@@ -4,6 +4,34 @@ MyOwnMesh is a pure-Rust peer-to-peer mesh networking stack. It ships
 as both a binary (daemon + CLI) and a library (`myownmesh-core`) so
 other apps embed the mesh without inheriting a GUI or HTTP updater.
 
+## Lineage from MyOwnLLM
+
+The code was extracted from
+[MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM)'s mesh substrate
+once the substrate had outgrown "one app's plumbing":
+
+| MyOwnLLM module (origin) | MyOwnMesh module (here) |
+|---|---|
+| `src-tauri/src/mesh/identity.rs` | `crates/myownmesh-core/src/identity.rs` |
+| `src-tauri/src/mesh/signing.rs` | `crates/myownmesh-core/src/signing.rs` |
+| `src-tauri/src/mesh/roster.rs` | `crates/myownmesh-core/src/roster.rs` |
+| `src/mesh-client.svelte.ts` (engine half) | `crates/myownmesh-core/src/engine/` |
+| `src/mesh-protocol.ts` | `crates/myownmesh-core/src/protocol/` |
+| `patches/@trystero-p2p__core@0.24.0.patch` | `crates/myownmesh-signaling/src/upstream.rs` + the Nostr driver |
+| `src/self_update.rs` (mesh-relevant fraction) | `crates/myownmesh-updater/` |
+
+The rewrite generalised every embedder-specific bit:
+`~/.myownllm/` becomes `~/.myownmesh/` (overridable via
+`MYOWNMESH_HOME`), the Trystero app-id moves from
+`myownllm-cloud-mesh-v1` to `myownmesh-cloud-mesh-v1`, and the
+signing domain tag is `myownmesh-mesh-auth-v1:` rather than
+`myownllm-mesh-auth-v1:` — so a MyOwnLLM peer and a bare-MyOwnMesh
+peer don't land in the same Nostr room or accept each other's
+signatures by accident. Downstream forks change those three
+constants (env vars at build time for the URL/app-id; a one-line
+edit in `lib.rs` for the domain tag) to non-interop with upstream
+on purpose.
+
 ## Crates
 
 ```
@@ -182,9 +210,14 @@ is the `Mesh` → `MeshHandle` → `JoinedNetwork` flow.
 
 ## Out of scope for v1
 
-- GUI (Tauri network browser) — planned for v1.x.
-- MyOwnLLM migration to depend on `myownmesh-core` — separate plan
-  once the core API is stable.
+- MyOwnLLM migration to depend on `myownmesh-core` at the source
+  level — staged. The publishing path (git tag, README copy-paste
+  block, version-pin discipline) is in place from this end;
+  MyOwnLLM's `src-tauri/Cargo.toml` will wire the git dep and
+  `src-tauri/src/mesh/{identity,signing,roster,commands}.rs` will
+  delegate to `myownmesh-core` once the field-tested behavior here
+  is audited against MyOwnLLM's user-visible mesh UX. The migration
+  PR lands once that audit clears.
 - Onion / payload-layer encryption above DTLS — explicitly
   declined.
 - Star auto-elect topology — explicit hub only.
@@ -193,3 +226,6 @@ is the `Mesh` → `MeshHandle` → `JoinedNetwork` flow.
 - Built-in TURN server — user-configured TURN only.
 - Built-in audio / file / LLM RPCs — embedders define their own
   message types over `Channel<T>` or the generic `Rpc`.
+- crates.io publish for the library crates — gated on a public-API
+  freeze. Until then embedders pull from git pinned to a release
+  tag; see [`RELEASE.md`](RELEASE.md).
