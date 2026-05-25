@@ -1,5 +1,6 @@
 <script lang="ts">
   import { meshClient } from "../../mesh-client.svelte";
+  import { governance } from "../../network-governance.svelte";
   import { networkDisplayName, topologyName, topologyHub } from "../../types";
   import type {
     AuthorizedPeer,
@@ -10,6 +11,7 @@
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { exportNetworkSettings } from "../../network-settings";
   import AddNetworkModal from "./AddNetworkModal.svelte";
+  import NetworkKindBadge from "../network/NetworkKindBadge.svelte";
 
   const {
     focusedConfigId,
@@ -232,7 +234,13 @@
       {#if selected}
         {#if tab === "status"}
           <div class="card">
-            <div class="card-title">{networkDisplayName(selected)}</div>
+            <div class="card-title">
+              <NetworkKindBadge
+                kind={governance.stateFor(selected.config_id).kind}
+                size={14}
+              />
+              <span>{networkDisplayName(selected)}</span>
+            </div>
             <dl class="grid">
               <dt>Network ID</dt>
               <dd class="mono break">{selected.network_id}</dd>
@@ -520,6 +528,9 @@
     font-weight: 600;
     font-size: 0.92rem;
     margin-bottom: 0.7rem;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
   }
   .grid {
     display: grid;

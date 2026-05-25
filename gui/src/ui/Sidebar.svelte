@@ -2,6 +2,8 @@
   import { meshClient } from "../mesh-client.svelte";
   import { networkDisplayName, topologyName } from "../types";
   import type { NetworkSummary, PeerInfo } from "../types";
+  import { governance } from "../network-governance.svelte";
+  import NetworkKindBadge from "./network/NetworkKindBadge.svelte";
 
   const {
     focusedConfigId,
@@ -9,12 +11,18 @@
     onSelectNetwork,
     onSelectPeer,
     onOpenNetworksSettings,
+    onOpenNetworkOverlay,
   }: {
     focusedConfigId: string | null;
     selectedPeerId: string | null;
     onSelectNetwork: (configId: string) => void;
     onSelectPeer: (deviceId: string) => void;
     onOpenNetworksSettings: () => void;
+    /** Open the per-network settings/control overlay against a
+     *  specific network. Triggered by the gear icon on each
+     *  sidebar row. The overlay slides over the graph; the rest
+     *  of the layout stays intact. */
+    onOpenNetworkOverlay: (configId: string) => void;
   } = $props();
 
   // The user can independently expand/collapse each network's
@@ -97,27 +105,51 @@
         {@const peers = meshClient.peersByNetwork[net.config_id] ?? []}
         {@const expanded = isExpanded(net)}
         {@const isFocused = net.config_id === focusedConfigId}
+        {@const kind = governance.stateFor(net.config_id).kind}
+        {@const pendingProposals = governance.stateFor(net.config_id).pending.length}
         <div class="net" class:focused={isFocused}>
-          <button
-            class="net-row"
-            onclick={() => {
-              if (isFocused) toggleNetwork(net.config_id);
-              else onSelectNetwork(net.config_id);
-            }}
-          >
-            <span class="caret" class:open={expanded}>
-              <svg viewBox="0 0 24 24" width="10" height="10" aria-hidden="true">
-                <path fill="currentColor" d="M8 6l8 6-8 6z" />
-              </svg>
-            </span>
-            <span
-              class="net-name"
-              title="Network ID: {net.network_id}&#10;Local config id: {net.config_id}"
+          <div class="net-row-wrap">
+            <button
+              class="net-row"
+              onclick={() => {
+                if (isFocused) toggleNetwork(net.config_id);
+                else onSelectNetwork(net.config_id);
+              }}
             >
-              {networkDisplayName(net)}
-            </span>
-            <span class="net-phase" data-phase={net.phase}>{phaseLabel(net)}</span>
-          </button>
+              <span class="caret" class:open={expanded}>
+                <svg viewBox="0 0 24 24" width="10" height="10" aria-hidden="true">
+                  <path fill="currentColor" d="M8 6l8 6-8 6z" />
+                </svg>
+              </span>
+              <NetworkKindBadge {kind} size={11} />
+              <span
+                class="net-name"
+                title="Network ID: {net.network_id}&#10;Local config id: {net.config_id}&#10;Kind: {kind}"
+              >
+                {networkDisplayName(net)}
+              </span>
+              <span class="net-phase" data-phase={net.phase}>{phaseLabel(net)}</span>
+            </button>
+            <button
+              class="gear"
+              onclick={(e) => {
+                e.stopPropagation();
+                onOpenNetworkOverlay(net.config_id);
+              }}
+              title="Settings & roster for {networkDisplayName(net)}"
+              aria-label="Open network settings"
+            >
+              {#if pendingProposals > 0}
+                <span class="gear-badge" aria-hidden="true"></span>
+              {/if}
+              <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M19.43 12.98a7.95 7.95 0 0 0 0-1.96l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1a8.07 8.07 0 0 0-1.69-.98l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.49.42l-.38 2.65a8.07 8.07 0 0 0-1.69.98l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.05.32-.08.65-.08.98s.03.66.08.98L2.46 14.6a.5.5 0 0 0-.12.64l2 3.46a.5.5 0 0 0 .61.22l2.49-1a8.07 8.07 0 0 0 1.69.98l.38 2.65c.05.24.25.42.49.42h4c.24 0 .44-.18.49-.42l.38-2.65a8.07 8.07 0 0 0 1.69-.98l2.49 1a.5.5 0 0 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"
+                />
+              </svg>
+            </button>
+          </div>
           {#if expanded}
             <div class="members">
               <div class="member self">
@@ -222,11 +254,25 @@
   .net.focused .net-name {
     color: #e8e8e8;
   }
+  .net-row-wrap {
+    display: flex;
+    align-items: stretch;
+    position: relative;
+  }
+  .net-row-wrap:hover .gear {
+    color: #ccc;
+    background: #131318;
+  }
+  .net.focused .net-row-wrap {
+    background: #1a1a2a;
+    border-left: 2px solid #6e6ef7;
+  }
   .net-row {
+    flex: 1;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 0.45rem;
-    width: 100%;
     background: none;
     border: none;
     color: #aaa;
@@ -237,13 +283,39 @@
     font-size: 0.83rem;
   }
   .net.focused .net-row {
-    background: #1a1a2a;
-    border-left: 2px solid #6e6ef7;
     padding-left: calc(0.85rem - 2px);
   }
   .net-row:hover {
     background: #131318;
     color: #e8e8e8;
+  }
+  .gear {
+    position: relative;
+    background: none;
+    border: none;
+    color: #555;
+    cursor: pointer;
+    padding: 0 0.55rem;
+    display: flex;
+    align-items: center;
+    line-height: 0;
+    transition:
+      color 0.12s,
+      background 0.12s;
+  }
+  .gear:hover {
+    color: #b8b8ff !important;
+    background: #1a1a2a !important;
+  }
+  .gear-badge {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.3rem;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #fbbf24;
+    box-shadow: 0 0 0 2px #0d0d0d;
   }
   .caret {
     color: #666;

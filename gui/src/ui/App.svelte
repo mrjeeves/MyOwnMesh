@@ -7,10 +7,17 @@
   import Sidebar from "./Sidebar.svelte";
   import NodeMap from "./NodeMap.svelte";
   import SettingsPanel from "./SettingsPanel.svelte";
+  import NetworkOverlay from "./network/NetworkOverlay.svelte";
 
   let settingsOpen = $state(false);
   let settingsInitialTab =
     $state<"approvals" | "networks" | "identity" | "diagnostics">("approvals");
+
+  /** Per-network overlay state. When non-null, the
+   *  `NetworkOverlay` slides over the right side of the graph,
+   *  scoped to a single network. Triggered by the gear icon on
+   *  each sidebar row. */
+  let networkOverlayConfigId = $state<string | null>(null);
 
   /** The config_id of the network the node-map + sidebar are
    *  currently focused on. `null` means "show the first one we
@@ -116,6 +123,14 @@
       }}
       onSelectPeer={(deviceId) => (selectedPeerId = deviceId)}
       onOpenNetworksSettings={() => openSettings("networks")}
+      onOpenNetworkOverlay={(id) => {
+        // Focus the overlay's target network on the graph too —
+        // keeps the canvas behind the panel relevant to what the
+        // user is editing.
+        focusedConfigId = id;
+        selectedPeerId = null;
+        networkOverlayConfigId = id;
+      }}
     />
 
     <div class="canvas">
@@ -163,6 +178,13 @@
       initialTab={settingsInitialTab}
       focusedConfigId={focusedConfigId}
       onClose={() => (settingsOpen = false)}
+    />
+  {/if}
+
+  {#if networkOverlayConfigId}
+    <NetworkOverlay
+      configId={networkOverlayConfigId}
+      onClose={() => (networkOverlayConfigId = null)}
     />
   {/if}
 </div>
