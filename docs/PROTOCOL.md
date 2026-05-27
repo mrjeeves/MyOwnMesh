@@ -234,13 +234,8 @@ canonical base32-lowercase pubkey portion (display suffixes stripped).
 
 ## Signaling envelope (Nostr)
 
-Out-of-band signaling messages (offer / answer / ICE candidate /
-announce) travel as NIP-01 regular Nostr events (kind `1077`). The
-kind sits in the stored range (1000–9999) rather than ephemeral
-(20000–29999) so a late joiner's `REQ since=now-300s` is replayed
-by the relay with everyone's recent announces — without that,
-discovery degenerates into a star around whichever existing peer
-happens to re-announce inside the new joiner's window. The event
+Out-of-band signaling messages (offer / answer / ICE candidate)
+travel as NIP-01 ephemeral Nostr events (kind `21000`). The event
 content is a JSON envelope:
 
 ```jsonc

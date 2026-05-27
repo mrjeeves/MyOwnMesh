@@ -16,12 +16,8 @@ myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0
   `Mesh` instances in one process.
 - **`nostr::driver`** — production Nostr signaling. Connects N relays
   in parallel (deterministic top-N selection per `(app_id,
-  network_id)`), publishes stored NIP-01 regular events (kind 1077),
-  subscribes by `#r` tag. The kind is in the stored range (1000–9999)
-  rather than ephemeral (20000–29999) so a late joiner's `REQ since=
-  now-300s` is replayed by the relay — otherwise discovery degenerates
-  into a star around whichever existing peer re-announces first inside
-  the joiner's window.
+  network_id)`), publishes ephemeral NIP-01 events (kind 21000),
+  subscribes by `#r` tag.
 
 ## Trystero compat & upstream fixes
 

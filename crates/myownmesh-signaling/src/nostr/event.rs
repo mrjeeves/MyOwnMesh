@@ -1,26 +1,23 @@
 //! Minimal Nostr event construction + signing. We implement the
 //! NIP-01 event shape directly rather than depend on the
-//! full-fat `nostr` crate — we need exactly one event kind, one
-//! filter shape, and BIP-340 signing, which is straightforward
-//! over `secp256k1`.
+//! full-fat `nostr` crate — we need exactly one event kind
+//! (ephemeral signaling), one filter shape, and BIP-340 signing,
+//! which is straightforward over `secp256k1`.
 
 use secp256k1::{rand, Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// Kind used for MyOwnMesh signaling. Lives in the NIP-01 regular
-/// range (1000–9999) so relays store and replay it on a `since`-
-/// scoped REQ. The original choice (21000, ephemeral) caused a
-/// star-around-first-peer failure mode: relays per NIP-01 MAY
-/// drop ephemeral events instead of storing them, so a third
-/// joiner's REQ replay returned nothing and they only saw the
-/// first peer that happened to re-announce inside the discovery
-/// window. With a stored kind plus the existing `since=now-300s`
-/// filter, late joiners always see the last five minutes of
-/// announces from everyone in the room, so the engine forms the
-/// full mesh and the topology selector can shelve from there.
-pub const SIGNALING_EVENT_KIND: u16 = 1077;
+/// Kind used for MyOwnMesh signaling. Falls in the ephemeral
+/// range (20000–29999) per NIP-01 — relays forward without
+/// storing, which is the semantics we want. (Tried moving to a
+/// stored regular kind to fix late-joiner discovery; public
+/// relays in the default pool reject arbitrary kinds in the
+/// regular range, so we keep ephemeral and instead solve late-
+/// joiner discovery at the engine layer via fresh-announce-on-
+/// unknown-peer in `engine::mod::handle_signaling_inbound`.)
+pub const SIGNALING_EVENT_KIND: u16 = 21000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
