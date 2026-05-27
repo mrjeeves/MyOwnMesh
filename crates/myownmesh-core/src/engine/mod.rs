@@ -481,29 +481,69 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // the add_ice_candidate await must happen without the
             // peer lock held.
             let kind = crate::transport::classify_candidate_sdp(&candidate.candidate);
-            let session = if let Some(peer) = state.peers.get(&device_id) {
-                peer.state.write().diag.remote_candidates.record(kind);
-                peer.session.lock().clone()
+            // Decide under the lock whether to apply now or queue
+            // for after `set_remote_description`. Trickle ICE
+            // candidates routinely arrive a few hundred ms before
+            // the answer on a fast network; if we just hand them
+            // to webrtc-rs at that point, it rejects with "remote
+            // description is not set" and the candidate is gone —
+            // including the host candidate that would have closed
+            // a LAN pair, leaving the agent to fall back to a
+            // peer-reflexive pair and the GUI to mis-paint the
+            // link as STUN instead of LAN.
+            enum Action {
+                Apply(Arc<crate::transport::PeerSession>),
+                Queued,
+                NoPeer,
+            }
+            let action = if let Some(peer) = state.peers.get(&device_id) {
+                let mut data = peer.state.write();
+                data.diag.remote_candidates.record(kind);
+                if !data.remote_description_set {
+                    data.pending_remote_candidates.push(candidate.clone());
+                    Action::Queued
+                } else {
+                    let session = peer.session.lock().clone();
+                    drop(data);
+                    match session {
+                        Some(s) => Action::Apply(s),
+                        None => Action::NoPeer,
+                    }
+                }
             } else {
-                None
+                Action::NoPeer
             };
-            if let Some(session) = session {
-                if let Err(e) = session.add_ice_candidate(candidate).await {
+            match action {
+                Action::Apply(session) => {
+                    if let Err(e) = session.add_ice_candidate(candidate).await {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate rejected by {}: {e}",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "kind": format!("{kind:?}"),
+                                "error": e.to_string(),
+                            }),
+                        );
+                        warn!(peer = %device_id, "add_ice_candidate failed: {e}");
+                    }
+                }
+                Action::Queued => {
                     state.log_diag_with(
-                        crate::events::DiagLevel::Warn,
+                        crate::events::DiagLevel::Debug,
                         "ice",
                         format!(
-                            "remote {kind:?} candidate rejected by {}: {e}",
+                            "queued remote {kind:?} candidate from {} (awaiting remote SDP)",
                             short_peer(&device_id)
                         ),
-                        serde_json::json!({
-                            "peer": device_id,
-                            "kind": format!("{kind:?}"),
-                            "error": e.to_string(),
-                        }),
+                        serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
                     );
-                    warn!(peer = %device_id, "add_ice_candidate failed: {e}");
                 }
+                Action::NoPeer => {}
             }
         }
         SignalingInbound::PeerLeft { device_id } => {
@@ -664,6 +704,36 @@ async fn apply_remote_sdp(
                 }),
             );
             warn!(peer = %device_id, "set_remote_description failed: {e}");
+        } else {
+            // Drain any ICE candidates that arrived ahead of the
+            // SDP. The lock comes off before any await — we pull
+            // the pending vec out, then apply each candidate
+            // outside the guard so the per-peer state lock isn't
+            // held across the webrtc-rs add_ice_candidate await.
+            let pending = if let Some(peer) = state.peers.get(device_id) {
+                let mut data = peer.state.write();
+                data.remote_description_set = true;
+                std::mem::take(&mut data.pending_remote_candidates)
+            } else {
+                Vec::new()
+            };
+            if !pending.is_empty() {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Debug,
+                    "ice",
+                    format!(
+                        "applying {} queued remote candidate(s) for {}",
+                        pending.len(),
+                        short_peer(device_id)
+                    ),
+                    serde_json::json!({ "peer": device_id, "count": pending.len() }),
+                );
+                for cand in pending {
+                    if let Err(e) = session.add_ice_candidate(cand).await {
+                        warn!(peer = %device_id, "queued add_ice_candidate failed: {e}");
+                    }
+                }
+            }
         }
     } else {
         state.log_diag_with(
