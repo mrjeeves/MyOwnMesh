@@ -1209,6 +1209,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
+ "dashmap",
  "interprocess",
  "myownmesh-core",
  "myownmesh-signaling",
@@ -1216,6 +1217,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

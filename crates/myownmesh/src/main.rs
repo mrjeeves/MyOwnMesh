@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 
 mod cli;
 mod control;
+mod ipc;
 mod registry;
 
 #[derive(Parser, Debug)]
