@@ -42,6 +42,14 @@ pub use signaling_bridge::{attach_local, attach_nostr};
 /// quadratic load on the relay pool.
 const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 
+/// Minimum gap between re-offers we send to the same peer while
+/// their session is stuck at `Sighted` (PC created, data channel
+/// never opened). Coalesces REQ-replay announce bursts into one
+/// re-offer per window so we don't pile up SDP renegotiations on
+/// the remote PC. Sized small enough that two restart-aligned
+/// peers converge inside a handful of seconds.
+const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -348,6 +356,69 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             if should_reflect {
                 let _ = state.signaling_tx.send(SignalingOutbound::Announce);
             }
+            // If we already have a session for this peer that's
+            // stuck at Sighted (PC created but data channel never
+            // opened) and we're the Offerer, re-poke the other
+            // side with a fresh offer. webrtc-rs `create_offer`
+            // calls `set_local_description` internally, which
+            // kicks off a new ICE gathering cycle on the same PC
+            // — no teardown needed, the remote handles the
+            // renegotiation transparently. Rate-limited per-peer
+            // via `last_offer_sent_at` so the announce burst from
+            // a REQ replay (we've observed ~14 in one ms) doesn't
+            // translate into a fan of fourteen offers. Only fires
+            // for `Sighted` so once the channel opens and status
+            // advances to `Handshaking` / `Active` / etc. we stop
+            // re-offering automatically — no extra teardown
+            // logic, no extra timer.
+            let reoffer_session = if role == Role::Offerer {
+                state.peers.get(&device_id).and_then(|p| {
+                    let mut data = p.state.write();
+                    if !matches!(data.status, PeerStatus::Sighted) {
+                        return None;
+                    }
+                    let due = data
+                        .last_offer_sent_at
+                        .map(|prev| {
+                            Instant::now().duration_since(prev)
+                                >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                        })
+                        .unwrap_or(true);
+                    if !due {
+                        return None;
+                    }
+                    data.last_offer_sent_at = Some(Instant::now());
+                    p.session.lock().clone()
+                })
+            } else {
+                None
+            };
+            if let Some(session) = reoffer_session {
+                match session.create_offer().await {
+                    Ok(desc) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Info,
+                            "signaling",
+                            format!(
+                                "re-offer to {} (stuck at Sighted)",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "sdp_bytes": desc.sdp.len(),
+                                "reason": "stuck-at-sighted",
+                            }),
+                        );
+                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                            device_id: device_id.clone(),
+                            sdp: desc.sdp,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(peer = %device_id, "re-offer create_offer failed: {e}");
+                    }
+                }
+            }
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -517,6 +588,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                     device_id: device_id.clone(),
                     sdp: desc.sdp,
                 });
+                if let Some(p) = state.peers.get(&device_id) {
+                    p.state.write().last_offer_sent_at = Some(Instant::now());
+                }
             }
             Err(e) => {
                 state.log_diag_with(
@@ -790,8 +864,9 @@ async fn handle_ice_state_change(
 /// Ask the peer's ICE agent for its nominated candidate pair and
 /// stash it on the peer state. Quiet on `None` — the agent is
 /// allowed not to know yet (renegotiation in flight, agent torn
-/// down, etc.) and the next state change will re-query.
-async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
+/// down, etc.) and the next state change or the ICE poll will
+/// re-query.
+pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
     // Same DashMap-Ref + MutexGuard scoping pattern as the watchdog:
     // pull the cloned `Arc<PeerSession>` into a named local before
     // the inner block returns so the guard drops before the `Ref`

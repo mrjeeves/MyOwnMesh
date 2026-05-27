@@ -55,6 +55,39 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     for peer_id in candidates {
         try_restart_ice(state, &peer_id).await;
     }
+
+    // Retry selected-pair classification for any peer whose ICE
+    // reached Connected/Completed but whose `selected_pair` is
+    // still `None`. The single-shot record on the state callback
+    // (`engine::mod::handle_ice_state_change`) can fire before
+    // webrtc-rs has flipped the `nominated` bit on the
+    // CandidatePair stats — particularly on the controlling
+    // (Offerer) side, where the agent only marks the pair
+    // nominated after it sends USE-CANDIDATE and receives a
+    // success response. Without this retry, the GUI's LAN /
+    // STUN / TURN classification stays blank even though packets
+    // are flowing — exactly the symptom we kept seeing on the
+    // Offerer-side laptop in a working LAN pair. Cheap re-query:
+    // skips any peer whose pair is already known, only touches
+    // the stats API for peers in `Active`/`Shelved` with no
+    // pair recorded yet.
+    let need_pair: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|e| {
+            let data = e.value().state.read();
+            if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
+                return None;
+            }
+            if data.selected_pair.is_some() {
+                return None;
+            }
+            Some(e.key().clone())
+        })
+        .collect();
+    for peer_id in need_pair {
+        super::record_selected_pair(state, &peer_id).await;
+    }
 }
 
 /// Tier 3 — `pc.restart_ice()` then wait the recovery grace.
