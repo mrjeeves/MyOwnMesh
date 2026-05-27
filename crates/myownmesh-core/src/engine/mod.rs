@@ -34,6 +34,14 @@ pub mod wake;
 
 pub use signaling_bridge::{attach_local, attach_nostr};
 
+/// Minimum gap between announces we publish in response to a peer's
+/// announce. The engine fires one reflected announce per inbound
+/// announce; this floor coalesces a burst of inbound announces (a
+/// new joiner triggering N existing peers to all react at once)
+/// into a single outbound publish per N-peer wave so we don't put
+/// quadratic load on the relay pool.
+const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -309,6 +317,37 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 ),
                 serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
             );
+            // Reflect every inbound announce with one of our own.
+            // The dense `ANNOUNCE_BACKOFF_MS` schedule covers fresh
+            // joiners well enough on its own, but it doesn't help a
+            // peer that's been in steady-state 60 s cadence for ten
+            // minutes — when a new third peer arrives, that
+            // steady-state peer's next announce could be up to 60 s
+            // away, and meanwhile the joiner only sees whichever
+            // existing peer happens to re-announce first (the
+            // star-around-first-peer symptom). Reflecting on every
+            // received announce guarantees the joiner sees every
+            // existing peer in one round-trip, regardless of where
+            // each existing peer sits on its announce schedule.
+            // Rate-limited globally so N peers all reacting to a
+            // join don't produce N^2 publishes.
+            let should_reflect = {
+                let mut guard = state.last_reactive_announce_at.lock();
+                let now = std::time::Instant::now();
+                let due = guard
+                    .map(|prev| {
+                        now.duration_since(prev)
+                            >= std::time::Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
+                    })
+                    .unwrap_or(true);
+                if due {
+                    *guard = Some(now);
+                }
+                due
+            };
+            if should_reflect {
+                let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+            }
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
