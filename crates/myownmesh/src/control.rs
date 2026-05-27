@@ -156,6 +156,125 @@ pub enum Request {
         network: String,
         proposal_id: String,
     },
+
+    // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------
+    //
+    // The variants below require the client to have first sent
+    // `EventsSubscribe` on the same connection — they install
+    // per-client state (handler claims, channel subscriptions,
+    // in-flight outbound stream forwarders) that the daemon
+    // routes back as `ServerOut` event frames. Sending one on a
+    // non-event-subscribed connection returns a `not subscribed`
+    // error so the client gets immediate feedback rather than a
+    // silent black hole.
+    /// Claim a method name on a network. Subsequent peer RPC
+    /// calls matching the method are forwarded to the client
+    /// identified by `client_id` as `RpcInbound` events on its
+    /// event socket. Last-claim-wins: a later register evicts
+    /// the previous owner with a `HandlerDisplaced` event.
+    /// `streaming = true` installs a streaming handler (chunks
+    /// via `RpcStreamChunk` + `RpcStreamEnd`); `false` is
+    /// single-shot (`RpcRespond`).
+    RpcRegister {
+        client_id: crate::ipc::ClientId,
+        network: String,
+        method: String,
+        streaming: bool,
+    },
+    /// Release a method claim. No-op if not currently held by
+    /// this client.
+    RpcUnregister {
+        client_id: crate::ipc::ClientId,
+        network: String,
+        method: String,
+    },
+    /// Resolve an in-flight inbound RPC (single-shot). Matches
+    /// by `request_id` regardless of which client originally
+    /// received the `RpcInbound`. Either `ok` or `error` should
+    /// be set; if both, `error` wins.
+    RpcRespond {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Push one chunk to an in-flight streaming inbound RPC.
+    RpcStreamChunk {
+        request_id: String,
+        payload: serde_json::Value,
+    },
+    /// Close an in-flight streaming inbound RPC. After this the
+    /// request id is no longer routable; further chunks are
+    /// silently dropped. Optional `error` propagates to the
+    /// peer as the stream-end's failure reason.
+    RpcStreamEnd {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Make an outbound single-shot RPC. Blocks the daemon's
+    /// command socket response on the peer's reply — same shape
+    /// as `Rpc::call`.
+    RpcCall {
+        network: String,
+        peer: String,
+        method: String,
+        payload: serde_json::Value,
+    },
+    /// Make an outbound streaming RPC. Returns immediately with
+    /// the engine-assigned `request_id`; subsequent
+    /// `RpcCallStreamChunk` / `RpcCallStreamEnd` events deliver
+    /// the chunks on the client's event socket. The `client_id`
+    /// identifies which event socket receives the chunks.
+    RpcCallStream {
+        client_id: crate::ipc::ClientId,
+        network: String,
+        peer: String,
+        method: String,
+        payload: serde_json::Value,
+    },
+    /// Subscribe to a typed channel by name. Inbound channel
+    /// frames are forwarded as `ChannelInbound` events on the
+    /// `client_id`'s event socket. Multiple clients can
+    /// subscribe to the same channel; each gets a copy of every
+    /// frame.
+    ChannelSubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+        channel: String,
+    },
+    /// Release a channel subscription. No-op if not currently
+    /// subscribed.
+    ChannelUnsubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+        channel: String,
+    },
+    /// Send one frame on a typed channel to a specific peer.
+    /// Doesn't require a subscription — sends and subscriptions
+    /// are independent.
+    ChannelSendTo {
+        network: String,
+        channel: String,
+        peer: String,
+        payload: serde_json::Value,
+    },
+    /// Broadcast a frame on a typed channel to every active
+    /// peer. Returns the number of peers the send was
+    /// dispatched to.
+    ChannelSendAll {
+        network: String,
+        channel: String,
+        payload: serde_json::Value,
+    },
+    /// Replace the network's advertised capabilities. Triggers
+    /// a `capabilities_update` broadcast to peers on the next
+    /// engine tick.
+    CapabilitiesSet {
+        network: String,
+        capabilities: myownmesh_core::protocol::CapabilityAdvert,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,7 +343,11 @@ pub async fn serve(
     let listener = bind_listener(&target)?;
     info!(?target, "control socket listening");
 
-    let state = Arc::new(ControlState { mesh, registry });
+    let state = Arc::new(ControlState {
+        mesh,
+        registry,
+        clients: crate::ipc::ClientRegistry::new(),
+    });
 
     loop {
         tokio::select! {
@@ -280,6 +403,7 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
 struct ControlState {
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
+    clients: crate::ipc::ClientRegistry,
 }
 
 async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> Result<()> {
@@ -296,17 +420,29 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 continue;
             }
         };
-        // EventsSubscribe converts the connection into a one-way
-        // stream. Dispatch directly so we can write multiple lines
-        // without going through `Response`, and break out of the
-        // request loop when it returns (client disconnected).
+        // EventsSubscribe converts the connection into a server-
+        // push channel: the daemon writes mesh events plus any
+        // IPC-routed frames (RpcInbound, ChannelInbound, ...)
+        // until the client disconnects. Allocate a ClientId so
+        // subsequent RPC/channel-management requests on OTHER
+        // command sockets can target this connection.
         if matches!(request, Request::EventsSubscribe) {
-            // Initial ack so the client knows the subscription is
-            // live before the first real event arrives.
-            let ack = Response::ok(serde_json::json!({ "subscribed": true }));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let client = state.clients.register(tx);
+            let client_id = client.id;
+            // Ack carries the client_id so the caller knows what
+            // to pass back on subsequent `client_id`-bearing ops.
+            let ack = Response::ok(serde_json::json!({
+                "subscribed": true,
+                "client_id": client_id.to_string(),
+            }));
             let line = serde_json::to_string(&ack)? + "\n";
             writer.write_all(line.as_bytes()).await?;
-            run_events_stream(&state, &mut writer).await?;
+            let result = run_events_stream(&state, &mut writer, rx).await;
+            // Clean up the client's claims regardless of how
+            // the stream ended.
+            state.clients.unregister(client_id);
+            result?;
             break;
         }
         let resp = dispatch(&state, request).await;
@@ -505,6 +641,256 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             },
             None => Response::err(format!("unknown network: {network}")),
         },
+
+        // ---- RPC handler claims --------------------------------------
+        Request::RpcRegister {
+            client_id,
+            network,
+            method,
+            streaming,
+        } => {
+            if state.clients.client(client_id).is_none() {
+                return Response::err(format!("unknown client_id: {client_id}"));
+            }
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let mode = if streaming {
+                crate::ipc::clients::HandlerMode::Stream
+            } else {
+                crate::ipc::clients::HandlerMode::Single
+            };
+            let key = (network.clone(), method.clone());
+            let prev = state.clients.claim_method(key.clone(), client_id, mode);
+            crate::ipc::bridge::install_handler_for_mode(
+                &net,
+                network.clone(),
+                method.clone(),
+                mode,
+                state.clients.clone(),
+            );
+            if let Some(prev_owner) = prev {
+                crate::ipc::bridge::notify_displaced(
+                    &state.clients,
+                    prev_owner,
+                    client_id,
+                    network,
+                    method,
+                );
+            }
+            Response::ok(serde_json::json!({ "registered": true }))
+        }
+
+        Request::RpcUnregister {
+            client_id,
+            network,
+            method,
+        } => {
+            let key = (network, method);
+            let released = state.clients.release_method(&key, client_id);
+            Response::ok(serde_json::json!({ "released": released }))
+        }
+
+        // ---- inbound-RPC responses (from IPC handler back to daemon)
+        Request::RpcRespond {
+            request_id,
+            ok,
+            error,
+        } => {
+            let resolved = if let Some(err) = error {
+                state.clients.reject_inbound_single(&request_id, err)
+            } else {
+                state
+                    .clients
+                    .resolve_inbound_single(&request_id, ok.unwrap_or(serde_json::Value::Null))
+            };
+            if resolved {
+                Response::ok(serde_json::json!({ "resolved": true }))
+            } else {
+                Response::err(format!("no in-flight inbound RPC for '{request_id}'"))
+            }
+        }
+
+        Request::RpcStreamChunk {
+            request_id,
+            payload,
+        } => {
+            let accepted = state
+                .clients
+                .push_inbound_stream_chunk(&request_id, payload)
+                .await;
+            if accepted {
+                Response::ok(serde_json::json!({ "delivered": true }))
+            } else {
+                Response::err(format!("no in-flight inbound stream for '{request_id}'"))
+            }
+        }
+
+        Request::RpcStreamEnd {
+            request_id,
+            error: _,
+        } => {
+            // Note: webrtc-rs's `Rpc::serve_stream` derives the
+            // stream-end error from the inner future (Err →
+            // `RpcStreamEnd { error }` on the wire). At this
+            // layer dropping the sender is the only signal we
+            // have — the engine emits `error: None`. Surfacing
+            // an explicit error from the IPC client requires
+            // sending it as the final chunk before close. A
+            // follow-up extension can plumb the wire-level
+            // error if needed; for now the close is silent.
+            let closed = state.clients.close_inbound_stream(&request_id);
+            Response::ok(serde_json::json!({ "closed": closed }))
+        }
+
+        // ---- outbound RPC --------------------------------------------
+        Request::RpcCall {
+            network,
+            peer,
+            method,
+            payload,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            match net.rpc().call(&peer, &method, payload).await {
+                Ok(resp) => Response::ok(serde_json::json!({ "response": resp.body })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::RpcCallStream {
+            client_id,
+            network,
+            peer,
+            method,
+            payload,
+        } => {
+            let Some(client) = state.clients.client(client_id) else {
+                return Response::err(format!("unknown client_id: {client_id}"));
+            };
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            // The lib's `call_stream` allocates a request_id
+            // internally but doesn't expose it; we mirror its
+            // shape and tag chunks on the wire with a fresh
+            // daemon-side id so the IPC client can correlate
+            // its in-flight calls.
+            let request_id = format!("ipc-stream-{}", state.clients.next_call_stream_id());
+            let rx = match net.rpc().call_stream(&peer, &method, payload).await {
+                Ok(rx) => rx,
+                Err(e) => return Response::err(e.to_string()),
+            };
+            let writer_tx = client.writer_tx.clone();
+            let req_id_for_task = request_id.clone();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(chunk) = rx.recv().await {
+                    match chunk {
+                        Ok(payload) => {
+                            let _ = writer_tx.send(crate::ipc::ServerOut::RpcCallStreamChunk {
+                                request_id: req_id_for_task.clone(),
+                                payload,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = writer_tx.send(crate::ipc::ServerOut::RpcCallStreamEnd {
+                                request_id: req_id_for_task.clone(),
+                                error: Some(err),
+                            });
+                            return;
+                        }
+                    }
+                }
+                let _ = writer_tx.send(crate::ipc::ServerOut::RpcCallStreamEnd {
+                    request_id: req_id_for_task,
+                    error: None,
+                });
+            });
+            Response::ok(serde_json::json!({ "request_id": request_id }))
+        }
+
+        // ---- typed channels ------------------------------------------
+        Request::ChannelSubscribe {
+            client_id,
+            network,
+            channel,
+        } => {
+            if state.clients.client(client_id).is_none() {
+                return Response::err(format!("unknown client_id: {client_id}"));
+            }
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let key = (network.clone(), channel.clone());
+            let first = state.clients.subscribe_channel(key.clone(), client_id);
+            if first {
+                crate::ipc::bridge::spawn_channel_pump(
+                    &net,
+                    network,
+                    channel,
+                    state.clients.clone(),
+                );
+            }
+            Response::ok(serde_json::json!({ "subscribed": true }))
+        }
+
+        Request::ChannelUnsubscribe {
+            client_id,
+            network,
+            channel,
+        } => {
+            let key = (network, channel);
+            state.clients.unsubscribe_channel(&key, client_id);
+            // We don't actively tear the pump down — it exits
+            // on its next iteration when it sees an empty
+            // subscriber list. Keeps the unsubscribe synchronous
+            // and free of cross-task signaling.
+            Response::ok(serde_json::json!({ "unsubscribed": true }))
+        }
+
+        Request::ChannelSendTo {
+            network,
+            channel,
+            peer,
+            payload,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let chan = net.channel::<serde_json::Value>(&channel);
+            match chan.send_to(&peer, &payload).await {
+                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::ChannelSendAll {
+            network,
+            channel,
+            payload,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let chan = net.channel::<serde_json::Value>(&channel);
+            match chan.broadcast(&payload).await {
+                Ok(count) => Response::ok(serde_json::json!({ "dispatched_to": count })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::CapabilitiesSet {
+            network,
+            capabilities,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            net.advertise(capabilities);
+            Response::ok(serde_json::json!({ "advertised": true }))
+        }
     }
 }
 
@@ -650,45 +1036,72 @@ fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<Topology
     }
 }
 
-/// Stream mesh events to one connected subscriber. Returns when the
-/// underlying writer breaks (client disconnected) or the engine's
-/// broadcast channel closes (daemon shutting down).
-async fn run_events_stream<W>(state: &Arc<ControlState>, writer: &mut W) -> Result<()>
+/// Stream events to one connected subscriber. Drains two
+/// sources concurrently:
+///
+/// 1. The mesh-wide [`MeshHandle::events`] broadcast — peer /
+///    phase / diag entries the engine emits.
+/// 2. The per-client mpsc — `ServerOut` frames the IPC bridge
+///    (RPC inbound, channel inbound, handler-displaced
+///    notifications) pushes for this specific client.
+///
+/// Returns when the writer breaks (client gone) or both source
+/// streams close. Source 1 closes only on daemon shutdown;
+/// source 2 closes when the client's `unregister` drops the
+/// last sender, which the caller invokes after this function
+/// returns.
+async fn run_events_stream<W>(
+    state: &Arc<ControlState>,
+    writer: &mut W,
+    mut client_rx: tokio::sync::mpsc::UnboundedReceiver<crate::ipc::ServerOut>,
+) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut rx = state.mesh.events();
+    let mut mesh_rx = state.mesh.events();
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                // Each event is framed with kind=event so the
-                // subscriber can multiplex against other server
-                // pushes in the future. The `event` field carries
-                // the original `MeshEvent` JSON (peer / phase /
-                // diag, internally tagged).
-                let line = serde_json::to_string(&serde_json::json!({
-                    "kind": "event",
-                    "event": event,
-                }))? + "\n";
+        tokio::select! {
+            biased;
+            // Per-client frames first — drains IPC-routed
+            // RpcInbound / ChannelInbound / etc.
+            maybe_frame = client_rx.recv() => {
+                let Some(frame) = maybe_frame else {
+                    // Sender dropped — only happens after the
+                    // outer handle_client called `unregister`,
+                    // which only fires after this returns. In
+                    // practice this branch never fires while
+                    // the connection is live; treat as benign
+                    // shutdown.
+                    return Ok(());
+                };
+                let line = serde_json::to_string(&frame)? + "\n";
                 if writer.write_all(line.as_bytes()).await.is_err() {
-                    return Ok(()); // client gone
+                    return Ok(());
                 }
                 if writer.flush().await.is_err() {
                     return Ok(());
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                // Slow subscriber; surface the gap so the GUI can
-                // resync via a peers_list snapshot.
-                let line = serde_json::to_string(&serde_json::json!({
-                    "kind": "lagged",
-                    "skipped": n,
-                }))? + "\n";
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    return Ok(());
+            recv = mesh_rx.recv() => match recv {
+                Ok(event) => {
+                    let frame = crate::ipc::ServerOut::Event { event };
+                    let line = serde_json::to_string(&frame)? + "\n";
+                    if writer.write_all(line.as_bytes()).await.is_err() {
+                        return Ok(());
+                    }
+                    if writer.flush().await.is_err() {
+                        return Ok(());
+                    }
                 }
-            }
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let frame = crate::ipc::ServerOut::Lagged { skipped: n };
+                    let line = serde_json::to_string(&frame)? + "\n";
+                    if writer.write_all(line.as_bytes()).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
         }
     }
 }

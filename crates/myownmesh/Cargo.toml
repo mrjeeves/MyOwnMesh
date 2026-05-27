@@ -34,3 +34,8 @@ serde_json = { workspace = true }
 
 interprocess = { workspace = true }
 parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+myownmesh-signaling = { workspace = true }
+tempfile = { workspace = true }
