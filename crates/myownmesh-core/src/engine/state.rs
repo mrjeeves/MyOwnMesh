@@ -213,6 +213,16 @@ pub struct NetworkState {
     /// drain it via [`Self::take_signaling_outbound_rx`] when they
     /// bring up their signaling task.
     signaling_outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<SignalingOutbound>>>,
+
+    /// Last time we reflected a peer's announce with one of our
+    /// own. Rate-limited so a room with N peers all reacting to
+    /// each other's announces doesn't degenerate into a publish
+    /// storm — one outbound reactive announce per
+    /// [`REACTIVE_ANNOUNCE_MIN_INTERVAL_MS`] coalesces any number
+    /// of inbound announces in that window. See the comment on
+    /// the call site in `engine::mod::handle_signaling_inbound`
+    /// for the discovery rationale.
+    pub last_reactive_announce_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl NetworkState {
@@ -269,6 +279,7 @@ impl NetworkState {
             signaling_inbound_tx,
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            last_reactive_announce_at: Mutex::new(None),
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
     }

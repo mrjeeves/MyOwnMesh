@@ -1,23 +1,28 @@
 //! Minimal Nostr event construction + signing. We implement the
 //! NIP-01 event shape directly rather than depend on the
-//! full-fat `nostr` crate — we need exactly one event kind
-//! (ephemeral signaling), one filter shape, and BIP-340 signing,
-//! which is straightforward over `secp256k1`.
+//! full-fat `nostr` crate — we need exactly one event kind, one
+//! filter shape, and BIP-340 signing, which is straightforward
+//! over `secp256k1`.
 
 use secp256k1::{rand, Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// Kind used for MyOwnMesh signaling. Falls in the ephemeral
-/// range (20000–29999) per NIP-01 — relays forward without
-/// storing, which is the semantics we want. (Tried moving to a
-/// stored regular kind to fix late-joiner discovery; public
-/// relays in the default pool reject arbitrary kinds in the
-/// regular range, so we keep ephemeral and instead solve late-
-/// joiner discovery at the engine layer via fresh-announce-on-
-/// unknown-peer in `engine::mod::handle_signaling_inbound`.)
-pub const SIGNALING_EVENT_KIND: u16 = 21000;
+/// Kind used for MyOwnMesh signaling. Lives in the NIP-01 regular
+/// range (1000–9999) so relays store and replay it on a `since`-
+/// scoped REQ — that's what lets a late joiner discover every
+/// existing peer, not just the one that happens to re-announce
+/// inside their window. The earlier ephemeral choice (21000)
+/// caused a star-around-first-peer failure mode.
+///
+/// Late joiners may also receive replayed historical OFFER /
+/// ANSWER / CANDIDATE events addressed to them; the engine
+/// reacts to each PeerAnnounced by reflecting a fresh announce
+/// back, so even when a peer's view is muddied by stale
+/// directed messages the OTHER side always gets a current
+/// announce and can drive a fresh handshake.
+pub const SIGNALING_EVENT_KIND: u16 = 1077;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
