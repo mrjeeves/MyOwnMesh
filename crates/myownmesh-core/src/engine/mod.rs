@@ -399,10 +399,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                         state.log_diag_with(
                             crate::events::DiagLevel::Info,
                             "signaling",
-                            format!(
-                                "re-offer to {} (stuck at Sighted)",
-                                short_peer(&device_id)
-                            ),
+                            format!("re-offer to {} (stuck at Sighted)", short_peer(&device_id)),
                             serde_json::json!({
                                 "peer": device_id,
                                 "sdp_bytes": desc.sdp.len(),
