@@ -180,28 +180,29 @@ pub const ANNOUNCE_INTERVAL_MS: u64 = 5_333;
 /// once exhausted, all subsequent waits use [`ANNOUNCE_STEADY_MS`].
 ///
 /// Curve:
-///   - announce 1 fires at t=0 (no wait, daemon startup)
-///   - 5s × 5  → announces 2-6  at t = 5, 10, 15, 20, 25
-///   - 10s × 3 → announces 7-9  at t = 35, 45, 55
-///   - 15s × 4 → announces 10-13 at t = 70, 85, 100, 115
-///   - 30s × 2 → announces 14-15 at t = 145, 175
-///   - 60s …   → announces 16+ at t = 235, 295, 355, …
+///   - announce 1 fires at t=0 (daemon startup)
+///   - announce 2 fires at t=30s (safety net for a silently-failed
+///     first publish)
+///   - announces 3+ fire on the 5-minute steady tick
 ///
-/// Rationale: a brand-new join wants to be discovered immediately
-/// by anyone already in the room (relays don't keep ephemeral
-/// signaling events, so a third device joining 2 minutes from now
-/// only sees us if our announce arrives after their subscription).
-/// Once we've been broadcasting for ~3 minutes everyone who's going
-/// to find us will have, so we drop to a 60s heartbeat — enough to
-/// keep peer-side liveness detection happy without flooding either
-/// the relays or the user's Activity log.
-pub const ANNOUNCE_BACKOFF_MS: &[u64] = &[
-    5_000, 5_000, 5_000, 5_000, 5_000, // 5s × 5
-    10_000, 10_000, 10_000, // 10s × 3
-    15_000, 15_000, 15_000, 15_000, // 15s × 4
-    30_000, 30_000, // 30s × 2
-];
+/// Rationale: with stored-kind signaling (kind 1077, see
+/// `nostr::event::SIGNALING_EVENT_KIND`) and engine-side reactive
+/// reflection on every inbound announce, the dense early schedule
+/// the ephemeral-kind era required is now redundant. A late joiner
+/// receives every existing peer's most recent announce on REQ
+/// replay; existing peers re-announce within ~1s of seeing the
+/// joiner's announce; per-relay open-announce in
+/// `nostr::driver::run_relay_inner` covers freshly-(re)connected
+/// relays. The remaining role of the periodic announce is just to
+/// refresh storage well inside any reasonable relay retention
+/// window — five minutes is conservative against public relays
+/// that retain regular events for hours to days, while the 30s
+/// safety net catches a silently-failed first publish at startup.
+pub const ANNOUNCE_BACKOFF_MS: &[u64] = &[30_000];
 
 /// Steady-state announce cadence, used once
-/// [`ANNOUNCE_BACKOFF_MS`] is exhausted.
-pub const ANNOUNCE_STEADY_MS: u64 = 60_000;
+/// [`ANNOUNCE_BACKOFF_MS`] is exhausted. Sized to refresh relay
+/// storage well inside typical retention; see the comment on
+/// [`ANNOUNCE_BACKOFF_MS`] for why discovery doesn't need a
+/// tighter cadence anymore.
+pub const ANNOUNCE_STEADY_MS: u64 = 300_000;

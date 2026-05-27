@@ -257,8 +257,14 @@ Room tag: `["r", "<room_handle>"]` where the handle is
 runtimes so two peers using the same `(app_id, network_id)` land in
 the same Nostr room.
 
-Periodic announce cadence: `ANNOUNCE_INTERVAL_MS = 5_333` ms,
-matching upstream Trystero.
+Periodic announce cadence: one publish on startup, one safety-net
+re-publish at +30 s, then every 5 min (`ANNOUNCE_BACKOFF_MS` +
+`ANNOUNCE_STEADY_MS` in `crates/myownmesh-signaling/src/upstream.rs`).
+Discovery doesn't rely on the periodic cadence — it relies on the
+relay's storage of our last announce plus engine-side reactive
+reflection on every inbound announce (`engine::handle_signaling_inbound`).
+The periodic publish is only there to refresh storage inside the
+relay's retention window.
 
 Full Nostr-driver behavior — relay selection, subscription replay
 on reconnect, transition-only logging — is documented in

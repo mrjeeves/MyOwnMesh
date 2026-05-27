@@ -417,18 +417,47 @@ impl PeerSession {
     /// pair stats expose `nominated` plus ids that resolve to local /
     /// remote candidate stats with public `candidate_type` fields.
     pub async fn selected_candidate_pair(&self) -> Option<super::diag::SelectedCandidatePair> {
-        use webrtc::ice::candidate::CandidateType;
+        use webrtc::ice::candidate::{CandidatePairState, CandidateType};
         use webrtc::stats::StatsReportType;
         let report = self.pc.get_stats().await;
         // Find the nominated pair. There can be several pair entries
         // (one per checklist combination); only the nominated one is
         // currently carrying packets.
-        let (local_id, remote_id) = report.reports.values().find_map(|r| match r {
-            StatsReportType::CandidatePair(p) if p.nominated => {
-                Some((p.local_candidate_id.clone(), p.remote_candidate_id.clone()))
+        //
+        // Fallback: webrtc-rs doesn't always flip `nominated=true` on
+        // the controlling (Offerer) side — the field can stay false
+        // even after ICE is solidly Connected and bytes are flowing.
+        // When no pair is marked nominated, fall back to the
+        // Succeeded pair with the most bytes_received (the one
+        // actually carrying traffic); if multiple have zero bytes,
+        // any Succeeded pair classifies the same way for our
+        // purposes (LAN / STUN / TURN). Without this fallback the
+        // Offerer side stays unclassified on a healthy LAN pair —
+        // packets flow, GUI never paints the link type.
+        let (local_id, remote_id) = {
+            let nominated = report.reports.values().find_map(|r| match r {
+                StatsReportType::CandidatePair(p) if p.nominated => {
+                    Some((p.local_candidate_id.clone(), p.remote_candidate_id.clone()))
+                }
+                _ => None,
+            });
+            match nominated {
+                Some(ids) => ids,
+                None => report
+                    .reports
+                    .values()
+                    .filter_map(|r| match r {
+                        StatsReportType::CandidatePair(p)
+                            if p.state == CandidatePairState::Succeeded =>
+                        {
+                            Some(p)
+                        }
+                        _ => None,
+                    })
+                    .max_by_key(|p| p.bytes_received)
+                    .map(|p| (p.local_candidate_id.clone(), p.remote_candidate_id.clone()))?,
             }
-            _ => None,
-        })?;
+        };
         fn map(t: CandidateType) -> super::diag::IceCandidateKind {
             match t {
                 CandidateType::Host => super::diag::IceCandidateKind::Host,

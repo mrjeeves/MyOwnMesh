@@ -42,6 +42,14 @@ pub use signaling_bridge::{attach_local, attach_nostr};
 /// quadratic load on the relay pool.
 const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 
+/// Minimum gap between re-offers we send to the same peer while
+/// their session is stuck at `Sighted` (PC created, data channel
+/// never opened). Coalesces REQ-replay announce bursts into one
+/// re-offer per window so we don't pile up SDP renegotiations on
+/// the remote PC. Sized small enough that two restart-aligned
+/// peers converge inside a handful of seconds.
+const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -348,6 +356,66 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             if should_reflect {
                 let _ = state.signaling_tx.send(SignalingOutbound::Announce);
             }
+            // If we already have a session for this peer that's
+            // stuck at Sighted (PC created but data channel never
+            // opened) and we're the Offerer, re-poke the other
+            // side with a fresh offer. webrtc-rs `create_offer`
+            // calls `set_local_description` internally, which
+            // kicks off a new ICE gathering cycle on the same PC
+            // — no teardown needed, the remote handles the
+            // renegotiation transparently. Rate-limited per-peer
+            // via `last_offer_sent_at` so the announce burst from
+            // a REQ replay (we've observed ~14 in one ms) doesn't
+            // translate into a fan of fourteen offers. Only fires
+            // for `Sighted` so once the channel opens and status
+            // advances to `Handshaking` / `Active` / etc. we stop
+            // re-offering automatically — no extra teardown
+            // logic, no extra timer.
+            let reoffer_session = if role == Role::Offerer {
+                state.peers.get(&device_id).and_then(|p| {
+                    let mut data = p.state.write();
+                    if !matches!(data.status, PeerStatus::Sighted) {
+                        return None;
+                    }
+                    let due = data
+                        .last_offer_sent_at
+                        .map(|prev| {
+                            Instant::now().duration_since(prev)
+                                >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                        })
+                        .unwrap_or(true);
+                    if !due {
+                        return None;
+                    }
+                    data.last_offer_sent_at = Some(Instant::now());
+                    p.session.lock().clone()
+                })
+            } else {
+                None
+            };
+            if let Some(session) = reoffer_session {
+                match session.create_offer().await {
+                    Ok(desc) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Info,
+                            "signaling",
+                            format!("re-offer to {} (stuck at Sighted)", short_peer(&device_id)),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "sdp_bytes": desc.sdp.len(),
+                                "reason": "stuck-at-sighted",
+                            }),
+                        );
+                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                            device_id: device_id.clone(),
+                            sdp: desc.sdp,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(peer = %device_id, "re-offer create_offer failed: {e}");
+                    }
+                }
+            }
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -413,29 +481,69 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // the add_ice_candidate await must happen without the
             // peer lock held.
             let kind = crate::transport::classify_candidate_sdp(&candidate.candidate);
-            let session = if let Some(peer) = state.peers.get(&device_id) {
-                peer.state.write().diag.remote_candidates.record(kind);
-                peer.session.lock().clone()
+            // Decide under the lock whether to apply now or queue
+            // for after `set_remote_description`. Trickle ICE
+            // candidates routinely arrive a few hundred ms before
+            // the answer on a fast network; if we just hand them
+            // to webrtc-rs at that point, it rejects with "remote
+            // description is not set" and the candidate is gone —
+            // including the host candidate that would have closed
+            // a LAN pair, leaving the agent to fall back to a
+            // peer-reflexive pair and the GUI to mis-paint the
+            // link as STUN instead of LAN.
+            enum Action {
+                Apply(Arc<crate::transport::PeerSession>),
+                Queued,
+                NoPeer,
+            }
+            let action = if let Some(peer) = state.peers.get(&device_id) {
+                let mut data = peer.state.write();
+                data.diag.remote_candidates.record(kind);
+                if !data.remote_description_set {
+                    data.pending_remote_candidates.push(candidate.clone());
+                    Action::Queued
+                } else {
+                    let session = peer.session.lock().clone();
+                    drop(data);
+                    match session {
+                        Some(s) => Action::Apply(s),
+                        None => Action::NoPeer,
+                    }
+                }
             } else {
-                None
+                Action::NoPeer
             };
-            if let Some(session) = session {
-                if let Err(e) = session.add_ice_candidate(candidate).await {
+            match action {
+                Action::Apply(session) => {
+                    if let Err(e) = session.add_ice_candidate(candidate).await {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate rejected by {}: {e}",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "kind": format!("{kind:?}"),
+                                "error": e.to_string(),
+                            }),
+                        );
+                        warn!(peer = %device_id, "add_ice_candidate failed: {e}");
+                    }
+                }
+                Action::Queued => {
                     state.log_diag_with(
-                        crate::events::DiagLevel::Warn,
+                        crate::events::DiagLevel::Debug,
                         "ice",
                         format!(
-                            "remote {kind:?} candidate rejected by {}: {e}",
+                            "queued remote {kind:?} candidate from {} (awaiting remote SDP)",
                             short_peer(&device_id)
                         ),
-                        serde_json::json!({
-                            "peer": device_id,
-                            "kind": format!("{kind:?}"),
-                            "error": e.to_string(),
-                        }),
+                        serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
                     );
-                    warn!(peer = %device_id, "add_ice_candidate failed: {e}");
                 }
+                Action::NoPeer => {}
             }
         }
         SignalingInbound::PeerLeft { device_id } => {
@@ -517,6 +625,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                     device_id: device_id.clone(),
                     sdp: desc.sdp,
                 });
+                if let Some(p) = state.peers.get(&device_id) {
+                    p.state.write().last_offer_sent_at = Some(Instant::now());
+                }
             }
             Err(e) => {
                 state.log_diag_with(
@@ -593,6 +704,36 @@ async fn apply_remote_sdp(
                 }),
             );
             warn!(peer = %device_id, "set_remote_description failed: {e}");
+        } else {
+            // Drain any ICE candidates that arrived ahead of the
+            // SDP. The lock comes off before any await — we pull
+            // the pending vec out, then apply each candidate
+            // outside the guard so the per-peer state lock isn't
+            // held across the webrtc-rs add_ice_candidate await.
+            let pending = if let Some(peer) = state.peers.get(device_id) {
+                let mut data = peer.state.write();
+                data.remote_description_set = true;
+                std::mem::take(&mut data.pending_remote_candidates)
+            } else {
+                Vec::new()
+            };
+            if !pending.is_empty() {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Debug,
+                    "ice",
+                    format!(
+                        "applying {} queued remote candidate(s) for {}",
+                        pending.len(),
+                        short_peer(device_id)
+                    ),
+                    serde_json::json!({ "peer": device_id, "count": pending.len() }),
+                );
+                for cand in pending {
+                    if let Err(e) = session.add_ice_candidate(cand).await {
+                        warn!(peer = %device_id, "queued add_ice_candidate failed: {e}");
+                    }
+                }
+            }
         }
     } else {
         state.log_diag_with(
@@ -790,8 +931,9 @@ async fn handle_ice_state_change(
 /// Ask the peer's ICE agent for its nominated candidate pair and
 /// stash it on the peer state. Quiet on `None` — the agent is
 /// allowed not to know yet (renegotiation in flight, agent torn
-/// down, etc.) and the next state change will re-query.
-async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
+/// down, etc.) and the next state change or the ICE poll will
+/// re-query.
+pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &str) {
     // Same DashMap-Ref + MutexGuard scoping pattern as the watchdog:
     // pull the cloned `Arc<PeerSession>` into a named local before
     // the inner block returns so the guard drops before the `Ref`

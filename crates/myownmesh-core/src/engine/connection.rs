@@ -12,7 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::CapabilityAdvert;
-use crate::transport::{PeerDiag, PeerSession, SelectedCandidatePair};
+use crate::transport::{LocalIceCandidate, PeerDiag, PeerSession, SelectedCandidatePair};
 
 use super::ladder::ConnectionTier;
 
@@ -58,6 +58,15 @@ pub struct PeerStateData {
     pub verification_code_received: Option<String>,
     pub last_recv_at: Option<Instant>,
     pub last_ping_sent_at: Option<Instant>,
+    /// Wall-clock of the most recent SDP offer we sent for this
+    /// peer (either the original from `ensure_peer_session` or a
+    /// re-poke from `handle_signaling_inbound`). Used to rate-
+    /// limit the announce-driven re-offer path so a burst of
+    /// inbound announces (e.g. REQ-replay delivering 14 stored
+    /// announces in one ms) doesn't translate into 14 outbound
+    /// offers. `None` until we've sent the first offer for this
+    /// session; cleared on `drop_peer`.
+    pub last_offer_sent_at: Option<Instant>,
     pub last_ping_t: Option<i64>,
     pub rtt_ms: Option<u32>,
     pub ice_disconnected_since: Option<Instant>,
@@ -79,6 +88,23 @@ pub struct PeerStateData {
     /// involved) without relying on heuristics over the gathered-
     /// candidate counts. `None` until ICE reaches Connected.
     pub selected_pair: Option<SelectedCandidatePair>,
+    /// True once we've successfully applied the peer's SDP via
+    /// `set_remote_description`. Until this is true, inbound ICE
+    /// candidates can't be added to the PC (webrtc-rs returns
+    /// "remote description is not set") and would otherwise be
+    /// dropped — including the LAN Host candidate that arrives
+    /// trickle-style fractions of a second before the answer on a
+    /// fast local network, which leaves the agent classifying the
+    /// remote as `PeerReflexive` (discovered via STUN binding) and
+    /// the GUI mis-painting a LAN link as STUN. We instead queue
+    /// pre-SDP candidates in `pending_remote_candidates` and
+    /// drain them inside `apply_remote_sdp` once the description
+    /// is in place.
+    pub remote_description_set: bool,
+    /// Remote ICE candidates that arrived before we'd applied the
+    /// peer's SDP. Drained and applied after the first successful
+    /// `set_remote_description`; see [`remote_description_set`].
+    pub pending_remote_candidates: Vec<LocalIceCandidate>,
     pub diag: PeerDiag,
 }
 
@@ -100,6 +126,7 @@ impl Default for PeerStateData {
             verification_code_received: None,
             last_recv_at: None,
             last_ping_sent_at: None,
+            last_offer_sent_at: None,
             last_ping_t: None,
             rtt_ms: None,
             ice_disconnected_since: None,
@@ -109,6 +136,8 @@ impl Default for PeerStateData {
             ice_failed_count: 0,
             no_turn_diag_emitted: false,
             selected_pair: None,
+            remote_description_set: false,
+            pending_remote_candidates: Vec::new(),
             diag: PeerDiag::default(),
         }
     }
