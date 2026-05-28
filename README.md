@@ -259,7 +259,7 @@ relationship to the original TypeScript modules.
 
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — embedder walkthrough ·
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — wire-protocol reference ·
-[`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (design, decisions locked, awaiting implementation) ·
+[`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
 [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) — the 7-tier ladder, every tunable ·
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, conventions, testing ·
