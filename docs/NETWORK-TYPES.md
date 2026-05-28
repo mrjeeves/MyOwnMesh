@@ -1,9 +1,17 @@
 # Network types: open and closed
 
-**Status: design — not yet implemented.** All four foundational
-decisions (sync algorithm, deadlock resolution, fork semantics,
-wire shape) are settled — see [Decisions](#decisions) at the bottom.
-The doc is the contract; implementation lands in a follow-up PR.
+**Status: implemented in v0.1.2.** Types live in
+[`crates/myownmesh-core/src/network_state.rs`](../crates/myownmesh-core/src/network_state.rs);
+wire frames are in
+[`crates/myownmesh-core/src/protocol/`](../crates/myownmesh-core/src/protocol/);
+the engine enforces authority on every inbound `network_state_*`
+frame and surfaces quorum-violating proposals as diag entries; the
+`JoinedNetwork` handle exposes propose / sign / deny / split. The
+ratify + deny lifecycle is exercised end-to-end in
+[`tests/closed_network_governance.rs`](../crates/myownmesh-core/tests/closed_network_governance.rs).
+This doc remains the contract; the four foundational decisions
+(sync algorithm, deadlock resolution, fork semantics, wire shape)
+are settled — see [Decisions](#decisions) at the bottom.
 
 ## Why
 
