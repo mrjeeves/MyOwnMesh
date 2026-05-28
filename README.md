@@ -27,34 +27,40 @@ myownmesh-signaling      # Nostr signaling driver + in-process LocalBroker
 myownmesh-updater        # self-update with configurable release feed
 ```
 
+## Install
+
+One command — detects platform, fetches the binary from
+[GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases),
+verifies SHA-256, drops `myownmesh` on your PATH.
+
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/mrjeeves/MyOwnMesh/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/mrjeeves/MyOwnMesh/main/scripts/install.ps1 | iex
+```
+
+The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
+writable) on Unix and `%LOCALAPPDATA%\Programs\MyOwnMesh` on
+Windows, and adds the directory to PATH if it isn't already there.
+Pass `--serve` (Unix) or `-Serve` (Windows) to launch the daemon
+once the install finishes. `myownmesh update` self-applies later
+releases against the same artifacts.
+
+Prefer a tarball directly? The portable binaries
+(`myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
+[Releases](https://github.com/mrjeeves/MyOwnMesh/releases) for the
+five platforms in the [matrix](#platforms).
+
 ## Get started
 
 Pick the persona that matches what you're doing — none of them
 depend on each other, so any combination works on the same box.
 
-### 1. Run a node (pre-built daemon)
-
-Pre-built binaries land on [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
-for every tagged version. Portable headless binaries
-(`myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar) for the
-five platforms in the [matrix](#platforms). `myownmesh update`
-self-applies against the same artifacts once a newer release is
-published.
-
-```bash
-# macOS / Linux — example for linux-x86_64; replace the platform suffix as needed
-curl -fsSL https://github.com/mrjeeves/MyOwnMesh/releases/latest/download/myownmesh-linux-x86_64.tar.gz | tar -xz
-./myownmesh serve
-```
-
-```powershell
-# Windows
-Invoke-WebRequest -Uri "https://github.com/mrjeeves/MyOwnMesh/releases/latest/download/myownmesh-windows-x86_64.zip" -OutFile myownmesh.zip
-Expand-Archive myownmesh.zip
-.\myownmesh.exe serve
-```
-
-### 2. Run a node (build from source)
+### 1. Run a node (build from source)
 
 ```bash
 git clone https://github.com/mrjeeves/MyOwnMesh
@@ -67,7 +73,7 @@ cargo run -p myownmesh -- serve
 just serve                                    # MYOWNMESH_LOG=debug cargo run -p myownmesh -- serve
 ```
 
-### 3. Run the desktop GUI
+### 2. Run the desktop GUI
 
 Pre-built installers (`.deb` / `.AppImage` / `.dmg` / `.msi` /
 `.exe`) ship in the same [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
@@ -90,7 +96,7 @@ cd gui && pnpm install && pnpm tauri dev  # another shell
 
 For a release build of the GUI: `cd gui && pnpm tauri build`.
 
-### 4. Embed in your Rust app (library)
+### 3. Embed in your Rust app (library)
 
 The library crates aren't on crates.io yet — pull them as git
 dependencies pinned to a release tag. Cargo dedupes git deps by URL,
@@ -150,7 +156,7 @@ Override `MYOWNMESH_HOME=~/.youapp/mesh` to keep your app's identity
 `~/.myownmesh/`). Narrative walkthrough:
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
-### 5. Try it without leaving the workspace
+### 4. Try it without leaving the workspace
 
 Two ephemeral peers exchange a full handshake + a typed channel
 message in-process via the LocalBroker — no Nostr relays, no
@@ -170,7 +176,7 @@ cargo run --example echo_rpc      -p myownmesh-core   # generic RPC
 cargo run --example roster_demo   -p myownmesh-core   # approve / persist / reconnect
 ```
 
-### 6. Hack on the workspace
+### 5. Hack on the workspace
 
 ```bash
 just setup       # Rust toolchain via rustup (idempotent)
