@@ -69,6 +69,17 @@ pub const REDISCOVERY_BACKOFF_SCHEDULE_MS: &[u64] = &[90_000, 180_000, 300_000, 
 /// the leave-presence before the new join.
 pub const REDISCOVERY_REJOIN_GAP_MS: u64 = 1_500;
 
+/// Inbound-message staleness threshold for zombie clearing. When a
+/// fresh announce/offer arrives from a peer we already hold but
+/// haven't received anything from in longer than this, the engine
+/// treats the existing session as a zombie and drops it so the
+/// inbound signal can drive a clean rebuild — instead of wedging
+/// WebRTC by applying a new SDP onto a stale peer connection.
+/// Re-exported from the signaling crate so the engine and signaling
+/// layer share one value — see `myownmesh-signaling`'s `upstream.rs`
+/// item 3.
+pub use myownmesh_signaling::upstream::STALE_INBOUND_MS;
+
 /// Periodic diag emit so a long-stable connection still reports
 /// status to the UI.
 pub const SIGNALING_DIAG_HEARTBEAT_MS: u64 = 5 * 60 * 1000;
