@@ -14,7 +14,7 @@ use crate::protocol::{keepalive::PingMessage, MeshMessage};
 
 use super::connection::PeerStatus;
 use super::scheduler::{WAKE_COALESCE_MS, WAKE_DETECTION_THRESHOLD_MS, WAKE_PROBE_DELAY_MS};
-use super::state::NetworkState;
+use super::state::{NetworkState, SignalingOutbound};
 
 /// Local detector — tracks the last observed tick instant and
 /// raises a wake event when the next tick comes too long after.
@@ -74,6 +74,20 @@ impl Default for WakeDetector {
 /// who responded.
 pub async fn on_wake(state: &Arc<NetworkState>) {
     debug!(network = %state.network_id, "tier 2 wake probe");
+
+    // Re-advertise immediately on resume. While this node was paused
+    // (OS suspend, container freeze, or a model-load memory-thrash
+    // that starved the process) it sent no traffic, so peers tore it
+    // down after the heartbeat grace. They only rediscover us through
+    // a fresh announce — without this we wait up to ANNOUNCE_STEADY_MS
+    // (5 min) for the next scheduled one. Reactive reflection
+    // (see `handle_signaling_inbound`) makes neighbors re-announce
+    // within ~1 s, so the round-trip rebuild lands in seconds. One
+    // send per wake event — wake events are coalesced upstream by
+    // WAKE_COALESCE_MS, and reflected announces are rate-limited by
+    // REACTIVE_ANNOUNCE_MIN_INTERVAL_MS, so this can't storm the relay.
+    let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+
     let active: Vec<String> = state
         .peers
         .iter()
@@ -134,6 +148,22 @@ fn monotonic_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn on_wake_emits_announce_for_rediscovery() {
+        // A node that was paused must re-advertise on resume so peers
+        // that tore it down during the pause rediscover it without
+        // waiting for the 5-minute steady announce cadence.
+        let state = crate::engine::build_test_state("wake-announce");
+        let mut rx = state
+            .take_signaling_outbound_rx()
+            .expect("outbound signaling rx should be available");
+        on_wake(&state).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(SignalingOutbound::Announce)),
+            "on_wake must emit a fresh announce"
+        );
+    }
 
     #[test]
     fn detector_fires_on_long_gap() {

@@ -416,6 +416,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     }
                 }
             }
+            clear_stale_session_if_zombie(state, &device_id).await;
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -427,6 +428,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 format!("offer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
+            clear_stale_session_if_zombie(state, &device_id).await;
             ensure_peer_session(state, device_id.clone(), role).await;
             apply_remote_sdp(state, &device_id, RTCSdpType::Offer, sdp).await;
             // Build the answer. Extract the session under the lock,
@@ -1368,6 +1370,49 @@ async fn broadcast_capabilities(state: &Arc<NetworkState>, caps: CapabilityAdver
     delivered
 }
 
+/// Engine-side wiring of the documented inbound-recency zombie
+/// clearing (`STALE_INBOUND_MS`). When a fresh announce/offer arrives
+/// from a peer we still hold but haven't received anything from in
+/// longer than the threshold, the existing peer connection is a
+/// zombie: applying the new SDP onto it would wedge WebRTC, and
+/// `ensure_peer_session` would short-circuit on the stale entry. Drop
+/// it first so the inbound signal drives a clean rebuild.
+///
+/// This is the path that lets a node which was frozen (and torn down
+/// by its peers) recover in seconds: once it re-announces on wake and
+/// a neighbor's offer comes back, the woken node clears its own stale
+/// session here instead of waiting for the next scheduled announce.
+///
+/// A peer with no recorded inbound yet (`last_recv_at == None`, e.g.
+/// mid-first-handshake or stuck at `Sighted`) is left untouched — only
+/// a peer that was receiving and then went silent is a zombie; the
+/// Sighted-stuck case is handled by the re-offer path instead.
+async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &str) {
+    let is_zombie = match state.peers.get(device_id) {
+        Some(peer) => match peer.state.read().last_recv_at {
+            Some(last) => last.elapsed().as_millis() as u64 > scheduler::STALE_INBOUND_MS,
+            None => false,
+        },
+        None => false,
+    };
+    if is_zombie {
+        state.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "signaling",
+            format!(
+                "clearing stale session for {} before rebuild (no inbound > {} ms)",
+                short_peer(device_id),
+                scheduler::STALE_INBOUND_MS
+            ),
+            serde_json::json!({
+                "peer": device_id,
+                "stale_inbound_ms": scheduler::STALE_INBOUND_MS,
+            }),
+        );
+        drop_peer(state, device_id, DropReason::HeartbeatTimeout).await;
+    }
+}
+
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
     let removed = state.peers.remove(device_id);
     if let Some((_, peer)) = removed {
@@ -1394,4 +1439,98 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
     }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
+}
+
+/// Build a minimal `NetworkState` for unit tests. One process-wide
+/// `MYOWNMESH_HOME` is set once (so parallel unit tests don't clobber
+/// each other's env var) and each caller passes a unique suffix so
+/// their on-disk roster / state files don't collide.
+#[cfg(test)]
+pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let _ = HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("MYOWNMESH_HOME", dir.path());
+        dir
+    });
+
+    let network_id = format!("unit-test-{network_id_suffix}");
+    let config = crate::config::NetworkConfig {
+        id: network_id.clone(),
+        network_id,
+        label: "test".into(),
+        kind: Default::default(),
+        topology: crate::config::TopologyMode::FullMesh,
+        signaling: crate::config::SignalingConfig::default(),
+        stun_servers: Vec::new(),
+        turn_servers: Vec::new(),
+        roster_path: None,
+        auto_approve: true,
+    };
+    let identity = Arc::new(crate::identity::Identity::ephemeral());
+    let transport = crate::transport::Transport::new().expect("transport");
+    let (state, _signaling_in_rx, _cmd_rx) =
+        NetworkState::new(config, identity, transport).expect("network state");
+    state
+}
+
+/// Insert a peer with no WebRTC session and a chosen `last_recv_at`,
+/// so a test can exercise the staleness predicate without standing up
+/// a real transport.
+#[cfg(test)]
+pub(crate) fn insert_session_less_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    last_recv_at: Option<Instant>,
+) {
+    let peer = Arc::new(PeerConnection::new(device_id.to_string(), None));
+    peer.state.write().last_recv_at = last_recv_at;
+    state.peers.insert(device_id.to_string(), peer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn stale_instant() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(scheduler::STALE_INBOUND_MS + 5_000))
+            .expect("test host monotonic clock has enough headroom")
+    }
+
+    #[tokio::test]
+    async fn zombie_session_cleared_on_stale_inbound() {
+        let state = build_test_state("zombie-clear");
+        insert_session_less_peer(&state, "peer-zombie", Some(stale_instant()));
+        assert!(state.peers.contains_key("peer-zombie"));
+        clear_stale_session_if_zombie(&state, "peer-zombie").await;
+        assert!(
+            !state.peers.contains_key("peer-zombie"),
+            "a peer silent past STALE_INBOUND_MS must be dropped so the inbound announce/offer rebuilds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_active_peer_not_cleared() {
+        let state = build_test_state("fresh-keep");
+        insert_session_less_peer(&state, "peer-fresh", Some(Instant::now()));
+        clear_stale_session_if_zombie(&state, "peer-fresh").await;
+        assert!(
+            state.peers.contains_key("peer-fresh"),
+            "a peer that received recently must be kept — in-place ICE recovery, not a full rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_without_inbound_not_cleared() {
+        let state = build_test_state("none-keep");
+        insert_session_less_peer(&state, "peer-handshaking", None);
+        clear_stale_session_if_zombie(&state, "peer-handshaking").await;
+        assert!(
+            state.peers.contains_key("peer-handshaking"),
+            "a peer with no inbound yet (mid-handshake / Sighted) must be left for the re-offer path"
+        );
+    }
 }
