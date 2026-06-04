@@ -9,20 +9,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// Kind used for MyOwnMesh signaling. Lives in the NIP-01 regular
-/// range (1000–9999) so relays store and replay it on a `since`-
-/// scoped REQ — that's what lets a late joiner discover every
-/// existing peer, not just the one that happens to re-announce
-/// inside their window. The earlier ephemeral choice (21000)
-/// caused a star-around-first-peer failure mode.
+/// Kind used for MyOwnMesh **presence** — the periodic Announce, and
+/// nothing else. Lives in the NIP-01 regular range (1000–9999) so
+/// relays store and replay it on a `since`-scoped REQ — that's what
+/// lets a late joiner discover every existing peer, not just the one
+/// that happens to re-announce inside their window. The earlier
+/// ephemeral choice (21000) caused a star-around-first-peer failure
+/// mode for *discovery*.
 ///
-/// Late joiners may also receive replayed historical OFFER /
-/// ANSWER / CANDIDATE events addressed to them; the engine
-/// reacts to each PeerAnnounced by reflecting a fresh announce
-/// back, so even when a peer's view is muddied by stale
-/// directed messages the OTHER side always gets a current
-/// announce and can drive a fresh handshake.
+/// Presence is the ONLY thing that rides this stored kind. Connection
+/// negotiation (offer / answer / candidate) uses
+/// [`SIGNALING_EPHEMERAL_KIND`] precisely so it is never stored or
+/// replayed — see the rationale there.
 pub const SIGNALING_EVENT_KIND: u16 = 1077;
+
+/// Kind used for MyOwnMesh **connection negotiation** — every directed
+/// offer / answer / ICE candidate. Lives in the NIP-01 ephemeral range
+/// (20000–29999): relays forward these to current subscribers in real
+/// time but never persist them, so a `since`-scoped REQ cannot replay
+/// them.
+///
+/// This separation is load-bearing. An offer/answer carries
+/// session-specific ICE credentials (ufrag/pwd) bound to exactly one
+/// live `RTCPeerConnection`. If a relay replays a *previous* session's
+/// offer/answer — which a stored kind does for the whole `since`
+/// window — the receiver applies it as its remote description and
+/// binds a brand-new PeerConnection to dead credentials: ICE checks
+/// never match, the data channel never opens, and the peer sits at
+/// `Sighted` until the stale event finally ages out of the window
+/// (the "they see each other but never connect" symptom). Routing
+/// negotiation through an ephemeral kind makes that class of failure
+/// structurally impossible — presence persists, the connection is
+/// always live.
+///
+/// 21077 = 20000 (ephemeral base) + 1077, so the presence and
+/// negotiation kinds read as an obvious pair in relay traffic.
+pub const SIGNALING_EPHEMERAL_KIND: u16 = 21077;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrEvent {
