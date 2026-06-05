@@ -443,20 +443,46 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
     }
 }
 
-/// WebKitGTK's DMA-BUF zero-copy renderer produces scrambled / torn
-/// frames on Raspberry Pi GPUs under Wayland — the window draws but
-/// the content is unreadable, looking like scan lines or graphics that
-/// "don't fit on screen." Disabling DMABUF falls back to a
-/// software-composited path that renders correctly. We only flip this
-/// on Linux + aarch64 because that's where the breakage lives; x86_64
-/// desktops keep the fast path. Honors a user-set value so anyone
-/// wanting to re-enable DMABUF on hardware that doesn't have the bug
-/// can still do so via `WEBKIT_DISABLE_DMABUF_RENDERER=0 myownmesh`.
-/// Ported from MyOwnLLM, which hit the same artifacting on Pi.
+/// Raspberry Pi (and other aarch64 Linux SBCs) ship GPU drivers — V3D on
+/// the Pi — whose GL/EGL path WebKitGTK's accelerated compositor can't
+/// drive cleanly. That one root fault surfaces as two very different bugs:
+///
+///   1. *Garbled rendering.* The compositor hands back scrambled frames —
+///      torn scan-lines, or bars of color blocks where the page should be.
+///      Disabling just the DMA-BUF renderer (WebKitGTK 2.42+'s zero-copy
+///      buffer path) is enough for a mostly-static page, but this GUI's
+///      node graph is an animated, pan/zoomed SVG — composited layers that
+///      still route through the broken GL compositor and corrupt (the
+///      "bars of color blocks" the map rendered as on the Pi).
+///
+///   2. *The whole desktop wedges.* Worse: spinning up that GL/EGL context
+///      collides with the Pi's Wayland compositor and its buffer-sharing
+///      model. While our window is open the session locks up — other
+///      windows stop taking clicks, menus (even the reboot menu) won't
+///      open, and the machine has to be power-cycled. Close the app, or
+///      never open it, and the desktop behaves.
+///
+/// `WEBKIT_DISABLE_COMPOSITING_MODE=1` turns accelerated compositing off
+/// entirely, so WebKit paints on the CPU and never creates the GL context
+/// that corrupts frames *or* fights the system compositor — it fixes both
+/// at once. We also keep `WEBKIT_DISABLE_DMABUF_RENDERER=1` set (moot once
+/// compositing is off, but harmless, and it still covers a host that opts
+/// accelerated compositing back on).
+///
+/// Scoped to Linux + aarch64, where the breakage lives; x86_64 desktops
+/// keep the fast GPU path. Each var honors a value the user pre-set, so on
+/// hardware without the bug the fast path is one override away:
+/// `WEBKIT_DISABLE_COMPOSITING_MODE=0 WEBKIT_DISABLE_DMABUF_RENDERER=0 myownmesh`.
+/// Kept in sync with MyOwnLLM, which hit the same breakage on Pi.
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-fn workaround_pi_webkit_dmabuf() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+fn workaround_pi_webkit_rendering() {
+    for (key, value) in [
+        ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
     }
 }
 
@@ -464,7 +490,7 @@ fn main() {
     // Must run before WebKitGTK initialises its compositor (i.e. before
     // we build the Tauri window below), so set it first thing.
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    workaround_pi_webkit_dmabuf();
+    workaround_pi_webkit_rendering();
 
     let log_level = std::env::var("MYOWNMESH_GUI_LOG")
         .unwrap_or_else(|_| "info,myownmesh_gui=info".to_string());

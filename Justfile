@@ -14,14 +14,16 @@ default: help
 help:
     @just --list
 
-# Install Rust toolchain via rustup if missing.
+# Install dev prerequisites. The daemon is pure Rust, but the GUI is a
+# Tauri + Svelte app, so this also pulls the WebKitGTK/GTK libs, Node,
+# and pnpm that `just dev` needs.
 [unix]
-[doc("Install dev prerequisites (Rust via rustup).")]
+[doc("Install dev prerequisites (GTK/WebKit libs, Rust, Node, pnpm).")]
 setup:
     @./scripts/bootstrap.sh
 
 [windows]
-[doc("Install dev prerequisites (Rust via rustup).")]
+[doc("Install dev prerequisites (Rust, Node, pnpm, Tauri deps).")]
 setup:
     @& .\scripts\bootstrap.ps1
 
