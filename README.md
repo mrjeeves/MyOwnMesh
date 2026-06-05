@@ -205,8 +205,8 @@ protocol-message checklist, and the topology-mode checklist.
 ## Daemon + CLI
 
 ```sh
-myownmesh                  # start the daemon (alias for `serve`)
-myownmesh serve            # run the daemon in foreground
+myownmesh                  # open the desktop GUI (myownmesh-gui)
+myownmesh serve            # run the daemon in the foreground (headless)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
@@ -214,7 +214,10 @@ myownmesh update check     # poll the release feed
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
 ```
 
-Daemon reads `~/.myownmesh/config.json` (auto-created on first edit;
+A bare `myownmesh` (no subcommand) opens the desktop GUI — same as
+MyOwnLLM — which auto-spawns the daemon for you. On a headless box
+with no display it prints a pointer to `myownmesh serve` instead, so
+servers run the daemon directly. Daemon reads `~/.myownmesh/config.json` (auto-created on first edit;
 sensible defaults until then), joins every network listed there,
 attaches the Nostr signaling driver per network, and listens for
 `myownmesh ctl …` clients on a local socket
@@ -226,7 +229,10 @@ reference in [`crates/myownmesh/README.md`](crates/myownmesh/README.md).
 A Tauri + Svelte 5 frontend in [`gui/`](gui/), running as a **client**
 of the daemon — talks to `myownmesh serve` over the local control
 socket, never embeds `myownmesh-core` directly. Crashing the UI
-never disturbs the running mesh.
+never disturbs the running mesh. Launch it with a bare `myownmesh`
+(no subcommand) once the bundle is installed — the daemon binary
+locates `myownmesh-gui` and hands off to it — or `just dev` from a
+source checkout.
 
 - **Node graph** — self at the centre, peers laid out by topology, click a node for label / display suffix / RTT / capabilities. During pending approval the popup surfaces the per-session 6-char verification code as a tile for out-of-band confirmation.
 - **Approvals tab** (default in Settings) — pending peer requests from every joined network flatten into one list with Approve / Deny inline.

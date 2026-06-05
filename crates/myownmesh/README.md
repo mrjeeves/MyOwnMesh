@@ -27,8 +27,8 @@ cargo run -p myownmesh -- serve
 ## Usage
 
 ```
-myownmesh                  # start the daemon (alias for `serve`)
-myownmesh serve            # run the daemon in foreground
+myownmesh                  # open the desktop GUI (myownmesh-gui)
+myownmesh serve            # run the daemon in the foreground (headless)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
@@ -36,6 +36,12 @@ myownmesh update check     # poll the release feed
 myownmesh config path      # print ~/.myownmesh/config.json
 myownmesh config edit      # open in $EDITOR
 ```
+
+A bare `myownmesh` hands off to the `myownmesh-gui` desktop app
+(found next to this binary, on `$PATH`, or via `MYOWNMESH_GUI_BIN`);
+the GUI then auto-spawns `myownmesh serve`. On a headless box with no
+display it prints a pointer to `serve` instead. This crate stays
+headless either way — the GUI lives in [`gui/`](../../gui/).
 
 The daemon reads `~/.myownmesh/config.json` (auto-created on first
 edit; sensible defaults until then), joins every network listed

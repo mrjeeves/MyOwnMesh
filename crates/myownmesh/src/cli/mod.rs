@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod ctl;
+pub mod gui;
 pub mod identity;
 pub mod serve;
 pub mod update;
