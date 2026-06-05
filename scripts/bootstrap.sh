@@ -96,40 +96,98 @@ if have rustup; then
 fi
 
 # ---------------------------------------------------------------------------
-# Node + pnpm — `just dev` runs `pnpm tauri dev` inside gui/. We don't
-# auto-install Node from a distro package: those are frequently too old
-# for Vite 6 (needs Node 20+), so we point the user at a current release
-# and bail rather than wire up a broken toolchain.
+# Node + pnpm — `just dev` runs `pnpm tauri dev` inside gui/, and Vite 6
+# needs Node 20+. Install a current Node when it's missing or too old
+# (distro packages on Debian / Raspberry Pi OS lag well behind), then get
+# pnpm through corepack. This step used to just warn and bail, which left
+# `just dev` to die with "pnpm: command not found".
 # ---------------------------------------------------------------------------
 
-if ! have node; then
-  if [[ "$OS" == "Darwin" ]] && have brew; then
-    log "Installing Node via brew…"
-    brew install node
-  else
-    warn "Node.js not found. Install Node 20+ from https://nodejs.org (or via"
-    warn "fnm/nvm — e.g. \`fnm install 22\`), then re-run \`just setup\`."
-    exit 1
-  fi
-fi
+NODE_MAJOR=22  # LTS line to install when Node is absent or too old.
 
-if ! have pnpm; then
-  if have corepack; then
-    # corepack ships with Node 16.9–24 and is the blessed way to get the
-    # exact pnpm pinned in gui/package.json's "packageManager" field.
-    log "Enabling pnpm via corepack…"
-    corepack enable || true
-    corepack prepare pnpm@latest --activate
-  elif have npm; then
-    # Node 25+ unbundled corepack; older/leaner Node distros may lack it.
-    log "Installing pnpm via npm…"
-    npm install -g pnpm
+node_major() { node -v 2>/dev/null | sed 's/^v//; s/\..*//'; }
+
+install_node_linux() {
+  [[ -f /etc/os-release ]] && . /etc/os-release
+  # Match on ID + ID_LIKE (space-padded) so derivatives resolve too:
+  # Raspberry Pi OS is ID=raspbian ID_LIKE=debian; Pop/Mint carry
+  # ID_LIKE="ubuntu debian"; etc.
+  case " ${ID:-} ${ID_LIKE:-} " in
+    *" debian "*|*" ubuntu "*|*" raspbian "*)
+      # The distro nodejs is usually too old for Vite 6, so pull a current
+      # line from NodeSource — its package bundles npm and corepack.
+      log "Installing Node ${NODE_MAJOR}.x via NodeSource…"
+      curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
+      sudo apt-get install -y nodejs
+      ;;
+    *" fedora "*|*" rhel "*|*" centos "*)
+      log "Installing Node via dnf…"
+      sudo dnf install -y nodejs npm
+      ;;
+    *" arch "*)
+      log "Installing Node via pacman…"
+      sudo pacman -S --needed --noconfirm nodejs npm
+      ;;
+    *)
+      warn "Don't know how to install Node on this distro (${ID:-?})."
+      warn "Install Node ${NODE_MAJOR}+ from https://nodejs.org (or fnm/nvm),"
+      warn "then re-run \`just setup\`."
+      exit 1
+      ;;
+  esac
+}
+
+ensure_node() {
+  if have node; then
+    local maj
+    maj="$(node_major)"
+    if [[ -n "$maj" && "$maj" -ge 20 ]]; then
+      return
+    fi
+    warn "Node $(node -v 2>/dev/null) is older than v20 (Vite 6 needs 20+) — installing v${NODE_MAJOR}."
+  fi
+  if [[ "$OS" == "Darwin" ]]; then
+    if have brew; then
+      log "Installing Node via brew…"
+      brew install node
+    else
+      warn "Homebrew not found. Install Node ${NODE_MAJOR}+ from https://nodejs.org, then re-run."
+      exit 1
+    fi
   else
-    warn "Neither corepack nor npm is on PATH. Install pnpm manually:"
+    install_node_linux
+  fi
+  hash -r 2>/dev/null || true  # forget the shell's cached "node not found"
+}
+
+ensure_pnpm() {
+  if have pnpm; then
+    return
+  fi
+  if have corepack; then
+    log "Enabling pnpm via corepack…"
+    # corepack writes its shims into Node's bin dir: a system Node
+    # (NodeSource / dnf / pacman) needs sudo there, a user-managed one
+    # (fnm / nvm / brew) doesn't — try without sudo first.
+    corepack enable 2>/dev/null || sudo corepack enable 2>/dev/null || true
+    corepack prepare pnpm@latest --activate || true
+    hash -r 2>/dev/null || true
+  fi
+  if ! have pnpm && have npm; then
+    # Node 25+ unbundled corepack; some distro Nodes ship npm only.
+    log "Installing pnpm via npm…"
+    sudo npm install -g pnpm 2>/dev/null || npm install -g pnpm || true
+    hash -r 2>/dev/null || true
+  fi
+  if ! have pnpm; then
+    warn "Could not put pnpm on PATH automatically. Install it manually:"
     warn "  https://pnpm.io/installation"
     exit 1
   fi
-fi
+}
+
+ensure_node
+ensure_pnpm
 
 # Note: the GUI's `pnpm tauri …` commands use the @tauri-apps/cli pulled
 # in as a gui/ devDependency, so a global `cargo install tauri-cli` isn't
