@@ -443,7 +443,29 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
     }
 }
 
+/// WebKitGTK's DMA-BUF zero-copy renderer produces scrambled / torn
+/// frames on Raspberry Pi GPUs under Wayland — the window draws but
+/// the content is unreadable, looking like scan lines or graphics that
+/// "don't fit on screen." Disabling DMABUF falls back to a
+/// software-composited path that renders correctly. We only flip this
+/// on Linux + aarch64 because that's where the breakage lives; x86_64
+/// desktops keep the fast path. Honors a user-set value so anyone
+/// wanting to re-enable DMABUF on hardware that doesn't have the bug
+/// can still do so via `WEBKIT_DISABLE_DMABUF_RENDERER=0 myownmesh`.
+/// Ported from MyOwnLLM, which hit the same artifacting on Pi.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn workaround_pi_webkit_dmabuf() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
 fn main() {
+    // Must run before WebKitGTK initialises its compositor (i.e. before
+    // we build the Tauri window below), so set it first thing.
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    workaround_pi_webkit_dmabuf();
+
     let log_level = std::env::var("MYOWNMESH_GUI_LOG")
         .unwrap_or_else(|_| "info,myownmesh_gui=info".to_string());
     tracing_subscriber::fmt()

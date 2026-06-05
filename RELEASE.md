@@ -29,6 +29,10 @@ The release workflow runs on `push: tags: v*` and on
   `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar.
 - Builds the Tauri GUI bundle (.deb / .AppImage / .dmg / .msi /
   .exe) via `tauri-action`.
+- Packages the portable `myownmesh-gui` binary as
+  `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` so the
+  `curl | sh` installer can drop it next to the daemon (a bare
+  `myownmesh` then opens the GUI).
 - Uploads everything to the GitHub release.
 
 The matrix mirrors MyOwnLLM's `release.yml` so behaviour is
@@ -39,7 +43,8 @@ consistent across both apps.
 | Artifact | Where | Audience |
 |---|---|---|
 | `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` | [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases) | End users running the headless daemon; the self-updater consumes the same artifacts. |
-| Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app. |
+| `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
+| Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app with full OS integration. |
 | `myownmesh-core`, `myownmesh-signaling`, `myownmesh-updater` source | Git tag `vX.Y.Z` | Embedders, via `git = …, tag = "vX.Y.Z"` in their `Cargo.toml`. |
 
 The three library crates are **not on crates.io yet** — embedders
