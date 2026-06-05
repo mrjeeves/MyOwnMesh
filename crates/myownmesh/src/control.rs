@@ -100,6 +100,20 @@ pub enum Request {
     NetworkRemove {
         network: String,
     },
+    /// Update an already-joined network's config in place. Hot-
+    /// reloadable changes (topology / label / auto_approve / roster
+    /// path) are applied without dropping any peer; transport-level
+    /// changes (signaling relays / STUN / TURN / network_id) rebuild
+    /// the network — the ICE config is baked into each
+    /// `RTCPeerConnection` at creation, so a STUN/TURN edit only takes
+    /// effect on fresh connections. Either way the new config is
+    /// persisted to config.json. Fails if the network isn't currently
+    /// joined (use `NetworkAdd` for that). This is the path that lets
+    /// an embedder (MyOwnLLM) push a user's STUN/TURN edit to a
+    /// network the daemon already joined on a prior launch.
+    NetworkUpdate {
+        config: NetworkConfig,
+    },
     /// Subscribe to the live event stream. The connection becomes a
     /// one-way server-push channel after this op; the daemon writes
     /// one JSON-encoded `MeshEvent` (or framing wrapper) per line
@@ -549,6 +563,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         },
         Request::NetworkAdd { config } => network_add(state, config).await,
         Request::NetworkRemove { network } => network_remove(state, &network).await,
+        Request::NetworkUpdate { config } => network_update(state, config).await,
         Request::EventsSubscribe => {
             // Handled by `handle_client` before reaching dispatch.
             // If we somehow get here, surface the bug.
@@ -993,6 +1008,103 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
     }
 }
 
+/// Update an already-joined network in place. Hot-reloadable edits
+/// (topology / label / auto_approve / roster path) apply without
+/// touching live sessions; transport edits (signaling / STUN / TURN /
+/// network_id) tear the network down and rejoin under the new config,
+/// because the ICE server set is baked into each `RTCPeerConnection`
+/// when it's created — there's no way to retrofit a new TURN server
+/// onto an existing connection. Either way config.json is rewritten so
+/// the change survives a daemon restart.
+async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Response {
+    // This is update, not add: the network must already be joined.
+    let joined = match state
+        .registry
+        .get(&config.id)
+        .or_else(|| state.registry.get(&config.network_id))
+    {
+        Some(j) => j,
+        None => {
+            return Response::err(format!(
+                "unknown network '{}' — join it with network_add first",
+                config.id
+            ))
+        }
+    };
+
+    // Compare the incoming config against the engine's live config to
+    // decide hot-apply vs. transport restart.
+    let net_state = joined.state();
+    let needs_restart = {
+        let current = net_state.config.read().clone();
+        myownmesh_core::engine::reconcile::requires_restart(&current, &config)
+    };
+
+    if !needs_restart {
+        // Topology / label / auto_approve / roster — apply in place,
+        // no peers dropped.
+        if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
+            return Response::err(format!("apply config: {e}"));
+        }
+        drop(net_state);
+        drop(joined);
+        if let Err(e) = persist_network_update(&config) {
+            return Response::err(format!("config applied but config.json save failed: {e}"));
+        }
+        return Response::ok(serde_json::json!({ "updated": config.id, "restarted": false }));
+    }
+
+    // Transport restart path. Release our Arc clones first so the
+    // registry can reclaim ownership and `leave()` the old driver
+    // cleanly rather than reporting StillBorrowed.
+    drop(net_state);
+    drop(joined);
+
+    match state.registry.remove(&config.id) {
+        RemoveResult::Removed(old) => {
+            if let Err(e) = old.leave().await {
+                warn!("leave during network update returned error: {e:#}");
+            }
+        }
+        RemoveResult::StillBorrowed => {
+            warn!(
+                network = %config.id,
+                "network update: old engine teardown deferred (request in flight)"
+            );
+        }
+        RemoveResult::NotFound => {
+            // Raced with a concurrent remove between our get() and
+            // here; fall through and re-join fresh from the new config.
+        }
+    }
+
+    // Re-join under the new transport config.
+    let joined = match state.mesh.join(config.clone()).await {
+        Ok(j) => j,
+        Err(e) => return Response::err(format!("rejoin with new config: {e}")),
+    };
+    let summary = serde_json::json!({
+        "config_id": joined.config_id(),
+        "network_id": joined.network_id(),
+        "label": joined.label(),
+        "phase": joined.current_phase(),
+        "topology": joined.current_topology(),
+    });
+    let nostr = {
+        let net_state = joined.state();
+        myownmesh_core::engine::attach_nostr(&net_state)
+    };
+    if nostr.is_none() {
+        warn!(network = %config.network_id, "nostr attach returned no handle after update");
+    }
+    state.registry.insert(joined, nostr);
+
+    if let Err(e) = persist_network_update(&config) {
+        return Response::err(format!("network updated but config.json save failed: {e}"));
+    }
+    Response::ok(serde_json::json!({ "updated": summary, "restarted": true }))
+}
+
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {
     let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
     // Append only if not already present — covers the case where
@@ -1017,6 +1129,25 @@ fn persist_network_remove(config_id: &str, network_id: &str) -> Result<()> {
     if cfg.networks.len() != before {
         cfg.save().map_err(anyhow::Error::msg)?;
     }
+    Ok(())
+}
+
+fn persist_network_update(net: &NetworkConfig) -> Result<()> {
+    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
+    // Replace the matching record in place (by either alias). If it's
+    // somehow absent — e.g. the user hand-deleted it between join and
+    // this update — append so the on-disk config still agrees with the
+    // now-running engine rather than silently dropping it.
+    if let Some(slot) = cfg
+        .networks
+        .iter_mut()
+        .find(|n| n.id == net.id || n.network_id == net.network_id)
+    {
+        *slot = net.clone();
+    } else {
+        cfg.networks.push(net.clone());
+    }
+    cfg.save().map_err(anyhow::Error::msg)?;
     Ok(())
 }
 

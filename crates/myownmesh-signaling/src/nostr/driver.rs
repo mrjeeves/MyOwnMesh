@@ -24,11 +24,13 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
 
-use super::event::{make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EVENT_KIND};
+use super::event::{
+    make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
+};
 use super::handle::derive_room_handle;
 use super::relay::SubscriptionReplay;
 use super::shuffle::select_top_n;
-use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS};
+use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
 use crate::SignalingMessage;
 
 /// Configuration for one driver instance.
@@ -300,15 +302,25 @@ async fn run_relay_session(
 ) -> RelaySessionOutcome {
     let (mut write, mut read) = stream.split();
 
-    // Open subscription for the room handle.
+    // Open subscription for the room handle. We subscribe to both
+    // signaling kinds in one REQ:
+    //   - SIGNALING_EVENT_KIND (stored): presence announces. The
+    //     `since` window replays the last few minutes so a late
+    //     joiner discovers everyone already here.
+    //   - SIGNALING_EPHEMERAL_KIND (not stored): live offer/answer/
+    //     candidate. The relay has nothing to replay for these, so
+    //     `since` is a no-op for them — they only ever arrive live.
+    // The window therefore governs presence replay only; connection
+    // negotiation is never replayed, which is the whole point of the
+    // ephemeral kind (see `event::SIGNALING_EPHEMERAL_KIND`).
     let sub_id = "mom-sig-1";
     let req = serde_json::json!([
         "REQ",
         sub_id,
         {
-            "kinds": [SIGNALING_EVENT_KIND],
+            "kinds": [SIGNALING_EVENT_KIND, SIGNALING_EPHEMERAL_KIND],
             "#r": [shared.room_handle.clone()],
-            "since": now_secs().saturating_sub(300),
+            "since": now_secs().saturating_sub(PRESENCE_REPLAY_WINDOW_SECS),
         }
     ]);
     let req_text = req.to_string();
@@ -480,14 +492,39 @@ fn handle_inbound_frame(
                 }
             }
 
+            // Enforce the presence/negotiation kind split on receive.
+            // This is the receive-side half of the replay fix: a
+            // stored-kind event can be replayed from history, so we
+            // only ever honour an Announce there; an offer/answer/
+            // candidate must arrive live on the ephemeral kind. A
+            // directed message on the stored kind is stale history
+            // (a pre-split build, or a relay that wrongly persisted
+            // an ephemeral event) and is dropped rather than applied
+            // as a remote description against dead ICE credentials.
             match envelope.msg {
                 SignalingMessage::Announce { peer_id } => {
+                    if event.kind != SIGNALING_EVENT_KIND {
+                        trace!(
+                            relay = %short(url),
+                            kind = event.kind,
+                            "ignoring announce on non-presence kind"
+                        );
+                        return Ok(());
+                    }
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
                     let _ = inbound_tx.send(NostrInbound::PeerAnnounced { device_id: peer_id });
                 }
                 other => {
+                    if event.kind != SIGNALING_EPHEMERAL_KIND {
+                        trace!(
+                            relay = %short(url),
+                            kind = event.kind,
+                            "dropping replayed/stored-kind negotiation message"
+                        );
+                        return Ok(());
+                    }
                     let _ = inbound_tx.send(NostrInbound::Message {
                         from: envelope.from,
                         msg: other,
@@ -546,23 +583,32 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let envelope = match outbound {
-            NostrOutbound::Announce => SignalingEnvelope {
-                from: shared.device_id.clone(),
-                to: None,
-                msg: SignalingMessage::Announce {
-                    peer_id: shared.device_id.clone(),
+        // Presence rides the stored kind; directed negotiation rides
+        // the ephemeral kind so it's never replayed onto a future
+        // session. The kind is chosen by message class, not content.
+        let (envelope, kind) = match outbound {
+            NostrOutbound::Announce => (
+                SignalingEnvelope {
+                    from: shared.device_id.clone(),
+                    to: None,
+                    msg: SignalingMessage::Announce {
+                        peer_id: shared.device_id.clone(),
+                    },
                 },
-            },
-            NostrOutbound::DirectedToPeer { to, msg } => SignalingEnvelope {
-                from: shared.device_id.clone(),
-                to: Some(to),
-                msg,
-            },
+                SIGNALING_EVENT_KIND,
+            ),
+            NostrOutbound::DirectedToPeer { to, msg } => (
+                SignalingEnvelope {
+                    from: shared.device_id.clone(),
+                    to: Some(to),
+                    msg,
+                },
+                SIGNALING_EPHEMERAL_KIND,
+            ),
         };
         let event = Arc::new(make_event(
             &shared.identity,
-            SIGNALING_EVENT_KIND,
+            kind,
             vec![vec!["r".into(), shared.room_handle.clone()]],
             serde_json::to_string(&envelope).expect("serialize ok"),
             now_secs(),
@@ -733,5 +779,107 @@ mod tests {
         }
         let seen = shared.seen_event_ids.lock();
         assert_eq!(seen.len(), SEEN_EVENT_CAPACITY);
+    }
+
+    /// Build a directed Offer frame from `peer` to `to`, signed by
+    /// `signer`, on the given Nostr `kind`. Used to exercise the
+    /// presence/negotiation kind guard from both sides.
+    fn offer_frame_for(peer: &str, to: &str, signer: &NostrIdentity, kind: u16) -> String {
+        let envelope = SignalingEnvelope {
+            from: peer.into(),
+            to: Some(to.into()),
+            msg: SignalingMessage::Offer {
+                peer_id: peer.into(),
+                offer_id: "off-1".into(),
+                sdp: "v=0\r\n".into(),
+            },
+        };
+        let content = serde_json::to_string(&envelope).unwrap();
+        let event = crate::nostr::event::make_event(
+            signer,
+            kind,
+            vec![vec!["r".into(), "test-room".into()]],
+            content,
+            1_700_000_000,
+        );
+        serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
+    }
+
+    /// A live offer on the ephemeral kind is delivered to the engine.
+    #[test]
+    fn offer_on_ephemeral_kind_is_delivered() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let frame = offer_frame_for(
+            &peer_pub,
+            "self-device",
+            &peer_signer,
+            SIGNALING_EPHEMERAL_KIND,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+
+        match rx.try_recv().expect("offer delivered") {
+            NostrInbound::Message { from, msg } => {
+                assert_eq!(from, peer_pub);
+                assert!(matches!(msg, SignalingMessage::Offer { .. }));
+            }
+            other => panic!("expected Message(Offer), got {other:?}"),
+        }
+    }
+
+    /// The replay-poisoning fix: an offer that arrives on the STORED
+    /// presence kind is replayed history (or a pre-split build), not a
+    /// live negotiation. It must be dropped so it can never bind a
+    /// fresh PeerConnection to dead ICE credentials.
+    #[test]
+    fn offer_on_stored_kind_is_dropped() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let frame = offer_frame_for(&peer_pub, "self-device", &peer_signer, SIGNALING_EVENT_KIND);
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a directed offer on the stored kind must be dropped, not applied"
+        );
+    }
+
+    /// Mirror guard: presence is only honoured on the stored kind, so
+    /// an Announce wrongly published on the ephemeral kind is ignored.
+    #[test]
+    fn announce_on_ephemeral_kind_is_dropped() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let envelope = SignalingEnvelope {
+            from: peer_pub.clone(),
+            to: None,
+            msg: SignalingMessage::Announce {
+                peer_id: peer_pub.clone(),
+            },
+        };
+        let ev = crate::nostr::event::make_event(
+            &peer_signer,
+            SIGNALING_EPHEMERAL_KIND,
+            vec![vec!["r".into(), "test-room".into()]],
+            serde_json::to_string(&envelope).unwrap(),
+            1_700_000_000,
+        );
+        let frame =
+            serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&ev).unwrap()]).to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an announce on the ephemeral kind must be dropped"
+        );
     }
 }

@@ -139,6 +139,40 @@
 //! 12× (5s → 60s steady) — and that 12× compounds with the relay
 //! deduplication of item 6, giving a roughly 60× reduction in
 //! observed Activity-log spam vs. the pre-fix behavior.
+//!
+//! # 8. Presence is stored; connection negotiation is ephemeral
+//!
+//! **Problem:** Moving all signaling to a stored Nostr kind (1077,
+//! item 7) fixed discovery — a late joiner gets every peer's last
+//! announce on REQ replay — but it dragged offer / answer / candidate
+//! onto the same stored-and-replayed channel. SDP carries
+//! session-specific ICE credentials (ufrag/pwd) bound to one live
+//! `RTCPeerConnection`. On any fresh subscribe the relay replays the
+//! whole `since` window, so a *previous session's* offer/answer is
+//! delivered again, the engine applies it as the remote description,
+//! and the new PeerConnection is bound to dead credentials. ICE checks
+//! never match; the peer reaches `Sighted` and never advances until
+//! the stale event ages out of the window (minutes later). Item 6's
+//! event-ID dedup doesn't help — a prior session's event has a
+//! legitimately distinct id. This is the "they see each other a lot
+//! but never actually connect" field symptom, and it is why adding a
+//! TURN relay couldn't help: the relay candidates were just as stale.
+//!
+//! **Our fix:** Split the wire by message class.
+//! [`super::nostr::event::SIGNALING_EVENT_KIND`] (stored) carries
+//! presence only; offer / answer / candidate go on
+//! [`super::nostr::event::SIGNALING_EPHEMERAL_KIND`] in the NIP-01
+//! ephemeral range, which relays forward live but never persist.
+//! Negotiation can no longer be replayed onto a future session, so a
+//! reconnect is always driven by a *live* offer (the engine's reactive
+//! announce reflection still triggers it within ~1s). The receive
+//! path enforces the split: an Announce is honoured only on the stored
+//! kind, an offer/answer/candidate only on the ephemeral kind — so any
+//! stale directed message replayed from history (or from a pre-split
+//! build) is dropped at the driver boundary instead of poisoning a
+//! handshake. Presence persists; the connection is always live.
+//!
+//! Constant: [`PRESENCE_REPLAY_WINDOW_SECS`].
 
 /// Inbound-message staleness threshold for zombie clearing — see
 /// item 3. Picked at ~5× Trystero's 5.333s announce cadence, well
@@ -206,3 +240,14 @@ pub const ANNOUNCE_BACKOFF_MS: &[u64] = &[30_000];
 /// [`ANNOUNCE_BACKOFF_MS`] for why discovery doesn't need a
 /// tighter cadence anymore.
 pub const ANNOUNCE_STEADY_MS: u64 = 300_000;
+
+/// How far back the room subscription's `since` reaches when (re)
+/// opening a REQ — see item 8. Replays the last few minutes of
+/// **presence** so a late joiner discovers everyone already here.
+/// It governs presence only: connection negotiation rides the
+/// ephemeral kind ([`super::nostr::event::SIGNALING_EPHEMERAL_KIND`])
+/// which relays never store, so there's nothing to replay for it.
+/// Matched to [`ANNOUNCE_STEADY_MS`] (300s) so the window is exactly
+/// one steady heartbeat — every present peer has re-announced at
+/// least once inside it.
+pub const PRESENCE_REPLAY_WINDOW_SECS: u64 = 300;
