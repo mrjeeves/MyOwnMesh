@@ -163,16 +163,24 @@ impl IceCheckSnapshot {
             return "no connectivity checks sent yet — agent is still priming the checklist";
         }
         match (resp == 0, inbound == 0) {
-            (true, true) => "checks are leaving but NOTHING comes back and the peer's checks \
+            (true, true) => {
+                "checks are leaving but NOTHING comes back and the peer's checks \
                              never reach us — UDP to this peer is being dropped in both \
                              directions (local firewall, VPN, or macOS Local Network permission \
-                             not granted to this binary)",
-            (true, false) => "the peer's checks reach us but ours get no response — one-way \
-                              block: our outbound UDP isn't reaching the peer",
-            (false, true) => "we get responses to our checks but see none of the peer's inbound \
-                              checks — one-way block on the peer's side",
-            (false, false) => "checks are flowing both ways but no pair is nominated yet — \
-                               keep watching; if it never nominates the path is marginal",
+                             not granted to this binary)"
+            }
+            (true, false) => {
+                "the peer's checks reach us but ours get no response — one-way \
+                              block: our outbound UDP isn't reaching the peer"
+            }
+            (false, true) => {
+                "we get responses to our checks but see none of the peer's inbound \
+                              checks — one-way block on the peer's side"
+            }
+            (false, false) => {
+                "checks are flowing both ways but no pair is nominated yet — \
+                               keep watching; if it never nominates the path is marginal"
+            }
         }
     }
 }
@@ -245,7 +253,11 @@ mod tests {
             remote_candidates: vec![],
             pairs: vec![],
         };
-        assert!(snap.diagnosis().contains("never reached us"), "got: {}", snap.diagnosis());
+        assert!(
+            snap.diagnosis().contains("never reached us"),
+            "got: {}",
+            snap.diagnosis()
+        );
     }
 
     #[test]
@@ -256,7 +268,11 @@ mod tests {
             pairs: vec![pair("succeeded", 3, 3, 2)],
         };
         assert_eq!(snap.succeeded_pairs(), 1);
-        assert!(snap.diagnosis().contains("connectivity exists"), "got: {}", snap.diagnosis());
+        assert!(
+            snap.diagnosis().contains("connectivity exists"),
+            "got: {}",
+            snap.diagnosis()
+        );
     }
 
     #[test]
@@ -268,7 +284,11 @@ mod tests {
             remote_candidates: vec!["host udp4 192.168.1.51:55001".into()],
             pairs: vec![pair("in-progress", 5, 0, 3)],
         };
-        assert!(snap.diagnosis().contains("one-way"), "got: {}", snap.diagnosis());
+        assert!(
+            snap.diagnosis().contains("one-way"),
+            "got: {}",
+            snap.diagnosis()
+        );
     }
 
     #[test]

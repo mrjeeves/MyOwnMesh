@@ -576,7 +576,10 @@ impl PeerSession {
         pairs.sort_by(|a, b| {
             (b.state == "succeeded")
                 .cmp(&(a.state == "succeeded"))
-                .then((b.requests_sent + b.responses_received).cmp(&(a.requests_sent + a.responses_received)))
+                .then(
+                    (b.requests_sent + b.responses_received)
+                        .cmp(&(a.requests_sent + a.responses_received)),
+                )
         });
         local_candidates.sort();
         remote_candidates.sort();

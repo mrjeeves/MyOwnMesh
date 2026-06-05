@@ -1038,7 +1038,10 @@ pub(crate) async fn log_ice_check_snapshot(
             snap.succeeded_pairs(),
             snap.diagnosis(),
         );
-        msg.push_str(&format!("\n  local : {}", render_candidate_list(&snap.local_candidates)));
+        msg.push_str(&format!(
+            "\n  local : {}",
+            render_candidate_list(&snap.local_candidates)
+        ));
         msg.push_str(&format!(
             "\n  remote: {}",
             render_candidate_list(&snap.remote_candidates)
