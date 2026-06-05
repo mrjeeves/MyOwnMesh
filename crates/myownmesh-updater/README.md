@@ -24,6 +24,25 @@ Package-manager installs (Homebrew / apt / rpm / MSI / choco) are
 detected on first launch and self-update is skipped — the OS
 package manager stays the source of truth.
 
+Only the `myownmesh` daemon binary is self-updated. The GUI
+(`myownmesh-gui`) ships its own bundle; it auto-spawns whichever
+daemon is on PATH, which this keeps current.
+
+## CLI
+
+The daemon stages updates in the background; drive it by hand with:
+
+```
+myownmesh update check          # force a check now and stage if permitted
+myownmesh update apply           # apply a staged update (effective next start)
+myownmesh update status          # version, channel, policy, last check, staged
+myownmesh update enable          # turn background checks on
+myownmesh update disable         # turn background checks off
+```
+
+`check` and `status` take `--json`. `MYOWNMESH_AUTOUPDATE=0` hard-
+disables self-update regardless of config.
+
 ## Configurable release URL
 
 Build-time env defaults:
