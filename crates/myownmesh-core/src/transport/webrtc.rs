@@ -304,6 +304,43 @@ fn install_data_channel_handlers(
     }
 }
 
+/// Render an ICE candidate as a compact `kind net addr:port` string
+/// for the connectivity-check snapshot — e.g. `host udp4
+/// 192.168.1.50:54321`. Keeps the log line readable while still
+/// showing the exact address so the user can spot a wrong subnet, a
+/// link-local IPv6 that won't route, or a srflx that resolved to an
+/// unexpected public IP.
+fn fmt_candidate(
+    t: webrtc::ice::candidate::CandidateType,
+    net: webrtc::ice::network_type::NetworkType,
+    ip: &str,
+    port: u16,
+) -> String {
+    use webrtc::ice::candidate::CandidateType;
+    let kind = match t {
+        CandidateType::Host => "host",
+        CandidateType::ServerReflexive => "srflx",
+        CandidateType::PeerReflexive => "prflx",
+        CandidateType::Relay => "relay",
+        CandidateType::Unspecified => "?",
+    };
+    format!("{kind} {net} {ip}:{port}")
+}
+
+/// Lower-case wire name for a candidate-pair check state, matching the
+/// strings [`super::diag::IceCheckSnapshot`] compares against.
+fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
+    use webrtc::ice::candidate::CandidatePairState as S;
+    match s {
+        S::Waiting => "waiting",
+        S::InProgress => "in-progress",
+        S::Failed => "failed",
+        S::Succeeded => "succeeded",
+        S::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
 /// One peer's WebRTC session — peer connection, application data
 /// channel, and transport-level event sink.
 pub struct PeerSession {
@@ -476,6 +513,78 @@ impl PeerSession {
             _ => None,
         })?;
         Some(super::diag::SelectedCandidatePair { local, remote })
+    }
+
+    /// Capture a full connectivity-check snapshot from the ICE agent's
+    /// stats. Where [`Self::selected_candidate_pair`] only reports the
+    /// *winning* pair once ICE is Connected, this returns **every**
+    /// candidate pair and its live STUN check counters at any point in
+    /// the lifecycle — the data you need to answer "why is this peer
+    /// stuck in Checking / why did it go Failed". The engine logs it on
+    /// ICE failure and periodically while a peer is still checking.
+    pub async fn ice_check_snapshot(&self) -> super::diag::IceCheckSnapshot {
+        use std::collections::HashMap;
+        use webrtc::stats::StatsReportType;
+
+        let report = self.pc.get_stats().await;
+
+        // First pass: build candidate-id → "kind net addr:port" so the
+        // pairs below can render real addresses instead of opaque ids,
+        // and collect the flat local/remote candidate lists.
+        let mut by_id: HashMap<String, String> = HashMap::new();
+        let mut local_candidates = Vec::new();
+        let mut remote_candidates = Vec::new();
+        for r in report.reports.values() {
+            match r {
+                StatsReportType::LocalCandidate(c) => {
+                    let s = fmt_candidate(c.candidate_type, c.network_type, &c.ip, c.port);
+                    by_id.insert(c.id.clone(), s.clone());
+                    local_candidates.push(s);
+                }
+                StatsReportType::RemoteCandidate(c) => {
+                    let s = fmt_candidate(c.candidate_type, c.network_type, &c.ip, c.port);
+                    by_id.insert(c.id.clone(), s.clone());
+                    remote_candidates.push(s);
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: the candidate pairs and their check counters.
+        let mut pairs = Vec::new();
+        for r in report.reports.values() {
+            if let StatsReportType::CandidatePair(p) = r {
+                let resolve = |id: &str| by_id.get(id).cloned().unwrap_or_else(|| id.to_string());
+                pairs.push(super::diag::IcePairSnapshot {
+                    local: resolve(&p.local_candidate_id),
+                    remote: resolve(&p.remote_candidate_id),
+                    state: pair_state_str(p.state),
+                    nominated: p.nominated,
+                    requests_sent: p.requests_sent,
+                    responses_received: p.responses_received,
+                    requests_received: p.requests_received,
+                    responses_sent: p.responses_sent,
+                    bytes_sent: p.bytes_sent,
+                    bytes_received: p.bytes_received,
+                });
+            }
+        }
+
+        // Stable ordering so successive snapshots diff cleanly in the
+        // log: succeeded pairs first, then by descending check
+        // activity (the pairs actually doing something float up).
+        pairs.sort_by(|a, b| {
+            (b.state == "succeeded")
+                .cmp(&(a.state == "succeeded"))
+                .then((b.requests_sent + b.responses_received).cmp(&(a.requests_sent + a.responses_received)))
+        });
+        local_candidates.sort();
+        remote_candidates.sort();
+        super::diag::IceCheckSnapshot {
+            local_candidates,
+            remote_candidates,
+            pairs,
+        }
     }
 
     /// Close the connection. Idempotent — subsequent close calls

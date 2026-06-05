@@ -88,6 +88,32 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     for peer_id in need_pair {
         super::record_selected_pair(state, &peer_id).await;
     }
+
+    // Live ICE-establishment progress. For any peer still in
+    // `Checking`, emit a one-line snapshot of the connectivity-check
+    // counters each poll so the user can watch — in real time — whether
+    // our STUN checks are getting responses. A stuck `resp←0` while
+    // `sent→` climbs is the unambiguous fingerprint of UDP being
+    // dropped (firewall / VPN / macOS Local Network permission), which
+    // no amount of staring at "ICE → Checking" would reveal. Self-
+    // limiting: a peer only sits in Checking for the ~30 s before ICE
+    // gives up, so this quiets down on its own once it connects or
+    // fails.
+    let checking: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|e| {
+            let session = e.value().session.lock().clone()?;
+            if session.ice_connection_state() == RTCIceConnectionState::Checking {
+                Some(e.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for peer_id in checking {
+        super::log_ice_check_snapshot(state, &peer_id, "checking", false).await;
+    }
 }
 
 /// Tier 3 — `pc.restart_ice()` then wait the recovery grace.
