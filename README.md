@@ -218,7 +218,8 @@ myownmesh serve            # run the daemon in the foreground (headless)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
-myownmesh update check     # poll the release feed
+myownmesh update status    # version, channel, policy, staged update
+myownmesh update check     # check the feed now and stage if permitted
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
 ```
 
