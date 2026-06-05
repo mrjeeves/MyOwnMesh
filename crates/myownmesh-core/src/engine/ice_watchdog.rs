@@ -16,7 +16,9 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
-use super::scheduler::{ICE_DISCONNECTED_RESTART_MS, ICE_RESTART_RECOVERY_MS};
+use super::scheduler::{
+    ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, ICE_RESTART_RECOVERY_MS,
+};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -114,6 +116,55 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     for peer_id in checking {
         super::log_ice_check_snapshot(state, &peer_id, "checking", false).await;
     }
+
+    // Checking-timeout watchdog. A peer that's sat in `Checking` past
+    // ICE_CHECKING_TIMEOUT_MS isn't going to connect on this attempt;
+    // webrtc-rs would otherwise wait its ~30 s internal timer before
+    // flipping to Failed. Tear it down and re-seed discovery so a
+    // usable path — e.g. the instant the laptop rejoins a network the
+    // peer is actually on — is retried in seconds rather than half a
+    // minute. The natural ~15 s cycle plus the shared announce
+    // rate-limit keeps this from churning the relays.
+    let stuck: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|e| {
+            let since = e.value().state.read().ice_checking_since?;
+            (now.saturating_duration_since(since).as_millis() as u64 >= ICE_CHECKING_TIMEOUT_MS)
+                .then(|| e.key().clone())
+        })
+        .collect();
+    for peer_id in stuck {
+        on_checking_timeout(state, &peer_id).await;
+    }
+}
+
+/// A peer sat in ICE `Checking` past the timeout without connecting.
+/// Surface *why* (full check snapshot), then drop it and re-seed
+/// discovery so a fresh PeerConnection is built rather than waiting out
+/// webrtc-rs's ~30 s internal ICE-failure timer. The re-announce is
+/// rate-limited via the shared reactive-announce guard so a wave of
+/// timeouts can't flood the relays.
+async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    state.log_diag_with(
+        DiagLevel::Warn,
+        "ice",
+        format!(
+            "ICE stuck in checking > {}s for {} — rebuilding",
+            ICE_CHECKING_TIMEOUT_MS / 1000,
+            super::short_peer(device_id),
+        ),
+        serde_json::json!({ "peer": device_id, "checking_timeout_ms": ICE_CHECKING_TIMEOUT_MS }),
+    );
+    // The full snapshot (candidates + per-pair STUN counters + a
+    // plain-language diagnosis) is the record of why this attempt
+    // never completed — log it before the teardown removes the agent.
+    super::log_ice_check_snapshot(state, device_id, "stuck in checking", true).await;
+    super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
+    // Nudge discovery so we don't wait for the peer's next scheduled
+    // announce; rate-limited, so several simultaneous timeouts collapse
+    // into a single publish.
+    super::maybe_reactive_announce(state);
 }
 
 /// Tier 3 — `pc.restart_ice()` then wait the recovery grace.

@@ -339,23 +339,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // each existing peer sits on its announce schedule.
             // Rate-limited globally so N peers all reacting to a
             // join don't produce N^2 publishes.
-            let should_reflect = {
-                let mut guard = state.last_reactive_announce_at.lock();
-                let now = std::time::Instant::now();
-                let due = guard
-                    .map(|prev| {
-                        now.duration_since(prev)
-                            >= std::time::Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
-                    })
-                    .unwrap_or(true);
-                if due {
-                    *guard = Some(now);
-                }
-                due
-            };
-            if should_reflect {
-                let _ = state.signaling_tx.send(SignalingOutbound::Announce);
-            }
+            maybe_reactive_announce(state);
             // If we already have a session for this peer that's
             // stuck at Sighted (PC created but data channel never
             // opened) and we're the Offerer, re-poke the other
@@ -571,6 +555,31 @@ pub(crate) fn short_peer(id: &str) -> String {
         return id.to_string();
     }
     format!("{}…{}", &id[..6], &id[id.len() - 4..])
+}
+
+/// Emit a presence announce, but only if we haven't already emitted one
+/// within `REACTIVE_ANNOUNCE_MIN_INTERVAL_MS`. Every reactive announce
+/// — reflecting a peer's announce, re-seeding discovery after a
+/// checking-timeout rebuild, kicking discovery on a network change —
+/// goes through here so a burst of triggers (a REQ-replay wave, a
+/// network handoff dropping several peers at once) can never fan out
+/// into a storm of relay publishes. Returns whether the announce was
+/// actually emitted. The driver's own steady-state announcer is
+/// independent of this and unaffected.
+pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
+    let mut guard = state.last_reactive_announce_at.lock();
+    let now = Instant::now();
+    let due = guard
+        .map(|prev| {
+            now.duration_since(prev) >= Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
+        })
+        .unwrap_or(true);
+    if due {
+        *guard = Some(now);
+        drop(guard);
+        let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+    }
+    due
 }
 
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
@@ -890,6 +899,7 @@ async fn handle_ice_state_change(
         match ice {
             RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                 data.ice_disconnected_since = None;
+                data.ice_checking_since = None;
                 if matches!(
                     data.tier,
                     ConnectionTier::IceWatchdog { .. } | ConnectionTier::IceRestart { .. }
@@ -898,7 +908,17 @@ async fn handle_ice_state_change(
                 }
                 false
             }
+            RTCIceConnectionState::Checking => {
+                // Arm the checking-timeout watchdog for this attempt.
+                // Refresh on every entry into Checking (initial connect
+                // and post-restart re-gather both pass through here).
+                data.ice_checking_since = Some(Instant::now());
+                false
+            }
             RTCIceConnectionState::Disconnected => {
+                // A drop from an established link — owned by the
+                // disconnected watchdog, not the checking timeout.
+                data.ice_checking_since = None;
                 if data.ice_disconnected_since.is_none() {
                     data.ice_disconnected_since = Some(Instant::now());
                     data.tier = ConnectionTier::IceWatchdog {
@@ -907,7 +927,10 @@ async fn handle_ice_state_change(
                 }
                 false
             }
-            RTCIceConnectionState::Failed => true,
+            RTCIceConnectionState::Failed => {
+                data.ice_checking_since = None;
+                true
+            }
             _ => false,
         }
     };

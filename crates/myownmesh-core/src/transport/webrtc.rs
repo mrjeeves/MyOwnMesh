@@ -304,6 +304,27 @@ fn install_data_channel_handlers(
     }
 }
 
+/// True if `ip` is a private / local-scope address — RFC1918 v4
+/// (`10/8`, `172.16/12`, `192.168/16`), v4 link-local (`169.254/16`),
+/// v6 unique-local (`fc00::/7`), or v6 link-local (`fe80::/10`).
+/// Carrier-grade NAT space (`100.64/10`) is deliberately excluded: it's
+/// reachable only via the carrier, not a LAN. Used to classify a
+/// connected ICE pair as a direct local link from its endpoint address
+/// rather than trusting the ICE candidate type alone — a peer-reflexive
+/// candidate on a `192.168.x.x` address is still the LAN.
+fn is_private_lan_ip(ip: &str) -> bool {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_private() || v4.is_link_local(),
+        Ok(IpAddr::V6(v6)) => {
+            let seg = v6.segments();
+            // fc00::/7 (unique-local) or fe80::/10 (link-local).
+            (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
 /// Render an ICE candidate as a compact `kind net addr:port` string
 /// for the connectivity-check snapshot — e.g. `host udp4
 /// 192.168.1.50:54321`. Keeps the log line readable while still
@@ -495,21 +516,39 @@ impl PeerSession {
                     .map(|p| (p.local_candidate_id.clone(), p.remote_candidate_id.clone()))?,
             }
         };
-        fn map(t: CandidateType) -> super::diag::IceCandidateKind {
+        // Classify from the candidate's actual address first, falling
+        // back to the ICE type. A *working* pair whose endpoint is a
+        // private/RFC1918 address is, by definition, a direct
+        // local-network link: those ranges aren't routable across the
+        // internet, so if packets are flowing the two devices share a
+        // LAN. We report it as `Host` even when ICE labelled the
+        // candidate `prflx` (peer-reflexive) — which happens routinely
+        // when the remote's host candidate arrived a beat before its
+        // SDP and was learned from a STUN binding rather than the
+        // candidate list, the exact reason a genuinely-local peer was
+        // mis-painted as "STUN / over the internet". `Relay` always
+        // wins (a TURN relay is a relay even on a private address).
+        fn classify(t: CandidateType, ip: &str) -> super::diag::IceCandidateKind {
+            use super::diag::IceCandidateKind;
             match t {
-                CandidateType::Host => super::diag::IceCandidateKind::Host,
-                CandidateType::ServerReflexive => super::diag::IceCandidateKind::ServerReflexive,
-                CandidateType::PeerReflexive => super::diag::IceCandidateKind::PeerReflexive,
-                CandidateType::Relay => super::diag::IceCandidateKind::Relay,
-                CandidateType::Unspecified => super::diag::IceCandidateKind::Unknown,
+                CandidateType::Relay => IceCandidateKind::Relay,
+                _ if is_private_lan_ip(ip) => IceCandidateKind::Host,
+                CandidateType::Host => IceCandidateKind::Host,
+                CandidateType::ServerReflexive => IceCandidateKind::ServerReflexive,
+                CandidateType::PeerReflexive => IceCandidateKind::PeerReflexive,
+                CandidateType::Unspecified => IceCandidateKind::Unknown,
             }
         }
         let local = report.reports.values().find_map(|r| match r {
-            StatsReportType::LocalCandidate(c) if c.id == local_id => Some(map(c.candidate_type)),
+            StatsReportType::LocalCandidate(c) if c.id == local_id => {
+                Some(classify(c.candidate_type, &c.ip))
+            }
             _ => None,
         })?;
         let remote = report.reports.values().find_map(|r| match r {
-            StatsReportType::RemoteCandidate(c) if c.id == remote_id => Some(map(c.candidate_type)),
+            StatsReportType::RemoteCandidate(c) if c.id == remote_id => {
+                Some(classify(c.candidate_type, &c.ip))
+            }
             _ => None,
         })?;
         Some(super::diag::SelectedCandidatePair { local, remote })
@@ -608,6 +647,22 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_lan_ips_recognised_public_ones_not() {
+        // RFC1918 + link-local → LAN.
+        assert!(is_private_lan_ip("192.168.1.50"));
+        assert!(is_private_lan_ip("10.0.0.3"));
+        assert!(is_private_lan_ip("172.16.4.9"));
+        assert!(is_private_lan_ip("169.254.10.20"));
+        assert!(is_private_lan_ip("fe80::1"));
+        assert!(is_private_lan_ip("fd12:3456::1"));
+        // Public, CGNAT, and junk → not LAN.
+        assert!(!is_private_lan_ip("1.2.3.4"));
+        assert!(!is_private_lan_ip("100.64.0.1")); // carrier-grade NAT, not a LAN
+        assert!(!is_private_lan_ip("2606:4700::1111"));
+        assert!(!is_private_lan_ip("not-an-ip"));
+    }
 
     #[tokio::test]
     async fn loopback_handshake_opens_data_channel() {
