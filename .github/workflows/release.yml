@@ -165,6 +165,36 @@ jobs:
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
           fi
 
+      # Package the portable GUI binary the same way, so the curl|sh
+      # installer can drop `myownmesh-gui` next to `myownmesh` on PATH
+      # and a bare `myownmesh` finds it via sibling lookup. The OS
+      # bundles (.deb/.dmg/.msi/...) uploaded above are still the
+      # "proper install"; this is the lightweight half for the CLI
+      # installer. Remove the raw binary afterwards so it isn't caught
+      # by the upload glob below — only the archives + .sha256 ship.
+      - name: Package portable GUI binary
+        shell: bash
+        run: |
+          set -e
+          BIN=gui/src-tauri/target/${{ matrix.platform.target }}/release/myownmesh-gui
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          if [[ ! -f "$BIN" ]]; then
+            echo "GUI binary not found at $BIN"; exit 1
+          fi
+          mkdir -p dist-bin
+          NAME="myownmesh-gui-${{ matrix.platform.name }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$BIN" "dist-bin/myownmesh-gui.exe"
+            (cd dist-bin && 7z a "${NAME}.zip" myownmesh-gui.exe)
+            (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            rm -f dist-bin/myownmesh-gui.exe
+          else
+            cp "$BIN" "dist-bin/myownmesh-gui"
+            tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh-gui
+            (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            rm -f dist-bin/myownmesh-gui
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}

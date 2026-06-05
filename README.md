@@ -29,9 +29,10 @@ myownmesh-updater        # self-update with configurable release feed
 
 ## Install
 
-One command — detects platform, fetches the binary from
+One command — detects platform, fetches the binaries from
 [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases),
-verifies SHA-256, drops `myownmesh` on your PATH.
+verifies SHA-256, drops `myownmesh` **and** the `myownmesh-gui`
+desktop app on your PATH (so a bare `myownmesh` opens the GUI).
 
 ```sh
 # macOS / Linux
@@ -46,9 +47,14 @@ irm https://raw.githubusercontent.com/mrjeeves/MyOwnMesh/main/scripts/install.ps
 The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
 writable) on Unix and `%LOCALAPPDATA%\Programs\MyOwnMesh` on
 Windows, and adds the directory to PATH if it isn't already there.
-Pass `--serve` (Unix) or `-Serve` (Windows) to launch the daemon
-once the install finishes. `myownmesh update` self-applies later
-releases against the same artifacts.
+The desktop GUI goes in by default — it's small and very handy;
+pass `--no-gui` (Unix) or `-NoGui` (Windows) for a daemon-only
+install on a headless box. The GUI binary relies on the system
+webview (libwebkit2gtk / WebView2 / WKWebView); for full OS
+integration (menu entry, icon) grab the `.deb` / `.AppImage` /
+`.dmg` / `.msi` bundle from Releases instead. Pass `--serve` (Unix)
+or `-Serve` (Windows) to launch the daemon once the install
+finishes.
 
 Prefer a tarball directly? The portable binaries
 (`myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
@@ -75,7 +81,9 @@ just serve                                    # MYOWNMESH_LOG=debug cargo run -p
 
 ### 2. Run the desktop GUI
 
-Pre-built installers (`.deb` / `.AppImage` / `.dmg` / `.msi` /
+The [one-command install](#install) above already includes the GUI
+binary, so a bare `myownmesh` opens it. For full OS integration,
+pre-built installers (`.deb` / `.AppImage` / `.dmg` / `.msi` /
 `.exe`) ship in the same [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
 as the daemon. The GUI auto-spawns the daemon as a child process,
 so installing only the GUI bundle gets you both.
