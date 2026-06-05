@@ -1,9 +1,12 @@
 //! MyOwnMesh daemon + CLI entry point.
 //!
 //! Persona selection happens on the first argv inspection: with no
-//! arguments (or `serve`), we start the daemon. Any other subcommand
-//! is `ctl …`-style and addresses the running daemon via the
-//! control socket.
+//! arguments we launch the desktop GUI (`myownmesh-gui`), matching
+//! MyOwnLLM where a bare invocation opens the app. `serve` runs the
+//! daemon in the foreground — the explicit headless entry point, and
+//! what the GUI auto-spawns as its own child. Any other subcommand is
+//! `ctl …`-style and addresses the running daemon via the control
+//! socket.
 
 use std::process::ExitCode;
 
@@ -24,7 +27,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon in the foreground. Default when no subcommand is provided.
+    /// Run the mesh daemon in the foreground (headless). The desktop
+    /// GUI auto-spawns this; run it yourself on servers and headless
+    /// boxes. A bare `myownmesh` (no subcommand) opens the GUI instead.
     Serve,
     /// Show this device's identity.
     Identity {
@@ -92,7 +97,15 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    let cmd = cli.command.unwrap_or(Command::Serve);
+    // Bare `myownmesh` (no subcommand) opens the desktop GUI, mirroring
+    // MyOwnLLM where a bare invocation launches the app and subcommands
+    // stay headless. The GUI launch is a synchronous process hand-off,
+    // so we take it before building the tokio runtime the daemon and
+    // ctl paths need. `myownmesh serve` remains the explicit daemon
+    // entry point (and the GUI's own auto-spawn target).
+    let Some(cmd) = cli.command else {
+        return cli::gui::launch();
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
