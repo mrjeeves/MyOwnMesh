@@ -1322,6 +1322,7 @@ dependencies = [
  "dashmap",
  "interprocess",
  "myownmesh-core",
+ "myownmesh-services",
  "myownmesh-signaling",
  "myownmesh-updater",
  "parking_lot",

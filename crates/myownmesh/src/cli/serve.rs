@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::control;
 use crate::registry::NetworkRegistry;
+use crate::services::ServiceManager;
 
 pub async fn run() -> Result<()> {
     let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
@@ -53,19 +54,42 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Infrastructure services (relay / signaling / STUN / TURN). The
+    // manager reconciles the running set against config.services; an
+    // all-off config (the default) starts nothing. Service start
+    // failures are logged inside `apply`, not fatal.
+    let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
+    let report = service_manager.apply(cfg.services.clone()).await;
+    info!(
+        relay = report.relay.enabled,
+        signaling = report.signaling.running,
+        stun = report.stun.running,
+        turn = report.turn.running,
+        "services applied from config"
+    );
+
     // Updater tick. Spawned even when disabled in config — the
     // task just exits early.
     let _updater = tokio::spawn(myownmesh_updater::tick_forever());
 
-    // Control socket. Holds clones of the mesh handle + the registry
-    // so ctl commands can address the daemon's state.
+    // Control socket. Holds clones of the mesh handle + the registry +
+    // the service manager so ctl commands can address the daemon's state.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let ctl_mesh = mesh.clone();
     let ctl_registry = registry.clone();
+    let ctl_services = service_manager.clone();
     let ctl_shutdown = shutdown_tx.subscribe();
     let ctl_socket = cfg.daemon.control_socket.clone();
     let _ctl_handle = tokio::spawn(async move {
-        if let Err(e) = control::serve(ctl_mesh, ctl_registry, ctl_socket, ctl_shutdown).await {
+        if let Err(e) = control::serve(
+            ctl_mesh,
+            ctl_registry,
+            ctl_services,
+            ctl_socket,
+            ctl_shutdown,
+        )
+        .await
+        {
             warn!("control socket exited with error: {e:#}");
         }
     });
@@ -75,6 +99,8 @@ pub async fn run() -> Result<()> {
     info!("shutdown requested");
 
     let _ = shutdown_tx.send(());
+    // Stop hosted services before tearing down networks.
+    service_manager.shutdown().await;
     // Drain the registry — `take_all` returns owned `JoinedNetwork`s
     // for those that aren't still held by an in-flight control
     // request. Anything still pinned by a control client will tear

@@ -295,23 +295,15 @@ pub struct ServicesConfig {
 /// other can still exchange messages. Forwarding is roster-gated: a
 /// frame is only relayed when both the sender and the destination are
 /// approved peers of this device.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct RelayServiceConfig {
+    /// Off by default — hosting a relay is opt-in.
     pub enabled: bool,
     /// Ceiling on how many distinct destinations a single inbound frame
-    /// may fan out to in broadcast mode. 0 = unlimited. A guard against
-    /// one chatty peer turning the relay into an amplifier.
+    /// may fan out to in broadcast mode. 0 (the default) = unlimited. A
+    /// guard against one chatty peer turning the relay into an amplifier.
     pub max_fanout: u32,
-}
-
-impl Default for RelayServiceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_fanout: 0,
-        }
-    }
 }
 
 /// Self-hosted signaling server: a minimal Nostr-compatible relay
