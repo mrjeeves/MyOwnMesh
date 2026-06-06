@@ -4,12 +4,13 @@
 //! is set-it-and-forget-it: a background ticker periodically checks the
 //! configured release feed and, per the user's `auto_apply` policy:
 //!
-//!   1. Downloads the platform asset (`myownmesh-<platform>.{tar.gz,zip}`),
-//!      SHA-256-verifies it against the sidecar (or `SHA256SUMS`).
-//!   2. Extracts the embedded `myownmesh` binary into
-//!      `~/.myownmesh/updates/<version>/`.
+//!   1. Downloads the platform asset(s) — `myownmesh-<platform>.{tar.gz,zip}`
+//!      and, when a GUI is installed beside the daemon, the matching
+//!      `myownmesh-gui-<platform>` archive — SHA-256-verifying each
+//!      against its sidecar (or `SHA256SUMS`).
+//!   2. Extracts the embedded binaries into `~/.myownmesh/updates/<version>/`.
 //!   3. Writes `~/.myownmesh/updates/pending.json` so the next process
-//!      start applies it.
+//!      start applies them.
 //!
 //! On the next start, [`apply_pending_if_any`] atomically renames the
 //! staged binary over the running one and clears the marker. We never
@@ -21,9 +22,19 @@
 //! are detected and skipped — the OS package manager owns versioning
 //! there.
 //!
-//! Only the `myownmesh` daemon binary is self-updated here. The GUI
-//! (`myownmesh-gui`) ships its own bundle / portable binary; it
-//! auto-spawns whichever daemon is on PATH, which this keeps current.
+//! Both halves of a portable install are kept in lockstep: the
+//! `myownmesh` daemon binary *and*, when one is installed beside it, the
+//! `myownmesh-gui` desktop binary. Every release publishes a
+//! `myownmesh-gui-<platform>` archive next to the daemon's, so when we
+//! stage an update we stage both and the next launch swaps both — the
+//! GUI no longer drifts to an older version than the daemon it spawns. A
+//! headless box with no GUI installed just updates the daemon; a macOS
+//! `.app` / Linux `.deb` desktop bundle is owned by its own installer
+//! and is left alone (same rule as package-manager installs).
+//!
+//! An explicit `myownmesh update` (see [`update_now`]) does the whole
+//! thing in one shot — check, download, verify, apply both binaries —
+//! mirroring MyOwnLLM's single `myownllm update` command.
 
 pub mod policy;
 
@@ -143,6 +154,21 @@ pub enum CheckOutcome {
     Staged { version: String },
 }
 
+/// Result of an explicit `myownmesh update` (see [`update_now`]). Unlike
+/// [`CheckOutcome`] this reflects an *applied* update — the binaries on
+/// disk have already been swapped; the running processes pick the new
+/// code up on restart.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum UpdateNowOutcome {
+    /// Package-manager install — deferred to the system updater.
+    PackageManager,
+    /// Already on the latest published version; nothing to do.
+    UpToDate { current: String, latest: String },
+    /// Updated. `components` lists what was swapped (`daemon`, `gui`).
+    Updated { to: String, components: Vec<String> },
+}
+
 fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -176,41 +202,122 @@ fn apply_pending() -> Result<Option<String>> {
         return Ok(None);
     }
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
-    let staged_path = doc["path"]
-        .as_str()
-        .ok_or_else(|| Error::msg("pending.json missing path"))?;
     let target_version = doc["version"].as_str().unwrap_or("?").to_string();
 
-    // Refuse downgrades / same-version applies. A stale pending.json left
-    // by a previous broken self-update could otherwise replace a freshly
-    // installed binary with an older one.
-    let current = current_version();
-    if compare_semver(&target_version, current) != std::cmp::Ordering::Greater {
+    let artifacts = parse_pending_artifacts(&doc);
+    if artifacts.is_empty() {
         let _ = std::fs::remove_file(&pending);
+        return Err(Error::msg(
+            "pending.json lists no artifacts — clearing marker",
+        ));
+    }
+
+    // Daemon first (the required half), then the GUI (best-effort). Each
+    // half carries its own downgrade guard (see `artifact_needs_apply`) so
+    // a stale marker can't roll a binary back, and so a GUI that lags an
+    // already-current daemon still catches up. A GUI that can't swap —
+    // it's open on Windows, or was uninstalled since staging — logs and is
+    // skipped rather than wedging boot or blocking the daemon update.
+    let mut order: Vec<&StagedArtifact> = artifacts.iter().collect();
+    order.sort_by_key(|a| if a.kind == ArtifactKind::Daemon { 0 } else { 1 });
+
+    let mut applied: Vec<&'static str> = Vec::new();
+    for art in order {
+        if !artifact_needs_apply(art.kind, &target_version) {
+            continue;
+        }
+        match apply_one(art) {
+            Ok(true) => {
+                applied.push(art.kind.as_str());
+                // Stamp the GUI version so a current daemon can later tell
+                // the GUI is up to date (the GUI binary has no readable
+                // version of its own from here).
+                if art.kind == ArtifactKind::Gui {
+                    record_gui_version(&target_version);
+                }
+            }
+            Ok(false) => {} // nothing installed to replace (e.g. no GUI here)
+            Err(e) => {
+                if art.kind == ArtifactKind::Daemon {
+                    // Leave the marker in place so the next launch retries
+                    // rather than silently dropping the update.
+                    return Err(e);
+                }
+                tracing::warn!("self-update: {} apply skipped: {e}", art.kind.as_str());
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&pending);
+    if applied.is_empty() {
         return Ok(None);
     }
+    tracing::info!(
+        "self-update applied {target_version} ({})",
+        applied.join("+")
+    );
+    Ok(Some(target_version))
+}
 
-    let staged = PathBuf::from(staged_path);
-    if !staged.exists() {
-        let _ = std::fs::remove_file(&pending);
+/// Per-artifact downgrade guard: only swap a binary when `target_version`
+/// is strictly newer than what's installed. The daemon compares against
+/// its own running version; the GUI against the version stamp the updater
+/// last wrote (absent stamp ⇒ unknown ⇒ allow, so a GUI installed out of
+/// band by the shell installer gets synced on the first update). This is
+/// what lets `myownmesh update` repair a GUI that's a version behind an
+/// already-current daemon — the exact "daemon updated, GUI didn't" drift.
+fn artifact_needs_apply(kind: ArtifactKind, target_version: &str) -> bool {
+    match kind {
+        ArtifactKind::Daemon => version_is_newer(target_version, Some(current_version())),
+        ArtifactKind::Gui => version_is_newer(target_version, installed_gui_version().as_deref()),
+    }
+}
+
+/// True when `target` is strictly newer than `installed`, treating an
+/// unknown (`None`) installed version as "needs update" so an out-of-band
+/// install gets synced once.
+fn version_is_newer(target: &str, installed: Option<&str>) -> bool {
+    match installed {
+        Some(v) => compare_semver(target, v) == std::cmp::Ordering::Greater,
+        None => true,
+    }
+}
+
+/// Swap one staged artifact over its installed counterpart. `Ok(true)`
+/// when a swap happened, `Ok(false)` when there was nothing to replace
+/// (e.g. a staged GUI but no GUI installed on this host).
+fn apply_one(art: &StagedArtifact) -> Result<bool> {
+    if !art.staged.exists() {
         return Err(Error::msg(format!(
-            "staged binary {} missing — clearing marker",
-            staged.display()
+            "staged {} binary {} missing",
+            art.kind.as_str(),
+            art.staged.display()
         )));
     }
-
     // Tolerate a legacy marker that points at the archive itself: extract
     // on the fly so we never rename a .tar.gz over the live binary.
-    let staged_dir = staged
+    let staged_dir = art
+        .staged
         .parent()
         .ok_or_else(|| Error::msg("staged path has no parent"))?;
-    let staged = extract_binary_if_archived(&staged, staged_dir)?;
+    let staged = extract_binary_if_archived(&art.staged, staged_dir, art.kind.bin_name())?;
 
-    let current_exe = std::env::current_exe()?;
-    atomic_replace(&staged, &current_exe)?;
-    let _ = std::fs::remove_file(&pending);
-    tracing::info!("self-update applied {target_version}");
-    Ok(Some(target_version))
+    let target = match resolve_apply_target(art.kind)? {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    atomic_replace(&staged, &target)?;
+    Ok(true)
+}
+
+/// Installed path a staged artifact replaces: the running executable for
+/// the daemon, the located GUI binary for the GUI (or `None` when no GUI
+/// is installed on this host).
+fn resolve_apply_target(kind: ArtifactKind) -> Result<Option<PathBuf>> {
+    match kind {
+        ArtifactKind::Daemon => Ok(Some(std::env::current_exe()?)),
+        ArtifactKind::Gui => Ok(find_installed_gui_binary()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +361,63 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
         });
     }
 
-    stage_release(&release, &latest).await?;
+    // Stage the daemon (it's behind — we're past the up-to-date check) and
+    // the GUI beside it when that's behind too, so both land in lockstep.
+    let mut want = vec![ArtifactKind::Daemon];
+    if gui_needs_update(&latest) {
+        want.push(ArtifactKind::Gui);
+    }
+    stage_release(&release, &latest, &want).await?;
     Ok(CheckOutcome::Staged { version: latest })
+}
+
+/// Explicit, user-driven "update everything now" — the surface behind a
+/// bare `myownmesh update`, mirroring MyOwnLLM's `myownllm update`.
+///
+/// Unlike the background ticker this ignores the `auto_apply` policy and
+/// the check interval (the user asked for it, so consent is implied) and
+/// runs even when background checks are disabled in config — but it still
+/// defers to the OS package manager, which owns versioning for those
+/// installs. Brings every installed half up to the latest release: the
+/// daemon if it's behind, and the GUI beside it if its version stamp is
+/// behind or unknown (the "daemon updated, GUI didn't" drift). Applies to
+/// disk immediately and reports what changed; the running processes keep
+/// their old code until restarted.
+pub async fn update_now() -> Result<UpdateNowOutcome> {
+    if detect_install_kind() == InstallKind::PackageManager {
+        mark_pm_detected();
+        return Ok(UpdateNowOutcome::PackageManager);
+    }
+
+    let au = load_auto_update().unwrap_or_default();
+    let release = fetch_release(&au).await?;
+    let latest = release["tag_name"]
+        .as_str()
+        .map(|s| s.trim_start_matches('v').to_string())
+        .ok_or_else(|| Error::msg("release missing tag_name"))?;
+    let current = current_version().to_string();
+
+    let mut want = Vec::new();
+    if compare_semver(&current, &latest) == std::cmp::Ordering::Less {
+        want.push(ArtifactKind::Daemon);
+    }
+    if gui_needs_update(&latest) {
+        want.push(ArtifactKind::Gui);
+    }
+
+    if want.is_empty() {
+        return Ok(UpdateNowOutcome::UpToDate { current, latest });
+    }
+
+    stamp_check_now()?;
+    let kinds = stage_release(&release, &latest, &want).await?;
+    // Apply right now rather than waiting for the next launch.
+    apply_now()?;
+
+    Ok(UpdateNowOutcome::Updated {
+        to: latest,
+        components: kinds.iter().map(|k| k.as_str().to_string()).collect(),
+    })
 }
 
 /// Current updater status (no network access).
@@ -433,6 +595,62 @@ async fn fetch_release(au: &AutoUpdateConfig) -> Result<Value> {
 // Asset matching.
 // ---------------------------------------------------------------------------
 
+/// Platform-specific name of the GUI executable.
+fn gui_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "myownmesh-gui.exe"
+    } else {
+        "myownmesh-gui"
+    }
+}
+
+/// Locate an installed `myownmesh-gui` binary so the updater can keep it
+/// in lockstep with the daemon. This is the *inverse* of the daemon's own
+/// `find_gui_binary` (in `crates/myownmesh/src/cli/gui.rs`) and looks in
+/// the same places, minus the dev-artefact fallback — we never swap a
+/// `cargo`/`tauri dev` build output from under a contributor:
+///
+///   1. `MYOWNMESH_GUI_BIN` (explicit override).
+///   2. Beside the running daemon — the portable install drops
+///      `myownmesh` and `myownmesh-gui` side by side, so the sibling
+///      path is the common case.
+///   3. `myownmesh-gui` on `$PATH`.
+///
+/// Returns `None` when no portable GUI is installed (headless box) or
+/// when the GUI lives inside an OS bundle the updater shouldn't touch
+/// (a macOS `.app`, a Linux `.deb`) — neither is a daemon sibling nor on
+/// `$PATH`, so the daemon updates alone and the bundle's own installer
+/// owns the GUI.
+fn find_installed_gui_binary() -> Option<PathBuf> {
+    let exe = gui_exe_name();
+
+    if let Some(p) = std::env::var_os("MYOWNMESH_GUI_BIN") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(candidate) = current.parent().map(|dir| dir.join(exe)) {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(exe);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
 /// Platform substring the release assets embed
 /// (`myownmesh-<this>.{tar.gz,zip}`).
 fn current_platform() -> &'static str {
@@ -488,6 +706,31 @@ fn pick_daemon_asset(assets: &[Value]) -> Option<&Value> {
         a["name"].as_str().is_some_and(|n| {
             n.starts_with("myownmesh-")
                 && !n.starts_with("myownmesh-gui-")
+                && n.contains(platform)
+                && !is_sidecar_asset(n)
+                && (n.ends_with(".tar.gz") || n.ends_with(".tgz") || n.ends_with(".zip"))
+        })
+    })
+}
+
+/// Pick the **GUI** asset (`myownmesh-gui-<platform>...`) for the current
+/// platform — the counterpart to [`pick_daemon_asset`]. Matches the exact
+/// published name first, then a guarded substring scan, skipping sidecars
+/// (`.sha256`, signatures). Returns `None` when the release predates the
+/// portable GUI binary (older tags shipped the daemon only); callers
+/// treat a missing GUI asset as "update the daemon, skip the GUI".
+fn pick_gui_asset(assets: &[Value]) -> Option<&Value> {
+    let platform = current_platform();
+    let exact = format!("myownmesh-gui-{platform}.{}", archive_ext());
+    if let Some(a) = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(exact.as_str()))
+    {
+        return Some(a);
+    }
+    assets.iter().find(|a| {
+        a["name"].as_str().is_some_and(|n| {
+            n.starts_with("myownmesh-gui-")
                 && n.contains(platform)
                 && !is_sidecar_asset(n)
                 && (n.ends_with(".tar.gz") || n.ends_with(".tgz") || n.ends_with(".zip"))
@@ -556,40 +799,163 @@ fn basename(path: &str) -> &str {
 // Download, verify, extract, stage.
 // ---------------------------------------------------------------------------
 
-async fn stage_release(release: &Value, version: &str) -> Result<()> {
-    let staged_binary = download_verify_extract(release, version).await?;
-    write_pending_marker(&staged_binary, version)?;
-    tracing::info!(
-        "self-update staged {version} at {} (apply on next launch)",
-        staged_binary.display()
-    );
-    Ok(())
+/// Which executable a staged artifact replaces. A release bumps the
+/// daemon and the GUI together, so an update stages one of each (when a
+/// GUI is installed) and the next launch applies both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactKind {
+    Daemon,
+    Gui,
 }
 
-/// Download the platform asset, SHA-256-verify it, and extract the
-/// embedded `myownmesh` binary. Returns the path of the verified
-/// executable. Does NOT write `pending.json`.
-async fn download_verify_extract(release: &Value, version: &str) -> Result<PathBuf> {
+impl ArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ArtifactKind::Daemon => "daemon",
+            ArtifactKind::Gui => "gui",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "daemon" => Some(ArtifactKind::Daemon),
+            "gui" => Some(ArtifactKind::Gui),
+            _ => None,
+        }
+    }
+
+    /// Name of the executable embedded in this kind's release archive.
+    fn bin_name(self) -> &'static str {
+        match self {
+            ArtifactKind::Daemon => {
+                if cfg!(windows) {
+                    "myownmesh.exe"
+                } else {
+                    "myownmesh"
+                }
+            }
+            ArtifactKind::Gui => gui_exe_name(),
+        }
+    }
+}
+
+/// A verified binary extracted into the staging dir, waiting to be
+/// swapped over its installed counterpart on the next launch.
+#[derive(Debug, Clone)]
+struct StagedArtifact {
+    kind: ArtifactKind,
+    staged: PathBuf,
+}
+
+/// Download, verify, and extract the `want`ed artifacts of a release,
+/// then record them in `pending.json` for apply-on-next-launch. The
+/// daemon (when wanted) is required — no asset for this platform is a hard
+/// error. The GUI is best-effort: a missing GUI asset (older release) or a
+/// transient download error logs and continues so a GUI hiccup never
+/// blocks the security-relevant daemon update. Returns the kinds actually
+/// staged. Does NOT apply — that happens on the next launch (or
+/// immediately via [`apply_now`] for an explicit `update`).
+async fn stage_release(
+    release: &Value,
+    version: &str,
+    want: &[ArtifactKind],
+) -> Result<Vec<ArtifactKind>> {
     let assets = release["assets"]
         .as_array()
         .ok_or_else(|| Error::msg("release missing assets"))?;
-    let asset = pick_daemon_asset(assets).ok_or_else(|| {
-        Error::msg(format!(
-            "no release asset matches this platform ({})",
-            current_platform()
-        ))
-    })?;
-    let dl_url = asset["browser_download_url"]
-        .as_str()
-        .ok_or_else(|| Error::msg("asset missing browser_download_url"))?;
-    let asset_name = asset["name"].as_str().unwrap_or("myownmesh").to_string();
 
     let updates_dir = myownmesh_core::dirs::updates_dir()?.join(version);
     std::fs::create_dir_all(&updates_dir)?;
+    let client = http_client(Duration::from_secs(300))?;
+
+    let mut staged: Vec<StagedArtifact> = Vec::new();
+
+    if want.contains(&ArtifactKind::Daemon) {
+        let daemon_asset = pick_daemon_asset(assets).ok_or_else(|| {
+            Error::msg(format!(
+                "no daemon release asset matches this platform ({})",
+                current_platform()
+            ))
+        })?;
+        let daemon_bin = download_verify_stage(
+            &client,
+            assets,
+            &updates_dir,
+            daemon_asset,
+            ArtifactKind::Daemon,
+        )
+        .await?;
+        staged.push(StagedArtifact {
+            kind: ArtifactKind::Daemon,
+            staged: daemon_bin,
+        });
+    }
+
+    if want.contains(&ArtifactKind::Gui) {
+        match pick_gui_asset(assets) {
+            Some(gui_asset) => {
+                match download_verify_stage(
+                    &client,
+                    assets,
+                    &updates_dir,
+                    gui_asset,
+                    ArtifactKind::Gui,
+                )
+                .await
+                {
+                    Ok(gui_bin) => staged.push(StagedArtifact {
+                        kind: ArtifactKind::Gui,
+                        staged: gui_bin,
+                    }),
+                    Err(e) => tracing::warn!("GUI update staging failed ({e}); skipping the GUI"),
+                }
+            }
+            None => tracing::warn!(
+                "release has no GUI asset for {}; skipping the GUI",
+                current_platform()
+            ),
+        }
+    }
+
+    if staged.is_empty() {
+        return Err(Error::msg("nothing to stage"));
+    }
+
+    write_pending_marker(version, &staged)?;
+    let kinds: Vec<ArtifactKind> = staged.iter().map(|a| a.kind).collect();
+    tracing::info!(
+        "self-update staged {version} ({}) under {} (apply on next launch)",
+        kinds
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join("+"),
+        updates_dir.display()
+    );
+    Ok(kinds)
+}
+
+/// Download one release asset, SHA-256-verify it against its sidecar (or
+/// `SHA256SUMS`), and extract the embedded `kind` binary. Returns the
+/// path of the verified executable. Does NOT write `pending.json`.
+async fn download_verify_stage(
+    client: &reqwest::Client,
+    assets: &[Value],
+    updates_dir: &Path,
+    asset: &Value,
+    kind: ArtifactKind,
+) -> Result<PathBuf> {
+    let dl_url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| Error::msg("asset missing browser_download_url"))?;
+    let asset_name = asset["name"]
+        .as_str()
+        .unwrap_or(kind.bin_name())
+        .to_string();
+
     let archive_path = updates_dir.join(&asset_name);
     let part_path = updates_dir.join(format!("{asset_name}.part"));
 
-    let client = http_client(Duration::from_secs(300))?;
     let bytes = client
         .get(dl_url)
         .send()
@@ -628,7 +994,7 @@ async fn download_verify_extract(release: &Value, version: &str) -> Result<PathB
     }
 
     std::fs::rename(&part_path, &archive_path)?;
-    let binary = extract_binary_if_archived(&archive_path, &updates_dir)?;
+    let binary = extract_binary_if_archived(&archive_path, updates_dir, kind.bin_name())?;
 
     #[cfg(unix)]
     {
@@ -641,45 +1007,93 @@ async fn download_verify_extract(release: &Value, version: &str) -> Result<PathB
     Ok(binary)
 }
 
-fn write_pending_marker(staged: &Path, version: &str) -> Result<()> {
+/// Build the `pending.json` document for a set of staged artifacts. The
+/// `artifacts` array is the current format; we also keep a top-level
+/// `path` pointing at the daemon binary so an older `myownmesh` that only
+/// understands the single-binary marker still applies the daemon half.
+fn pending_doc(version: &str, artifacts: &[StagedArtifact]) -> Value {
+    let arts: Vec<Value> = artifacts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "kind": a.kind.as_str(),
+                "path": a.staged.to_string_lossy(),
+            })
+        })
+        .collect();
+    let mut doc = serde_json::json!({
+        "version": version,
+        "artifacts": arts,
+        "staged_at": iso_now(),
+    });
+    if let Some(daemon) = artifacts.iter().find(|a| a.kind == ArtifactKind::Daemon) {
+        doc["path"] = Value::String(daemon.staged.to_string_lossy().into_owned());
+    }
+    doc
+}
+
+/// Parse the staged-artifact list out of a `pending.json` document.
+/// Prefers the `artifacts` array; falls back to a legacy single-binary
+/// marker (`{ version, path }`), which is always the daemon.
+fn parse_pending_artifacts(doc: &Value) -> Vec<StagedArtifact> {
+    if let Some(arr) = doc.get("artifacts").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for a in arr {
+            let kind = a
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(ArtifactKind::parse);
+            let path = a.get("path").and_then(Value::as_str);
+            if let (Some(kind), Some(path)) = (kind, path) {
+                out.push(StagedArtifact {
+                    kind,
+                    staged: PathBuf::from(path),
+                });
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Some(path) = doc.get("path").and_then(Value::as_str) {
+        return vec![StagedArtifact {
+            kind: ArtifactKind::Daemon,
+            staged: PathBuf::from(path),
+        }];
+    }
+    Vec::new()
+}
+
+fn write_pending_marker(version: &str, artifacts: &[StagedArtifact]) -> Result<()> {
     let pending_path = myownmesh_core::dirs::updates_dir()?.join("pending.json");
     if let Some(parent) = pending_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let doc = serde_json::json!({
-        "version": version,
-        "path": staged.to_string_lossy(),
-        "staged_at": iso_now(),
-    });
+    let doc = pending_doc(version, artifacts);
     std::fs::write(&pending_path, serde_json::to_string_pretty(&doc)?)?;
     Ok(())
 }
 
 /// If `archive` is a tar.gz / tgz / zip, extract via the system `tar`
-/// and return the path to the embedded `myownmesh` (or `myownmesh.exe`).
-/// If it's already a raw binary, return it unchanged.
+/// and return the path to the embedded `bin_name` (e.g. `myownmesh` or
+/// `myownmesh-gui`). If it's already a raw binary, return it unchanged.
 ///
 /// Uses the system `tar`, which is libarchive-backed on every target we
 /// ship for (macOS, Linux, Windows 10 1803+) and auto-detects gzipped
 /// tarballs and zips via `tar -xf`.
-fn extract_binary_if_archived(archive: &Path, dest_dir: &Path) -> Result<PathBuf> {
+fn extract_binary_if_archived(archive: &Path, dest_dir: &Path, bin_name: &str) -> Result<PathBuf> {
     let name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("");
     // Never treat a sidecar as the binary — a stale marker could point at
     // one, and atomic_replace would clobber the live binary with it.
     if is_sidecar_asset(name) {
         return Err(Error::msg(format!(
-            "refusing to install sidecar `{name}` as the myownmesh binary"
+            "refusing to install sidecar `{name}` as the {bin_name} binary"
         )));
     }
     let is_archive = name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".zip");
     if !is_archive {
         return Ok(archive.to_path_buf());
     }
-
-    #[cfg(windows)]
-    let bin_name = "myownmesh.exe";
-    #[cfg(not(windows))]
-    let bin_name = "myownmesh";
 
     let bin_path = dest_dir.join(bin_name);
     // Wipe any stale extract so the file in place is from THIS archive.
@@ -792,14 +1206,24 @@ fn old_binary_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Delete the `<exe>.old` left by a previous Windows side-swap. Cheap,
-/// idempotent, runs at startup.
+/// Delete the `<exe>.old` files left by a previous Windows side-swap —
+/// both the daemon's own and, if a portable GUI is installed beside us,
+/// the GUI's (a daemon can side-swap the GUI binary while the GUI is
+/// running). Cheap, idempotent, runs at startup.
 fn cleanup_old_replaced_binary() {
     #[cfg(windows)]
-    if let Ok(exe) = std::env::current_exe() {
-        let old = old_binary_path(&exe);
-        if old.exists() {
-            let _ = std::fs::remove_file(&old);
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            let old = old_binary_path(&exe);
+            if old.exists() {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        if let Some(gui) = find_installed_gui_binary() {
+            let old = old_binary_path(&gui);
+            if old.exists() {
+                let _ = std::fs::remove_file(&old);
+            }
         }
     }
 }
@@ -846,6 +1270,52 @@ fn staged_version() -> Option<String> {
     doc.get("version")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// GUI version stamp.
+//
+// The GUI binary exposes no version we can read from here (running it just
+// opens a window), so the updater records the version it last installed
+// for the GUI in `~/.myownmesh/updates/gui.version`. That lets an
+// already-current daemon notice the GUI lagging behind it and resync — the
+// "daemon updated, GUI didn't" drift this whole change is about.
+// ---------------------------------------------------------------------------
+
+fn gui_version_marker_path() -> Result<PathBuf> {
+    Ok(myownmesh_core::dirs::updates_dir()?.join("gui.version"))
+}
+
+/// Version the updater last installed for the GUI, or `None` when it has
+/// never installed one (a fresh shell-installer GUI has no stamp yet).
+fn installed_gui_version() -> Option<String> {
+    let s = std::fs::read_to_string(gui_version_marker_path().ok()?).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+fn record_gui_version(version: &str) {
+    if let Ok(path) = gui_version_marker_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, format!("{version}\n"));
+    }
+}
+
+/// Whether the GUI beside the daemon should be brought to `latest`. False
+/// when no GUI is installed here; otherwise compares `latest` against the
+/// recorded stamp (absent ⇒ unknown ⇒ true, so a GUI installed out of band
+/// is synced on the first update).
+fn gui_needs_update(latest: &str) -> bool {
+    if find_installed_gui_binary().is_none() {
+        return false;
+    }
+    version_is_newer(latest, installed_gui_version().as_deref())
 }
 
 fn unix_secs() -> i64 {
@@ -901,6 +1371,90 @@ mod tests {
         ];
         let picked = pick_daemon_asset(&a).expect("daemon archive should match");
         assert_eq!(picked["name"].as_str(), Some(daemon.as_str()));
+    }
+
+    #[test]
+    fn picks_gui_archive_not_daemon_or_sidecar() {
+        // The GUI matcher must grab `myownmesh-gui-<platform>` and not the
+        // daemon archive (whose name is a prefix) nor the GUI's own
+        // `.sha256` sidecar, which both carry the platform substring.
+        let platform = current_platform();
+        let ext = archive_ext();
+        let daemon = format!("myownmesh-{platform}.{ext}");
+        let gui = format!("myownmesh-gui-{platform}.{ext}");
+        let a = [
+            json!({"name": format!("{gui}.sha256"), "browser_download_url": "https://x/sha"}),
+            json!({"name": daemon, "browser_download_url": "https://x/daemon"}),
+            json!({"name": gui, "browser_download_url": "https://x/gui"}),
+        ];
+        let picked = pick_gui_asset(&a).expect("gui archive should match");
+        assert_eq!(picked["name"].as_str(), Some(gui.as_str()));
+        // And the daemon matcher must never grab the GUI archive.
+        assert_eq!(
+            pick_daemon_asset(&a).and_then(|d| d["name"].as_str()),
+            Some(daemon.as_str())
+        );
+    }
+
+    #[test]
+    fn missing_gui_asset_returns_none() {
+        let platform = current_platform();
+        let ext = archive_ext();
+        let a = [json!({"name": format!("myownmesh-{platform}.{ext}")})];
+        assert!(pick_gui_asset(&a).is_none());
+    }
+
+    #[test]
+    fn pending_doc_roundtrips_daemon_and_gui() {
+        let arts = vec![
+            StagedArtifact {
+                kind: ArtifactKind::Daemon,
+                staged: PathBuf::from("/u/0.1.7/myownmesh"),
+            },
+            StagedArtifact {
+                kind: ArtifactKind::Gui,
+                staged: PathBuf::from("/u/0.1.7/myownmesh-gui"),
+            },
+        ];
+        let doc = pending_doc("0.1.7", &arts);
+        assert_eq!(doc["version"].as_str(), Some("0.1.7"));
+        // Back-compat: top-level `path` is the daemon binary, so an older
+        // single-binary applier still swaps the daemon.
+        assert_eq!(doc["path"].as_str(), Some("/u/0.1.7/myownmesh"));
+
+        let parsed = parse_pending_artifacts(&doc);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].kind, ArtifactKind::Daemon);
+        assert_eq!(parsed[1].kind, ArtifactKind::Gui);
+        assert_eq!(parsed[1].staged, PathBuf::from("/u/0.1.7/myownmesh-gui"));
+    }
+
+    #[test]
+    fn pending_legacy_single_path_is_daemon() {
+        // A marker written by an older updater: just { version, path }.
+        let doc = json!({ "version": "0.1.6", "path": "/u/0.1.6/myownmesh" });
+        let parsed = parse_pending_artifacts(&doc);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, ArtifactKind::Daemon);
+        assert_eq!(parsed[0].staged, PathBuf::from("/u/0.1.6/myownmesh"));
+    }
+
+    #[test]
+    fn version_gate_allows_newer_and_unknown_only() {
+        // Newer applies; equal/older never downgrades.
+        assert!(version_is_newer("0.1.7", Some("0.1.5")));
+        assert!(!version_is_newer("0.1.5", Some("0.1.5")));
+        assert!(!version_is_newer("0.1.4", Some("0.1.5")));
+        // Unknown installed version (no GUI stamp yet) ⇒ sync once. This is
+        // what repairs a GUI left a version behind an already-current
+        // daemon — the drift `myownmesh update` has to fix.
+        assert!(version_is_newer("0.1.7", None));
+        // The daemon arm runs through the same gate against its own version.
+        assert!(artifact_needs_apply(ArtifactKind::Daemon, "999.0.0"));
+        assert!(!artifact_needs_apply(
+            ArtifactKind::Daemon,
+            current_version()
+        ));
     }
 
     #[test]

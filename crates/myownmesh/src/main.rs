@@ -41,10 +41,12 @@ enum Command {
         #[command(subcommand)]
         action: cli::ctl::CtlCmd,
     },
-    /// Self-update operations.
+    /// Update MyOwnMesh. A bare `myownmesh update` fetches the latest
+    /// release and updates the daemon and the desktop GUI together (like
+    /// `myownllm update`); the subcommands drive the pieces by hand.
     Update {
         #[command(subcommand)]
-        action: cli::update::UpdateCmd,
+        action: Option<cli::update::UpdateCmd>,
     },
     /// Open the config file in $EDITOR.
     Config {

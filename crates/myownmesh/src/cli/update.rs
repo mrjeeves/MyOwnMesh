@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use myownmesh_updater::{CheckOutcome, UpdateStatus};
+use myownmesh_updater::{CheckOutcome, UpdateNowOutcome, UpdateStatus};
 
 #[derive(Subcommand, Debug)]
 pub enum UpdateCmd {
@@ -33,7 +33,14 @@ pub enum UpdateCmd {
     Disable,
 }
 
-pub async fn run(cmd: UpdateCmd) -> Result<()> {
+pub async fn run(cmd: Option<UpdateCmd>) -> Result<()> {
+    // Bare `myownmesh update` — fetch the latest release and update
+    // everything (daemon + GUI) in one shot, like `myownllm update`.
+    let Some(cmd) = cmd else {
+        let outcome = myownmesh_updater::update_now().await?;
+        render_update_now(&outcome);
+        return Ok(());
+    };
     match cmd {
         UpdateCmd::Check { json } => {
             let outcome = myownmesh_updater::check_now(true).await?;
@@ -68,6 +75,28 @@ pub async fn run(cmd: UpdateCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn render_update_now(outcome: &UpdateNowOutcome) {
+    match outcome {
+        UpdateNowOutcome::PackageManager => {
+            println!(
+                "Installed via a package manager; use it to update \
+                 (Homebrew / apt / rpm / MSI / Chocolatey)."
+            );
+        }
+        UpdateNowOutcome::UpToDate { current, latest } => {
+            if current == latest {
+                println!("Already on the latest version ({current}).");
+            } else {
+                println!("Already up to date — on {current} (latest published: {latest}).");
+            }
+        }
+        UpdateNowOutcome::Updated { to, components } => {
+            println!("Updated to {to} ({}).", components.join(" + "));
+            println!("Restart MyOwnMesh to run the new version.");
+        }
+    }
 }
 
 fn render_outcome(outcome: &CheckOutcome) {
