@@ -70,6 +70,13 @@ pub struct PeerStateData {
     pub last_ping_t: Option<i64>,
     pub rtt_ms: Option<u32>,
     pub ice_disconnected_since: Option<Instant>,
+    /// When ICE entered `Checking` for the current attempt. Set on the
+    /// transition into Checking, cleared the moment it reaches
+    /// Connected (or goes Disconnected/Failed/Closed). The
+    /// checking-timeout watchdog reads this to rebuild a peer that's
+    /// been stuck mid-negotiation too long instead of waiting out
+    /// webrtc-rs's ~30 s internal timer.
+    pub ice_checking_since: Option<Instant>,
     pub handshake_started_at: Option<Instant>,
     pub hello_attempt: u32,
     pub rehandshake_attempt: u32,
@@ -130,6 +137,7 @@ impl Default for PeerStateData {
             last_ping_t: None,
             rtt_ms: None,
             ice_disconnected_since: None,
+            ice_checking_since: None,
             handshake_started_at: None,
             hello_attempt: 0,
             rehandshake_attempt: 0,

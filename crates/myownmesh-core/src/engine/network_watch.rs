@@ -35,6 +35,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
@@ -42,6 +43,7 @@ use tracing::{debug, info};
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
 use super::ice_watchdog;
+use super::scheduler::NETWORK_CHANGE_RESTART_COOLDOWN_MS;
 use super::state::NetworkState;
 
 /// Snapshot of the OS's chosen primary outbound IPs. Compared by
@@ -85,6 +87,11 @@ async fn primary_v6() -> Option<Ipv6Addr> {
 /// so we don't need a Mutex — single owner.
 pub struct NetworkWatch {
     last: NetworkSnapshot,
+    /// When we last fired a change-triggered ICE-restart fan-out. Used
+    /// to coalesce the burst of primary-IP flips a Wi-Fi→cellular
+    /// handoff produces into a single restart (see
+    /// `NETWORK_CHANGE_RESTART_COOLDOWN_MS`).
+    last_restart_at: Option<Instant>,
 }
 
 impl NetworkWatch {
@@ -96,17 +103,40 @@ impl NetworkWatch {
     pub async fn new() -> Self {
         Self {
             last: NetworkSnapshot::sample().await,
+            last_restart_at: None,
         }
     }
 
-    /// Sample, compare, and fire the change handler if the
-    /// primary outbound IPs moved.
+    /// Sample, compare, and fire the change handler if the primary
+    /// outbound IPs moved — but at most once per
+    /// `NETWORK_CHANGE_RESTART_COOLDOWN_MS`. We always adopt the new
+    /// snapshot so further moves are still detected; we just don't pile
+    /// a second restart onto the first one's in-flight gather while the
+    /// network is still settling. Leading-edge: the first change in a
+    /// burst fires immediately (responsive), the rest coalesce.
     pub async fn poll(&mut self, state: &Arc<NetworkState>) {
         let current = NetworkSnapshot::sample().await;
         if current == self.last {
             return;
         }
         let prev = std::mem::replace(&mut self.last, current.clone());
+        let now = Instant::now();
+        let in_cooldown = self
+            .last_restart_at
+            .map(|t| {
+                now.duration_since(t) < Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS)
+            })
+            .unwrap_or(false);
+        if in_cooldown {
+            debug!(
+                network = %state.network_id,
+                prev_v4 = ?prev.v4, next_v4 = ?current.v4,
+                prev_v6 = ?prev.v6, next_v6 = ?current.v6,
+                "network changed again within restart cooldown — coalescing"
+            );
+            return;
+        }
+        self.last_restart_at = Some(now);
         on_network_change(state, &prev, &current).await;
     }
 }
@@ -138,6 +168,13 @@ async fn on_network_change(
     }));
 
     ice_watchdog::force_ice_restart_all(state).await;
+    // Re-seed discovery as well: peers we lost while off-network (or
+    // that were torn down by the checking-timeout watchdog) rediscover
+    // on the next announce round-trip instead of waiting for their own
+    // schedule — so rejoining a network the peer is on reconnects in
+    // about a second. Rate-limited through the shared guard so this
+    // can't add relay load on top of the restart fan-out.
+    super::maybe_reactive_announce(state);
     debug!(network = %state.network_id, "ICE restart fan-out complete");
 }
 

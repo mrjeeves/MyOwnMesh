@@ -53,6 +53,27 @@ pub const ICE_RESTART_RECOVERY_MS: u64 = 4_000;
 /// Periodic ICE state poll cadence.
 pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 
+/// A peer stuck in ICE `Checking` this long without reaching
+/// `Connected` is treated as a failed attempt and rebuilt, rather than
+/// waiting out webrtc-rs's internal ~30 s ICE-failure timer (the
+/// "connection loss is slow to report, and everything after is slow"
+/// symptom). Sized comfortably above a slow gather — cellular STUN
+/// during a Wi-Fi→hotspot handoff has been seen to take ~8 s just to
+/// finish gathering — so we never tear down a link that's still
+/// legitimately forming, while still cutting the dead-path detection
+/// time roughly in half.
+pub const ICE_CHECKING_TIMEOUT_MS: u64 = 15_000;
+
+/// After a network change kicks an ICE-restart fan-out, ignore further
+/// change-triggered restarts for this long. A Wi-Fi→cellular handoff
+/// flips the primary outbound IP several times across a couple seconds
+/// (v4 swaps, then v6 appears); without this, each flip fires another
+/// `restart_ice()` that collides with the previous one's in-flight
+/// gather (`ICE Agent can not be restarted when gathering`) and burns a
+/// whole gather cycle. One restart per burst is enough — the
+/// checking-timeout watchdog rebuilds anything still stuck afterward.
+pub const NETWORK_CHANGE_RESTART_COOLDOWN_MS: u64 = 5_000;
+
 /// Tier 5 maximum wait before pruning a reconnecting entry.
 pub const RECONNECTING_GRACE_MS: u64 = 90_000;
 

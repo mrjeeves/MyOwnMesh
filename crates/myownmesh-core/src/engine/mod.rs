@@ -339,23 +339,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // each existing peer sits on its announce schedule.
             // Rate-limited globally so N peers all reacting to a
             // join don't produce N^2 publishes.
-            let should_reflect = {
-                let mut guard = state.last_reactive_announce_at.lock();
-                let now = std::time::Instant::now();
-                let due = guard
-                    .map(|prev| {
-                        now.duration_since(prev)
-                            >= std::time::Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
-                    })
-                    .unwrap_or(true);
-                if due {
-                    *guard = Some(now);
-                }
-                due
-            };
-            if should_reflect {
-                let _ = state.signaling_tx.send(SignalingOutbound::Announce);
-            }
+            maybe_reactive_announce(state);
             // If we already have a session for this peer that's
             // stuck at Sighted (PC created but data channel never
             // opened) and we're the Offerer, re-poke the other
@@ -573,6 +557,31 @@ pub(crate) fn short_peer(id: &str) -> String {
     format!("{}…{}", &id[..6], &id[id.len() - 4..])
 }
 
+/// Emit a presence announce, but only if we haven't already emitted one
+/// within `REACTIVE_ANNOUNCE_MIN_INTERVAL_MS`. Every reactive announce
+/// — reflecting a peer's announce, re-seeding discovery after a
+/// checking-timeout rebuild, kicking discovery on a network change —
+/// goes through here so a burst of triggers (a REQ-replay wave, a
+/// network handoff dropping several peers at once) can never fan out
+/// into a storm of relay publishes. Returns whether the announce was
+/// actually emitted. The driver's own steady-state announcer is
+/// independent of this and unaffected.
+pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
+    let mut guard = state.last_reactive_announce_at.lock();
+    let now = Instant::now();
+    let due = guard
+        .map(|prev| {
+            now.duration_since(prev) >= Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
+        })
+        .unwrap_or(true);
+    if due {
+        *guard = Some(now);
+        drop(guard);
+        let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+    }
+    due
+}
+
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
     if state.peers.contains_key(&device_id) {
         return;
@@ -773,7 +782,11 @@ async fn handle_transport_event(
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "ice",
-                format!("local {kind:?} candidate → {}", short_peer(&device_id)),
+                format!(
+                    "local {kind:?} candidate → {}: {}",
+                    short_peer(&device_id),
+                    cand.candidate
+                ),
                 serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
             );
             let _ = state.signaling_tx.send(SignalingOutbound::Candidate {
@@ -886,6 +899,7 @@ async fn handle_ice_state_change(
         match ice {
             RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                 data.ice_disconnected_since = None;
+                data.ice_checking_since = None;
                 if matches!(
                     data.tier,
                     ConnectionTier::IceWatchdog { .. } | ConnectionTier::IceRestart { .. }
@@ -894,7 +908,17 @@ async fn handle_ice_state_change(
                 }
                 false
             }
+            RTCIceConnectionState::Checking => {
+                // Arm the checking-timeout watchdog for this attempt.
+                // Refresh on every entry into Checking (initial connect
+                // and post-restart re-gather both pass through here).
+                data.ice_checking_since = Some(Instant::now());
+                false
+            }
             RTCIceConnectionState::Disconnected => {
+                // A drop from an established link — owned by the
+                // disconnected watchdog, not the checking timeout.
+                data.ice_checking_since = None;
                 if data.ice_disconnected_since.is_none() {
                     data.ice_disconnected_since = Some(Instant::now());
                     data.tier = ConnectionTier::IceWatchdog {
@@ -903,11 +927,19 @@ async fn handle_ice_state_change(
                 }
                 false
             }
-            RTCIceConnectionState::Failed => true,
+            RTCIceConnectionState::Failed => {
+                data.ice_checking_since = None;
+                true
+            }
             _ => false,
         }
     };
     if escalate_failed {
+        // Dump the full connectivity-check snapshot *before* the ladder
+        // tears the session down — this is the "why did it fail"
+        // record: every candidate pair, every STUN check counter, and a
+        // plain-language diagnosis the user can act on.
+        log_ice_check_snapshot(state, device_id, "ICE failed", true).await;
         ice_watchdog::on_failed(state, device_id).await;
     }
     // Once ICE settles, ask the agent which candidate pair it
@@ -919,9 +951,16 @@ async fn handle_ice_state_change(
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
             record_selected_pair(state, device_id).await;
         }
-        RTCIceConnectionState::Disconnected
-        | RTCIceConnectionState::Failed
-        | RTCIceConnectionState::Closed => {
+        RTCIceConnectionState::Disconnected => {
+            // A drop on a previously-checking/active pair: log a concise
+            // breadcrumb of the check counters so a flap leaves a trail
+            // (was the path ever two-way?) before we clear the pair.
+            log_ice_check_snapshot(state, device_id, "ICE disconnected", false).await;
+            if let Some(peer) = state.peers.get(device_id) {
+                peer.state.write().selected_pair = None;
+            }
+        }
+        RTCIceConnectionState::Failed | RTCIceConnectionState::Closed => {
             if let Some(peer) = state.peers.get(device_id) {
                 peer.state.write().selected_pair = None;
             }
@@ -970,6 +1009,107 @@ pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &
             "remote": format!("{:?}", pair.remote),
         }),
     );
+}
+
+/// Pull a live ICE connectivity-check snapshot for `device_id` and log
+/// it. This is the core instrument for diagnosing why a peer won't
+/// connect: it surfaces every candidate pair the agent formed and,
+/// crucially, whether our STUN checks are getting responses — the
+/// difference between "signaling never delivered candidates" and "the
+/// network is silently dropping our UDP". `full` controls verbosity: a
+/// terminal event (ICE failed) dumps every pair plus a plain-language
+/// diagnosis at WARN; a periodic progress tick logs a single aggregate
+/// line at INFO so it can be watched live without flooding the log.
+///
+/// The webrtc-rs sibling crates are silenced to ERROR in the default
+/// log filter (see `myownmesh/src/main.rs`), so these counters would
+/// otherwise be invisible. This lifts the load-bearing ones into our
+/// own diag stream where the user — and the GUI Activity tab — see them
+/// by default, no `MYOWNMESH_LOG` override required.
+pub(crate) async fn log_ice_check_snapshot(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    context: &str,
+    full: bool,
+) {
+    // Same Ref + MutexGuard scoping dance as record_selected_pair:
+    // clone the session out, drop every guard, then await.
+    let session = {
+        let Some(peer) = state.peers.get(device_id) else {
+            return;
+        };
+        let session = peer.session.lock().clone();
+        session
+    };
+    let Some(session) = session else { return };
+    let snap = session.ice_check_snapshot().await;
+    if snap.is_empty() {
+        return;
+    }
+    let detail = serde_json::json!({
+        "peer": device_id,
+        "context": context,
+        "snapshot": snap,
+    });
+    if full {
+        let mut msg = format!(
+            "ICE check for {} ({context}): {} local · {} remote · {} pairs · {} succeeded\n  → {}",
+            short_peer(device_id),
+            snap.local_candidates.len(),
+            snap.remote_candidates.len(),
+            snap.pairs.len(),
+            snap.succeeded_pairs(),
+            snap.diagnosis(),
+        );
+        msg.push_str(&format!(
+            "\n  local : {}",
+            render_candidate_list(&snap.local_candidates)
+        ));
+        msg.push_str(&format!(
+            "\n  remote: {}",
+            render_candidate_list(&snap.remote_candidates)
+        ));
+        // Per-pair: `sent→` / `resp←` are our checks and the replies we
+        // got; `in←` / `resp→` are the peer's checks and our replies.
+        for p in &snap.pairs {
+            msg.push_str(&format!(
+                "\n  {} ⇄ {} [{}{}] sent→{} resp←{} | in←{} resp→{} | bytes {}/{}",
+                p.local,
+                p.remote,
+                p.state,
+                if p.nominated { " NOMINATED" } else { "" },
+                p.requests_sent,
+                p.responses_received,
+                p.requests_received,
+                p.responses_sent,
+                p.bytes_sent,
+                p.bytes_received,
+            ));
+        }
+        state.log_diag_with(crate::events::DiagLevel::Warn, "ice", msg, detail);
+    } else {
+        let msg = format!(
+            "ICE checking {} — {}/{} pairs succeeded; checks sent→{} resp←{} in←{} · {}",
+            short_peer(device_id),
+            snap.succeeded_pairs(),
+            snap.pairs.len(),
+            snap.total_requests_sent(),
+            snap.total_responses_received(),
+            snap.total_requests_received(),
+            snap.diagnosis(),
+        );
+        state.log_diag_with(crate::events::DiagLevel::Info, "ice", msg, detail);
+    }
+}
+
+/// Comma-join a candidate list for the snapshot log, or `(none)` when
+/// empty so an absent side reads unambiguously rather than as a blank.
+fn render_candidate_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_string()
+    } else {
+        items.join(", ")
+    }
 }
 
 async fn handle_pc_state_change(

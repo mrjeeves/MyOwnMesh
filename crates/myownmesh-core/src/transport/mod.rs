@@ -18,6 +18,9 @@ pub mod diag;
 pub mod ice;
 pub mod webrtc;
 
-pub use diag::{IceCandidateKind, IceCandidateStats, PeerDiag, SelectedCandidatePair};
+pub use diag::{
+    IceCandidateKind, IceCandidateStats, IceCheckSnapshot, IcePairSnapshot, PeerDiag,
+    SelectedCandidatePair,
+};
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
 pub use webrtc::{LocalIceCandidate, PeerSession, Role, Transport, TransportEvent};
