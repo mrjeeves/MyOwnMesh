@@ -77,6 +77,16 @@ pub enum Request {
     NetworkRemove {
         network: String,
     },
+    /// Snapshot which infrastructure services this device hosts plus the
+    /// persisted config. The daemon answers with `{ status, config }`.
+    ServicesStatus,
+    /// Replace the device's services config. Passed as raw JSON (built
+    /// by the frontend) the same way `NetworkAdd` carries its config, so
+    /// the GUI doesn't have to re-derive the full `ServicesConfig` shape
+    /// in Rust.
+    ServicesSet {
+        services: serde_json::Value,
+    },
     EventsSubscribe,
 
     // ---- closed-network governance --------------------------------

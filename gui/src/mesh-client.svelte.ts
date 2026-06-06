@@ -20,6 +20,8 @@ import type {
   NetworkConfigInput,
   NetworkSummary,
   PeerInfo,
+  ServicesConfig,
+  ServicesStatusResponse,
   StreamFrame,
   SubscriptionStatus,
 } from "./types";
@@ -48,6 +50,10 @@ function createMeshClient() {
    *  `types.ts` — the Governance tab reads what it needs by key. */
   let governanceByNetwork = $state<Record<string, unknown>>({});
   let diags = $state<DiagEntry[]>([]);
+  // Device-level infrastructure services this device hosts (relay /
+  // signaling / STUN / TURN): live status + the persisted config the
+  // Services settings section edits. `null` until first fetched.
+  let services = $state<ServicesStatusResponse | null>(null);
   // Wall-clock ms of the most recent "network change" diag, per
   // network. The NodeMap animates the self↔internet edge for a few
   // seconds after this bumps so the user sees that the engine
@@ -146,7 +152,12 @@ function createMeshClient() {
    *  stream signals a lag so we can resync from the daemon's
    *  ground truth. */
   async function refreshAll() {
-    await Promise.all([refreshStatus(), refreshIdentity(), refreshNetworks()]);
+    await Promise.all([
+      refreshStatus(),
+      refreshIdentity(),
+      refreshNetworks(),
+      refreshServices(),
+    ]);
     await Promise.all([
       refreshAllPeers(),
       refreshAllRosters(),
@@ -309,6 +320,27 @@ function createMeshClient() {
     })) as { new_network_id: string };
     await refreshGovernance(network);
     return resp.new_network_id;
+  }
+
+  // ---- infrastructure services (relay / signaling / STUN / TURN) -----
+
+  /** Fetch the device's service status + persisted config. Cheap; runs
+   *  on every `refreshAll` so the Services section has current data. */
+  async function refreshServices() {
+    try {
+      services = (await invoke("mesh_services_status")) as ServicesStatusResponse;
+    } catch (e) {
+      lastError = String(e);
+    }
+  }
+
+  /** Persist a new services config and reconcile the running services.
+   *  Re-fetches the full status so the cache reflects the new persisted
+   *  config + live running state (a service can be enabled but fail to
+   *  start, e.g. a port in use). */
+  async function servicesSet(config: ServicesConfig) {
+    await invoke("mesh_services_set", { services: config });
+    await refreshServices();
   }
 
   // ---- event stream handling ------------------------------------------
@@ -566,6 +598,9 @@ function createMeshClient() {
     get diags() {
       return diags;
     },
+    get services() {
+      return services;
+    },
     get connected() {
       return connected;
     },
@@ -588,6 +623,10 @@ function createMeshClient() {
     networkAdd,
     networkRemove,
     exportNetworkFile,
+
+    // services
+    refreshServices,
+    servicesSet,
 
     // governance
     governanceState,

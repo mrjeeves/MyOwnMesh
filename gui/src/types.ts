@@ -98,6 +98,81 @@ export interface MeshConfigSnapshot {
   [key: string]: unknown;
 }
 
+// ---- infrastructure services (relay / signaling / STUN / TURN) -------
+//
+// Device-level service hosting. The *config* shapes mirror
+// `myownmesh_core::config::ServicesConfig` (the write shape sent into
+// `ServicesSet`); the *report* shapes mirror the daemon's
+// `ServicesReport` (the live status returned by `ServicesStatus`). These
+// toggles apply to the whole device, not a single network.
+
+export interface RelayServiceConfig {
+  enabled: boolean;
+  max_fanout: number;
+}
+
+export interface SignalingServerConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+}
+
+export interface StunServiceConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+}
+
+export interface TurnCredential {
+  username: string;
+  password: string;
+}
+
+export interface TurnServiceConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+  public_ip: string;
+  realm: string;
+  credentials: TurnCredential[];
+}
+
+export interface ServicesConfig {
+  relay: RelayServiceConfig;
+  signaling: SignalingServerConfig;
+  stun: StunServiceConfig;
+  turn: TurnServiceConfig;
+}
+
+/** Live status of one network-listener service (signaling / STUN /
+ *  TURN). `running` differs from `enabled` when a start failed — e.g. a
+ *  port already in use, or TURN enabled without credentials. */
+export interface EndpointReport {
+  enabled: boolean;
+  running: boolean;
+  listen: string | null;
+}
+
+export interface RelayReport {
+  enabled: boolean;
+  networks: number;
+  max_fanout: number;
+}
+
+export interface ServicesReport {
+  relay: RelayReport;
+  signaling: EndpointReport;
+  stun: EndpointReport;
+  turn: EndpointReport;
+}
+
+/** Daemon response to `ServicesStatus`: the live runtime status plus the
+ *  persisted config the toggles edit. */
+export interface ServicesStatusResponse {
+  status: ServicesReport;
+  config: ServicesConfig;
+}
+
 // ---- peer status / tier ----------------------------------------------
 
 export type PeerStatus =

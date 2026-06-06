@@ -269,6 +269,31 @@ async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Re
     Ok(())
 }
 
+// ---- infrastructure services (relay / signaling / STUN / TURN) --------
+
+#[tauri::command]
+async fn mesh_services_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::ServicesStatus)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_services_set(
+    state: State<'_, AppState>,
+    services: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::ServicesSet { services })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
 /// Return the most recent `mesh://subscription` payload. The Svelte
 /// client calls this on init — right after registering the
 /// `mesh://subscription` listener — so it picks up the current state
@@ -525,6 +550,8 @@ fn main() {
             mesh_network_add,
             mesh_network_remove,
             mesh_network_export_file,
+            mesh_services_status,
+            mesh_services_set,
             mesh_subscription_state,
             mesh_governance_state,
             mesh_governance_propose_kind_change,

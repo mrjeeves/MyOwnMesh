@@ -3,13 +3,14 @@
   import NetworksSection from "./settings/NetworksSection.svelte";
   import IdentitySection from "./settings/IdentitySection.svelte";
   import DiagnosticsSection from "./settings/DiagnosticsSection.svelte";
+  import ServicesSection from "./settings/ServicesSection.svelte";
 
   /** Approvals lives first because that's the first thing a new
    *  user needs to do — every cross-device peering starts with a
    *  pending approval. Connections (under Networks) is for
-   *  already-approved peers; Identity / Diagnostics are
-   *  housekeeping. */
-  type Tab = "approvals" | "networks" | "identity" | "diagnostics";
+   *  already-approved peers; Services hosts mesh infrastructure;
+   *  Identity / Diagnostics are housekeeping. */
+  type Tab = "approvals" | "networks" | "services" | "identity" | "diagnostics";
 
   const {
     initialTab = "approvals",
@@ -27,6 +28,7 @@
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "approvals", label: "Approvals" },
     { id: "networks", label: "Networks" },
+    { id: "services", label: "Services" },
     { id: "identity", label: "Identity" },
     { id: "diagnostics", label: "Activity" },
   ];
@@ -68,6 +70,8 @@
         <ApprovalsSection />
       {:else if active === "networks"}
         <NetworksSection {focusedConfigId} />
+      {:else if active === "services"}
+        <ServicesSection />
       {:else if active === "identity"}
         <IdentitySection />
       {:else if active === "diagnostics"}
