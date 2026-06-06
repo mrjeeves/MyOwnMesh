@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.88.0"
 license = "MIT"
@@ -18,9 +18,9 @@ description = "Pure-Rust peer-to-peer mesh networking on webrtc-rs."
 
 [workspace.dependencies]
 # Internal crates
-myownmesh-core = { path = "crates/myownmesh-core", version = "0.1.6" }
-myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "0.1.6" }
-myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.1.6" }
+myownmesh-core = { path = "crates/myownmesh-core", version = "0.1.7" }
+myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "0.1.7" }
+myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.1.7" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal", "process"] }
