@@ -36,15 +36,19 @@ on purpose.
 
 ```
 crates/
-├── myownmesh-core         # lib  — runtime, engine, transport, protocol, topology, RPC, channels
-├── myownmesh-signaling    # lib  — Nostr driver + in-process LocalBroker
+├── myownmesh-core         # lib  — runtime, engine, transport, protocol, topology, RPC, channels, service roles + relay
+├── myownmesh-signaling    # lib  — Nostr driver + in-process LocalBroker + self-hosted NIP-01 relay server
+├── myownmesh-services     # lib  — self-hosted STUN + TURN servers (webrtc-rs stun/turn)
 ├── myownmesh-updater      # lib  — self-update with configurable release feed
-└── myownmesh              # bin  — daemon + CLI + control-socket IPC
+└── myownmesh              # bin  — daemon + CLI + control-socket IPC + service manager
 ```
 
 Embedders depend on `myownmesh-core` (and optionally
-`myownmesh-signaling` if they want the Nostr driver). They don't pull
-in `myownmesh-updater` or the bin.
+`myownmesh-signaling` if they want the Nostr driver, or
+`myownmesh-services` if they want to host STUN / TURN). They don't pull
+in `myownmesh-updater` or the bin. The heavyweight STUN / TURN
+dependency tree lives in `myownmesh-services` precisely so a core-only
+embedder doesn't inherit it.
 
 A future `myownmesh-gui` crate will sit alongside these without
 changing the layout. The GUI port from MyOwnLLM's `CloudMesh*` Svelte
@@ -163,6 +167,39 @@ The Nostr driver bakes in every upstream-Trystero fix catalogued
 in `crates/myownmesh-signaling/src/upstream.rs` natively — no
 patches required.
 
+A device can also **host** signaling itself:
+`myownmesh-signaling::server` is a minimal NIP-01 relay that the
+Nostr driver speaks to unchanged. Point a network's
+`signaling.servers` at `ws://that-host:port` and the fleet runs
+with no dependency on public Nostr at all.
+
+## Hosted services
+
+Beyond consuming signaling / STUN / TURN, a device can host them for
+the rest of the mesh — relay routing, a signaling relay, a STUN
+server, and a TURN server. All off by default and configured
+device-wide under `services` in `config.json`, activatable from the
+GUI (Settings → Services), the CLI (`myownmesh ctl services …`), and
+config edits.
+
+```
+config.services
+├── relay        # forwards roster traffic on a reserved channel (core::services::RelayService)
+├── signaling    # NIP-01 relay (myownmesh-signaling::server)
+├── stun         # RFC 5389 binding (myownmesh-services::stun)
+└── turn         # RFC 5766 relay (myownmesh-services::turn)
+```
+
+The daemon's `ServiceManager` (`crates/myownmesh/src/services.rs`)
+owns the running handles, reconciles them against config on demand,
+and advertises a [`ServiceRole`](crates/myownmesh-core/src/services/mod.rs)
+to peers via the capability matrix (`service:relay`,
+`service:signaling`, `service:stun`, `service:turn`) plus an optional
+`ServiceAdvert` carrying concrete endpoint URLs. That advertisement is
+what lets a peer discover and adopt a host — making a fully
+internet-isolated network trivial to stand up. See
+[`docs/SERVICES.md`](docs/SERVICES.md) for the operator guide.
+
 ## Persistent state
 
 ```
@@ -221,11 +258,22 @@ is the `Mesh` → `MeshHandle` → `JoinedNetwork` flow.
 - Onion / payload-layer encryption above DTLS — explicitly
   declined.
 - Star auto-elect topology — explicit hub only.
-- Signaling strategies other than Nostr — sibling crates later
-  (BitTorrent trackers, MQTT, IPFS, Firebase).
-- Built-in TURN server — user-configured TURN only.
+- Additional *consumer* signaling strategies beyond Nostr
+  (BitTorrent trackers, MQTT, IPFS, Firebase) — sibling crates
+  later. (A device can now *host* signaling via the built-in
+  NIP-01 relay; see [Hosted services](#hosted-services).)
+- Transparent relay fallback — the relay service forwards roster
+  traffic on an explicit channel today; automatic per-peer routing
+  through a relay when ICE can't punch through is a follow-up.
 - Built-in audio / file / LLM RPCs — embedders define their own
   message types over `Channel<T>` or the generic `Rpc`.
+
+Now in (was out of scope before service hosting landed):
+
+- **Built-in STUN / TURN servers** — `myownmesh-services` hosts both;
+  user-configured external STUN / TURN still works as before.
+- **Self-hosted signaling** — `myownmesh-signaling::server` is a
+  NIP-01 relay usable in place of public Nostr.
 - crates.io publish for the library crates — gated on a public-API
   freeze. Until then embedders pull from git pinned to a release
   tag; see [`RELEASE.md`](RELEASE.md).
