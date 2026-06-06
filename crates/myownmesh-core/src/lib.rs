@@ -98,6 +98,7 @@ pub mod network_state;
 pub mod protocol;
 pub mod roster;
 pub mod rpc;
+pub mod services;
 pub mod signing;
 pub mod topology;
 pub mod transport;
@@ -105,7 +106,9 @@ pub mod verification;
 
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, StunServer, TopologyMode, TurnServer,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, RelayServiceConfig, ServicesConfig,
+    SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode, TurnCredential, TurnServer,
+    TurnServiceConfig,
 };
 pub use engine::ladder::ConnectionTier;
 pub use error::{Error, Result};
@@ -119,6 +122,9 @@ pub use network_state::{
 pub use protocol::CapabilityAdvert;
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
+pub use services::{
+    relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,
+};
 pub use topology::Topology;
 
 /// Domain-separation tag prefixed to every signed handshake payload.

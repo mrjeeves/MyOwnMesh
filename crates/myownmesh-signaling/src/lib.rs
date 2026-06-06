@@ -16,6 +16,7 @@
 
 pub mod local;
 pub mod nostr;
+pub mod server;
 pub mod upstream;
 
 use async_trait::async_trait;
@@ -86,6 +87,9 @@ pub enum Error {
     Encode(#[from] serde_json::Error),
     #[error("no relays available")]
     NoRelays,
+    /// The self-hosted signaling [`server`] couldn't bind its listener.
+    #[error("bind {0}: {1}")]
+    Bind(String, #[source] std::io::Error),
     #[error("other: {0}")]
     Other(String),
 }

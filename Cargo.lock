@@ -1366,6 +1366,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "myownmesh-services"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "myownmesh-core",
+ "stun",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "turn",
+ "webrtc-util",
+]
+
+[[package]]
 name = "myownmesh-signaling"
 version = "0.1.8"
 dependencies = [

@@ -1,0 +1,202 @@
+//! Integration tests for the self-hosted signaling relay.
+//!
+//! Two levels of proof:
+//!  1. Raw NIP-01 over the wire — a subscriber receives an event a
+//!     publisher posts to the same room, plus `EOSE`.
+//!  2. The headline feature — two real [`nostr`](myownmesh_signaling::nostr)
+//!     drivers, pointed only at a self-hosted relay (no public Nostr),
+//!     discover each other. This is the "use it in place of Nostr" claim
+//!     under test.
+
+use std::time::Duration;
+
+use futures_util::{SinkExt, Stream, StreamExt};
+use serde_json::{json, Value};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+use myownmesh_signaling::server::SignalingServer;
+
+/// Read frames until a text frame arrives (skipping pings/pongs),
+/// failing the test on timeout or close.
+async fn next_text(ws: &mut (impl Stream<Item = Result<Message, WsError>> + Unpin)) -> String {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("ws read timed out")
+            .expect("ws closed unexpectedly")
+            .expect("ws error");
+        if let Message::Text(t) = msg {
+            return t;
+        }
+    }
+}
+
+fn parse(frame: &str) -> Vec<Value> {
+    serde_json::from_str(frame).expect("relay frame is a JSON array")
+}
+
+#[tokio::test]
+async fn relay_forwards_event_to_matching_subscriber() {
+    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let (mut sub, _) = connect_async(&url).await.unwrap();
+    let (mut pubr, _) = connect_async(&url).await.unwrap();
+
+    // Subscriber asks for room1 / kind 1077.
+    sub.send(Message::Text(
+        json!(["REQ", "sub1", {"kinds": [1077], "#r": ["room1"]}]).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // Nothing stored yet → immediate EOSE.
+    let eose = parse(&next_text(&mut sub).await);
+    assert_eq!(eose[0], "EOSE");
+    assert_eq!(eose[1], "sub1");
+
+    // Publisher posts a matching event.
+    let event = json!({
+        "id": "e1", "pubkey": "pk", "created_at": 1000, "kind": 1077,
+        "tags": [["r", "room1"]], "content": "hello", "sig": "s"
+    });
+    pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
+        .await
+        .unwrap();
+
+    // Publisher gets an OK; subscriber gets the event.
+    let ok = parse(&next_text(&mut pubr).await);
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[2], true);
+
+    let delivered = parse(&next_text(&mut sub).await);
+    assert_eq!(delivered[0], "EVENT");
+    assert_eq!(delivered[1], "sub1");
+    assert_eq!(delivered[2]["content"], "hello");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn relay_replays_stored_presence_to_late_subscriber() {
+    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    // Publisher posts presence BEFORE anyone subscribes.
+    let (mut pubr, _) = connect_async(&url).await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let event = json!({
+        "id": "p1", "pubkey": "pk", "created_at": now, "kind": 1077,
+        "tags": [["r", "roomX"]], "content": "present", "sig": "s"
+    });
+    pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
+        .await
+        .unwrap();
+    let _ok = next_text(&mut pubr).await;
+
+    // A subscriber joining afterwards still discovers the presence via
+    // stored-event replay (kind 1077 is retained).
+    let (mut sub, _) = connect_async(&url).await.unwrap();
+    sub.send(Message::Text(
+        json!(["REQ", "late", {"kinds": [1077], "#r": ["roomX"], "since": now - 60}]).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let replayed = parse(&next_text(&mut sub).await);
+    assert_eq!(replayed[0], "EVENT");
+    assert_eq!(replayed[2]["content"], "present");
+    let eose = parse(&next_text(&mut sub).await);
+    assert_eq!(eose[0], "EOSE");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn ephemeral_events_are_not_stored() {
+    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let (mut pubr, _) = connect_async(&url).await.unwrap();
+    // Ephemeral kind 21077 (mesh negotiation) — forwarded live, never
+    // retained for replay.
+    let event = json!({
+        "id": "n1", "pubkey": "pk", "created_at": 1000, "kind": 21077,
+        "tags": [["r", "roomE"]], "content": "offer", "sig": "s"
+    });
+    pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
+        .await
+        .unwrap();
+    let _ok = next_text(&mut pubr).await;
+
+    // A later subscriber sees only EOSE — the ephemeral event wasn't
+    // stored, so there's nothing to replay.
+    let (mut sub, _) = connect_async(&url).await.unwrap();
+    sub.send(Message::Text(
+        json!(["REQ", "s", {"kinds": [21077], "#r": ["roomE"]}]).to_string(),
+    ))
+    .await
+    .unwrap();
+    let first = parse(&next_text(&mut sub).await);
+    assert_eq!(first[0], "EOSE", "ephemeral event must not be replayed");
+
+    server.stop();
+}
+
+// The headline test: two real Nostr drivers, pointed ONLY at a
+// self-hosted relay, discover each other — proving the relay works "in
+// place of Nostr" with zero driver changes.
+#[tokio::test]
+async fn two_drivers_discover_via_self_hosted_relay() {
+    use myownmesh_signaling::nostr::driver::{
+        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+    };
+    use tokio::sync::mpsc;
+
+    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let mk = |device: &str| NostrDriverConfig {
+        app_id: "myownmesh-test".into(),
+        network_id: "isolated-net".into(),
+        device_id: device.into(),
+        servers: vec![url.clone()],
+        denylist: vec![],
+        redundancy: 1,
+    };
+
+    // Keep the outbound senders and driver handles bound for the whole
+    // test — dropping either tears the driver down.
+    let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
+    let _driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+
+    let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
+    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+
+    // Drivers auto-announce on start; B should learn about A through the
+    // self-hosted relay (live forward or stored replay).
+    let found = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = in_rx_b.recv().await {
+            if let NostrInbound::PeerAnnounced { device_id } = ev {
+                if device_id == "device-aaa" {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out before discovering peer via self-hosted relay");
+    assert!(found, "driver B never saw driver A's announce");
+
+    // Hold the senders/handles until here.
+    drop(out_tx_a);
+    drop(out_tx_b);
+    server.stop();
+}
