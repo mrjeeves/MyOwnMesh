@@ -43,7 +43,7 @@ consistent across both apps.
 | Artifact | Where | Audience |
 |---|---|---|
 | `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` | [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases) | End users running the headless daemon; the self-updater consumes the same artifacts. |
-| `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
+| `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. The self-updater keeps it in lockstep with the daemon (it swaps this binary too when one is installed beside `myownmesh`). Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
 | Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app with full OS integration. |
 | `myownmesh-core`, `myownmesh-signaling`, `myownmesh-updater` source | Git tag `vX.Y.Z` | Embedders, via `git = …, tag = "vX.Y.Z"` in their `Cargo.toml`. |
 
@@ -105,6 +105,40 @@ Configured via `auto_update.auto_apply`:
 Package-manager installs (Homebrew / apt / rpm / MSI / choco) are
 detected on first launch and self-update is skipped — the OS
 package manager stays the source of truth.
+
+## What updates
+
+A release bumps the daemon (`myownmesh`) and the desktop GUI
+(`myownmesh-gui`) together. The self-updater keeps **both** current:
+when it stages an update it stages the GUI binary too, as long as one
+is installed beside the daemon (the portable `curl | sh` layout), and
+the next launch swaps both. This is what keeps the GUI's window title
+from lagging behind the daemon it spawns.
+
+A headless box with no GUI updates the daemon alone. A full desktop
+bundle (macOS `.app` / `.dmg`, Linux `.deb` / `.AppImage`, Windows
+`.msi`) is owned by its own installer and is left untouched — same
+rule as a package-manager install.
+
+## Updating by hand
+
+```
+myownmesh update
+```
+
+Fetches the latest release and updates everything (daemon + GUI) in one
+shot — the equivalent of MyOwnLLM's `myownllm update`. It ignores the
+`auto_apply` policy and the check interval (you asked for it), but still
+defers to the OS package manager. Restart MyOwnMesh afterwards to run
+the new binaries.
+
+The granular subcommands remain for scripting and inspection:
+
+- `myownmesh update check` — check the feed now and stage any permitted
+  update (respects `auto_apply`).
+- `myownmesh update apply` — apply what's already staged.
+- `myownmesh update status` — version, channel, policy, last check, staged.
+- `myownmesh update enable` / `disable` — toggle background checks.
 
 ## Forking
 

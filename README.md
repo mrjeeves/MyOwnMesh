@@ -218,10 +218,16 @@ myownmesh serve            # run the daemon in the foreground (headless)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
+myownmesh update           # update everything now (daemon + GUI), then restart
 myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
 ```
+
+A bare `myownmesh update` fetches the latest release and updates the
+daemon **and** the desktop GUI together — the equivalent of MyOwnLLM's
+`myownllm update`. The GUI ships as its own binary beside the daemon, so
+the self-updater swaps both; restart afterwards to run the new version.
 
 A bare `myownmesh` (no subcommand) opens the desktop GUI — same as
 MyOwnLLM — which auto-spawns the daemon for you. On a headless box
