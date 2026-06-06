@@ -184,11 +184,21 @@ config edits.
 
 ```
 config.services
+├── node         # participate as a mesh member; off = pure-infra box (default on)
 ├── relay        # forwards roster traffic on a reserved channel (core::services::RelayService)
-├── signaling    # NIP-01 relay (myownmesh-signaling::server)
+├── signaling    # intelligent NIP-01 relay — live presence, instant leave, flood limits (myownmesh-signaling::server)
 ├── stun         # RFC 5389 binding (myownmesh-services::stun)
-└── turn         # RFC 5766 relay (myownmesh-services::turn)
+└── turn         # RFC 5766 relay + per-connection bandwidth cap (myownmesh-services::turn)
 ```
+
+The signaling relay is stateful: it tracks live presence from the
+connection lifecycle and emits a `leave` ([`SignalingMessage::Leave`])
+the instant a member's socket drops, so the engine's reconnection ladder
+reacts immediately instead of waiting out a heartbeat timeout. It stays
+plain NIP-01 on the wire and degrades gracefully — an optional
+accelerator, never a coordinator the mesh depends on. `node` is itself a
+toggle, so a device can be pure infrastructure (signaling / STUN / TURN
+with no mesh membership).
 
 The daemon's `ServiceManager` (`crates/myownmesh/src/services.rs`)
 owns the running handles, reconciles them against config on demand,

@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::identity::DeviceId;
 
+/// Flood-protection limits for the self-hosted signaling relay. Defined
+/// in the signaling crate (its natural home) and re-used here so the
+/// config, the daemon, and the relay all share one shape.
+pub use myownmesh_signaling::server::Limits as SignalingLimits;
+
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Topology selector for a single network. Wire-form matches the
@@ -282,10 +287,32 @@ pub const DEFAULT_STUN_TURN_PORT: u16 = 3478;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct ServicesConfig {
+    /// Whether this device participates as a regular mesh node. On by
+    /// default; turn off for a pure-infrastructure box.
+    pub node: NodeServiceConfig,
     pub relay: RelayServiceConfig,
     pub signaling: SignalingServerConfig,
     pub stun: StunServiceConfig,
     pub turn: TurnServiceConfig,
+}
+
+/// Whether this device acts as a regular mesh node — i.e. joins its
+/// configured networks and participates as a peer. Enabled by default;
+/// disable it to run a **pure-infrastructure box** that only hosts
+/// signaling / STUN / TURN (advertising itself purely as an edge /
+/// ingress-egress point) without joining any network itself. The
+/// roster-gated relay forwards traffic *within* networks, so it needs
+/// node participation and has no effect when node is off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NodeServiceConfig {
+    pub enabled: bool,
+}
+
+impl Default for NodeServiceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Mesh-member routing. When enabled this device forwards typed-channel
@@ -320,6 +347,10 @@ pub struct SignalingServerConfig {
     /// `127.0.0.1` keeps it loopback-only.
     pub bind: String,
     pub port: u16,
+    /// Flood-protection limits (per-connection rates, per-IP connection
+    /// caps, subscription / message-size caps). Safe defaults; loosen for
+    /// a busy public relay, tighten for a locked-down private one.
+    pub limits: SignalingLimits,
 }
 
 impl Default for SignalingServerConfig {
@@ -328,6 +359,7 @@ impl Default for SignalingServerConfig {
             enabled: false,
             bind: "0.0.0.0".to_string(),
             port: DEFAULT_SIGNALING_SERVER_PORT,
+            limits: SignalingLimits::default(),
         }
     }
 }
@@ -375,6 +407,11 @@ pub struct TurnServiceConfig {
     /// Static long-term credentials the server accepts. Mirror an entry
     /// into each peer's `turn_servers` config so they can allocate.
     pub credentials: Vec<TurnCredential>,
+    /// Per-connection (per-allocation) relayed-bandwidth cap in bytes per
+    /// second, applied independently to each direction. `0` = unlimited.
+    /// A global QoS knob so one client can't saturate the relay — there's
+    /// no per-user override yet, this cap applies to every allocation.
+    pub max_bps_per_connection: u64,
 }
 
 impl Default for TurnServiceConfig {
@@ -386,6 +423,7 @@ impl Default for TurnServiceConfig {
             public_ip: String::new(),
             realm: "myownmesh".to_string(),
             credentials: Vec::new(),
+            max_bps_per_connection: 0,
         }
     }
 }
@@ -572,6 +610,9 @@ mod tests {
     #[test]
     fn services_default_off() {
         let s = ServicesConfig::default();
+        // A fresh device IS a node by default; the hosted services are
+        // all opt-in.
+        assert!(s.node.enabled);
         assert!(!s.relay.enabled);
         assert!(!s.signaling.enabled);
         assert!(!s.stun.enabled);
@@ -580,6 +621,20 @@ mod tests {
         assert_eq!(s.stun.port, DEFAULT_STUN_TURN_PORT);
         assert_eq!(s.turn.port, DEFAULT_STUN_TURN_PORT);
         assert_eq!(s.turn.realm, "myownmesh");
+        // Signaling ships safe flood-limit defaults.
+        assert_eq!(s.signaling.limits, SignalingLimits::default());
+        assert!(s.signaling.limits.max_event_rate > 0);
+        // TURN bandwidth is unlimited until configured.
+        assert_eq!(s.turn.max_bps_per_connection, 0);
+    }
+
+    #[test]
+    fn node_defaults_on_for_old_configs() {
+        // A config written before the `node` toggle existed must still
+        // behave as a node (the field is #[serde(default)] → enabled).
+        let json = r#"{ "version": 1, "services": {}, "networks": [] }"#;
+        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.services.node.enabled);
     }
 
     #[test]

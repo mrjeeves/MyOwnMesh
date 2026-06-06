@@ -104,6 +104,9 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                         let _ = peer_id; // peer id is informational; we use `from`
                         SignalingInbound::PeerAnnounced { device_id: from }
                     }
+                    SignalingMessage::Leave { peer_id } => {
+                        SignalingInbound::PeerLeft { device_id: peer_id }
+                    }
                     SignalingMessage::Offer { sdp, .. } => SignalingInbound::Offer {
                         device_id: from,
                         sdp,
@@ -242,10 +245,17 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
                 NostrInbound::PeerAnnounced { device_id } => {
                     SignalingInbound::PeerAnnounced { device_id }
                 }
+                // An intelligent relay told us the peer's signaling socket
+                // dropped — tear the peer down now rather than waiting for
+                // the heartbeat timeout.
+                NostrInbound::PeerLeft { device_id } => SignalingInbound::PeerLeft { device_id },
                 NostrInbound::Message { from, msg } => match msg {
                     SignalingMessage::Announce { peer_id } => {
                         let _ = peer_id;
                         SignalingInbound::PeerAnnounced { device_id: from }
+                    }
+                    SignalingMessage::Leave { peer_id } => {
+                        SignalingInbound::PeerLeft { device_id: peer_id }
                     }
                     SignalingMessage::Offer { sdp, .. } => SignalingInbound::Offer {
                         device_id: from,

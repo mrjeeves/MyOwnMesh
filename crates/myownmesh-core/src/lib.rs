@@ -106,9 +106,9 @@ pub mod verification;
 
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, RelayServiceConfig, ServicesConfig,
-    SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode, TurnCredential, TurnServer,
-    TurnServiceConfig,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, RelayServiceConfig,
+    ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig,
+    TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::ladder::ConnectionTier;
 pub use error::{Error, Result};

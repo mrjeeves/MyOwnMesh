@@ -54,6 +54,15 @@ pub enum SignalingMessage {
         #[serde(default)]
         username_fragment: Option<String>,
     },
+    /// A peer's signaling connection dropped. Emitted by an intelligent
+    /// [`server`] relay the instant a member's WebSocket closes, so other
+    /// members tear the peer down promptly instead of waiting out a
+    /// heartbeat timeout. Public relays never send this; receivers that
+    /// don't get it simply fall back to timeout-based detection, so it's
+    /// a pure accelerator.
+    Leave {
+        peer_id: String,
+    },
 }
 
 /// Per-relay health snapshot. Diagnostic-only — surfaced via the

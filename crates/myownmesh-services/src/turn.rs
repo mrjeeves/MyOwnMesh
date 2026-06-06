@@ -15,20 +15,174 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use turn::auth::{generate_auth_key, AuthHandler};
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
+use turn::relay::RelayAddressGenerator;
 use turn::server::config::{ConnConfig, ServerConfig};
 use turn::server::Server;
 use turn::Error as TurnError;
 use webrtc_util::vnet::net::Net;
+use webrtc_util::Conn;
 
 use myownmesh_core::config::{TurnCredential, TurnServiceConfig};
 
 use crate::{Error, Result};
+
+/// Smallest burst the per-connection bandwidth cap always allows, so a
+/// single full-size UDP datagram never deadlocks a tiny cap. The average
+/// throughput still converges on the configured rate.
+const MIN_BURST_BYTES: u64 = 65_536;
+
+/// Token bucket over bytes, for per-allocation bandwidth shaping. A cap
+/// of 0 is never wrapped (see [`ThrottledRelayGenerator`]), so `rate` is
+/// always > 0 here.
+struct ByteBucket {
+    tokens: f64,
+    capacity: f64,
+    rate: f64,
+    last: Instant,
+}
+
+impl ByteBucket {
+    fn new(bps: u64) -> Self {
+        let capacity = bps.max(MIN_BURST_BYTES) as f64;
+        Self {
+            tokens: capacity,
+            capacity,
+            rate: bps as f64,
+            last: Instant::now(),
+        }
+    }
+
+    /// Refill for elapsed time and try to consume `n` bytes. Returns
+    /// `None` if consumed now, or `Some(wait)` if the caller must wait
+    /// that long and retry. Pure (takes `now`) so it's unit-testable
+    /// without real time. `n` is clamped to capacity so an oversized
+    /// datagram still drains through.
+    fn try_consume(&mut self, n: usize, now: Instant) -> Option<Duration> {
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + dt * self.rate).min(self.capacity);
+        let need = (n as f64).min(self.capacity);
+        if self.tokens >= need {
+            self.tokens -= need;
+            None
+        } else {
+            Some(Duration::from_secs_f64((need - self.tokens) / self.rate))
+        }
+    }
+}
+
+async fn consume(bucket: &AsyncMutex<ByteBucket>, n: usize) {
+    loop {
+        let wait = {
+            let mut b = bucket.lock().await;
+            b.try_consume(n, Instant::now())
+        };
+        match wait {
+            None => return,
+            Some(w) => tokio::time::sleep(w).await,
+        }
+    }
+}
+
+/// Wraps an allocation's relay [`Conn`] to shape its throughput to a
+/// per-connection byte/sec cap, independently in each direction.
+struct ThrottledConn {
+    inner: Arc<dyn Conn + Send + Sync>,
+    send_bucket: AsyncMutex<ByteBucket>,
+    recv_bucket: AsyncMutex<ByteBucket>,
+}
+
+impl ThrottledConn {
+    fn new(inner: Arc<dyn Conn + Send + Sync>, bps: u64) -> Self {
+        Self {
+            inner,
+            send_bucket: AsyncMutex::new(ByteBucket::new(bps)),
+            recv_bucket: AsyncMutex::new(ByteBucket::new(bps)),
+        }
+    }
+}
+
+#[async_trait]
+impl Conn for ThrottledConn {
+    async fn connect(&self, addr: SocketAddr) -> std::result::Result<(), webrtc_util::Error> {
+        self.inner.connect(addr).await
+    }
+    async fn recv(&self, buf: &mut [u8]) -> std::result::Result<usize, webrtc_util::Error> {
+        let n = self.inner.recv(buf).await?;
+        consume(&self.recv_bucket, n).await;
+        Ok(n)
+    }
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> std::result::Result<(usize, SocketAddr), webrtc_util::Error> {
+        let (n, addr) = self.inner.recv_from(buf).await?;
+        consume(&self.recv_bucket, n).await;
+        Ok((n, addr))
+    }
+    async fn send(&self, buf: &[u8]) -> std::result::Result<usize, webrtc_util::Error> {
+        consume(&self.send_bucket, buf.len()).await;
+        self.inner.send(buf).await
+    }
+    async fn send_to(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::result::Result<usize, webrtc_util::Error> {
+        consume(&self.send_bucket, buf.len()).await;
+        self.inner.send_to(buf, target).await
+    }
+    fn local_addr(&self) -> std::result::Result<SocketAddr, webrtc_util::Error> {
+        self.inner.local_addr()
+    }
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.remote_addr()
+    }
+    async fn close(&self) -> std::result::Result<(), webrtc_util::Error> {
+        self.inner.close().await
+    }
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+/// Relay-address generator that delegates allocation to the static
+/// generator, then wraps each allocation's relay socket in a
+/// [`ThrottledConn`] when a per-connection cap is configured. The cap is
+/// global (every allocation gets the same limit).
+struct ThrottledRelayGenerator {
+    inner: RelayAddressGeneratorStatic,
+    max_bps: u64,
+}
+
+#[async_trait]
+impl RelayAddressGenerator for ThrottledRelayGenerator {
+    fn validate(&self) -> std::result::Result<(), TurnError> {
+        self.inner.validate()
+    }
+
+    async fn allocate_conn(
+        &self,
+        use_ipv4: bool,
+        requested_port: u16,
+    ) -> std::result::Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), TurnError> {
+        let (conn, addr) = self.inner.allocate_conn(use_ipv4, requested_port).await?;
+        if self.max_bps == 0 {
+            return Ok((conn, addr));
+        }
+        let throttled: Arc<dyn Conn + Send + Sync> =
+            Arc::new(ThrottledConn::new(conn, self.max_bps));
+        Ok((throttled, addr))
+    }
+}
 
 /// Long-term credential auth handler backed by a static username → key
 /// map. The key is the MD5 digest `generate_auth_key` computes from
@@ -128,13 +282,19 @@ impl TurnServer {
         let server = Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {
                 conn,
-                relay_addr_generator: Box::new(RelayAddressGeneratorStatic {
-                    relay_address: relay_ip,
-                    // Interface the relay sockets bind on; the wildcard
-                    // is fine here — relay_address is what clients are
-                    // told to use.
-                    address: "0.0.0.0".to_owned(),
-                    net: Arc::new(Net::new(None)),
+                // Wrap the static generator so each allocation's relay
+                // socket is bandwidth-shaped to the configured cap (a
+                // no-op passthrough when the cap is 0).
+                relay_addr_generator: Box::new(ThrottledRelayGenerator {
+                    inner: RelayAddressGeneratorStatic {
+                        relay_address: relay_ip,
+                        // Interface the relay sockets bind on; the
+                        // wildcard is fine here — relay_address is what
+                        // clients are told to use.
+                        address: "0.0.0.0".to_owned(),
+                        net: Arc::new(Net::new(None)),
+                    },
+                    max_bps: config.max_bps_per_connection,
                 }),
             }],
             realm: config.realm.clone(),
@@ -202,6 +362,7 @@ mod tests {
             public_ip: "127.0.0.1".into(),
             realm: "myownmesh".into(),
             credentials: vec![cred("alice", "s3cret")],
+            max_bps_per_connection: 0,
         }
     }
 
@@ -224,6 +385,7 @@ mod tests {
             public_ip: "".into(),
             realm: "myownmesh".into(),
             credentials: vec![cred("alice", "pw")],
+            max_bps_per_connection: 0,
         };
         assert!(matches!(
             TurnServer::start(&cfg).await,
@@ -236,6 +398,47 @@ mod tests {
         let server = TurnServer::start(&loopback_config()).await.unwrap();
         assert_ne!(server.local_addr().port(), 0);
         assert_eq!(server.relay_ip().to_string(), "127.0.0.1");
+        server.stop().await.unwrap();
+    }
+
+    #[test]
+    fn byte_bucket_shapes_to_rate() {
+        // rate 100_000 B/s → capacity max(100_000, 65_536) = 100_000.
+        let mut b = ByteBucket::new(100_000);
+        let t0 = Instant::now();
+        // First 100KB fits in the burst — no wait.
+        assert!(b.try_consume(100_000, t0).is_none());
+        // Immediately asking for 50KB more must wait ~0.5s (no refill).
+        let wait = b.try_consume(50_000, t0).expect("should need to wait");
+        assert!(
+            wait.as_millis() >= 400 && wait.as_millis() <= 600,
+            "got {wait:?}"
+        );
+        // After 1s of refill, the bucket is full again.
+        assert!(b.try_consume(50_000, t0 + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn byte_bucket_oversized_datagram_never_deadlocks() {
+        // A datagram larger than a tiny cap's per-second budget still
+        // drains (clamped to capacity) rather than waiting forever.
+        let mut b = ByteBucket::new(1_000); // capacity floored to 65_536
+        let t0 = Instant::now();
+        // Drain the burst, then a full datagram is clamped to capacity.
+        assert!(b.try_consume(65_536, t0).is_none());
+        let wait = b
+            .try_consume(65_536, t0)
+            .expect("should wait but not forever");
+        assert!(wait.as_secs_f64().is_finite());
+    }
+
+    #[tokio::test]
+    async fn turn_with_bandwidth_cap_starts() {
+        // A configured cap must not break startup or allocation wiring.
+        let mut cfg = loopback_config();
+        cfg.max_bps_per_connection = 256_000;
+        let server = TurnServer::start(&cfg).await.unwrap();
+        assert_ne!(server.local_addr().port(), 0);
         server.stop().await.unwrap();
     }
 

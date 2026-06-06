@@ -106,15 +106,41 @@
 <div class="content">
   <h3>Hosted services</h3>
   <p class="intro">
-    Turn this device into mesh infrastructure. Each service is hosted by
-    the local daemon and advertised to peers so they can discover and
-    adopt it — which is what makes a fully self-hosted, internet-isolated
-    network practical. Everything is off by default.
+    This device can be any combination of a mesh node and hosted
+    infrastructure — relay, signaling, STUN, TURN. Each service runs in
+    the local daemon and is advertised to peers so they can discover and
+    adopt it, which is what makes a fully self-hosted, internet-isolated
+    network practical.
   </p>
 
   {#if !draft || !report}
     <div class="hint">Service status unavailable — is the daemon running?</div>
   {:else}
+    <!-- Node --------------------------------------------------------- -->
+    <div class="card">
+      <div class="card-head">
+        <label class="toggle">
+          <input
+            type="checkbox"
+            bind:checked={draft.node.enabled}
+            onchange={markDirty}
+          />
+          <span class="svc-name">Mesh node</span>
+        </label>
+        <span class="status {report.node.enabled ? 'on' : 'off'}">
+          {report.node.enabled
+            ? `joined ${report.node.joined} network${report.node.joined === 1 ? "" : "s"}`
+            : "pure-infrastructure mode"}
+        </span>
+      </div>
+      <p class="svc-hint">
+        Whether this device participates as a regular mesh member, joining
+        its configured networks. Turn off to run a pure-infrastructure box
+        that only hosts the services below — the relay needs node
+        participation, so it goes idle when this is off.
+      </p>
+    </div>
+
     <!-- Relay --------------------------------------------------------- -->
     <div class="card">
       <div class="card-head">
@@ -192,6 +218,66 @@
               oninput={markDirty}
             />
           </label>
+        </div>
+
+        <div class="creds">
+          <div class="creds-title">Flood limits (0 = unlimited)</div>
+          <div class="fields">
+            <label class="field">
+              <span>Events / sec</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_event_rate}
+                oninput={markDirty}
+              />
+            </label>
+            <label class="field">
+              <span>REQ / sec</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_req_rate}
+                oninput={markDirty}
+              />
+            </label>
+            <label class="field">
+              <span>Subscriptions / conn</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_subscriptions}
+                oninput={markDirty}
+              />
+            </label>
+            <label class="field">
+              <span>Connections / IP</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_connections_per_ip}
+                oninput={markDirty}
+              />
+            </label>
+            <label class="field">
+              <span>Max frame bytes</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_message_bytes}
+                oninput={markDirty}
+              />
+            </label>
+            <label class="field">
+              <span>Filters / REQ</span>
+              <input
+                type="number"
+                min="0"
+                bind:value={draft.signaling.limits.max_filters_per_req}
+                oninput={markDirty}
+              />
+            </label>
+          </div>
         </div>
       {/if}
     </div>
@@ -293,6 +379,16 @@
               bind:value={draft.turn.realm}
               oninput={markDirty}
             />
+          </label>
+          <label class="field wide">
+            <span>Max bandwidth per connection (bytes/sec, each way)</span>
+            <input
+              type="number"
+              min="0"
+              bind:value={draft.turn.max_bps_per_connection}
+              oninput={markDirty}
+            />
+            <span class="unit">0 = unlimited — a global QoS cap on every allocation</span>
           </label>
         </div>
 

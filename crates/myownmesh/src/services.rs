@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use myownmesh_core::services::{ServiceAdvert, ServiceRole};
-use myownmesh_core::{CapabilityAdvert, MeshHandle, RelayService, ServicesConfig};
+use myownmesh_core::{
+    CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, RelayService, ServicesConfig,
+};
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
 use myownmesh_signaling::server::{SignalingServer, SignalingServerHandle};
 use serde::Serialize;
@@ -48,10 +50,19 @@ struct ManagerState {
 /// Status snapshot for the control protocol / CLI / GUI.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServicesReport {
+    pub node: NodeReport,
     pub relay: RelayReport,
     pub signaling: EndpointReport,
     pub stun: EndpointReport,
     pub turn: EndpointReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeReport {
+    pub enabled: bool,
+    /// Networks this device has currently joined as a node (0 in
+    /// pure-infrastructure mode).
+    pub joined: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +106,19 @@ impl ServiceManager {
     pub async fn apply(&self, desired: ServicesConfig) -> ServicesReport {
         let mut g = self.state.lock().await;
 
+        // ---- Node participation ----
+        // Toggling node membership joins or leaves every configured
+        // network. Handle it first so the relay rebuild below sees the
+        // resulting registry membership.
+        if g.config.node.enabled && !desired.node.enabled {
+            info!("node participation disabled — leaving all networks (pure-infra mode)");
+            g.relays.clear();
+            leave_all(&self.registry).await;
+        } else if !g.config.node.enabled && desired.node.enabled {
+            info!("node participation enabled — joining configured networks");
+            join_configured(&self.mesh, &self.registry).await;
+        }
+
         // ---- STUN ----
         if g.stun.is_some() != desired.stun.enabled || g.config.stun != desired.stun {
             if let Some(h) = g.stun.take() {
@@ -129,7 +153,12 @@ impl ServiceManager {
                 h.stop();
             }
             if desired.signaling.enabled {
-                match SignalingServer::start(&desired.signaling.bind, desired.signaling.port).await
+                match SignalingServer::start(
+                    &desired.signaling.bind,
+                    desired.signaling.port,
+                    desired.signaling.limits.clone(),
+                )
+                .await
                 {
                     Ok(h) => g.signaling = Some(h),
                     Err(e) => warn!("signaling service failed to start: {e}"),
@@ -156,19 +185,23 @@ impl ServiceManager {
 
         g.config = desired;
         self.refresh_adverts_locked(&g);
+        let joined = self.registry.summaries().len();
         info!(
+            node = g.config.node.enabled,
+            joined,
             stun = g.stun.is_some(),
             turn = g.turn.is_some(),
             signaling = g.signaling.is_some(),
             relays = g.relays.len(),
             "services reconciled"
         );
-        g.report()
+        g.report(joined)
     }
 
     /// Snapshot the current service status without changing anything.
     pub async fn status(&self) -> ServicesReport {
-        self.state.lock().await.report()
+        let joined = self.registry.summaries().len();
+        self.state.lock().await.report(joined)
     }
 
     /// The currently-applied config (for persistence round-trips).
@@ -229,8 +262,12 @@ impl ServiceManager {
 }
 
 impl ManagerState {
-    fn report(&self) -> ServicesReport {
+    fn report(&self, joined_networks: usize) -> ServicesReport {
         ServicesReport {
+            node: NodeReport {
+                enabled: self.config.node.enabled,
+                joined: joined_networks,
+            },
             relay: RelayReport {
                 enabled: self.config.relay.enabled,
                 networks: self.relays.len(),
@@ -308,6 +345,55 @@ fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         max_connections: None,
         extra,
+    }
+}
+
+/// Join one configured network: bring it up on the mesh, attach the
+/// Nostr signaling driver, and register it. Skips networks already in the
+/// registry. Shared by daemon startup and the node-enable transition so
+/// there's a single join path. Best-effort — a failed join is logged, not
+/// fatal.
+pub(crate) async fn join_network(
+    mesh: &MeshHandle,
+    registry: &NetworkRegistry,
+    cfg: NetworkConfig,
+) {
+    if registry.contains(&cfg.id) || registry.contains(&cfg.network_id) {
+        return;
+    }
+    match mesh.join(cfg.clone()).await {
+        Ok(joined) => {
+            let nostr = myownmesh_core::engine::attach_nostr(&joined.state());
+            if nostr.is_none() {
+                warn!(network = %cfg.network_id, "nostr attach returned no handle");
+            }
+            registry.insert(joined, nostr);
+            info!(network = %cfg.network_id, "joined network");
+        }
+        Err(e) => warn!(network = %cfg.network_id, "join failed: {e:#}"),
+    }
+}
+
+/// Join every network in the on-disk config — the node-enable transition.
+async fn join_configured(mesh: &MeshHandle, registry: &NetworkRegistry) {
+    let cfg = match MeshConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("load config for node join: {e}");
+            return;
+        }
+    };
+    for net in cfg.networks {
+        join_network(mesh, registry, net).await;
+    }
+}
+
+/// Leave every joined network — the node-disable transition.
+async fn leave_all(registry: &NetworkRegistry) {
+    for net in registry.take_all() {
+        if let Err(e) = net.leave().await {
+            warn!("leave failed: {e:#}");
+        }
     }
 }
 

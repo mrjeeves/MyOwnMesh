@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use myownmesh_signaling::server::SignalingServer;
+use myownmesh_signaling::server::{Limits, SignalingServer};
 
 /// Read frames until a text frame arrives (skipping pings/pongs),
 /// failing the test on timeout or close.
@@ -38,7 +38,9 @@ fn parse(frame: &str) -> Vec<Value> {
 
 #[tokio::test]
 async fn relay_forwards_event_to_matching_subscriber() {
-    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
 
     let (mut sub, _) = connect_async(&url).await.unwrap();
@@ -80,7 +82,9 @@ async fn relay_forwards_event_to_matching_subscriber() {
 
 #[tokio::test]
 async fn relay_replays_stored_presence_to_late_subscriber() {
-    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
 
     // Publisher posts presence BEFORE anyone subscribes.
@@ -118,7 +122,9 @@ async fn relay_replays_stored_presence_to_late_subscriber() {
 
 #[tokio::test]
 async fn ephemeral_events_are_not_stored() {
-    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
 
     let (mut pubr, _) = connect_async(&url).await.unwrap();
@@ -157,7 +163,9 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     };
     use tokio::sync::mpsc;
 
-    let server = SignalingServer::start("127.0.0.1", 0).await.unwrap();
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
 
     let mk = |device: &str| NostrDriverConfig {
@@ -197,6 +205,121 @@ async fn two_drivers_discover_via_self_hosted_relay() {
 
     // Hold the senders/handles until here.
     drop(out_tx_a);
+    drop(out_tx_b);
+    server.stop();
+}
+
+// Intelligent-relay behaviour: when a member's socket drops, the relay
+// emits a `leave` to the room so others tear down promptly.
+#[tokio::test]
+async fn relay_emits_leave_when_member_disconnects() {
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    // Subscriber watches the room for presence + departures.
+    let (mut sub, _) = connect_async(&url).await.unwrap();
+    sub.send(Message::Text(
+        json!(["REQ", "s", {"kinds": [1077, 21077], "#r": ["leaveroom"]}]).to_string(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(parse(&next_text(&mut sub).await)[0], "EOSE");
+
+    // A member announces with a real mesh envelope, so the relay tracks
+    // its presence against this connection.
+    let (mut member, _) = connect_async(&url).await.unwrap();
+    let envelope = json!({ "from": "devA", "kind": "announce", "peer_id": "devA" }).to_string();
+    let announce = json!({
+        "id": "a1", "pubkey": "pk", "created_at": 1000, "kind": 1077,
+        "tags": [["r", "leaveroom"]], "content": envelope, "sig": "s"
+    });
+    member
+        .send(Message::Text(json!(["EVENT", announce]).to_string()))
+        .await
+        .unwrap();
+    // Drain the member's OK so we know the relay has recorded presence.
+    assert_eq!(parse(&next_text(&mut member).await)[0], "OK");
+    // Subscriber sees the announce.
+    assert_eq!(parse(&next_text(&mut sub).await)[0], "EVENT");
+
+    // Member drops — the relay should synthesize a leave to the room.
+    drop(member);
+
+    let leave = parse(&next_text(&mut sub).await);
+    assert_eq!(leave[0], "EVENT");
+    let content: Value =
+        serde_json::from_str(leave[2]["content"].as_str().expect("content is a string")).unwrap();
+    assert_eq!(content["kind"], "leave");
+    assert_eq!(content["peer_id"], "devA");
+
+    server.stop();
+}
+
+// End-to-end: a driver learns a peer left the instant the relay sees the
+// peer's socket drop — no heartbeat-timeout wait. Proves the smart-relay
+// departure path lights up `NostrInbound::PeerLeft` through the real
+// driver, while staying plain NIP-01 on the wire.
+#[tokio::test]
+async fn driver_gets_peer_left_when_peer_disconnects() {
+    use myownmesh_signaling::nostr::driver::{
+        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+    };
+    use tokio::sync::mpsc;
+
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let mk = |device: &str| NostrDriverConfig {
+        app_id: "myownmesh-test".into(),
+        network_id: "leave-net".into(),
+        device_id: device.into(),
+        servers: vec![url.clone()],
+        denylist: vec![],
+        redundancy: 1,
+    };
+
+    let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
+    let driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+
+    let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
+    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+
+    // First B discovers A.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = in_rx_b.recv().await {
+            if matches!(ev, NostrInbound::PeerAnnounced { device_id } if device_id == "device-aaa")
+            {
+                return;
+            }
+        }
+        panic!("B never discovered A");
+    })
+    .await
+    .expect("discovery timed out");
+
+    // Now A leaves. Dropping the handle + outbound sender closes A's
+    // relay socket; the relay emits a leave; B's driver surfaces PeerLeft.
+    drop(driver_a);
+    drop(out_tx_a);
+
+    let saw_leave = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = in_rx_b.recv().await {
+            if matches!(ev, NostrInbound::PeerLeft { device_id } if device_id == "device-aaa") {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for PeerLeft");
+    assert!(saw_leave, "B never saw A's departure");
+
     drop(out_tx_b);
     server.stop();
 }

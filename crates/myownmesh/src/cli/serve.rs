@@ -36,22 +36,18 @@ pub async fn run() -> Result<()> {
     // handle so the control socket can address them by id (peers
     // list, roster ops, topology, add/remove) without serve.rs
     // threading handles through every dispatch arm.
+    //
+    // Node participation is itself a toggle: a pure-infrastructure box
+    // (`services.node.enabled = false`) hosts signaling / STUN / TURN
+    // without joining any network. The join path is shared with the
+    // runtime node-enable transition in `ServiceManager`.
     let registry = NetworkRegistry::new();
-    for net in cfg.networks.iter() {
-        match mesh.join(net.clone()).await {
-            Ok(joined_net) => {
-                info!(network = %net.network_id, "joined network");
-                let state = joined_net.state();
-                let nostr = myownmesh_core::engine::attach_nostr(&state);
-                if nostr.is_none() {
-                    warn!(network = %net.network_id, "nostr attach returned no handle");
-                }
-                registry.insert(joined_net, nostr);
-            }
-            Err(e) => {
-                warn!(network = %net.network_id, "join failed: {e:#}");
-            }
+    if cfg.services.node.enabled {
+        for net in cfg.networks.iter() {
+            crate::services::join_network(&mesh, &registry, net.clone()).await;
         }
+    } else {
+        info!("node participation disabled — pure-infrastructure mode (hosting services only)");
     }
 
     // Infrastructure services (relay / signaling / STUN / TURN). The

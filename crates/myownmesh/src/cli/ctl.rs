@@ -40,17 +40,18 @@ pub enum CtlCmd {
 pub enum ServicesCmd {
     /// Show which services this device hosts and their listen addresses.
     Status,
-    /// Turn a service on: relay | signaling | stun | turn. TURN also
-    /// needs credentials + a public IP — set those in config.json (or
-    /// the GUI) first; an enabled-but-unconfigured TURN shows as not
-    /// running.
+    /// Turn a service on: node | relay | signaling | stun | turn.
+    /// `node` is mesh participation itself (off = pure-infrastructure
+    /// box). TURN also needs credentials + a public IP — set those in
+    /// config.json (or the GUI) first; an enabled-but-unconfigured TURN
+    /// shows as not running.
     Enable {
-        /// relay | signaling | stun | turn
+        /// node | relay | signaling | stun | turn
         service: String,
     },
-    /// Turn a service off: relay | signaling | stun | turn.
+    /// Turn a service off: node | relay | signaling | stun | turn.
     Disable {
-        /// relay | signaling | stun | turn
+        /// node | relay | signaling | stun | turn
         service: String,
     },
 }
@@ -178,11 +179,14 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
     let mut services: ServicesConfig =
         serde_json::from_value(config_val).context("parse current services config")?;
     match service {
+        "node" => services.node.enabled = enabled,
         "relay" => services.relay.enabled = enabled,
         "signaling" => services.signaling.enabled = enabled,
         "stun" => services.stun.enabled = enabled,
         "turn" => services.turn.enabled = enabled,
-        other => bail!("unknown service '{other}' — expected relay | signaling | stun | turn"),
+        other => {
+            bail!("unknown service '{other}' — expected node | relay | signaling | stun | turn")
+        }
     }
     let response = roundtrip(&Request::ServicesSet { services }).await?;
     print_response(response)
