@@ -19,7 +19,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
@@ -107,6 +107,16 @@ pub fn start(
     // Fan-out channel for outbound events. Capacity is generous
     // so a slow relay can't backpressure the publish side.
     let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(64);
+    // Force-reconnect signal. A bumped generation tells every relay
+    // task to drop its current socket and redial *now*, skipping the
+    // backoff wait — see `run_relay` / `run_relay_session`. The engine
+    // bumps it on resume-from-sleep so a zombie relay socket (a TCP
+    // connection the OS never tore down while the host was suspended)
+    // is replaced immediately instead of waiting minutes for the
+    // kernel to notice the peer is gone. `Arc` so the same sender is
+    // shared by the driver tasks (which `.subscribe()` receivers) and
+    // the engine (which holds a clone to bump it).
+    let force_reconnect = Arc::new(watch::channel(0u64).0);
     let shared = Arc::new(DriverShared {
         identity,
         room_handle,
@@ -114,6 +124,7 @@ pub fn start(
         relays: Mutex::new(Vec::new()),
         outbound: tokio::sync::Mutex::new(Some(outbound_rx)),
         publish_tx,
+        force_reconnect: force_reconnect.clone(),
         seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
             SEEN_EVENT_CAPACITY,
         )),
@@ -163,13 +174,17 @@ pub fn start(
         run_announcer(shared_for_announce, cancel_token_for_task).await;
     });
 
-    NostrDriverHandle { cancellers }
+    NostrDriverHandle {
+        cancellers,
+        force_reconnect,
+    }
 }
 
 /// Handle returned by [`start`]. Drop or call [`Self::stop`] to
 /// signal every spawned task to exit.
 pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
+    force_reconnect: Arc<watch::Sender<u64>>,
 }
 
 impl NostrDriverHandle {
@@ -177,6 +192,14 @@ impl NostrDriverHandle {
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Clone of the force-reconnect signal. The engine stashes this
+    /// (see `engine::state::NetworkState::set_relay_reconnect`) and
+    /// bumps it to make every relay redial immediately — e.g. on
+    /// resume from sleep, when the existing sockets are stale.
+    pub fn reconnect_signal(&self) -> Arc<watch::Sender<u64>> {
+        self.force_reconnect.clone()
     }
 }
 
@@ -195,6 +218,11 @@ struct DriverShared {
     relays: Mutex<Vec<RelayHandle>>,
     outbound: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<NostrOutbound>>>,
     publish_tx: broadcast::Sender<Arc<NostrEvent>>,
+    /// Generation counter for forced reconnects. Bumping it wakes
+    /// every relay task's `watch::Receiver` so it drops its socket
+    /// and redials without waiting out the backoff. See the comment
+    /// at the channel's creation in [`start`].
+    force_reconnect: Arc<watch::Sender<u64>>,
     /// Cross-relay event-ID dedupe ring. Each Nostr event has a
     /// sha256 `id`; the same event published once to N relays
     /// arrives N times if we don't dedupe. Without this, the engine
@@ -230,6 +258,11 @@ async fn run_relay(
 ) {
     let mut backoff_attempt = 0u32;
     let mut replay = SubscriptionReplay::new();
+    // Receiver for forced reconnects. `borrow_and_update` marks the
+    // current generation as seen so a stale value from before this
+    // task started can't fire a spurious immediate reconnect.
+    let mut force_rx = shared.force_reconnect.subscribe();
+    force_rx.borrow_and_update();
     // Tracks consecutive connect failures so we can dampen the log
     // spam from chronically-broken public relays (DNS no-such-host,
     // 403s, TLS handshake timeouts). Without this, a single bad
@@ -257,10 +290,26 @@ async fn run_relay(
                 }
                 consecutive_failures = 0;
                 backoff_attempt = 0;
-                let outcome =
-                    run_relay_session(&url, stream, &shared, &inbound_tx, &mut replay, &cancel)
-                        .await;
+                let outcome = run_relay_session(
+                    &url,
+                    stream,
+                    &shared,
+                    &inbound_tx,
+                    &mut replay,
+                    &cancel,
+                    &mut force_rx,
+                )
+                .await;
                 trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
+                if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
+                    // Engine asked us to redial now (e.g. resume from
+                    // sleep). Skip the backoff entirely and reconnect on
+                    // the next loop turn so a fresh socket — and the
+                    // open-announce it sends — lands immediately.
+                    debug!(relay = %short(&url), "forced reconnect — redialing now");
+                    backoff_attempt = 0;
+                    continue;
+                }
             }
             Err(e) => {
                 if consecutive_failures == 0 {
@@ -278,20 +327,33 @@ async fn run_relay(
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        // Reconnect backoff: 1 / 2 / 4 / 8 / 16 s capped at 60 s.
+        // Reconnect backoff: 1 / 2 / 4 / 8 / 16 s capped at 60 s. A
+        // forced-reconnect bump cuts the wait short so resume-from-sleep
+        // recovery doesn't sit through a backoff that accrued while the
+        // host was suspended.
         backoff_attempt = (backoff_attempt + 1).min(6);
         let wait = (1u64 << backoff_attempt).min(60);
         debug!(relay = %short(&url), wait_s = wait, "relay backoff before reconnect");
-        sleep(Duration::from_secs(wait)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_secs(wait)) => {}
+            _ = force_rx.changed() => {
+                debug!(relay = %short(&url), "forced reconnect during backoff — redialing now");
+                backoff_attempt = 0;
+            }
+        }
     }
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Variants are read by their Debug impl in trace logs.
+#[allow(dead_code)] // Some variants are read only via their Debug impl in trace logs.
 enum RelaySessionOutcome {
     Cancelled,
     SocketClosed,
     Error(String),
+    /// The engine bumped the force-reconnect signal — drop this socket
+    /// and redial immediately, skipping the backoff. Matched in
+    /// [`run_relay`].
+    ForcedReconnect,
 }
 
 /// How often the relay read loop wakes on an otherwise-idle socket to
@@ -311,6 +373,7 @@ async fn run_relay_session(
     inbound_tx: &mpsc::UnboundedSender<NostrInbound>,
     replay: &mut SubscriptionReplay,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
+    force_rx: &mut watch::Receiver<u64>,
 ) -> RelaySessionOutcome {
     let (mut write, mut read) = stream.split();
 
@@ -406,6 +469,16 @@ async fn run_relay_session(
                         warn!(relay = %short(url), "publish bus lagged {n} events");
                     }
                 }
+            }
+            // Forced reconnect — the engine bumped the generation
+            // (resume-from-sleep, etc.). Tear this session down so
+            // `run_relay` redials immediately onto a fresh socket. We
+            // skip the clean Close frame here: the whole point is that
+            // the existing socket is likely a zombie, so spending up to
+            // a second trying to close it gracefully would defeat the
+            // "reconnect now" intent.
+            _ = force_rx.changed() => {
+                return RelaySessionOutcome::ForcedReconnect;
             }
             // Idle-wake so a stopped/dropped handle is noticed within one
             // poll interval even on a quiet socket. Without this, a
@@ -693,6 +766,7 @@ mod tests {
             relays: Mutex::new(Vec::new()),
             outbound: tokio::sync::Mutex::new(Some(out_rx)),
             publish_tx,
+            force_reconnect: Arc::new(watch::channel(0u64).0),
             seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
                 SEEN_EVENT_CAPACITY,
             )),
