@@ -133,12 +133,18 @@ fn install_and_configure(domain: &str) -> Result<()> {
     println!();
     println!("Done. Peers can now point at  wss://{host}");
     println!();
-    println!("For it to work end to end, make sure:");
+    println!("Three things have to be true for TLS to come up:");
     println!("  • DNS — an A/AAAA record for {host} resolves to this server's public IP.");
-    println!("  • Firewall — inbound TCP 80 and 443 are open (80 is the ACME challenge).");
+    println!("  • Firewall — inbound TCP 80 AND 443 open (Caddy needs 80 for the ACME challenge).");
     println!("  • Relay — `myownmesh serve` is running with services.signaling.enabled = true.");
     println!();
-    println!("Verify:  curl -I https://{host}");
+    println!(
+        "Verify:  curl -I https://{host}   (Caddy issues the cert on the first HTTPS request)"
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    println!(
+        "If it doesn't answer:  sudo systemctl status caddy  ·  sudo journalctl -u caddy -n 50"
+    );
     Ok(())
 }
 
@@ -302,6 +308,47 @@ fn caddy_installed() -> bool {
 
 fn reload_caddy(path: &Path) {
     let cfg = path.to_string_lossy().to_string();
+
+    // Validate first so a typo in the merged file can't take down a
+    // running relay. Non-fatal — just a heads-up if it fails.
+    if !run_echo(
+        "caddy",
+        &["validate", "--config", &cfg, "--adapter", "caddyfile"],
+    ) {
+        println!("• Couldn't validate the Caddyfile — continuing anyway.");
+    }
+
+    // A packaged Caddy (apt / dnf, or Homebrew) runs as a *managed
+    // service* that owns the config path we just wrote — and that
+    // service is what has to start to bind :443 and provision the
+    // certificate. A bare `caddy reload` only talks to an
+    // already-running instance, and `caddy start` as a normal user
+    // can't bind :443. So drive the service manager first; that's the
+    // step that was missing when "TLS isn't working" after install.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if has_systemd_caddy() {
+            // Start now and at boot, then load our config (reload is
+            // graceful; restart is the fallback if reload can't).
+            run_sudo("systemctl", &["enable", "--now", "caddy"]);
+            if run_sudo("systemctl", &["reload", "caddy"])
+                || run_sudo("systemctl", &["restart", "caddy"])
+            {
+                println!("✓ Caddy service is running with the new config.");
+                return;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if which("brew") && run_echo("brew", &["services", "restart", "caddy"]) {
+            println!("✓ Caddy service restarted with the new config.");
+            return;
+        }
+    }
+
+    // No managed service detected — reload a running instance, else
+    // launch one in the background.
     if run_echo(
         "caddy",
         &["reload", "--config", &cfg, "--adapter", "caddyfile"],
@@ -318,15 +365,31 @@ fn reload_caddy(path: &Path) {
         return;
     }
     println!();
-    println!("Couldn't reload or start Caddy automatically. Start it yourself:");
+    println!("Couldn't start Caddy automatically. Start it yourself:");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    println!("    sudo systemctl enable --now caddy && sudo systemctl reload caddy");
+    #[cfg(target_os = "macos")]
+    println!("    brew services restart caddy");
     println!(
-        "    caddy run --config {} --adapter caddyfile",
+        "  or in the foreground:  caddy run --config {} --adapter caddyfile",
         path.display()
     );
-    #[cfg(target_os = "macos")]
-    println!("  or:  brew services restart caddy");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    println!("  or:  sudo systemctl enable --now caddy");
+}
+
+/// Whether this box runs Caddy as a systemd service — the packaged
+/// install path on Debian/Ubuntu/Fedora. If so, that service (not a
+/// bare `caddy` invocation) is what owns binding :443 and renewing the
+/// cert, so the installer drives it through `systemctl`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn has_systemd_caddy() -> bool {
+    if !which("systemctl") {
+        return false;
+    }
+    Command::new("systemctl")
+        .args(["list-unit-files", "caddy.service"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("caddy.service"))
+        .unwrap_or(false)
 }
 
 fn try_install_caddy() -> Result<()> {
