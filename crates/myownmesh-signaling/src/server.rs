@@ -223,9 +223,22 @@ async fn accept_loop(listener: TcpListener, hub: Hub) {
 }
 
 async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| Error::Socket(e.to_string()))?;
+    let ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            // A failed handshake means something reached us on the TCP
+            // port but didn't complete a WebSocket upgrade. The most
+            // common cause in a public deployment is a `wss://` (TLS)
+            // client hitting this *plain-ws* listener with no TLS proxy
+            // in front — the TLS ClientHello isn't valid HTTP, so the
+            // upgrade fails here. (An HTTP health probe looks the same.)
+            // Log it at `warn` so an operator debugging "peers never
+            // connect" can see that traffic IS arriving but the handshake
+            // is wrong, rather than staring at silence.
+            warn!(%peer, "signaling: websocket handshake failed — a wss:// client on a plain-ws relay (no TLS proxy)?: {e}");
+            return Ok(());
+        }
+    };
     let (mut write, mut read) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
 
