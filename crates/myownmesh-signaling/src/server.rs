@@ -106,6 +106,24 @@ impl Default for Limits {
     }
 }
 
+/// Live activity snapshot for the relay — surfaced in the periodic log
+/// heartbeat and via `ctl services status` so an operator can tell at a
+/// glance whether peers are actually reaching the relay. A public
+/// deployment behind a misconfigured proxy / wrong DNS shows
+/// `connections: 0` here, which says "traffic isn't arriving" rather than
+/// "the relay is broken".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayStatsSnapshot {
+    /// Connections open right now.
+    pub connections: u64,
+    /// Connections accepted since startup.
+    pub connections_total: u64,
+    /// Rooms with at least one live member.
+    pub rooms: u64,
+    /// `EVENT`s the relay has accepted and fanned out since startup.
+    pub events_relayed: u64,
+}
+
 /// A running signaling relay. Constructed via [`SignalingServer::start`].
 pub struct SignalingServer;
 
@@ -113,7 +131,9 @@ pub struct SignalingServer;
 /// [`SignalingServerHandle::stop`]) to shut the listener down.
 pub struct SignalingServerHandle {
     task: JoinHandle<()>,
+    heartbeat: JoinHandle<()>,
     local_addr: SocketAddr,
+    hub: Hub,
 }
 
 impl SignalingServerHandle {
@@ -123,15 +143,22 @@ impl SignalingServerHandle {
         self.local_addr
     }
 
+    /// Live activity snapshot — connections, rooms, events relayed.
+    pub fn stats(&self) -> RelayStatsSnapshot {
+        self.hub.snapshot()
+    }
+
     /// Stop the relay, aborting its accept loop and connection tasks.
     pub fn stop(self) {
         self.task.abort();
+        self.heartbeat.abort();
     }
 }
 
 impl Drop for SignalingServerHandle {
     fn drop(&mut self) {
         self.task.abort();
+        self.heartbeat.abort();
     }
 }
 
@@ -149,8 +176,33 @@ impl SignalingServer {
             .map_err(|e| Error::Bind(addr.clone(), e))?;
         info!(%local_addr, "signaling relay listening (NIP-01 over WebSocket)");
         let hub = Hub::new(limits);
-        let task = tokio::spawn(accept_loop(listener, hub));
-        Ok(SignalingServerHandle { task, local_addr })
+        let task = tokio::spawn(accept_loop(listener, hub.clone()));
+        let heartbeat = tokio::spawn(stats_heartbeat(hub.clone()));
+        Ok(SignalingServerHandle {
+            task,
+            heartbeat,
+            local_addr,
+            hub,
+        })
+    }
+}
+
+/// Periodic activity log so an operator watching the daemon can see the
+/// relay is alive and whether anyone is connected. `connections: 0` every
+/// interval is the tell that traffic isn't reaching the relay (DNS / TLS /
+/// firewall) rather than the relay itself being broken.
+async fn stats_heartbeat(hub: Hub) {
+    let mut tick = tokio::time::interval(Duration::from_secs(300));
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tick.tick().await;
+        let s = hub.snapshot();
+        info!(
+            connections = s.connections,
+            rooms = s.rooms,
+            events_relayed = s.events_relayed,
+            "signaling: relay activity"
+        );
     }
 }
 
@@ -244,6 +296,10 @@ struct HubInner {
     /// Keypair used only to sign the relay's own synthesized `leave`
     /// events so they're well-formed for verifying peers.
     identity: NostrIdentity,
+    /// Activity counters surfaced via [`Hub::snapshot`] (live connection
+    /// count + room count are read directly from the maps).
+    connections_total: u64,
+    events_relayed: u64,
 }
 
 struct ConnEntry {
@@ -282,6 +338,8 @@ impl Hub {
                 ip_counts: HashMap::new(),
                 limits,
                 identity: NostrIdentity::generate(),
+                connections_total: 0,
+                events_relayed: 0,
             })),
         }
     }
@@ -296,6 +354,16 @@ impl Hub {
 
     fn on_client_message(&self, id: u64, txt: &str) -> bool {
         self.inner.lock().on_client_message(id, txt)
+    }
+
+    fn snapshot(&self) -> RelayStatsSnapshot {
+        let g = self.inner.lock();
+        RelayStatsSnapshot {
+            connections: g.conns.len() as u64,
+            connections_total: g.connections_total,
+            rooms: g.presence.len() as u64,
+            events_relayed: g.events_relayed,
+        }
     }
 }
 
@@ -322,6 +390,8 @@ impl HubInner {
                 strikes: 0,
             },
         );
+        self.connections_total += 1;
+        info!(%ip, active = self.conns.len(), "signaling: client connected");
         Some(id)
     }
 
@@ -335,6 +405,7 @@ impl HubInner {
                 self.ip_counts.remove(&entry.ip);
             }
         }
+        info!(ip = %entry.ip, active = self.conns.len(), "signaling: client disconnected");
         // Emit a departure for each device this connection was the live
         // owner of (skip any that a newer connection has since taken
         // over — presence holds only the latest owner per device).
@@ -517,6 +588,7 @@ impl HubInner {
                 return;
             }
         };
+        self.events_relayed = self.events_relayed.saturating_add(1);
 
         // Live presence: an announce makes this connection the owner of
         // (room, device). Best-effort — only well-formed mesh announces

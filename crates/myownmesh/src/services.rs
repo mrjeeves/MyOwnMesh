@@ -23,7 +23,7 @@ use myownmesh_core::{
     CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, RelayService, ServicesConfig,
 };
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
-use myownmesh_signaling::server::{SignalingServer, SignalingServerHandle};
+use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -73,6 +73,10 @@ pub struct EndpointReport {
     pub running: bool,
     /// The address the listener bound, when running.
     pub listen: Option<String>,
+    /// Live activity, for the signaling relay only (None for STUN/TURN).
+    /// Lets an operator see at a glance whether peers are reaching it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<RelayStatsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,16 +281,19 @@ impl ManagerState {
                 enabled: self.config.signaling.enabled,
                 running: self.signaling.is_some(),
                 listen: self.signaling.as_ref().map(|h| h.local_addr().to_string()),
+                activity: self.signaling.as_ref().map(|h| h.stats()),
             },
             stun: EndpointReport {
                 enabled: self.config.stun.enabled,
                 running: self.stun.is_some(),
                 listen: self.stun.as_ref().map(|h| h.local_addr().to_string()),
+                activity: None,
             },
             turn: EndpointReport {
                 enabled: self.config.turn.enabled,
                 running: self.turn.is_some(),
                 listen: self.turn.as_ref().map(|h| h.local_addr().to_string()),
+                activity: None,
             },
         }
     }

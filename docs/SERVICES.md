@@ -277,6 +277,75 @@ In the GUI these live under a network's gear icon → **Settings**
 self-hosted device for signaling + TURN, the network needs nothing
 outside its own walls.
 
+## Running a public relay
+
+The signaling relay is built to be safe to stand up publicly (that's what
+the flood limits are for). Three deployment realities to get right:
+
+### 1. It serves plain `ws://` — terminate TLS in front of it
+
+The relay speaks plain WebSocket; it has **no built-in TLS**. Browsers on
+an HTTPS page, and the built-in default relay list, use `wss://`, so a
+public endpoint needs a TLS-terminating reverse proxy that forwards the
+WebSocket upgrade to the relay. Caddy (auto-HTTPS):
+
+```
+relay.example.com {
+    reverse_proxy 127.0.0.1:4848
+}
+```
+
+or nginx:
+
+```
+location / {
+    proxy_pass http://127.0.0.1:4848;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
+Peers then point at `wss://relay.example.com`; keep the relay's own port
+(4848) bound to loopback/private and open 443 at the firewall.
+
+### 2. Give it its own hostname
+
+If a name is a static site (GitHub Pages, etc.) its DNS points at the
+static host, not your relay box — `wss://that-name` hits the site, not the
+relay. Run the relay on a server you control and point a **dedicated
+subdomain** (e.g. `relay.example.com`) at it.
+
+> The trap with `myownmesh.com`: that name is the project's GitHub Pages
+> site, so it can't host a WebSocket server and its DNS doesn't point at
+> one. A public relay needs its own host / subdomain.
+
+### 3. Verify traffic is actually arriving
+
+The relay logs every connection and a periodic heartbeat at `info`, and
+`ctl services status` reports live counts — so you can tell "nobody's
+reaching me" from "I'm broken":
+
+```
+$ myownmesh ctl services status        # the signaling.activity block
+{ "connections": 2, "connections_total": 5, "rooms": 1, "events_relayed": 42 }
+```
+
+In the daemon log, per peer plus a 5-minute heartbeat:
+
+```
+INFO signaling: client connected     ip=… active=1
+INFO signaling: client disconnected  ip=… active=0
+INFO signaling: relay activity       connections=2 rooms=1 events_relayed=42
+```
+
+If you see `listening` but **never** a `client connected` (and
+`connections` stays `0`) while peers are trying, the relay is fine — the
+traffic isn't arriving. Check, in order: **DNS** (does the hostname
+resolve to this box?), **TLS / proxy** (is the proxy upgrading
+WebSockets?), then **firewall** (is the port open?).
+
 ## Where it lives in the code
 
 | Piece | Location |
