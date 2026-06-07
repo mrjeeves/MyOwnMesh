@@ -2,6 +2,7 @@
 //! command's argv shape and behavior lives in one place rather than
 //! threading through a giant `main.rs`.
 
+pub mod caddy;
 pub mod config;
 pub mod ctl;
 pub mod gui;
