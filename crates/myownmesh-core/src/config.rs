@@ -70,17 +70,14 @@ pub struct StunServer {
     pub urls: Vec<String>,
 }
 
-/// Built-in STUN URLs applied when a deserialized `NetworkConfig`
-/// omits `stun_servers`. Three vendors so any single provider's
-/// outage still leaves NAT traversal working. Mirrors MyOwnLLM's
-/// `DEFAULT_NETWORK_STUN`. Users can opt out by writing an explicit
-/// empty array (`"stun_servers": []`) — `default_stun_servers` only
-/// fires when the field is absent.
-pub const DEFAULT_NETWORK_STUN: &[&str] = &[
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-    "stun:stun.cloudflare.com:3478",
-];
+/// Built-in STUN URL applied when a deserialized `NetworkConfig` omits
+/// `stun_servers`. Points at the project's reference STUN so NAT
+/// reflexion works out of the box. STUN is the same program too — a
+/// `myownmesh` host running `services.turn` answers STUN on the same
+/// port — so run your own and point `stun_servers` at it. Opt out
+/// entirely with an explicit empty array (`"stun_servers": []`);
+/// `default_stun_servers` only fires when the field is absent.
+pub const DEFAULT_NETWORK_STUN: &[&str] = &["stun:stun.myownmesh.com:3478"];
 
 /// Build the default STUN server list. Exposed so embedders that
 /// construct `NetworkConfig` programmatically can call
@@ -91,6 +88,21 @@ pub fn default_stun_servers() -> Vec<StunServer> {
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+    }]
+}
+
+/// Build the default TURN server list. Relays media/data when no direct
+/// path exists (symmetric NAT, CGNAT, locked-down hotspots). Points at
+/// the project's reference TURN with a shared guest credential so it
+/// works out of the box. That relay is bandwidth-capped per connection,
+/// so for sustained throughput run your own — `services.turn` on any
+/// `myownmesh` host — and point `turn_servers` at it. Opt out with an
+/// explicit empty array (`"turn_servers": []`).
+pub fn default_turn_servers() -> Vec<TurnServer> {
+    vec![TurnServer {
+        urls: vec!["turn:turn.myownmesh.com:3478".to_string()],
+        username: Some("guest".to_string()),
+        credential: Some("theguestpassword".to_string()),
     }]
 }
 
@@ -186,11 +198,14 @@ pub struct NetworkConfig {
     pub signaling: SignalingConfig,
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<StunServer>,
-    /// TURN servers are never bundled — user-supplied only. ICE
-    /// works without TURN for most cases; the engine surfaces a
-    /// dedicated `ice-failed-no-turn` diagnostic so the user knows
-    /// when their topology needs one.
-    #[serde(default)]
+    /// TURN servers. Defaults to the project's reference TURN (shared
+    /// guest credential, bandwidth-capped) so symmetric-NAT / CGNAT
+    /// peers connect out of the box; run your own and point this at it
+    /// for dedicated capacity. Opt out with an explicit empty array
+    /// (`"turn_servers": []`) — `default_turn_servers` only fires when
+    /// the field is absent. The engine surfaces an `ice-failed-no-turn`
+    /// diagnostic if a topology needs TURN and none is reachable.
+    #[serde(default = "default_turn_servers")]
     pub turn_servers: Vec<TurnServer>,
     /// Override the on-disk roster path. Null = use the default
     /// (`~/.myownmesh/mesh/rosters/{network_id}.json`).
@@ -612,11 +627,21 @@ mod tests {
         assert!(cfg.stun_servers[0]
             .urls
             .iter()
-            .any(|u| u.contains("google")));
-        assert!(cfg.stun_servers[0]
-            .urls
-            .iter()
-            .any(|u| u.contains("cloudflare")));
+            .any(|u| u.contains("myownmesh")));
+        // TURN is filled in the same way — an omitted field picks up the
+        // reference TURN with its guest credential so symmetric-NAT peers
+        // connect out of the box.
+        assert_eq!(cfg.turn_servers, default_turn_servers());
+        assert_eq!(cfg.turn_servers[0].username.as_deref(), Some("guest"));
+        assert!(cfg.turn_servers[0].urls[0].contains("myownmesh"));
+    }
+
+    #[test]
+    fn turn_servers_opt_out_with_empty_array() {
+        // An explicit empty array disables the default reference TURN.
+        let json = r#"{ "id": "n1", "network_id": "t", "turn_servers": [] }"#;
+        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.turn_servers.is_empty());
     }
 
     #[test]

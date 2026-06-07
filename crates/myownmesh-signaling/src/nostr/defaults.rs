@@ -1,22 +1,16 @@
-//! Built-in default Nostr relay URLs. Sourced from Trystero v0.24's
-//! defaults so the deterministic shuffle (see [`super::shuffle`])
-//! produces identical top-N picks for MyOwnMesh and JS Trystero
-//! peers configured with the same app-id.
+//! Built-in default signaling relay.
 //!
-//! Maintenance: when upstream Trystero adds or removes a default,
-//! mirror the change here so the wire-compat property holds.
+//! Out of the box, MyOwnMesh peers rendezvous on the project's
+//! reference relay so a fresh install connects with zero setup. But the
+//! relay *is* the program itself: a self-hosted signaling relay is just
+//! `myownmesh serve` with `services.signaling` enabled (a
+//! Nostr-compatible server), frontable with TLS in one step via
+//! `myownmesh install caddy <domain>`. Run your own — on your LAN, over
+//! a tailnet, or on your own domain — and point `signaling.servers` at
+//! it; it's exactly as secure and robust either way.
 
-/// Built-in default relay URL set. Order matters only as a stable
-/// input to the per-app-id shuffle — see [`super::shuffle`].
-pub const DEFAULT_RELAY_URLS: &[&str] = &[
-    "wss://nos.lol",
-    "wss://relay.damus.io",
-    "wss://relay.nostr.band",
-    "wss://nostr.mom",
-    "wss://relay.snort.social",
-    "wss://relay.primal.net",
-    "wss://nostr-pub.wellorder.net",
-    "wss://relay.nostr.bg",
-    "wss://nostr.wine",
-    "wss://offchain.pub",
-];
+/// Built-in default relay URL set, used when `signaling.servers` is
+/// empty. One reference relay today; the per-app-id shuffle (see
+/// [`super::shuffle`]) still applies when you configure several relays
+/// of your own.
+pub const DEFAULT_RELAY_URLS: &[&str] = &["wss://myownmesh.com:4848"];
