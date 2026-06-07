@@ -24,10 +24,11 @@ pub enum InstallCmd {
     /// With no DOMAIN it prints the install steps for your OS plus the
     /// reverse-proxy snippet to paste. With a DOMAIN (e.g. `myownmesh
     /// install caddy myownmesh.com`) it does the lot: installs Caddy if
-    /// it's missing, writes a `DOMAIN { reverse_proxy 127.0.0.1:<port> }`
-    /// block pointed at your relay, and reloads Caddy — so peers can
-    /// reach the relay over `wss://DOMAIN`. Safe to re-run: it only ever
-    /// touches its own managed block and backs the file up first.
+    /// it's missing, writes a Caddy site that terminates TLS on 443 and
+    /// proxies WebSocket upgrades to your relay, binds the relay to
+    /// loopback, and starts the Caddy service — so peers can reach it at
+    /// `wss://DOMAIN`. Safe to re-run: it only touches its own managed
+    /// block and backs the file up first.
     Caddy {
         /// Domain the relay is served on. Omit to just print the steps.
         domain: Option<String>,
@@ -44,7 +45,7 @@ pub enum CaddyCmd {
 pub async fn run_install(cmd: InstallCmd) -> Result<()> {
     match cmd {
         InstallCmd::Caddy { domain } => match domain {
-            Some(d) => install_and_configure(&d),
+            Some(d) => install_and_configure(&d).await,
             None => {
                 print_install_help();
                 Ok(())
@@ -70,7 +71,7 @@ pub async fn run_caddy(cmd: CaddyCmd) -> Result<()> {
 
 // ---- the "do it all" path ------------------------------------------------
 
-fn install_and_configure(domain: &str) -> Result<()> {
+async fn install_and_configure(domain: &str) -> Result<()> {
     let host = normalize_domain(domain);
     if host.is_empty() {
         anyhow::bail!("couldn't parse a domain out of {domain:?}");
@@ -78,8 +79,8 @@ fn install_and_configure(domain: &str) -> Result<()> {
     let port = signaling_port();
 
     println!("Setting up Caddy as a wss:// reverse proxy for the signaling relay.");
-    println!("  domain : {host}");
-    println!("  relay  : 127.0.0.1:{port}  (services.signaling)");
+    println!("  domain : {host}  (TLS on 443)");
+    println!("  relay  : 127.0.0.1:{port}  (services.signaling, loopback)");
     println!();
 
     // 1. Ensure Caddy is present.
@@ -129,17 +130,53 @@ fn install_and_configure(domain: &str) -> Result<()> {
     // 3. Reload (or start) Caddy.
     reload_caddy(&path);
 
-    // 4. What's left for the user.
+    // 4. Harden the relay: enable it and bind it to loopback so the only
+    //    public door is Caddy's TLS — no plaintext ws://host:{port}
+    //    straight to the relay. Applied live through the daemon when it's
+    //    running; otherwise persisted to config for the next start.
+    match crate::cli::ctl::bind_signaling_loopback().await {
+        Ok(true) => println!("✓ Relay enabled and bound to 127.0.0.1 (reachable only via Caddy)."),
+        Ok(false) => match persist_signaling_loopback() {
+            Ok(()) => println!(
+                "✓ Set the relay to 127.0.0.1 in config — restart the daemon (or `myownmesh \
+                 serve`) to apply."
+            ),
+            Err(e) => println!(
+                "• Couldn't update the relay bind ({e}). Set services.signaling.bind = \
+                 \"127.0.0.1\" yourself."
+            ),
+        },
+        Err(e) => println!("• Couldn't reach the daemon to bind the relay to loopback: {e}"),
+    }
+
+    // 5. What's left for the user.
     println!();
     println!("Done. Peers can now point at  wss://{host}");
     println!();
-    println!("For it to work end to end, make sure:");
+    println!("Two things still have to be true for TLS to come up:");
     println!("  • DNS — an A/AAAA record for {host} resolves to this server's public IP.");
-    println!("  • Firewall — inbound TCP 80 and 443 are open (80 is the ACME challenge).");
-    println!("  • Relay — `myownmesh serve` is running with services.signaling.enabled = true.");
+    println!("  • Firewall — inbound TCP 80 AND 443 open (Caddy needs 80 for the ACME challenge).");
     println!();
-    println!("Verify:  curl -I https://{host}");
+    println!(
+        "Verify:  npx wscat -c wss://{host}   (a real WebSocket handshake — expect a connect)"
+    );
+    println!(
+        "         curl -I https://{host}   (Caddy issues the cert on the first HTTPS request)"
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    println!(
+        "If it doesn't answer:  sudo systemctl status caddy  ·  sudo journalctl -u caddy -n 50"
+    );
     Ok(())
+}
+
+/// Fallback for when the daemon isn't running: persist the loopback bind
+/// (and enable signaling) to config.json so it takes effect on next start.
+fn persist_signaling_loopback() -> Result<()> {
+    let mut cfg = MeshConfig::load().unwrap_or_default();
+    cfg.services.signaling.enabled = true;
+    cfg.services.signaling.bind = "127.0.0.1".to_string();
+    cfg.save().context("save config")
 }
 
 // ---- pure helpers (unit-tested) ------------------------------------------
@@ -166,9 +203,25 @@ fn end_marker(host: &str) -> String {
     format!("# <<< myownmesh-managed: {host}")
 }
 
-/// The reverse-proxy site block for `host` → local relay `port`.
+/// The site block for `host`: proxy only WebSocket upgrades to the local
+/// relay, and answer everything else (browsers, scanners, health checks)
+/// with a plain 200 instead of letting the WS-only relay reject them with
+/// an EOF — which Caddy would otherwise log as a 502 on every stray hit.
 fn site_block(host: &str, port: u16) -> String {
-    format!("{host} {{\n\treverse_proxy 127.0.0.1:{port}\n}}\n")
+    format!(
+        "{host} {{\n\
+         \t@ws {{\n\
+         \t\theader Connection *Upgrade*\n\
+         \t\theader Upgrade websocket\n\
+         \t}}\n\
+         \thandle @ws {{\n\
+         \t\treverse_proxy 127.0.0.1:{port}\n\
+         \t}}\n\
+         \thandle {{\n\
+         \t\trespond \"MyOwnMesh signaling relay — connect over wss://\" 200\n\
+         \t}}\n\
+         }}\n"
+    )
 }
 
 /// Insert or replace *our* managed reverse-proxy block for `host` in an
@@ -302,6 +355,47 @@ fn caddy_installed() -> bool {
 
 fn reload_caddy(path: &Path) {
     let cfg = path.to_string_lossy().to_string();
+
+    // Validate first so a typo in the merged file can't take down a
+    // running relay. Non-fatal — just a heads-up if it fails.
+    if !run_echo(
+        "caddy",
+        &["validate", "--config", &cfg, "--adapter", "caddyfile"],
+    ) {
+        println!("• Couldn't validate the Caddyfile — continuing anyway.");
+    }
+
+    // A packaged Caddy (apt / dnf, or Homebrew) runs as a *managed
+    // service* that owns the config path we just wrote — and that
+    // service is what has to start to bind :443 and provision the
+    // certificate. A bare `caddy reload` only talks to an
+    // already-running instance, and `caddy start` as a normal user
+    // can't bind :443. So drive the service manager first; that's the
+    // step that was missing when "TLS isn't working" after install.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if has_systemd_caddy() {
+            // Start now and at boot, then load our config (reload is
+            // graceful; restart is the fallback if reload can't).
+            run_sudo("systemctl", &["enable", "--now", "caddy"]);
+            if run_sudo("systemctl", &["reload", "caddy"])
+                || run_sudo("systemctl", &["restart", "caddy"])
+            {
+                println!("✓ Caddy service is running with the new config.");
+                return;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if which("brew") && run_echo("brew", &["services", "restart", "caddy"]) {
+            println!("✓ Caddy service restarted with the new config.");
+            return;
+        }
+    }
+
+    // No managed service detected — reload a running instance, else
+    // launch one in the background.
     if run_echo(
         "caddy",
         &["reload", "--config", &cfg, "--adapter", "caddyfile"],
@@ -318,15 +412,31 @@ fn reload_caddy(path: &Path) {
         return;
     }
     println!();
-    println!("Couldn't reload or start Caddy automatically. Start it yourself:");
+    println!("Couldn't start Caddy automatically. Start it yourself:");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    println!("    sudo systemctl enable --now caddy && sudo systemctl reload caddy");
+    #[cfg(target_os = "macos")]
+    println!("    brew services restart caddy");
     println!(
-        "    caddy run --config {} --adapter caddyfile",
+        "  or in the foreground:  caddy run --config {} --adapter caddyfile",
         path.display()
     );
-    #[cfg(target_os = "macos")]
-    println!("  or:  brew services restart caddy");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    println!("  or:  sudo systemctl enable --now caddy");
+}
+
+/// Whether this box runs Caddy as a systemd service — the packaged
+/// install path on Debian/Ubuntu/Fedora. If so, that service (not a
+/// bare `caddy` invocation) is what owns binding :443 and renewing the
+/// cert, so the installer drives it through `systemctl`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn has_systemd_caddy() -> bool {
+    if !which("systemctl") {
+        return false;
+    }
+    Command::new("systemctl")
+        .args(["list-unit-files", "caddy.service"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("caddy.service"))
+        .unwrap_or(false)
 }
 
 fn try_install_caddy() -> Result<()> {
@@ -539,6 +649,11 @@ mod tests {
         let b = site_block("myownmesh.com", 4848);
         assert!(b.contains("myownmesh.com {"));
         assert!(b.contains("reverse_proxy 127.0.0.1:4848"));
+        // Only WebSocket upgrades are proxied; plain hits get a 200 so a
+        // WS-only relay's EOF doesn't surface as a 502 on every stray hit.
+        assert!(b.contains("header Connection *Upgrade*"));
+        assert!(b.contains("handle @ws {"));
+        assert!(b.contains("respond \"MyOwnMesh signaling relay"));
     }
 
     #[test]

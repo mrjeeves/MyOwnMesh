@@ -192,6 +192,32 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
     print_response(response)
 }
 
+/// Put the signaling relay behind a reverse proxy: enable it and bind it
+/// to loopback so the only public door is the TLS one Caddy owns (no
+/// plaintext `ws://host:4848` straight to the relay). Applied live via
+/// the daemon — `ServicesSet` rebinds the listener without a restart.
+/// Returns `Ok(true)` when applied, `Ok(false)` when the daemon isn't
+/// reachable (the caller persists to config.json and asks for a restart
+/// instead). Used by `myownmesh install caddy <domain>`.
+pub(crate) async fn bind_signaling_loopback() -> Result<bool> {
+    let status = match roundtrip(&Request::ServicesStatus).await {
+        Ok(s) => s,
+        Err(_) => return Ok(false), // daemon not running
+    };
+    if !status.ok {
+        return Ok(false);
+    }
+    let Some(config_val) = status.data.unwrap_or(Value::Null).get("config").cloned() else {
+        return Ok(false);
+    };
+    let mut services: ServicesConfig =
+        serde_json::from_value(config_val).context("parse current services config")?;
+    services.signaling.enabled = true;
+    services.signaling.bind = "127.0.0.1".to_string();
+    let response = roundtrip(&Request::ServicesSet { services }).await?;
+    Ok(response.ok)
+}
+
 async fn roundtrip(request: &Request) -> Result<Response> {
     let stream = connect_socket().await?;
     let (reader, mut writer) = stream.split();
