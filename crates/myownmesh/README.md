@@ -29,6 +29,9 @@ cargo run -p myownmesh -- serve
 ```
 myownmesh                  # open the desktop GUI (myownmesh-gui)
 myownmesh serve            # run the daemon in the foreground (headless)
+myownmesh service install  # run serve as a background OS service
+myownmesh service status   # is it installed / enabled / running?
+myownmesh service stop     # stop it (start / restart / uninstall too)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
@@ -49,6 +52,48 @@ edit; sensible defaults until then), joins every network listed
 there, attaches the Nostr signaling driver per network, and listens
 for `myownmesh ctl …` clients on a local socket
 (`~/.myownmesh/daemon.sock` on Unix, named pipe on Windows).
+
+## Running as a background service
+
+`myownmesh service …` registers `serve` with the host init system so
+the daemon survives logout and reboot — **systemd** on Linux,
+**launchd** on macOS. (This manages the daemon *process*; it's
+unrelated to `ctl services`, which toggles the mesh's own hosted
+relay / STUN / TURN / signaling roles.)
+
+```bash
+myownmesh service install    # write the unit + enable + start it
+myownmesh service status     # installed / enabled / running, + log hint
+myownmesh service start      # start | stop | restart
+myownmesh service uninstall  # stop, disable, remove
+```
+
+By default it installs a **per-user** service (no root; state stays in
+`~/.myownmesh`; starts at login — on Linux it also enables lingering so
+it keeps running while you're logged out). Pass `--system` for a
+root-owned service that starts at **boot** and keeps its state under a
+system directory:
+
+```bash
+sudo myownmesh service --system install
+```
+
+The Linux system unit runs unprivileged via `DynamicUser=yes` +
+`StateDirectory=` (state in `/var/lib/myownmesh`, no account to
+create) with a hardening block; the macOS system daemon stores state
+under `/Library/Application Support/MyOwnMesh`. `--system` disables the
+in-process self-updater (it can't rewrite a root-owned binary); update
+by re-running the installer / `cargo install`, then
+`sudo myownmesh service --system restart`.
+
+If `serve` lives in your home (e.g. a `cargo install` build), a
+`--system` install copies it to `/usr/local/lib/myownmesh/` so the
+service account can execute it. Follow logs with the printed hint
+(`journalctl -u myownmesh -f`, or `tail -f` the launchd log).
+
+Windows isn't wired to a service manager yet — `service` there points
+you at Task Scheduler / NSSM instead. On a headless / SSH-only Mac,
+prefer `--system` (a LaunchAgent needs a GUI session to load).
 
 ## Logging
 

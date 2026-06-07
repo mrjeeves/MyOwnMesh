@@ -37,6 +37,7 @@ pub fn launch() -> ExitCode {
         eprintln!();
         eprintln!("On a headless box, run the daemon directly instead:");
         eprintln!("  myownmesh serve            # run the mesh daemon in the foreground");
+        eprintln!("  myownmesh service install  # ...or run it as a background service");
         eprintln!("  myownmesh ctl status       # query a running daemon");
         eprintln!("  myownmesh identity show    # print this device's id");
         eprintln!();

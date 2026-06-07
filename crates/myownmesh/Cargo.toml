@@ -36,6 +36,13 @@ serde_json = { workspace = true }
 interprocess = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+dirs = { workspace = true }
+
+# `service --system` needs an effective-uid check to fail fast without
+# root. Unix-only; the Windows build routes `service` to a manual-setup
+# message and never touches libc.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 myownmesh-signaling = { workspace = true }

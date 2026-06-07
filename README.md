@@ -217,6 +217,8 @@ protocol-message checklist, and the topology-mode checklist.
 ```sh
 myownmesh                  # open the desktop GUI (myownmesh-gui)
 myownmesh serve            # run the daemon in the foreground (headless)
+myownmesh service install  # run serve as a background service (systemd/launchd)
+myownmesh service status   # installed / enabled / running (start|stop|restart|uninstall)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list

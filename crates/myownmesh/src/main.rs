@@ -49,6 +49,18 @@ enum Command {
         #[command(subcommand)]
         action: Option<cli::update::UpdateCmd>,
     },
+    /// Install/start/stop/uninstall MyOwnMesh as a background OS service
+    /// (systemd on Linux, launchd on macOS). Manages the daemon process
+    /// lifecycle — distinct from `ctl services`, which toggles the mesh's
+    /// own hosted relay/STUN/TURN/signaling roles.
+    Service {
+        /// Manage the system-wide service (root, starts at boot) instead
+        /// of the default per-user service (no root, starts at login).
+        #[arg(long, global = true)]
+        system: bool,
+        #[command(subcommand)]
+        action: cli::service::ServiceCmd,
+    },
     /// Open the config file in $EDITOR.
     Config {
         #[command(subcommand)]
@@ -127,6 +139,7 @@ fn main() -> ExitCode {
             Command::Identity { action } => cli::identity::run(action).await,
             Command::Ctl { action } => cli::ctl::run(action).await,
             Command::Update { action } => cli::update::run(action).await,
+            Command::Service { system, action } => cli::service::run(system, action).await,
             Command::Config { action } => cli::config::run(action).await,
         }
     });

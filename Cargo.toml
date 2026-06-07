@@ -84,6 +84,10 @@ secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
 which = "6"
+# Effective-uid check for `service --system` (Unix only). Already in the
+# tree transitively via the webrtc stack; promoting it to a direct dep
+# adds nothing.
+libc = "0.2"
 
 # Test-only
 tempfile = "3"
