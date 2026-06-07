@@ -294,6 +294,14 @@ enum RelaySessionOutcome {
     Error(String),
 }
 
+/// How often the relay read loop wakes on an otherwise-idle socket to
+/// re-check the cancel flag. The loop wakes immediately on any inbound
+/// frame or outbound publish; this bounds how long a *stopped* driver
+/// (handle dropped / `stop()`) holds an idle socket open before it tears
+/// it down — which is what lets an intelligent relay emit our `leave`
+/// promptly rather than waiting on its own connection timeout.
+const RELAY_CANCEL_POLL_MS: u64 = 250;
+
 async fn run_relay_session(
     url: &str,
     stream: tokio_tungstenite::WebSocketStream<
@@ -359,6 +367,11 @@ async fn run_relay_session(
 
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            // Best-effort clean close so the relay sees our departure
+            // immediately (a Close frame, falling back to the TCP FIN
+            // from dropping the stream). Bounded so a wedged socket
+            // can't hang teardown.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), write.close()).await;
             return RelaySessionOutcome::Cancelled;
         }
         tokio::select! {
@@ -394,6 +407,13 @@ async fn run_relay_session(
                     }
                 }
             }
+            // Idle-wake so a stopped/dropped handle is noticed within one
+            // poll interval even on a quiet socket. Without this, a
+            // `read.next()` parked on an idle connection could hold the
+            // socket open long after `stop()`, delaying the relay's
+            // departure signal. Normal traffic wakes the loop sooner via
+            // the branches above; this only bites when nothing is moving.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(RELAY_CANCEL_POLL_MS)) => {}
         }
     }
 }
