@@ -165,13 +165,24 @@ export interface ServicesConfig {
   turn: TurnServiceConfig;
 }
 
+/** Live activity for the signaling relay — `connections: 0` is the tell
+ *  that peers aren't reaching it (DNS / TLS / firewall). */
+export interface RelayStatsSnapshot {
+  connections: number;
+  connections_total: number;
+  rooms: number;
+  events_relayed: number;
+}
+
 /** Live status of one network-listener service (signaling / STUN /
  *  TURN). `running` differs from `enabled` when a start failed — e.g. a
- *  port already in use, or TURN enabled without credentials. */
+ *  port already in use, or TURN enabled without credentials. `activity`
+ *  is present only for the signaling relay. */
 export interface EndpointReport {
   enabled: boolean;
   running: boolean;
   listen: string | null;
+  activity?: RelayStatsSnapshot | null;
 }
 
 export interface RelayReport {

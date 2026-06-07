@@ -98,7 +98,17 @@
   // Per-service status pills. Hoisted to derived values because Svelte
   // only allows {@const} as the immediate child of a block, not inside
   // a plain element.
-  const sigState = $derived(endpointState(report?.signaling));
+  // Signaling pill also surfaces the live connection count so an
+  // operator can see whether peers are actually reaching the relay.
+  const sigState = $derived.by(() => {
+    const r = report?.signaling;
+    const base = endpointState(r);
+    if (r?.running && r.activity) {
+      const n = r.activity.connections;
+      return { cls: base.cls, text: `${base.text} · ${n} client${n === 1 ? "" : "s"}` };
+    }
+    return base;
+  });
   const stunState = $derived(endpointState(report?.stun));
   const turnState = $derived(endpointState(report?.turn));
 </script>
