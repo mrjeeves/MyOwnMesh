@@ -284,18 +284,40 @@ the flood limits are for). Three deployment realities to get right:
 
 ### 1. It serves plain `ws://` — terminate TLS in front of it
 
-The relay speaks plain WebSocket; it has **no built-in TLS**. Browsers on
-an HTTPS page, and the built-in default relay list, use `wss://`, so a
-public endpoint needs a TLS-terminating reverse proxy that forwards the
-WebSocket upgrade to the relay. Caddy (auto-HTTPS):
+The relay speaks plain WebSocket; it has **no built-in TLS**. The built-in
+default relay list uses `wss://`, and port 443 also sails through
+restrictive firewalls that block oddball ports — so a public endpoint
+wants a TLS-terminating reverse proxy on **443** that forwards the
+WebSocket upgrade to the relay on loopback.
+
+One command does the lot — installs Caddy if it's missing, writes the
+site block, binds the relay to loopback, and (re)starts the Caddy
+service:
+
+```
+myownmesh install caddy relay.example.com
+```
+
+It generates a Caddy site that proxies **only** WebSocket upgrades to the
+relay and answers everything else (browsers, scanners, health checks)
+with a plain 200, so stray hits don't pile up as 502s in the log:
 
 ```
 relay.example.com {
-    reverse_proxy 127.0.0.1:4848
+    @ws {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @ws {
+        reverse_proxy 127.0.0.1:4848
+    }
+    handle {
+        respond "MyOwnMesh signaling relay — connect over wss://" 200
+    }
 }
 ```
 
-or nginx:
+Doing it by hand with nginx instead:
 
 ```
 location / {
@@ -307,8 +329,11 @@ location / {
 }
 ```
 
-Peers then point at `wss://relay.example.com`; keep the relay's own port
-(4848) bound to loopback/private and open 443 at the firewall.
+Peers then point at `wss://relay.example.com` (no port — 443). Open **80
+and 443** at the firewall (Caddy needs 80 for the ACME challenge) and keep
+the relay's own port (4848) on loopback — `install caddy` sets
+`services.signaling.bind` to `127.0.0.1` for you, so the only public door
+is the TLS one.
 
 ### 2. Give it its own hostname
 
@@ -317,9 +342,12 @@ static host, not your relay box — `wss://that-name` hits the site, not the
 relay. Run the relay on a server you control and point a **dedicated
 subdomain** (e.g. `relay.example.com`) at it.
 
-> The trap with `myownmesh.com`: that name is the project's GitHub Pages
-> site, so it can't host a WebSocket server and its DNS doesn't point at
-> one. A public relay needs its own host / subdomain.
+> Point peers at the **relay's** host, not a static site. The project's
+> own site `myownmesh.net` is GitHub Pages — it can't host a WebSocket
+> server, so `wss://myownmesh.net` would hit the site, not a relay.
+> `myownmesh.com` is the relay (a server running the Caddy proxy above).
+> Give your own relay a host or subdomain that resolves to the box it
+> runs on.
 
 ### 3. Verify traffic is actually arriving
 

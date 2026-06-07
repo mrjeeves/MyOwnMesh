@@ -10,7 +10,10 @@
 //! it; it's exactly as secure and robust either way.
 
 /// Built-in default relay URL set, used when `signaling.servers` is
-/// empty. One reference relay today; the per-app-id shuffle (see
-/// [`super::shuffle`]) still applies when you configure several relays
-/// of your own.
-pub const DEFAULT_RELAY_URLS: &[&str] = &["wss://myownmesh.com:4848"];
+/// empty. One reference relay today, reached over standard `wss://`
+/// (port 443) — TLS is terminated by the reverse proxy `myownmesh
+/// install caddy` sets up, which forwards to the relay on loopback.
+/// Port 443 also sails through restrictive firewalls that block oddball
+/// ports. The per-app-id shuffle (see [`super::shuffle`]) still applies
+/// when you configure several relays of your own.
+pub const DEFAULT_RELAY_URLS: &[&str] = &["wss://myownmesh.com"];
