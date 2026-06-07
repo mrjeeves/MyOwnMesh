@@ -126,7 +126,7 @@ allocations. Peers add `stun:your-host:3478` to a network's STUN servers.
 ### TURN
 
 A full TURN server (via the webrtc-rs `turn` crate) for peers behind
-symmetric NAT, where a direct path can't be punched. TURN needs two
+symmetric NAT, where a direct path can't be punched. TURN needs three
 things that STUN/signaling don't:
 
 - **A public IP** (`public_ip`) — the routable address the server hands
@@ -135,10 +135,29 @@ things that STUN/signaling don't:
 - **At least one credential** — a username / password pair. Mirror the
   same pair into each peer's TURN config. Enabled without credentials,
   TURN shows as *enabled, not running*.
+- **Open UDP ports — the one that bites people.** `:3478` is only the
+  *control* channel; every relayed allocation flows through a *separate*
+  UDP port. By default the server draws those from the **OS ephemeral
+  range** (so the relay is never artificially capped) — on Linux that's
+  `sysctl net.ipv4.ip_local_port_range`, e.g. Ubuntu's `32768–60999`.
+  Open `udp 3478` **and that whole range**:
+
+      sudo ufw allow 3478/udp
+      sudo ufw allow 32768:60999/udp     # your sysctl range
+
+  **All of it must be open at the host firewall AND your cloud/provider
+  security group** — a host firewall being inactive (`ufw status` →
+  `inactive`) does **not** mean the provider lets them in. The classic
+  failure is opening only 443 for the signaling proxy and then seeing
+  `0 srflx · 0 relay` candidates on every client. To shrink the firewall
+  surface, pin a fixed window via `relay_port_min` / `relay_port_max`
+  (e.g. `49152`–`65535`) and open only that. `myownmesh ctl services
+  enable turn` prints the right checklist either way.
 
 A TURN server also answers STUN binding requests, so enabling TURN gives
 you STUN for free on the same port — you rarely need both the STUN and
-TURN services on one host.
+TURN services on one host. (So `stun:` and `turn:` URLs can point at the
+same host:3478.)
 
 **Bandwidth cap (QoS).** `max_bps_per_connection` shapes each
 allocation's relayed throughput to a byte/sec ceiling, applied

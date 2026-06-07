@@ -188,8 +188,62 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
             bail!("unknown service '{other}' — expected node | relay | signaling | stun | turn")
         }
     }
+    // Capture the TURN port plan before `services` is moved, so we can
+    // print the firewall checklist after a successful enable.
+    let turn_help = if enabled && service == "turn" {
+        Some((
+            services.turn.port,
+            services.turn.relay_port_min,
+            services.turn.relay_port_max,
+            services.turn.public_ip.clone(),
+        ))
+    } else {
+        None
+    };
     let response = roundtrip(&Request::ServicesSet { services }).await?;
-    print_response(response)
+    let ok = response.ok;
+    print_response(response)?;
+    if ok {
+        if let Some((port, relay_min, relay_max, public_ip)) = turn_help {
+            print_turn_firewall_help(port, relay_min, relay_max, &public_ip);
+        }
+    }
+    Ok(())
+}
+
+/// Spell out the UDP ports a freshly-enabled TURN server needs reachable.
+/// The #1 reason a self-hosted TURN "doesn't work" is that only the
+/// control port (or nothing) is open — every relayed allocation flows
+/// through a separate port in the relay range, and a cloud security group
+/// blocks them even when the host firewall is off.
+fn print_turn_firewall_help(port: u16, relay_min: u16, relay_max: u16, public_ip: &str) {
+    println!();
+    println!("TURN is on. For NAT'd peers to actually relay, these UDP ports must be");
+    println!("reachable — at the host firewall AND your cloud/provider security group");
+    println!("(a host firewall being inactive does NOT mean the provider lets them in):");
+    println!("  • udp {port}  — STUN/TURN control");
+    if relay_min == 0 {
+        // Unbounded (default): relay sockets come from the OS ephemeral
+        // range — open that whole range.
+        println!("  • udp <OS ephemeral range>  — relay allocations (one port per active peer)");
+        println!("    find your range:  sysctl net.ipv4.ip_local_port_range   (e.g. 32768 60999)");
+        println!("ufw, if that's what you run (substitute your range):");
+        println!("  sudo ufw allow {port}/udp");
+        println!("  sudo ufw allow 32768:60999/udp");
+        println!("(Want a smaller firewall rule? Pin services.turn.relay_port_min/max.)");
+    } else {
+        println!("  • udp {relay_min}:{relay_max}  — relay allocations (one port per active peer)");
+        println!("ufw, if that's what you run:");
+        println!("  sudo ufw allow {port}/udp");
+        println!("  sudo ufw allow {relay_min}:{relay_max}/udp");
+    }
+    if public_ip.trim().is_empty() {
+        println!(
+            "Set services.turn.public_ip to this box's routable IP, too — TURN won't \
+             start without it on a wildcard bind."
+        );
+    }
+    println!("And point your stun./turn. DNS records at this box.");
 }
 
 /// Put the signaling relay behind a reverse proxy: enable it and bind it

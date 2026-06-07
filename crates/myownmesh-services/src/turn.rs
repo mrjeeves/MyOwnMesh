@@ -161,6 +161,41 @@ impl Conn for ThrottledConn {
 struct ThrottledRelayGenerator {
     inner: RelayAddressGeneratorStatic,
     max_bps: u64,
+    /// Relay sockets are bound from this inclusive port window instead of
+    /// the OS ephemeral range, so operators open one small, predictable
+    /// UDP range at the firewall. `min <= max` is guaranteed at
+    /// construction.
+    min_port: u16,
+    max_port: u16,
+    /// Round-robin starting point so we don't rescan held low ports on
+    /// every allocation — just a spread hint, not load-bearing.
+    cursor: std::sync::atomic::AtomicU16,
+}
+
+impl ThrottledRelayGenerator {
+    /// Bind a relay socket on the first free port in `[min_port, max_port]`,
+    /// scanning from a rotating cursor. Returns the same `(conn, addr)`
+    /// the static generator would, so the caller can wrap it.
+    async fn allocate_in_range(
+        &self,
+        use_ipv4: bool,
+    ) -> std::result::Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), TurnError> {
+        let span = (self.max_port - self.min_port) as u32 + 1;
+        let start = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+        let mut last_err: Option<TurnError> = None;
+        for i in 0..span {
+            let port = self.min_port + ((start + i) % span) as u16;
+            match self.inner.allocate_conn(use_ipv4, port).await {
+                Ok(pair) => return Ok(pair),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        // `span >= 1` is guaranteed at construction (min <= max), so the
+        // loop always ran at least once and set `last_err` on failure.
+        Err(last_err.expect("relay port range is non-empty"))
+    }
 }
 
 #[async_trait]
@@ -174,7 +209,16 @@ impl RelayAddressGenerator for ThrottledRelayGenerator {
         use_ipv4: bool,
         requested_port: u16,
     ) -> std::result::Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), TurnError> {
-        let (conn, addr) = self.inner.allocate_conn(use_ipv4, requested_port).await?;
+        // The TURN server passes 0 for normal allocations. With a fixed
+        // window configured (min_port != 0) pick from it so relay traffic
+        // lands on a small firewall-able range; otherwise (min_port == 0,
+        // the default) fall through to the OS ephemeral range — unbounded.
+        // A non-zero requested_port (e.g. EVEN-PORT) is always honored.
+        let (conn, addr) = if requested_port == 0 && self.min_port != 0 {
+            self.allocate_in_range(use_ipv4).await?
+        } else {
+            self.inner.allocate_conn(use_ipv4, requested_port).await?
+        };
         if self.max_bps == 0 {
             return Ok((conn, addr));
         }
@@ -279,12 +323,19 @@ impl TurnServer {
 
         let auth_handler = Arc::new(StaticAuthHandler::new(&config.realm, &config.credentials));
 
+        // Clamp the relay range so `min <= max` always holds (a
+        // misconfigured max collapses to a single port rather than
+        // underflowing the span).
+        let relay_port_min = config.relay_port_min;
+        let relay_port_max = config.relay_port_max.max(config.relay_port_min);
+
         let server = Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {
                 conn,
                 // Wrap the static generator so each allocation's relay
-                // socket is bandwidth-shaped to the configured cap (a
-                // no-op passthrough when the cap is 0).
+                // socket is drawn from the configured port range and
+                // bandwidth-shaped to the configured cap (a no-op
+                // passthrough when the cap is 0).
                 relay_addr_generator: Box::new(ThrottledRelayGenerator {
                     inner: RelayAddressGeneratorStatic {
                         relay_address: relay_ip,
@@ -295,6 +346,9 @@ impl TurnServer {
                         net: Arc::new(Net::new(None)),
                     },
                     max_bps: config.max_bps_per_connection,
+                    min_port: relay_port_min,
+                    max_port: relay_port_max,
+                    cursor: std::sync::atomic::AtomicU16::new(0),
                 }),
             }],
             realm: config.realm.clone(),
@@ -306,12 +360,19 @@ impl TurnServer {
         .await
         .map_err(|e| Error::Turn(e.to_string()))?;
 
+        let relay_ports = if relay_port_min == 0 {
+            "OS ephemeral range".to_string()
+        } else {
+            format!("{relay_port_min}-{relay_port_max}")
+        };
         info!(
             %local_addr,
             %relay_ip,
             realm = %config.realm,
             credentials = config.credentials.len(),
-            "TURN server listening"
+            relay_ports = %relay_ports,
+            "TURN listening — open UDP {} (control) and the relay ports ({}) at the firewall AND your cloud/provider security group",
+            config.port, relay_ports
         );
         Ok(TurnServerHandle {
             server,
@@ -363,6 +424,8 @@ mod tests {
             realm: "myownmesh".into(),
             credentials: vec![cred("alice", "s3cret")],
             max_bps_per_connection: 0,
+            relay_port_min: 49152,
+            relay_port_max: 50151,
         }
     }
 
@@ -386,6 +449,8 @@ mod tests {
             realm: "myownmesh".into(),
             credentials: vec![cred("alice", "pw")],
             max_bps_per_connection: 0,
+            relay_port_min: 49152,
+            relay_port_max: 50151,
         };
         assert!(matches!(
             TurnServer::start(&cfg).await,
@@ -399,6 +464,48 @@ mod tests {
         assert_ne!(server.local_addr().port(), 0);
         assert_eq!(server.relay_ip().to_string(), "127.0.0.1");
         server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_allocations_land_in_configured_range() {
+        // An allocation with no requested port must draw from the bounded
+        // relay range, so operators can open one small UDP window.
+        let generator = ThrottledRelayGenerator {
+            inner: RelayAddressGeneratorStatic {
+                relay_address: "127.0.0.1".parse().unwrap(),
+                address: "127.0.0.1".to_owned(),
+                net: Arc::new(Net::new(None)),
+            },
+            max_bps: 0,
+            min_port: 50500,
+            max_port: 50519,
+            cursor: std::sync::atomic::AtomicU16::new(0),
+        };
+        let (_conn, addr) = generator.allocate_conn(true, 0).await.unwrap();
+        assert!(
+            (50500..=50519).contains(&addr.port()),
+            "relay port {} is outside the configured range",
+            addr.port()
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_range_falls_back_to_os_ephemeral() {
+        // min_port == 0 is the default: no fixed window, allocation still
+        // succeeds on an OS-assigned port (just not constrained).
+        let generator = ThrottledRelayGenerator {
+            inner: RelayAddressGeneratorStatic {
+                relay_address: "127.0.0.1".parse().unwrap(),
+                address: "127.0.0.1".to_owned(),
+                net: Arc::new(Net::new(None)),
+            },
+            max_bps: 0,
+            min_port: 0,
+            max_port: 0,
+            cursor: std::sync::atomic::AtomicU16::new(0),
+        };
+        let (_conn, addr) = generator.allocate_conn(true, 0).await.unwrap();
+        assert_ne!(addr.port(), 0);
     }
 
     #[test]

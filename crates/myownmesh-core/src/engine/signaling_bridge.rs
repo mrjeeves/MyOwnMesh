@@ -163,6 +163,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         servers: cfg.signaling.servers.clone(),
         denylist: cfg.signaling.denylist.clone(),
         redundancy: cfg.signaling.redundancy as usize,
+        public_fallback: cfg.signaling.public_fallback,
     };
     let redundancy = nostr_cfg.redundancy;
     drop(cfg);
