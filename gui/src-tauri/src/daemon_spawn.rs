@@ -7,9 +7,15 @@
 //! Binary discovery order:
 //!
 //! 1. `MYOWNMESH_BIN` environment variable (manual override).
-//! 2. `myownmesh` (or `myownmesh.exe`) on `$PATH`.
-//! 3. Workspace dev artefacts relative to the GUI crate:
+//! 2. Workspace dev artefacts relative to the GUI crate:
 //!    `../../target/debug/myownmesh{.exe}` then `../../target/release/...`.
+//!    In a source checkout this is the binary you just built, so it must
+//!    win over any older release installed on `$PATH` — otherwise
+//!    `just dev` would run the GUI you just compiled against a stale
+//!    daemon (e.g. one that predates the `services` control ops, which
+//!    surfaces as "is the daemon running?" in the Services tab). On an
+//!    installed GUI this path doesn't exist, so we fall through to PATH.
+//! 3. `myownmesh` (or `myownmesh.exe`) on `$PATH` (the production path).
 //!
 //! If we already see an existing daemon answering on the control
 //! socket, we don't spawn a second one — the user may have started
@@ -74,6 +80,21 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
     } else {
         "myownmesh"
     };
+    // Dev-mode workspace artefacts, checked BEFORE PATH so a source
+    // checkout always runs the daemon it just built rather than an older
+    // release installed on PATH. The GUI crate's CARGO_MANIFEST_DIR is
+    // `gui/src-tauri`, so the workspace target lives at `../../target/...`.
+    // On an installed GUI this path doesn't exist, so we fall through to
+    // the PATH lookup below.
+    let candidates = vec![
+        workspace_target_path("debug", exe),
+        workspace_target_path("release", exe),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return Ok(c);
+        }
+    }
     // PATH lookup. We do this manually rather than relying on
     // Command's implicit PATH search so we can report the resolved
     // location and skip non-existent stale entries.
@@ -83,20 +104,6 @@ pub fn find_daemon_binary() -> Result<PathBuf> {
             if candidate.exists() {
                 return Ok(candidate);
             }
-        }
-    }
-    // Dev-mode workspace artefacts. The GUI crate's CARGO_MANIFEST_DIR
-    // is `gui/src-tauri`, so the workspace target lives at
-    // `../../target/...`. We resolve relative to the running exe's
-    // location first (works after `cargo install` of the GUI),
-    // falling back to CARGO_MANIFEST_DIR for `cargo run` / `tauri dev`.
-    let candidates = vec![
-        workspace_target_path("debug", exe),
-        workspace_target_path("release", exe),
-    ];
-    for c in candidates.into_iter().flatten() {
-        if c.exists() {
-            return Ok(c);
         }
     }
     Err(anyhow!(

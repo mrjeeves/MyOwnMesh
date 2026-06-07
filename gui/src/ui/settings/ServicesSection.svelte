@@ -114,7 +114,11 @@
   </p>
 
   {#if !draft || !report}
-    <div class="hint">Service status unavailable — is the daemon running?</div>
+    <div class="hint">
+      Couldn't read service status. The daemon may be stopped, or an older
+      version that predates service hosting — update or rebuild the daemon
+      and reopen this panel.
+    </div>
   {:else}
     <!-- Node --------------------------------------------------------- -->
     <div class="card">
