@@ -51,6 +51,10 @@ pub struct NostrDriverConfig {
     pub denylist: Vec<String>,
     /// Top-N relays to maintain.
     pub redundancy: usize,
+    /// Fall back to the built-in public relays when every primary relay is
+    /// unreachable. On by default; the fallback is reactive (only while
+    /// the primary set is down) so steady state stays on your own relays.
+    pub public_fallback: bool,
 }
 
 /// Inbound signaling events the driver pushes to the engine.
@@ -104,6 +108,23 @@ pub fn start(
         .collect();
     let selected = select_top_n(&config.app_id, &filtered, config.redundancy);
 
+    // Public-relay fallback pool. Computed now (before `selected` is
+    // moved): the built-in public relays, minus the denylist and anything
+    // already in the primary set. These are NOT connected in steady state
+    // — a supervisor brings them up only after every primary has been down
+    // for a grace window, and drops them again the moment one recovers, so
+    // presence isn't leaked to public infrastructure during normal
+    // operation. Off entirely when `public_fallback` is false.
+    let fallback_urls: Vec<String> = if config.public_fallback {
+        super::defaults::FALLBACK_RELAY_URLS
+            .iter()
+            .map(|s| s.to_string())
+            .filter(|u| !super::denylist::is_denied(u, denylist) && !selected.contains(u))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Fan-out channel for outbound events. Capacity is generous
     // so a slow relay can't backpressure the publish side.
     let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(64);
@@ -141,15 +162,41 @@ pub fn start(
 
     let mut cancellers = Vec::new();
 
-    // Spawn one connection task per relay.
+    // Count of primary relays with a live session; the fallback
+    // supervisor watches this to decide when to step in.
+    let primary_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Spawn one connection task per primary relay.
     for url in selected {
         let shared = shared.clone();
         let inbound_tx = inbound_tx.clone();
         let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_token_for_task = cancel_token.clone();
         cancellers.push(cancel_token);
+        let live = primary_live.clone();
         tokio::spawn(async move {
-            run_relay(url, shared, inbound_tx, cancel_token_for_task).await;
+            run_relay(url, shared, inbound_tx, cancel_token_for_task, Some(live)).await;
+        });
+    }
+
+    // Spawn the public-relay fallback supervisor (no-op unless the pool is
+    // non-empty, i.e. `public_fallback` is on and there are relays to use).
+    if !fallback_urls.is_empty() {
+        let shared = shared.clone();
+        let inbound_tx = inbound_tx.clone();
+        let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_token_for_task = cancel_token.clone();
+        cancellers.push(cancel_token);
+        let primary_live = primary_live.clone();
+        tokio::spawn(async move {
+            run_fallback_supervisor(
+                fallback_urls,
+                shared,
+                inbound_tx,
+                cancel_token_for_task,
+                primary_live,
+            )
+            .await;
         });
     }
 
@@ -255,6 +302,7 @@ async fn run_relay(
     shared: Arc<DriverShared>,
     inbound_tx: mpsc::UnboundedSender<NostrInbound>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    live: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) {
     let mut backoff_attempt = 0u32;
     let mut replay = SubscriptionReplay::new();
@@ -290,6 +338,12 @@ async fn run_relay(
                 }
                 consecutive_failures = 0;
                 backoff_attempt = 0;
+                // Count this live session so the fallback supervisor can
+                // tell whether any primary relay is currently connected.
+                // `None` for fallback tasks (they don't gate themselves).
+                if let Some(c) = &live {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let outcome = run_relay_session(
                     &url,
                     stream,
@@ -300,6 +354,9 @@ async fn run_relay(
                     &mut force_rx,
                 )
                 .await;
+                if let Some(c) = &live {
+                    c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
                 if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
                     // Engine asked us to redial now (e.g. resume from
@@ -341,6 +398,111 @@ async fn run_relay(
                 backoff_attempt = 0;
             }
         }
+    }
+}
+
+/// How often the fallback supervisor samples primary-relay health.
+const FALLBACK_POLL_MS: u64 = 3_000;
+
+/// How long *every* primary relay must be continuously unreachable before
+/// the public fallback is brought up. Long enough that a routine
+/// reconnect or a brief blip doesn't leak presence to public relays;
+/// short enough that a real outage recovers in seconds.
+const FALLBACK_ACTIVATION_GRACE_MS: u64 = 20_000;
+
+/// What the fallback supervisor should do on a given tick. A pure
+/// function of the inputs so the policy is unit-testable without spawning
+/// relays.
+#[derive(Debug, PartialEq)]
+enum FallbackAction {
+    /// Primary down past the grace and fallback isn't up — start it.
+    Activate,
+    /// A primary returned while fallback was up — stop it.
+    StandDown,
+    /// Nothing to change this tick.
+    Hold,
+}
+
+fn fallback_action(primary_live: usize, fallback_active: bool, down_for_ms: u64) -> FallbackAction {
+    if primary_live > 0 {
+        if fallback_active {
+            FallbackAction::StandDown
+        } else {
+            FallbackAction::Hold
+        }
+    } else if !fallback_active && down_for_ms >= FALLBACK_ACTIVATION_GRACE_MS {
+        FallbackAction::Activate
+    } else {
+        FallbackAction::Hold
+    }
+}
+
+/// Supervises the public-relay fallback. Steady state: idle, sampling
+/// `primary_live`. When every primary relay has been down for
+/// [`FALLBACK_ACTIVATION_GRACE_MS`] it spawns a `run_relay` task per
+/// fallback URL; when a primary returns it cancels them. So the public
+/// relays only ever carry traffic when the configured/primary set can't —
+/// presence stays off public infrastructure in normal operation.
+async fn run_fallback_supervisor(
+    urls: Vec<String>,
+    shared: Arc<DriverShared>,
+    inbound_tx: mpsc::UnboundedSender<NostrInbound>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    primary_live: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Instant;
+
+    // Cancel tokens for the fallback relay tasks currently running.
+    let mut active: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+    let mut down_since: Option<Instant> = None;
+
+    loop {
+        if cancel.load(SeqCst) {
+            for c in &active {
+                c.store(true, SeqCst);
+            }
+            return;
+        }
+
+        let live = primary_live.load(SeqCst);
+        if live == 0 {
+            down_since.get_or_insert_with(Instant::now);
+        } else {
+            down_since = None;
+        }
+        let down_for_ms = down_since
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+
+        match fallback_action(live, !active.is_empty(), down_for_ms) {
+            FallbackAction::Activate => {
+                warn!(
+                    count = urls.len(),
+                    "primary signaling unreachable — bringing up public fallback relays"
+                );
+                for url in &urls {
+                    let task_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    active.push(task_cancel.clone());
+                    let shared = shared.clone();
+                    let inbound_tx = inbound_tx.clone();
+                    let url = url.clone();
+                    tokio::spawn(async move {
+                        run_relay(url, shared, inbound_tx, task_cancel, None).await;
+                    });
+                }
+            }
+            FallbackAction::StandDown => {
+                info!("primary signaling recovered — standing down public fallback relays");
+                for c in &active {
+                    c.store(true, SeqCst);
+                }
+                active.clear();
+            }
+            FallbackAction::Hold => {}
+        }
+
+        sleep(Duration::from_millis(FALLBACK_POLL_MS)).await;
     }
 }
 
@@ -754,6 +916,43 @@ fn short(url: &str) -> &str {
 mod tests {
     use super::*;
     use crate::nostr::event::NostrIdentity;
+
+    #[test]
+    fn fallback_holds_while_a_primary_is_up() {
+        // Primary connected, fallback not running → leave it alone.
+        assert_eq!(fallback_action(2, false, 0), FallbackAction::Hold);
+        assert_eq!(
+            fallback_action(1, false, FALLBACK_ACTIVATION_GRACE_MS * 10),
+            FallbackAction::Hold
+        );
+    }
+
+    #[test]
+    fn fallback_waits_out_the_grace_then_activates() {
+        // All primaries down, but not yet past the grace → hold…
+        assert_eq!(fallback_action(0, false, 0), FallbackAction::Hold);
+        assert_eq!(
+            fallback_action(0, false, FALLBACK_ACTIVATION_GRACE_MS - 1),
+            FallbackAction::Hold
+        );
+        // …then activate once the grace elapses.
+        assert_eq!(
+            fallback_action(0, false, FALLBACK_ACTIVATION_GRACE_MS),
+            FallbackAction::Activate
+        );
+    }
+
+    #[test]
+    fn fallback_stands_down_when_a_primary_returns() {
+        // Fallback running and a primary comes back → tear it down.
+        assert_eq!(fallback_action(1, true, 999_999), FallbackAction::StandDown);
+    }
+
+    #[test]
+    fn fallback_holds_while_active_and_primary_still_down() {
+        // Already covering the outage; don't respawn every tick.
+        assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
+    }
 
     fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();

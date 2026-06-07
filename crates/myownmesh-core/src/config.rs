@@ -139,6 +139,13 @@ pub struct SignalingConfig {
     /// us, drop our REQs, or otherwise misbehave. Hostname-only
     /// (no scheme); match is case-insensitive.
     pub denylist: Vec<String>,
+    /// Fall back to the built-in public relays when every configured /
+    /// primary relay (your own and the reference one) is unreachable. On
+    /// by default. The fallback is reactive — public relays are only
+    /// connected while the primary set is down, and dropped again the
+    /// moment one recovers — so steady state never touches public
+    /// infrastructure. Set `false` to stay strictly on your own relays.
+    pub public_fallback: bool,
 }
 
 impl Default for SignalingConfig {
@@ -148,6 +155,7 @@ impl Default for SignalingConfig {
             servers: Vec::new(),
             redundancy: DEFAULT_SIGNALING_REDUNDANCY,
             denylist: default_signaling_denylist(),
+            public_fallback: true,
         }
     }
 }
@@ -437,18 +445,16 @@ impl Default for TurnServiceConfig {
             port: DEFAULT_STUN_TURN_PORT,
             public_ip: String::new(),
             realm: "myownmesh".to_string(),
-            // Ship one placeholder credential so an enabled TURN server
-            // accepts allocations out of the box, and so users can see
-            // the exact shape to copy into each peer's `turn_servers`
-            // (username + credential). These are deliberately NOT a
-            // secret: change them before exposing TURN on a public IP,
-            // or anyone reading the source can spend your relay's
-            // bandwidth. The matching client entry is
-            // `{ "urls": ["turn:<host>:3478"], "username": "myownmesh",
-            // "credential": "changeme" }`.
+            // Ship the same shared credential the *client* default uses
+            // (see `default_turn_servers`) so an enabled TURN server
+            // accepts the default clients out of the box — "network in a
+            // box". Deliberately NOT a secret: it's bandwidth-capped via
+            // `max_bps_per_connection`, and anyone can read it, so set
+            // your own before relying on it for sustained throughput.
+            // Must stay in sync with `default_turn_servers`.
             credentials: vec![TurnCredential {
-                username: "myownmesh".to_string(),
-                password: "changeme".to_string(),
+                username: "guest".to_string(),
+                password: "theguestpassword".to_string(),
             }],
             max_bps_per_connection: 0,
         }
@@ -714,6 +720,26 @@ mod tests {
         assert_eq!(turn.credentials.len(), 1);
         assert!(!turn.credentials[0].username.is_empty());
         assert!(!turn.credentials[0].password.is_empty());
+    }
+
+    #[test]
+    fn turn_server_default_credential_matches_client_default() {
+        // "Network in a box" only works if an enabled TURN server accepts
+        // the credential clients use by default — so the server-side
+        // placeholder and the client-side `default_turn_servers` entry
+        // must stay in lockstep.
+        let server = TurnServiceConfig::default();
+        let client = default_turn_servers();
+        assert_eq!(server.credentials.len(), 1);
+        assert_eq!(client.len(), 1);
+        assert_eq!(
+            Some(&server.credentials[0].username),
+            client[0].username.as_ref()
+        );
+        assert_eq!(
+            Some(&server.credentials[0].password),
+            client[0].credential.as_ref()
+        );
     }
 
     #[test]

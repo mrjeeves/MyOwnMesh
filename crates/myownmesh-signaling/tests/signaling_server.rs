@@ -175,6 +175,9 @@ async fn two_drivers_discover_via_self_hosted_relay() {
         servers: vec![url.clone()],
         denylist: vec![],
         redundancy: 1,
+        // No public fallback in tests — keep the driver strictly on the
+        // local test relay so it never reaches for real public relays.
+        public_fallback: false,
     };
 
     // Keep the outbound senders and driver handles bound for the whole
@@ -287,6 +290,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
         servers: vec![url.clone()],
         denylist: vec![],
         redundancy: 1,
+        public_fallback: false,
     };
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
