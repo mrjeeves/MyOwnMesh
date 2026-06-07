@@ -121,8 +121,10 @@ a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
       "label": "Home",
       "topology": { "kind": "ring", "n_preferred": 3 },
       "signaling": { "strategy": "nostr", "redundancy": 5 },
-      "stun_servers": [{ "urls": ["stun:stun.l.google.com:19302"] }],
-      "turn_servers": [],
+      "stun_servers": [{ "urls": ["stun:stun.myownmesh.com:3478"] }],
+      "turn_servers": [
+        { "urls": ["turn:turn.myownmesh.com:3478"], "username": "guest", "credential": "theguestpassword" }
+      ],
       "auto_approve": false
     }
   ]
