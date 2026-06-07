@@ -257,20 +257,18 @@ async fn relay_emits_leave_when_member_disconnects() {
     server.stop();
 }
 
-// End-to-end: a driver learns a peer left after the relay sees the peer's
-// socket drop. Proves the smart-relay departure path lights up
+// End-to-end: a driver learns a peer left soon after the relay sees the
+// peer's socket drop. Proves the smart-relay departure path lights up
 // `NostrInbound::PeerLeft` through the real driver, staying plain NIP-01.
 //
-// `#[ignore]`d in CI: this depends on how fast a *dropped* driver closes
-// its relay socket, and the driver tears down via a polled cancel flag
-// while its read loop is parked in `read.next()` — so socket-close (and
-// thus the relay's leave emission) latency varies by platform/scheduler
-// and made this flaky on the macOS / Windows runners. The deterministic
-// guarantee — the relay emits a `leave` the moment a socket closes — is
-// covered by `relay_emits_leave_when_member_disconnects` above. Run this
-// manually with `cargo test -- --ignored`.
+// This relies on a *dropped* driver closing its relay socket promptly.
+// The driver's read loop now wakes every `RELAY_CANCEL_POLL_MS` (≈250 ms)
+// to re-check its cancel flag and sends a clean Close on teardown, so the
+// socket closes within a fraction of a second of the handle dropping —
+// well inside this test's window on every platform. (Before that fix the
+// loop could stay parked in `read.next()` on an idle socket, which made
+// this flaky on the macOS / Windows CI runners.)
 #[tokio::test]
-#[ignore = "timing-fragile in CI: driver socket-close latency is platform-dependent"]
 async fn driver_gets_peer_left_when_peer_disconnects() {
     use myownmesh_signaling::nostr::driver::{
         start, NostrDriverConfig, NostrInbound, NostrOutbound,
