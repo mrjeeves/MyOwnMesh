@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::trace;
 
 use crate::channels::RawChannelFrame;
@@ -223,6 +223,16 @@ pub struct NetworkState {
     /// the call site in `engine::mod::handle_signaling_inbound`
     /// for the discovery rationale.
     pub last_reactive_announce_at: Mutex<Option<std::time::Instant>>,
+
+    /// Force-reconnect handle for the signaling driver, stashed by
+    /// [`crate::engine::signaling_bridge::attach_nostr`] once the
+    /// Nostr driver is up. Bumping the generation makes every relay
+    /// drop its socket and redial immediately (see the driver's
+    /// `force_reconnect`); the engine triggers it on resume-from-sleep
+    /// so a zombie relay socket is replaced at once rather than after
+    /// the kernel's multi-minute TCP timeout. `None` when no driver is
+    /// attached (e.g. the in-process local broker used in tests).
+    relay_reconnect: Mutex<Option<Arc<watch::Sender<u64>>>>,
 }
 
 impl NetworkState {
@@ -280,6 +290,7 @@ impl NetworkState {
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             last_reactive_announce_at: Mutex::new(None),
+            relay_reconnect: Mutex::new(None),
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
@@ -291,6 +302,28 @@ impl NetworkState {
         self: &Arc<Self>,
     ) -> Option<mpsc::UnboundedReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()
+    }
+
+    /// Register the signaling driver's force-reconnect signal. Called
+    /// once when the Nostr driver is attached.
+    pub fn set_relay_reconnect(&self, signal: Arc<watch::Sender<u64>>) {
+        *self.relay_reconnect.lock() = Some(signal);
+    }
+
+    /// Ask every relay to drop its socket and redial immediately,
+    /// skipping the backoff. Returns `true` if a driver was attached
+    /// to receive the request. Used on resume-from-sleep so the node
+    /// stops being invisible the moment it wakes instead of waiting
+    /// for a stale socket to time out. Cheap and idempotent — bumps a
+    /// `watch` generation the relay tasks observe.
+    pub fn request_relay_reconnect(&self) -> bool {
+        match self.relay_reconnect.lock().as_ref() {
+            Some(signal) => {
+                signal.send_modify(|gen| *gen = gen.wrapping_add(1));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Emit a top-level mesh event. Silently drops if no

@@ -124,15 +124,31 @@ impl ServiceManager {
         }
 
         // ---- STUN ----
-        if g.stun.is_some() != desired.stun.enabled || g.config.stun != desired.stun {
+        // A TURN server already answers STUN Binding requests on its own
+        // port, so a standalone STUN listener alongside TURN is redundant
+        // — and on the default config both want :3478, so it would just
+        // fail with "address in use". When both are enabled we fold STUN
+        // into TURN: skip the standalone listener entirely (no warning),
+        // and report STUN as served-by-TURN rather than a failed start.
+        // Turn STUN back on by itself the moment TURN is disabled.
+        let run_standalone_stun = desired.stun.enabled && !desired.turn.enabled;
+        if g.stun.is_some() != run_standalone_stun
+            || g.config.stun != desired.stun
+            || g.config.turn != desired.turn
+        {
             if let Some(h) = g.stun.take() {
                 h.stop();
             }
-            if desired.stun.enabled {
+            if run_standalone_stun {
                 match StunServer::start(&desired.stun).await {
                     Ok(h) => g.stun = Some(h),
                     Err(e) => warn!("STUN service failed to start: {e}"),
                 }
+            } else if desired.stun.enabled && desired.turn.enabled {
+                info!(
+                    "STUN folded into TURN — TURN answers STUN Binding on the same \
+                     port, so the standalone STUN listener isn't needed"
+                );
             }
         }
 
@@ -283,11 +299,27 @@ impl ManagerState {
                 listen: self.signaling.as_ref().map(|h| h.local_addr().to_string()),
                 activity: self.signaling.as_ref().map(|h| h.stats()),
             },
-            stun: EndpointReport {
-                enabled: self.config.stun.enabled,
-                running: self.stun.is_some(),
-                listen: self.stun.as_ref().map(|h| h.local_addr().to_string()),
-                activity: None,
+            stun: {
+                // When STUN is folded into TURN (both enabled, no
+                // standalone listener) report it as running at TURN's
+                // address — STUN Binding genuinely is served there, so an
+                // operator shouldn't see it as "enabled but not running".
+                let folded =
+                    self.config.stun.enabled && self.config.turn.enabled && self.stun.is_none();
+                EndpointReport {
+                    enabled: self.config.stun.enabled,
+                    running: self.stun.is_some() || (folded && self.turn.is_some()),
+                    listen: self
+                        .stun
+                        .as_ref()
+                        .map(|h| h.local_addr().to_string())
+                        .or_else(|| {
+                            folded
+                                .then(|| self.turn.as_ref().map(|h| h.local_addr().to_string()))
+                                .flatten()
+                        }),
+                    activity: None,
+                }
             },
             turn: EndpointReport {
                 enabled: self.config.turn.enabled,

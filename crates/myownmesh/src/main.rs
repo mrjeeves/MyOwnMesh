@@ -66,6 +66,18 @@ enum Command {
         #[command(subcommand)]
         action: cli::config::ConfigCmd,
     },
+    /// Install helpers — currently the Caddy reverse proxy that fronts
+    /// the signaling relay with TLS so peers can connect over wss://.
+    Install {
+        #[command(subcommand)]
+        action: cli::caddy::InstallCmd,
+    },
+    /// Caddy reverse-proxy helpers (e.g. `caddy path` prints the
+    /// Caddyfile location to edit).
+    Caddy {
+        #[command(subcommand)]
+        action: cli::caddy::CaddyCmd,
+    },
 }
 
 fn main() -> ExitCode {
@@ -141,6 +153,8 @@ fn main() -> ExitCode {
             Command::Update { action } => cli::update::run(action).await,
             Command::Service { system, action } => cli::service::run(system, action).await,
             Command::Config { action } => cli::config::run(action).await,
+            Command::Install { action } => cli::caddy::run_install(action).await,
+            Command::Caddy { action } => cli::caddy::run_caddy(action).await,
         }
     });
 

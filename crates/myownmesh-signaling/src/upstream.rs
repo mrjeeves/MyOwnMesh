@@ -217,7 +217,7 @@ pub const ANNOUNCE_INTERVAL_MS: u64 = 5_333;
 ///   - announce 1 fires at t=0 (daemon startup)
 ///   - announce 2 fires at t=30s (safety net for a silently-failed
 ///     first publish)
-///   - announces 3+ fire on the 5-minute steady tick
+///   - announces 3+ fire on the 2-minute steady tick
 ///
 /// Rationale: with stored-kind signaling (kind 1077, see
 /// `nostr::event::SIGNALING_EVENT_KIND`) and engine-side reactive
@@ -229,17 +229,20 @@ pub const ANNOUNCE_INTERVAL_MS: u64 = 5_333;
 /// `nostr::driver::run_relay_inner` covers freshly-(re)connected
 /// relays. The remaining role of the periodic announce is just to
 /// refresh storage well inside any reasonable relay retention
-/// window — five minutes is conservative against public relays
-/// that retain regular events for hours to days, while the 30s
-/// safety net catches a silently-failed first publish at startup.
+/// window — two minutes is still conservative against public relays
+/// that retain regular events for hours to days, while keeping a
+/// peer's presence fresh enough that a node which dropped and came
+/// back (laptop sleep/wake) is rediscovered within one short cycle.
+/// The 30s safety net still catches a silently-failed first publish
+/// at startup.
 pub const ANNOUNCE_BACKOFF_MS: &[u64] = &[30_000];
 
 /// Steady-state announce cadence, used once
 /// [`ANNOUNCE_BACKOFF_MS`] is exhausted. Sized to refresh relay
-/// storage well inside typical retention; see the comment on
-/// [`ANNOUNCE_BACKOFF_MS`] for why discovery doesn't need a
-/// tighter cadence anymore.
-pub const ANNOUNCE_STEADY_MS: u64 = 300_000;
+/// storage well inside typical retention while keeping presence
+/// fresh enough for fast rediscovery after a drop; see the comment
+/// on [`ANNOUNCE_BACKOFF_MS`] for the full rationale.
+pub const ANNOUNCE_STEADY_MS: u64 = 120_000;
 
 /// How far back the room subscription's `since` reaches when (re)
 /// opening a REQ — see item 8. Replays the last few minutes of
@@ -247,7 +250,7 @@ pub const ANNOUNCE_STEADY_MS: u64 = 300_000;
 /// It governs presence only: connection negotiation rides the
 /// ephemeral kind ([`super::nostr::event::SIGNALING_EPHEMERAL_KIND`])
 /// which relays never store, so there's nothing to replay for it.
-/// Matched to [`ANNOUNCE_STEADY_MS`] (300s) so the window is exactly
+/// Matched to [`ANNOUNCE_STEADY_MS`] (120s) so the window is exactly
 /// one steady heartbeat — every present peer has re-announced at
 /// least once inside it.
-pub const PRESENCE_REPLAY_WINDOW_SECS: u64 = 300;
+pub const PRESENCE_REPLAY_WINDOW_SECS: u64 = 120;

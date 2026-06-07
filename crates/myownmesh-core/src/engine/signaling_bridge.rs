@@ -289,5 +289,11 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         trace!("nostr inbound pump exiting");
     });
 
-    Some(nostr_driver::start(nostr_cfg, out_rx, in_tx))
+    let handle = nostr_driver::start(nostr_cfg, out_rx, in_tx);
+    // Hand the engine the force-reconnect signal so resume-from-sleep
+    // (and any other recovery path) can make every relay redial at
+    // once instead of waiting out a zombie socket. See
+    // `wake::on_wake` and `NetworkState::request_relay_reconnect`.
+    state.set_relay_reconnect(handle.reconnect_signal());
+    Some(handle)
 }

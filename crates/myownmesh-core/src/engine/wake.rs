@@ -80,13 +80,27 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
     // that starved the process) it sent no traffic, so peers tore it
     // down after the heartbeat grace. They only rediscover us through
     // a fresh announce — without this we wait up to ANNOUNCE_STEADY_MS
-    // (5 min) for the next scheduled one. Reactive reflection
+    // (2 min) for the next scheduled one. Reactive reflection
     // (see `handle_signaling_inbound`) makes neighbors re-announce
     // within ~1 s, so the round-trip rebuild lands in seconds. One
     // send per wake event — wake events are coalesced upstream by
     // WAKE_COALESCE_MS, and reflected announces are rate-limited by
     // REACTIVE_ANNOUNCE_MIN_INTERVAL_MS, so this can't storm the relay.
     let _ = state.signaling_tx.send(SignalingOutbound::Announce);
+
+    // The announce above is useless if it's written to a dead socket.
+    // After an OS suspend the relay WebSocket is typically a zombie —
+    // the TCP connection was never torn down because the host wasn't
+    // running to receive the FIN/RST, so our side still thinks it's
+    // open and the kernel won't notice for minutes. Force every relay
+    // to redial now: the fresh session re-subscribes (replaying recent
+    // presence) and sends its own open-announce, so peers rediscover us
+    // in seconds instead of waiting for the stale socket to time out.
+    // No-op when there's no Nostr driver attached (e.g. local-broker
+    // tests).
+    if state.request_relay_reconnect() {
+        debug!(network = %state.network_id, "wake — forcing relay reconnect");
+    }
 
     let active: Vec<String> = state
         .peers
@@ -153,7 +167,7 @@ mod tests {
     async fn on_wake_emits_announce_for_rediscovery() {
         // A node that was paused must re-advertise on resume so peers
         // that tore it down during the pause rediscover it without
-        // waiting for the 5-minute steady announce cadence.
+        // waiting for the 2-minute steady announce cadence.
         let state = crate::engine::build_test_state("wake-announce");
         let mut rx = state
             .take_signaling_outbound_rx()
@@ -162,6 +176,28 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(SignalingOutbound::Announce)),
             "on_wake must emit a fresh announce"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_wake_forces_relay_reconnect() {
+        // The wake path must also kick the relay so a socket left stale
+        // by the suspend is replaced at once. With no driver attached it
+        // degrades to a silent no-op (request returns false); with one,
+        // on_wake bumps the generation every relay task watches.
+        let state = crate::engine::build_test_state("wake-reconnect");
+        let _ = state.take_signaling_outbound_rx();
+        assert!(
+            !state.request_relay_reconnect(),
+            "no attached driver → no-op"
+        );
+        let signal = std::sync::Arc::new(tokio::sync::watch::channel(0u64).0);
+        let rx = signal.subscribe();
+        state.set_relay_reconnect(signal);
+        on_wake(&state).await;
+        assert!(
+            rx.has_changed().unwrap(),
+            "on_wake must bump the relay-reconnect signal"
         );
     }
 
