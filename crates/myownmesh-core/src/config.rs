@@ -422,7 +422,19 @@ impl Default for TurnServiceConfig {
             port: DEFAULT_STUN_TURN_PORT,
             public_ip: String::new(),
             realm: "myownmesh".to_string(),
-            credentials: Vec::new(),
+            // Ship one placeholder credential so an enabled TURN server
+            // accepts allocations out of the box, and so users can see
+            // the exact shape to copy into each peer's `turn_servers`
+            // (username + credential). These are deliberately NOT a
+            // secret: change them before exposing TURN on a public IP,
+            // or anyone reading the source can spend your relay's
+            // bandwidth. The matching client entry is
+            // `{ "urls": ["turn:<host>:3478"], "username": "myownmesh",
+            // "credential": "changeme" }`.
+            credentials: vec![TurnCredential {
+                username: "myownmesh".to_string(),
+                password: "changeme".to_string(),
+            }],
             max_bps_per_connection: 0,
         }
     }
@@ -655,15 +667,28 @@ mod tests {
         cfg.services.signaling.enabled = true;
         cfg.services.turn.enabled = true;
         cfg.services.turn.public_ip = "203.0.113.7".to_string();
-        cfg.services.turn.credentials.push(TurnCredential {
+        // Replace the placeholder default with a real operator entry.
+        cfg.services.turn.credentials = vec![TurnCredential {
             username: "alice".into(),
             password: "s3cret".into(),
-        });
+        }];
         let s = serde_json::to_string(&cfg).unwrap();
         let back: MeshConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(cfg, back);
         assert!(back.services.signaling.enabled);
         assert_eq!(back.services.turn.credentials.len(), 1);
+        assert_eq!(back.services.turn.credentials[0].username, "alice");
+    }
+
+    #[test]
+    fn turn_service_default_ships_placeholder_credential() {
+        // The default TURN service carries one non-empty placeholder
+        // credential so an enabled relay accepts allocations out of the
+        // box and users can see the shape to mirror into `turn_servers`.
+        let turn = TurnServiceConfig::default();
+        assert_eq!(turn.credentials.len(), 1);
+        assert!(!turn.credentials[0].username.is_empty());
+        assert!(!turn.credentials[0].password.is_empty());
     }
 
     #[test]
