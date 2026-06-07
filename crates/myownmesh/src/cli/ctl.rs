@@ -9,6 +9,7 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
+use myownmesh_core::ServicesConfig;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -29,6 +30,30 @@ pub enum CtlCmd {
     /// Roster ops on a saved network.
     #[command(subcommand)]
     Roster(RosterCmd),
+    /// Host infrastructure services for the mesh: relay / signaling /
+    /// STUN / TURN.
+    #[command(subcommand)]
+    Services(ServicesCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServicesCmd {
+    /// Show which services this device hosts and their listen addresses.
+    Status,
+    /// Turn a service on: node | relay | signaling | stun | turn.
+    /// `node` is mesh participation itself (off = pure-infrastructure
+    /// box). TURN also needs credentials + a public IP — set those in
+    /// config.json (or the GUI) first; an enabled-but-unconfigured TURN
+    /// shows as not running.
+    Enable {
+        /// node | relay | signaling | stun | turn
+        service: String,
+    },
+    /// Turn a service off: node | relay | signaling | stun | turn.
+    Disable {
+        /// node | relay | signaling | stun | turn
+        service: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -68,6 +93,9 @@ pub enum RosterCmd {
 
 pub async fn run(cmd: CtlCmd) -> Result<()> {
     let request = match cmd {
+        // Services toggles are a read-modify-write against the live
+        // config, so they take a dedicated path rather than one request.
+        CtlCmd::Services(services_cmd) => return run_services(services_cmd).await,
         CtlCmd::Status => Request::Status,
         CtlCmd::Networks(NetworksCmd::List) => Request::NetworksList,
         CtlCmd::Networks(NetworksCmd::Join { network_id }) => {
@@ -105,6 +133,11 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         }
     };
     let response = roundtrip(&request).await?;
+    print_response(response)
+}
+
+/// Pretty-print a daemon response's data payload, or bail on error.
+fn print_response(response: Response) -> Result<()> {
     if !response.ok {
         let msg = response
             .error
@@ -114,6 +147,49 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
     let body = response.data.unwrap_or(Value::Null);
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
+}
+
+/// Run a `services` subcommand. `status` is a plain request; `enable` /
+/// `disable` are a read-modify-write: fetch the current services config,
+/// flip the one service's `enabled` flag, and send it back.
+async fn run_services(cmd: ServicesCmd) -> Result<()> {
+    match cmd {
+        ServicesCmd::Status => {
+            let response = roundtrip(&Request::ServicesStatus).await?;
+            print_response(response)
+        }
+        ServicesCmd::Enable { service } => set_service(&service, true).await,
+        ServicesCmd::Disable { service } => set_service(&service, false).await,
+    }
+}
+
+async fn set_service(service: &str, enabled: bool) -> Result<()> {
+    let status = roundtrip(&Request::ServicesStatus).await?;
+    if !status.ok {
+        bail!(
+            "daemon error: {}",
+            status.error.unwrap_or_else(|| "(no error message)".into())
+        );
+    }
+    let data = status.data.unwrap_or(Value::Null);
+    let config_val = data
+        .get("config")
+        .cloned()
+        .ok_or_else(|| anyhow!("daemon status missing services config"))?;
+    let mut services: ServicesConfig =
+        serde_json::from_value(config_val).context("parse current services config")?;
+    match service {
+        "node" => services.node.enabled = enabled,
+        "relay" => services.relay.enabled = enabled,
+        "signaling" => services.signaling.enabled = enabled,
+        "stun" => services.stun.enabled = enabled,
+        "turn" => services.turn.enabled = enabled,
+        other => {
+            bail!("unknown service '{other}' — expected node | relay | signaling | stun | turn")
+        }
+    }
+    let response = roundtrip(&Request::ServicesSet { services }).await?;
+    print_response(response)
 }
 
 async fn roundtrip(request: &Request) -> Result<Response> {

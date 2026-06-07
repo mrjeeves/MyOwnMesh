@@ -98,6 +98,109 @@ export interface MeshConfigSnapshot {
   [key: string]: unknown;
 }
 
+// ---- infrastructure services (relay / signaling / STUN / TURN) -------
+//
+// Device-level service hosting. The *config* shapes mirror
+// `myownmesh_core::config::ServicesConfig` (the write shape sent into
+// `ServicesSet`); the *report* shapes mirror the daemon's
+// `ServicesReport` (the live status returned by `ServicesStatus`). These
+// toggles apply to the whole device, not a single network.
+
+export interface NodeServiceConfig {
+  enabled: boolean;
+}
+
+export interface RelayServiceConfig {
+  enabled: boolean;
+  max_fanout: number;
+}
+
+/** Flood-protection limits for the self-hosted signaling relay. `0`
+ *  means "no limit" for any field. */
+export interface SignalingLimits {
+  max_event_rate: number;
+  max_req_rate: number;
+  max_subscriptions: number;
+  max_filters_per_req: number;
+  max_message_bytes: number;
+  max_connections_per_ip: number;
+}
+
+export interface SignalingServerConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+  limits: SignalingLimits;
+}
+
+export interface StunServiceConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+}
+
+export interface TurnCredential {
+  username: string;
+  password: string;
+}
+
+export interface TurnServiceConfig {
+  enabled: boolean;
+  bind: string;
+  port: number;
+  public_ip: string;
+  realm: string;
+  credentials: TurnCredential[];
+  /** Per-connection (per-allocation) relayed-bandwidth cap in bytes per
+   *  second, each direction. 0 = unlimited. */
+  max_bps_per_connection: number;
+}
+
+export interface ServicesConfig {
+  /** Mesh participation. Off = pure-infrastructure box. */
+  node: NodeServiceConfig;
+  relay: RelayServiceConfig;
+  signaling: SignalingServerConfig;
+  stun: StunServiceConfig;
+  turn: TurnServiceConfig;
+}
+
+/** Live status of one network-listener service (signaling / STUN /
+ *  TURN). `running` differs from `enabled` when a start failed — e.g. a
+ *  port already in use, or TURN enabled without credentials. */
+export interface EndpointReport {
+  enabled: boolean;
+  running: boolean;
+  listen: string | null;
+}
+
+export interface RelayReport {
+  enabled: boolean;
+  networks: number;
+  max_fanout: number;
+}
+
+export interface NodeReport {
+  enabled: boolean;
+  /** Networks joined as a node (0 in pure-infrastructure mode). */
+  joined: number;
+}
+
+export interface ServicesReport {
+  node: NodeReport;
+  relay: RelayReport;
+  signaling: EndpointReport;
+  stun: EndpointReport;
+  turn: EndpointReport;
+}
+
+/** Daemon response to `ServicesStatus`: the live runtime status plus the
+ *  persisted config the toggles edit. */
+export interface ServicesStatusResponse {
+  status: ServicesReport;
+  config: ServicesConfig;
+}
+
 // ---- peer status / tier ----------------------------------------------
 
 export type PeerStatus =

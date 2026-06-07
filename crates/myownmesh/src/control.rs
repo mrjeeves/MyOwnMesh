@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use interprocess::local_socket::{
     tokio::prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions,
 };
-use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, TopologyMode};
+use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, ServicesConfig, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -28,6 +28,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::registry::{NetworkRegistry, RemoveResult};
+use crate::services::ServiceManager;
 
 /// Default control socket name (Unix abstract or Windows named-pipe
 /// segment). Overridable via `config.daemon.control_socket`.
@@ -114,6 +115,21 @@ pub enum Request {
     NetworkUpdate {
         config: NetworkConfig,
     },
+    /// Snapshot which infrastructure services this device hosts
+    /// (relay / signaling / STUN / TURN): live runtime status plus the
+    /// persisted config. The GUI's Services settings section reads this
+    /// to render toggles and listen addresses.
+    ServicesStatus,
+    /// Replace the device's services config wholesale: persist it to
+    /// config.json and reconcile the running services (start newly
+    /// enabled ones, stop disabled ones, restart reconfigured ones).
+    /// Returns the resulting status. The GUI sends the full edited
+    /// `ServicesConfig`; the CLI reads the current one, flips a field,
+    /// and sends it back.
+    ServicesSet {
+        services: ServicesConfig,
+    },
+
     /// Subscribe to the live event stream. The connection becomes a
     /// one-way server-push channel after this op; the daemon writes
     /// one JSON-encoded `MeshEvent` (or framing wrapper) per line
@@ -350,6 +366,7 @@ enum SocketTarget {
 pub async fn serve(
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
+    services: Arc<ServiceManager>,
     custom: Option<PathBuf>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> Result<()> {
@@ -360,6 +377,7 @@ pub async fn serve(
     let state = Arc::new(ControlState {
         mesh,
         registry,
+        services,
         clients: crate::ipc::ClientRegistry::new(),
     });
 
@@ -417,6 +435,7 @@ fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener> {
 struct ControlState {
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
+    services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
 }
 
@@ -564,6 +583,12 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         Request::NetworkAdd { config } => network_add(state, config).await,
         Request::NetworkRemove { network } => network_remove(state, &network).await,
         Request::NetworkUpdate { config } => network_update(state, config).await,
+        Request::ServicesStatus => {
+            let status = state.services.status().await;
+            let config = state.services.current_config().await;
+            Response::ok(serde_json::json!({ "status": status, "config": config }))
+        }
+        Request::ServicesSet { services } => services_set(state, services).await,
         Request::EventsSubscribe => {
             // Handled by `handle_client` before reaching dispatch.
             // If we somehow get here, surface the bug.
@@ -959,6 +984,11 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
     }
     state.registry.insert(joined, nostr);
 
+    // Start a relay forwarder for the new network if relay hosting is on,
+    // and refresh the service-role advert so the new network advertises
+    // what this device hosts.
+    state.services.on_network_added(&config.id).await;
+
     // Persist to disk. We re-load the config rather than rely on
     // the in-memory copy from startup so concurrent edits (a user
     // hand-editing config.json) survive — we append to whatever's
@@ -983,6 +1013,7 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
         RemoveResult::Removed(joined) => {
             let config_id = joined.config_id().to_string();
             let network_id = joined.network_id().to_string();
+            state.services.on_network_removed(&config_id).await;
             if let Err(e) = joined.leave().await {
                 warn!("leave({key_owned}) returned error: {e:#}");
             }
@@ -997,6 +1028,7 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
             // re-join. We don't know the network_id since we
             // couldn't unwrap; persist by the key we were given
             // and let the persist helper handle either alias.
+            state.services.on_network_removed(&key_owned).await;
             if let Err(e) = persist_network_remove(&key_owned, &key_owned) {
                 return Response::err(format!("network removed but config.json save failed: {e}"));
             }
@@ -1099,10 +1131,34 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     }
     state.registry.insert(joined, nostr);
 
+    // The old network (and its relay forwarder) was torn down; rebind a
+    // fresh relay to the new network state if relay hosting is on.
+    state.services.on_network_removed(&config.id).await;
+    state.services.on_network_added(&config.id).await;
+
     if let Err(e) = persist_network_update(&config) {
         return Response::err(format!("network updated but config.json save failed: {e}"));
     }
     Response::ok(serde_json::json!({ "updated": summary, "restarted": true }))
+}
+
+/// Replace the device services config: persist it, then reconcile the
+/// running services. Persist first so a daemon restart re-applies the
+/// same config even if the live reconcile partly fails (a failed service
+/// start is logged inside `apply`, not surfaced as an error here).
+async fn services_set(state: &Arc<ControlState>, services: ServicesConfig) -> Response {
+    if let Err(e) = persist_services(&services) {
+        return Response::err(format!("services config save failed: {e}"));
+    }
+    let status = state.services.apply(services).await;
+    Response::ok(serde_json::json!({ "status": status }))
+}
+
+fn persist_services(services: &ServicesConfig) -> Result<()> {
+    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
+    cfg.services = services.clone();
+    cfg.save().map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {

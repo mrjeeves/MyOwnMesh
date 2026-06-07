@@ -58,6 +58,10 @@ pub struct NostrDriverConfig {
 pub enum NostrInbound {
     /// A peer announced their presence in the room.
     PeerAnnounced { device_id: String },
+    /// A peer's signaling connection dropped — an intelligent relay told
+    /// us the instant the peer's socket closed, so the engine can tear
+    /// the peer down promptly instead of waiting for a heartbeat timeout.
+    PeerLeft { device_id: String },
     /// A peer addressed us directly with a signaling message.
     Message { from: String, msg: SignalingMessage },
 }
@@ -515,6 +519,23 @@ fn handle_inbound_frame(
                         return Ok(());
                     }
                     let _ = inbound_tx.send(NostrInbound::PeerAnnounced { device_id: peer_id });
+                }
+                SignalingMessage::Leave { peer_id } => {
+                    // Departure rides the ephemeral kind like the rest of
+                    // the live negotiation traffic — a stored-kind "leave"
+                    // would be stale history, so drop it.
+                    if event.kind != SIGNALING_EPHEMERAL_KIND {
+                        trace!(
+                            relay = %short(url),
+                            kind = event.kind,
+                            "ignoring leave on non-ephemeral kind"
+                        );
+                        return Ok(());
+                    }
+                    if peer_id == shared.device_id {
+                        return Ok(());
+                    }
+                    let _ = inbound_tx.send(NostrInbound::PeerLeft { device_id: peer_id });
                 }
                 other => {
                     if event.kind != SIGNALING_EPHEMERAL_KIND {

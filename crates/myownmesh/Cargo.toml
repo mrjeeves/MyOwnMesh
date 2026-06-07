@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 myownmesh-core = { workspace = true }
 myownmesh-signaling = { workspace = true }
+myownmesh-services = { workspace = true }
 myownmesh-updater = { workspace = true }
 
 tokio = { workspace = true }

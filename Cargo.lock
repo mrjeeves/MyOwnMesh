@@ -1322,6 +1322,7 @@ dependencies = [
  "dashmap",
  "interprocess",
  "myownmesh-core",
+ "myownmesh-services",
  "myownmesh-signaling",
  "myownmesh-updater",
  "parking_lot",
@@ -1363,6 +1364,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+]
+
+[[package]]
+name = "myownmesh-services"
+version = "0.1.8"
+dependencies = [
+ "async-trait",
+ "myownmesh-core",
+ "stun",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "turn",
+ "webrtc-util",
 ]
 
 [[package]]

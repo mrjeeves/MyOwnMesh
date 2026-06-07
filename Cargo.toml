@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/myownmesh-core",
     "crates/myownmesh-signaling",
+    "crates/myownmesh-services",
     "crates/myownmesh-updater",
     "crates/myownmesh",
 ]
@@ -20,6 +21,7 @@ description = "Pure-Rust peer-to-peer mesh networking on webrtc-rs."
 # Internal crates
 myownmesh-core = { path = "crates/myownmesh-core", version = "0.1.8" }
 myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "0.1.8" }
+myownmesh-services = { path = "crates/myownmesh-services", version = "0.1.8" }
 myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.1.8" }
 
 # Async runtime
@@ -33,6 +35,14 @@ pin-project-lite = "0.2"
 
 # WebRTC transport
 webrtc = "0.13"
+
+# Self-hosted STUN / TURN servers. Versions are pinned to the webrtc-rs
+# 0.13 ecosystem so they share the `webrtc-util` Conn trait the
+# transport already links — promoting them to direct deps adds no new
+# tree, they're already transitive deps of `webrtc`.
+stun = "0.8"
+turn = "0.10"
+webrtc-util = "0.11"
 
 # WebSocket (Nostr signaling)
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }

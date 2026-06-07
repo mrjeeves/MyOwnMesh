@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::identity::DeviceId;
 
+/// Flood-protection limits for the self-hosted signaling relay. Defined
+/// in the signaling crate (its natural home) and re-used here so the
+/// config, the daemon, and the relay all share one shape.
+pub use myownmesh_signaling::server::Limits as SignalingLimits;
+
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Topology selector for a single network. Wire-form matches the
@@ -257,6 +262,182 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Default WebSocket port for the self-hosted signaling relay.
+/// Arbitrary high port outside the privileged range so the daemon can
+/// bind it without root.
+pub const DEFAULT_SIGNALING_SERVER_PORT: u16 = 4848;
+
+/// Default UDP port for the self-hosted STUN / TURN service. 3478 is
+/// the IANA-assigned STUN/TURN port (RFC 5389 / RFC 5766) — peers
+/// configuring `stun:` / `turn:` URLs expect it by default.
+pub const DEFAULT_STUN_TURN_PORT: u16 = 3478;
+
+/// How this device offers infrastructure services to the rest of the
+/// mesh. Device-level rather than per-network: a STUN / TURN / signaling
+/// server serves every network this device participates in (and any
+/// external ICE / Nostr client), so the toggles live on the device
+/// config, not on an individual [`NetworkConfig`].
+///
+/// Everything is off by default — turning a device into an always-on
+/// relay, signaling host, or TURN server is an explicit opt-in. When a
+/// service is enabled the daemon advertises the matching
+/// [`crate::services::ServiceRole`] to peers so the rest of the mesh can
+/// discover and adopt it, which is what makes a fully self-hosted,
+/// internet-isolated network trivial to stand up.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ServicesConfig {
+    /// Whether this device participates as a regular mesh node. On by
+    /// default; turn off for a pure-infrastructure box.
+    pub node: NodeServiceConfig,
+    pub relay: RelayServiceConfig,
+    pub signaling: SignalingServerConfig,
+    pub stun: StunServiceConfig,
+    pub turn: TurnServiceConfig,
+}
+
+/// Whether this device acts as a regular mesh node — i.e. joins its
+/// configured networks and participates as a peer. Enabled by default;
+/// disable it to run a **pure-infrastructure box** that only hosts
+/// signaling / STUN / TURN (advertising itself purely as an edge /
+/// ingress-egress point) without joining any network itself. The
+/// roster-gated relay forwards traffic *within* networks, so it needs
+/// node participation and has no effect when node is off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NodeServiceConfig {
+    pub enabled: bool,
+}
+
+impl Default for NodeServiceConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Mesh-member routing. When enabled this device forwards typed-channel
+/// traffic between roster members on the reserved
+/// [`crate::services::RELAY_CHANNEL`] — turning it into an ingress /
+/// egress hub so spokes that can each reach the relay but not each
+/// other can still exchange messages. Forwarding is roster-gated: a
+/// frame is only relayed when both the sender and the destination are
+/// approved peers of this device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct RelayServiceConfig {
+    /// Off by default — hosting a relay is opt-in.
+    pub enabled: bool,
+    /// Ceiling on how many distinct destinations a single inbound frame
+    /// may fan out to in broadcast mode. 0 (the default) = unlimited. A
+    /// guard against one chatty peer turning the relay into an amplifier.
+    pub max_fanout: u32,
+}
+
+/// Self-hosted signaling server: a minimal Nostr-compatible relay
+/// (NIP-01 over WebSocket) that mesh peers can use in place of the
+/// public Nostr relay pool. Point a network's `signaling.servers` at
+/// `ws://this-host:port` and it interoperates with the built-in driver
+/// with zero client changes — the same wire format the driver already
+/// speaks to public relays.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SignalingServerConfig {
+    pub enabled: bool,
+    /// Interface to bind. `0.0.0.0` listens on every interface;
+    /// `127.0.0.1` keeps it loopback-only.
+    pub bind: String,
+    pub port: u16,
+    /// Flood-protection limits (per-connection rates, per-IP connection
+    /// caps, subscription / message-size caps). Safe defaults; loosen for
+    /// a busy public relay, tighten for a locked-down private one.
+    pub limits: SignalingLimits,
+}
+
+impl Default for SignalingServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "0.0.0.0".to_string(),
+            port: DEFAULT_SIGNALING_SERVER_PORT,
+            limits: SignalingLimits::default(),
+        }
+    }
+}
+
+/// Self-hosted STUN server. Answers RFC 5389 Binding requests so peers
+/// can discover their server-reflexive address without depending on a
+/// public STUN provider. Pure reflexion — no auth, no allocations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StunServiceConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub port: u16,
+}
+
+impl Default for StunServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "0.0.0.0".to_string(),
+            port: DEFAULT_STUN_TURN_PORT,
+        }
+    }
+}
+
+/// Self-hosted TURN server (RFC 5766) for relaying media / data when no
+/// direct path can be found (symmetric NAT — common on phone hotspots).
+/// A TURN server also answers STUN Binding requests, so enabling TURN
+/// gives STUN for free on the same port; run the standalone STUN service
+/// only when you want reflexion without allocations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct TurnServiceConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub port: u16,
+    /// Public IP the server hands out in relay allocations. TURN can't
+    /// guess its own routable address, so off-LAN clients need this set
+    /// explicitly. Empty falls back to the bind address — only correct
+    /// when the device already holds a public IP on the bound interface.
+    pub public_ip: String,
+    /// Authentication realm advertised to clients. Cosmetic but must
+    /// match what peers put in their TURN URL credentials.
+    pub realm: String,
+    /// Static long-term credentials the server accepts. Mirror an entry
+    /// into each peer's `turn_servers` config so they can allocate.
+    pub credentials: Vec<TurnCredential>,
+    /// Per-connection (per-allocation) relayed-bandwidth cap in bytes per
+    /// second, applied independently to each direction. `0` = unlimited.
+    /// A global QoS knob so one client can't saturate the relay — there's
+    /// no per-user override yet, this cap applies to every allocation.
+    pub max_bps_per_connection: u64,
+}
+
+impl Default for TurnServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "0.0.0.0".to_string(),
+            port: DEFAULT_STUN_TURN_PORT,
+            public_ip: String::new(),
+            realm: "myownmesh".to_string(),
+            credentials: Vec::new(),
+            max_bps_per_connection: 0,
+        }
+    }
+}
+
+/// One username / password pair the TURN server accepts. Plaintext in
+/// config.json — the file is already 0600-adjacent (lives in
+/// `~/.myownmesh`), and long-term TURN credentials are low-value shared
+/// secrets, not device identity keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnCredential {
+    pub username: String,
+    pub password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MeshConfig {
@@ -267,6 +448,9 @@ pub struct MeshConfig {
     pub auto_update: AutoUpdateConfig,
     pub auto_cleanup: AutoCleanupConfig,
     pub daemon: DaemonConfig,
+    /// Infrastructure services this device hosts for the mesh
+    /// (relay / signaling / STUN / TURN). All off by default.
+    pub services: ServicesConfig,
     pub networks: Vec<NetworkConfig>,
 }
 
@@ -278,6 +462,7 @@ impl Default for MeshConfig {
             auto_update: AutoUpdateConfig::default(),
             auto_cleanup: AutoCleanupConfig::default(),
             daemon: DaemonConfig::default(),
+            services: ServicesConfig::default(),
             networks: Vec::new(),
         }
     }
@@ -420,6 +605,65 @@ mod tests {
             .urls
             .iter()
             .any(|u| u.contains("cloudflare")));
+    }
+
+    #[test]
+    fn services_default_off() {
+        let s = ServicesConfig::default();
+        // A fresh device IS a node by default; the hosted services are
+        // all opt-in.
+        assert!(s.node.enabled);
+        assert!(!s.relay.enabled);
+        assert!(!s.signaling.enabled);
+        assert!(!s.stun.enabled);
+        assert!(!s.turn.enabled);
+        assert_eq!(s.signaling.port, DEFAULT_SIGNALING_SERVER_PORT);
+        assert_eq!(s.stun.port, DEFAULT_STUN_TURN_PORT);
+        assert_eq!(s.turn.port, DEFAULT_STUN_TURN_PORT);
+        assert_eq!(s.turn.realm, "myownmesh");
+        // Signaling ships safe flood-limit defaults.
+        assert_eq!(s.signaling.limits, SignalingLimits::default());
+        assert!(s.signaling.limits.max_event_rate > 0);
+        // TURN bandwidth is unlimited until configured.
+        assert_eq!(s.turn.max_bps_per_connection, 0);
+    }
+
+    #[test]
+    fn node_defaults_on_for_old_configs() {
+        // A config written before the `node` toggle existed must still
+        // behave as a node (the field is #[serde(default)] → enabled).
+        let json = r#"{ "version": 1, "services": {}, "networks": [] }"#;
+        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.services.node.enabled);
+    }
+
+    #[test]
+    fn config_without_services_field_parses() {
+        // A config.json written by a build that predates the services
+        // block must still load — the field is #[serde(default)].
+        let json = r#"{
+            "version": 1,
+            "networks": []
+        }"#;
+        let cfg: MeshConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.services, ServicesConfig::default());
+    }
+
+    #[test]
+    fn services_round_trip() {
+        let mut cfg = MeshConfig::default();
+        cfg.services.signaling.enabled = true;
+        cfg.services.turn.enabled = true;
+        cfg.services.turn.public_ip = "203.0.113.7".to_string();
+        cfg.services.turn.credentials.push(TurnCredential {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        });
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: MeshConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(cfg, back);
+        assert!(back.services.signaling.enabled);
+        assert_eq!(back.services.turn.credentials.len(), 1);
     }
 
     #[test]
