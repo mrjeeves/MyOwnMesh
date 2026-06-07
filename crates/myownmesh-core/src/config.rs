@@ -435,6 +435,18 @@ pub struct TurnServiceConfig {
     /// A global QoS knob so one client can't saturate the relay — there's
     /// no per-user override yet, this cap applies to every allocation.
     pub max_bps_per_connection: u64,
+    /// Optional fixed UDP port window the server allocates relay sockets
+    /// from. `:port` above is only the control channel; every relayed
+    /// allocation flows through a separate UDP port, and **all of those
+    /// must be open at your firewall AND your cloud provider's security
+    /// group**. Default `0` = **unbounded**: relay sockets use the OS
+    /// ephemeral range (so you open that whole range — Linux:
+    /// `sysctl net.ipv4.ip_local_port_range`), which never artificially
+    /// caps the relay. Set both to pin a smaller, predictable window
+    /// (e.g. `49152`–`65535`) and open only that. `relay_port_min == 0`
+    /// means unbounded regardless of `relay_port_max`.
+    pub relay_port_min: u16,
+    pub relay_port_max: u16,
 }
 
 impl Default for TurnServiceConfig {
@@ -457,6 +469,12 @@ impl Default for TurnServiceConfig {
                 password: "theguestpassword".to_string(),
             }],
             max_bps_per_connection: 0,
+            // 0 = unbounded: use the OS ephemeral range so a public relay
+            // is never artificially capped out of the box (open udp 3478 +
+            // that range at the firewall). Operators who want a smaller
+            // firewall surface pin relay_port_min/max to a fixed window.
+            relay_port_min: 0,
+            relay_port_max: 0,
         }
     }
 }
@@ -740,6 +758,13 @@ mod tests {
             Some(&server.credentials[0].password),
             client[0].credential.as_ref()
         );
+    }
+
+    #[test]
+    fn turn_service_default_relay_range_is_unbounded() {
+        // Default must NOT cap the relay out of the box — 0 means "use the
+        // OS ephemeral range". Operators opt into a fixed window.
+        assert_eq!(TurnServiceConfig::default().relay_port_min, 0);
     }
 
     #[test]
