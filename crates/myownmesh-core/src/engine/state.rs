@@ -357,19 +357,15 @@ impl NetworkState {
         detail: serde_json::Value,
     ) {
         let message = message.into();
+        // Console line reads "category: message" — clean, demo-like, no
+        // field-suffix clutter. The structured network_id + category still
+        // ride the MeshEvent::Diag below for the GUI; only the console
+        // rendering is simplified.
         match level {
-            DiagLevel::Debug => {
-                tracing::debug!(network = %self.network_id, category = %category, "{message}")
-            }
-            DiagLevel::Info => {
-                tracing::info!(network = %self.network_id, category = %category, "{message}")
-            }
-            DiagLevel::Warn => {
-                tracing::warn!(network = %self.network_id, category = %category, "{message}")
-            }
-            DiagLevel::Error => {
-                tracing::error!(network = %self.network_id, category = %category, "{message}")
-            }
+            DiagLevel::Debug => tracing::debug!("{category}: {message}"),
+            DiagLevel::Info => tracing::info!("{category}: {message}"),
+            DiagLevel::Warn => tracing::warn!("{category}: {message}"),
+            DiagLevel::Error => tracing::error!("{category}: {message}"),
         }
         self.emit(MeshEvent::Diag(DiagEntry {
             ts: now_unix_ms(),
@@ -395,11 +391,7 @@ impl NetworkState {
             prev,
             next,
         }));
-        self.log_diag(
-            DiagLevel::Info,
-            "phase",
-            format!("phase: {prev:?} → {next:?}"),
-        );
+        self.log_diag(DiagLevel::Info, "phase", format!("{prev:?} → {next:?}"));
     }
 
     /// Subscribe to a named user channel. Returns a fresh

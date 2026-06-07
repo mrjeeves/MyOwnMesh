@@ -103,11 +103,7 @@ pub async fn run_driver(
     mut signaling_inbound: mpsc::UnboundedReceiver<SignalingInbound>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetworkCmd>,
 ) {
-    state.log_diag(
-        crate::events::DiagLevel::Info,
-        "engine",
-        "engine driver starting",
-    );
+    state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
     // Surface the ICE-server configuration so users can confirm at
     // a glance whether they have any relay coverage. Mirrors
     // MyOwnLLM's pattern: when peers get stuck at ICE-checking with
@@ -204,11 +200,7 @@ pub async fn run_driver(
         }
     }
 
-    state.log_diag(
-        crate::events::DiagLevel::Info,
-        "engine",
-        "engine driver stopping",
-    );
+    state.log_diag(crate::events::DiagLevel::Info, "engine", "driver stopping");
     state.shutdown().await;
 }
 
@@ -317,7 +309,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // (re-opening the peer slot) is short-circuited inside
             // `ensure_peer_session` without affecting the log.
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "signaling",
                 format!(
                     "peer announced: {} (we are {role:?})",
@@ -407,7 +399,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // If we didn't already start an answerer, do so now.
             let role = Role::Answerer;
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "signaling",
                 format!("offer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
@@ -426,7 +418,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 match session.create_answer().await {
                     Ok(desc) => {
                         state.log_diag_with(
-                            crate::events::DiagLevel::Info,
+                            crate::events::DiagLevel::Debug,
                             "signaling",
                             format!("answer sent to {}", short_peer(&device_id)),
                             serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
@@ -450,7 +442,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
         }
         SignalingInbound::Answer { device_id, sdp } => {
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "signaling",
                 format!("answer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
@@ -618,7 +610,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     state.log_diag_with(
         crate::events::DiagLevel::Info,
         "peer",
-        format!("peer sighted: {} (role: {role:?})", short_peer(&device_id)),
+        format!("{} connecting (we are {role:?})", short_peer(&device_id)),
         serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
     );
 
@@ -627,7 +619,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         match session.create_offer().await {
             Ok(desc) => {
                 state.log_diag_with(
-                    crate::events::DiagLevel::Info,
+                    crate::events::DiagLevel::Debug,
                     "signaling",
                     format!("offer sent to {}", short_peer(&device_id)),
                     serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
@@ -833,7 +825,7 @@ async fn handle_transport_event(
             // signature; "new" never advancing means the signaling
             // layer never delivered candidates.
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "ice",
                 format!("ICE → {ice_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{ice_state:?}") }),
@@ -846,7 +838,7 @@ async fn handle_transport_event(
             // but PC sticks at Connecting (DTLS handshake issue)
             // or vice versa.
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "transport",
                 format!("PC → {pc_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{pc_state:?}") }),
@@ -855,7 +847,7 @@ async fn handle_transport_event(
         }
         TransportEvent::DataChannelOpen => {
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "transport",
                 format!(
                     "data channel open with {} — starting handshake",
@@ -994,19 +986,31 @@ pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &
     if let Some(peer) = state.peers.get(device_id) {
         peer.state.write().selected_pair = Some(pair);
     }
+    // Summarize the chosen path as a transport word so a glance tells you
+    // whether you're going direct or through STUN/TURN — the detail keeps
+    // the raw candidate types for the GUI / DEBUG.
+    let local = format!("{:?}", pair.local);
+    let remote = format!("{:?}", pair.remote);
+    let transport = if local.contains("Relay") || remote.contains("Relay") {
+        "relayed (TURN)"
+    } else if local.contains("Srflx")
+        || local.contains("Prflx")
+        || remote.contains("Srflx")
+        || remote.contains("Prflx")
+    {
+        "reflexive (STUN)"
+    } else {
+        "direct"
+    };
     state.log_diag_with(
         crate::events::DiagLevel::Info,
         "ice",
-        format!(
-            "selected pair for {}: local={:?} remote={:?}",
-            short_peer(device_id),
-            pair.local,
-            pair.remote,
-        ),
+        format!("{} connected · {transport}", short_peer(device_id)),
         serde_json::json!({
             "peer": device_id,
-            "local": format!("{:?}", pair.local),
-            "remote": format!("{:?}", pair.remote),
+            "local": local,
+            "remote": remote,
+            "transport": transport,
         }),
     );
 }
@@ -1098,7 +1102,7 @@ pub(crate) async fn log_ice_check_snapshot(
             snap.total_requests_received(),
             snap.diagnosis(),
         );
-        state.log_diag_with(crate::events::DiagLevel::Info, "ice", msg, detail);
+        state.log_diag_with(crate::events::DiagLevel::Debug, "ice", msg, detail);
     }
 }
 
@@ -1573,7 +1577,7 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
         state.log_diag_with(
             crate::events::DiagLevel::Warn,
             "peer",
-            format!("peer dropped: {device_id} ({reason:?})"),
+            format!("{} dropped ({reason:?})", short_peer(device_id)),
             serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
         );
     }

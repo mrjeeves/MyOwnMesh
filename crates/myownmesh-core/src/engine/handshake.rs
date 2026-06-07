@@ -85,7 +85,7 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         data.diag.hellos_sent += 1;
     }
     state.log_diag_with(
-        crate::events::DiagLevel::Info,
+        crate::events::DiagLevel::Debug,
         "handshake",
         format!(
             "sending hello to {} (code: {code})",
@@ -207,7 +207,7 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
     }
 
     state.log_diag_with(
-        crate::events::DiagLevel::Info,
+        crate::events::DiagLevel::Debug,
         "handshake",
         format!(
             "hello received from {} (label: {:?}, code: {})",
@@ -312,10 +312,11 @@ pub async fn on_auth_response(
     };
 
     state.log_diag_with(
-        crate::events::DiagLevel::Info,
+        crate::events::DiagLevel::Debug,
         "handshake",
         format!(
-            "auth ok with {device_id} ({})",
+            "auth ok with {} ({})",
+            super::short_peer(device_id),
             if auto_approve {
                 if rostered {
                     "rostered → auto-approve"
@@ -371,7 +372,7 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         state.log_diag_with(
             crate::events::DiagLevel::Info,
             "peer",
-            format!("peer active: {device_id}"),
+            format!("{} ACTIVE", super::short_peer(device_id)),
             serde_json::json!({ "peer": device_id }),
         );
         state.emit(MeshEvent::Peer(PeerEvent::Approved {
