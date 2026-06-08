@@ -166,6 +166,40 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // plain-language diagnosis) is the record of why this attempt
     // never completed — log it before the teardown removes the agent.
     super::log_ice_check_snapshot(state, device_id, "stuck in checking", true).await;
+
+    // Zero remote candidates is the fingerprint of wedged signaling, not a
+    // blocked network: the peer's candidates never crossed the relay (or
+    // ours never reached it). The usual cause is a relay socket left a
+    // zombie by a network change on one side — held open for minutes
+    // because the kernel never saw a FIN/RST. The network-change watcher
+    // already forces a redial when it *sees* the interface move, but it
+    // can't see every case (a multi-homed route flip needn't change our
+    // own primary IP). So when this is the failure shape, force a redial
+    // here too — but only if no other peer is currently up, so we never
+    // drop a relay that's demonstrably working for someone else. The
+    // reconnect generation is coalesced by its watch, so simultaneous
+    // timeouts collapse into one redial.
+    let no_remote = state
+        .peers
+        .get(device_id)
+        .map(|p| p.state.read().diag.remote_candidates.total() == 0)
+        .unwrap_or(false);
+    let have_other_live_peer = state.peers.iter().any(|e| {
+        e.key() != device_id
+            && matches!(
+                e.value().state.read().status,
+                PeerStatus::Active | PeerStatus::Shelved
+            )
+    });
+    if no_remote && !have_other_live_peer && state.request_relay_reconnect() {
+        state.log_diag(
+            DiagLevel::Info,
+            "signaling",
+            "no remote candidates arrived — forcing relay reconnect (socket likely \
+             went stale after a network change)",
+        );
+    }
+
     super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
     // Nudge discovery so we don't wait for the peer's next scheduled
     // announce; rate-limited, so several simultaneous timeouts collapse

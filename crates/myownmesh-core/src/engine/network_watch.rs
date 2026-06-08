@@ -170,6 +170,24 @@ async fn on_network_change(
         }),
     }));
 
+    // FIRST, redial the relays. This is the half that was missing — and
+    // why renegotiation alone never fixed the handoff. When the primary
+    // interface moves, every relay WebSocket was bound to the old route
+    // and is now a zombie: the TCP connection wasn't torn down (no
+    // FIN/RST crossed the dead path), so our side still thinks it's open
+    // and the kernel won't notice for *minutes*. Until those sockets
+    // redial we are deaf and mute on signaling — the renegotiation offer
+    // and the ICE candidates below get published to nowhere (they ride an
+    // ephemeral Nostr kind, so they're forwarded to current subscribers
+    // or dropped, never stored), which is exactly the "0 remote
+    // candidates arrived" stall. `request_relay_reconnect` bumps the
+    // generation every relay task watches, so they drop the zombie and
+    // reconnect on the new interface at once. Same fix the wake path uses
+    // for the identical post-suspend zombie (see `engine::wake::on_wake`).
+    if state.request_relay_reconnect() {
+        debug!(network = %state.network_id, "network change — forcing relay reconnect");
+    }
+
     ice_watchdog::force_ice_restart_all(state).await;
     // Re-seed discovery as well: peers we lost while off-network (or
     // that were torn down by the checking-timeout watchdog) rediscover
