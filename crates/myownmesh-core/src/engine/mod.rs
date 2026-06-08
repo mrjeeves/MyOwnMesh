@@ -399,6 +399,33 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     }
                 }
             }
+            // A live peer that re-announced while its ICE is down most
+            // likely had its network move — the answerer side of a handoff
+            // prods us this way (it re-gathered and can't send us a
+            // competing offer). If we're its offerer, renegotiate now so it
+            // recovers in place rather than waiting out our own consent
+            // timer. Single-flighted inside `renegotiate_ice`.
+            if role == Role::Offerer {
+                let unhealthy = state
+                    .peers
+                    .get(&device_id)
+                    .and_then(|p| {
+                        let session = p.session.lock().clone()?;
+                        let status = p.state.read().status;
+                        Some(
+                            matches!(status, PeerStatus::Active | PeerStatus::Shelved)
+                                && !matches!(
+                                    session.ice_connection_state(),
+                                    RTCIceConnectionState::Connected
+                                        | RTCIceConnectionState::Completed
+                                ),
+                        )
+                    })
+                    .unwrap_or(false);
+                if unhealthy {
+                    renegotiate_ice(state, &device_id, false).await;
+                }
+            }
             clear_stale_session_if_zombie(state, &device_id).await;
             ensure_peer_session(state, device_id, role).await;
         }
@@ -579,6 +606,139 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
         let _ = state.signaling_tx.send(SignalingOutbound::Announce);
     }
     due
+}
+
+/// Re-establish ICE on a *live* peer by renegotiating the SDP — the half
+/// `restart_ice()` leaves undone.
+///
+/// `restart_ice()` rotates our local ICE ufrag/pwd and re-gathers *our*
+/// candidates, but on its own it never tells the peer: no fresh offer
+/// goes out, so the peer keeps the old credentials, never re-answers, and
+/// never sends candidates of its own. The link then sits with our new
+/// candidates and zero remote ones and can only recover by a full
+/// teardown + rebuild (which lands on TURN). This does the missing half —
+/// `restart_ice()` *then* a fresh offer — so both ends re-gather against
+/// the new ufrag and reconnect in place, usually within a second or two.
+///
+/// Glare- and flood-safe:
+///   * Only the deterministic *offerer* (lex-lower device id) emits the
+///     restart offer, so the two ends can't offer at once. The answerer
+///     re-gathers implicitly when the offer lands; meanwhile it nudges the
+///     offerer with the (globally rate-limited) reactive announce rather
+///     than sending a competing offer.
+///   * Single-flighted on `last_offer_sent_at` (`REOFFER_MIN_INTERVAL_MS`)
+///     so the network-change watcher, the ICE watchdog, and an inbound
+///     announce collapse into one offer per window instead of a storm.
+///   * Skipped while a renegotiation is already in flight (ICE
+///     `Checking`) — re-issuing `restart_ice()` mid-gather just burns the
+///     cycle ("ICE Agent can not be restarted when gathering").
+///
+/// `force` is set by the network-change watcher: right after the OS swaps
+/// the primary interface, ICE still *reads* `Connected` (its
+/// consent-freshness timer hasn't fired — that's the whole reason the
+/// watcher exists), so we must renegotiate despite the stale "healthy"
+/// state. The watchdog / announce callers pass `force = false` and skip a
+/// genuinely-connected link.
+pub(crate) async fn renegotiate_ice(state: &Arc<NetworkState>, device_id: &str, force: bool) {
+    let session = {
+        let Some(peer) = state.peers.get(device_id) else {
+            return;
+        };
+        let s = peer.session.lock().clone();
+        s
+    };
+    let Some(session) = session else { return };
+
+    match session.ice_connection_state() {
+        // Healthy. Unless the caller knows the network just moved
+        // (`force`), leave it alone — and opportunistically settle the
+        // tier back to Steady if a prior restart has since recovered.
+        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed if !force => {
+            if let Some(peer) = state.peers.get(device_id) {
+                let mut data = peer.state.write();
+                data.ice_disconnected_since = None;
+                if matches!(
+                    data.tier,
+                    ConnectionTier::IceRestart { .. } | ConnectionTier::IceWatchdog { .. }
+                ) {
+                    data.tier = ConnectionTier::Steady;
+                }
+            }
+            return;
+        }
+        // A gather/connectivity check is already in flight — don't
+        // interrupt it, even on a forced network-change pass.
+        RTCIceConnectionState::Checking => return,
+        _ => {}
+    }
+
+    // Single-flight: collapse overlapping triggers into one offer/window.
+    let offerer = {
+        let Some(peer) = state.peers.get(device_id) else {
+            return;
+        };
+        let mut data = peer.state.write();
+        let due = data
+            .last_offer_sent_at
+            .map(|t| {
+                Instant::now().duration_since(t) >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+            })
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        data.last_offer_sent_at = Some(Instant::now());
+        data.tier = ConnectionTier::IceRestart {
+            started: Instant::now(),
+        };
+        data.diag.ice_restarts += 1;
+        state.identity.public_id() < device_id
+    };
+
+    if let Err(e) = session.restart_ice().await {
+        // Benign when a gather from a previous trigger is still in flight;
+        // the next watchdog poll picks it up once that settles.
+        debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
+    }
+
+    if offerer {
+        match session.create_offer().await {
+            Ok(desc) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Info,
+                    "ice",
+                    format!(
+                        "renegotiating ICE with {} — restart offer",
+                        short_peer(device_id)
+                    ),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "role": "offerer",
+                        "sdp_bytes": desc.sdp.len(),
+                    }),
+                );
+                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                    device_id: device_id.to_string(),
+                    sdp: desc.sdp,
+                });
+            }
+            Err(e) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
+        }
+    } else {
+        // Answerer: avoid glare. Nudge the offerer to send the restart
+        // offer; the reactive announce is globally rate-limited so this
+        // can't add signaling load.
+        state.log_diag_with(
+            crate::events::DiagLevel::Debug,
+            "ice",
+            format!(
+                "ICE renegotiate with {} — nudging offerer",
+                short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "role": "answerer" }),
+        );
+        maybe_reactive_announce(state);
+    }
 }
 
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {

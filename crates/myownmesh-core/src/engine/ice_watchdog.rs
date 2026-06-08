@@ -3,22 +3,22 @@
 //! `disconnected` — earlier than the underlying WebRTC stack's
 //! own consent-freshness timer would notice a stale network.
 //!
-//! Side-effect of beating the upstream timer: a recovered
-//! connection sees `connected` again from inside our
-//! `restart_ice()` call, so we never tear down the data channel
-//! on a brief LAN blip.
+//! Recovery goes through [`super::renegotiate_ice`], which does
+//! `restart_ice()` *and* sends a fresh offer — a bare `restart_ice()`
+//! only re-gathers our own candidates and rotates our ufrag, which the
+//! peer never hears about, so the link can't actually come back. The
+//! watchdog poll re-drives the (single-flighted) renegotiation while a
+//! link stays down; the data channel is preserved across the restart, so
+//! a brief blip never tears it down.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tracing::{debug, warn};
+use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::ladder::ConnectionTier;
-use super::scheduler::{
-    ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, ICE_RESTART_RECOVERY_MS,
-};
+use super::scheduler::{ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -55,7 +55,13 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
         .collect();
 
     for peer_id in candidates {
-        try_restart_ice(state, &peer_id).await;
+        // Renegotiate (restart_ice + a fresh offer), not a bare
+        // restart_ice — see `engine::renegotiate_ice`. Single-flighted
+        // there, so polling every few seconds while a link stays down
+        // retries the offer without flooding signaling. Not forced: ICE
+        // is genuinely disconnected here, so there's no stale-Connected
+        // state to push past.
+        super::renegotiate_ice(state, &peer_id, false).await;
     }
 
     // Retry selected-pair classification for any peer whose ICE
@@ -167,74 +173,6 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     super::maybe_reactive_announce(state);
 }
 
-/// Tier 3 — `pc.restart_ice()` then wait the recovery grace.
-async fn try_restart_ice(state: &Arc<NetworkState>, device_id: &str) {
-    let session = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return;
-        };
-        let session = peer.session.lock().clone();
-        session
-    };
-    let Some(session) = session else { return };
-
-    // Skip if ICE has already recovered on its own.
-    match session.ice_connection_state() {
-        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
-            if let Some(peer) = state.peers.get(device_id) {
-                let mut data = peer.state.write();
-                data.ice_disconnected_since = None;
-                data.tier = ConnectionTier::Steady;
-            }
-            return;
-        }
-        _ => {}
-    }
-
-    debug!(peer = %device_id, "tier 2.5 → restart_ice()");
-    if let Some(peer) = state.peers.get(device_id) {
-        let mut data = peer.state.write();
-        data.diag.ice_restarts += 1;
-        data.tier = ConnectionTier::IceRestart {
-            started: Instant::now(),
-        };
-    }
-    if let Err(e) = session.restart_ice().await {
-        state.log_diag_with(
-            crate::events::DiagLevel::Warn,
-            "ice",
-            format!("restart_ice failed for {device_id}: {e}"),
-            serde_json::json!({ "peer": device_id, "error": e.to_string() }),
-        );
-    }
-
-    // Schedule the recovery check. After `ICE_RESTART_RECOVERY_MS`
-    // we either see ICE back to `connected` (the watchdog
-    // resolves naturally via the engine's state-change handler)
-    // or escalate to Tier 4.
-    let state_clone = state.clone();
-    let device_id = device_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(ICE_RESTART_RECOVERY_MS)).await;
-        let still_failing = {
-            let Some(peer) = state_clone.peers.get(&device_id) else {
-                return;
-            };
-            let data = peer.state.read();
-            !matches!(data.tier, ConnectionTier::Steady)
-        };
-        if still_failing {
-            state_clone.log_diag_with(
-                crate::events::DiagLevel::Warn,
-                "ice",
-                format!("ICE restart did not recover for {device_id} — escalating to Tier 4"),
-                serde_json::json!({ "peer": device_id }),
-            );
-            super::ladder::escalate_to_rehandshake(&state_clone, &device_id).await;
-        }
-    });
-}
-
 /// Called directly from the ICE state-change handler when ICE
 /// reports `Failed`. Skips the watchdog window — we know the
 /// connection is gone.
@@ -242,11 +180,16 @@ pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
     state.log_diag_with(
         crate::events::DiagLevel::Warn,
         "ice",
-        format!("ICE failed for {device_id} — Tier 4 immediately"),
+        format!("ICE failed for {device_id} — renegotiating"),
         serde_json::json!({ "peer": device_id }),
     );
     maybe_emit_no_turn_diag(state, device_id);
-    super::ladder::escalate_to_rehandshake(state, device_id).await;
+    // The right response to a hard ICE failure is the same as a network
+    // change: restart_ice + a fresh offer so both ends re-gather and
+    // re-exchange. The old path escalated to a Tier-4 re-handshake, which
+    // only re-sends `hello` over the already-dead data channel and can't
+    // bring the transport back. Single-flighted in `renegotiate_ice`.
+    super::renegotiate_ice(state, device_id, false).await;
 }
 
 /// Inspect the peer's candidate stats after an ICE failure and, if
@@ -324,13 +267,14 @@ fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
     }));
 }
 
-/// Force an ICE restart on every active or shelved peer, ignoring
-/// the "already connected" short-circuit. Used by the network-change
-/// watcher: when the OS reports the primary outbound IP just
-/// changed, every existing connection's local candidates are stale
-/// and ICE won't notice until its 30 s consent-freshness timer
-/// expires. Pre-empting that timer here gets us reconnected within
-/// seconds instead of half a minute.
+/// Renegotiate ICE on every active or shelved peer. Used by the
+/// network-change watcher: when the OS reports the primary outbound IP
+/// just changed, every existing connection's local candidates are stale
+/// and ICE won't notice until its ~30 s consent-freshness timer expires.
+/// Pre-empting that here — `restart_ice()` **plus** a fresh offer (see
+/// [`super::renegotiate_ice`]) — gets both ends re-gathered and
+/// reconnected within seconds instead of half a minute, and the
+/// per-peer single-flight keeps the fan-out from flooding signaling.
 pub async fn force_ice_restart_all(state: &Arc<NetworkState>) {
     let candidates: Vec<String> = state
         .peers
@@ -342,36 +286,8 @@ pub async fn force_ice_restart_all(state: &Arc<NetworkState>) {
         .collect();
 
     for peer_id in candidates {
-        force_one(state, &peer_id).await;
-    }
-}
-
-async fn force_one(state: &Arc<NetworkState>, device_id: &str) {
-    // Bind the cloned `Option<Arc<PeerSession>>` to a named local
-    // before the inner block returns so the MutexGuard temporary
-    // from `.lock()` drops before the `peer` Ref does. Without
-    // this, Rust 2021's trailing-expression scoping keeps the
-    // guard alive across the outer borrow checker boundary and
-    // fails E0597. Matches the pattern used by `try_restart_ice`
-    // above.
-    let session = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return;
-        };
-        let session = peer.session.lock().clone();
-        session
-    };
-    let Some(session) = session else { return };
-
-    debug!(peer = %device_id, "network change — forcing ICE restart");
-    if let Some(peer) = state.peers.get(device_id) {
-        let mut data = peer.state.write();
-        data.diag.ice_restarts += 1;
-        data.tier = ConnectionTier::IceRestart {
-            started: Instant::now(),
-        };
-    }
-    if let Err(e) = session.restart_ice().await {
-        warn!(peer = %device_id, "force restart_ice failed: {e}");
+        // Forced: on a network change ICE often still reads Connected
+        // (consent-freshness hasn't fired), so push past the stale state.
+        super::renegotiate_ice(state, &peer_id, true).await;
     }
 }
