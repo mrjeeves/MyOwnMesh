@@ -17,8 +17,8 @@ are settled — see [Decisions](#decisions) at the bottom.
 
 A MyOwnMesh network defaults to permissive: anyone holding the
 network id can knock, and once approved by any current member they
-become a peer with equal authority. That's right for friend-mesh
-and most MyOwnLLM deployments today. It's wrong for an office mesh
+become a peer with equal authority. That's right for a friend-mesh
+and most small deployments. It's wrong for an office mesh
 where ten people share infrastructure they don't all administer —
 one member shouldn't be able to add a stranger to the org's mesh.
 
@@ -48,12 +48,12 @@ A determined adversary holding the control socket can bypass the
 GUI; what they can't bypass is the cryptographic verification on
 the other side. **The wire, not the UI, is the security boundary.**
 
-During the preview-mode window — where the GUI scaffolds these
-surfaces while the engine half lands — every governance mutation
-lives entirely in `localStorage` on the issuer's machine, and the
-preview banner on the Governance tab is explicit about that. None
-of the closed-network claims have wire enforcement until
-`network_state_v1` ships in the engine.
+Both halves have shipped: the daemon signs, broadcasts, verifies,
+and persists `network_state_*` frames, and the GUI's Governance tab
+drives them over the control socket. Roster membership converges by
+anti-entropy gossip — each node advertises a compact membership root
+and pulls only what it's missing — so a member approved on one device
+propagates to the rest of the network rather than living on one box.
 
 ## Two kinds
 

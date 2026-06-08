@@ -15,13 +15,13 @@ tag via git:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }  # only if you want the Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }  # only if you want the Nostr driver
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-`tag = "v0.1.0"` gets reproducible builds; switch to
+`tag = "v0.2.0"` gets reproducible builds; switch to
 `branch = "main"` if you're tracking the latest work. Both crates
 resolve out of the same checkout because cargo dedupes git deps by
 URL. See [`../RELEASE.md`](../RELEASE.md) for the published-artifact

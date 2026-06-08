@@ -16,25 +16,38 @@ and lets you crash-restart the UI without touching the running mesh.
 - **Node graph** — central canvas. Self at the centre, peers laid out
   on a ring (Ring / FullMesh topology) or around the hub (Star
   topology). Colours encode peer status; edge style encodes link
-  state. Click a node for detail. The detail popup includes the
-  peer's stable display suffix (blue tile) and — during pending
-  approval — the per-session verification code (amber tile) so
-  approvals can be confirmed without leaving the graph.
+  state. Click a node — or pick a peer in the sidebar — for detail.
+  The detail popup includes the peer's stable display suffix (blue
+  tile) and — during pending approval — the per-session verification
+  code (amber tile) so approvals can be confirmed without leaving the
+  graph.
 - **Sidebar** — networks list. Each network expands to show its
-  current members, click a peer to highlight it on the graph, click
-  the `+` to open Networks settings. Always visible: networks are
-  the primary navigation surface, so the sidebar isn't hideable.
-- **Settings overlay** — full-window tabbed panel.
+  current members; click a peer to highlight it on the graph, click
+  the per-network gear to jump to that network's settings, or the
+  `+` in the header to open Networks settings. Always visible:
+  networks are the primary navigation surface, so the sidebar isn't
+  hideable.
+- **Settings panel** — full-window tabbed panel.
   - **Approvals** *(default)* — pending peer requests across every
     joined network. Each row shows the peer's label, the stable
     display suffix (`-XXXXX`) in a blue tile, and the per-session
     6-char verification code in an amber tile. Approve / Deny
     inline. Empty state walks new users through how to get a peer
     here in the first place.
-  - **Networks** — Status (topology selector + per-network rollup) ·
+  - **Networks** — one home per saved network, chosen with a picker:
+    Status (read-only overview) · Settings (label, topology,
+    signaling / STUN / TURN, auto-approve, export, remove) ·
     Connections (per-peer table — *connections only*, no Approve
     action; pending approvals live in the Approvals tab) · Roster
-    (approved devices).
+    (approved devices + roles) · Governance (open ↔ closed kind +
+    propose / sign / deny). The per-network gear in the sidebar
+    opens straight here.
+  - **Services** — host relay / signaling / STUN / TURN for the rest
+    of the mesh; toggle each and edit its bind/port/limits.
+  - **Updates** — current version, the auto-update toggle and policy
+    (channel + which version bumps auto-apply + check interval), any
+    staged update, and the release-feed URL (point a fleet at your
+    own release host to white-label).
   - **Identity** — device pubkey / display id / daemon version.
   - **Activity** — live event-stream log spanning every category the
     daemon emits (peer state changes, phase transitions, ICE /

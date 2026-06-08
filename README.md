@@ -2,13 +2,13 @@
 
 # MyOwnMesh
 
-### The peer-to-peer mesh underneath [MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM) — pure Rust, embed it in anything.
+### A private mesh network you actually own — pure Rust, embed it in anything.
 
 [Quick start](docs/QUICKSTART.md) · [Protocol](docs/PROTOCOL.md) · [Architecture](ARCHITECTURE.md) · [Connection engine](CONNECTION-ENGINE.md) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows_·_Pi-2ea44f.svg)](#platforms)
-[![Tests](https://img.shields.io/badge/tests-98_passing-2ea44f.svg)](crates/myownmesh-core/tests)
+[![Tests](https://img.shields.io/badge/tests-266_passing-2ea44f.svg)](crates/myownmesh-core/tests)
 
 </div>
 
@@ -113,8 +113,8 @@ so both crates resolve out of the same checkout:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.1.0" }  # Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }  # Nostr driver
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -190,7 +190,7 @@ cargo run --example roster_demo   -p myownmesh-core   # approve / persist / reco
 ```bash
 just setup       # Rust toolchain via rustup (idempotent)
 just build       # cargo build --workspace
-just test        # cargo test --workspace        (98 tests today)
+just test        # cargo test --workspace        (266 tests today)
 just check       # fmt + clippy -D warnings + test
 just fmt         # cargo fmt --all
 just lint        # cargo clippy --workspace --all-targets -- -D warnings
@@ -229,12 +229,14 @@ myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
 ```
 
 A bare `myownmesh update` fetches the latest release and updates the
-daemon **and** the desktop GUI together — the equivalent of MyOwnLLM's
-`myownllm update`. The GUI ships as its own binary beside the daemon, so
-the self-updater swaps both; restart afterwards to run the new version.
+daemon **and** the desktop GUI together. The GUI ships as its own binary
+beside the daemon, so the self-updater swaps both; restart afterwards to
+run the new version. Everything the updater does is also a screen —
+Settings → Updates — including the release-feed URL, so you can point a
+fleet at your own release host (white-label) without rebuilding.
 
-A bare `myownmesh` (no subcommand) opens the desktop GUI — same as
-MyOwnLLM — which auto-spawns the daemon for you. On a headless box
+A bare `myownmesh` (no subcommand) opens the desktop GUI, which
+auto-spawns the daemon for you. On a headless box
 with no display it prints a pointer to `myownmesh serve` instead, so
 servers run the daemon directly. Daemon reads `~/.myownmesh/config.json` (auto-created on first edit;
 sensible defaults until then), joins every network listed there,
@@ -253,9 +255,10 @@ never disturbs the running mesh. Launch it with a bare `myownmesh`
 locates `myownmesh-gui` and hands off to it — or `just dev` from a
 source checkout.
 
-- **Node graph** — self at the centre, peers laid out by topology, click a node for label / display suffix / RTT / capabilities. During pending approval the popup surfaces the per-session 6-char verification code as a tile for out-of-band confirmation.
+- **Node graph** — self at the centre, peers laid out by topology. Click a node (or pick it from the sidebar) for label / display suffix / RTT / capabilities; during pending approval the popup surfaces the per-session 6-char verification code as a tile for out-of-band confirmation.
 - **Approvals tab** (default in Settings) — pending peer requests from every joined network flatten into one list with Approve / Deny inline.
-- **Networks** — Status (topology selector + per-network rollup) · Connections (live peer table) · Roster (approved devices).
+- **Networks** — one home per network: Status · Settings (label, topology, signaling / STUN / TURN, auto-approve, export, remove) · Connections (live peer table) · Roster (approved devices + roles) · Governance (open ↔ closed, propose / sign / deny). The per-network gear in the sidebar jumps straight here.
+- **Updates** — current version, the auto-update toggle and policy (channel + which version bumps apply on their own), any staged update, and the release-feed URL for white-labelling.
 - **Activity** — unified event log: peer state transitions, phase changes, ICE / handshake / signaling diagnostics. Quiet toggle suppresses info-level chatter; warns and errors always land.
 
 Layout / wire protocol in [`gui/README.md`](gui/README.md).
