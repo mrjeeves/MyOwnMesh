@@ -48,8 +48,8 @@ prior tier fails to recover.
 |------|---------|--------|-------|
 | **1. Steady** | App message arrives | Reset `last_recv_at`. | No-op recovery path. |
 | **2. Wake probe** | Wake event (OS or tick gap > `WAKE_DETECTION_THRESHOLD_MS`) | Ping all peers + wait `WAKE_PROBE_DELAY_MS` (1.5 s). | Catches resume-from-sleep where heartbeats were paused. |
-| **2.5. ICE watchdog** | Per-peer `iceConnectionState == disconnected` | After `ICE_DISCONNECTED_RESTART_MS` (1 s), call `pc.restart_ice()`. | **Fires before Trystero's 5 s timeout** — the whole point of having this tier. |
-| **3. ICE restart** | Wake probe finds all peers silent | Per-PC `pc.restart_ice()` with `ICE_RESTART_RECOVERY_MS` (4 s) grace. | Avoids tearing down the data channel if ICE can recover in place. |
+| **2.5. ICE watchdog** | Per-peer `iceConnectionState == disconnected` | After `ICE_DISCONNECTED_RESTART_MS` (1 s), **renegotiate ICE**: `pc.restart_ice()` *and* send a fresh offer (`renegotiate_ice`). Re-driven each `ICE_POLL_INTERVAL_MS` while the link stays down. | **Fires before Trystero's 5 s timeout.** A bare `restart_ice()` only re-gathers *our* candidates + rotates our ufrag — the peer never hears about it, so the link can't actually come back; the offer is the other half. |
+| **3. ICE restart** | Network change (primary IP moved) or ICE failed | Same `renegotiate_ice` per peer, forced past the stale `Connected` state a just-moved interface still reports. The data channel survives; the periodic poll retries until ICE reconnects, or the checking-timeout rebuilds. | Recovers a network handoff (LTE↔Wi-Fi) in place, in seconds — no teardown, no fall to TURN. Only the deterministic offerer emits the offer (no glare); single-flighted so the watchdog + network-watch don't flood signaling. |
 | **4. Re-handshake** | Silence > `HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS` (~75 s) or Tier 3 failed | Per-peer `hello` cycle on `REHANDSHAKE_BACKOFF_MS_SCHEDULE` (2 / 5 / 10 / 20 / 30 s) with `REHANDSHAKE_JITTER_FRACTION` (±20 %) jitter. Up to `REHANDSHAKE_RESCUE_ATTEMPTS` (3) rounds. | Jitter prevents the thundering-herd retry when two peers wake simultaneously. |
 | **5. Room rejoin** | Three Tier-4 rounds failed, OR rostered peer offline > `OFFLINE_ROSTERED_CHECK_INTERVAL_MS` (60 s) | Trystero room `leave` + `joinRoom`. Backed off via `REDISCOVERY_BACKOFF_SCHEDULE_MS` (90 s / 3 min / 5 min / 10 min). | Throttle prevents relay-spam after persistent failure. |
 | **6. Stop + Start** | Signaling / STUN / TURN config edit | Reconcile teardown + fresh start, immediately. | Triggered only by user action — never as an automatic recovery. |
@@ -75,8 +75,7 @@ WAKE_COALESCE_MS                    = 2_000               // dedupe wake events 
 WAKE_PROBE_DELAY_MS                 = 1_500               // tier-2 probe wait
 
 ICE_DISCONNECTED_RESTART_MS         = 1_000               // tier-2.5 watchdog (beats Trystero's 5s)
-ICE_RESTART_RECOVERY_MS             = 4_000               // tier-3 grace after restart
-ICE_POLL_INTERVAL_MS                = 3_000               // periodic ICE state poll
+ICE_POLL_INTERVAL_MS                = 3_000               // periodic ICE poll + renegotiation retry cadence
 
 RECONNECTING_GRACE_MS               = 90_000              // tier-5 max wait before pruning
 RECONNECT_PRUNE_INTERVAL_MS         = 10_000              // sweep stale reconnecting entries

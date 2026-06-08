@@ -1,6 +1,9 @@
 //! Network-change watcher. Polls the OS's chosen primary outbound
-//! IPs every few seconds and, when they change, forces an ICE
-//! restart on every active peer in this network.
+//! IPs every few seconds and, when they change, renegotiates ICE on
+//! every active peer in this network — `restart_ice()` *plus* a fresh
+//! offer, so both ends re-gather on the new interface and reconnect in
+//! place (see `engine::renegotiate_ice`), rather than a bare local
+//! re-gather the peer never hears about.
 //!
 //! Why this exists
 //! ---------------
@@ -151,7 +154,7 @@ async fn on_network_change(
         next_v4 = ?current.v4,
         prev_v6 = ?prev.v6,
         next_v6 = ?current.v6,
-        "primary outbound IP changed — forcing ICE restart on all active peers"
+        "primary outbound IP changed — renegotiating ICE on all active peers"
     );
 
     state.emit(MeshEvent::Diag(DiagEntry {
@@ -159,7 +162,7 @@ async fn on_network_change(
         network_id: state.network_id.clone(),
         level: DiagLevel::Info,
         category: "network".to_string(),
-        message: "Primary network interface changed; restarting ICE on every active peer."
+        message: "Primary network interface changed; renegotiating ICE with every active peer."
             .to_string(),
         detail: serde_json::json!({
             "prev": { "v4": prev.v4.map(|v| v.to_string()), "v6": prev.v6.map(|v| v.to_string()) },

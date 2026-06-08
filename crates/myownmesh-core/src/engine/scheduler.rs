@@ -46,11 +46,10 @@ pub const WAKE_PROBE_DELAY_MS: u64 = 1_500;
 /// timeout by firing at 1 s after `ice_disconnected`.
 pub const ICE_DISCONNECTED_RESTART_MS: u64 = 1_000;
 
-/// Tier 3 grace after `pc.restart_ice()` before escalating to
-/// Tier 4.
-pub const ICE_RESTART_RECOVERY_MS: u64 = 4_000;
-
-/// Periodic ICE state poll cadence.
+/// Periodic ICE state poll cadence. Also the retry cadence for an
+/// in-progress ICE renegotiation: while a peer's link stays down the
+/// watchdog re-drives the (single-flighted) `renegotiate_ice` here, so a
+/// lost restart offer is re-sent within a poll rather than escalating.
 pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 
 /// A peer stuck in ICE `Checking` this long without reaching
