@@ -349,14 +349,18 @@ pub async fn on_auth_response(
 }
 
 pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
-    let (now_active, label) = {
+    let (became_active, label) = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
         };
         let mut data = peer.state.write();
         data.remote_approve_seen = true;
+        // Guard the transition edge: a peer that re-sends Approve after
+        // we're already ACTIVE shouldn't re-fire the on-active side
+        // effects (roster persist, gossip, Approved event).
+        let was_active = matches!(data.status, PeerStatus::Active);
         let active = data.local_approve_sent && data.remote_approve_seen;
-        if active {
+        if active && !was_active {
             data.status = PeerStatus::Active;
             data.tier = ConnectionTier::Steady;
             // Successful Active reset: clear the no-TURN diagnostic
@@ -366,9 +370,28 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
             data.ice_failed_count = 0;
             data.no_turn_diag_emitted = false;
         }
-        (active, data.label.clone())
+        (active && !was_active, data.label.clone())
     };
-    if now_active {
+    if became_active {
+        // Both sides have now approved — the bilateral double handshake is
+        // complete and the link is ACTIVE. THIS is the moment a peer
+        // becomes a confirmed member, so persist them into the roster
+        // (idempotent: the manual-approve path already added them; the
+        // auto-approve path had not) and gossip the new membership so the
+        // rest of the network converges. Without this an auto-approved
+        // peer would reach ACTIVE but never be remembered, and no member
+        // beyond the two endpoints would ever learn the peer exists —
+        // exactly the "we keep losing our roster" symptom.
+        if let Err(e) = state.approve_roster(device_id, &label).await {
+            state.log_diag(
+                crate::events::DiagLevel::Warn,
+                "roster",
+                format!(
+                    "persist {} after mutual approve failed: {e}",
+                    super::short_peer(device_id)
+                ),
+            );
+        }
         state.log_diag_with(
             crate::events::DiagLevel::Info,
             "peer",
@@ -382,6 +405,9 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         }));
         phase::recompute(state);
         super::ladder::reevaluate_topology(state).await;
+        // Advertise the updated roster so the rest of the network pulls
+        // the newly-confirmed member (anti-entropy; see governance::).
+        super::governance::broadcast_roster_summary(state).await;
     }
 }
 

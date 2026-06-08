@@ -1,16 +1,15 @@
 <script lang="ts">
-  /** Edit-network panel — the first real "change a saved network's
-   *  knobs" surface in the GUI. Until this landed, the only path to
-   *  a new label or a new TURN URL was hand-editing
-   *  `~/.myownmesh/config.json` and bouncing the daemon.
+  /** Edit-network panel — change a saved network's knobs (label,
+   *  topology, signaling / STUN / TURN, auto-approve) without hand-editing
+   *  `~/.myownmesh/config.json`.
    *
-   *  Mechanism: edit-network goes through a `networkRemove` +
-   *  `networkAdd` with the same `network_id` (and so the same
-   *  on-disk roster file, since rosters are keyed by `network_id`).
-   *  Peers see a brief disconnect; the next ACTIVE re-handshake
-   *  finds them in the roster again and skips re-approval. A proper
-   *  atomic `mesh_network_update` is a follow-up — this gets users
-   *  the affordance immediately without engine work. */
+   *  Mechanism: an atomic `networkUpdate`. The daemon hot-applies
+   *  label / topology / auto-approve with no peer disruption, and only
+   *  restarts the transport for signaling/STUN/TURN edits (the ICE server
+   *  set is baked into each connection at creation, so there's no way to
+   *  retrofit it live). The roster is preserved either way, and a config
+   *  the daemon rejects rolls back to the previous one — so a save can't
+   *  strand the network. Embedded in Settings → Networks. */
 
   import { save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { meshClient } from "../../mesh-client.svelte";
@@ -48,16 +47,11 @@
   let busy = $state(false);
   let actionError = $state<string | null>(null);
   let savedAt = $state<number | null>(null);
-  /** Last-known full config from the daemon. Snapshotted on load
-   *  so the save flow can roll back to it if the new config fails
-   *  to apply (and so an orphan record can carry it forward if
-   *  the rollback itself fails — see `save()`). */
-  let originalConfig = $state<NetworkConfigInput | null>(null);
 
   /** Seed the draft from the daemon's current config the first time
    *  we render. Re-seed when the user switches to a different
-   *  network — the parent overlay remounts us via a `key={config_id}`
-   *  block, so this `$effect` fires once per mount. */
+   *  network — the parent wraps us in a `{#key config_id}` block, so
+   *  this `$effect` fires once per mount. */
   $effect(() => {
     if (loaded) return;
     void (async () => {
@@ -68,7 +62,6 @@
             n.id === network.config_id || n.network_id === network.network_id,
         );
         if (net) {
-          originalConfig = net;
           seedFrom(net);
         } else {
           seedDefaults();
@@ -173,7 +166,7 @@
     stunDraft = [...DEFAULT_NETWORK_STUN];
   }
 
-  // ---- save (remove + re-add with same network_id) --------------------
+  // ---- save (atomic in-place update) ----------------------------------
 
   async function save() {
     if (busy) return;
@@ -181,10 +174,12 @@
     actionError = null;
     let newCfg: NetworkConfigInput;
     try {
-      // Build the new wire payload first so we don't tear down the
-      // current network just to find the inputs invalid.
+      // Build the new wire payload, carrying THIS network's existing
+      // config id so the daemon edits the same record in place rather
+      // than creating a duplicate.
       const topo = buildTopology(topology, starHub || null);
       newCfg = buildNetworkConfig({
+        id: network.config_id,
         networkId: network.network_id,
         label: labelDraft,
         topology: topo,
@@ -199,57 +194,17 @@
       return;
     }
 
-    // Edit = remove + re-add. The roster file lives at
-    // `~/.myownmesh/mesh/rosters/{network_id}.json` on disk and is
-    // keyed by network_id (not the local config record id), so it
-    // survives the round-trip. The risk is the add step failing
-    // (e.g. bad TURN URL the daemon rejects on parse) — without
-    // care, that leaves the user with no network and no surface
-    // to recover from. We snapshot the original on load, attempt
-    // remove + new add, fall back to re-adding the original, and
-    // record an orphan if even that fails.
-    //
-    // A proper atomic `mesh_network_update` would be cleaner. This
-    // gets the user the affordance immediately without engine work.
+    // Atomic update. The daemon hot-applies label / topology /
+    // auto-approve in place (no peers dropped) and only restarts the
+    // transport for signaling/STUN/TURN edits — and if it rejects the
+    // new config it rolls back to the previous one. The roster survives
+    // either path, so unlike the old remove + re-add dance a failed save
+    // can never strand the network.
     try {
-      await meshClient.networkRemove(network.config_id);
-    } catch (e) {
-      actionError = `Couldn't remove existing config: ${String(e)}`;
-      busy = false;
-      return;
-    }
-
-    try {
-      await meshClient.networkAdd(newCfg);
+      await meshClient.networkUpdate(newCfg);
       savedAt = Date.now();
-    } catch (addErr) {
-      // New config rejected by the daemon — try to put the user
-      // back where they were.
-      if (originalConfig) {
-        try {
-          await meshClient.networkAdd(originalConfig);
-          actionError = `Save failed; rolled back to previous config. (${String(addErr)})`;
-        } catch (rollbackErr) {
-          // Both failed. Stash the original so the user can retry
-          // from the sidebar's orphan section instead of losing
-          // the network entirely.
-          governance.recordOrphan({
-            config_id: network.config_id,
-            network_id: network.network_id,
-            label: network.label,
-            failed_at: Date.now(),
-            reason: `save: ${String(addErr)} · rollback: ${String(rollbackErr)}`,
-            config: originalConfig,
-          });
-          actionError =
-            `Save failed AND rollback failed. The network has been removed ` +
-            `from the daemon and is recoverable from the "Failed saves" ` +
-            `section in the sidebar.\n\n` +
-            `save: ${String(addErr)}\nrollback: ${String(rollbackErr)}`;
-        }
-      } else {
-        actionError = `Save failed and no rollback snapshot was available: ${String(addErr)}`;
-      }
+    } catch (e) {
+      actionError = `Save failed: ${String(e)}`;
     } finally {
       busy = false;
     }
@@ -271,10 +226,9 @@
       // Drop any orphan tracking we had for this network — the
       // user has explicitly chosen to forget it.
       governance.discardOrphan(network.network_id);
-      // The overlay's parent watches `meshClient.networks`; when
-      // this config_id disappears, the overlay closes itself
-      // (via the "network not found" empty state). No explicit
-      // onClose call needed.
+      // NetworksSection watches `meshClient.networks`; when this
+      // config_id disappears it reseeds the picker to another network,
+      // so there's nothing to close here.
     } catch (e) {
       actionError = `Remove failed: ${String(e)}`;
     } finally {
@@ -322,10 +276,11 @@
 
 <div class="tab">
   <div class="hint">
-    Editing a network reapplies the new config to the daemon. The
-    roster (and so every peer you've already approved) survives the
-    round-trip — peers will reconnect within a few seconds. For
-    transient changes use the per-tab quick-toggles instead.
+    Saving applies the new config to the daemon in place. Label,
+    topology, and auto-approve apply instantly with no disruption;
+    changing signaling / STUN / TURN briefly restarts the transport and
+    peers reconnect within a few seconds. Your roster (every peer you've
+    already approved) is preserved either way.
   </div>
 
   {#if actionError}

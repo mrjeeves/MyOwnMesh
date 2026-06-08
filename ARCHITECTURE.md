@@ -50,10 +50,11 @@ in `myownmesh-updater` or the bin. The heavyweight STUN / TURN
 dependency tree lives in `myownmesh-services` precisely so a core-only
 embedder doesn't inherit it.
 
-A future `myownmesh-gui` crate will sit alongside these without
-changing the layout. The GUI port from MyOwnLLM's `CloudMesh*` Svelte
-components is deferred until the headless engine has been
-field-tested.
+The desktop GUI (`gui/`) is a Tauri + Svelte 5 **client** of the
+daemon — it talks to `myownmesh serve` over the local control socket
+and never embeds `myownmesh-core`, so it lives in its own Cargo
+workspace and a `cargo build --workspace` at the root stays fast
+(no Tauri compile).
 
 ## Module map (`myownmesh-core`)
 

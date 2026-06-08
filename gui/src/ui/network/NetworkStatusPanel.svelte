@@ -1,6 +1,7 @@
 <script lang="ts">
-  /** Status tab in the per-network overlay. At-a-glance summary:
-   *  network kind, topology, peer count, your role, transition log. */
+  /** Status panel for a network (Settings → Networks → Status).
+   *  At-a-glance summary: network kind, topology, peer count, your
+   *  role, transition log. */
   import { meshClient } from "../../mesh-client.svelte";
   import { governance } from "../../network-governance.svelte";
   import {

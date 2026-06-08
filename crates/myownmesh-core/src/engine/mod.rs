@@ -218,6 +218,13 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             reply,
         } => {
             let result = state.approve_roster(&device_id, &label).await;
+            // A successful approval changed our roster — advertise the new
+            // membership so other members converge (the same path the
+            // mutual-confirmation handshake takes, here for the explicit
+            // user-approve case).
+            if result.is_ok() {
+                governance::broadcast_roster_summary(state).await;
+            }
             let _ = reply.send(result);
         }
         NetworkCmd::RemoveRoster { device_id, reply } => {
@@ -1166,16 +1173,9 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
         MeshMessage::NetworkStatePropose(m) => governance::on_propose(state, device_id, m).await,
         MeshMessage::NetworkStateAck(m) => governance::on_ack(state, device_id, m).await,
         MeshMessage::NetworkStateSplit(m) => governance::on_split(state, device_id, m).await,
-        MeshMessage::RosterSummary(_)
-        | MeshMessage::RosterRequest(_)
-        | MeshMessage::RosterEntries(_) => {
-            // Roster gossip dispatch lives in a later commit on this
-            // branch. Until then, governance + state broadcasts handle
-            // role-change convergence; pure adds/removes on a `closed`
-            // network still flow through the existing roster-approve
-            // path on the originator side.
-            trace!(peer = %device_id, "roster gossip frame received; handler not yet wired");
-        }
+        MeshMessage::RosterSummary(m) => governance::on_roster_summary(state, device_id, m).await,
+        MeshMessage::RosterRequest(m) => governance::on_roster_request(state, device_id, m).await,
+        MeshMessage::RosterEntries(m) => governance::on_roster_entries(state, device_id, m).await,
         MeshMessage::Unknown => {
             trace!(peer = %device_id, "discarding unknown frame variant");
         }

@@ -39,7 +39,8 @@ use crate::error::{Error, Result};
 use crate::network_state::{self, NetworkKind, Proposal, Role, Transition, TransitionVariant};
 use crate::protocol::{
     AckDecision, MeshMessage, NetworkStateAckMessage, NetworkStateBroadcast,
-    NetworkStateProposeMessage, NetworkStateSplitMessage,
+    NetworkStateProposeMessage, NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry,
+    RosterRequestMessage, RosterSummaryMessage,
 };
 
 use super::connection::PeerStatus;
@@ -600,8 +601,12 @@ pub async fn on_split(state: &Arc<EngineState>, peer_id: &str, msg: NetworkState
 }
 
 /// A peer broadcasts their view of the network's governance state.
-/// For v1 we just diag-log when there's drift; richer reconciliation
-/// (catch-up requests, divergence resolution) lives in a follow-up.
+/// We diag-log governance drift, and — because the broadcast carries the
+/// sender's roster membership root — drive roster convergence off it too:
+/// if their roster membership differs from ours, pull the delta. This
+/// makes the post-mutation `NetworkState` broadcast double as a roster
+/// summary, so a peer learns of new members the moment any governance
+/// frame lands, not just on its own ACTIVE transition.
 pub async fn on_state_broadcast(
     state: &Arc<EngineState>,
     peer_id: &str,
@@ -624,6 +629,145 @@ pub async fn on_state_broadcast(
                 msg.transitions_count
             ),
         );
+    }
+    maybe_request_roster(state, peer_id, &msg.roster_root).await;
+}
+
+// ---- roster gossip --------------------------------------------------
+//
+// Anti-entropy over the per-network roster. The contract (see
+// `docs/NETWORK-TYPES.md`): once a peer is *mutually* confirmed (the
+// bilateral approve handshake completes and the link goes ACTIVE) it is
+// persisted into the local roster and advertised to the rest of the
+// network so every member converges on the same membership.
+//
+// "Advertise, don't flood": we broadcast a compact membership *summary*
+// (a 52-char root, not the entries) to active peers. A peer whose root
+// disagrees pulls the full roster with one targeted `RosterRequest`; the
+// responder replies peer-to-peer with `RosterEntries`. Each node that
+// learns a new member re-summarises to ITS active peers, so an update
+// ripples hop-by-hop along whatever shape the network actually has — a
+// ring forwards it neighbour-to-neighbour, a star through the hub —
+// reaching members we have no direct link to, instead of every node
+// blasting its whole roster at every other node.
+//
+// Merges are additive and idempotent: gossip only ever *adds* members it
+// was missing, never rewrites or removes existing entries. That is the
+// correct membership model for an `open` network (a member is anyone any
+// current member has vouched for) and keeps the protocol convergent —
+// removals on an open network are local, and authority changes on a
+// `closed` network ride the signed transition log, not roster gossip.
+
+/// Broadcast our roster membership summary to every active peer. Cheap —
+/// one small frame per peer carrying a root, not the roster itself.
+/// Called when our roster changes (a peer is confirmed / approved) and on
+/// each ACTIVE transition so a freshly-connected peer reconciles at once.
+pub async fn broadcast_roster_summary(state: &Arc<EngineState>) {
+    let summary = crate::roster::summary(&state.roster.read());
+    broadcast(state, MeshMessage::RosterSummary(summary)).await;
+}
+
+/// Inbound roster summary. If the sender's membership root differs from
+/// ours, ask for their full roster so we can merge what we're missing.
+pub async fn on_roster_summary(state: &Arc<EngineState>, peer_id: &str, msg: RosterSummaryMessage) {
+    maybe_request_roster(state, peer_id, &msg.root).await;
+}
+
+/// Inbound roster request. Reply peer-to-peer (not broadcast) with our
+/// full roster as entries. v1 always sends everything (`include_all`); a
+/// subtree-walk can ship later without changing the frame kind.
+pub async fn on_roster_request(
+    state: &Arc<EngineState>,
+    peer_id: &str,
+    _msg: RosterRequestMessage,
+) {
+    let entries: Vec<RosterEntry> = state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .map(RosterEntry::from)
+        .collect();
+    let msg = MeshMessage::RosterEntries(RosterEntriesMessage { entries });
+    if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
+        tracing::debug!(peer = %peer_id, err = %e, "roster entries reply send failed");
+    }
+}
+
+/// Inbound roster entries. Additively merge any members we were missing,
+/// persist if the roster changed, and — if it did — re-summarise to our
+/// peers so the new member propagates onward (gossip convergence).
+pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
+    let kind = state.governance_state.read().kind;
+    let self_pk = state.identity.public_id().to_string();
+    let added = {
+        let mut roster = state.roster.write();
+        let mut added = 0usize;
+        for entry in &msg.entries {
+            let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
+            // Our own entry is locally authoritative; never let a peer's
+            // gossip rewrite how we see ourselves.
+            if pubkey == self_pk {
+                continue;
+            }
+            // Additive only — skip members we already hold so a stale
+            // label / timestamp from a peer can't clobber ours and a
+            // local removal can't be undone by a no-op rewrite.
+            if crate::roster::is_authorized(&roster, &pubkey) {
+                continue;
+            }
+            crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
+            // Role authority: on an `open` network the tag is cosmetic, so
+            // adopt whatever the gossip carried. On a `closed` network the
+            // signed transition log is the only source of authority, so a
+            // freshly-learned member lands as the default `Member` and is
+            // promoted (if at all) by a ratified RoleGrant, never by raw
+            // gossip.
+            if kind == NetworkKind::Open && entry.role != Role::Member {
+                crate::roster::set_role_in(&mut roster, &pubkey, entry.role);
+            }
+            added += 1;
+        }
+        if added > 0 {
+            if let Err(e) = crate::roster::save(&roster) {
+                diag(
+                    state,
+                    crate::events::DiagLevel::Warn,
+                    format!("persist after roster merge failed: {e}"),
+                );
+            }
+        }
+        added
+    };
+    if added > 0 {
+        diag(
+            state,
+            crate::events::DiagLevel::Info,
+            format!(
+                "roster: merged {added} member(s) from {}",
+                &peer_id[..peer_id.len().min(12)]
+            ),
+        );
+        broadcast_roster_summary(state).await;
+    }
+}
+
+/// If `their_root` (a membership root) differs from ours, send a targeted
+/// request for the peer's full roster. We only ever *pull* on a mismatch —
+/// the side that's behind asks — so two peers don't both dump their whole
+/// rosters at each other. Idempotent and convergent: once memberships
+/// agree the roots match and no request fires.
+async fn maybe_request_roster(state: &Arc<EngineState>, peer_id: &str, their_root: &str) {
+    let our_root = crate::roster::membership_root(&state.roster.read());
+    if our_root == their_root {
+        return;
+    }
+    let msg = MeshMessage::RosterRequest(RosterRequestMessage {
+        include_all: true,
+        subtree_hashes: Vec::new(),
+    });
+    if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
+        tracing::debug!(peer = %peer_id, err = %e, "roster request send failed");
     }
 }
 
@@ -744,7 +888,10 @@ pub async fn broadcast_state(state: &Arc<EngineState>) {
         let gov = state.governance_state.read();
         (gov.kind, gov.transitions.len() as u32)
     };
-    let roster_root = crate::roster::merkle_root(&state.roster.read());
+    // Membership root (not the full merkle root) so peers reconcile on
+    // *who is in the network*, not on per-node label / timestamp churn —
+    // see `roster::membership_root`.
+    let roster_root = crate::roster::membership_root(&state.roster.read());
     let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
         kind,
         transitions_count,

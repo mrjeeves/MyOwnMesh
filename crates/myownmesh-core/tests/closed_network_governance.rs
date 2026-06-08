@@ -36,12 +36,12 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         roster_path: None,
         // `auto_approve = true` makes the wire-level approve frame
         // fire automatically so both peers reach ACTIVE without a
-        // user-clicked approve. Note it does NOT write to the
-        // on-disk roster (auto_approve is a "trust" toggle, not an
-        // auto-roster one) — for the closed-network flow we need
-        // each peer to be in the other's roster too so
-        // unanimous-of-members evaluates correctly. The test
-        // explicit-`approve_roster`s after handshake.
+        // user-clicked approve. Reaching ACTIVE now also persists each
+        // peer into the other's roster (the mutual-confirmation =
+        // membership rule), which is exactly what the closed-network
+        // quorum needs. The explicit `cross_approve` below is kept as a
+        // belt-and-braces seed so the test doesn't depend on that
+        // handshake side effect's timing.
         auto_approve: true,
     }
 }

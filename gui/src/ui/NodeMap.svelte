@@ -252,9 +252,18 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
-    // Only initiate a pan when the user clicks on empty canvas —
-    // clicking nodes still selects them (the node group calls
-    // stopPropagation).
+    // Only initiate a pan when the press lands on empty canvas. Pressing
+    // a node must fall through to the node's own click handler so the
+    // node selects.
+    //
+    // This guard is load-bearing: pointerdown bubbles from the node up to
+    // this <svg> handler, and calling `setPointerCapture` on the <svg>
+    // here retargets the subsequent `click` to the <svg> (capture
+    // override) — which is exactly why clicking a graph node did nothing
+    // and peers could only be selected from the sidebar. Skipping the
+    // capture when the press started on a node lets the click reach it.
+    const target = e.target as Element | null;
+    if (target?.closest?.(".node")) return;
     dragging = true;
     dragStart = { x: e.clientX, y: e.clientY, panX, panY };
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
