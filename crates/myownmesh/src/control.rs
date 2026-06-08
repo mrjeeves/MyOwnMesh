@@ -109,9 +109,9 @@ pub enum Request {
     /// `RTCPeerConnection` at creation, so a STUN/TURN edit only takes
     /// effect on fresh connections. Either way the new config is
     /// persisted to config.json. Fails if the network isn't currently
-    /// joined (use `NetworkAdd` for that). This is the path that lets
-    /// an embedder (MyOwnLLM) push a user's STUN/TURN edit to a
-    /// network the daemon already joined on a prior launch.
+    /// joined (use `NetworkAdd` for that). This is the path the GUI's
+    /// network-settings Save takes to push an edit (a new TURN URL, say)
+    /// to a network the daemon already joined on a prior launch.
     NetworkUpdate {
         config: NetworkConfig,
     },
@@ -304,6 +304,23 @@ pub enum Request {
     CapabilitiesSet {
         network: String,
         capabilities: myownmesh_core::protocol::CapabilityAdvert,
+    },
+
+    // ---- self-update -------------------------------------------------
+    /// Snapshot the updater's state — current version, channel, policy,
+    /// effective release feed, last check, any staged version.
+    UpdateStatus,
+    /// Force a release-feed check now (ignores the interval cooldown) and
+    /// stage a permitted update. Applies on the next daemon start.
+    UpdateCheck,
+    /// Apply a staged update to disk now (takes effect on next start).
+    UpdateApply,
+    /// Apply a partial updater-preferences edit (enable, channel,
+    /// auto_apply, interval, or a white-label release URL). Returns the
+    /// resulting status. Carried as raw JSON deserialised into the
+    /// updater's `UpdatePrefs` so the daemon doesn't re-derive the shape.
+    UpdateSetPrefs {
+        prefs: serde_json::Value,
     },
 }
 
@@ -583,6 +600,31 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         Request::NetworkAdd { config } => network_add(state, config).await,
         Request::NetworkRemove { network } => network_remove(state, &network).await,
         Request::NetworkUpdate { config } => network_update(state, config).await,
+
+        // ---- self-update ----
+        Request::UpdateStatus => match myownmesh_updater::status() {
+            Ok(s) => Response::ok(serde_json::to_value(s).unwrap_or(serde_json::Value::Null)),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::UpdateCheck => match myownmesh_updater::check_now(true).await {
+            Ok(o) => Response::ok(serde_json::to_value(o).unwrap_or(serde_json::Value::Null)),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::UpdateApply => match myownmesh_updater::apply_now() {
+            Ok(applied) => Response::ok(serde_json::json!({ "applied": applied })),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::UpdateSetPrefs { prefs } => {
+            match serde_json::from_value::<myownmesh_updater::UpdatePrefs>(prefs) {
+                Ok(p) => match myownmesh_updater::set_prefs(p) {
+                    Ok(s) => {
+                        Response::ok(serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+                    }
+                    Err(e) => Response::err(e.to_string()),
+                },
+                Err(e) => Response::err(format!("bad update prefs: {e}")),
+            }
+        }
         Request::ServicesStatus => {
             let status = state.services.status().await;
             let config = state.services.current_config().await;
@@ -1086,9 +1128,15 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
         return Response::ok(serde_json::json!({ "updated": config.id, "restarted": false }));
     }
 
-    // Transport restart path. Release our Arc clones first so the
+    // Transport restart path. Snapshot the live config FIRST so that if
+    // the rejoin under the new config is rejected (a bad TURN URL the
+    // daemon won't parse, say) we can restore the network exactly as it
+    // was rather than leaving the user with nothing — the roster file
+    // survives on disk regardless, but a vanished network with no
+    // recovery surface is a footgun. Then release our Arc clones so the
     // registry can reclaim ownership and `leave()` the old driver
     // cleanly rather than reporting StillBorrowed.
+    let old_config = net_state.config.read().clone();
     drop(net_state);
     drop(joined);
 
@@ -1110,10 +1158,29 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
         }
     }
 
-    // Re-join under the new transport config.
+    // Re-join under the new transport config. If the daemon rejects it,
+    // roll back to the snapshot so the network (and its live session) is
+    // restored instead of silently disappearing.
     let joined = match state.mesh.join(config.clone()).await {
         Ok(j) => j,
-        Err(e) => return Response::err(format!("rejoin with new config: {e}")),
+        Err(e) => {
+            let rollback = match state.mesh.join(old_config).await {
+                Ok(restored) => {
+                    let nostr = {
+                        let net_state = restored.state();
+                        myownmesh_core::engine::attach_nostr(&net_state)
+                    };
+                    state.registry.insert(restored, nostr);
+                    state.services.on_network_added(&config.id).await;
+                    " — restored the previous config"
+                }
+                Err(re) => {
+                    warn!(network = %config.id, "network update rollback failed: {re:#}");
+                    " — AND rollback failed; re-add it from the Networks tab"
+                }
+            };
+            return Response::err(format!("rejoin with new config: {e}{rollback}"));
+        }
     };
     let summary = serde_json::json!({
         "config_id": joined.config_id(),

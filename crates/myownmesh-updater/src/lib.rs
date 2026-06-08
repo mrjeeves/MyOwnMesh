@@ -41,7 +41,7 @@ pub mod policy;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -129,6 +129,10 @@ pub struct UpdateStatus {
     pub staged_version: Option<String>,
     /// Effective release URL for the active channel.
     pub release_url: String,
+    /// True when `release_url` comes from a config override
+    /// (`auto_update.{stable,beta}_url`) rather than the build-time /
+    /// GitHub default — i.e. the feed has been white-labelled.
+    pub release_url_overridden: bool,
 }
 
 /// Result of a single check. `Serialize`-friendly so the CLI can emit it
@@ -423,6 +427,12 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
 /// Current updater status (no network access).
 pub fn status() -> Result<UpdateStatus> {
     let au = load_auto_update().unwrap_or_default();
+    let override_url = if au.channel == "beta" {
+        au.beta_url.as_deref()
+    } else {
+        au.stable_url.as_deref()
+    };
+    let release_url_overridden = override_url.map(|s| !s.is_empty()).unwrap_or(false);
     Ok(UpdateStatus {
         current_version: current_version().to_string(),
         install_kind: detect_install_kind(),
@@ -433,15 +443,89 @@ pub fn status() -> Result<UpdateStatus> {
         last_check_at: last_check_at(),
         staged_version: staged_version(),
         release_url: resolve_release_url(&au),
+        release_url_overridden,
     })
 }
 
 /// Flip `auto_update.enabled` in `~/.myownmesh/config.json`.
 pub fn set_enabled(enabled: bool) -> Result<()> {
+    set_prefs(UpdatePrefs {
+        enabled: Some(enabled),
+        ..Default::default()
+    })
+    .map(|_| ())
+}
+
+/// Editable updater preferences. Every field is optional — `None` leaves
+/// the stored value untouched — so the GUI/CLI can apply a partial edit
+/// (toggle auto-update, switch channel, repoint the release feed) without
+/// re-sending the whole config.
+///
+/// `stable_url` / `beta_url` are the white-labelling hook: a vendor can
+/// point the same binary at their own release host at runtime. An empty
+/// string clears the override (revert to the build-time / GitHub
+/// default); a non-empty value pins that feed.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdatePrefs {
+    pub enabled: Option<bool>,
+    pub channel: Option<String>,
+    pub auto_apply: Option<String>,
+    pub check_interval_hours: Option<u32>,
+    pub stable_url: Option<String>,
+    pub beta_url: Option<String>,
+}
+
+/// Apply a partial preferences update to `~/.myownmesh/config.json`,
+/// validating the enumerated fields, and return the resulting status.
+/// The single write-through point the GUI and CLI use to change updater
+/// settings. The daemon re-reads config each tick, so changes take effect
+/// without a restart.
+pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
     let mut cfg = MeshConfig::load()?;
-    cfg.auto_update.enabled = enabled;
+    let au = &mut cfg.auto_update;
+    if let Some(v) = prefs.enabled {
+        au.enabled = v;
+    }
+    if let Some(v) = prefs.channel {
+        if v != "stable" && v != "beta" {
+            return Err(Error::msg(format!(
+                "invalid update channel '{v}' (expected 'stable' or 'beta')"
+            )));
+        }
+        au.channel = v;
+    }
+    if let Some(v) = prefs.auto_apply {
+        if ApplyPolicy::parse(&v).is_none() {
+            return Err(Error::msg(format!(
+                "invalid auto_apply policy '{v}' (expected patch | minor | all | none)"
+            )));
+        }
+        au.auto_apply = v;
+    }
+    if let Some(v) = prefs.check_interval_hours {
+        // Clamp to a sane floor so a fat-fingered 0 doesn't spin the
+        // background ticker hot.
+        au.check_interval_hours = v.max(1);
+    }
+    if let Some(v) = prefs.stable_url {
+        au.stable_url = normalise_url_override(v);
+    }
+    if let Some(v) = prefs.beta_url {
+        au.beta_url = normalise_url_override(v);
+    }
     cfg.save()?;
-    Ok(())
+    status()
+}
+
+/// An empty/whitespace override clears back to the default feed; anything
+/// else is trimmed and stored verbatim.
+fn normalise_url_override(v: String) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// Background ticker. Runs forever; checks the feed at the configured
@@ -1495,6 +1579,52 @@ mod tests {
             detect_install_kind_from_path("/home/user/.local/bin/myownmesh"),
             InstallKind::Raw
         );
+    }
+
+    #[test]
+    fn set_prefs_validates_and_persists() {
+        // One tempdir, one sequential test: MYOWNMESH_HOME is process
+        // global, so we don't want two of these racing.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("MYOWNMESH_HOME", tmp.path());
+
+        // Bad enumerations are rejected before anything is written.
+        assert!(set_prefs(UpdatePrefs {
+            channel: Some("nightly".into()),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(set_prefs(UpdatePrefs {
+            auto_apply: Some("whenever".into()),
+            ..Default::default()
+        })
+        .is_err());
+
+        // A valid partial edit persists and is reflected in status.
+        let st = set_prefs(UpdatePrefs {
+            channel: Some("beta".into()),
+            auto_apply: Some("minor".into()),
+            check_interval_hours: Some(0), // clamps up to 1
+            beta_url: Some("https://vendor.example/releases".into()),
+            ..Default::default()
+        })
+        .expect("set valid prefs");
+        assert_eq!(st.channel, "beta");
+        assert_eq!(st.auto_apply, "minor");
+        assert_eq!(st.check_interval_hours, 1);
+        assert_eq!(st.release_url, "https://vendor.example/releases");
+        assert!(st.release_url_overridden);
+
+        // An empty override string clears back to the default feed.
+        let st = set_prefs(UpdatePrefs {
+            beta_url: Some("   ".into()),
+            ..Default::default()
+        })
+        .expect("clear override");
+        assert!(!st.release_url_overridden);
+        assert_eq!(st.release_url, default_release_api_beta());
+
+        std::env::remove_var("MYOWNMESH_HOME");
     }
 
     #[test]
