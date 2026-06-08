@@ -77,6 +77,13 @@ pub enum Request {
     NetworkRemove {
         network: String,
     },
+    /// Atomic in-place edit of an already-joined network. Hot-applies
+    /// label / topology / auto-approve without dropping peers; restarts
+    /// transport only for signaling/STUN/TURN edits. Preserves the roster
+    /// either way — replaces the GUI's old remove + re-add edit path.
+    NetworkUpdate {
+        config: serde_json::Value,
+    },
     /// Snapshot which infrastructure services this device hosts plus the
     /// persisted config. The daemon answers with `{ status, config }`.
     ServicesStatus,
@@ -125,6 +132,14 @@ pub enum Request {
     GovernanceSpawnSplit {
         network: String,
         proposal_id: String,
+    },
+
+    // ---- self-update ----------------------------------------------
+    UpdateStatus,
+    UpdateCheck,
+    UpdateApply,
+    UpdateSetPrefs {
+        prefs: serde_json::Value,
     },
 }
 

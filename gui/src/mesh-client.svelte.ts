@@ -24,6 +24,9 @@ import type {
   ServicesStatusResponse,
   StreamFrame,
   SubscriptionStatus,
+  UpdateCheckOutcome,
+  UpdatePrefs,
+  UpdateStatus,
 } from "./types";
 
 const POLL_INTERVAL_MS = 2000;
@@ -219,6 +222,18 @@ function createMeshClient() {
     await refreshNetworks();
   }
 
+  /** Atomic in-place edit of an already-joined network. The daemon
+   *  hot-applies label / topology / auto-approve and only restarts
+   *  transport for signaling/STUN/TURN edits — the roster is preserved
+   *  either way. This replaces the old "remove then re-add" edit path,
+   *  which churned the network (and risked losing its roster) on every
+   *  settings save. */
+  async function networkUpdate(config: NetworkConfigInput) {
+    await invoke("mesh_network_update", { config });
+    await refreshNetworks();
+    await refreshAllPeers();
+  }
+
   /** Accept any JSON-shaped value — the GUI exports the
    *  shareable `NetworkSettingsExport` envelope, not the raw
    *  `NetworkConfig`, so the type here is intentionally loose. */
@@ -320,6 +335,28 @@ function createMeshClient() {
     })) as { new_network_id: string };
     await refreshGovernance(network);
     return resp.new_network_id;
+  }
+
+  // ---- self-update ----------------------------------------------------
+  //
+  // Pass-throughs to the daemon's updater (the daemon owns the binary
+  // swap; the GUI just renders status and forwards intent). No reactive
+  // cache — the Updates section fetches on open and after each action.
+
+  async function updateStatus(): Promise<UpdateStatus> {
+    return (await invoke("update_status")) as UpdateStatus;
+  }
+
+  async function updateCheck(): Promise<UpdateCheckOutcome> {
+    return (await invoke("update_check")) as UpdateCheckOutcome;
+  }
+
+  async function updateApply(): Promise<{ applied: string | null }> {
+    return (await invoke("update_apply")) as { applied: string | null };
+  }
+
+  async function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus> {
+    return (await invoke("update_set_prefs", { prefs })) as UpdateStatus;
   }
 
   // ---- infrastructure services (relay / signaling / STUN / TURN) -----
@@ -622,7 +659,14 @@ function createMeshClient() {
     configShow,
     networkAdd,
     networkRemove,
+    networkUpdate,
     exportNetworkFile,
+
+    // self-update
+    updateStatus,
+    updateCheck,
+    updateApply,
+    updateSetPrefs,
 
     // services
     refreshServices,

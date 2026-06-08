@@ -258,6 +258,23 @@ async fn mesh_network_remove(
     unwrap_response(resp)
 }
 
+/// Atomic in-place network edit. The daemon hot-applies label / topology
+/// / auto-approve and only restarts transport for signaling/STUN/TURN
+/// changes — the roster survives either way. Replaces the GUI's previous
+/// remove + re-add edit dance.
+#[tauri::command]
+async fn mesh_network_update(
+    state: State<'_, AppState>,
+    config: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::NetworkUpdate { config })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
 /// Write a `NetworkSettingsExport` envelope to disk. Pretty-printed
 /// so the file is easy to inspect by hand. Import goes through a
 /// native `<input type="file">` on the renderer side (matches the
@@ -439,6 +456,56 @@ async fn mesh_governance_spawn_split(
     unwrap_response(resp)
 }
 
+// ---- self-update ------------------------------------------------------
+//
+// Thin pass-throughs to the daemon's updater. The daemon owns the actual
+// check / stage / apply (it's the process whose binary gets swapped — the
+// GUI is updated in lockstep beside it), so the GUI never touches the
+// updater crate directly; it just surfaces status and forwards intent.
+
+#[tauri::command]
+async fn update_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::UpdateStatus)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn update_check(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::UpdateCheck)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn update_apply(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::UpdateApply)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn update_set_prefs(
+    state: State<'_, AppState>,
+    prefs: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::UpdateSetPrefs { prefs })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
 /// Background task that owns the daemon's event subscription. Each
 /// incoming line becomes a `mesh://event` Tauri event on the frontend.
 /// On disconnect we wait a beat and re-subscribe — the daemon may be
@@ -549,6 +616,7 @@ fn main() {
             mesh_config_show,
             mesh_network_add,
             mesh_network_remove,
+            mesh_network_update,
             mesh_network_export_file,
             mesh_services_status,
             mesh_services_set,
@@ -561,6 +629,10 @@ fn main() {
             mesh_governance_deny,
             mesh_governance_withdraw,
             mesh_governance_spawn_split,
+            update_status,
+            update_check,
+            update_apply,
+            update_set_prefs,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

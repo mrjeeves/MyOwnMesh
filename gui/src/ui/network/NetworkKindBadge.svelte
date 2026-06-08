@@ -2,7 +2,7 @@
   /** Padlock badge for a network's governance kind — `open` shows an
    *  unlocked outline, `closed` shows a filled lock. Used wherever a
    *  network name renders so the kind is always one glance away from
-   *  the user (sidebar row, overlay header, status card, graph). */
+   *  the user (sidebar row, settings header, status card, graph). */
   import type { NetworkKind } from "../../types";
 
   const {

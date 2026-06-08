@@ -11,18 +11,16 @@
     onSelectNetwork,
     onSelectPeer,
     onOpenNetworksSettings,
-    onOpenNetworkOverlay,
+    onOpenNetworkSettings,
   }: {
     focusedConfigId: string | null;
     selectedPeerId: string | null;
     onSelectNetwork: (configId: string) => void;
     onSelectPeer: (deviceId: string) => void;
     onOpenNetworksSettings: () => void;
-    /** Open the per-network settings/control overlay against a
-     *  specific network. Triggered by the gear icon on each
-     *  sidebar row. The overlay slides over the graph; the rest
-     *  of the layout stays intact. */
-    onOpenNetworkOverlay: (configId: string) => void;
+    /** Open the full Networks settings surface scoped to a specific
+     *  network. Triggered by the gear icon on each sidebar row. */
+    onOpenNetworkSettings: (configId: string) => void;
   } = $props();
 
   // The user can independently expand/collapse each network's
@@ -171,7 +169,7 @@
               class="gear"
               onclick={(e) => {
                 e.stopPropagation();
-                onOpenNetworkOverlay(net.config_id);
+                onOpenNetworkSettings(net.config_id);
               }}
               title="Settings & roster for {networkDisplayName(net)}"
               aria-label="Open network settings"

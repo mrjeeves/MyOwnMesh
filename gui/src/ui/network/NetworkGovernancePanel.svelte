@@ -1,17 +1,15 @@
 <script lang="ts">
-  /** Governance tab — the open/closed kind toggle and the
-   *  propose/sign/deny/split flow from `docs/NETWORK-TYPES.md`.
+  /** Governance panel (Settings → Networks → Governance) — the
+   *  open/closed kind toggle and the propose/sign/deny/split flow from
+   *  `docs/NETWORK-TYPES.md`.
    *
-   *  This is the deepest preview-mode surface in the GUI. The
-   *  engine doesn't yet emit, sign, or persist `network_state_*`
-   *  frames — every action below mutates the local
-   *  `network-governance.svelte.ts` store and is flagged with a
-   *  visible "Preview mode" banner so users (and downstream
-   *  embedders auditing the reference implementation) know what's
-   *  driving the state. The component is shaped exactly the same
-   *  way it will be when wired to a real engine; the
-   *  `governance.proposeKindChange()` / `signProposal()` calls
-   *  become Tauri invokes and the banner goes away. */
+   *  Backed by the daemon: every action here round-trips through the
+   *  `network-governance.svelte.ts` store, which signs and broadcasts a
+   *  `network_state_*` frame via the control socket. The engine verifies
+   *  each signature and only ratifies a transition once its signer set
+   *  satisfies the quorum table — the wire, not this UI, is the security
+   *  boundary. The role gates below are convenience, keeping a user from
+   *  issuing a request the engine would just reject. */
 
   import { meshClient } from "../../mesh-client.svelte";
   import {
@@ -341,9 +339,9 @@
       <dd>≥ 1 controller or owner signature</dd>
     </dl>
     <div class="muted small">
-      Quorum thresholds in preview-mode are relaxed for explorability
-      (any single co-signer applies a kind change). The real engine
-      will enforce the table above.
+      The engine enforces the table above: a transition only ratifies
+      once its signer set satisfies the quorum, and a single deny kills a
+      proposal.
       <span>Currently <strong>{onlineCount}</strong> peer{onlineCount === 1 ? "" : "s"} online.</span>
     </div>
   </div>

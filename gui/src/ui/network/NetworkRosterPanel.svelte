@@ -1,6 +1,6 @@
 <script lang="ts">
-  /** Roster tab in the per-network overlay. Approved peers + their
-   *  role in the network's governance model.
+  /** Roster panel for a network (Settings → Networks → Roster).
+   *  Approved peers + their role in the network's governance model.
    *
    *  Role column is always shown so the affordance is discoverable
    *  even on `open` networks (where the role tag is cosmetic until

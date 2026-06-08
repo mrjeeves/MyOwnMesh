@@ -144,6 +144,11 @@ function coerceNetworkSettings(raw: NetworkSettingsExport): NetworkSettingsExpor
  *  `NetworkAdd` expects) from the modal's primitives. Centralised
  *  so the modal doesn't replicate the schema translation. */
 export function buildNetworkConfig(args: {
+  /** Existing local config record id to edit in place. Omit when adding
+   *  a new network — a fresh id is minted. Pass the current `config_id`
+   *  when building a payload for `networkUpdate`, so the daemon edits the
+   *  same record (and keeps its roster) rather than creating a new one. */
+  id?: string;
   networkId: string;
   label?: string;
   topology: TopologyMode;
@@ -153,7 +158,7 @@ export function buildNetworkConfig(args: {
   autoApprove?: boolean;
 }): NetworkConfigInput {
   return {
-    id: newNetworkInternalId(),
+    id: args.id ?? newNetworkInternalId(),
     network_id: args.networkId,
     label: args.label?.trim() || undefined,
     topology: args.topology,

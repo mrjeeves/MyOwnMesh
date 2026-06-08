@@ -392,22 +392,21 @@ export interface AuthorizedPeer {
    *  Optional in the wire shape — entries written before
    *  `network_state_v1` shipped don't carry the field and the GUI
    *  treats `undefined` as `"member"`. See
-   *  [`docs/NETWORK-TYPES.md`](../../docs/NETWORK-TYPES.md).
-   *
-   *  **Preview-mode**: the engine doesn't honour this field yet —
-   *  the GUI persists it to local state via `network-governance.svelte.ts`
-   *  so the surfaces work end-to-end while the design is implemented. */
+   *  [`docs/NETWORK-TYPES.md`](../../docs/NETWORK-TYPES.md). On a
+   *  `closed` network the engine enforces this via the signed
+   *  transition log; on an `open` network it's a cosmetic tag. */
   role?: Role;
 }
 
 // ---- governance (closed networks) ------------------------------------
 //
-// All of this is *preview-mode* surface — the engine doesn't yet
-// emit, accept, or persist the closed-network state log. The GUI
-// scaffolds the shapes so downstream embedders implementing the
-// design from `docs/NETWORK-TYPES.md` have a reference, and so the
-// transition from "preview" to "real" is a one-line swap from
-// `network-governance.svelte.ts` to a Tauri invoke().
+// These mirror the daemon's signed closed-network state — the kind, the
+// role map, the append-only transition log, and in-flight proposals. The
+// engine owns and enforces all of it (every transition is a signed
+// `network_state_*` frame verified against the quorum table in
+// `docs/NETWORK-TYPES.md`); the GUI reads snapshots through
+// `network-governance.svelte.ts` and issues mutations over the control
+// socket.
 
 /** Network kind. `open` is the default and matches the engine's
  *  current behaviour. `closed` adds role-based roster authority +
@@ -475,9 +474,8 @@ export type PendingProposalVariant =
     };
 
 /** Snapshot of a network's signed governance state — the kind, the
- *  per-peer role map, the transition log, and any in-flight
- *  proposals. Local-only in preview-mode; the engine will own and
- *  emit this in the real implementation. */
+ *  per-peer role map, the transition log, and any in-flight proposals.
+ *  Owned and emitted by the daemon; read here via the control socket. */
 export interface NetworkStateView {
   kind: NetworkKind;
   /** Pubkey → role assignments. Pubkeys not in this map default to
@@ -567,6 +565,52 @@ export interface DaemonStatus {
   version: string;
   device_id: string;
   joined_networks: string[];
+}
+
+// ---- self-update ------------------------------------------------------
+//
+// Mirrors `myownmesh_updater::{UpdateStatus, CheckOutcome, UpdatePrefs}`.
+// The daemon owns the actual check/stage/apply; the GUI just renders this
+// status and forwards preference edits.
+
+export interface UpdateStatus {
+  current_version: string;
+  /** `raw` self-updates; `package_manager` defers to the OS updater. */
+  install_kind: "raw" | "package_manager";
+  enabled: boolean;
+  channel: string;
+  /** `patch` | `minor` | `all` | `none`. */
+  auto_apply: string;
+  check_interval_hours: number;
+  /** Unix seconds of the last successful feed check, or null. */
+  last_check_at: number | null;
+  /** Version staged and waiting to apply on next daemon start, or null. */
+  staged_version: string | null;
+  /** Effective release-feed URL for the active channel. */
+  release_url: string;
+  /** True when `release_url` comes from a config override (white-label). */
+  release_url_overridden: boolean;
+}
+
+/** Outcome of a forced update check. Tagged by `outcome` (snake_case). */
+export type UpdateCheckOutcome =
+  | { outcome: "disabled" }
+  | { outcome: "package_manager" }
+  | { outcome: "not_due" }
+  | { outcome: "up_to_date"; current: string; latest: string }
+  | { outcome: "policy_blocked"; current: string; latest: string; policy: string }
+  | { outcome: "staged"; version: string };
+
+/** Partial updater-preferences edit. Omitted fields are left untouched.
+ *  `stable_url` / `beta_url` are the white-labelling hook (empty string
+ *  clears the override back to the default feed). */
+export interface UpdatePrefs {
+  enabled?: boolean;
+  channel?: string;
+  auto_apply?: string;
+  check_interval_hours?: number;
+  stable_url?: string;
+  beta_url?: string;
 }
 
 // ---- events -----------------------------------------------------------
