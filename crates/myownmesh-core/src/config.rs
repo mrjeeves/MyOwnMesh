@@ -234,9 +234,12 @@ pub struct AutoUpdateConfig {
     /// only takes the latest released version.
     pub channel: String,
     /// `"patch"` | `"minor"` | `"all"` | `"none"`. Controls which
-    /// version bumps the updater applies without confirmation.
-    /// "patch" is the default; bigger jumps stage but wait for a
-    /// user "apply" action.
+    /// version bumps the updater applies without confirmation. While the
+    /// project is in fast-moving alpha the default is `"all"` — every
+    /// device should ride the latest release rather than stall a few
+    /// versions back. The narrower policies stay selectable (and become
+    /// the sensible default once the wire format settles); `"none"`
+    /// stages updates but waits for an explicit "apply".
     pub auto_apply: String,
     pub check_interval_hours: u32,
     /// Override the release feed URL. Null = use the build-time
@@ -250,7 +253,8 @@ impl Default for AutoUpdateConfig {
         Self {
             enabled: true,
             channel: "stable".to_string(),
-            auto_apply: "patch".to_string(),
+            // Alpha default: take every release. See the field doc.
+            auto_apply: "all".to_string(),
             check_interval_hours: 6,
             stable_url: None,
             beta_url: None,
@@ -572,7 +576,8 @@ mod tests {
         assert_eq!(cfg.version, CONFIG_VERSION);
         assert!(cfg.auto_update.enabled);
         assert_eq!(cfg.auto_update.channel, "stable");
-        assert_eq!(cfg.auto_update.auto_apply, "patch");
+        // Alpha default: ride every release.
+        assert_eq!(cfg.auto_update.auto_apply, "all");
         assert_eq!(cfg.auto_update.check_interval_hours, 6);
         assert!(cfg.daemon.enabled);
         assert!(cfg.networks.is_empty());
