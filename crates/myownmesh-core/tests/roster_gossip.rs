@@ -15,6 +15,14 @@
 //!      diff — so every node converges on the same membership without a
 //!      full-roster flood.
 //!
+//! Both scenarios live in ONE test on purpose: each integration-test file
+//! is its own process, but the tests *within* a file share it, and the
+//! engine keys its data dir off the process-global `MYOWNMESH_HOME` env
+//! var (see the SAFETY note in `two_peer_handshake.rs`). Two parallel
+//! `#[test]`s here would race that var. Running the scenarios in sequence
+//! under one `MYOWNMESH_HOME` keeps them isolated (distinct network_ids ⇒
+//! distinct roster files) without that race.
+//!
 //! Companion to `two_peer_handshake.rs` (open-network handshake) and
 //! `closed_network_governance.rs` (signed transitions).
 
@@ -22,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::state::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -64,95 +73,89 @@ async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
     }
 }
 
-fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, device_id: &str) -> bool {
+fn rostered(state: &Arc<NetworkState>, device_id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), device_id)
 }
 
-#[tokio::test]
-async fn mutual_approve_persists_roster_on_both_sides() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
-
+/// Bring two auto-approve peers up on `network_id` over a fresh broker and
+/// wait until both have seen the bilateral approve land (ACTIVE). Returns
+/// the two engine states; the driver handles are leaked so the engines
+/// keep running for the rest of the test.
+async fn bring_up_pair(
+    network_id: &str,
+    transport: &Transport,
+) -> (
+    Arc<NetworkState>,
+    Arc<Identity>,
+    Arc<NetworkState>,
+    Arc<Identity>,
+) {
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let a_id = Arc::new(Identity::ephemeral());
+    let b_id = Arc::new(Identity::ephemeral());
 
-    let alice_id = Arc::new(Identity::ephemeral());
-    let bob_id = Arc::new(Identity::ephemeral());
+    let (a_state, a_driver) = spawn_network(
+        fresh_network("a", network_id),
+        a_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("spawn a");
+    let (b_state, b_driver) = spawn_network(
+        fresh_network("b", network_id),
+        b_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("spawn b");
 
-    let mut alice_cfg = fresh_network("alice", "roster-gossip-persist");
-    let mut bob_cfg = fresh_network("bob", "roster-gossip-persist");
-    alice_cfg.network_id = "roster-gossip-persist".into();
-    bob_cfg.network_id = "roster-gossip-persist".into();
+    let mut a_events = a_state.events_tx.subscribe();
+    let mut b_events = b_state.events_tx.subscribe();
 
-    let (alice_state, _ad) = spawn_network(alice_cfg, alice_id.clone(), transport.clone())
-        .await
-        .expect("alice engine");
-    let (bob_state, _bd) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
-        .await
-        .expect("bob engine");
+    attach_local(&a_state, &broker);
+    attach_local(&b_state, &broker);
 
-    let mut alice_events = alice_state.events_tx.subscribe();
-    let mut bob_events = bob_state.events_tx.subscribe();
+    wait_for_approval(&mut a_events, b_id.public_id()).await;
+    wait_for_approval(&mut b_events, a_id.public_id()).await;
 
-    attach_local(&alice_state, &broker);
-    attach_local(&bob_state, &broker);
+    // Keep the engines + broker alive for the remainder of the test.
+    std::mem::forget(a_driver);
+    std::mem::forget(b_driver);
+    std::mem::forget(broker);
 
-    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
-    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
-
-    // The bilateral handshake completing must have persisted each peer
-    // into the other's roster — no explicit approve_roster call here.
-    assert!(
-        rostered(&alice_state, bob_id.public_id()),
-        "alice should have rostered bob on mutual ACTIVE"
-    );
-    assert!(
-        rostered(&bob_state, alice_id.public_id()),
-        "bob should have rostered alice on mutual ACTIVE"
-    );
+    (a_state, a_id, b_state, b_id)
 }
 
 #[tokio::test]
-async fn roster_membership_gossips_to_connected_peer() {
+async fn roster_persists_on_mutual_approve_then_gossips() {
+    // One MYOWNMESH_HOME for the whole test; distinct network_ids below
+    // keep the two scenarios' roster files apart. Kept alive (not dropped)
+    // until the test ends so no engine writes into a reclaimed tempdir.
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
-    let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
 
-    let alice_id = Arc::new(Identity::ephemeral());
-    let bob_id = Arc::new(Identity::ephemeral());
-    // Carol never connects — she's only ever a roster entry that Alice
-    // vouches for. The test proves Bob learns of her purely via gossip.
+    // --- Scenario 1: the double handshake persists the roster ---------
+    let (a1, a1_id, b1, b1_id) = bring_up_pair("roster-gossip-persist", &transport).await;
+    assert!(
+        rostered(&a1, b1_id.public_id()),
+        "alice should have rostered bob on mutual ACTIVE"
+    );
+    assert!(
+        rostered(&b1, a1_id.public_id()),
+        "bob should have rostered alice on mutual ACTIVE"
+    );
+
+    // --- Scenario 2: a roster add on one peer gossips to the other ----
+    let (a2, _a2_id, b2, _b2_id) = bring_up_pair("roster-gossip-converge", &transport).await;
+    // Carol never connects — she's only ever a roster entry Alice vouches
+    // for. Approve her through the command queue (the path the GUI's
+    // Approve takes), which persists her locally AND advertises the new
+    // membership to active peers.
     let carol_id = Arc::new(Identity::ephemeral());
-
-    let mut alice_cfg = fresh_network("alice", "roster-gossip-converge");
-    let mut bob_cfg = fresh_network("bob", "roster-gossip-converge");
-    alice_cfg.network_id = "roster-gossip-converge".into();
-    bob_cfg.network_id = "roster-gossip-converge".into();
-
-    let (alice_state, _ad) = spawn_network(alice_cfg, alice_id.clone(), transport.clone())
-        .await
-        .expect("alice engine");
-    let (bob_state, _bd) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
-        .await
-        .expect("bob engine");
-
-    let mut alice_events = alice_state.events_tx.subscribe();
-    let mut bob_events = bob_state.events_tx.subscribe();
-
-    attach_local(&alice_state, &broker);
-    attach_local(&bob_state, &broker);
-
-    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
-    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
-
-    // Alice approves Carol through the command queue — the same path the
-    // GUI's "Approve" takes — which persists Carol locally AND advertises
-    // the new membership to active peers.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    alice_state
-        .cmd_tx
+    a2.cmd_tx
         .send(NetworkCmd::ApproveRoster {
             device_id: carol_id.public_id().to_string(),
             label: "carol".into(),
@@ -165,7 +168,7 @@ async fn roster_membership_gossips_to_connected_peer() {
     // through Alice's gossip (summary → request → entries → merge).
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if rostered(&bob_state, carol_id.public_id()) {
+        if rostered(&b2, carol_id.public_id()) {
             break;
         }
         if Instant::now() > deadline {
