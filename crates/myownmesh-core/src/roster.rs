@@ -227,12 +227,49 @@ pub fn merkle_root(roster: &Roster) -> String {
     data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
 }
 
+/// Deterministic root over just the *membership* of the roster — the
+/// sorted set of canonical device ids, ignoring labels, approval
+/// timestamps, and roles. Two peers with the same set of authorised
+/// devices produce the same membership root even if they each labelled
+/// those devices differently or approved them at different moments.
+///
+/// This — not [`merkle_root`] — is the root roster gossip converges on.
+/// Cosmetic, inherently per-node fields (a label, the local
+/// `approved_at`) must NOT drive anti-entropy: if they did, two peers
+/// holding the *same* members under different labels would see mismatched
+/// roots forever and request each other's rosters on every exchange
+/// without ever agreeing. Membership is the thing we actually want every
+/// member to converge on ("who is in this network"). Base32-lowercase,
+/// 52 chars.
+pub fn membership_root(roster: &Roster) -> String {
+    use sha2::{Digest, Sha256};
+    let mut ids: Vec<&str> = roster
+        .authorized_devices
+        .iter()
+        .map(|p| p.device_id.as_str())
+        .collect();
+    ids.sort_unstable();
+
+    let mut h = Sha256::new();
+    h.update(ROSTER_MERKLE_V.as_bytes());
+    h.update(b"|membership");
+    for id in ids {
+        h.update(id.as_bytes());
+        h.update(b"|");
+    }
+    let digest = h.finalize();
+    data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
+}
+
 /// Build a wire-shape summary for this roster, ready to drop into a
 /// `MeshMessage::RosterSummary` frame. Convenience over the
-/// individual helpers for the common "summarise + emit" path.
+/// individual helpers for the common "summarise + emit" path. The
+/// advertised root is the [`membership_root`] (not [`merkle_root`]) so
+/// peers converge on membership without thrashing over per-node label /
+/// timestamp differences — see that function's note.
 pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
     crate::protocol::RosterSummaryMessage {
-        root: merkle_root(roster),
+        root: membership_root(roster),
         count: roster.authorized_devices.len() as u32,
         last_edit_ts: last_edit_ts(roster),
     }
@@ -504,6 +541,58 @@ mod tests {
         add_peer_in(&mut one, "peer1", "Laptop");
         one.authorized_devices[0].approved_at = 100;
         assert_ne!(merkle_root(&empty), merkle_root(&one));
+    }
+
+    #[test]
+    fn membership_root_ignores_label_and_timestamp_and_role() {
+        // The whole point of the membership root: two peers holding the
+        // SAME set of devices agree even when they each labelled them
+        // differently, approved them at different moments, or tagged
+        // different roles. If this regressed, roster gossip would request
+        // forever without converging.
+        let mut a = empty_for("net-a");
+        add_peer_in(&mut a, "peer1", "Alice's laptop");
+        a.authorized_devices[0].approved_at = 100;
+        add_peer_in(&mut a, "peer2", "Alice's phone");
+        a.authorized_devices[1].approved_at = 200;
+        set_role_in(&mut a, "peer1", crate::network_state::Role::Owner);
+
+        let mut b = empty_for("net-a");
+        add_peer_in(&mut b, "peer2", "laptop-2"); // different label, order, role
+        b.authorized_devices[0].approved_at = 999;
+        add_peer_in(&mut b, "peer1", "");
+        b.authorized_devices[1].approved_at = 1;
+
+        assert_eq!(membership_root(&a), membership_root(&b));
+        // ...while the full merkle root, which DOES hash those fields,
+        // diverges — confirming the two roots capture different things.
+        assert_ne!(merkle_root(&a), merkle_root(&b));
+    }
+
+    #[test]
+    fn membership_root_changes_on_add_and_remove() {
+        let mut r = empty_for("net-a");
+        let empty = membership_root(&r);
+        add_peer_in(&mut r, "peer1", "X");
+        let one = membership_root(&r);
+        assert_ne!(empty, one);
+        add_peer_in(&mut r, "peer2", "Y");
+        let two = membership_root(&r);
+        assert_ne!(one, two);
+        remove_peer_in(&mut r, "peer2");
+        // Back to the same membership ⇒ back to the same root.
+        assert_eq!(membership_root(&r), one);
+    }
+
+    #[test]
+    fn membership_root_is_base32_lowercase() {
+        let mut r = empty_for("net-a");
+        add_peer_in(&mut r, "peer1", "Laptop");
+        let root = membership_root(&r);
+        assert_eq!(root.len(), 52);
+        assert!(root
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
     }
 
     #[test]
