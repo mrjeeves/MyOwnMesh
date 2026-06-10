@@ -1183,18 +1183,22 @@ fn extract_binary_if_archived(archive: &Path, dest_dir: &Path, bin_name: &str) -
     // Wipe any stale extract so the file in place is from THIS archive.
     let _ = std::fs::remove_file(&bin_path);
 
-    let status = std::process::Command::new("tar")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest_dir)
-        .status()
-        .map_err(|e| {
-            Error::msg(format!(
-                "failed to spawn `tar` for {}: {e}",
-                archive.display()
-            ))
-        })?;
+    let mut cmd = std::process::Command::new("tar");
+    cmd.arg("-xf").arg(archive).arg("-C").arg(dest_dir);
+    // When the updater runs inside a windowless process (the GUI, or a
+    // daemon it spawned hidden), a console child like `tar` would flash
+    // up its own console window on Windows; run it without one.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let status = cmd.status().map_err(|e| {
+        Error::msg(format!(
+            "failed to spawn `tar` for {}: {e}",
+            archive.display()
+        ))
+    })?;
     if !status.success() {
         return Err(Error::msg(format!(
             "tar exited with {status} extracting {}",
