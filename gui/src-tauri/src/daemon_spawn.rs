@@ -139,14 +139,24 @@ pub async fn ensure_daemon_running(client: &ControlClient) -> Result<Option<Daem
     let bin = find_daemon_binary().context("locate myownmesh binary")?;
     tracing::info!(?bin, "spawning daemon");
 
-    let child = Command::new(&bin)
-        .arg("serve")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
         // Inherit stderr so the user sees engine logs in the GUI's
         // dev console. stdout is also inherited; the daemon's logs
         // go to stderr via tracing-subscriber so this is quiet.
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // The daemon is a console-subsystem binary and this GUI is windowless,
+    // so without CREATE_NO_WINDOW Windows would give the child its own
+    // console window, parked on screen for the app's whole lifetime. The
+    // inherited stdio handles are unaffected by the flag.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
     let handle = DaemonChild::new(child);
