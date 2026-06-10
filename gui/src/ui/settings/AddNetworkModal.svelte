@@ -24,7 +24,9 @@
   import { onMount } from "svelte";
   import { meshClient } from "../../mesh-client.svelte";
   import {
+    DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
+    DEFAULT_NETWORK_TURN,
     buildNetworkConfig,
     generateNetworkId,
     normalizeNetworkId,
@@ -56,13 +58,16 @@
   let saving = $state(false);
   let error = $state("");
 
-  // Advanced overrides — when expanded + edited, save sends the full
-  // transport config to NetworkAdd. Otherwise we send the bare
-  // network_id and let the engine's defaults take over.
+  // Advanced overrides. The drafts are seeded with the MyOwnMesh
+  // defaults (signaling / STUN / TURN), so save always sends an
+  // explicit transport config to NetworkAdd — identical to the
+  // engine's own defaults unless the user edited a field. Sending them
+  // explicitly (rather than a bare network_id) is what makes the
+  // defaults visible in the saved network and the edit panel.
   let advancedExpanded = $state(false);
-  let signalingDraft = $state<string[]>([]);
+  let signalingDraft = $state<string[]>([...DEFAULT_NETWORK_SIGNALING]);
   let stunDraft = $state<string[]>([...DEFAULT_NETWORK_STUN]);
-  let turnDraft = $state<TurnEntry[]>([]);
+  let turnDraft = $state<TurnEntry[]>(DEFAULT_NETWORK_TURN.map((t) => ({ ...t })));
   let turnEntry = $state<TurnEntry>({ url: "", username: "", credential: "" });
 
   let importDraft = $state<NetworkSettingsExport | null>(null);
@@ -80,9 +85,10 @@
    *  saving a plain new network or applying transport overrides. */
   const hasOverrides = $derived(
     importDraft !== null ||
-      signalingDraft.some((s) => s.trim() !== "") ||
+      // Any edit away from the seeded MyOwnMesh defaults.
+      JSON.stringify(signalingDraft) !== JSON.stringify(DEFAULT_NETWORK_SIGNALING) ||
       JSON.stringify(stunDraft) !== JSON.stringify(DEFAULT_NETWORK_STUN) ||
-      turnDraft.length > 0,
+      JSON.stringify(turnDraft) !== JSON.stringify(DEFAULT_NETWORK_TURN),
   );
 
   onMount(() => {
@@ -376,10 +382,13 @@
     {#if advancedExpanded}
       <div class="advanced">
         <p class="advanced-hint">
-          Optional. Leave blank to use Trystero's public Nostr relays and
-          Google's STUN pool. Override here when you want a private relay,
-          a custom STUN, or TURN for symmetric-NAT peers (phone hotspot /
-          CGNAT).
+          Optional. These are seeded with the MyOwnMesh defaults —
+          signaling <code>wss://myownmesh.com</code>, STUN
+          <code>stun.myownmesh.com</code>, and the shared-guest TURN
+          relay <code>turn.myownmesh.com</code> — so a fresh network
+          connects out of the box, even for symmetric-NAT peers (phone
+          hotspot / CGNAT). Override here to point at a private relay,
+          your own STUN, or your own TURN server.
         </p>
 
         <div class="adv-block">
@@ -495,7 +504,7 @@
               <dt>signaling</dt>
               <dd>
                 {importDraft.signaling_servers.length === 0
-                  ? "(default pool)"
+                  ? "(default · wss://myownmesh.com)"
                   : importDraft.signaling_servers.join(", ")}
               </dd>
               <dt>STUN</dt>

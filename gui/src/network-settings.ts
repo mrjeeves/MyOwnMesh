@@ -27,21 +27,34 @@ import type { NetworkConfigInput, TopologyMode } from "./types";
 export const NETWORK_SETTINGS_KIND = "myownmesh.network-settings";
 export const NETWORK_SETTINGS_VERSION = 1;
 
-/** Defaults the modal seeds new networks with. Matches MyOwnLLM's
- *  pair so configs round-trip cleanly between the two products. The
- *  engine's `SignalingConfig::Default` already fills built-in
- *  Nostr relays when the explicit list is empty, so leaving
- *  signaling at `[]` is the right "use defaults" signal. */
-export const DEFAULT_NETWORK_STUN: string[] = [
-  "stun:stun.l.google.com:19302",
-  "stun:stun1.l.google.com:19302",
-];
+/** Defaults the modals seed new networks with — the project's
+ *  semi-public MyOwnMesh endpoints, matching the engine's own
+ *  `config.rs` defaults so the value the user sees in the UI is the
+ *  value the daemon actually uses. The engine resolves an empty
+ *  signaling list to the same `wss://myownmesh.com` relay (reached
+ *  over standard `wss://` on 443), so seeding it explicitly is just so
+ *  it's visible and editable. */
+export const DEFAULT_NETWORK_SIGNALING: string[] = ["wss://myownmesh.com"];
+export const DEFAULT_NETWORK_STUN: string[] = ["stun:stun.myownmesh.com:3478"];
 
 export interface TurnEntry {
   url: string;
   username?: string;
   credential?: string;
 }
+
+/** Default TURN relay for new networks — the project's reference TURN
+ *  with its shared semi-public guest credential, so symmetric-NAT /
+ *  CGNAT peers relay out of the box. Bandwidth-capped; run your own
+ *  (`services.turn` on any myownmesh host) for sustained throughput.
+ *  Kept in lockstep with `myownmesh_core::config::default_turn_servers`. */
+export const DEFAULT_NETWORK_TURN: TurnEntry[] = [
+  {
+    url: "turn:turn.myownmesh.com:3478",
+    username: "guest",
+    credential: "theguestpassword",
+  },
+];
 
 export interface NetworkSettingsExport {
   kind: typeof NETWORK_SETTINGS_KIND;

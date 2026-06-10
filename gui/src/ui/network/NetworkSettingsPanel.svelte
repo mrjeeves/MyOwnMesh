@@ -16,7 +16,9 @@
   import { governance } from "../../network-governance.svelte";
   import {
     buildNetworkConfig,
+    DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
+    DEFAULT_NETWORK_TURN,
     exportNetworkSettings,
     type TurnEntry,
   } from "../../network-settings";
@@ -97,9 +99,9 @@
   function seedDefaults() {
     labelDraft = network.label ?? "";
     topology = "ring";
-    signalingDraft = [];
+    signalingDraft = [...DEFAULT_NETWORK_SIGNALING];
     stunDraft = [...DEFAULT_NETWORK_STUN];
-    turnDraft = [];
+    turnDraft = DEFAULT_NETWORK_TURN.map((t) => ({ ...t }));
     autoApprove = false;
   }
 
@@ -362,9 +364,11 @@
     <div class="card">
       <div class="card-title">Signaling relays</div>
       <div class="hint subtle">
-        Leave empty to use the built-in Nostr relay pool. Add your own
-        WebSocket URLs (<code>wss://...</code>) to pin specific
-        relays — they take full precedence over the defaults.
+        Defaults to the reference relay
+        <code>wss://myownmesh.com</code>; leaving the list empty falls
+        back to that same built-in default. Add your own WebSocket URLs
+        (<code>wss://...</code>) to pin specific relays — they take full
+        precedence over the default.
       </div>
       {#each signalingDraft as url (url)}
         <div class="list-row">
@@ -417,9 +421,11 @@
       <div class="card-title">TURN servers</div>
       <div class="hint subtle">
         Needed for peers behind symmetric NAT (most common on phone
-        hotspots). MyOwnMesh ships <strong>no default TURN</strong> —
-        bring your own or use Cloudflare Calls / Open Relay Project /
-        self-hosted Coturn.
+        hotspots). New networks default to the shared-guest relay
+        <code>turn:turn.myownmesh.com:3478</code> so this works out of
+        the box; it's bandwidth-capped, so for sustained throughput
+        bring your own (<code>services.turn</code> on any myownmesh
+        host, Cloudflare Calls, or self-hosted Coturn).
       </div>
       {#each turnDraft as t (t.url)}
         <div class="list-row turn">
