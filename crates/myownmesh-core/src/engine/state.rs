@@ -19,9 +19,19 @@ use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
+use crate::transport::webrtc::VideoSample;
 use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 
 use super::connection::PeerConnection;
+
+/// One assembled video access unit from a peer's track lane, as the
+/// embedder-facing subscription surfaces it.
+#[derive(Debug, Clone)]
+pub struct InboundVideoSample {
+    /// The authenticated peer the unit arrived from.
+    pub from: String,
+    pub sample: VideoSample,
+}
 
 /// Engine command queue entry. Anything that mutates per-peer
 /// state, sends a frame, or reconfigures the network goes through
@@ -203,6 +213,11 @@ pub struct NetworkState {
 
     pub events_tx: broadcast::Sender<MeshEvent>,
     pub channel_subscribers: DashMap<String, broadcast::Sender<RawChannelFrame>>,
+    /// Fan-out for assembled video access units arriving on peers'
+    /// track lanes. One broadcast per network (subscribers filter by
+    /// `from`); kept shallow — video is a freshness stream, a lagging
+    /// subscriber loses old frames, never delays new ones.
+    pub video_subscribers: broadcast::Sender<InboundVideoSample>,
     pub rpc: RwLock<Option<Arc<RpcInner>>>,
 
     pub signaling_tx: mpsc::UnboundedSender<SignalingOutbound>,
@@ -268,6 +283,9 @@ impl NetworkState {
             s
         };
         let (events_tx, _) = broadcast::channel(256);
+        // Shallow: at 30 fps a depth of 16 is half a second of slack —
+        // beyond that a slow consumer should lose frames, not delay them.
+        let (video_subscribers, _) = broadcast::channel(16);
         let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (signaling_inbound_tx, signaling_inbound_rx) = mpsc::unbounded_channel();
@@ -284,6 +302,7 @@ impl NetworkState {
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             channel_subscribers: DashMap::new(),
+            video_subscribers,
             rpc: RwLock::new(None),
             signaling_tx,
             signaling_inbound_tx,
@@ -420,6 +439,45 @@ impl NetworkState {
         } else {
             trace!(channel = name, "no subscriber for channel frame");
         }
+    }
+
+    /// Subscribe to assembled video access units from every peer on
+    /// this network (filter by [`InboundVideoSample::from`]). Lagging
+    /// loses old frames, never delays new ones — video is freshness.
+    pub fn subscribe_video(&self) -> broadcast::Receiver<InboundVideoSample> {
+        self.video_subscribers.subscribe()
+    }
+
+    /// Engine-side dispatch: fan an assembled access unit out to the
+    /// video subscribers. Silently drops with none registered.
+    pub fn dispatch_video(&self, from: &str, sample: VideoSample) {
+        let _ = self.video_subscribers.send(InboundVideoSample {
+            from: from.to_string(),
+            sample,
+        });
+    }
+
+    /// Write one encoded H.264 access unit (Annex-B) onto the video
+    /// lane to `peer`. `duration` paces the RTP clock (1/fps). Errors
+    /// when the peer is unknown or its session isn't established;
+    /// writes on a lane the peer never consumes are simply discarded
+    /// by the far side.
+    pub async fn send_video_sample(
+        &self,
+        peer: &str,
+        data: bytes::Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let session = {
+            let Some(p) = self.peers.get(peer) else {
+                return Err(Error::Network(format!("peer not found: {peer}")));
+            };
+            let session = p.session.lock().clone();
+            session
+        };
+        let session =
+            session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
+        session.send_video(data, duration).await
     }
 
     /// Send a channel frame to one peer via the command queue.

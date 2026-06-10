@@ -77,7 +77,9 @@ use crate::transport::{Role, Transport, TransportEvent};
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
-pub use state::{NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound};
+pub use state::{
+    InboundVideoSample, NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound,
+};
 
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
@@ -1038,6 +1040,12 @@ async fn handle_transport_event(
         }
         TransportEvent::Message(bytes) => {
             handle_inbound_frame(state, &device_id, bytes).await;
+        }
+        TransportEvent::VideoSample(sample) => {
+            // Same gate as channel frames: the connection's existence
+            // (DTLS identity + roster approval) is the authorization;
+            // app layers add their own policy on top.
+            state.dispatch_video(&device_id, sample);
         }
     }
 }
