@@ -306,6 +306,30 @@ pub enum Request {
         capabilities: myownmesh_core::protocol::CapabilityAdvert,
     },
 
+    // ---- video track lane ---------------------------------------------
+    /// Write one encoded H.264 access unit (Annex-B, base64) onto the
+    /// video track lane to `peer`. The lane is provisioned on every
+    /// connection at negotiation, so this works the moment the peer is
+    /// up — no renegotiation, no subscription required. `duration_us`
+    /// paces the RTP clock (1/fps).
+    VideoSend {
+        network: String,
+        peer: String,
+        duration_us: u64,
+        data: String,
+    },
+    /// Route assembled video access units arriving from this network's
+    /// peers to this client's event socket as `video_inbound` frames.
+    VideoSubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+    /// Release a video subscription. No-op if not subscribed.
+    VideoUnsubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+
     // ---- self-update -------------------------------------------------
     /// Snapshot the updater's state — current version, channel, policy,
     /// effective release feed, last check, any staged version.
@@ -972,6 +996,54 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             };
             net.advertise(capabilities);
             Response::ok(serde_json::json!({ "advertised": true }))
+        }
+
+        Request::VideoSend {
+            network,
+            peer,
+            duration_us,
+            data,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let bytes = match data_encoding::BASE64.decode(data.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => return Response::err(format!("data not base64: {e}")),
+            };
+            match net
+                .state()
+                .send_video_sample(
+                    &peer,
+                    bytes.into(),
+                    std::time::Duration::from_micros(duration_us),
+                )
+                .await
+            {
+                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::VideoSubscribe { client_id, network } => {
+            if state.clients.client(client_id).is_none() {
+                return Response::err(format!("unknown client_id: {client_id}"));
+            }
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let first = state.clients.subscribe_video(network.clone(), client_id);
+            if first {
+                crate::ipc::bridge::spawn_video_pump(&net, network, state.clients.clone());
+            }
+            Response::ok(serde_json::json!({ "subscribed": true }))
+        }
+
+        Request::VideoUnsubscribe { client_id, network } => {
+            state.clients.unsubscribe_video(&network, client_id);
+            // The pump exits on its next sample once it sees an empty
+            // subscriber list — same passive teardown as channels.
+            Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
     }
 }

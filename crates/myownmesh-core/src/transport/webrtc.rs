@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -31,10 +31,15 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::interceptor::registry::Registry;
+use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
+use webrtc::track::track_remote::TrackRemote;
 
 use crate::error::{Error, Result};
 
@@ -75,6 +80,18 @@ pub enum TransportEvent {
     Message(Bytes),
     /// Data channel closed (peer initiated or local error).
     DataChannelClosed,
+    /// One assembled access unit from the peer's video track lane.
+    VideoSample(VideoSample),
+}
+
+/// One H.264 access unit off the peer's video track — Annex-B bytes
+/// ready for a decoder. `rtp_timestamp` ticks at the 90 kHz video
+/// clock; `key` marks an IDR (a safe decode entry point).
+#[derive(Debug, Clone)]
+pub struct VideoSample {
+    pub rtp_timestamp: u32,
+    pub key: bool,
+    pub data: Bytes,
 }
 
 /// One locally-gathered ICE candidate, in the form the signaling
@@ -158,6 +175,30 @@ impl Transport {
 
         register_callbacks(&pc, &events_tx, &data_channel);
 
+        // One H.264 video lane, provisioned on **every** connection at
+        // setup — both roles add the local track before SDP runs, so the
+        // one offer/answer negotiates a sendrecv video m-line once and
+        // for all, and no renegotiation path needs to exist anywhere.
+        // An idle lane costs nothing: no samples written, no RTP sent.
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_string(),
+            "myownmesh".to_string(),
+        ));
+        let rtp_sender = pc
+            .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|e| Error::Transport(format!("add_track: {e}")))?;
+        // Drain the sender's RTCP so its interceptors (NACK responder,
+        // reports) actually run; the task ends with the connection.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            while rtp_sender.read(&mut buf).await.is_ok() {}
+        });
+
         // Offerer creates the data channel synchronously so the
         // resulting SDP includes it. Answerer waits for the
         // `on_data_channel` callback that fires when the peer's
@@ -181,6 +222,7 @@ impl Transport {
             PeerSession {
                 pc,
                 data_channel,
+                video_track,
                 events_tx,
                 role,
             },
@@ -259,6 +301,125 @@ fn register_callbacks(
             })
         }));
     }
+
+    // The peer's video track lane went live — pump its RTP into
+    // assembled access units until the track (i.e. the connection) ends.
+    {
+        let tx = events_tx.clone();
+        pc.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if track.kind() != RTPCodecType::Video {
+                    trace!(kind = ?track.kind(), "ignoring non-video track");
+                    return;
+                }
+                tokio::spawn(pump_video_track(track, tx));
+            })
+        }));
+    }
+}
+
+/// Drain one remote video track: depacketize H.264 RTP into access
+/// units and surface each as [`TransportEvent::VideoSample`]. Ends
+/// when the track does (peer connection closed).
+async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+    let mut assembler = H264AuAssembler::default();
+    loop {
+        let pkt = match track.read_rtp().await {
+            Ok((pkt, _)) => pkt,
+            Err(_) => break, // track ended with its connection
+        };
+        match assembler.push(&pkt) {
+            Ok(Some(sample)) => {
+                if tx.send(TransportEvent::VideoSample(sample)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {}
+            // A malformed packet (or one straddling a loss the NACK
+            // retransmit didn't cover) costs the current unit only —
+            // the stream re-syncs on the next timestamp, and the
+            // sender's periodic IDR bounds any visible damage.
+            Err(e) => trace!("video depacketize: {e}"),
+        }
+    }
+}
+
+/// Reassembles H.264 access units from RTP: depacketized payloads
+/// accumulate per RTP timestamp, and the marker bit closes the unit.
+/// A timestamp change with an unfinished unit means its tail was lost
+/// — that unit is dropped whole, never surfaced torn.
+#[derive(Default)]
+struct H264AuAssembler {
+    depacketizer: webrtc::rtp::codecs::h264::H264Packet,
+    buf: Vec<u8>,
+    timestamp: u32,
+}
+
+impl H264AuAssembler {
+    fn push(&mut self, pkt: &webrtc::rtp::packet::Packet) -> Result<Option<VideoSample>> {
+        use webrtc::rtp::packetizer::Depacketizer;
+        if pkt.payload.is_empty() {
+            return Ok(None); // padding / probe
+        }
+        if !self.buf.is_empty() && pkt.header.timestamp != self.timestamp {
+            self.buf.clear();
+        }
+        self.timestamp = pkt.header.timestamp;
+        let part = self
+            .depacketizer
+            .depacketize(&pkt.payload)
+            .map_err(|e| Error::Transport(format!("h264 depacketize: {e}")))?;
+        self.buf.extend_from_slice(&part);
+        if !pkt.header.marker {
+            return Ok(None);
+        }
+        let data = Bytes::from(std::mem::take(&mut self.buf));
+        Ok(Some(VideoSample {
+            rtp_timestamp: self.timestamp,
+            key: au_has_idr(&data),
+            data,
+        }))
+    }
+}
+
+/// Whether an Annex-B access unit contains an IDR slice (NAL type 5)
+/// — a safe decoder entry point. (SPS/PPS ride along with IDRs but
+/// don't make a frame decodable by themselves.)
+fn au_has_idr(data: &[u8]) -> bool {
+    annexb_nal_types(data).any(|t| t == 5)
+}
+
+/// Iterate the NAL unit types of an Annex-B stream (both 3- and
+/// 4-byte start codes).
+fn annexb_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        while i + 3 <= data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                if data[i + 2] == 1 {
+                    if i + 3 < data.len() {
+                        let t = data[i + 3] & 0x1F;
+                        i += 4;
+                        return Some(t);
+                    }
+                    i += 3;
+                    continue;
+                }
+                if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                    if i + 4 < data.len() {
+                        let t = data[i + 4] & 0x1F;
+                        i += 5;
+                        return Some(t);
+                    }
+                    i += 4;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        None
+    })
 }
 
 fn install_data_channel_handlers(
@@ -363,10 +524,12 @@ fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
 }
 
 /// One peer's WebRTC session — peer connection, application data
-/// channel, and transport-level event sink.
+/// channel, the provisioned video track lane, and transport-level
+/// event sink.
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    video_track: Arc<TrackLocalStaticSample>,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
     role: Role,
 }
@@ -440,6 +603,22 @@ impl PeerSession {
         dc.send(&payload)
             .await
             .map_err(|e| Error::Transport(format!("data channel send: {e}")))
+    }
+
+    /// Write one encoded H.264 access unit (Annex-B) onto this peer's
+    /// video lane. `duration` paces the RTP timestamp advance (1/fps).
+    /// Before the lane's negotiation completes, webrtc-rs treats the
+    /// write as a no-op (the track has no bound sender yet) — callers
+    /// can simply start writing once the peer is up.
+    pub async fn send_video(&self, data: Bytes, duration: std::time::Duration) -> Result<()> {
+        self.video_track
+            .write_sample(&Sample {
+                data,
+                duration,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Error::Transport(format!("video write_sample: {e}")))
     }
 
     /// Force ICE restart. Used by the engine's Tier 2.5 / Tier 3
@@ -748,6 +927,147 @@ mod tests {
             }
         }
         assert!(got, "answerer never received the app frame");
+
+        offerer.close().await.expect("close offerer");
+        answerer.close().await.expect("close answerer");
+    }
+
+    #[test]
+    fn annexb_nal_scan_finds_types_across_both_start_codes() {
+        // 4-byte start code SPS (7), 3-byte start code PPS (8), then IDR (5).
+        let au = [
+            0, 0, 0, 1, 0x67, 0xAA, // SPS
+            0, 0, 1, 0x68, 0xBB, // PPS
+            0, 0, 0, 1, 0x65, 0x11, 0x22, // IDR slice
+        ];
+        let types: Vec<u8> = annexb_nal_types(&au).collect();
+        assert_eq!(types, vec![7, 8, 5]);
+        assert!(au_has_idr(&au));
+
+        // A delta slice (type 1) alone is not a key.
+        let p = [0, 0, 0, 1, 0x41, 0x99];
+        assert!(!au_has_idr(&p));
+
+        // Degenerate inputs scan to nothing without panicking.
+        assert_eq!(annexb_nal_types(&[]).count(), 0);
+        assert_eq!(annexb_nal_types(&[0, 0, 1]).count(), 0);
+    }
+
+    #[test]
+    fn au_assembler_groups_by_timestamp_and_drops_torn_units() {
+        use webrtc::rtp::packet::Packet;
+        let mut asm = H264AuAssembler::default();
+        let nal = |ts: u32, marker: bool, body: &[u8]| {
+            let mut p = Packet::default();
+            p.header.timestamp = ts;
+            p.header.marker = marker;
+            p.payload = Bytes::copy_from_slice(body);
+            p
+        };
+        // Two single-NAL packets of one frame; marker closes it.
+        assert!(asm
+            .push(&nal(1000, false, &[0x41, 1, 1, 1]))
+            .unwrap()
+            .is_none());
+        let s = asm
+            .push(&nal(1000, true, &[0x65, 2, 2, 2]))
+            .unwrap()
+            .expect("marker completes the unit");
+        assert!(s.key, "an IDR NAL anywhere in the unit marks it key");
+        assert_eq!(s.rtp_timestamp, 1000);
+        // Depacketized single NALs come back with start codes attached.
+        assert_eq!(
+            s.data.as_ref(),
+            &[0, 0, 0, 1, 0x41, 1, 1, 1, 0, 0, 0, 1, 0x65, 2, 2, 2]
+        );
+
+        // A unit whose marker never arrived is dropped when the next
+        // timestamp starts; the new unit is unaffected.
+        assert!(asm
+            .push(&nal(2000, false, &[0x41, 7, 7, 7]))
+            .unwrap()
+            .is_none());
+        let s = asm
+            .push(&nal(3000, true, &[0x41, 9, 9, 9]))
+            .unwrap()
+            .expect("fresh unit completes");
+        assert_eq!(s.rtp_timestamp, 3000);
+        assert!(!s.key);
+        assert_eq!(s.data.as_ref(), &[0, 0, 0, 1, 0x41, 9, 9, 9]);
+    }
+
+    #[tokio::test]
+    async fn loopback_video_lane_carries_h264_samples() {
+        // Same loopback bring-up as the data-channel test, but the
+        // assertion is on the provisioned video lane: an Annex-B access
+        // unit written on the offerer's track arrives at the answerer as
+        // one assembled VideoSample, byte-equal and key-flagged. This is
+        // the negotiation-without-renegotiation property end to end:
+        // m-line in the one offer/answer, RTP, depacketize, reassembly.
+        let transport = Transport::new().expect("transport");
+        let cfg = RTCConfiguration::default();
+
+        let (offerer, mut off_rx) = transport
+            .open_peer_with_config(Role::Offerer, cfg.clone())
+            .await
+            .expect("offerer");
+        let (answerer, mut ans_rx) = transport
+            .open_peer_with_config(Role::Answerer, cfg)
+            .await
+            .expect("answerer");
+
+        let offer = offerer.create_offer().await.expect("create_offer");
+        answerer
+            .set_remote_description(offer)
+            .await
+            .expect("answerer.set_remote");
+        let answer = answerer.create_answer().await.expect("create_answer");
+        offerer
+            .set_remote_description(answer)
+            .await
+            .expect("offerer.set_remote");
+
+        // One synthetic IDR access unit. The H264 payloader parses
+        // Annex-B, so the bytes must be a plausible NAL stream.
+        let au: Vec<u8> = {
+            let mut v = vec![0u8, 0, 0, 1, 0x65];
+            v.extend((0..400u32).map(|i| (i % 251) as u8));
+            v
+        };
+
+        // The track binds only once negotiation + ICE complete, and
+        // writes before that are silent no-ops — so keep (re)sending
+        // the unit at frame cadence until the far side reports it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut received: Option<VideoSample> = None;
+        let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        while received.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = send_tick.tick() => {
+                    let _ = offerer
+                        .send_video(Bytes::from(au.clone()), std::time::Duration::from_millis(33))
+                        .await;
+                }
+                Some(ev) = off_rx.recv() => {
+                    if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
+                        answerer.add_ice_candidate(c.clone()).await.expect("ice → answerer");
+                    }
+                }
+                Some(ev) = ans_rx.recv() => {
+                    match ev {
+                        TransportEvent::LocalIceCandidate(Some(c)) => {
+                            offerer.add_ice_candidate(c.clone()).await.expect("ice → offerer");
+                        }
+                        TransportEvent::VideoSample(s) => received = Some(s),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let sample = received.expect("answerer never received a video sample");
+        assert_eq!(sample.data.as_ref(), &au[..], "AU survives byte-exact");
+        assert!(sample.key, "IDR unit arrives key-flagged");
 
         offerer.close().await.expect("close offerer");
         answerer.close().await.expect("close answerer");

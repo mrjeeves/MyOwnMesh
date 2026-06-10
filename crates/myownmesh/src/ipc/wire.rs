@@ -68,6 +68,17 @@ pub enum ServerOut {
         channel: String,
         payload: Value,
     },
+    /// One assembled video access unit from a peer's track lane,
+    /// for a client that called `video_subscribe` on the network.
+    /// `data` is the Annex-B H.264 unit, base64; `rtp_timestamp`
+    /// ticks at the 90 kHz video clock; `key` marks an IDR.
+    VideoInbound {
+        network: String,
+        from: String,
+        rtp_timestamp: u32,
+        key: bool,
+        data: String,
+    },
     /// A more-recent client claimed a method this client had
     /// previously registered. The displaced client should stop
     /// expecting `RpcInbound` events for `method`; any

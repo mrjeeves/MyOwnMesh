@@ -150,6 +150,18 @@ of truth is `src/protocol/`. Receivers silently drop unknown
 `kind`s; embedders gate optional traffic per-peer via the
 `features` capability matrix.
 
+Alongside the data channel, every connection provisions one **H.264
+video track lane** (a sendrecv media transceiver) in the same
+offer/answer — negotiated once at setup, so no renegotiation path
+exists or is needed. An idle lane sends nothing and costs nothing;
+embedders write encoded access units with
+`NetworkState::send_video_sample` and subscribe to assembled inbound
+units with `subscribe_video` (the daemon mirrors both as `video_send`
+/ `video_subscribe` control ops). Media rides RTP/UDP with the
+default interceptors (NACK retransmission, reports) — lossy-fresh
+semantics, unlike the reliable-ordered data channel; the engine
+neither encodes nor decodes, it moves Annex-B access units.
+
 ## Signaling
 
 Today the production strategy is Nostr (5 relays by default,

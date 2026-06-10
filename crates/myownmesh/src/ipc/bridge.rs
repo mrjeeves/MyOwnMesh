@@ -206,6 +206,51 @@ pub fn spawn_channel_pump(
     });
 }
 
+/// Spawn the per-network video fan-out for IPC subscribers.
+/// Caller spawns this only on the FIRST `subscribe_video(...)`;
+/// the task exits once the subscriber list empties (same passive
+/// teardown as the channel pump) or the network is torn down.
+///
+/// The engine's video broadcast is shallow by design: if this
+/// pump (or a slow client socket) lags, old samples are dropped
+/// at the broadcast and the stream resumes from the freshest one
+/// — video is freshness, never a backlog.
+pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
+    let mut sub = network.state().subscribe_video();
+    tokio::spawn(async move {
+        loop {
+            let subscribers = registry.video_subscribers(&network_key);
+            if subscribers.is_empty() {
+                debug!(network = %network_key, "video pump exiting (no subscribers)");
+                break;
+            }
+            let inbound = match sub.recv().await {
+                Ok(s) => s,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(network = %network_key, "video pump lagged; dropped {n} samples");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!(network = %network_key, "video pump exiting (network closed)");
+                    break;
+                }
+            };
+            let frame = ServerOut::VideoInbound {
+                network: network_key.clone(),
+                from: inbound.from,
+                rtp_timestamp: inbound.sample.rtp_timestamp,
+                key: inbound.sample.key,
+                data: data_encoding::BASE64.encode(&inbound.sample.data),
+            };
+            for client_id in subscribers {
+                if let Some(client) = registry.client(client_id) {
+                    client.send(frame.clone());
+                }
+            }
+        }
+    });
+}
+
 /// `myownmesh-core`'s `Rpc::serve` wants an
 /// `Ok(RpcResponse)` — wrap a raw `Value` so callers don't
 /// reach across crate-private types.

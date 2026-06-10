@@ -1320,6 +1320,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dashmap",
+ "data-encoding",
  "dirs",
  "interprocess",
  "libc",

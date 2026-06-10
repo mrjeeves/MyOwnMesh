@@ -109,6 +109,9 @@ pub struct ClientHandle {
     /// Channel subscriptions this client currently holds.
     /// Same disconnect-cleanup rationale.
     pub channel_subs: Arc<DashSet<ClaimKey>>,
+    /// Video-lane subscriptions (by network) this client holds.
+    /// Same disconnect-cleanup rationale.
+    pub video_subs: Arc<DashSet<String>>,
 }
 
 impl ClientHandle {
@@ -133,6 +136,8 @@ struct RegistryInner {
     clients: DashMap<ClientId, Arc<ClientHandle>>,
     handler_claims: DashMap<ClaimKey, ClientId>,
     channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,
+    /// Video-lane subscribers per network id.
+    video_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
     pending_inbound: DashMap<String, PendingInbound>,
     /// Streaming methods that have a synthetic handler
     /// installed on the engine. `(network, method) → ()` —
@@ -163,6 +168,7 @@ impl ClientRegistry {
             writer_tx,
             method_claims: Arc::new(DashSet::new()),
             channel_subs: Arc::new(DashSet::new()),
+            video_subs: Arc::new(DashSet::new()),
         });
         self.inner.clients.insert(id, handle.clone());
         handle
@@ -200,6 +206,14 @@ impl ClientRegistry {
         for entry in handle.channel_subs.iter() {
             let key = entry.key().clone();
             if let Some(subs) = self.inner.channel_subs.get(&key) {
+                subs.lock().retain(|c| *c != id);
+            }
+        }
+        // Video subscriptions clean up the same way; the video pump
+        // exits on its next sample once its subscriber list is empty.
+        for entry in handle.video_subs.iter() {
+            let key = entry.key().clone();
+            if let Some(subs) = self.inner.video_subs.get(&key) {
                 subs.lock().retain(|c| *c != id);
             }
         }
@@ -291,6 +305,49 @@ impl ClientRegistry {
         let mut subs = subs.lock();
         subs.retain(|c| *c != client);
         subs.is_empty()
+    }
+
+    /// Returns `true` on the FIRST video subscriber for this network
+    /// — the caller's signal to spawn the network's video pump.
+    pub fn subscribe_video(&self, network: String, client: ClientId) -> bool {
+        if let Some(c) = self.client(client) {
+            c.video_subs.insert(network.clone());
+        }
+        let entry = self
+            .inner
+            .video_subs
+            .entry(network)
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+        let mut subs = entry.lock();
+        let was_empty = subs.is_empty();
+        if !subs.contains(&client) {
+            subs.push(client);
+        }
+        was_empty
+    }
+
+    /// Release a video subscription. Returns `true` if no clients
+    /// remain on this network's video lane.
+    pub fn unsubscribe_video(&self, network: &str, client: ClientId) -> bool {
+        if let Some(c) = self.client(client) {
+            c.video_subs.remove(network);
+        }
+        let Some(subs) = self.inner.video_subs.get(network) else {
+            return true;
+        };
+        let mut subs = subs.lock();
+        subs.retain(|c| *c != client);
+        subs.is_empty()
+    }
+
+    /// Snapshot the network's current video subscribers — used by
+    /// the video pump each sample.
+    pub fn video_subscribers(&self, network: &str) -> Vec<ClientId> {
+        self.inner
+            .video_subs
+            .get(network)
+            .map(|subs| subs.lock().clone())
+            .unwrap_or_default()
     }
 
     /// Snapshot the current set of subscribers — used by the
