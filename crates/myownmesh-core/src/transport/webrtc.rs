@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -82,6 +82,8 @@ pub enum TransportEvent {
     DataChannelClosed,
     /// One assembled access unit from the peer's video track lane.
     VideoSample(VideoSample),
+    /// One encoded audio frame from the peer's audio track lane.
+    AudioSample(AudioSample),
 }
 
 /// One H.264 access unit off the peer's video track — Annex-B bytes
@@ -91,6 +93,18 @@ pub enum TransportEvent {
 pub struct VideoSample {
     pub rtp_timestamp: u32,
     pub key: bool,
+    pub data: Bytes,
+}
+
+/// One Opus frame off the peer's audio track — exactly one frame per
+/// RTP packet (RFC 7587), so there is no reassembly: the payload is
+/// decoder-ready as it arrives. `rtp_timestamp` ticks at the 48 kHz
+/// Opus clock. Frames are surfaced in arrival order; a reordered
+/// packet (rare on the paths this rides) costs one frame of fidelity,
+/// never a wedged stream.
+#[derive(Debug, Clone)]
+pub struct AudioSample {
+    pub rtp_timestamp: u32,
     pub data: Bytes,
 }
 
@@ -199,6 +213,27 @@ impl Transport {
             while rtp_sender.read(&mut buf).await.is_ok() {}
         });
 
+        // And one Opus audio lane, provisioned the same way for the same
+        // reason: the single offer/answer negotiates a sendrecv audio
+        // m-line up front, no renegotiation machinery anywhere, and an
+        // idle lane costs nothing.
+        let audio_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                ..Default::default()
+            },
+            "audio".to_string(),
+            "myownmesh".to_string(),
+        ));
+        let audio_sender = pc
+            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|e| Error::Transport(format!("add_track (audio): {e}")))?;
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            while audio_sender.read(&mut buf).await.is_ok() {}
+        });
+
         // Offerer creates the data channel synchronously so the
         // resulting SDP includes it. Answerer waits for the
         // `on_data_channel` callback that fires when the peer's
@@ -223,6 +258,7 @@ impl Transport {
                 pc,
                 data_channel,
                 video_track,
+                audio_track,
                 events_tx,
                 role,
             },
@@ -302,20 +338,48 @@ fn register_callbacks(
         }));
     }
 
-    // The peer's video track lane went live — pump its RTP into
-    // assembled access units until the track (i.e. the connection) ends.
+    // A peer track lane went live — pump its RTP until the track
+    // (i.e. the connection) ends: video into assembled access units,
+    // audio straight through (one Opus frame per packet).
     {
         let tx = events_tx.clone();
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
             let tx = tx.clone();
             Box::pin(async move {
-                if track.kind() != RTPCodecType::Video {
-                    trace!(kind = ?track.kind(), "ignoring non-video track");
-                    return;
+                match track.kind() {
+                    RTPCodecType::Video => {
+                        tokio::spawn(pump_video_track(track, tx));
+                    }
+                    RTPCodecType::Audio => {
+                        tokio::spawn(pump_audio_track(track, tx));
+                    }
+                    kind => trace!(?kind, "ignoring unknown track kind"),
                 }
-                tokio::spawn(pump_video_track(track, tx));
             })
         }));
+    }
+}
+
+/// Drain one remote audio track: every RTP packet carries exactly one
+/// Opus frame (RFC 7587 — no fragmentation, no aggregation), so each
+/// non-empty payload surfaces directly as [`TransportEvent::AudioSample`].
+/// Ends when the track does (peer connection closed).
+async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+    loop {
+        let pkt = match track.read_rtp().await {
+            Ok((pkt, _)) => pkt,
+            Err(_) => break, // track ended with its connection
+        };
+        if pkt.payload.is_empty() {
+            continue; // padding / probe
+        }
+        let sample = AudioSample {
+            rtp_timestamp: pkt.header.timestamp,
+            data: pkt.payload.clone(),
+        };
+        if tx.send(TransportEvent::AudioSample(sample)).is_err() {
+            break;
+        }
     }
 }
 
@@ -666,6 +730,7 @@ pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     video_track: Arc<TrackLocalStaticSample>,
+    audio_track: Arc<TrackLocalStaticSample>,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
     role: Role,
 }
@@ -755,6 +820,21 @@ impl PeerSession {
             })
             .await
             .map_err(|e| Error::Transport(format!("video write_sample: {e}")))
+    }
+
+    /// Write one encoded Opus frame onto this peer's audio lane.
+    /// `duration` paces the RTP timestamp advance (the frame length —
+    /// 20 ms for the canonical Opus frame). Same pre-negotiation
+    /// no-op semantics as [`Self::send_video`].
+    pub async fn send_audio(&self, data: Bytes, duration: std::time::Duration) -> Result<()> {
+        self.audio_track
+            .write_sample(&Sample {
+                data,
+                duration,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Error::Transport(format!("audio write_sample: {e}")))
     }
 
     /// Force ICE restart. Used by the engine's Tier 2.5 / Tier 3
@@ -1333,6 +1413,82 @@ mod tests {
         let sample = received.expect("answerer never received a video sample");
         assert_eq!(sample.data.as_ref(), &au[..], "AU survives byte-exact");
         assert!(sample.key, "IDR unit arrives key-flagged");
+
+        offerer.close().await.expect("close offerer");
+        answerer.close().await.expect("close answerer");
+    }
+
+    #[tokio::test]
+    async fn loopback_audio_lane_carries_opus_frames() {
+        // The audio twin of the video lane test: an Opus frame written
+        // on the offerer's audio track arrives at the answerer as one
+        // AudioSample, byte-equal — the same single offer/answer
+        // negotiates both lanes, and no reassembly exists to get wrong
+        // (one frame per RTP packet, RFC 7587).
+        let transport = Transport::new().expect("transport");
+        let cfg = RTCConfiguration::default();
+
+        let (offerer, mut off_rx) = transport
+            .open_peer_with_config(Role::Offerer, cfg.clone())
+            .await
+            .expect("offerer");
+        let (answerer, mut ans_rx) = transport
+            .open_peer_with_config(Role::Answerer, cfg)
+            .await
+            .expect("answerer");
+
+        let offer = offerer.create_offer().await.expect("create_offer");
+        answerer
+            .set_remote_description(offer)
+            .await
+            .expect("answerer.set_remote");
+        let answer = answerer.create_answer().await.expect("create_answer");
+        offerer
+            .set_remote_description(answer)
+            .await
+            .expect("offerer.set_remote");
+
+        // One synthetic Opus frame: a valid TOC byte then arbitrary
+        // payload — the lane ships bytes, it never parses them.
+        let frame: Vec<u8> = {
+            let mut v = vec![0x78u8];
+            v.extend((0..160u32).map(|i| (i % 251) as u8));
+            v
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut received: Option<AudioSample> = None;
+        let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+        while received.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = send_tick.tick() => {
+                    let _ = offerer
+                        .send_audio(Bytes::from(frame.clone()), std::time::Duration::from_millis(20))
+                        .await;
+                }
+                Some(ev) = off_rx.recv() => {
+                    if let TransportEvent::LocalIceCandidate(Some(c)) = &ev {
+                        answerer.add_ice_candidate(c.clone()).await.expect("ice → answerer");
+                    }
+                }
+                Some(ev) = ans_rx.recv() => {
+                    match ev {
+                        TransportEvent::LocalIceCandidate(Some(c)) => {
+                            offerer.add_ice_candidate(c.clone()).await.expect("ice → offerer");
+                        }
+                        TransportEvent::AudioSample(s) => received = Some(s),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let sample = received.expect("answerer never received an audio sample");
+        assert_eq!(
+            sample.data.as_ref(),
+            &frame[..],
+            "frame survives byte-exact"
+        );
 
         offerer.close().await.expect("close offerer");
         answerer.close().await.expect("close answerer");

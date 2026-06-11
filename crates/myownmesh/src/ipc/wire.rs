@@ -79,6 +79,13 @@ pub enum ServerOut {
         key: bool,
         data: String,
     },
+    /// One Opus frame off a peer's audio track lane (base64 payload).
+    AudioInbound {
+        network: String,
+        from: String,
+        rtp_timestamp: u32,
+        data: String,
+    },
     /// A more-recent client claimed a method this client had
     /// previously registered. The displaced client should stop
     /// expecting `RpcInbound` events for `method`; any

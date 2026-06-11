@@ -251,6 +251,46 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
     });
 }
 
+/// Spawn the per-network audio fan-out for IPC subscribers — the
+/// audio twin of [`spawn_video_pump`], with the same passive
+/// teardown (exits once the subscriber list empties) and the same
+/// lag policy (a slow client sheds the oldest frames; live audio
+/// is freshness, never a backlog).
+pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
+    let mut sub = network.state().subscribe_audio();
+    tokio::spawn(async move {
+        loop {
+            let subscribers = registry.audio_subscribers(&network_key);
+            if subscribers.is_empty() {
+                debug!(network = %network_key, "audio pump exiting (no subscribers)");
+                break;
+            }
+            let inbound = match sub.recv().await {
+                Ok(s) => s,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(network = %network_key, "audio pump lagged; dropped {n} frames");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!(network = %network_key, "audio pump exiting (network closed)");
+                    break;
+                }
+            };
+            let frame = ServerOut::AudioInbound {
+                network: network_key.clone(),
+                from: inbound.from,
+                rtp_timestamp: inbound.sample.rtp_timestamp,
+                data: data_encoding::BASE64.encode(&inbound.sample.data),
+            };
+            for client_id in subscribers {
+                if let Some(client) = registry.client(client_id) {
+                    client.send(frame.clone());
+                }
+            }
+        }
+    });
+}
+
 /// `myownmesh-core`'s `Rpc::serve` wants an
 /// `Ok(RpcResponse)` — wrap a raw `Value` so callers don't
 /// reach across crate-private types.

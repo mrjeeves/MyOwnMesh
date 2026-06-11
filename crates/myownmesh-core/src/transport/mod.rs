@@ -23,4 +23,6 @@ pub use diag::{
     SelectedCandidatePair,
 };
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
-pub use webrtc::{LocalIceCandidate, PeerSession, Role, Transport, TransportEvent, VideoSample};
+pub use webrtc::{
+    AudioSample, LocalIceCandidate, PeerSession, Role, Transport, TransportEvent, VideoSample,
+};
