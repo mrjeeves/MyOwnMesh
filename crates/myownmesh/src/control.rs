@@ -330,6 +330,30 @@ pub enum Request {
         network: String,
     },
 
+    // ---- audio track lane ---------------------------------------------
+    /// Write one encoded Opus frame (base64) onto the audio track lane
+    /// to `peer`. Provisioned on every connection exactly like the video
+    /// lane — works the moment the peer is up, no subscription required.
+    /// `duration_us` is the frame length (20 000 for the canonical Opus
+    /// frame); it paces the RTP clock.
+    AudioSend {
+        network: String,
+        peer: String,
+        duration_us: u64,
+        data: String,
+    },
+    /// Route audio frames arriving from this network's peers to this
+    /// client's event socket as `audio_inbound` frames.
+    AudioSubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+    /// Release an audio subscription. No-op if not subscribed.
+    AudioUnsubscribe {
+        client_id: crate::ipc::ClientId,
+        network: String,
+    },
+
     // ---- self-update -------------------------------------------------
     /// Snapshot the updater's state — current version, channel, policy,
     /// effective release feed, last check, any staged version.
@@ -1043,6 +1067,53 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             state.clients.unsubscribe_video(&network, client_id);
             // The pump exits on its next sample once it sees an empty
             // subscriber list — same passive teardown as channels.
+            Response::ok(serde_json::json!({ "unsubscribed": true }))
+        }
+
+        Request::AudioSend {
+            network,
+            peer,
+            duration_us,
+            data,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let bytes = match data_encoding::BASE64.decode(data.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => return Response::err(format!("data not base64: {e}")),
+            };
+            match net
+                .state()
+                .send_audio_sample(
+                    &peer,
+                    bytes.into(),
+                    std::time::Duration::from_micros(duration_us),
+                )
+                .await
+            {
+                Ok(()) => Response::ok(serde_json::json!({ "sent": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
+        Request::AudioSubscribe { client_id, network } => {
+            if state.clients.client(client_id).is_none() {
+                return Response::err(format!("unknown client_id: {client_id}"));
+            }
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let first = state.clients.subscribe_audio(network.clone(), client_id);
+            if first {
+                crate::ipc::bridge::spawn_audio_pump(&net, network, state.clients.clone());
+            }
+            Response::ok(serde_json::json!({ "subscribed": true }))
+        }
+
+        Request::AudioUnsubscribe { client_id, network } => {
+            state.clients.unsubscribe_audio(&network, client_id);
+            // Passive pump teardown, exactly like video.
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
     }

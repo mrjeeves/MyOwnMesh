@@ -112,6 +112,8 @@ pub struct ClientHandle {
     /// Video-lane subscriptions (by network) this client holds.
     /// Same disconnect-cleanup rationale.
     pub video_subs: Arc<DashSet<String>>,
+    /// Audio-lane subscriptions (by network) this client holds.
+    pub audio_subs: Arc<DashSet<String>>,
 }
 
 impl ClientHandle {
@@ -138,6 +140,8 @@ struct RegistryInner {
     channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,
     /// Video-lane subscribers per network id.
     video_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
+    /// Audio-lane subscribers per network id.
+    audio_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,
     pending_inbound: DashMap<String, PendingInbound>,
     /// Streaming methods that have a synthetic handler
     /// installed on the engine. `(network, method) → ()` —
@@ -169,6 +173,7 @@ impl ClientRegistry {
             method_claims: Arc::new(DashSet::new()),
             channel_subs: Arc::new(DashSet::new()),
             video_subs: Arc::new(DashSet::new()),
+            audio_subs: Arc::new(DashSet::new()),
         });
         self.inner.clients.insert(id, handle.clone());
         handle
@@ -214,6 +219,13 @@ impl ClientRegistry {
         for entry in handle.video_subs.iter() {
             let key = entry.key().clone();
             if let Some(subs) = self.inner.video_subs.get(&key) {
+                subs.lock().retain(|c| *c != id);
+            }
+        }
+        // And audio subscriptions, identically.
+        for entry in handle.audio_subs.iter() {
+            let key = entry.key().clone();
+            if let Some(subs) = self.inner.audio_subs.get(&key) {
                 subs.lock().retain(|c| *c != id);
             }
         }
@@ -345,6 +357,49 @@ impl ClientRegistry {
     pub fn video_subscribers(&self, network: &str) -> Vec<ClientId> {
         self.inner
             .video_subs
+            .get(network)
+            .map(|subs| subs.lock().clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns `true` on the FIRST audio subscriber for this network
+    /// — the caller's signal to spawn the network's audio pump.
+    pub fn subscribe_audio(&self, network: String, client: ClientId) -> bool {
+        if let Some(c) = self.client(client) {
+            c.audio_subs.insert(network.clone());
+        }
+        let entry = self
+            .inner
+            .audio_subs
+            .entry(network)
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())));
+        let mut subs = entry.lock();
+        let was_empty = subs.is_empty();
+        if !subs.contains(&client) {
+            subs.push(client);
+        }
+        was_empty
+    }
+
+    /// Release an audio subscription. Returns `true` if no clients
+    /// remain on this network's audio lane.
+    pub fn unsubscribe_audio(&self, network: &str, client: ClientId) -> bool {
+        if let Some(c) = self.client(client) {
+            c.audio_subs.remove(network);
+        }
+        let Some(subs) = self.inner.audio_subs.get(network) else {
+            return true;
+        };
+        let mut subs = subs.lock();
+        subs.retain(|c| *c != client);
+        subs.is_empty()
+    }
+
+    /// Snapshot the network's current audio subscribers — used by
+    /// the audio pump each frame.
+    pub fn audio_subscribers(&self, network: &str) -> Vec<ClientId> {
+        self.inner
+            .audio_subs
             .get(network)
             .map(|subs| subs.lock().clone())
             .unwrap_or_default()

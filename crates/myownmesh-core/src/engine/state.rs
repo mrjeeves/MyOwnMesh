@@ -19,7 +19,7 @@ use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
-use crate::transport::webrtc::VideoSample;
+use crate::transport::webrtc::{AudioSample, VideoSample};
 use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 
 use super::connection::PeerConnection;
@@ -31,6 +31,15 @@ pub struct InboundVideoSample {
     /// The authenticated peer the unit arrived from.
     pub from: String,
     pub sample: VideoSample,
+}
+
+/// One audio frame from a peer's track lane, as the engine's
+/// subscribers receive it (tagged with the sending peer).
+#[derive(Debug, Clone)]
+pub struct InboundAudioSample {
+    /// Sending peer's device id.
+    pub from: String,
+    pub sample: AudioSample,
 }
 
 /// Engine command queue entry. Anything that mutates per-peer
@@ -218,6 +227,11 @@ pub struct NetworkState {
     /// `from`); kept shallow — video is a freshness stream, a lagging
     /// subscriber loses old frames, never delays new ones.
     pub video_subscribers: broadcast::Sender<InboundVideoSample>,
+    /// Fan-out for audio frames arriving on peers' audio lanes —
+    /// deeper than video's (audio frames are tiny and a dropped one
+    /// is an audible tick), still bounded so a lagging subscriber
+    /// sheds the oldest instead of growing a backlog.
+    pub audio_subscribers: broadcast::Sender<InboundAudioSample>,
     pub rpc: RwLock<Option<Arc<RpcInner>>>,
 
     pub signaling_tx: mpsc::UnboundedSender<SignalingOutbound>,
@@ -286,6 +300,7 @@ impl NetworkState {
         // Shallow: at 30 fps a depth of 16 is half a second of slack —
         // beyond that a slow consumer should lose frames, not delay them.
         let (video_subscribers, _) = broadcast::channel(16);
+        let (audio_subscribers, _) = broadcast::channel(64);
         let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (signaling_inbound_tx, signaling_inbound_rx) = mpsc::unbounded_channel();
@@ -303,6 +318,7 @@ impl NetworkState {
             events_tx,
             channel_subscribers: DashMap::new(),
             video_subscribers,
+            audio_subscribers,
             rpc: RwLock::new(None),
             signaling_tx,
             signaling_inbound_tx,
@@ -478,6 +494,43 @@ impl NetworkState {
         let session =
             session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
         session.send_video(data, duration).await
+    }
+
+    /// Subscribe to audio frames from every peer on this network
+    /// (filter by [`InboundAudioSample::from`]). Lagging loses old
+    /// frames, never delays new ones — live audio is freshness too.
+    pub fn subscribe_audio(&self) -> broadcast::Receiver<InboundAudioSample> {
+        self.audio_subscribers.subscribe()
+    }
+
+    /// Engine-side dispatch: fan an audio frame out to the audio
+    /// subscribers. Silently drops with none registered.
+    pub fn dispatch_audio(&self, from: &str, sample: AudioSample) {
+        let _ = self.audio_subscribers.send(InboundAudioSample {
+            from: from.to_string(),
+            sample,
+        });
+    }
+
+    /// Write one encoded Opus frame onto the audio lane to `peer`.
+    /// `duration` is the frame length (20 ms canonically) — it paces
+    /// the RTP clock. Same contract as [`Self::send_video_sample`].
+    pub async fn send_audio_sample(
+        &self,
+        peer: &str,
+        data: bytes::Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let session = {
+            let Some(p) = self.peers.get(peer) else {
+                return Err(Error::Network(format!("peer not found: {peer}")));
+            };
+            let session = p.session.lock().clone();
+            session
+        };
+        let session =
+            session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
+        session.send_audio(data, duration).await
     }
 
     /// Send a channel frame to one peer via the command queue.

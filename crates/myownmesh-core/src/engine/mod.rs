@@ -78,7 +78,8 @@ use crate::transport::{Role, Transport, TransportEvent};
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
 pub use state::{
-    InboundVideoSample, NetworkCmd, NetworkState, SignalingInbound, SignalingOutbound,
+    InboundAudioSample, InboundVideoSample, NetworkCmd, NetworkState, SignalingInbound,
+    SignalingOutbound,
 };
 
 /// Spawn the engine for a single joined network. Returns the
@@ -1046,6 +1047,10 @@ async fn handle_transport_event(
             // (DTLS identity + roster approval) is the authorization;
             // app layers add their own policy on top.
             state.dispatch_video(&device_id, sample);
+        }
+        TransportEvent::AudioSample(sample) => {
+            // Identical gate to video.
+            state.dispatch_audio(&device_id, sample);
         }
     }
 }
