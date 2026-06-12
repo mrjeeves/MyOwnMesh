@@ -1938,10 +1938,58 @@ async fn broadcast_capabilities(state: &Arc<NetworkState>, caps: CapabilityAdver
 /// Sighted-stuck case is handled by the re-offer path instead.
 async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &str) {
     let is_zombie = match state.peers.get(device_id) {
-        Some(peer) => match peer.state.read().last_recv_at {
-            Some(last) => last.elapsed().as_millis() as u64 > scheduler::STALE_INBOUND_MS,
-            None => false,
-        },
+        Some(peer) => {
+            let stale = match peer.state.read().last_recv_at {
+                Some(last) => last.elapsed().as_millis() as u64 > scheduler::STALE_INBOUND_MS,
+                None => false,
+            };
+            if !stale {
+                false
+            } else {
+                // Stale inbound is necessary but not sufficient. A session
+                // whose ICE is actively checking or connected — or that we
+                // kicked an in-place restart on within the last checking
+                // window — is mid-recovery, not a wedged zombie. Dropping it
+                // here is exactly what guillotined the restart-before-drop
+                // path after a wake: the restart had already re-gathered, but
+                // inbound was still pre-wake-stale, so the next announce tore
+                // it down and forced a full rebuild storm. Give recovery a
+                // full window before the zombie path can reclaim the peer; a
+                // genuinely dead session (Failed/Disconnected/New with no
+                // restart in flight) still gets cleared as before.
+                let recovering = {
+                    let restart_in_flight = {
+                        let data = peer.state.read();
+                        match data.tier {
+                            ConnectionTier::IceRestart { started } => {
+                                started.elapsed()
+                                    < Duration::from_millis(scheduler::ICE_CHECKING_TIMEOUT_MS)
+                            }
+                            ConnectionTier::IceWatchdog { since } => {
+                                since.elapsed()
+                                    < Duration::from_millis(scheduler::ICE_CHECKING_TIMEOUT_MS)
+                            }
+                            _ => false,
+                        }
+                    };
+                    let ice_live = peer
+                        .session
+                        .lock()
+                        .as_ref()
+                        .map(|s| {
+                            matches!(
+                                s.ice_connection_state(),
+                                RTCIceConnectionState::Checking
+                                    | RTCIceConnectionState::Connected
+                                    | RTCIceConnectionState::Completed
+                            )
+                        })
+                        .unwrap_or(false);
+                    restart_in_flight || ice_live
+                };
+                !recovering
+            }
+        }
         None => false,
     };
     if is_zombie {
@@ -2154,5 +2202,26 @@ mod tests {
         // rebuild while the interface is down.
         reoffer_after_failed_answer(&state, "ghost-peer").await;
         assert!(state.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_peer_mid_ice_restart_is_not_cleared() {
+        let state = build_test_state("restart-keep");
+        // Inbound is pre-wake-stale (the condition that fires the zombie
+        // clear), but an in-place ICE restart is in flight — the session is
+        // recovering, not wedged. It must survive: dropping it here is what
+        // guillotined the restart-before-drop path after a wake.
+        insert_session_less_peer(&state, "peer-restarting", Some(stale_instant()));
+        {
+            let peer = state.peers.get("peer-restarting").expect("peer present");
+            peer.state.write().tier = ConnectionTier::IceRestart {
+                started: Instant::now(),
+            };
+        }
+        clear_stale_session_if_zombie(&state, "peer-restarting").await;
+        assert!(
+            state.peers.contains_key("peer-restarting"),
+            "a peer with an in-flight ICE restart must survive the stale-inbound zombie check"
+        );
     }
 }
