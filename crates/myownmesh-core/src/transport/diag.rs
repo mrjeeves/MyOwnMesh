@@ -55,20 +55,20 @@ pub struct SelectedCandidatePair {
     pub remote: IceCandidateKind,
 }
 
-/// One ICE candidate pair's live connectivity-check counters, read
-/// straight from the agent's `get_stats()`. This is the ground truth
-/// for *why* a connection isn't forming — far more diagnostic than the
-/// gathered-candidate counts in [`IceCandidateStats`], which only say
-/// what was *tried*, not what's actually getting through.
+/// One ICE candidate pair's live state, read from the agent's
+/// `get_stats()`. This is the ground truth for *why* a connection isn't
+/// forming.
 ///
-/// The load-bearing fields are the STUN check counters:
-/// - `requests_sent` climbing while `responses_received` stays `0`
-///   means our connectivity checks are leaving the box but nothing is
-///   coming back — UDP to this peer is being dropped (local firewall,
-///   VPN capturing the subnet, or — on macOS — the app not having been
-///   granted the Local Network privacy permission).
-/// - `requests_received == 0` means the peer's checks aren't reaching
-///   us either, so the block is bidirectional.
+/// IMPORTANT — only [`state`](Self::state) and [`nominated`](Self::nominated)
+/// are real. webrtc-ice 0.13's `get_candidate_pairs_stats` builds every
+/// other field (the STUN request/response counters, byte counters) from
+/// `..Default::default()` — they are hard-wired to `0` and never updated,
+/// no matter how much traffic a pair carries. We deliberately do **not**
+/// carry those dead counters here: a snapshot that printed `sent→0 resp←0`
+/// on a nominated pair that had been streaming for minutes was actively
+/// misleading (it read as "no checks sent" when checks had plainly
+/// succeeded). The pair `state` machine and the `nominated` flag are
+/// maintained correctly, so the diagnosis below is built only on those.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IcePairSnapshot {
     /// Local candidate, pre-rendered as `kind net addr:port`
@@ -77,23 +77,11 @@ pub struct IcePairSnapshot {
     /// Remote candidate, same `kind net addr:port` shape.
     pub remote: String,
     /// Pair check state: `waiting` / `in-progress` / `failed` /
-    /// `succeeded` / `unspecified`.
+    /// `succeeded` / `unspecified`. Maintained correctly by webrtc-ice.
     pub state: String,
     /// True once the agent has nominated this pair for traffic.
+    /// Maintained correctly by webrtc-ice.
     pub nominated: bool,
-    /// STUN binding requests we've sent on this pair.
-    pub requests_sent: u64,
-    /// Success responses we've received back for our requests. The
-    /// number that matters: `requests_sent > 0, responses_received
-    /// == 0` is the signature of a one-way / fully blocked path.
-    pub responses_received: u64,
-    /// STUN binding requests the peer has sent us (their checks
-    /// reaching us).
-    pub requests_received: u64,
-    /// Success responses we've sent back to the peer.
-    pub responses_sent: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
 }
 
 /// A full, point-in-time snapshot of a peer connection's ICE
@@ -129,24 +117,31 @@ impl IceCheckSnapshot {
         self.pairs.iter().filter(|p| p.state == "succeeded").count()
     }
 
-    pub fn total_requests_sent(&self) -> u64 {
-        self.pairs.iter().map(|p| p.requests_sent).sum()
+    /// True once any pair is both nominated and succeeded — the path is
+    /// up and the agent has picked it.
+    pub fn has_nominated_pair(&self) -> bool {
+        self.pairs
+            .iter()
+            .any(|p| p.nominated && p.state == "succeeded")
     }
 
-    pub fn total_responses_received(&self) -> u64 {
-        self.pairs.iter().map(|p| p.responses_received).sum()
-    }
-
-    pub fn total_requests_received(&self) -> u64 {
-        self.pairs.iter().map(|p| p.requests_received).sum()
-    }
-
-    /// A plain-language read of the check counters — the one line that
-    /// turns raw stats into "here's your problem". Ordered from
-    /// success down through the failure modes the field actually hits.
+    /// A plain-language read of the pair states — the one line that turns
+    /// raw stats into "here's your problem". Built only on the fields
+    /// webrtc-ice actually maintains (`state`, `nominated`); see the note
+    /// on [`IcePairSnapshot`] for why the STUN counters are unusable.
+    /// Ordered from success down through the failure modes.
     pub fn diagnosis(&self) -> &'static str {
+        if self.has_nominated_pair() {
+            return "a pair is nominated and succeeded — the path is up";
+        }
         if self.succeeded_pairs() > 0 {
-            return "at least one pair succeeded — connectivity exists on this path";
+            // The decisive case for the flap: connectivity exists (pairs
+            // pass their checks) but nothing is nominated yet. On the
+            // controlled (answerer) side this means we're waiting on the
+            // controlling peer to send USE-CANDIDATE — tearing the agent
+            // down now (and rebuilding) just restarts this race.
+            return "pairs are succeeding but none is nominated yet — connectivity exists; \
+                    waiting on the controlling side to nominate (don't tear down)";
         }
         if self.remote_candidates.is_empty() {
             return "no remote candidates arrived — the peer's ICE candidates never reached us \
@@ -156,32 +151,11 @@ impl IceCheckSnapshot {
             return "candidates on both sides but no pairs formed yet — the agent has only just \
                     started, re-check in a few seconds";
         }
-        let sent = self.total_requests_sent();
-        let resp = self.total_responses_received();
-        let inbound = self.total_requests_received();
-        if sent == 0 {
-            return "no connectivity checks sent yet — agent is still priming the checklist";
+        if self.pairs.iter().all(|p| p.state == "failed") {
+            return "every candidate pair failed its connectivity check — no usable path between \
+                    these address sets (symmetric NAT with no working relay, or UDP blocked)";
         }
-        match (resp == 0, inbound == 0) {
-            (true, true) => {
-                "checks are leaving but NOTHING comes back and the peer's checks \
-                             never reach us — UDP to this peer is being dropped in both \
-                             directions (local firewall, VPN, or macOS Local Network permission \
-                             not granted to this binary)"
-            }
-            (true, false) => {
-                "the peer's checks reach us but ours get no response — one-way \
-                              block: our outbound UDP isn't reaching the peer"
-            }
-            (false, true) => {
-                "we get responses to our checks but see none of the peer's inbound \
-                              checks — one-way block on the peer's side"
-            }
-            (false, false) => {
-                "checks are flowing both ways but no pair is nominated yet — \
-                               keep watching; if it never nominates the path is marginal"
-            }
-        }
+        "connectivity checks still in progress — no pair has succeeded yet"
     }
 }
 
@@ -212,35 +186,27 @@ pub struct PeerDiag {
 mod tests {
     use super::*;
 
-    fn pair(state: &str, sent: u64, resp: u64, inbound: u64) -> IcePairSnapshot {
+    fn pair(state: &str, nominated: bool) -> IcePairSnapshot {
         IcePairSnapshot {
             local: "host udp4 192.168.1.50:54321".into(),
             remote: "host udp4 192.168.1.51:55001".into(),
             state: state.into(),
-            nominated: false,
-            requests_sent: sent,
-            responses_received: resp,
-            requests_received: inbound,
-            responses_sent: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
+            nominated,
         }
     }
 
     #[test]
-    fn diagnosis_flags_blocked_udp_when_checks_get_no_replies() {
-        // Pairs formed, we're sending checks, but nothing comes back and
-        // the peer's checks never reach us — the classic blocked-UDP
-        // fingerprint (firewall / VPN / macOS Local Network permission).
+    fn diagnosis_flags_all_pairs_failed_as_no_usable_path() {
+        // Every formed pair failed its connectivity check — no usable
+        // path between the two address sets.
         let snap = IceCheckSnapshot {
             local_candidates: vec!["host udp4 192.168.1.50:54321".into()],
             remote_candidates: vec!["host udp4 192.168.1.51:55001".into()],
-            pairs: vec![pair("in-progress", 4, 0, 0)],
+            pairs: vec![pair("failed", false), pair("failed", false)],
         };
         assert_eq!(snap.succeeded_pairs(), 0);
-        assert_eq!(snap.total_requests_sent(), 4);
         assert!(
-            snap.diagnosis().contains("both directions"),
+            snap.diagnosis().contains("no usable path"),
             "got: {}",
             snap.diagnosis()
         );
@@ -261,31 +227,47 @@ mod tests {
     }
 
     #[test]
-    fn diagnosis_reports_success_when_a_pair_succeeds() {
+    fn diagnosis_flags_succeeded_but_unnominated_as_awaiting_nomination() {
+        // The decisive flap case: a pair passes its check but nothing is
+        // nominated yet. Must read as "don't tear down".
         let snap = IceCheckSnapshot {
             local_candidates: vec!["host udp4 192.168.1.50:54321".into()],
             remote_candidates: vec!["host udp4 192.168.1.51:55001".into()],
-            pairs: vec![pair("succeeded", 3, 3, 2)],
+            pairs: vec![pair("succeeded", false), pair("failed", false)],
         };
         assert_eq!(snap.succeeded_pairs(), 1);
+        assert!(!snap.has_nominated_pair());
         assert!(
-            snap.diagnosis().contains("connectivity exists"),
+            snap.diagnosis().contains("waiting on the controlling side"),
             "got: {}",
             snap.diagnosis()
         );
     }
 
     #[test]
-    fn diagnosis_flags_one_way_block_when_only_our_checks_land() {
-        // We hear the peer's checks but ours get no response: outbound
-        // is blocked, inbound isn't.
+    fn diagnosis_reports_up_when_a_pair_is_nominated_and_succeeded() {
         let snap = IceCheckSnapshot {
             local_candidates: vec!["host udp4 192.168.1.50:54321".into()],
             remote_candidates: vec!["host udp4 192.168.1.51:55001".into()],
-            pairs: vec![pair("in-progress", 5, 0, 3)],
+            pairs: vec![pair("succeeded", true)],
+        };
+        assert!(snap.has_nominated_pair());
+        assert!(
+            snap.diagnosis().contains("the path is up"),
+            "got: {}",
+            snap.diagnosis()
+        );
+    }
+
+    #[test]
+    fn diagnosis_reports_in_progress_when_checks_still_running() {
+        let snap = IceCheckSnapshot {
+            local_candidates: vec!["host udp4 192.168.1.50:54321".into()],
+            remote_candidates: vec!["host udp4 192.168.1.51:55001".into()],
+            pairs: vec![pair("in-progress", false), pair("waiting", false)],
         };
         assert!(
-            snap.diagnosis().contains("one-way"),
+            snap.diagnosis().contains("still in progress"),
             "got: {}",
             snap.diagnosis()
         );

@@ -1136,6 +1136,7 @@ async fn handle_ice_state_change(
             RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                 data.ice_disconnected_since = None;
                 data.ice_checking_since = None;
+                data.checking_grace_used = 0;
                 if matches!(
                     data.tier,
                     ConnectionTier::IceWatchdog { .. } | ConnectionTier::IceRestart { .. }
@@ -1148,13 +1149,20 @@ async fn handle_ice_state_change(
                 // Arm the checking-timeout watchdog for this attempt.
                 // Refresh on every entry into Checking (initial connect
                 // and post-restart re-gather both pass through here).
+                // A real transition into Checking is a fresh attempt, so
+                // reset the grace budget (our own timeout-extension resets
+                // `ice_checking_since` directly without an ICE state
+                // change, so it never lands here — the budget persists
+                // across extensions, as intended).
                 data.ice_checking_since = Some(Instant::now());
+                data.checking_grace_used = 0;
                 false
             }
             RTCIceConnectionState::Disconnected => {
                 // A drop from an established link — owned by the
                 // disconnected watchdog, not the checking timeout.
                 data.ice_checking_since = None;
+                data.checking_grace_used = 0;
                 if data.ice_disconnected_since.is_none() {
                     data.ice_disconnected_since = Some(Instant::now());
                     data.tier = ConnectionTier::IceWatchdog {
@@ -1165,6 +1173,7 @@ async fn handle_ice_state_change(
             }
             RTCIceConnectionState::Failed => {
                 data.ice_checking_since = None;
+                data.checking_grace_used = 0;
                 true
             }
             _ => false,
@@ -1317,33 +1326,38 @@ pub(crate) async fn log_ice_check_snapshot(
             "\n  remote: {}",
             render_candidate_list(&snap.remote_candidates)
         ));
-        // Per-pair: `sent→` / `resp←` are our checks and the replies we
-        // got; `in←` / `resp→` are the peer's checks and our replies.
-        for p in &snap.pairs {
+        // Per-pair: only `state` and `nominated` are real — webrtc-ice
+        // 0.13 leaves the STUN/byte counters at zero (see
+        // `diag::IcePairSnapshot`), so printing them was pure noise. Cap
+        // the dump: a churning agent can form 150+ pairs and the full list
+        // is what was drowning the log. The pairs are pre-sorted
+        // nominated→succeeded→active, so the capped head is the
+        // informative part; the tail is summarized.
+        const MAX_PAIRS_LOGGED: usize = 12;
+        for p in snap.pairs.iter().take(MAX_PAIRS_LOGGED) {
             msg.push_str(&format!(
-                "\n  {} ⇄ {} [{}{}] sent→{} resp←{} | in←{} resp→{} | bytes {}/{}",
+                "\n  {} ⇄ {} [{}{}]",
                 p.local,
                 p.remote,
                 p.state,
                 if p.nominated { " NOMINATED" } else { "" },
-                p.requests_sent,
-                p.responses_received,
-                p.requests_received,
-                p.responses_sent,
-                p.bytes_sent,
-                p.bytes_received,
+            ));
+        }
+        if snap.pairs.len() > MAX_PAIRS_LOGGED {
+            let hidden = snap.pairs.len() - MAX_PAIRS_LOGGED;
+            let failed = snap.pairs.iter().filter(|p| p.state == "failed").count();
+            msg.push_str(&format!(
+                "\n  (… and {hidden} more pairs not shown · {failed} failed of {} total)",
+                snap.pairs.len(),
             ));
         }
         state.log_diag_with(crate::events::DiagLevel::Warn, "ice", msg, detail);
     } else {
         let msg = format!(
-            "ICE checking {} — {}/{} pairs succeeded; checks sent→{} resp←{} in←{} · {}",
+            "ICE checking {} — {}/{} pairs succeeded · {}",
             short_peer(device_id),
             snap.succeeded_pairs(),
             snap.pairs.len(),
-            snap.total_requests_sent(),
-            snap.total_responses_received(),
-            snap.total_requests_received(),
             snap.diagnosis(),
         );
         state.log_diag_with(crate::events::DiagLevel::Debug, "ice", msg, detail);

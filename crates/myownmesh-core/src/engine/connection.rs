@@ -77,6 +77,13 @@ pub struct PeerStateData {
     /// been stuck mid-negotiation too long instead of waiting out
     /// webrtc-rs's ~30 s internal timer.
     pub ice_checking_since: Option<Instant>,
+    /// How many times the checking-timeout has *extended* this attempt
+    /// instead of tearing it down, because the agent had succeeded pairs
+    /// (connectivity exists) but hadn't nominated yet. Bounds the grace so
+    /// a pair that succeeds-but-never-nominates can't stall a peer
+    /// forever; reset whenever ICE leaves Checking. See
+    /// `ice_watchdog::on_checking_timeout`.
+    pub checking_grace_used: u8,
     pub handshake_started_at: Option<Instant>,
     pub hello_attempt: u32,
     pub rehandshake_attempt: u32,
@@ -138,6 +145,7 @@ impl Default for PeerStateData {
             rtt_ms: None,
             ice_disconnected_since: None,
             ice_checking_since: None,
+            checking_grace_used: 0,
             handshake_started_at: None,
             hello_attempt: 0,
             rehandshake_attempt: 0,

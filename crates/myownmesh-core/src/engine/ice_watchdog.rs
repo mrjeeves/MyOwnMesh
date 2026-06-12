@@ -18,7 +18,9 @@ use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::scheduler::{ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
+use super::scheduler::{
+    CHECKING_GRACE_MAX, ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS,
+};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -146,12 +148,82 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
 }
 
 /// A peer sat in ICE `Checking` past the timeout without connecting.
-/// Surface *why* (full check snapshot), then drop it and re-seed
-/// discovery so a fresh PeerConnection is built rather than waiting out
-/// webrtc-rs's ~30 s internal ICE-failure timer. The re-announce is
-/// rate-limited via the shared reactive-announce guard so a wave of
-/// timeouts can't flood the relays.
+///
+/// Before rebuilding, check whether the agent actually has connectivity:
+/// webrtc-ice marks a pair `succeeded` once its check passes. If some
+/// pairs have succeeded but none is nominated yet, the path *works* and
+/// we're only waiting on the controlling side to send USE-CANDIDATE.
+/// Tearing the agent down then rebuilding (re-gather, re-prime the
+/// checklist, re-run every check) resets that nomination race from
+/// scratch — and if both ends do it on the same 15 s clock, neither ever
+/// finishes nominating. That is the dominant driver of the observed
+/// connect→stuck→rebuild flap. So in that state we *extend* the attempt
+/// (up to [`CHECKING_GRACE_MAX`] windows) instead of rebuilding.
+///
+/// Only when there's no such progress — no succeeded pair, or the grace
+/// budget is spent — do we surface *why* (full check snapshot), drop the
+/// peer, and re-seed discovery so a fresh PeerConnection is built rather
+/// than waiting out webrtc-rs's ~30 s internal ICE-failure timer. The
+/// re-announce is rate-limited via the shared reactive-announce guard so
+/// a wave of timeouts can't flood the relays.
 async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    // Pull a live snapshot first — its pair states drive the
+    // extend-vs-rebuild decision below.
+    let snapshot = {
+        let session = {
+            let Some(peer) = state.peers.get(device_id) else {
+                return;
+            };
+            let session = peer.session.lock().clone();
+            session
+        };
+        match session {
+            Some(s) => s.ice_check_snapshot().await,
+            None => return,
+        }
+    };
+
+    // Connectivity exists (a pair succeeded) but nothing is nominated yet:
+    // extend rather than rebuild, bounded by the grace budget.
+    if snapshot.succeeded_pairs() > 0 && !snapshot.has_nominated_pair() {
+        let extended = {
+            let Some(peer) = state.peers.get(device_id) else {
+                return;
+            };
+            let mut data = peer.state.write();
+            if data.checking_grace_used < CHECKING_GRACE_MAX {
+                data.checking_grace_used += 1;
+                // Re-arm the window without an ICE state change, so the
+                // grace budget (reset only on a real Checking transition)
+                // is preserved across extensions.
+                data.ice_checking_since = Some(Instant::now());
+                Some(data.checking_grace_used)
+            } else {
+                None
+            }
+        };
+        if let Some(used) = extended {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "ice",
+                format!(
+                    "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \
+                     the checking window ({used}/{CHECKING_GRACE_MAX}) instead of rebuilding",
+                    super::short_peer(device_id),
+                    snapshot.succeeded_pairs(),
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "succeeded_pairs": snapshot.succeeded_pairs(),
+                    "grace_used": used,
+                    "grace_max": CHECKING_GRACE_MAX,
+                }),
+            );
+            return;
+        }
+        // Budget exhausted — fall through to the rebuild path.
+    }
+
     state.log_diag_with(
         DiagLevel::Warn,
         "ice",
@@ -162,9 +234,9 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         ),
         serde_json::json!({ "peer": device_id, "checking_timeout_ms": ICE_CHECKING_TIMEOUT_MS }),
     );
-    // The full snapshot (candidates + per-pair STUN counters + a
-    // plain-language diagnosis) is the record of why this attempt
-    // never completed — log it before the teardown removes the agent.
+    // The full snapshot (candidates + per-pair states + a plain-language
+    // diagnosis) is the record of why this attempt never completed — log
+    // it before the teardown removes the agent.
     super::log_ice_check_snapshot(state, device_id, "stuck in checking", true).await;
 
     // Zero remote candidates is the fingerprint of wedged signaling, not a
