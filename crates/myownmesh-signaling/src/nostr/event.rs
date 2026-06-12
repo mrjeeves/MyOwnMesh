@@ -137,6 +137,49 @@ pub fn make_event(
     }
 }
 
+impl NostrEvent {
+    /// Verify this event is internally consistent and authentic per NIP-01:
+    /// the `id` is the SHA-256 of the canonical
+    /// `[0, pubkey, created_at, kind, tags, content]` serialization, and `sig`
+    /// is a valid BIP-340 Schnorr signature over that id by `pubkey`. A relay
+    /// that forwards/stores only verified events can't be used to inject forged
+    /// presence or `leave` traffic. Fails closed on any malformed field.
+    pub fn verify(&self) -> bool {
+        let id_payload = json!([
+            0,
+            self.pubkey,
+            self.created_at,
+            self.kind,
+            Value::Array(
+                self.tags
+                    .iter()
+                    .map(|t| Value::Array(t.iter().map(|s| Value::String(s.clone())).collect()))
+                    .collect()
+            ),
+            self.content,
+        ]);
+        let id_bytes = compute_event_id(&id_payload);
+        if hex::encode(id_bytes) != self.id {
+            return false;
+        }
+        let Ok(pk_bytes) = hex::decode(&self.pubkey) else {
+            return false;
+        };
+        let Ok(xonly) = XOnlyPublicKey::from_slice(&pk_bytes) else {
+            return false;
+        };
+        let Ok(sig_bytes) = hex::decode(&self.sig) else {
+            return false;
+        };
+        let Ok(sig) = secp256k1::schnorr::Signature::from_slice(&sig_bytes) else {
+            return false;
+        };
+        Secp256k1::verification_only()
+            .verify_schnorr(&sig, &id_bytes, &xonly)
+            .is_ok()
+    }
+}
+
 fn compute_event_id(payload: &Value) -> [u8; 32] {
     // NIP-01 specifies a compact JSON serialization with no
     // unnecessary whitespace and no escaping beyond the strictly
@@ -191,5 +234,45 @@ mod tests {
         assert_eq!(ev.sig.len(), 128);
         assert!(ev.id.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(ev.sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn verify_accepts_signed_event_and_rejects_tampering() {
+        let id = NostrIdentity::generate();
+        let ev = make_event(&id, SIGNALING_EVENT_KIND, vec![], "presence".into(), 999);
+        assert!(ev.verify(), "a freshly signed event verifies");
+
+        // Tampered content → recomputed id no longer matches.
+        let mut bad = ev.clone();
+        bad.content = "spoofed".into();
+        assert!(!bad.verify(), "tampered content is rejected");
+
+        // Claiming a different signer → id (which binds the pubkey) won't match.
+        let other = NostrIdentity::generate();
+        let mut imposter = ev.clone();
+        imposter.pubkey = other.pubkey_hex().to_string();
+        assert!(!imposter.verify(), "a mismatched pubkey is rejected");
+    }
+
+    #[test]
+    fn verify_rejects_a_valid_id_with_a_forged_signature() {
+        // An attacker who recomputes a correct id for tampered content still
+        // can't produce a valid signature without the secret key.
+        let id = NostrIdentity::generate();
+        let mut ev = make_event(&id, SIGNALING_EVENT_KIND, vec![], "real".into(), 1);
+        ev.content = "tampered".into();
+        let payload = json!([
+            0,
+            ev.pubkey,
+            ev.created_at,
+            ev.kind,
+            Value::Array(vec![]),
+            ev.content
+        ]);
+        ev.id = hex::encode(compute_event_id(&payload));
+        assert!(
+            !ev.verify(),
+            "a stale signature over a fresh id is rejected"
+        );
     }
 }
