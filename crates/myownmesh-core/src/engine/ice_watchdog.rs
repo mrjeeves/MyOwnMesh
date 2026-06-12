@@ -191,7 +191,15 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     };
 
     // Connectivity exists (a pair succeeded) but nothing is nominated yet:
-    // extend rather than rebuild, bounded by the grace budget.
+    // extend rather than rebuild, bounded by the grace budget. The condition
+    // deliberately excludes the *already-nominated* case: a pair that is
+    // nominated yet the agent still reads `Checking` 15 s on is a wedged
+    // connection, not a forming one — a healthy nominated pair flips ICE to
+    // `Connected`. Extending the nominated case (tried, reverted) was worse:
+    // it pins a wedged session in limbo for the whole grace budget — often
+    // while a `stuck at Sighted` re-offer loop keeps the data channel from
+    // ever opening — and then rebuilds anyway. Rebuilding promptly gives a
+    // fresh session a clean shot at the handshake instead.
     if snapshot.succeeded_pairs() > 0 && !snapshot.has_nominated_pair() {
         let extended = {
             let Some(peer) = state.peers.get(device_id) else {
@@ -211,7 +219,7 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         };
         if let Some(used) = extended {
             state.log_diag_with(
-                DiagLevel::Info,
+                DiagLevel::Debug,
                 "ice",
                 format!(
                     "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \
