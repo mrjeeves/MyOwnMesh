@@ -190,22 +190,17 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         }
     };
 
-    // Connectivity exists (at least one pair has succeeded) — the path is
-    // real even if the ICE agent hasn't flipped to Connected yet. Extend the
-    // window rather than rebuild. This covers two states:
-    //   * succeeded but nothing nominated — the controlling side hasn't sent
-    //     USE-CANDIDATE yet (the original nomination-stall case);
-    //   * a pair is *already nominated and succeeded* — the link is up at the
-    //     ICE layer and webrtc-rs just hasn't surfaced Connected (the lag is
-    //     pronounced right after a restart, when the checklist is large).
-    // The second case used to fall straight through to the rebuild path — we
-    // were tearing down a working path the snapshot itself labelled "the path
-    // is up", dropping the data channel and re-gathering from scratch, which
-    // resets the very handshake we're waiting on. With both ends doing it on
-    // the same 15 s clock, neither ever finishes. Bounded by the grace budget;
-    // a genuine renegotiation (a real Checking transition) resets it.
-    if snapshot.succeeded_pairs() > 0 {
-        let nominated = snapshot.has_nominated_pair();
+    // Connectivity exists (a pair succeeded) but nothing is nominated yet:
+    // extend rather than rebuild, bounded by the grace budget. The condition
+    // deliberately excludes the *already-nominated* case: a pair that is
+    // nominated yet the agent still reads `Checking` 15 s on is a wedged
+    // connection, not a forming one — a healthy nominated pair flips ICE to
+    // `Connected`. Extending the nominated case (tried, reverted) was worse:
+    // it pins a wedged session in limbo for the whole grace budget — often
+    // while a `stuck at Sighted` re-offer loop keeps the data channel from
+    // ever opening — and then rebuilds anyway. Rebuilding promptly gives a
+    // fresh session a clean shot at the handshake instead.
+    if snapshot.succeeded_pairs() > 0 && !snapshot.has_nominated_pair() {
         let extended = {
             let Some(peer) = state.peers.get(device_id) else {
                 return;
@@ -223,24 +218,18 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
             }
         };
         if let Some(used) = extended {
-            let why = if nominated {
-                "a pair is nominated and succeeded — holding the established path"
-            } else {
-                "succeeded pair(s) but none nominated yet — waiting on nomination"
-            };
             state.log_diag_with(
                 DiagLevel::Info,
                 "ice",
                 format!(
-                    "ICE for {} {why} ({} succeeded) — extending the checking window \
-                     ({used}/{CHECKING_GRACE_MAX}) instead of rebuilding",
+                    "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \
+                     the checking window ({used}/{CHECKING_GRACE_MAX}) instead of rebuilding",
                     super::short_peer(device_id),
                     snapshot.succeeded_pairs(),
                 ),
                 serde_json::json!({
                     "peer": device_id,
                     "succeeded_pairs": snapshot.succeeded_pairs(),
-                    "nominated": nominated,
                     "grace_used": used,
                     "grace_max": CHECKING_GRACE_MAX,
                 }),
