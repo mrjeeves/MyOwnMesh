@@ -23,6 +23,7 @@ use crate::transport::webrtc::{AudioSample, VideoSample};
 use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 
 use super::connection::PeerConnection;
+use super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS;
 
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
@@ -262,6 +263,16 @@ pub struct NetworkState {
     /// the kernel's multi-minute TCP timeout. `None` when no driver is
     /// attached (e.g. the in-process local broker used in tests).
     relay_reconnect: Mutex<Option<Arc<watch::Sender<u64>>>>,
+
+    /// Last time the ICE-failure path forced a relay redial via
+    /// [`request_relay_reconnect_throttled`]. Gates the "no remote
+    /// candidates arrived" rescue (see
+    /// `ice_watchdog::on_checking_timeout`) so a peer that keeps timing
+    /// out every `ICE_CHECKING_TIMEOUT_MS` can't redial the relays on
+    /// every cycle — one redial per
+    /// [`RELAY_RESCUE_MIN_INTERVAL_MS`] window is enough to recover a
+    /// genuinely-wedged signaling socket without churning healthy ones.
+    last_relay_rescue_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl NetworkState {
@@ -326,6 +337,7 @@ impl NetworkState {
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             last_reactive_announce_at: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
+            last_relay_rescue_at: Mutex::new(None),
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
@@ -359,6 +371,41 @@ impl NetworkState {
             }
             None => false,
         }
+    }
+
+    /// Like [`request_relay_reconnect`], but throttled to at most one
+    /// redial per [`RELAY_RESCUE_MIN_INTERVAL_MS`]. This is the rescue
+    /// path for the "ICE timed out with zero remote candidates"
+    /// fingerprint — the peer's candidates never crossed the relay, which
+    /// is almost always a relay socket that went stale after a network
+    /// blip (held open for minutes because the kernel never saw a
+    /// FIN/RST). Unlike the bare redial, this fires *even when other peers
+    /// are still up*: a wedged relay socket starves candidate delivery for
+    /// every peer, not just one, so gating on "no other live peer" (the
+    /// old behavior) left the wedge in place whenever the room wasn't
+    /// completely dark. The throttle is what makes that safe — a peer
+    /// stuck re-timing-out every `ICE_CHECKING_TIMEOUT_MS` can still only
+    /// bounce the relays once per window.
+    ///
+    /// Returns `true` when a redial was actually issued (driver attached
+    /// *and* past the throttle), `false` when suppressed — callers log the
+    /// distinction so the rescue's decisions are visible in diagnostics.
+    pub fn request_relay_reconnect_throttled(&self) -> bool {
+        let now = std::time::Instant::now();
+        {
+            let mut guard = self.last_relay_rescue_at.lock();
+            let due = guard
+                .map(|prev| {
+                    now.duration_since(prev)
+                        >= std::time::Duration::from_millis(RELAY_RESCUE_MIN_INTERVAL_MS)
+                })
+                .unwrap_or(true);
+            if !due {
+                return false;
+            }
+            *guard = Some(now);
+        }
+        self.request_relay_reconnect()
     }
 
     /// Emit a top-level mesh event. Silently drops if no

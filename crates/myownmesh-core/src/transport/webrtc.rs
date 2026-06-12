@@ -21,9 +21,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -44,6 +45,38 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::error::{Error, Result};
 
 use super::ice::build_rtc_configuration;
+
+/// Interface-name prefixes for virtual / container / overlay networks
+/// whose host addresses can never be reached by a remote peer. Gathering
+/// ICE host candidates on them only bloats the candidate set and slows
+/// the connectivity-check phase — a storage box running Docker routinely
+/// carries three or more bridge gateways (`docker0`, `br-…`), each adding
+/// a dead `172.x.0.1` host candidate that every peer then has to pair and
+/// time out against. Real interfaces — physical NICs, Wi-Fi, and the
+/// Tailscale tunnel (`tailscale0` / `utun*` / `wg*`), which is a
+/// legitimate peer path — are deliberately *not* listed, so they keep
+/// gathering candidates.
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "docker",  // docker0 and the default bridge
+    "br-",     // docker user-defined bridge networks
+    "veth",    // per-container veth pairs
+    "virbr",   // libvirt
+    "vmnet",   // vmware / parallels host-only nets
+    "cni",     // container network interface plugins (k8s)
+    "flannel", // flannel overlay
+    "cali",    // calico
+    "kube",    // kube-* bridges
+];
+
+/// True when `name` is a virtual interface we exclude from ICE gathering
+/// (see [`VIRTUAL_IFACE_PREFIXES`]). Prefix match: `docker0`, `br-abc123`,
+/// and `veth9f2` all hit; `eth0`, `wlan0`, `enp3s0`, and `tailscale0`
+/// don't.
+pub(crate) fn is_virtual_interface(name: &str) -> bool {
+    VIRTUAL_IFACE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
 
 /// Stable label for the application data channel. Receivers can
 /// filter the incoming [`on_data_channel`] event on this so other
@@ -148,10 +181,40 @@ impl Transport {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)
             .map_err(|e| Error::Transport(format!("register interceptors: {e}")))?;
+
+        // Trim ICE candidate gathering to interfaces that can actually
+        // carry peer traffic. Without this the agent gathers a host
+        // candidate on every up interface — including Docker bridges and
+        // other virtual nets whose `172.x.0.1`-style gateway addresses no
+        // remote peer can ever reach — which bloats the candidate set and
+        // drags out the connectivity-check phase. The Tailscale tunnel is
+        // intentionally *kept* (it's a real path); only the dead virtual
+        // interfaces in `VIRTUAL_IFACE_PREFIXES` are dropped.
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.set_interface_filter(Box::new(|name: &str| {
+            let keep = !is_virtual_interface(name);
+            // Instrumentation: a one-liner per excluded interface so a log
+            // (with our crate at DEBUG) confirms exactly which interfaces
+            // the filter pruned — the direct check that the candidate
+            // explosion is actually being trimmed on a given box.
+            if !keep {
+                debug!(
+                    interface = name,
+                    "ICE: excluding virtual interface from candidate gathering"
+                );
+            }
+            keep
+        }));
+
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting_engine)
             .build();
+        info!(
+            excluded_prefixes = ?VIRTUAL_IFACE_PREFIXES,
+            "ICE interface filter active — virtual interfaces excluded from candidate gathering"
+        );
         Ok(Self { api: Arc::new(api) })
     }
 
@@ -1042,6 +1105,50 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ICE interface filter -----------------------------------------
+
+    #[test]
+    fn virtual_interfaces_are_excluded_real_ones_kept() {
+        // Docker / container / overlay interfaces — the dead-candidate
+        // sources we trim. `br-…` and `veth…` carry hashed suffixes.
+        for name in [
+            "docker0",
+            "br-1a2b3c4d5e6f",
+            "veth9f2a1b",
+            "virbr0",
+            "vmnet8",
+            "cni0",
+            "flannel.1",
+            "cali1234abcd",
+            "kube-bridge",
+        ] {
+            assert!(
+                is_virtual_interface(name),
+                "{name} should be excluded from ICE gathering"
+            );
+        }
+
+        // Real interfaces — physical NICs, Wi-Fi, and the Tailscale tunnel
+        // (a legitimate peer path the user asked us to keep).
+        for name in [
+            "eth0",
+            "enp3s0",
+            "eno1",
+            "wlan0",
+            "wlp2s0",
+            "en0",
+            "tailscale0",
+            "utun3",
+            "wg0",
+            "lo",
+        ] {
+            assert!(
+                !is_virtual_interface(name),
+                "{name} should keep gathering ICE candidates"
+            );
+        }
+    }
 
     // ---- the H.264 access-unit assembler ------------------------------
 
