@@ -18,7 +18,7 @@ use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::scheduler::{ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
+use super::scheduler::{CHECKING_GRACE_MAX, ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -98,15 +98,15 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     }
 
     // Live ICE-establishment progress. For any peer still in
-    // `Checking`, emit a one-line snapshot of the connectivity-check
-    // counters each poll so the user can watch — in real time — whether
-    // our STUN checks are getting responses. A stuck `resp←0` while
-    // `sent→` climbs is the unambiguous fingerprint of UDP being
-    // dropped (firewall / VPN / macOS Local Network permission), which
-    // no amount of staring at "ICE → Checking" would reveal. Self-
-    // limiting: a peer only sits in Checking for the ~30 s before ICE
-    // gives up, so this quiets down on its own once it connects or
-    // fails.
+    // `Checking`, emit a one-line snapshot each poll so the user can
+    // watch — in real time — how many candidate pairs have reached
+    // `succeeded` and whether anything is nominated yet (the only pair
+    // fields webrtc-ice actually maintains; see `diag::IcePairSnapshot`).
+    // "succeeded pairs climbing but none nominated" is the fingerprint of
+    // the nomination stall the checking-timeout grace below now holds open
+    // instead of rebuilding. Self-limiting: a peer only sits in Checking
+    // for the ~30 s before ICE gives up, so this quiets down on its own
+    // once it connects or fails.
     let checking: Vec<String> = state
         .peers
         .iter()
@@ -146,12 +146,91 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
 }
 
 /// A peer sat in ICE `Checking` past the timeout without connecting.
-/// Surface *why* (full check snapshot), then drop it and re-seed
-/// discovery so a fresh PeerConnection is built rather than waiting out
-/// webrtc-rs's ~30 s internal ICE-failure timer. The re-announce is
-/// rate-limited via the shared reactive-announce guard so a wave of
-/// timeouts can't flood the relays.
+///
+/// Before rebuilding, check whether the agent actually has connectivity:
+/// webrtc-ice marks a pair `succeeded` once its check passes. If some
+/// pairs have succeeded but none is nominated yet, the path *works* and
+/// we're only waiting on the controlling side to send USE-CANDIDATE.
+/// Tearing the agent down then rebuilding (re-gather, re-prime the
+/// checklist, re-run every check) resets that nomination race from
+/// scratch — and if both ends do it on the same 15 s clock, neither ever
+/// finishes nominating. That is the dominant driver of the observed
+/// connect→stuck→rebuild flap. So in that state we *extend* the attempt
+/// (up to [`CHECKING_GRACE_MAX`] windows) instead of rebuilding.
+///
+/// Only when there's no such progress — no succeeded pair, or the grace
+/// budget is spent — do we surface *why* (full check snapshot), drop the
+/// peer, and re-seed discovery so a fresh PeerConnection is built rather
+/// than waiting out webrtc-rs's ~30 s internal ICE-failure timer. The
+/// re-announce is rate-limited via the shared reactive-announce guard so
+/// a wave of timeouts can't flood the relays.
 async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    // While the host is offline (no primary interface) every peer will
+    // time out its checking window, but tearing them all down now just
+    // means re-discovering them from scratch a second later when the
+    // interface returns. Hold the peers in place — the network-change
+    // handler restarts ICE on all of them once we're back online. The
+    // window stays armed, so this simply no-ops each poll until then.
+    if state.is_offline() {
+        return;
+    }
+    // Pull a live snapshot first — its pair states drive the
+    // extend-vs-rebuild decision below.
+    let snapshot = {
+        let session = {
+            let Some(peer) = state.peers.get(device_id) else {
+                return;
+            };
+            let session = peer.session.lock().clone();
+            session
+        };
+        match session {
+            Some(s) => s.ice_check_snapshot().await,
+            None => return,
+        }
+    };
+
+    // Connectivity exists (a pair succeeded) but nothing is nominated yet:
+    // extend rather than rebuild, bounded by the grace budget.
+    if snapshot.succeeded_pairs() > 0 && !snapshot.has_nominated_pair() {
+        let extended = {
+            let Some(peer) = state.peers.get(device_id) else {
+                return;
+            };
+            let mut data = peer.state.write();
+            if data.checking_grace_used < CHECKING_GRACE_MAX {
+                data.checking_grace_used += 1;
+                // Re-arm the window without an ICE state change, so the
+                // grace budget (reset only on a real Checking transition)
+                // is preserved across extensions.
+                data.ice_checking_since = Some(Instant::now());
+                Some(data.checking_grace_used)
+            } else {
+                None
+            }
+        };
+        if let Some(used) = extended {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "ice",
+                format!(
+                    "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \
+                     the checking window ({used}/{CHECKING_GRACE_MAX}) instead of rebuilding",
+                    super::short_peer(device_id),
+                    snapshot.succeeded_pairs(),
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "succeeded_pairs": snapshot.succeeded_pairs(),
+                    "grace_used": used,
+                    "grace_max": CHECKING_GRACE_MAX,
+                }),
+            );
+            return;
+        }
+        // Budget exhausted — fall through to the rebuild path.
+    }
+
     state.log_diag_with(
         DiagLevel::Warn,
         "ice",
@@ -162,37 +241,34 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         ),
         serde_json::json!({ "peer": device_id, "checking_timeout_ms": ICE_CHECKING_TIMEOUT_MS }),
     );
-    // The full snapshot (candidates + per-pair STUN counters + a
-    // plain-language diagnosis) is the record of why this attempt
-    // never completed — log it before the teardown removes the agent.
+    // The full snapshot (candidates + per-pair states + a plain-language
+    // diagnosis) is the record of why this attempt never completed — log
+    // it before the teardown removes the agent.
     super::log_ice_check_snapshot(state, device_id, "stuck in checking", true).await;
 
     // Zero remote candidates is the fingerprint of wedged signaling, not a
     // blocked network: the peer's candidates never crossed the relay (or
     // ours never reached it). The usual cause is a relay socket left a
     // zombie by a network change on one side — held open for minutes
-    // because the kernel never saw a FIN/RST. The network-change watcher
-    // already forces a redial when it *sees* the interface move, but it
-    // can't see every case (a multi-homed route flip needn't change our
-    // own primary IP). So when this is the failure shape, force a redial
-    // here too.
+    // because the kernel never saw a FIN/RST.
     //
-    // A stale relay socket starves candidate delivery for *every* peer,
-    // not just this one, so we redial even when other peers are still up
-    // (the old "only if no other live peer" gate left the wedge in place
-    // whenever the room wasn't completely dark — exactly this box's case,
-    // where two other peers stayed ACTIVE while this link flapped). The
-    // throttle in `request_relay_reconnect_throttled` (one redial per
-    // RELAY_RESCUE_MIN_INTERVAL_MS) is what keeps a peer that re-times-out
-    // every cycle from bouncing healthy sockets.
+    // We force a relay redial *only when no other peer is currently up*.
+    // This looks conservative but it's load-bearing: a forced relay
+    // reconnect on a node tears down every WebRTC peer that node holds —
+    // observed directly in the field, where one flaky peer hitting this
+    // path took an otherwise-healthy 4-peer box from Active to Alone, all
+    // four links resetting in the same 70 ms as the redial (the peer that
+    // *didn't* redial stayed stable throughout). So redialing to rescue a
+    // single stuck peer while others are live trades one bad link for all
+    // of them. When we're already alone there's nothing to lose, and a
+    // genuinely-stale socket is the likeliest reason we can't reach
+    // anyone — that's the case worth the redial. The throttle still caps
+    // it to one per RELAY_RESCUE_MIN_INTERVAL_MS.
     let no_remote = state
         .peers
         .get(device_id)
         .map(|p| p.state.read().diag.remote_candidates.total() == 0)
         .unwrap_or(false);
-    // Instrumentation: surface how many peers are live alongside the
-    // fingerprint so a log shows the rescue had the full picture — this is
-    // the case the old gate suppressed.
     let other_live_peers = state
         .peers
         .iter()
@@ -205,40 +281,40 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         })
         .count();
     if no_remote {
-        if state.request_relay_reconnect_throttled() {
-            state.log_diag_with(
-                DiagLevel::Info,
-                "signaling",
-                format!(
-                    "no remote candidates arrived for {} — forcing relay reconnect \
-                     (socket likely went stale; {other_live_peers} other peer(s) live)",
-                    super::short_peer(device_id),
-                ),
-                serde_json::json!({
-                    "peer": device_id,
-                    "reason": "no_remote_candidates",
-                    "other_live_peers": other_live_peers,
-                    "redial": true,
-                }),
-            );
-        } else {
-            // Throttled (or no driver attached): record that we saw the
-            // fingerprint but held off, so the log explains the gap
-            // between successive redials rather than going silent.
+        if other_live_peers > 0 {
+            // Suppressed on purpose — DEBUG so the decision is greppable
+            // when chasing a stuck peer, without adding an INFO line to the
+            // default stream every time a single link flaps while the rest
+            // of the mesh is healthy.
             state.log_diag_with(
                 DiagLevel::Debug,
                 "signaling",
                 format!(
-                    "no remote candidates arrived for {} — relay redial throttled \
-                     (last redial < {}s ago)",
+                    "no remote candidates arrived for {} — NOT redialing the relay \
+                     ({other_live_peers} other peer(s) live; a forced reconnect would reset them too)",
                     super::short_peer(device_id),
-                    super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS / 1000,
                 ),
                 serde_json::json!({
                     "peer": device_id,
                     "reason": "no_remote_candidates",
                     "other_live_peers": other_live_peers,
                     "redial": false,
+                }),
+            );
+        } else if state.request_relay_reconnect_throttled() {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "signaling",
+                format!(
+                    "no remote candidates arrived for {} and we're alone — forcing relay \
+                     reconnect (socket likely went stale)",
+                    super::short_peer(device_id),
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "reason": "no_remote_candidates",
+                    "other_live_peers": 0,
+                    "redial": true,
                 }),
             );
         }

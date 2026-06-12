@@ -98,6 +98,11 @@ pub enum NetworkCmd {
     /// serially.
     TransportEvent {
         device_id: String,
+        /// Epoch of the [`PeerConnection`](super::connection::PeerConnection)
+        /// session this event came from. The driver drops the event if it
+        /// no longer matches the peer's current epoch (a stale, torn-down
+        /// session still draining its event queue).
+        epoch: u64,
         event: TransportEvent,
     },
 
@@ -273,6 +278,17 @@ pub struct NetworkState {
     /// [`RELAY_RESCUE_MIN_INTERVAL_MS`] window is enough to recover a
     /// genuinely-wedged signaling socket without churning healthy ones.
     last_relay_rescue_at: Mutex<Option<std::time::Instant>>,
+
+    /// Set by the network watcher when the OS reports *no* primary
+    /// outbound IP (neither v4 nor v6) — i.e. the host is fully
+    /// offline, the state macOS lands in for a second or two on wake
+    /// before the interface comes back. While true, the ICE machinery
+    /// holds off re-gathering and tearing down peers: a `restart_ice()`
+    /// in this window can't bind a socket (the `Network is unreachable`
+    /// wall in the logs) and would only burn a checking-timeout on a
+    /// doomed attempt. Cleared the moment an interface returns, at which
+    /// point the network-change handler drives a clean restart fan-out.
+    offline: std::sync::atomic::AtomicBool,
 }
 
 impl NetworkState {
@@ -338,6 +354,7 @@ impl NetworkState {
             last_reactive_announce_at: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
+            offline: std::sync::atomic::AtomicBool::new(false),
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
@@ -406,6 +423,22 @@ impl NetworkState {
             *guard = Some(now);
         }
         self.request_relay_reconnect()
+    }
+
+    /// Record whether the host currently has any primary outbound IP.
+    /// Called by the network watcher each time the snapshot changes.
+    /// Returns the previous value so the caller can detect the
+    /// online→offline / offline→online edges.
+    pub fn set_offline(&self, offline: bool) -> bool {
+        self.offline
+            .swap(offline, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True while the host has no primary outbound IP. The ICE
+    /// machinery checks this to avoid re-gathering or dropping peers
+    /// during a brief network outage (see `set_offline`).
+    pub fn is_offline(&self) -> bool {
+        self.offline.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Emit a top-level mesh event. Silently drops if no

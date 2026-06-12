@@ -265,8 +265,12 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::BroadcastCapabilities { caps, reply } => {
             let _ = reply.send(broadcast_capabilities(state, caps).await);
         }
-        NetworkCmd::TransportEvent { device_id, event } => {
-            handle_transport_event(state, device_id, event).await;
+        NetworkCmd::TransportEvent {
+            device_id,
+            epoch,
+            event,
+        } => {
+            handle_transport_event(state, device_id, epoch, event).await;
         }
 
         // ---- governance ops ----
@@ -648,6 +652,13 @@ pub(crate) async fn renegotiate_ice(
     force: bool,
     trigger: &'static str,
 ) {
+    // No primary interface → a `restart_ice()` here can't bind a socket
+    // and only feeds the `Network is unreachable` gather spam. Hold off;
+    // the network-change handler drives a fresh restart fan-out the
+    // instant the interface returns.
+    if state.is_offline() {
+        return;
+    }
     let session = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
@@ -751,8 +762,11 @@ pub(crate) async fn renegotiate_ice(
     if offerer {
         match session.create_offer().await {
             Ok(desc) => {
+                // The single INFO line for this restart is the `trigger=…`
+                // line above; the offer/nudge mechanics ride at DEBUG so a
+                // renegotiation is one line in the default stream.
                 state.log_diag_with(
-                    crate::events::DiagLevel::Info,
+                    crate::events::DiagLevel::Debug,
                     "ice",
                     format!(
                         "renegotiating ICE with {} — restart offer",
@@ -860,14 +874,18 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
 
     // Per-peer transport-event pump. Forwards every event into
     // the main driver via the command queue so all per-peer state
-    // mutation happens serially.
+    // mutation happens serially. Each event is stamped with this
+    // session's epoch so the driver can drop events from a torn-down
+    // session that's still draining (see `handle_transport_event`).
     let driver_tx = state.cmd_tx.clone();
     let peer_id_for_pump = device_id.clone();
+    let session_epoch = peer.epoch;
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             if driver_tx
                 .send(NetworkCmd::TransportEvent {
                     device_id: peer_id_for_pump.clone(),
+                    epoch: session_epoch,
                     event: ev,
                 })
                 .is_err()
@@ -898,6 +916,11 @@ async fn apply_remote_sdp(
             ),
             serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
         );
+        // A late Answer that lost its session: drive a fresh offer instead
+        // of waiting out the next announce-driven re-offer.
+        if sdp_type == RTCSdpType::Answer {
+            reoffer_after_failed_answer(state, device_id).await;
+        }
         return;
     };
     let desc = match sdp_type {
@@ -921,6 +944,15 @@ async fn apply_remote_sdp(
                 }),
             );
             warn!(peer = %device_id, "set_remote_description failed: {e}");
+            // The common failure here is an Answer arriving when our
+            // signaling state has already raced back to `stable` (no
+            // pending local offer) — "invalid proposed signaling state
+            // transition from stable". A fresh offer re-opens the
+            // negotiation cleanly rather than leaving the link wedged
+            // until the next announce.
+            if sdp_type == RTCSdpType::Answer {
+                reoffer_after_failed_answer(state, device_id).await;
+            }
         } else {
             // Drain any ICE candidates that arrived ahead of the
             // SDP. The lock comes off before any await — we pull
@@ -965,11 +997,98 @@ async fn apply_remote_sdp(
     }
 }
 
+/// An inbound Answer that can't be applied — it arrived after we tore the
+/// session down ("no session"), or it raced our signaling state back to
+/// `stable` ("invalid proposed signaling state transition from stable") —
+/// means our last offer never completed the handshake. Discarding it and
+/// waiting for the announce-driven "stuck at Sighted" re-offer costs a full
+/// ~15-30 s lap; on a flapping wake that stacks into the multi-lap loop the
+/// logs showed. Instead we drive a fresh offer right now: rebuild the
+/// session if it's gone, otherwise re-offer in place. Only the offerer
+/// sends offers (an Answer is addressed to us as the offerer, but we guard
+/// on the same id comparison the rest of the engine uses), it's held off
+/// while offline, and it's throttled by `last_offer_sent_at` so a burst of
+/// stale answers collapses to a single offer.
+async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str) {
+    if state.identity.public_id() >= device_id || state.is_offline() {
+        return;
+    }
+    // Resolve the throttle + session under the peer lock, then act
+    // outside it (the create_offer / open_peer awaits must not hold it).
+    let session = match state.peers.get(device_id) {
+        None => None,
+        Some(peer) => {
+            let due = {
+                let mut data = peer.state.write();
+                let due = data
+                    .last_offer_sent_at
+                    .map(|t| {
+                        Instant::now().duration_since(t)
+                            >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                    })
+                    .unwrap_or(true);
+                if due {
+                    data.last_offer_sent_at = Some(Instant::now());
+                }
+                due
+            };
+            if !due {
+                return;
+            }
+            peer.session.lock().clone()
+        }
+    };
+    match session {
+        Some(session) => match session.create_offer().await {
+            Ok(desc) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Info,
+                    "signaling",
+                    format!(
+                        "re-offer to {} (answer could not be applied)",
+                        short_peer(device_id)
+                    ),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "sdp_bytes": desc.sdp.len(),
+                        "reason": "failed-answer",
+                    }),
+                );
+                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                    device_id: device_id.to_string(),
+                    sdp: desc.sdp,
+                });
+            }
+            Err(e) => warn!(peer = %device_id, "re-offer create_offer failed: {e}"),
+        },
+        // Peer gone (or session-less) — rebuild as offerer; that path
+        // sends a fresh offer as part of setup.
+        None => ensure_peer_session(state, device_id.to_string(), Role::Offerer).await,
+    }
+}
+
 async fn handle_transport_event(
     state: &Arc<NetworkState>,
     device_id: String,
+    epoch: u64,
     event: TransportEvent,
 ) {
+    // Drop events from a stale session. When a peer is rebuilt (drop +
+    // re-open for the same device id), the old session's event pump keeps
+    // draining for a moment; its trailing `DataChannelClosed` would
+    // otherwise call `drop_peer` on the *replacement* session and force an
+    // immediate, needless rebuild — the duplicate "data channel closed"
+    // lines and the spurious post-HeartbeatTimeout `IceFailed` seen in the
+    // field. If the peer is gone entirely, there's nothing to act on
+    // either. Either way, ignore the event (TRACE so the drop is still
+    // greppable when chasing a transport bug).
+    match state.peers.get(&device_id) {
+        Some(peer) if peer.epoch == epoch => {}
+        _ => {
+            trace!(peer = %device_id, epoch, "ignoring transport event from stale/absent session");
+            return;
+        }
+    }
     match event {
         TransportEvent::LocalIceCandidate(Some(cand)) => {
             // Classify before moving `cand` into the signaling
@@ -1109,12 +1228,12 @@ async fn handle_ice_state_change(
     // "connected"/"stuck" lines. `Disconnected` is the one that was
     // invisible before and matters most — it's a consent-freshness drop on
     // a previously-live link (the trigger the disconnected-watchdog then
-    // acts on), so it's logged at INFO; the routine churn states stay at
+    // acts on), so it's logged at INFO. `Failed` is left at DEBUG here
+    // because `ice_watchdog::on_failed` already emits a WARN for it — no
+    // need for two lines on the same event. The other churn states stay at
     // DEBUG to keep the stream readable.
     let level = match ice {
-        RTCIceConnectionState::Disconnected | RTCIceConnectionState::Failed => {
-            crate::events::DiagLevel::Info
-        }
+        RTCIceConnectionState::Disconnected => crate::events::DiagLevel::Info,
         _ => crate::events::DiagLevel::Debug,
     };
     state.log_diag_with(
@@ -1136,6 +1255,7 @@ async fn handle_ice_state_change(
             RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                 data.ice_disconnected_since = None;
                 data.ice_checking_since = None;
+                data.checking_grace_used = 0;
                 if matches!(
                     data.tier,
                     ConnectionTier::IceWatchdog { .. } | ConnectionTier::IceRestart { .. }
@@ -1148,13 +1268,20 @@ async fn handle_ice_state_change(
                 // Arm the checking-timeout watchdog for this attempt.
                 // Refresh on every entry into Checking (initial connect
                 // and post-restart re-gather both pass through here).
+                // A real transition into Checking is a fresh attempt, so
+                // reset the grace budget (our own timeout-extension resets
+                // `ice_checking_since` directly without an ICE state
+                // change, so it never lands here — the budget persists
+                // across extensions, as intended).
                 data.ice_checking_since = Some(Instant::now());
+                data.checking_grace_used = 0;
                 false
             }
             RTCIceConnectionState::Disconnected => {
                 // A drop from an established link — owned by the
                 // disconnected watchdog, not the checking timeout.
                 data.ice_checking_since = None;
+                data.checking_grace_used = 0;
                 if data.ice_disconnected_since.is_none() {
                     data.ice_disconnected_since = Some(Instant::now());
                     data.tier = ConnectionTier::IceWatchdog {
@@ -1164,7 +1291,19 @@ async fn handle_ice_state_change(
                 false
             }
             RTCIceConnectionState::Failed => {
-                data.ice_checking_since = None;
+                // Restart-before-drop: instead of tearing the peer down
+                // the instant ICE fails (the old PC-Failed behaviour, which
+                // pre-empted the in-place restart by ~1 ms and forced a full
+                // reconnect every time), we kick `renegotiate_ice` below and
+                // give it a bounded window to recover. Arm the
+                // checking-timeout watchdog as the backstop: if the restart
+                // re-enters Checking it re-arms with a fresh grace budget; if
+                // it recovers to Connected the window is cleared; if it never
+                // makes progress, `on_checking_timeout` reclaims the peer one
+                // window later — the same teardown as before, just deferred
+                // far enough to let the cheap restart win when it can.
+                data.ice_checking_since = Some(Instant::now());
+                data.checking_grace_used = 0;
                 true
             }
             _ => false,
@@ -1317,33 +1456,38 @@ pub(crate) async fn log_ice_check_snapshot(
             "\n  remote: {}",
             render_candidate_list(&snap.remote_candidates)
         ));
-        // Per-pair: `sent→` / `resp←` are our checks and the replies we
-        // got; `in←` / `resp→` are the peer's checks and our replies.
-        for p in &snap.pairs {
+        // Per-pair: only `state` and `nominated` are real — webrtc-ice
+        // 0.13 leaves the STUN/byte counters at zero (see
+        // `diag::IcePairSnapshot`), so printing them was pure noise. Cap
+        // the dump: a churning agent can form 150+ pairs and the full list
+        // is what was drowning the log. The pairs are pre-sorted
+        // nominated→succeeded→active, so the capped head is the
+        // informative part; the tail is summarized.
+        const MAX_PAIRS_LOGGED: usize = 12;
+        for p in snap.pairs.iter().take(MAX_PAIRS_LOGGED) {
             msg.push_str(&format!(
-                "\n  {} ⇄ {} [{}{}] sent→{} resp←{} | in←{} resp→{} | bytes {}/{}",
+                "\n  {} ⇄ {} [{}{}]",
                 p.local,
                 p.remote,
                 p.state,
                 if p.nominated { " NOMINATED" } else { "" },
-                p.requests_sent,
-                p.responses_received,
-                p.requests_received,
-                p.responses_sent,
-                p.bytes_sent,
-                p.bytes_received,
+            ));
+        }
+        if snap.pairs.len() > MAX_PAIRS_LOGGED {
+            let hidden = snap.pairs.len() - MAX_PAIRS_LOGGED;
+            let failed = snap.pairs.iter().filter(|p| p.state == "failed").count();
+            msg.push_str(&format!(
+                "\n  (… and {hidden} more pairs not shown · {failed} failed of {} total)",
+                snap.pairs.len(),
             ));
         }
         state.log_diag_with(crate::events::DiagLevel::Warn, "ice", msg, detail);
     } else {
         let msg = format!(
-            "ICE checking {} — {}/{} pairs succeeded; checks sent→{} resp←{} in←{} · {}",
+            "ICE checking {} — {}/{} pairs succeeded · {}",
             short_peer(device_id),
             snap.succeeded_pairs(),
             snap.pairs.len(),
-            snap.total_requests_sent(),
-            snap.total_responses_received(),
-            snap.total_requests_received(),
             snap.diagnosis(),
         );
         state.log_diag_with(crate::events::DiagLevel::Debug, "ice", msg, detail);
@@ -1366,7 +1510,31 @@ async fn handle_pc_state_change(
     pc: RTCPeerConnectionState,
 ) {
     match pc {
-        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+        // `Failed` no longer drops here. The ICE-connection `Failed`
+        // callback (`handle_ice_state_change`) owns recovery now: it
+        // kicks the in-place `renegotiate_ice` restart and arms the
+        // checking-timeout backstop, so a transient failure recovers
+        // without paying for a full reconnect. This handler used to win
+        // a ~1 ms race and tear the peer down before that restart could
+        // run — the bug the wake-from-sleep logs pinned down.
+        //
+        // As a safety net for the rare PC-`Failed`-without-ICE-`Failed`
+        // path (e.g. a DTLS-level failure), make sure the checking-timeout
+        // watchdog is armed so an orphaned peer is still reclaimed; the
+        // ICE-`Failed` arm normally sets this first, in which case we
+        // leave its (possibly already-progressed) window untouched.
+        RTCPeerConnectionState::Failed => {
+            if let Some(peer) = state.peers.get(device_id) {
+                let mut data = peer.state.write();
+                if data.ice_checking_since.is_none() {
+                    data.ice_checking_since = Some(Instant::now());
+                    data.checking_grace_used = 0;
+                }
+            }
+        }
+        // A closed connection is a real teardown, not a recoverable
+        // failure — drop the peer and let discovery rebuild it.
+        RTCPeerConnectionState::Closed => {
             drop_peer(state, device_id, DropReason::IceFailed).await;
         }
         _ => {}
@@ -1913,5 +2081,78 @@ mod tests {
             state.peers.contains_key("peer-handshaking"),
             "a peer with no inbound yet (mid-handshake / Sighted) must be left for the re-offer path"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_session_transport_event_is_ignored() {
+        let state = build_test_state("epoch-guard");
+        insert_session_less_peer(&state, "peer-epoch", Some(Instant::now()));
+        let epoch = state.peers.get("peer-epoch").expect("peer present").epoch;
+
+        // A DataChannelClosed pumped in from a torn-down session (epoch no
+        // longer current) must not drop the live replacement peer — this is
+        // the spurious post-rebuild `IceFailed` we saw amplifying the flap.
+        handle_transport_event(
+            &state,
+            "peer-epoch".to_string(),
+            epoch.wrapping_add(1),
+            TransportEvent::DataChannelClosed,
+        )
+        .await;
+        assert!(
+            state.peers.contains_key("peer-epoch"),
+            "a DataChannelClosed from a stale session epoch must be ignored, not drop the live peer"
+        );
+
+        // The current session's close is still honored.
+        handle_transport_event(
+            &state,
+            "peer-epoch".to_string(),
+            epoch,
+            TransportEvent::DataChannelClosed,
+        )
+        .await;
+        assert!(
+            !state.peers.contains_key("peer-epoch"),
+            "a DataChannelClosed from the current session epoch drops the peer as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_flag_round_trips_and_reports_edges() {
+        let state = build_test_state("offline-flag");
+        assert!(!state.is_offline(), "a fresh state is online");
+        // online → offline: swap returns the previous value (false).
+        assert!(!state.set_offline(true));
+        assert!(state.is_offline());
+        // offline → offline: previous value is true (no edge).
+        assert!(state.set_offline(true));
+        // offline → online: previous value is true (the returning edge).
+        assert!(state.set_offline(false));
+        assert!(!state.is_offline());
+    }
+
+    #[tokio::test]
+    async fn renegotiate_ice_is_a_noop_while_offline() {
+        let state = build_test_state("offline-reneg");
+        state.set_offline(true);
+        // The offline guard sits ahead of every peer-map / session access,
+        // so a renegotiation request while offline simply returns — no
+        // gather attempt, no panic on a peer that isn't there.
+        renegotiate_ice(&state, "ghost-peer", true, "test").await;
+        assert!(
+            state.peers.is_empty(),
+            "renegotiate_ice must not touch state while offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn reoffer_after_failed_answer_is_a_noop_while_offline() {
+        let state = build_test_state("offline-reoffer");
+        state.set_offline(true);
+        // Same guard: a late/stale answer that can't apply must not kick a
+        // rebuild while the interface is down.
+        reoffer_after_failed_answer(&state, "ghost-peer").await;
+        assert!(state.peers.is_empty());
     }
 }

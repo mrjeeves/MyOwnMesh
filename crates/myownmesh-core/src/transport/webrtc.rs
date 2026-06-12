@@ -211,9 +211,12 @@ impl Transport {
             .with_interceptor_registry(registry)
             .with_setting_engine(setting_engine)
             .build();
+        // One startup line. The excluded prefixes live in the structured
+        // field for anyone who needs them; the message stays a clean
+        // one-liner rather than dumping the whole array into the stream.
         info!(
-            excluded_prefixes = ?VIRTUAL_IFACE_PREFIXES,
-            "ICE interface filter active — virtual interfaces excluded from candidate gathering"
+            excluded = VIRTUAL_IFACE_PREFIXES.len(),
+            "ICE interface filter active — Docker/virtual interfaces excluded from candidate gathering"
         );
         Ok(Self { api: Arc::new(api) })
     }
@@ -1057,27 +1060,25 @@ impl PeerSession {
                     remote: resolve(&p.remote_candidate_id),
                     state: pair_state_str(p.state),
                     nominated: p.nominated,
-                    requests_sent: p.requests_sent,
-                    responses_received: p.responses_received,
-                    requests_received: p.requests_received,
-                    responses_sent: p.responses_sent,
-                    bytes_sent: p.bytes_sent,
-                    bytes_received: p.bytes_received,
                 });
             }
         }
 
-        // Stable ordering so successive snapshots diff cleanly in the
-        // log: succeeded pairs first, then by descending check
-        // activity (the pairs actually doing something float up).
-        pairs.sort_by(|a, b| {
-            (b.state == "succeeded")
-                .cmp(&(a.state == "succeeded"))
-                .then(
-                    (b.requests_sent + b.responses_received)
-                        .cmp(&(a.requests_sent + a.responses_received)),
-                )
-        });
+        // Stable ordering so successive snapshots diff cleanly in the log
+        // and a capped dump shows the pairs that matter: nominated first,
+        // then succeeded, then everything else. (We can't rank by check
+        // activity — webrtc-ice 0.13 never populates the per-pair STUN
+        // counters, so they're all zero; see `diag::IcePairSnapshot`.)
+        let rank = |p: &super::diag::IcePairSnapshot| -> u8 {
+            match (p.nominated, p.state.as_str()) {
+                (true, _) => 0,
+                (_, "succeeded") => 1,
+                (_, "in-progress") => 2,
+                (_, "waiting") => 3,
+                _ => 4,
+            }
+        };
+        pairs.sort_by_key(rank);
         local_candidates.sort();
         remote_candidates.sort();
         super::diag::IceCheckSnapshot {

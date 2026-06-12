@@ -116,7 +116,15 @@ fn main() -> ExitCode {
         "webrtc_util=error,",
         "webrtc_media=error,",
         "interceptor=error,",
-        "stun=error",
+        "stun=error,",
+        // TURN client socket binds emit a `bind() failed: Network is
+        // unreachable` warning per candidate while the interface is down
+        // (a macOS wake drops the network for a second or two). The engine
+        // now holds ICE restarts off while offline so this is rare, but the
+        // `turn` target wasn't pinned to error like its `stun` sibling —
+        // pin it so any residual gather-during-outage stays quiet.
+        "turn=error,",
+        "webrtc_turn=error",
     );
     let log_level = std::env::var("MYOWNMESH_LOG").unwrap_or_else(|_| default_filter.to_string());
     tracing_subscriber::fmt()

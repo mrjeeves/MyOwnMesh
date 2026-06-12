@@ -63,6 +63,18 @@ pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 /// time roughly in half.
 pub const ICE_CHECKING_TIMEOUT_MS: u64 = 15_000;
 
+/// How many times the checking-timeout will *extend* an attempt (rather
+/// than tear it down) when the agent has succeeded pairs but hasn't
+/// nominated one yet. Connectivity demonstrably exists in that state, so
+/// rebuilding only resets the nomination race — the dominant cause of the
+/// observed connect→stuck→rebuild flap. Each extension grants another
+/// `ICE_CHECKING_TIMEOUT_MS` (15 s); the bound caps a succeeds-but-never-
+/// nominates pathology at `CHECKING_GRACE_MAX × 15 s` of grace before we
+/// finally give up and rebuild. Four windows (~60 s) comfortably covers a
+/// slow controlling-side nomination without letting a wedged peer linger
+/// indefinitely.
+pub const CHECKING_GRACE_MAX: u8 = 4;
+
 /// Minimum gap between relay redials forced by the "ICE timed out with
 /// zero remote candidates" rescue (see
 /// [`crate::engine::state::NetworkState::request_relay_reconnect_throttled`]).

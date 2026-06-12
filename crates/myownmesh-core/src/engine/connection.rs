@@ -77,6 +77,13 @@ pub struct PeerStateData {
     /// been stuck mid-negotiation too long instead of waiting out
     /// webrtc-rs's ~30 s internal timer.
     pub ice_checking_since: Option<Instant>,
+    /// How many times the checking-timeout has *extended* this attempt
+    /// instead of tearing it down, because the agent had succeeded pairs
+    /// (connectivity exists) but hadn't nominated yet. Bounds the grace so
+    /// a pair that succeeds-but-never-nominates can't stall a peer
+    /// forever; reset whenever ICE leaves Checking. See
+    /// `ice_watchdog::on_checking_timeout`.
+    pub checking_grace_used: u8,
     pub handshake_started_at: Option<Instant>,
     pub hello_attempt: u32,
     pub rehandshake_attempt: u32,
@@ -138,6 +145,7 @@ impl Default for PeerStateData {
             rtt_ms: None,
             ice_disconnected_since: None,
             ice_checking_since: None,
+            checking_grace_used: 0,
             handshake_started_at: None,
             hello_attempt: 0,
             rehandshake_attempt: 0,
@@ -155,7 +163,19 @@ pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
     pub session: Mutex<Option<Arc<PeerSession>>>,
+    /// Monotonic id for *this* session of the peer. Each rebuild (drop +
+    /// re-open) gets a fresh epoch, so transport events pumped in from a
+    /// torn-down session — a `DataChannelClosed` for the old PC that lands
+    /// a millisecond after the replacement session was created — can be
+    /// recognised as stale and ignored, instead of calling `drop_peer` on
+    /// the live session and triggering yet another needless rebuild.
+    pub epoch: u64,
 }
+
+/// Process-wide monotonic source for [`PeerConnection::epoch`]. A plain
+/// counter: uniqueness across a process lifetime is all the staleness
+/// check needs, and wrap-around at u64 is not reachable in practice.
+static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl PeerConnection {
     pub fn new(device_id: String, session: Option<Arc<PeerSession>>) -> Self {
@@ -163,6 +183,7 @@ impl PeerConnection {
             device_id,
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
+            epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
