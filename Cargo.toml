@@ -98,3 +98,57 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# A debug daemon must still *stream*. AllMyStuff's `just dev` (and this
+# repo's own) runs `target/debug/myownmesh` as the sidecar, which used to
+# push every media byte — DTLS-SRTP encryption, RTP packetization, H.264
+# access-unit reassembly, the base64/JSON control-socket framing — through
+# opt-level 0. On a 20+ Mbps screen stream that read as "the app is slow"
+# when it was the dev profile. The daemon's own code stays unoptimized for
+# fast iteration; the per-packet hot path below gets real codegen, the
+# same targeted-override trick AllMyStuff uses for its pixel loops.
+[profile.dev.package.webrtc]
+opt-level = 3
+[profile.dev.package.webrtc-srtp]
+opt-level = 3
+[profile.dev.package.webrtc-dtls]
+opt-level = 3
+[profile.dev.package.webrtc-data]
+opt-level = 3
+[profile.dev.package.webrtc-sctp]
+opt-level = 3
+[profile.dev.package.webrtc-ice]
+opt-level = 3
+[profile.dev.package.webrtc-media]
+opt-level = 3
+[profile.dev.package.webrtc-util]
+opt-level = 3
+[profile.dev.package.rtp]
+opt-level = 3
+[profile.dev.package.rtcp]
+opt-level = 3
+[profile.dev.package.interceptor]
+opt-level = 3
+# The ciphers SRTP/DTLS actually spend their time in.
+[profile.dev.package.ring]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+# Every media frame rides the control socket as a JSON line with a
+# base64 payload — both ends of that framing per packet.
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3
+[profile.dev.package.bytes]
+opt-level = 3
