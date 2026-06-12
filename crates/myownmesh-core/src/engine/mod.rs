@@ -426,7 +426,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     })
                     .unwrap_or(false);
                 if unhealthy {
-                    renegotiate_ice(state, &device_id, false).await;
+                    renegotiate_ice(state, &device_id, false, "announce-unhealthy").await;
                 }
             }
             clear_stale_session_if_zombie(state, &device_id).await;
@@ -642,7 +642,12 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
 /// watcher exists), so we must renegotiate despite the stale "healthy"
 /// state. The watchdog / announce callers pass `force = false` and skip a
 /// genuinely-connected link.
-pub(crate) async fn renegotiate_ice(state: &Arc<NetworkState>, device_id: &str, force: bool) {
+pub(crate) async fn renegotiate_ice(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    force: bool,
+    trigger: &'static str,
+) {
     let session = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
@@ -651,6 +656,15 @@ pub(crate) async fn renegotiate_ice(state: &Arc<NetworkState>, device_id: &str, 
         s
     };
     let Some(session) = session else { return };
+
+    // Snapshot the ICE state we're firing from — together with `trigger`
+    // this is the instrumentation that answers "what kicked a link that
+    // was fine?". A restart from `Connected` (consent-freshness still
+    // green) attributed to `network-change` points at a spurious
+    // primary-IP flip; one from `Disconnected` attributed to
+    // `ice-disconnected-watchdog` is a genuine drop. Without the
+    // attribution every restart looks the same in the log.
+    let ice_before = session.ice_connection_state();
 
     match session.ice_connection_state() {
         // Healthy. Unless the caller knows the network just moved
@@ -697,6 +711,36 @@ pub(crate) async fn renegotiate_ice(state: &Arc<NetworkState>, device_id: &str, 
         data.diag.ice_restarts += 1;
         state.identity.public_id() < device_id
     };
+
+    // One line per *committed* restart (past single-flight), carrying the
+    // trigger, the role, whether it was forced, the ICE state it fired
+    // from, and the running restart count. This is the primary instrument
+    // for the flapping investigation: tail the log and every renegotiation
+    // names its cause. A burst of `trigger=network-change` from
+    // `ice_before=Connected` on a healthy box is the signature of the
+    // network watcher mis-firing on a multi-homed host.
+    let restarts = state
+        .peers
+        .get(device_id)
+        .map(|p| p.state.read().diag.ice_restarts)
+        .unwrap_or(0);
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "ice",
+        format!(
+            "ICE renegotiation for {} — trigger={trigger}, role={}, forced={force}, from={ice_before:?} (#{restarts})",
+            short_peer(device_id),
+            if offerer { "offerer" } else { "answerer" },
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "trigger": trigger,
+            "role": if offerer { "offerer" } else { "answerer" },
+            "forced": force,
+            "ice_before": format!("{ice_before:?}"),
+            "ice_restarts": restarts,
+        }),
+    );
 
     if let Err(e) = session.restart_ice().await {
         // Benign when a gather from a previous trigger is still in flight;
@@ -1060,6 +1104,26 @@ async fn handle_ice_state_change(
     device_id: &str,
     ice: RTCIceConnectionState,
 ) {
+    // Instrumentation: a breadcrumb on every ICE transition so the log
+    // carries the full state trail per peer, not just the headline
+    // "connected"/"stuck" lines. `Disconnected` is the one that was
+    // invisible before and matters most — it's a consent-freshness drop on
+    // a previously-live link (the trigger the disconnected-watchdog then
+    // acts on), so it's logged at INFO; the routine churn states stay at
+    // DEBUG to keep the stream readable.
+    let level = match ice {
+        RTCIceConnectionState::Disconnected | RTCIceConnectionState::Failed => {
+            crate::events::DiagLevel::Info
+        }
+        _ => crate::events::DiagLevel::Debug,
+    };
+    state.log_diag_with(
+        level,
+        "ice",
+        format!("{} ICE → {ice:?}", short_peer(device_id)),
+        serde_json::json!({ "peer": device_id, "ice_state": format!("{ice:?}") }),
+    );
+
     // Resolve the state transition under the lock, return what the
     // caller should do, then drop the lock before any await.
     let escalate_failed = {

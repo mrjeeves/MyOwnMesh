@@ -61,7 +61,7 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
         // retries the offer without flooding signaling. Not forced: ICE
         // is genuinely disconnected here, so there's no stale-Connected
         // state to push past.
-        super::renegotiate_ice(state, &peer_id, false).await;
+        super::renegotiate_ice(state, &peer_id, false, "ice-disconnected-watchdog").await;
     }
 
     // Retry selected-pair classification for any peer whose ICE
@@ -175,29 +175,73 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // already forces a redial when it *sees* the interface move, but it
     // can't see every case (a multi-homed route flip needn't change our
     // own primary IP). So when this is the failure shape, force a redial
-    // here too — but only if no other peer is currently up, so we never
-    // drop a relay that's demonstrably working for someone else. The
-    // reconnect generation is coalesced by its watch, so simultaneous
-    // timeouts collapse into one redial.
+    // here too.
+    //
+    // A stale relay socket starves candidate delivery for *every* peer,
+    // not just this one, so we redial even when other peers are still up
+    // (the old "only if no other live peer" gate left the wedge in place
+    // whenever the room wasn't completely dark — exactly this box's case,
+    // where two other peers stayed ACTIVE while this link flapped). The
+    // throttle in `request_relay_reconnect_throttled` (one redial per
+    // RELAY_RESCUE_MIN_INTERVAL_MS) is what keeps a peer that re-times-out
+    // every cycle from bouncing healthy sockets.
     let no_remote = state
         .peers
         .get(device_id)
         .map(|p| p.state.read().diag.remote_candidates.total() == 0)
         .unwrap_or(false);
-    let have_other_live_peer = state.peers.iter().any(|e| {
-        e.key() != device_id
-            && matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-    });
-    if no_remote && !have_other_live_peer && state.request_relay_reconnect() {
-        state.log_diag(
-            DiagLevel::Info,
-            "signaling",
-            "no remote candidates arrived — forcing relay reconnect (socket likely \
-             went stale after a network change)",
-        );
+    // Instrumentation: surface how many peers are live alongside the
+    // fingerprint so a log shows the rescue had the full picture — this is
+    // the case the old gate suppressed.
+    let other_live_peers = state
+        .peers
+        .iter()
+        .filter(|e| {
+            e.key() != device_id
+                && matches!(
+                    e.value().state.read().status,
+                    PeerStatus::Active | PeerStatus::Shelved
+                )
+        })
+        .count();
+    if no_remote {
+        if state.request_relay_reconnect_throttled() {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "signaling",
+                format!(
+                    "no remote candidates arrived for {} — forcing relay reconnect \
+                     (socket likely went stale; {other_live_peers} other peer(s) live)",
+                    super::short_peer(device_id),
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "reason": "no_remote_candidates",
+                    "other_live_peers": other_live_peers,
+                    "redial": true,
+                }),
+            );
+        } else {
+            // Throttled (or no driver attached): record that we saw the
+            // fingerprint but held off, so the log explains the gap
+            // between successive redials rather than going silent.
+            state.log_diag_with(
+                DiagLevel::Debug,
+                "signaling",
+                format!(
+                    "no remote candidates arrived for {} — relay redial throttled \
+                     (last redial < {}s ago)",
+                    super::short_peer(device_id),
+                    super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS / 1000,
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "reason": "no_remote_candidates",
+                    "other_live_peers": other_live_peers,
+                    "redial": false,
+                }),
+            );
+        }
     }
 
     super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
@@ -223,7 +267,7 @@ pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
     // re-exchange. The old path escalated to a Tier-4 re-handshake, which
     // only re-sends `hello` over the already-dead data channel and can't
     // bring the transport back. Single-flighted in `renegotiate_ice`.
-    super::renegotiate_ice(state, device_id, false).await;
+    super::renegotiate_ice(state, device_id, false, "ice-failed").await;
 }
 
 /// Inspect the peer's candidate stats after an ICE failure and, if
@@ -322,6 +366,6 @@ pub async fn force_ice_restart_all(state: &Arc<NetworkState>) {
     for peer_id in candidates {
         // Forced: on a network change ICE often still reads Connected
         // (consent-freshness hasn't fired), so push past the stale state.
-        super::renegotiate_ice(state, &peer_id, true).await;
+        super::renegotiate_ice(state, &peer_id, true, "network-change").await;
     }
 }

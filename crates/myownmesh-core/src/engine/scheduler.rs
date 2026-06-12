@@ -63,6 +63,19 @@ pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 /// time roughly in half.
 pub const ICE_CHECKING_TIMEOUT_MS: u64 = 15_000;
 
+/// Minimum gap between relay redials forced by the "ICE timed out with
+/// zero remote candidates" rescue (see
+/// [`crate::engine::state::NetworkState::request_relay_reconnect_throttled`]).
+/// A peer whose candidates never cross the relay re-times-out every
+/// `ICE_CHECKING_TIMEOUT_MS` (15 s); without this throttle the rescue
+/// would bounce the relay sockets on every one of those cycles. One
+/// redial per 30 s is enough to recover a socket that actually went
+/// stale after a network blip, while leaving healthy sockets — the ones
+/// already delivering candidates for other peers — undisturbed between
+/// windows. Comfortably above `ICE_CHECKING_TIMEOUT_MS` so a single stuck
+/// peer maps to at most one redial per two of its timeout cycles.
+pub const RELAY_RESCUE_MIN_INTERVAL_MS: u64 = 30_000;
+
 /// After a network change kicks an ICE-restart fan-out, ignore further
 /// change-triggered restarts for this long. A Wi-Fi→cellular handoff
 /// flips the primary outbound IP several times across a couple seconds
