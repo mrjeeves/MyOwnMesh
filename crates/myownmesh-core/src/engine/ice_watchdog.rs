@@ -241,28 +241,25 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // blocked network: the peer's candidates never crossed the relay (or
     // ours never reached it). The usual cause is a relay socket left a
     // zombie by a network change on one side — held open for minutes
-    // because the kernel never saw a FIN/RST. The network-change watcher
-    // already forces a redial when it *sees* the interface move, but it
-    // can't see every case (a multi-homed route flip needn't change our
-    // own primary IP). So when this is the failure shape, force a redial
-    // here too.
+    // because the kernel never saw a FIN/RST.
     //
-    // A stale relay socket starves candidate delivery for *every* peer,
-    // not just this one, so we redial even when other peers are still up
-    // (the old "only if no other live peer" gate left the wedge in place
-    // whenever the room wasn't completely dark — exactly this box's case,
-    // where two other peers stayed ACTIVE while this link flapped). The
-    // throttle in `request_relay_reconnect_throttled` (one redial per
-    // RELAY_RESCUE_MIN_INTERVAL_MS) is what keeps a peer that re-times-out
-    // every cycle from bouncing healthy sockets.
+    // We force a relay redial *only when no other peer is currently up*.
+    // This looks conservative but it's load-bearing: a forced relay
+    // reconnect on a node tears down every WebRTC peer that node holds —
+    // observed directly in the field, where one flaky peer hitting this
+    // path took an otherwise-healthy 4-peer box from Active to Alone, all
+    // four links resetting in the same 70 ms as the redial (the peer that
+    // *didn't* redial stayed stable throughout). So redialing to rescue a
+    // single stuck peer while others are live trades one bad link for all
+    // of them. When we're already alone there's nothing to lose, and a
+    // genuinely-stale socket is the likeliest reason we can't reach
+    // anyone — that's the case worth the redial. The throttle still caps
+    // it to one per RELAY_RESCUE_MIN_INTERVAL_MS.
     let no_remote = state
         .peers
         .get(device_id)
         .map(|p| p.state.read().diag.remote_candidates.total() == 0)
         .unwrap_or(false);
-    // Instrumentation: surface how many peers are live alongside the
-    // fingerprint so a log shows the rescue had the full picture — this is
-    // the case the old gate suppressed.
     let other_live_peers = state
         .peers
         .iter()
@@ -275,40 +272,39 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         })
         .count();
     if no_remote {
-        if state.request_relay_reconnect_throttled() {
+        if other_live_peers > 0 {
+            // Suppressed on purpose — log it so the decision (and the
+            // reason we're *not* redialing) is visible in diagnostics
+            // rather than looking like the rescue silently did nothing.
             state.log_diag_with(
                 DiagLevel::Info,
                 "signaling",
                 format!(
-                    "no remote candidates arrived for {} — forcing relay reconnect \
-                     (socket likely went stale; {other_live_peers} other peer(s) live)",
+                    "no remote candidates arrived for {} — NOT redialing the relay \
+                     ({other_live_peers} other peer(s) live; a forced reconnect would reset them too)",
                     super::short_peer(device_id),
-                ),
-                serde_json::json!({
-                    "peer": device_id,
-                    "reason": "no_remote_candidates",
-                    "other_live_peers": other_live_peers,
-                    "redial": true,
-                }),
-            );
-        } else {
-            // Throttled (or no driver attached): record that we saw the
-            // fingerprint but held off, so the log explains the gap
-            // between successive redials rather than going silent.
-            state.log_diag_with(
-                DiagLevel::Debug,
-                "signaling",
-                format!(
-                    "no remote candidates arrived for {} — relay redial throttled \
-                     (last redial < {}s ago)",
-                    super::short_peer(device_id),
-                    super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS / 1000,
                 ),
                 serde_json::json!({
                     "peer": device_id,
                     "reason": "no_remote_candidates",
                     "other_live_peers": other_live_peers,
                     "redial": false,
+                }),
+            );
+        } else if state.request_relay_reconnect_throttled() {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "signaling",
+                format!(
+                    "no remote candidates arrived for {} and we're alone — forcing relay \
+                     reconnect (socket likely went stale)",
+                    super::short_peer(device_id),
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "reason": "no_remote_candidates",
+                    "other_live_peers": 0,
+                    "redial": true,
                 }),
             );
         }
