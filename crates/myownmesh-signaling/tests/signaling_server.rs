@@ -36,6 +36,21 @@ fn parse(frame: &str) -> Vec<Value> {
     serde_json::from_str(frame).expect("relay frame is a JSON array")
 }
 
+/// Build a properly signed NIP-01 event JSON. The relay now verifies the id +
+/// BIP-340 signature, so tests post real events (forged ones are rejected).
+fn signed_event(kind: u16, room: &str, content: &str, created_at: u64) -> Value {
+    use myownmesh_signaling::nostr::event::{make_event, NostrIdentity};
+    let id = NostrIdentity::generate();
+    let ev = make_event(
+        &id,
+        kind,
+        vec![vec!["r".into(), room.into()]],
+        content.into(),
+        created_at,
+    );
+    serde_json::to_value(&ev).expect("event serializes")
+}
+
 #[tokio::test]
 async fn relay_forwards_event_to_matching_subscriber() {
     let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
@@ -59,10 +74,7 @@ async fn relay_forwards_event_to_matching_subscriber() {
     assert_eq!(eose[1], "sub1");
 
     // Publisher posts a matching event.
-    let event = json!({
-        "id": "e1", "pubkey": "pk", "created_at": 1000, "kind": 1077,
-        "tags": [["r", "room1"]], "content": "hello", "sig": "s"
-    });
+    let event = signed_event(1077, "room1", "hello", 1000);
     pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
         .await
         .unwrap();
@@ -93,10 +105,7 @@ async fn relay_replays_stored_presence_to_late_subscriber() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let event = json!({
-        "id": "p1", "pubkey": "pk", "created_at": now, "kind": 1077,
-        "tags": [["r", "roomX"]], "content": "present", "sig": "s"
-    });
+    let event = signed_event(1077, "roomX", "present", now);
     pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
         .await
         .unwrap();
@@ -130,10 +139,7 @@ async fn ephemeral_events_are_not_stored() {
     let (mut pubr, _) = connect_async(&url).await.unwrap();
     // Ephemeral kind 21077 (mesh negotiation) — forwarded live, never
     // retained for replay.
-    let event = json!({
-        "id": "n1", "pubkey": "pk", "created_at": 1000, "kind": 21077,
-        "tags": [["r", "roomE"]], "content": "offer", "sig": "s"
-    });
+    let event = signed_event(21077, "roomE", "offer", 1000);
     pubr.send(Message::Text(json!(["EVENT", event]).to_string()))
         .await
         .unwrap();
@@ -306,10 +312,7 @@ async fn relay_emits_leave_when_member_disconnects() {
     // its presence against this connection.
     let (mut member, _) = connect_async(&url).await.unwrap();
     let envelope = json!({ "from": "devA", "kind": "announce", "peer_id": "devA" }).to_string();
-    let announce = json!({
-        "id": "a1", "pubkey": "pk", "created_at": 1000, "kind": 1077,
-        "tags": [["r", "leaveroom"]], "content": envelope, "sig": "s"
-    });
+    let announce = signed_event(1077, "leaveroom", &envelope, 1000);
     member
         .send(Message::Text(json!(["EVENT", announce]).to_string()))
         .await

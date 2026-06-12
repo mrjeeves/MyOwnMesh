@@ -73,6 +73,13 @@ pub fn default_release_api_beta() -> &'static str {
 
 const USER_AGENT: &str = concat!("myownmesh-self-update/", env!("CARGO_PKG_VERSION"));
 
+/// The minisign public key releases are signed with, baked in at build time.
+/// `None` until release signing is configured (set `MYOWNMESH_RELEASE_PUBKEY`
+/// to the base64 key when building the shipped binary). When set, a valid
+/// detached signature over each artifact is **required** before it is staged —
+/// SHA-256 proves integrity, the signature proves provenance.
+const RELEASE_PUBKEY: Option<&str> = option_env!("MYOWNMESH_RELEASE_PUBKEY");
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("io: {0}")]
@@ -850,6 +857,29 @@ fn pick_sha_asset<'a>(assets: &'a [Value], asset_name: &str) -> Option<&'a Value
     })
 }
 
+/// The detached minisign signature asset (`<asset>.minisig`) for `asset_name`.
+fn pick_sig_asset<'a>(assets: &'a [Value], asset_name: &str) -> Option<&'a Value> {
+    let preferred = format!("{asset_name}.minisig");
+    assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(preferred.as_str()))
+}
+
+/// Verify a detached minisign signature over `data` against the baked-in
+/// release public key. Pure verification (no signing); fails closed on any
+/// malformed input.
+fn verify_signature(
+    pubkey_b64: &str,
+    data: &[u8],
+    minisig_text: &str,
+) -> std::result::Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
+        .map_err(|e| format!("bad release public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(minisig_text)
+        .map_err(|e| format!("bad signature file: {e}"))?;
+    pk.verify(data, &sig, false).map_err(|e| e.to_string())
+}
+
 fn expected_sha_for(sha_text: &str, asset_name: &str) -> Option<String> {
     // Lines look like "<hex>  <filename>" or "<hex> *<filename>"; the
     // name column may be a relative path, so match by basename.
@@ -1049,32 +1079,71 @@ async fn download_verify_stage(
         .await?;
     std::fs::write(&part_path, &bytes)?;
 
-    if let Some(sha_asset) = pick_sha_asset(assets, &asset_name) {
-        let sha_url = sha_asset["browser_download_url"]
-            .as_str()
-            .ok_or_else(|| Error::msg("sha asset missing url"))?;
-        let sha_text = client
-            .get(sha_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        let expected = expected_sha_for(&sha_text, &asset_name)
-            .ok_or_else(|| Error::msg(format!("checksum file lists no entry for {asset_name}")))?;
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let actual = hex::encode(hasher.finalize());
-        if !actual.eq_ignore_ascii_case(&expected) {
-            let _ = std::fs::remove_file(&part_path);
-            return Err(Error::ChecksumMismatch {
-                asset: asset_name,
-                expected,
-                actual,
-            });
+    // Integrity: a published checksum is mandatory. We never stage an
+    // unverified binary — a missing sidecar used to fall through to a warning,
+    // which let anyone able to omit it serve any payload.
+    let Some(sha_asset) = pick_sha_asset(assets, &asset_name) else {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(Error::msg(format!(
+            "no checksum sidecar for {asset_name}; refusing to stage unverified"
+        )));
+    };
+    let sha_url = sha_asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| Error::msg("sha asset missing url"))?;
+    let sha_text = client
+        .get(sha_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let expected = expected_sha_for(&sha_text, &asset_name)
+        .ok_or_else(|| Error::msg(format!("checksum file lists no entry for {asset_name}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual = hex::encode(hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&expected) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(Error::ChecksumMismatch {
+            asset: asset_name,
+            expected,
+            actual,
+        });
+    }
+
+    // Authenticity: when a release signing key is baked in, a valid detached
+    // minisign signature over the artifact is required before staging. SHA-256
+    // comes from the same release and proves only integrity; the signature is
+    // what makes a swapped release asset detectable.
+    match RELEASE_PUBKEY {
+        Some(pubkey) => {
+            let Some(sig_asset) = pick_sig_asset(assets, &asset_name) else {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(Error::msg(format!(
+                    "no signature for {asset_name}; refusing to stage"
+                )));
+            };
+            let sig_url = sig_asset["browser_download_url"]
+                .as_str()
+                .ok_or_else(|| Error::msg("signature asset missing url"))?;
+            let sig_text = client
+                .get(sig_url)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            if let Err(e) = verify_signature(pubkey, &bytes, &sig_text) {
+                let _ = std::fs::remove_file(&part_path);
+                return Err(Error::msg(format!(
+                    "signature check failed for {asset_name}: {e}"
+                )));
+            }
         }
-    } else {
-        tracing::warn!("no checksum sidecar for {asset_name}; skipping integrity check");
+        None => tracing::warn!(
+            "release signing not configured in this build; {asset_name} verified by SHA-256 only"
+        ),
     }
 
     std::fs::rename(&part_path, &archive_path)?;
@@ -1439,6 +1508,14 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn signature_verification_fails_closed_on_garbage() {
+        // Malformed key or signature must error, never silently pass — the
+        // download path treats any Err here as "do not stage".
+        assert!(verify_signature("not-a-valid-key", b"payload", "not-a-sig").is_err());
+        assert!(verify_signature("", b"payload", "").is_err());
+    }
 
     #[test]
     fn picks_daemon_not_gui_or_sidecar() {

@@ -202,3 +202,67 @@ jobs:
             dist-bin/myownmesh-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Detached Ed25519 (minisign) signatures over the portable archives, so the
+  # self-updater can prove provenance, not just integrity. Runs once after all
+  # platform bundles upload, and is a NO-OP until the maintainer configures the
+  # MINISIGN_SECRET_KEY secret (and bakes MYOWNMESH_RELEASE_PUBKEY into the
+  # shipped build) — see RELEASE-SIGNING.md. Gating means an unconfigured repo
+  # still releases exactly as before.
+  sign:
+    name: Sign release artifacts (minisign)
+    needs: bundles
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Gate on signing key
+        id: gate
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -n "$MINISIGN_SECRET_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::MINISIGN_SECRET_KEY not configured — skipping signing; artifacts ship SHA-256-only. See RELEASE-SIGNING.md."
+          fi
+
+      - name: Install minisign
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          set -e
+          curl -fsSL -o minisign.tar.gz \
+            https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
+          tar -xzf minisign.tar.gz
+          sudo install -m 0755 minisign-linux/x86_64/minisign /usr/local/bin/minisign
+
+      - name: Download release artifacts
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -e
+          mkdir -p signing
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir signing \
+            --pattern 'myownmesh-*.tar.gz' --pattern 'myownmesh-*.zip'
+
+      - name: Sign and upload signatures
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -e
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > signing/minisign.key
+          cd signing
+          shopt -s nullglob
+          # Password-less CI key (see RELEASE-SIGNING.md): no prompt, </dev/null
+          # guards against ever hanging on one.
+          for f in myownmesh-*.tar.gz myownmesh-*.zip; do
+            minisign -S -s minisign.key -m "$f" -x "$f.minisig" </dev/null
+          done
+          rm -f minisign.key
+          gh release upload "$TAG" myownmesh-*.minisig --repo "$GITHUB_REPOSITORY" --clobber
