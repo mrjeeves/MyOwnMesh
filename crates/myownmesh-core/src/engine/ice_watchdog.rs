@@ -165,6 +165,15 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
 /// re-announce is rate-limited via the shared reactive-announce guard so
 /// a wave of timeouts can't flood the relays.
 async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    // While the host is offline (no primary interface) every peer will
+    // time out its checking window, but tearing them all down now just
+    // means re-discovering them from scratch a second later when the
+    // interface returns. Hold the peers in place — the network-change
+    // handler restarts ICE on all of them once we're back online. The
+    // window stays armed, so this simply no-ops each poll until then.
+    if state.is_offline() {
+        return;
+    }
     // Pull a live snapshot first — its pair states drive the
     // extend-vs-rebuild decision below.
     let snapshot = {

@@ -149,6 +149,41 @@ async fn on_network_change(
     prev: &NetworkSnapshot,
     current: &NetworkSnapshot,
 ) {
+    // Going fully offline (no v4 *and* no v6) is the first half of a
+    // macOS wake: the interface drops for a second or two before it
+    // comes back. Firing the relay redial + ICE restart fan-out now is
+    // worse than useless — `restart_ice()` can't bind a socket on a
+    // down interface (the `Network is unreachable` wall in the logs),
+    // and every doomed attempt burns a 15 s checking-timeout. So we just
+    // latch the offline flag (which gates `renegotiate_ice` and the
+    // checking-timeout watchdog) and wait. The *next* change — the
+    // interface returning — is an offline→online edge that runs the full
+    // handler below and restarts everything cleanly on the new route.
+    let now_offline = current.v4.is_none() && current.v6.is_none();
+    let was_offline = state.set_offline(now_offline);
+    if now_offline {
+        info!(
+            prev_v4 = ?prev.v4,
+            prev_v6 = ?prev.v6,
+            "primary outbound IP lost — network down, holding ICE restarts until it returns"
+        );
+        state.emit(MeshEvent::Diag(DiagEntry {
+            ts: crate::engine::state::now_unix_ms(),
+            network_id: state.network_id.clone(),
+            level: DiagLevel::Info,
+            category: "network".to_string(),
+            message: "Lost the primary network interface; holding ICE restarts until it returns."
+                .to_string(),
+            detail: serde_json::json!({
+                "prev": { "v4": prev.v4.map(|v| v.to_string()), "v6": prev.v6.map(|v| v.to_string()) },
+            }),
+        }));
+        return;
+    }
+    if was_offline {
+        debug!(network = %state.network_id, "primary outbound IP returned — resuming ICE restarts");
+    }
+
     info!(
         prev_v4 = ?prev.v4,
         next_v4 = ?current.v4,

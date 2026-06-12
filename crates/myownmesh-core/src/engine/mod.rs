@@ -652,6 +652,13 @@ pub(crate) async fn renegotiate_ice(
     force: bool,
     trigger: &'static str,
 ) {
+    // No primary interface → a `restart_ice()` here can't bind a socket
+    // and only feeds the `Network is unreachable` gather spam. Hold off;
+    // the network-change handler drives a fresh restart fan-out the
+    // instant the interface returns.
+    if state.is_offline() {
+        return;
+    }
     let session = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
@@ -909,6 +916,11 @@ async fn apply_remote_sdp(
             ),
             serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
         );
+        // A late Answer that lost its session: drive a fresh offer instead
+        // of waiting out the next announce-driven re-offer.
+        if sdp_type == RTCSdpType::Answer {
+            reoffer_after_failed_answer(state, device_id).await;
+        }
         return;
     };
     let desc = match sdp_type {
@@ -932,6 +944,15 @@ async fn apply_remote_sdp(
                 }),
             );
             warn!(peer = %device_id, "set_remote_description failed: {e}");
+            // The common failure here is an Answer arriving when our
+            // signaling state has already raced back to `stable` (no
+            // pending local offer) — "invalid proposed signaling state
+            // transition from stable". A fresh offer re-opens the
+            // negotiation cleanly rather than leaving the link wedged
+            // until the next announce.
+            if sdp_type == RTCSdpType::Answer {
+                reoffer_after_failed_answer(state, device_id).await;
+            }
         } else {
             // Drain any ICE candidates that arrived ahead of the
             // SDP. The lock comes off before any await — we pull
@@ -973,6 +994,76 @@ async fn apply_remote_sdp(
             ),
             serde_json::json!({ "peer": device_id, "sdp_type": format!("{sdp_type:?}") }),
         );
+    }
+}
+
+/// An inbound Answer that can't be applied — it arrived after we tore the
+/// session down ("no session"), or it raced our signaling state back to
+/// `stable` ("invalid proposed signaling state transition from stable") —
+/// means our last offer never completed the handshake. Discarding it and
+/// waiting for the announce-driven "stuck at Sighted" re-offer costs a full
+/// ~15-30 s lap; on a flapping wake that stacks into the multi-lap loop the
+/// logs showed. Instead we drive a fresh offer right now: rebuild the
+/// session if it's gone, otherwise re-offer in place. Only the offerer
+/// sends offers (an Answer is addressed to us as the offerer, but we guard
+/// on the same id comparison the rest of the engine uses), it's held off
+/// while offline, and it's throttled by `last_offer_sent_at` so a burst of
+/// stale answers collapses to a single offer.
+async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str) {
+    if state.identity.public_id() >= device_id || state.is_offline() {
+        return;
+    }
+    // Resolve the throttle + session under the peer lock, then act
+    // outside it (the create_offer / open_peer awaits must not hold it).
+    let session = match state.peers.get(device_id) {
+        None => None,
+        Some(peer) => {
+            let due = {
+                let mut data = peer.state.write();
+                let due = data
+                    .last_offer_sent_at
+                    .map(|t| {
+                        Instant::now().duration_since(t)
+                            >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                    })
+                    .unwrap_or(true);
+                if due {
+                    data.last_offer_sent_at = Some(Instant::now());
+                }
+                due
+            };
+            if !due {
+                return;
+            }
+            peer.session.lock().clone()
+        }
+    };
+    match session {
+        Some(session) => match session.create_offer().await {
+            Ok(desc) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Info,
+                    "signaling",
+                    format!(
+                        "re-offer to {} (answer could not be applied)",
+                        short_peer(device_id)
+                    ),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "sdp_bytes": desc.sdp.len(),
+                        "reason": "failed-answer",
+                    }),
+                );
+                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                    device_id: device_id.to_string(),
+                    sdp: desc.sdp,
+                });
+            }
+            Err(e) => warn!(peer = %device_id, "re-offer create_offer failed: {e}"),
+        },
+        // Peer gone (or session-less) — rebuild as offerer; that path
+        // sends a fresh offer as part of setup.
+        None => ensure_peer_session(state, device_id.to_string(), Role::Offerer).await,
     }
 }
 
@@ -1200,7 +1291,18 @@ async fn handle_ice_state_change(
                 false
             }
             RTCIceConnectionState::Failed => {
-                data.ice_checking_since = None;
+                // Restart-before-drop: instead of tearing the peer down
+                // the instant ICE fails (the old PC-Failed behaviour, which
+                // pre-empted the in-place restart by ~1 ms and forced a full
+                // reconnect every time), we kick `renegotiate_ice` below and
+                // give it a bounded window to recover. Arm the
+                // checking-timeout watchdog as the backstop: if the restart
+                // re-enters Checking it re-arms with a fresh grace budget; if
+                // it recovers to Connected the window is cleared; if it never
+                // makes progress, `on_checking_timeout` reclaims the peer one
+                // window later — the same teardown as before, just deferred
+                // far enough to let the cheap restart win when it can.
+                data.ice_checking_since = Some(Instant::now());
                 data.checking_grace_used = 0;
                 true
             }
@@ -1408,7 +1510,31 @@ async fn handle_pc_state_change(
     pc: RTCPeerConnectionState,
 ) {
     match pc {
-        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+        // `Failed` no longer drops here. The ICE-connection `Failed`
+        // callback (`handle_ice_state_change`) owns recovery now: it
+        // kicks the in-place `renegotiate_ice` restart and arms the
+        // checking-timeout backstop, so a transient failure recovers
+        // without paying for a full reconnect. This handler used to win
+        // a ~1 ms race and tear the peer down before that restart could
+        // run — the bug the wake-from-sleep logs pinned down.
+        //
+        // As a safety net for the rare PC-`Failed`-without-ICE-`Failed`
+        // path (e.g. a DTLS-level failure), make sure the checking-timeout
+        // watchdog is armed so an orphaned peer is still reclaimed; the
+        // ICE-`Failed` arm normally sets this first, in which case we
+        // leave its (possibly already-progressed) window untouched.
+        RTCPeerConnectionState::Failed => {
+            if let Some(peer) = state.peers.get(device_id) {
+                let mut data = peer.state.write();
+                if data.ice_checking_since.is_none() {
+                    data.ice_checking_since = Some(Instant::now());
+                    data.checking_grace_used = 0;
+                }
+            }
+        }
+        // A closed connection is a real teardown, not a recoverable
+        // failure — drop the peer and let discovery rebuild it.
+        RTCPeerConnectionState::Closed => {
             drop_peer(state, device_id, DropReason::IceFailed).await;
         }
         _ => {}
@@ -1990,5 +2116,43 @@ mod tests {
             !state.peers.contains_key("peer-epoch"),
             "a DataChannelClosed from the current session epoch drops the peer as before"
         );
+    }
+
+    #[tokio::test]
+    async fn offline_flag_round_trips_and_reports_edges() {
+        let state = build_test_state("offline-flag");
+        assert!(!state.is_offline(), "a fresh state is online");
+        // online → offline: swap returns the previous value (false).
+        assert!(!state.set_offline(true));
+        assert!(state.is_offline());
+        // offline → offline: previous value is true (no edge).
+        assert!(state.set_offline(true));
+        // offline → online: previous value is true (the returning edge).
+        assert!(state.set_offline(false));
+        assert!(!state.is_offline());
+    }
+
+    #[tokio::test]
+    async fn renegotiate_ice_is_a_noop_while_offline() {
+        let state = build_test_state("offline-reneg");
+        state.set_offline(true);
+        // The offline guard sits ahead of every peer-map / session access,
+        // so a renegotiation request while offline simply returns — no
+        // gather attempt, no panic on a peer that isn't there.
+        renegotiate_ice(&state, "ghost-peer", true, "test").await;
+        assert!(
+            state.peers.is_empty(),
+            "renegotiate_ice must not touch state while offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn reoffer_after_failed_answer_is_a_noop_while_offline() {
+        let state = build_test_state("offline-reoffer");
+        state.set_offline(true);
+        // Same guard: a late/stale answer that can't apply must not kick a
+        // rebuild while the interface is down.
+        reoffer_after_failed_answer(&state, "ghost-peer").await;
+        assert!(state.peers.is_empty());
     }
 }
