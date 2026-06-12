@@ -18,9 +18,7 @@ use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::scheduler::{
-    CHECKING_GRACE_MAX, ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS,
-};
+use super::scheduler::{CHECKING_GRACE_MAX, ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -100,15 +98,15 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     }
 
     // Live ICE-establishment progress. For any peer still in
-    // `Checking`, emit a one-line snapshot of the connectivity-check
-    // counters each poll so the user can watch — in real time — whether
-    // our STUN checks are getting responses. A stuck `resp←0` while
-    // `sent→` climbs is the unambiguous fingerprint of UDP being
-    // dropped (firewall / VPN / macOS Local Network permission), which
-    // no amount of staring at "ICE → Checking" would reveal. Self-
-    // limiting: a peer only sits in Checking for the ~30 s before ICE
-    // gives up, so this quiets down on its own once it connects or
-    // fails.
+    // `Checking`, emit a one-line snapshot each poll so the user can
+    // watch — in real time — how many candidate pairs have reached
+    // `succeeded` and whether anything is nominated yet (the only pair
+    // fields webrtc-ice actually maintains; see `diag::IcePairSnapshot`).
+    // "succeeded pairs climbing but none nominated" is the fingerprint of
+    // the nomination stall the checking-timeout grace below now holds open
+    // instead of rebuilding. Self-limiting: a peer only sits in Checking
+    // for the ~30 s before ICE gives up, so this quiets down on its own
+    // once it connects or fails.
     let checking: Vec<String> = state
         .peers
         .iter()
