@@ -273,11 +273,12 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         .count();
     if no_remote {
         if other_live_peers > 0 {
-            // Suppressed on purpose — log it so the decision (and the
-            // reason we're *not* redialing) is visible in diagnostics
-            // rather than looking like the rescue silently did nothing.
+            // Suppressed on purpose — DEBUG so the decision is greppable
+            // when chasing a stuck peer, without adding an INFO line to the
+            // default stream every time a single link flaps while the rest
+            // of the mesh is healthy.
             state.log_diag_with(
-                DiagLevel::Info,
+                DiagLevel::Debug,
                 "signaling",
                 format!(
                     "no remote candidates arrived for {} — NOT redialing the relay \

@@ -211,9 +211,12 @@ impl Transport {
             .with_interceptor_registry(registry)
             .with_setting_engine(setting_engine)
             .build();
+        // One startup line. The excluded prefixes live in the structured
+        // field for anyone who needs them; the message stays a clean
+        // one-liner rather than dumping the whole array into the stream.
         info!(
-            excluded_prefixes = ?VIRTUAL_IFACE_PREFIXES,
-            "ICE interface filter active — virtual interfaces excluded from candidate gathering"
+            excluded = VIRTUAL_IFACE_PREFIXES.len(),
+            "ICE interface filter active — Docker/virtual interfaces excluded from candidate gathering"
         );
         Ok(Self { api: Arc::new(api) })
     }

@@ -755,8 +755,11 @@ pub(crate) async fn renegotiate_ice(
     if offerer {
         match session.create_offer().await {
             Ok(desc) => {
+                // The single INFO line for this restart is the `trigger=…`
+                // line above; the offer/nudge mechanics ride at DEBUG so a
+                // renegotiation is one line in the default stream.
                 state.log_diag_with(
-                    crate::events::DiagLevel::Info,
+                    crate::events::DiagLevel::Debug,
                     "ice",
                     format!(
                         "renegotiating ICE with {} — restart offer",
