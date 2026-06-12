@@ -163,7 +163,19 @@ pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
     pub session: Mutex<Option<Arc<PeerSession>>>,
+    /// Monotonic id for *this* session of the peer. Each rebuild (drop +
+    /// re-open) gets a fresh epoch, so transport events pumped in from a
+    /// torn-down session — a `DataChannelClosed` for the old PC that lands
+    /// a millisecond after the replacement session was created — can be
+    /// recognised as stale and ignored, instead of calling `drop_peer` on
+    /// the live session and triggering yet another needless rebuild.
+    pub epoch: u64,
 }
+
+/// Process-wide monotonic source for [`PeerConnection::epoch`]. A plain
+/// counter: uniqueness across a process lifetime is all the staleness
+/// check needs, and wrap-around at u64 is not reachable in practice.
+static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl PeerConnection {
     pub fn new(device_id: String, session: Option<Arc<PeerSession>>) -> Self {
@@ -171,6 +183,7 @@ impl PeerConnection {
             device_id,
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
+            epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }

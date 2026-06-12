@@ -265,8 +265,12 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::BroadcastCapabilities { caps, reply } => {
             let _ = reply.send(broadcast_capabilities(state, caps).await);
         }
-        NetworkCmd::TransportEvent { device_id, event } => {
-            handle_transport_event(state, device_id, event).await;
+        NetworkCmd::TransportEvent {
+            device_id,
+            epoch,
+            event,
+        } => {
+            handle_transport_event(state, device_id, epoch, event).await;
         }
 
         // ---- governance ops ----
@@ -860,14 +864,18 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
 
     // Per-peer transport-event pump. Forwards every event into
     // the main driver via the command queue so all per-peer state
-    // mutation happens serially.
+    // mutation happens serially. Each event is stamped with this
+    // session's epoch so the driver can drop events from a torn-down
+    // session that's still draining (see `handle_transport_event`).
     let driver_tx = state.cmd_tx.clone();
     let peer_id_for_pump = device_id.clone();
+    let session_epoch = peer.epoch;
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             if driver_tx
                 .send(NetworkCmd::TransportEvent {
                     device_id: peer_id_for_pump.clone(),
+                    epoch: session_epoch,
                     event: ev,
                 })
                 .is_err()
@@ -968,8 +976,25 @@ async fn apply_remote_sdp(
 async fn handle_transport_event(
     state: &Arc<NetworkState>,
     device_id: String,
+    epoch: u64,
     event: TransportEvent,
 ) {
+    // Drop events from a stale session. When a peer is rebuilt (drop +
+    // re-open for the same device id), the old session's event pump keeps
+    // draining for a moment; its trailing `DataChannelClosed` would
+    // otherwise call `drop_peer` on the *replacement* session and force an
+    // immediate, needless rebuild — the duplicate "data channel closed"
+    // lines and the spurious post-HeartbeatTimeout `IceFailed` seen in the
+    // field. If the peer is gone entirely, there's nothing to act on
+    // either. Either way, ignore the event (TRACE so the drop is still
+    // greppable when chasing a transport bug).
+    match state.peers.get(&device_id) {
+        Some(peer) if peer.epoch == epoch => {}
+        _ => {
+            trace!(peer = %device_id, epoch, "ignoring transport event from stale/absent session");
+            return;
+        }
+    }
     match event {
         TransportEvent::LocalIceCandidate(Some(cand)) => {
             // Classify before moving `cand` into the signaling
@@ -1109,12 +1134,12 @@ async fn handle_ice_state_change(
     // "connected"/"stuck" lines. `Disconnected` is the one that was
     // invisible before and matters most — it's a consent-freshness drop on
     // a previously-live link (the trigger the disconnected-watchdog then
-    // acts on), so it's logged at INFO; the routine churn states stay at
+    // acts on), so it's logged at INFO. `Failed` is left at DEBUG here
+    // because `ice_watchdog::on_failed` already emits a WARN for it — no
+    // need for two lines on the same event. The other churn states stay at
     // DEBUG to keep the stream readable.
     let level = match ice {
-        RTCIceConnectionState::Disconnected | RTCIceConnectionState::Failed => {
-            crate::events::DiagLevel::Info
-        }
+        RTCIceConnectionState::Disconnected => crate::events::DiagLevel::Info,
         _ => crate::events::DiagLevel::Debug,
     };
     state.log_diag_with(
@@ -1926,6 +1951,41 @@ mod tests {
         assert!(
             state.peers.contains_key("peer-handshaking"),
             "a peer with no inbound yet (mid-handshake / Sighted) must be left for the re-offer path"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_transport_event_is_ignored() {
+        let state = build_test_state("epoch-guard");
+        insert_session_less_peer(&state, "peer-epoch", Some(Instant::now()));
+        let epoch = state.peers.get("peer-epoch").expect("peer present").epoch;
+
+        // A DataChannelClosed pumped in from a torn-down session (epoch no
+        // longer current) must not drop the live replacement peer — this is
+        // the spurious post-rebuild `IceFailed` we saw amplifying the flap.
+        handle_transport_event(
+            &state,
+            "peer-epoch".to_string(),
+            epoch.wrapping_add(1),
+            TransportEvent::DataChannelClosed,
+        )
+        .await;
+        assert!(
+            state.peers.contains_key("peer-epoch"),
+            "a DataChannelClosed from a stale session epoch must be ignored, not drop the live peer"
+        );
+
+        // The current session's close is still honored.
+        handle_transport_event(
+            &state,
+            "peer-epoch".to_string(),
+            epoch,
+            TransportEvent::DataChannelClosed,
+        )
+        .await;
+        assert!(
+            !state.peers.contains_key("peer-epoch"),
+            "a DataChannelClosed from the current session epoch drops the peer as before"
         );
     }
 }

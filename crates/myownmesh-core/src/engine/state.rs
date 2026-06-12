@@ -98,6 +98,11 @@ pub enum NetworkCmd {
     /// serially.
     TransportEvent {
         device_id: String,
+        /// Epoch of the [`PeerConnection`](super::connection::PeerConnection)
+        /// session this event came from. The driver drops the event if it
+        /// no longer matches the peer's current epoch (a stale, torn-down
+        /// session still draining its event queue).
+        epoch: u64,
         event: TransportEvent,
     },
 
