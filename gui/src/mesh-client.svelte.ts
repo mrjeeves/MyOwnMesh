@@ -476,6 +476,8 @@ function createMeshClient() {
     //   authenticated  → "auth ok with …" (handshake.rs)
     //   approved       → "peer active: …" (handshake.rs)
     //   dropped        → "peer dropped: …" (engine/mod.rs)
+    //   parked         → "parked …" (ladder.rs)
+    //   unparked       → "unparking …" (ladder.rs / engine/mod.rs)
     // Remaining variants (shelved / unshelved / capabilities_changed)
     // have no engine-side diag pair, so the GUI synthesis is the
     // only thing that surfaces them in the log.
@@ -484,6 +486,8 @@ function createMeshClient() {
       case "authenticated":
       case "approved":
       case "dropped":
+      case "parked":
+      case "unparked":
         return null;
       case "shelved": {
         const by_us = (event as { by_us?: boolean }).by_us === true;

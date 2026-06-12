@@ -204,6 +204,7 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
         if let Some(caps) = &hello.capabilities {
             data.capabilities = Some(caps.clone());
         }
+        data.remote_features = hello.features.clone();
     }
 
     state.log_diag_with(

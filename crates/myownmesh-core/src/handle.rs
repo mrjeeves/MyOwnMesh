@@ -205,7 +205,10 @@ impl JoinedNetwork {
 
     /// Reconfigure the topology selector at runtime. Triggers
     /// a synchronous re-evaluation of preferred peers and emits
-    /// any necessary shelve / unshelve frames.
+    /// any necessary shelve / unshelve frames, then re-applies the
+    /// connect-set cap — parking peers that fell out of the new
+    /// connect set (after the linger) and re-dialing any that came
+    /// back in (or all of them, if the new mode has no cap).
     pub async fn set_topology(&self, mode: TopologyMode) -> Result<()> {
         self.state
             .cmd_tx

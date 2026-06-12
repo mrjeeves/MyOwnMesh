@@ -363,12 +363,14 @@
     to: string;
     /** Visual state of the edge. `active` / `shelved` / `transient`
      *  match the prior topology semantics for peer↔hub / peer↔self
-     *  links; `internet`, `lan`, `stun`, `turn`, `blocked` capture
-     *  the new link-kind routing (self↔internet, and any peer routed
-     *  via internet vs. direct). */
+     *  links; `parked` is a presence-only peer with no transport at
+     *  all (connect-set cap); `internet`, `lan`, `stun`, `turn`,
+     *  `blocked` capture the new link-kind routing (self↔internet,
+     *  and any peer routed via internet vs. direct). */
     state:
       | "active"
       | "shelved"
+      | "parked"
       | "transient"
       | "internet"
       | "lan"
@@ -590,6 +592,9 @@
    *  "lan/stun/turn" when the user is reading the green/yellow
    *  active/shelved language). */
   function linkEdgeState(link: LinkKind | null, peer: PeerInfo): LaidOutEdge["state"] {
+    // Parked peers have no transport — link-kind classification is
+    // meaningless for them, so it wins over any stale link reading.
+    if (peer.status === "parked") return "parked";
     if (link === "blocked") return "blocked";
     if (link === "turn") return "turn";
     if (link === "stun") return "stun";
@@ -597,8 +602,11 @@
     return edgeStateFor(peer);
   }
 
-  function edgeStateFor(p: PeerInfo | null): "active" | "shelved" | "transient" {
+  function edgeStateFor(
+    p: PeerInfo | null,
+  ): "active" | "shelved" | "parked" | "transient" {
     if (!p) return "transient";
+    if (p.status === "parked") return "parked";
     if (p.status === "active" && !p.local_shelved && !p.remote_shelved)
       return "active";
     if (
@@ -622,6 +630,7 @@
       return "#4ade80";
     if (p.status === "active") return "#facc15";
     if (p.status === "shelved") return "#facc15";
+    if (p.status === "parked") return "#64748b";
     if (p.status === "pending_approval") return "#a78bfa";
     if (p.status === "handshaking") return "#60a5fa";
     if (p.status === "sighted") return "#94a3b8";
@@ -638,6 +647,8 @@
         return "#4ade80";
       case "shelved":
         return "#6b7280";
+      case "parked":
+        return "#3a3a4a";
       case "stun":
         return "#60a5fa";
       case "turn":
@@ -653,6 +664,7 @@
 
   function edgeDash(state: LaidOutEdge["state"]): string | undefined {
     if (state === "transient" || state === "shelved") return "4 4";
+    if (state === "parked") return "2 6";
     if (state === "turn" || state === "blocked" || state === "stun") return "5 4";
     return undefined;
   }

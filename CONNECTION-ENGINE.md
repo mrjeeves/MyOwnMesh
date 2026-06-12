@@ -54,6 +54,55 @@ prior tier fails to recover.
 | **5. Room rejoin** | Three Tier-4 rounds failed, OR rostered peer offline > `OFFLINE_ROSTERED_CHECK_INTERVAL_MS` (60 s) | Trystero room `leave` + `joinRoom`. Backed off via `REDISCOVERY_BACKOFF_SCHEDULE_MS` (90 s / 3 min / 5 min / 10 min). | Throttle prevents relay-spam after persistent failure. |
 | **6. Stop + Start** | Signaling / STUN / TURN config edit | Reconcile teardown + fresh start, immediately. | Triggered only by user action — never as an automatic recovery. |
 
+## The connect-set cap (parked peers)
+
+Shelving bounds app-traffic fan-out but not *connection* build-up:
+every discovered peer still costs a WebRTC session, ICE keepalives,
+and a heartbeat slot. The connect-set cap bounds that too. The
+topology selector makes a second, larger selection — the **connect
+set** (ring: `n_preferred + RING_DEFAULT_CONNECT_MARGIN` by default,
+`n_connect` in config, `0` disables) — and peers outside it are
+**parked**: no transport at all, presence tracked via signaling
+announces only.
+
+Mechanics, all local and deterministic (no wire frames):
+
+- **Symmetry by construction.** The effective connect set is "my
+  picks, OR any present peer whose own walk picks me" — both ends
+  can evaluate both directions because selectors are pure, so over a
+  converged presence view neither side dials an edge the other
+  side parks. Without the OR, one-way ring shortcuts would flap
+  (one end parks, the other redials).
+- **Announce gate.** An announce from an out-of-connect-set peer
+  creates a Parked entry and never dials. Inbound *offers* are
+  never refused — divergent views and legacy peers get a real
+  session, and the sweep settles it later.
+- **Linger before teardown.** A connected peer must sit outside the
+  connect set for `PARK_LINGER_MS` (60 s) continuously before its
+  transport is closed — hysteresis over transient peer-view
+  divergence and in-flight handshakes.
+- **Legacy exemption.** A handshaken peer that doesn't advertise
+  `topology_park_v1` is never parked — it would treat the teardown
+  as a fault and ladder-climb forever. Its connection stays shelved,
+  exactly the pre-cap behavior.
+- **Approval exemption.** A peer at PendingApproval is never parked
+  out from under the user's approval card.
+- **Presence TTL.** Parked entries have no transport to detect death
+  on; one silent for `PARKED_PRESENCE_TTL_MS` (5 min ≈ 5 missed
+  announces) is removed so a ghost can't hold a ring slot.
+- **Unpark = re-dial.** When the connect set rebalances a parked
+  peer back in (a neighbor died, the ring shifted), the lex-lower
+  side re-enters the normal dial path as Offerer; the other side
+  emits a reactive announce and answers. The warm-standby margin
+  exists so the *traffic* set can usually be restored instantly from
+  already-connected (shelved) peers while the freshly-unparked edge
+  comes up.
+
+Parking never fires for peers in the connect set, never bypasses
+`select_preferred` (the connect set is a superset over the same
+input), and below `n_connect` present peers the cap changes nothing
+— a friend-mesh never parks anyone.
+
 ## Tunables
 
 Constants ported verbatim from MyOwnLLM's `mesh-client.svelte.ts`.
@@ -89,6 +138,10 @@ DEFAULT_SIGNALING_REDUNDANCY        = 5                   // five relays at once
 
 RING_DEFAULT_PREFERRED              = 3                   // 2 neighbors + 1 shortcut
 RING_MIN_PREFERRED                  = 2                   // floor; below this we have no shortcut slot
+RING_DEFAULT_CONNECT_MARGIN         = 2                   // connect set = n_preferred + this (warm standbys)
+
+PARK_LINGER_MS                      = 60_000              // out-of-connect-set grace before transport teardown
+PARKED_PRESENCE_TTL_MS              = 300_000             // parked entry removed after ~5 missed announces
 
 DIAG_MAX                            = 80                  // diag ring buffer cap
 ```

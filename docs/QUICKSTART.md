@@ -210,8 +210,14 @@ The selector is configured per-network and can be changed at runtime:
 ```rust
 use myownmesh_core::TopologyMode;
 
-// Default: ring with 3 preferred neighbors
-net.set_topology(TopologyMode::Ring { n_preferred: Some(3) }).await?;
+// Default: ring with 3 preferred neighbors. `n_connect` caps how
+// many peers get a WebRTC transport at all (preferred + warm
+// standbys); peers beyond it are parked — tracked by signaling
+// presence only. `None` = n_preferred + 2; `Some(0)` disables the cap.
+net.set_topology(TopologyMode::Ring {
+    n_preferred: Some(3),
+    n_connect: None,
+}).await?;
 
 // Star with a fixed hub
 net.set_topology(TopologyMode::Star {

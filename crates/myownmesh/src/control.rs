@@ -1419,7 +1419,10 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
 
 fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {
     match name {
-        "ring" => Ok(TopologyMode::Ring { n_preferred: None }),
+        "ring" => Ok(TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: None,
+        }),
         "star" => {
             let hub = hub.ok_or_else(|| "star topology requires --hub <device_id>".to_string())?;
             Ok(TopologyMode::Star {

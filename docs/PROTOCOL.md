@@ -105,6 +105,18 @@ Each side tracks `local_shelved` (we sent shelve) and `remote_shelved`
 (they sent it) independently. A connection is effectively shelved
 when either flag is set.
 
+### Parking (no wire frames)
+
+The connect-set cap — *parking* peers beyond a per-node transport
+budget — deliberately has **no message kinds**. Both ends run the
+same pure selector over the same presence view and independently
+agree an edge shouldn't exist, so neither dials; there is nothing to
+negotiate. The `topology_park_v1` feature id still rides the `hello`
+`features` list: an engine never parks an established connection to
+a peer that doesn't advertise it, because a legacy peer would treat
+the teardown as a fault and redial. See `CONNECTION-ENGINE.md` for
+the linger / presence-TTL timings.
+
 ---
 
 ## Capabilities

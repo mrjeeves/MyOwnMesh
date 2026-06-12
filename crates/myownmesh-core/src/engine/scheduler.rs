@@ -98,6 +98,25 @@ pub const RELAY_RESCUE_MIN_INTERVAL_MS: u64 = 30_000;
 /// checking-timeout watchdog rebuilds anything still stuck afterward.
 pub const NETWORK_CHANGE_RESTART_COOLDOWN_MS: u64 = 5_000;
 
+/// How long a connected peer must sit continuously outside the
+/// topology's connect set before the engine parks it (closes the
+/// transport). Hysteresis against two transients: peer-view
+/// divergence — both ends compute the connect set from local
+/// presence, and a just-joined peer is visible to one end seconds
+/// before the other — and in-flight handshakes, which get to finish
+/// before the verdict lands. Sized to cover a couple of reactive-
+/// announce round trips plus a full handshake watchdog window.
+pub const PARK_LINGER_MS: u64 = 60_000;
+
+/// Presence TTL for parked peers. A parked entry has no transport to
+/// detect death on, so its liveness is announce-recency: steady-state
+/// announces arrive on a ~60 s cadence, and an entry silent past this
+/// (≈ 5 missed announces) is removed. Without this, a crashed peer
+/// would hold its ring slot forever and the engine would keep
+/// "unparking" (dialing) a ghost whenever the connect set rebalanced
+/// onto it.
+pub const PARKED_PRESENCE_TTL_MS: u64 = 300_000;
+
 /// Tier 5 maximum wait before pruning a reconnecting entry.
 pub const RECONNECTING_GRACE_MS: u64 = 90_000;
 

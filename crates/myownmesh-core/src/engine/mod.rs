@@ -191,6 +191,11 @@ pub async fn run_driver(
 
             _ = reconnect_prune.tick() => {
                 ladder::reconnect_prune_tick(&state).await;
+                // Same cadence drives the park sweep: linger-timer
+                // expiry (a peer continuously out of the connect set
+                // for PARK_LINGER_MS), parked-presence TTL decay, and
+                // unparks the event-driven reevaluations missed.
+                ladder::reevaluate_topology(&state).await;
             }
 
             _ = ice_poll.tick() => {
@@ -346,6 +351,16 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // Rate-limited globally so N peers all reacting to a
             // join don't produce N^2 publishes.
             maybe_reactive_announce(state);
+            // Connect-set gate: when the announcer is outside the
+            // topology's connect set, track its presence as Parked
+            // and never bring up a transport. The reflected
+            // announce above still went out, so the parked peer
+            // learns we exist and computes the same verdict from
+            // its own seat. Inbound *offers* are not gated — see
+            // `park_gate_on_announce`.
+            if ladder::park_gate_on_announce(state, &device_id) {
+                return;
+            }
             // If we already have a session for this peer that's
             // stuck at Sighted (PC created but data channel never
             // opened) and we're the Offerer, re-poke the other
@@ -802,9 +817,37 @@ pub(crate) async fn renegotiate_ice(
     }
 }
 
-async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
-    if state.peers.contains_key(&device_id) {
-        return;
+pub(crate) async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
+    // A Parked entry is a session-less presence placeholder, not a
+    // live connection — replace it and fall through to a fresh dial.
+    // This is both the unpark-by-announce path and the divergence
+    // escape hatch: a peer that offers to us while our view says
+    // "parked" gets a real session (we never refuse inbound), and
+    // the park sweep re-settles once presence views converge.
+    let parked_upgrade = match state.peers.get(&device_id) {
+        Some(existing) => {
+            if existing.state.read().status != PeerStatus::Parked {
+                return;
+            }
+            true
+        }
+        None => false,
+    };
+    if parked_upgrade {
+        state.peers.remove(&device_id);
+        state.emit(MeshEvent::Peer(PeerEvent::Unparked {
+            network_id: state.network_id.clone(),
+            device_id: device_id.clone(),
+        }));
+        state.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "topology",
+            format!(
+                "unparking {} (incoming dial path as {role:?})",
+                short_peer(&device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
+        );
     }
     let cfg = state.config.read().clone();
     let (session, mut rx) = match state

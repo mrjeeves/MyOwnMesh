@@ -137,6 +137,24 @@ pub enum PeerEvent {
         device_id: DeviceId,
         by_us: bool,
     },
+    /// Topology connect-set cap excluded this peer: its transport is
+    /// closed (or was never dialed) and the engine tracks it by
+    /// signaling presence only. Both ends compute the same connect
+    /// set, so no wire frame is involved — this event is the local
+    /// record of the decision.
+    Parked {
+        network_id: String,
+        device_id: DeviceId,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// The connect set rebalanced this previously-parked peer back
+    /// in; the engine is re-establishing a transport (the lex-lower
+    /// side dials, the other side announces and answers).
+    Unparked {
+        network_id: String,
+        device_id: DeviceId,
+    },
     /// Peer's capability advertisement changed. Receivers refresh
     /// their cached copy.
     CapabilitiesChanged {
