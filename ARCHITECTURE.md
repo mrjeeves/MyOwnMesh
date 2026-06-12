@@ -138,9 +138,20 @@ primitive:
 - **FullMesh**. Every peer keeps every other peer active. N²
   channels — intended for small fixed-size deployments.
 
+Ring additionally caps *connections*, not just traffic: beyond the
+preferred set it keeps `n_connect` transports total (default
+`n_preferred + 2`; `0` disables) — the extras sit shelved as warm
+standbys — and **parks** everyone else: no WebRTC session at all,
+presence tracked via signaling announces, re-dialed when the ring
+rebalances them back in. That bounds per-node connection build-up
+to O(n_connect) instead of O(network size). See
+`CONNECTION-ENGINE.md` ("The connect-set cap") for the linger,
+presence-TTL, and mixed-version rules.
+
 Selectors are pure functions. Both sides of any peer pair run the
 same algorithm over the same sorted input and arrive at the same
-answer — that's what makes shelving safe without coordination.
+answer — that's what makes shelving and parking safe without
+coordination.
 
 ## Wire protocol
 

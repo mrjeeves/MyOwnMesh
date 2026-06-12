@@ -46,6 +46,7 @@
       return "#4ade80";
     if (p.status === "active") return "#facc15";
     if (p.status === "shelved") return "#facc15";
+    if (p.status === "parked") return "#64748b";
     if (p.status === "pending_approval") return "#a78bfa";
     if (p.status === "handshaking") return "#60a5fa";
     if (p.status === "sighted") return "#94a3b8";

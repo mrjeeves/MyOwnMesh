@@ -23,7 +23,7 @@ export type MeshPhase =
 // test pins this shape down).
 
 export type TopologyMode =
-  | { kind: "ring"; n_preferred: number | null }
+  | { kind: "ring"; n_preferred: number | null; n_connect?: number | null }
   | { kind: "star"; hub: string }
   | { kind: "full_mesh" };
 
@@ -42,7 +42,7 @@ export function buildTopology(
   name: "ring" | "star" | "full_mesh",
   hub?: string | null,
 ): TopologyMode {
-  if (name === "ring") return { kind: "ring", n_preferred: null };
+  if (name === "ring") return { kind: "ring", n_preferred: null, n_connect: null };
   if (name === "full_mesh") return { kind: "full_mesh" };
   return { kind: "star", hub: hub ?? "" };
 }
@@ -220,6 +220,7 @@ export type PeerStatus =
   | "pending_approval"
   | "active"
   | "shelved"
+  | "parked"
   | "reconnecting"
   | "offline"
   | "error";

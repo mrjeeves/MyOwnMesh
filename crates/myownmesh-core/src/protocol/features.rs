@@ -38,6 +38,18 @@ impl Feature {
     /// the `Unknown` catch-all. See
     /// [`docs/NETWORK-TYPES.md`](../../../../docs/NETWORK-TYPES.md).
     pub const NETWORK_STATE_V1: &'static str = "network_state_v1";
+
+    /// Peer runs the connect-set cap: it parks out-of-connect-set
+    /// peers (closes the transport, tracks presence via signaling)
+    /// and re-dials them when the topology rebalances. No wire
+    /// frames — parking is a local deterministic decision — but the
+    /// flag matters for mixed fleets: the engine never *parks* a
+    /// connected peer that doesn't advertise this, because a legacy
+    /// peer would treat our teardown as a fault and redial forever
+    /// (park → redial → park flap). Legacy peers keep today's
+    /// connect-to-everyone behavior; their connections simply sit
+    /// shelved.
+    pub const TOPOLOGY_PARK_V1: &'static str = "topology_park_v1";
 }
 
 /// The set of features this build advertises to peers. Embedders
@@ -49,6 +61,7 @@ pub const ADVERTISED_FEATURES: &[&str] = &[
     Feature::TYPED_CHANNELS,
     Feature::CAPABILITIES_UPDATE,
     Feature::NETWORK_STATE_V1,
+    Feature::TOPOLOGY_PARK_V1,
 ];
 
 /// Test whether a peer's advertised feature list contains `feature`.

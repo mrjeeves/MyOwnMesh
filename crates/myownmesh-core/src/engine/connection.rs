@@ -31,6 +31,12 @@ pub enum PeerStatus {
     /// Active connection demoted by the topology selector. The
     /// data channel stays open as a heartbeat path.
     Shelved,
+    /// Out of the topology's connect set: no transport at all.
+    /// Presence is tracked via signaling announces; the engine
+    /// re-dials when the connect set rebalances the peer back in.
+    /// Unlike `Offline`, parked is a deliberate steady state, not a
+    /// fault — no reconnection tier ever fires for it.
+    Parked,
     /// Connection dropped; reconnect attempts in progress.
     Reconnecting,
     /// Connection torn down. The engine retains the entry only
@@ -52,6 +58,22 @@ pub struct PeerStateData {
     pub remote_shelved: bool,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
+    /// Feature ids the peer advertised in its `hello`. Empty until a
+    /// handshake has completed (or for legacy peers that predate the
+    /// features list). The park sweep consults this to exempt peers
+    /// that don't speak `topology_park_v1`.
+    pub remote_features: Vec<String>,
+    /// When the connect-set selector first found this (connected)
+    /// peer outside the connect set. Parking only fires after the
+    /// peer has been continuously outside for `PARK_LINGER_MS` —
+    /// hysteresis that absorbs transient peer-view divergence while
+    /// announces propagate. Cleared whenever the peer is back in.
+    pub park_pending_since: Option<Instant>,
+    /// Last signaling announce observed while parked. Parked entries
+    /// have no transport to detect death on, so presence decays by
+    /// announce-recency: entries silent past
+    /// `PARKED_PRESENCE_TTL_MS` are removed by the park sweep.
+    pub last_announce_at: Option<Instant>,
     pub nonce_sent: Option<String>,
     pub nonce_received: Option<String>,
     pub verification_code_sent: Option<String>,
@@ -134,6 +156,9 @@ impl Default for PeerStateData {
             remote_shelved: false,
             label: String::new(),
             capabilities: None,
+            remote_features: Vec::new(),
+            park_pending_since: None,
+            last_announce_at: None,
             nonce_sent: None,
             nonce_received: None,
             verification_code_sent: None,

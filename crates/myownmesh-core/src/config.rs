@@ -29,9 +29,19 @@ pub enum TopologyMode {
     /// Default. Auto-healing ring with `n_preferred` neighbors (2
     /// immediate + (n-2) shortcuts). Missing/null `n_preferred`
     /// defaults to 3.
+    ///
+    /// `n_connect` caps how many peers we keep WebRTC transports to
+    /// (the *connect set*: the preferred set plus a warm standby
+    /// margin for fast failover). Peers beyond the cap are *parked* —
+    /// presence tracked via signaling, no transport at all — instead
+    /// of shelved-but-connected. Missing/null defaults to
+    /// `n_preferred + DEFAULT_RING_CONNECT_MARGIN`; an explicit `0`
+    /// disables the cap (connect to everyone, pre-parking behavior).
     Ring {
         #[serde(default)]
         n_preferred: Option<u32>,
+        #[serde(default)]
+        n_connect: Option<u32>,
     },
     /// All spokes route through a single, config-named hub. Hub holds
     /// all peers active; spokes shelve everyone but the hub.
@@ -43,7 +53,10 @@ pub enum TopologyMode {
 
 impl Default for TopologyMode {
     fn default() -> Self {
-        TopologyMode::Ring { n_preferred: None }
+        TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: None,
+        }
     }
 }
 
@@ -52,14 +65,36 @@ impl TopologyMode {
     /// 1 shortcut). Used when a Ring config omits the field.
     pub const DEFAULT_RING_N_PREFERRED: u32 = 3;
 
+    /// Warm-standby margin added to `n_preferred` when a Ring config
+    /// omits `n_connect`. The extra transports are the next-closest
+    /// ring positions, kept open (shelved) so a preferred peer's
+    /// death promotes a standby without paying a fresh dial.
+    pub const DEFAULT_RING_CONNECT_MARGIN: u32 = 2;
+
     /// Resolve the effective `n_preferred` for a Ring topology,
     /// substituting the default when the field is None. Other
     /// topology modes return 0 — they don't use this value.
     pub fn effective_n_preferred(&self) -> u32 {
         match self {
-            TopologyMode::Ring { n_preferred } => {
+            TopologyMode::Ring { n_preferred, .. } => {
                 n_preferred.unwrap_or(Self::DEFAULT_RING_N_PREFERRED)
             }
+            _ => 0,
+        }
+    }
+
+    /// Resolve the effective connect-set cap for a Ring topology:
+    /// the configured `n_connect`, defaulting to `n_preferred +
+    /// DEFAULT_RING_CONNECT_MARGIN`, floored at `n_preferred` (the
+    /// connect set must cover the traffic set). `0` is preserved
+    /// as-is — it means "no cap". Other topology modes return 0.
+    pub fn effective_n_connect(&self) -> u32 {
+        match self {
+            TopologyMode::Ring { n_connect, .. } => match n_connect {
+                Some(0) => 0,
+                Some(n) => (*n).max(self.effective_n_preferred()),
+                None => self.effective_n_preferred() + Self::DEFAULT_RING_CONNECT_MARGIN,
+            },
             _ => 0,
         }
     }
@@ -587,17 +622,27 @@ mod tests {
     fn topology_default_is_ring() {
         let t = TopologyMode::default();
         match t {
-            TopologyMode::Ring { n_preferred } => assert!(n_preferred.is_none()),
+            TopologyMode::Ring {
+                n_preferred,
+                n_connect,
+            } => {
+                assert!(n_preferred.is_none());
+                assert!(n_connect.is_none());
+            }
             _ => panic!("default topology should be ring"),
         }
     }
 
     #[test]
     fn topology_effective_n_preferred_falls_back() {
-        let r = TopologyMode::Ring { n_preferred: None };
+        let r = TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: None,
+        };
         assert_eq!(r.effective_n_preferred(), 3);
         let r5 = TopologyMode::Ring {
             n_preferred: Some(5),
+            n_connect: None,
         };
         assert_eq!(r5.effective_n_preferred(), 5);
         // Non-Ring topologies don't have an n_preferred — return 0.
@@ -605,9 +650,50 @@ mod tests {
     }
 
     #[test]
+    fn topology_effective_n_connect_resolution() {
+        // Omitted → n_preferred + margin.
+        let r = TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: None,
+        };
+        assert_eq!(r.effective_n_connect(), 3 + 2);
+        // Explicit value wins…
+        let r7 = TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: Some(7),
+        };
+        assert_eq!(r7.effective_n_connect(), 7);
+        // …but is floored at n_preferred so the connect set always
+        // covers the traffic set.
+        let floor = TopologyMode::Ring {
+            n_preferred: Some(5),
+            n_connect: Some(2),
+        };
+        assert_eq!(floor.effective_n_connect(), 5);
+        // Explicit 0 = cap disabled.
+        let off = TopologyMode::Ring {
+            n_preferred: None,
+            n_connect: Some(0),
+        };
+        assert_eq!(off.effective_n_connect(), 0);
+        // Non-Ring topologies never cap.
+        assert_eq!(TopologyMode::FullMesh.effective_n_connect(), 0);
+    }
+
+    /// A pre-`n_connect` config file (no field at all) must keep
+    /// parsing — absence means "use the default cap".
+    #[test]
+    fn topology_ring_parses_without_n_connect() {
+        let t: TopologyMode = serde_json::from_str(r#"{"kind":"ring","n_preferred":4}"#).unwrap();
+        assert_eq!(t.effective_n_preferred(), 4);
+        assert_eq!(t.effective_n_connect(), 4 + 2);
+    }
+
+    #[test]
     fn topology_serde_tags_by_kind() {
         let ring = TopologyMode::Ring {
             n_preferred: Some(3),
+            n_connect: None,
         };
         let s = serde_json::to_string(&ring).unwrap();
         assert!(s.contains("\"kind\":\"ring\""), "got: {s}");

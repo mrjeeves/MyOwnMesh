@@ -31,7 +31,10 @@ fn current(state: &Arc<NetworkState>) -> MeshPhase {
             PeerStatus::PendingApproval => any_authenticated = true,
             PeerStatus::Handshaking | PeerStatus::Sighted => any_sighted = true,
             PeerStatus::Reconnecting => any_reconnecting = true,
-            PeerStatus::Offline | PeerStatus::Error => {}
+            // Parked is a deliberate steady state (peer present, no
+            // transport by topology decision) — it neither makes the
+            // mesh Active nor Degraded.
+            PeerStatus::Parked | PeerStatus::Offline | PeerStatus::Error => {}
         }
     }
     if any_active {

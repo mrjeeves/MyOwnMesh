@@ -18,17 +18,41 @@ use super::Topology;
 #[derive(Debug, Clone, Copy)]
 pub struct RingSelector {
     pub n_preferred: u32,
+    /// Connect-set cap: how many peers to keep WebRTC transports to
+    /// (preferred peers + warm standbys). `0` disables the cap —
+    /// every present peer gets a transport, none are parked. When
+    /// set, it is used floored at `n_preferred` so the connect set
+    /// always covers the traffic set.
+    pub n_connect: u32,
 }
 
 impl Default for RingSelector {
     fn default() -> Self {
-        Self { n_preferred: 3 }
+        Self {
+            n_preferred: 3,
+            n_connect: 5,
+        }
     }
 }
 
 impl Topology for RingSelector {
     fn select_preferred(&self, self_id: &str, peer_ids: &[String]) -> HashSet<String> {
         select_ring_neighbors(self_id, peer_ids, self.n_preferred)
+    }
+
+    fn select_connect(&self, self_id: &str, peer_ids: &[String]) -> Option<HashSet<String>> {
+        if self.n_connect == 0 {
+            return None;
+        }
+        // Same outward ring walk with a larger n. The walk picks in a
+        // deterministic order, so over the same input the result is a
+        // strict prefix relation: select(n1) ⊆ select(n2) for n1 ≤ n2
+        // — the connect set always covers the preferred set.
+        Some(select_ring_neighbors(
+            self_id,
+            peer_ids,
+            self.n_connect.max(self.n_preferred),
+        ))
     }
 }
 
@@ -202,6 +226,56 @@ mod tests {
         let r1 = select_ring_neighbors("a", &peers, 3);
         let r2 = select_ring_neighbors("a", &peers, 3);
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn connect_set_is_superset_of_preferred() {
+        // The park machinery relies on this: a peer must never be
+        // preferred (traffic-bearing) while outside the connect set
+        // (transport-bearing) over the same input.
+        let peers = s(&["b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        let sel = RingSelector {
+            n_preferred: 3,
+            n_connect: 5,
+        };
+        let preferred = sel.select_preferred("a", &peers);
+        let connect = sel.select_connect("a", &peers).expect("cap enabled");
+        assert_eq!(connect.len(), 5);
+        for p in &preferred {
+            assert!(connect.contains(p), "preferred {p} missing from connect");
+        }
+    }
+
+    #[test]
+    fn connect_set_zero_disables_cap() {
+        let sel = RingSelector {
+            n_preferred: 3,
+            n_connect: 0,
+        };
+        assert!(sel.select_connect("a", &s(&["b", "c"])).is_none());
+    }
+
+    #[test]
+    fn connect_set_floored_at_n_preferred() {
+        // A misconfigured n_connect below n_preferred must not shrink
+        // the transport set under the traffic set.
+        let peers = s(&["b", "c", "d", "e", "f", "g"]);
+        let sel = RingSelector {
+            n_preferred: 4,
+            n_connect: 2,
+        };
+        let connect = sel.select_connect("a", &peers).expect("cap enabled");
+        assert_eq!(connect.len(), 4);
+    }
+
+    #[test]
+    fn connect_set_below_capacity_keeps_everyone() {
+        // 4 peers, cap 5 → nobody parked; small meshes are unchanged
+        // by the cap.
+        let peers = s(&["b", "c", "d", "e"]);
+        let sel = RingSelector::default();
+        let connect = sel.select_connect("a", &peers).expect("cap enabled");
+        assert_eq!(connect.len(), peers.len());
     }
 
     #[test]
