@@ -219,7 +219,7 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
         };
         if let Some(used) = extended {
             state.log_diag_with(
-                DiagLevel::Info,
+                DiagLevel::Debug,
                 "ice",
                 format!(
                     "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \

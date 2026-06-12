@@ -387,7 +387,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 match session.create_offer().await {
                     Ok(desc) => {
                         state.log_diag_with(
-                            crate::events::DiagLevel::Info,
+                            crate::events::DiagLevel::Debug,
                             "signaling",
                             format!("re-offer to {} (stuck at Sighted)", short_peer(&device_id)),
                             serde_json::json!({
@@ -736,7 +736,7 @@ pub(crate) async fn renegotiate_ice(
         .map(|p| p.state.read().diag.ice_restarts)
         .unwrap_or(0);
     state.log_diag_with(
-        crate::events::DiagLevel::Info,
+        crate::events::DiagLevel::Debug,
         "ice",
         format!(
             "ICE renegotiation for {} — trigger={trigger}, role={}, forced={force}, from={ice_before:?} (#{restarts})",
@@ -1042,7 +1042,7 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
         Some(session) => match session.create_offer().await {
             Ok(desc) => {
                 state.log_diag_with(
-                    crate::events::DiagLevel::Info,
+                    crate::events::DiagLevel::Debug,
                     "signaling",
                     format!(
                         "re-offer to {} (answer could not be applied)",
@@ -1136,7 +1136,7 @@ async fn handle_transport_event(
                 (0, 0, 0)
             };
             state.log_diag_with(
-                crate::events::DiagLevel::Info,
+                crate::events::DiagLevel::Debug,
                 "ice",
                 format!(
                     "local gathering complete for {} — {h} host · {s} srflx · {r} relay",
@@ -1439,8 +1439,12 @@ pub(crate) async fn log_ice_check_snapshot(
         "snapshot": snap,
     });
     if full {
-        let mut msg = format!(
-            "ICE check for {} ({context}): {} local · {} remote · {} pairs · {} succeeded\n  → {}",
+        // Concise one-liner at WARN — counts plus the plain-language
+        // diagnosis (e.g. "no remote candidates arrived"). This is the part
+        // worth seeing on the default stream; the per-candidate / per-pair
+        // dump below is deep instrumentation kept behind debug.
+        let header = format!(
+            "ICE check for {} ({context}): {} local · {} remote · {} pairs · {} succeeded — {}",
             short_peer(device_id),
             snap.local_candidates.len(),
             snap.remote_candidates.len(),
@@ -1448,40 +1452,48 @@ pub(crate) async fn log_ice_check_snapshot(
             snap.succeeded_pairs(),
             snap.diagnosis(),
         );
-        msg.push_str(&format!(
-            "\n  local : {}",
-            render_candidate_list(&snap.local_candidates)
-        ));
-        msg.push_str(&format!(
-            "\n  remote: {}",
-            render_candidate_list(&snap.remote_candidates)
-        ));
-        // Per-pair: only `state` and `nominated` are real — webrtc-ice
-        // 0.13 leaves the STUN/byte counters at zero (see
-        // `diag::IcePairSnapshot`), so printing them was pure noise. Cap
-        // the dump: a churning agent can form 150+ pairs and the full list
-        // is what was drowning the log. The pairs are pre-sorted
-        // nominated→succeeded→active, so the capped head is the
-        // informative part; the tail is summarized.
-        const MAX_PAIRS_LOGGED: usize = 12;
-        for p in snap.pairs.iter().take(MAX_PAIRS_LOGGED) {
-            msg.push_str(&format!(
-                "\n  {} ⇄ {} [{}{}]",
-                p.local,
-                p.remote,
-                p.state,
-                if p.nominated { " NOMINATED" } else { "" },
-            ));
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "ice",
+            header,
+            detail.clone(),
+        );
+
+        // Skip building the (potentially long) candidate/pair dump unless
+        // debug logging is actually on — it only ever rendered at debug now.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let mut msg = format!(
+                "ICE detail for {} ({context}):\n  local : {}\n  remote: {}",
+                short_peer(device_id),
+                render_candidate_list(&snap.local_candidates),
+                render_candidate_list(&snap.remote_candidates),
+            );
+            // Per-pair: only `state` and `nominated` are real — webrtc-ice
+            // 0.13 leaves the STUN/byte counters at zero (see
+            // `diag::IcePairSnapshot`), so printing them was pure noise. Cap
+            // the dump: a churning agent can form 150+ pairs. The pairs are
+            // pre-sorted nominated→succeeded→active, so the capped head is the
+            // informative part; the tail is summarized.
+            const MAX_PAIRS_LOGGED: usize = 12;
+            for p in snap.pairs.iter().take(MAX_PAIRS_LOGGED) {
+                msg.push_str(&format!(
+                    "\n  {} ⇄ {} [{}{}]",
+                    p.local,
+                    p.remote,
+                    p.state,
+                    if p.nominated { " NOMINATED" } else { "" },
+                ));
+            }
+            if snap.pairs.len() > MAX_PAIRS_LOGGED {
+                let hidden = snap.pairs.len() - MAX_PAIRS_LOGGED;
+                let failed = snap.pairs.iter().filter(|p| p.state == "failed").count();
+                msg.push_str(&format!(
+                    "\n  (… and {hidden} more pairs not shown · {failed} failed of {} total)",
+                    snap.pairs.len(),
+                ));
+            }
+            state.log_diag_with(crate::events::DiagLevel::Debug, "ice", msg, detail);
         }
-        if snap.pairs.len() > MAX_PAIRS_LOGGED {
-            let hidden = snap.pairs.len() - MAX_PAIRS_LOGGED;
-            let failed = snap.pairs.iter().filter(|p| p.state == "failed").count();
-            msg.push_str(&format!(
-                "\n  (… and {hidden} more pairs not shown · {failed} failed of {} total)",
-                snap.pairs.len(),
-            ));
-        }
-        state.log_diag_with(crate::events::DiagLevel::Warn, "ice", msg, detail);
     } else {
         let msg = format!(
             "ICE checking {} — {}/{} pairs succeeded · {}",
