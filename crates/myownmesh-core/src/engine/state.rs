@@ -561,6 +561,7 @@ impl NetworkState {
     pub async fn send_video_sample(
         &self,
         peer: &str,
+        lane: u8,
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
@@ -573,7 +574,7 @@ impl NetworkState {
         };
         let session =
             session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
-        session.send_video(data, duration).await
+        session.send_video(lane, data, duration).await
     }
 
     /// Subscribe to audio frames from every peer on this network
@@ -598,6 +599,7 @@ impl NetworkState {
     pub async fn send_audio_sample(
         &self,
         peer: &str,
+        lane: u8,
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
@@ -610,7 +612,7 @@ impl NetworkState {
         };
         let session =
             session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
-        session.send_audio(data, duration).await
+        session.send_audio(lane, data, duration).await
     }
 
     /// Send a channel frame to one peer via the command queue.

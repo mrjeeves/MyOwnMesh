@@ -25,4 +25,5 @@ pub use diag::{
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
 pub use webrtc::{
     AudioSample, LocalIceCandidate, PeerSession, Role, Transport, TransportEvent, VideoSample,
+    MEDIA_LANES,
 };

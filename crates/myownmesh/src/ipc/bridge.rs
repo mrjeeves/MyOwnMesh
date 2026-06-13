@@ -238,6 +238,7 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
             let frame = ServerOut::VideoInbound {
                 network: network_key.clone(),
                 from: inbound.from,
+                stream: inbound.sample.lane,
                 rtp_timestamp: inbound.sample.rtp_timestamp,
                 key: inbound.sample.key,
                 data: data_encoding::BASE64.encode(&inbound.sample.data),
@@ -279,6 +280,7 @@ pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: 
             let frame = ServerOut::AudioInbound {
                 network: network_key.clone(),
                 from: inbound.from,
+                stream: inbound.sample.lane,
                 rtp_timestamp: inbound.sample.rtp_timestamp,
                 data: data_encoding::BASE64.encode(&inbound.sample.data),
             };
