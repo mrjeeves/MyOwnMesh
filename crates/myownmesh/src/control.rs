@@ -315,6 +315,11 @@ pub enum Request {
     VideoSend {
         network: String,
         peer: String,
+        /// Which of the peer's video lanes to write to (0–7, the lane pool).
+        /// Defaults to lane 0, so a client from before the lane pool — which
+        /// omits the field — still writes the single original lane.
+        #[serde(default)]
+        stream: u8,
         duration_us: u64,
         data: String,
     },
@@ -339,6 +344,11 @@ pub enum Request {
     AudioSend {
         network: String,
         peer: String,
+        /// Which of the peer's audio lanes to write to (0–7, the lane pool).
+        /// Defaults to lane 0 for pre-pool clients, exactly like
+        /// [`Request::VideoSend`].
+        #[serde(default)]
+        stream: u8,
         duration_us: u64,
         data: String,
     },
@@ -556,6 +566,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             "version": env!("CARGO_PKG_VERSION"),
             "device_id": state.mesh.identity().display_id(),
             "joined_networks": state.mesh.joined_network_ids(),
+            // How many independent video/audio lanes each peer connection
+            // provisions. A client reads this to know how many simultaneous
+            // streams to one peer it can send at full quality (the rest fall
+            // back to MJPEG); absent means a pre-pool daemon — one lane.
+            "media_lanes": myownmesh_core::transport::MEDIA_LANES,
         })),
         Request::IdentityShow => Response::ok(serde_json::json!({
             "device_id": state.mesh.identity().display_id(),
@@ -1025,6 +1040,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         Request::VideoSend {
             network,
             peer,
+            stream,
             duration_us,
             data,
         } => {
@@ -1039,6 +1055,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 .state()
                 .send_video_sample(
                     &peer,
+                    stream,
                     bytes.into(),
                     std::time::Duration::from_micros(duration_us),
                 )
@@ -1073,6 +1090,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         Request::AudioSend {
             network,
             peer,
+            stream,
             duration_us,
             data,
         } => {
@@ -1087,6 +1105,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 .state()
                 .send_audio_sample(
                     &peer,
+                    stream,
                     bytes.into(),
                     std::time::Duration::from_micros(duration_us),
                 )

@@ -119,26 +119,50 @@ pub enum TransportEvent {
     AudioSample(AudioSample),
 }
 
-/// One H.264 access unit off the peer's video track — Annex-B bytes
+/// One H.264 access unit off a peer's video track — Annex-B bytes
 /// ready for a decoder. `rtp_timestamp` ticks at the 90 kHz video
-/// clock; `key` marks an IDR (a safe decode entry point).
+/// clock; `key` marks an IDR (a safe decode entry point); `lane` is
+/// which of the peer's video lanes it arrived on (see [`MEDIA_LANES`]).
 #[derive(Debug, Clone)]
 pub struct VideoSample {
     pub rtp_timestamp: u32,
     pub key: bool,
+    pub lane: u8,
     pub data: Bytes,
 }
 
-/// One Opus frame off the peer's audio track — exactly one frame per
+/// One Opus frame off a peer's audio track — exactly one frame per
 /// RTP packet (RFC 7587), so there is no reassembly: the payload is
 /// decoder-ready as it arrives. `rtp_timestamp` ticks at the 48 kHz
-/// Opus clock. Frames are surfaced in arrival order; a reordered
-/// packet (rare on the paths this rides) costs one frame of fidelity,
-/// never a wedged stream.
+/// Opus clock; `lane` is which of the peer's audio lanes it arrived on.
+/// Frames are surfaced in arrival order; a reordered packet (rare on
+/// the paths this rides) costs one frame of fidelity, never a wedged
+/// stream.
 #[derive(Debug, Clone)]
 pub struct AudioSample {
     pub rtp_timestamp: u32,
+    pub lane: u8,
     pub data: Bytes,
+}
+
+/// How many independent media lanes (RTP tracks) every peer connection
+/// provisions, for video and for audio alike. One track per lane is added
+/// up front — both roles add them before SDP runs, so a single offer/answer
+/// negotiates them all and no renegotiation path need exist — so a peer can
+/// carry several simultaneous streams (e.g. two screens of one machine, each
+/// crisp H.264) without them sharing, and so interleaving, a single lane. An
+/// idle lane costs nothing: no samples written, no RTP sent. Lane 0 is the
+/// original single lane: a peer that predates the pool negotiates only it,
+/// and everything still works on lane 0.
+pub const MEDIA_LANES: usize = 8;
+
+/// The lane a track id encodes (`"video-3"` → 3). A bare `"video"` /
+/// `"audio"` id — a peer from before the lane pool — is lane 0.
+fn lane_of_track_id(id: &str) -> u8 {
+    id.rsplit_once('-')
+        .and_then(|(_, n)| n.parse::<u8>().ok())
+        .filter(|n| (*n as usize) < MEDIA_LANES)
+        .unwrap_or(0)
 }
 
 /// One locally-gathered ICE candidate, in the form the signaling
@@ -255,50 +279,57 @@ impl Transport {
 
         register_callbacks(&pc, &events_tx, &data_channel);
 
-        // One H.264 video lane, provisioned on **every** connection at
-        // setup — both roles add the local track before SDP runs, so the
-        // one offer/answer negotiates a sendrecv video m-line once and
-        // for all, and no renegotiation path needs to exist anywhere.
-        // An idle lane costs nothing: no samples written, no RTP sent.
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                ..Default::default()
-            },
-            "video".to_string(),
-            "myownmesh".to_string(),
-        ));
-        let rtp_sender = pc
-            .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-            .map_err(|e| Error::Transport(format!("add_track: {e}")))?;
-        // Drain the sender's RTCP so its interceptors (NACK responder,
-        // reports) actually run; the task ends with the connection.
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while rtp_sender.read(&mut buf).await.is_ok() {}
-        });
+        // A pool of H.264 video lanes and Opus audio lanes, provisioned on
+        // **every** connection at setup — both roles add the local tracks
+        // before SDP runs, so the one offer/answer negotiates every
+        // sendrecv m-line once and for all, and no renegotiation path needs
+        // to exist anywhere. Each lane is a distinct track whose id carries
+        // its index (`video-0`…, `audio-0`…), so the far side knows which
+        // lane a sample arrived on and several streams to one peer never
+        // share — and so interleave on — a single track. An idle lane costs
+        // nothing: no samples written, no RTP sent. Lane 0 is the original
+        // single lane, so a peer that predates the pool negotiates just it.
+        let mut video_tracks = Vec::with_capacity(MEDIA_LANES);
+        let mut audio_tracks = Vec::with_capacity(MEDIA_LANES);
+        for lane in 0..MEDIA_LANES {
+            let video_track = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_H264.to_owned(),
+                    ..Default::default()
+                },
+                format!("video-{lane}"),
+                "myownmesh".to_string(),
+            ));
+            let rtp_sender = pc
+                .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+                .await
+                .map_err(|e| Error::Transport(format!("add_track (video lane {lane}): {e}")))?;
+            // Drain the sender's RTCP so its interceptors (NACK responder,
+            // reports) actually run; the task ends with the connection.
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1500];
+                while rtp_sender.read(&mut buf).await.is_ok() {}
+            });
+            video_tracks.push(video_track);
 
-        // And one Opus audio lane, provisioned the same way for the same
-        // reason: the single offer/answer negotiates a sendrecv audio
-        // m-line up front, no renegotiation machinery anywhere, and an
-        // idle lane costs nothing.
-        let audio_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                ..Default::default()
-            },
-            "audio".to_string(),
-            "myownmesh".to_string(),
-        ));
-        let audio_sender = pc
-            .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-            .map_err(|e| Error::Transport(format!("add_track (audio): {e}")))?;
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            while audio_sender.read(&mut buf).await.is_ok() {}
-        });
+            let audio_track = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    ..Default::default()
+                },
+                format!("audio-{lane}"),
+                "myownmesh".to_string(),
+            ));
+            let audio_sender = pc
+                .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
+                .await
+                .map_err(|e| Error::Transport(format!("add_track (audio lane {lane}): {e}")))?;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1500];
+                while audio_sender.read(&mut buf).await.is_ok() {}
+            });
+            audio_tracks.push(audio_track);
+        }
 
         // Offerer creates the data channel synchronously so the
         // resulting SDP includes it. Answerer waits for the
@@ -323,8 +354,8 @@ impl Transport {
             PeerSession {
                 pc,
                 data_channel,
-                video_track,
-                audio_track,
+                video_tracks,
+                audio_tracks,
                 events_tx,
                 role,
             },
@@ -431,6 +462,7 @@ fn register_callbacks(
 /// non-empty payload surfaces directly as [`TransportEvent::AudioSample`].
 /// Ends when the track does (peer connection closed).
 async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+    let lane = lane_of_track_id(&track.id());
     loop {
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
@@ -441,6 +473,7 @@ async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
         }
         let sample = AudioSample {
             rtp_timestamp: pkt.header.timestamp,
+            lane,
             data: pkt.payload.clone(),
         };
         if tx.send(TransportEvent::AudioSample(sample)).is_err() {
@@ -453,6 +486,7 @@ async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
 /// units and surface each as [`TransportEvent::VideoSample`]. Ends
 /// when the track does (peer connection closed).
 async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+    let lane = lane_of_track_id(&track.id());
     let mut assembler = H264AuAssembler::default();
     loop {
         let pkt = match track.read_rtp().await {
@@ -460,7 +494,8 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
             Err(_) => break, // track ended with its connection
         };
         match assembler.push(&pkt) {
-            Ok(Some(sample)) => {
+            Ok(Some(mut sample)) => {
+                sample.lane = lane;
                 if tx.send(TransportEvent::VideoSample(sample)).is_err() {
                     break;
                 }
@@ -603,6 +638,9 @@ impl H264AuAssembler {
         Ok(Some(VideoSample {
             rtp_timestamp: self.timestamp,
             key: au_has_idr(&data),
+            // The pump that owns the track stamps the real lane; the
+            // assembler is lane-agnostic.
+            lane: 0,
             data,
         }))
     }
@@ -790,13 +828,13 @@ fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
 }
 
 /// One peer's WebRTC session — peer connection, application data
-/// channel, the provisioned video track lane, and transport-level
-/// event sink.
+/// channel, the provisioned pool of video + audio track lanes (see
+/// [`MEDIA_LANES`]), and transport-level event sink.
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-    video_track: Arc<TrackLocalStaticSample>,
-    audio_track: Arc<TrackLocalStaticSample>,
+    video_tracks: Vec<Arc<TrackLocalStaticSample>>,
+    audio_tracks: Vec<Arc<TrackLocalStaticSample>>,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
     role: Role,
 }
@@ -872,35 +910,55 @@ impl PeerSession {
             .map_err(|e| Error::Transport(format!("data channel send: {e}")))
     }
 
-    /// Write one encoded H.264 access unit (Annex-B) onto this peer's
-    /// video lane. `duration` paces the RTP timestamp advance (1/fps).
-    /// Before the lane's negotiation completes, webrtc-rs treats the
-    /// write as a no-op (the track has no bound sender yet) — callers
-    /// can simply start writing once the peer is up.
-    pub async fn send_video(&self, data: Bytes, duration: std::time::Duration) -> Result<()> {
-        self.video_track
+    /// Write one encoded H.264 access unit (Annex-B) onto `lane` of this
+    /// peer's video pool. `duration` paces the RTP timestamp advance
+    /// (1/fps). Before the lane's negotiation completes, webrtc-rs treats
+    /// the write as a no-op (the track has no bound sender yet) — callers
+    /// can simply start writing once the peer is up. A lane past the pool
+    /// (or one a pre-pool peer never negotiated) errors rather than writing
+    /// to the wrong stream.
+    pub async fn send_video(
+        &self,
+        lane: u8,
+        data: Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let track = self
+            .video_tracks
+            .get(lane as usize)
+            .ok_or_else(|| Error::Transport(format!("no video lane {lane}")))?;
+        track
             .write_sample(&Sample {
                 data,
                 duration,
                 ..Default::default()
             })
             .await
-            .map_err(|e| Error::Transport(format!("video write_sample: {e}")))
+            .map_err(|e| Error::Transport(format!("video write_sample (lane {lane}): {e}")))
     }
 
-    /// Write one encoded Opus frame onto this peer's audio lane.
+    /// Write one encoded Opus frame onto `lane` of this peer's audio pool.
     /// `duration` paces the RTP timestamp advance (the frame length —
-    /// 20 ms for the canonical Opus frame). Same pre-negotiation
-    /// no-op semantics as [`Self::send_video`].
-    pub async fn send_audio(&self, data: Bytes, duration: std::time::Duration) -> Result<()> {
-        self.audio_track
+    /// 20 ms for the canonical Opus frame). Same pre-negotiation no-op and
+    /// out-of-range semantics as [`Self::send_video`].
+    pub async fn send_audio(
+        &self,
+        lane: u8,
+        data: Bytes,
+        duration: std::time::Duration,
+    ) -> Result<()> {
+        let track = self
+            .audio_tracks
+            .get(lane as usize)
+            .ok_or_else(|| Error::Transport(format!("no audio lane {lane}")))?;
+        track
             .write_sample(&Sample {
                 data,
                 duration,
                 ..Default::default()
             })
             .await
-            .map_err(|e| Error::Transport(format!("audio write_sample: {e}")))
+            .map_err(|e| Error::Transport(format!("audio write_sample (lane {lane}): {e}")))
     }
 
     /// Force ICE restart. Used by the engine's Tier 2.5 / Tier 3
@@ -1106,6 +1164,22 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn track_id_carries_its_lane() {
+        // The id a lane's track advertises round-trips to its index…
+        assert_eq!(lane_of_track_id("video-0"), 0);
+        assert_eq!(lane_of_track_id("video-3"), 3);
+        assert_eq!(lane_of_track_id("audio-7"), 7);
+        // …a bare id from a pre-pool peer is lane 0…
+        assert_eq!(lane_of_track_id("video"), 0);
+        assert_eq!(lane_of_track_id("audio"), 0);
+        // …and anything out of range or unparseable falls back to 0 rather
+        // than indexing a lane that doesn't exist.
+        assert_eq!(lane_of_track_id(&format!("video-{MEDIA_LANES}")), 0);
+        assert_eq!(lane_of_track_id("video-x"), 0);
+        assert_eq!(lane_of_track_id("weird"), 0);
+    }
 
     // ---- ICE interface filter -----------------------------------------
 
@@ -1497,8 +1571,11 @@ mod tests {
         while received.is_none() && tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = send_tick.tick() => {
+                    // A non-zero lane proves the whole pool negotiates and the
+                    // far side recovers the lane from the track id (not just
+                    // lane 0): write on lane 3, expect it back tagged lane 3.
                     let _ = offerer
-                        .send_video(Bytes::from(au.clone()), std::time::Duration::from_millis(33))
+                        .send_video(3, Bytes::from(au.clone()), std::time::Duration::from_millis(33))
                         .await;
                 }
                 Some(ev) = off_rx.recv() => {
@@ -1521,6 +1598,7 @@ mod tests {
         let sample = received.expect("answerer never received a video sample");
         assert_eq!(sample.data.as_ref(), &au[..], "AU survives byte-exact");
         assert!(sample.key, "IDR unit arrives key-flagged");
+        assert_eq!(sample.lane, 3, "the lane survives the round-trip");
 
         offerer.close().await.expect("close offerer");
         answerer.close().await.expect("close answerer");
@@ -1570,8 +1648,10 @@ mod tests {
         while received.is_none() && tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = send_tick.tick() => {
+                    // A different non-zero lane (audio pool is independent):
+                    // write on lane 5, expect it back tagged lane 5.
                     let _ = offerer
-                        .send_audio(Bytes::from(frame.clone()), std::time::Duration::from_millis(20))
+                        .send_audio(5, Bytes::from(frame.clone()), std::time::Duration::from_millis(20))
                         .await;
                 }
                 Some(ev) = off_rx.recv() => {
@@ -1597,6 +1677,7 @@ mod tests {
             &frame[..],
             "frame survives byte-exact"
         );
+        assert_eq!(sample.lane, 5, "the lane survives the round-trip");
 
         offerer.close().await.expect("close offerer");
         answerer.close().await.expect("close answerer");

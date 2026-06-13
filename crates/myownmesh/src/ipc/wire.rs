@@ -75,6 +75,9 @@ pub enum ServerOut {
     VideoInbound {
         network: String,
         from: String,
+        /// Which of the peer's video lanes the unit arrived on — lets a
+        /// subscriber keep several simultaneous streams from one peer apart.
+        stream: u8,
         rtp_timestamp: u32,
         key: bool,
         data: String,
@@ -83,6 +86,8 @@ pub enum ServerOut {
     AudioInbound {
         network: String,
         from: String,
+        /// Which of the peer's audio lanes the frame arrived on.
+        stream: u8,
         rtp_timestamp: u32,
         data: String,
     },
