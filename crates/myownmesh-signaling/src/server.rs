@@ -601,6 +601,23 @@ impl HubInner {
                 return;
             }
         };
+
+        // Authenticity: never store or fan out a forged event. The id must bind
+        // the event's fields and the BIP-340 signature must be the pubkey's, so
+        // a peer can't spoof another's presence (or a `leave`) through us. The
+        // mesh's own ed25519 handshake remains the real peer auth on the
+        // resulting WebRTC channel; this stops the relay being a
+        // discovery-injection vector. Every legitimate client event is built by
+        // `make_event`, so this only rejects malformed or forged traffic.
+        if !event.verify() {
+            trace!("signaling: dropping EVENT with bad id/signature");
+            if let Some(conn) = self.conns.get(&conn_id) {
+                let _ = conn.out.send(WsMessage::Text(
+                    json!(["OK", event.id, false, "invalid: bad signature"]).to_string(),
+                ));
+            }
+            return;
+        }
         self.events_relayed = self.events_relayed.saturating_add(1);
 
         // Live presence: an announce makes this connection the owner of
