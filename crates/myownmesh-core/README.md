@@ -5,8 +5,8 @@ The mesh runtime. This is the crate embedders depend on.
 Pull via git tag — library crates aren't on crates.io yet:
 
 ```toml
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }  # Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }  # Nostr driver
 ```
 
 See [`../../RELEASE.md`](../../RELEASE.md) for the published-artifact

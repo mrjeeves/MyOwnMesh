@@ -9,7 +9,7 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
-use myownmesh_core::ServicesConfig;
+use myownmesh_core::{NetworkConfig, ServicesConfig};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -59,9 +59,14 @@ pub enum ServicesCmd {
 #[derive(Subcommand, Debug)]
 pub enum NetworksCmd {
     List,
+    /// Join a network by id: persists it to config.json with the
+    /// default signaling / STUN / TURN setup and attaches it on the
+    /// live daemon. For a custom setup, edit config.json or use the GUI.
     Join {
         network_id: String,
     },
+    /// Leave a network: detaches it on the live daemon and removes it
+    /// from config.json. Accepts the network id or local config id.
     Leave {
         network_id: String,
     },
@@ -99,15 +104,18 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         CtlCmd::Status => Request::Status,
         CtlCmd::Networks(NetworksCmd::List) => Request::NetworksList,
         CtlCmd::Networks(NetworksCmd::Join { network_id }) => {
-            bail!(
-                "join via ctl is not wired in v1 — edit config.json then restart, or call `myownmesh config edit` (target: {network_id})"
-            );
+            // Normalise client-side so the stored id matches what the
+            // engine and `ctl networks list` use, and so an invalid id
+            // fails with a clear message before we touch the daemon.
+            let network_id = myownmesh_core::identity::normalize_network_id(&network_id)
+                .with_context(|| format!("invalid network id '{network_id}'"))?;
+            Request::NetworkAdd {
+                config: NetworkConfig::from_network_id(network_id.clone(), network_id),
+            }
         }
-        CtlCmd::Networks(NetworksCmd::Leave { network_id }) => {
-            bail!(
-                "leave via ctl is not wired in v1 — edit config.json then restart (target: {network_id})"
-            );
-        }
+        CtlCmd::Networks(NetworksCmd::Leave { network_id }) => Request::NetworkRemove {
+            network: network_id,
+        },
         CtlCmd::Networks(NetworksCmd::Topology {
             network_id,
             topology,

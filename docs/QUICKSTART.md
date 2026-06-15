@@ -15,13 +15,13 @@ tag via git:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }  # only if you want the Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }  # only if you want the Nostr driver
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-`tag = "v0.2.0"` gets reproducible builds; switch to
+`tag = "v0.2.7"` gets reproducible builds; switch to
 `branch = "main"` if you're tracking the latest work. Both crates
 resolve out of the same checkout because cargo dedupes git deps by
 URL. See [`../RELEASE.md`](../RELEASE.md) for the published-artifact
@@ -53,6 +53,7 @@ let net = mesh.join(NetworkConfig {
     id: "home".into(),                          // local config record id
     network_id: "my-cool-mesh".into(),          // wire-level rendezvous handle
     label: "Home mesh".into(),
+    kind: Default::default(),                   // Open governance
     topology: TopologyMode::default(),          // Ring
     signaling: Default::default(),
     stun_servers: Default::default(),

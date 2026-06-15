@@ -84,11 +84,10 @@ REDISCOVERY_BACKOFF_SCHEDULE_MS     = [90_000, 180_000, 300_000, 600_000]
 REDISCOVERY_REJOIN_GAP_MS           = 1_500               // gap between leave() and joinRoom() on tier-5
 
 SIGNALING_DIAG_HEARTBEAT_MS         = 5 * 60 * 1000       // periodic "all relays OK" diag emit
-SIGNALING_DIAG_INTERVAL_MS          = 10_000              // poll cadence for getRelaySockets()
+NETWORK_WATCH_POLL_MS               = 3_000               // network-change watcher poll cadence
 DEFAULT_SIGNALING_REDUNDANCY        = 5                   // five relays at once
 
-RING_DEFAULT_PREFERRED              = 3                   // 2 neighbors + 1 shortcut
-RING_MIN_PREFERRED                  = 2                   // floor; below this we have no shortcut slot
+DEFAULT_RING_N_PREFERRED            = 3                   // 2 neighbors + 1 shortcut (TopologyMode assoc const, config.rs)
 
 DIAG_MAX                            = 80                  // diag ring buffer cap
 ```
@@ -96,9 +95,10 @@ DIAG_MAX                            = 80                  // diag ring buffer ca
 Scheduler tick names (used by the wake-honest scheduler so tick
 gaps can be attributed to a specific timer):
 ```
-SCHED_HEARTBEAT        SCHED_OFFLINE_CHECK
-SCHED_RECONNECT_PRUNE  SCHED_CATALOG_REFRESH       (catalog refresh is embedder-defined)
+ticks::HEARTBEAT        ticks::OFFLINE_CHECK
+ticks::RECONNECT_PRUNE  ticks::ICE_POLL
 ```
+(the `ticks` module in `engine/scheduler.rs`.)
 
 ## Edge cases handled
 

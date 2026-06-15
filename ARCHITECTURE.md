@@ -69,9 +69,11 @@ src/
 ├── dirs.rs                 # ~/.myownmesh layout
 ├── error.rs                # crate-wide Error + Result
 ├── events.rs               # MeshEvent / PeerEvent / DiagEntry surfaced to embedders
+├── network_state.rs        # per-network signed governance log (open/closed kind, roles, splits)
 ├── protocol/               # wire-level MeshMessage variants
 ├── topology/               # Ring / Star / FullMesh selectors
 ├── transport/              # webrtc-rs wrapper, ICE config, diag counters
+├── services/               # hosted infra: relay / signaling / STUN / TURN config + runtime
 ├── engine/                 # the connection engine (see below)
 ├── channels.rs             # typed pub/sub Channel<T>
 ├── rpc.rs                  # generic Rpc — single-shot + streaming
@@ -93,9 +95,11 @@ src/engine/
 ├── ladder.rs               # 7-tier reconnection state machine
 ├── ice_watchdog.rs         # Tier 2.5 — restart_ice() before Trystero's 5s timeout
 ├── wake.rs                 # tick-gap → wake event coalescing
+├── network_watch.rs        # OS network-change detection → fast rejoin
 ├── reconcile.rs            # Tier 6 — config edit triggers stop+start
+├── governance.rs           # closed-network state log: proposals / transitions / splits
 ├── scheduler.rs            # every tunable constant, named ticks
-├── phase.rs                # MeshPhase rollup (Alone / Discovering / Active / Degraded)
+├── phase.rs                # MeshPhase rollup (Joining / Alone / Discovering / Active / Degraded / Stopped)
 └── signaling_bridge.rs     # adapters: attach_local / attach_nostr
 ```
 
