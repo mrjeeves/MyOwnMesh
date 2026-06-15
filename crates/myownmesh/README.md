@@ -35,10 +35,14 @@ myownmesh service stop     # stop it (start / restart / uninstall too)
 myownmesh identity show    # print this device's id
 myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
+myownmesh ctl networks join <id>    # join a network (defaults) — persist + attach live
+myownmesh ctl networks leave <id>   # leave a network — detach + remove from config
 myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config path      # print ~/.myownmesh/config.json
 myownmesh config edit      # open in $EDITOR
+myownmesh install caddy <domain>    # TLS reverse proxy (Caddy) for the signaling relay
+myownmesh caddy path       # print the Caddyfile location to edit
 ```
 
 A bare `myownmesh` hands off to the `myownmesh-gui` desktop app
@@ -108,7 +112,7 @@ a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
   "auto_update": {
     "enabled": true,
     "channel": "stable",
-    "auto_apply": "patch"
+    "auto_apply": "all"
   },
   "daemon": {
     "enabled": true,

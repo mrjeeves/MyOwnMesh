@@ -226,6 +226,29 @@ pub struct NetworkConfig {
     pub auto_approve: bool,
 }
 
+impl NetworkConfig {
+    /// Build a config from just the wire-level network id, filling every
+    /// other field with its default (reference STUN/TURN, open
+    /// governance, default topology, no roster override, manual
+    /// approval). The local `id` defaults to the network id. This backs
+    /// `myownmesh ctl networks join <network_id>`, which only takes an
+    /// id; richer setups go through config.json or the GUI.
+    pub fn from_network_id(id: impl Into<String>, network_id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            network_id: network_id.into(),
+            label: String::new(),
+            kind: Default::default(),
+            topology: Default::default(),
+            signaling: Default::default(),
+            stun_servers: default_stun_servers(),
+            turn_servers: default_turn_servers(),
+            roster_path: None,
+            auto_approve: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AutoUpdateConfig {

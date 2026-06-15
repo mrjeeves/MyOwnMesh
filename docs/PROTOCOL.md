@@ -234,20 +234,35 @@ canonical base32-lowercase pubkey portion (display suffixes stripped).
 
 ## Signaling envelope (Nostr)
 
-Out-of-band signaling messages (offer / answer / ICE candidate /
-announce) travel as NIP-01 regular Nostr events (kind `1077`). The
-kind sits in the stored range (1000–9999) rather than ephemeral
-(20000–29999) so a late joiner's `REQ since=now-300s` is replayed
-by the relay with everyone's recent announces — without that,
-discovery degenerates into a star around whichever existing peer
-happens to re-announce inside the new joiner's window. The event
-content is a JSON envelope:
+Out-of-band signaling splits across two Nostr event kinds by message
+class:
+
+- **Presence / announce** travels as a NIP-01 *stored* regular event,
+  **kind `1077`** (stored range 1000–9999). Stored so a late joiner's
+  `REQ since=now-300s` is replayed by the relay with everyone's recent
+  announces — without that, discovery degenerates into a star around
+  whichever existing peer happens to re-announce inside the new
+  joiner's window.
+- **Connection negotiation** — offer / answer / ICE candidate / leave —
+  travels as an *ephemeral* event, **kind `21077`** (ephemeral range
+  20000–29999), which relays forward live but never persist. Negotiation
+  is point-in-time and must not be replayed onto a future session, so it
+  is deliberately ephemeral.
+
+The driver subscribes to both kinds, and the receive path enforces the
+split: an announce is honoured only on `1077`, an
+offer/answer/candidate/leave only on `21077` (so a stale directed
+message replayed from history is dropped). Constants
+`SIGNALING_EVENT_KIND = 1077` and `SIGNALING_EPHEMERAL_KIND = 21077`
+live in `crates/myownmesh-signaling/src/nostr/event.rs`.
+
+The event content is a JSON envelope:
 
 ```jsonc
 {
   "from": "<sender device_id>",
   "to":   "<recipient device_id, or null for broadcast>",
-  "kind": "offer" | "answer" | "candidate" | "announce",
+  "kind": "offer" | "answer" | "candidate" | "leave" | "announce",
   ...kind-specific fields
 }
 ```
@@ -258,7 +273,7 @@ runtimes so two peers using the same `(app_id, network_id)` land in
 the same Nostr room.
 
 Periodic announce cadence: one publish on startup, one safety-net
-re-publish at +30 s, then every 5 min (`ANNOUNCE_BACKOFF_MS` +
+re-publish at +30 s, then every 2 min (`ANNOUNCE_BACKOFF_MS` +
 `ANNOUNCE_STEADY_MS` in `crates/myownmesh-signaling/src/upstream.rs`).
 Discovery doesn't rely on the periodic cadence — it relies on the
 relay's storage of our last announce plus engine-side reactive

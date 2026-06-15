@@ -3,7 +3,7 @@
 Cutting a release:
 
 ```
-just release 0.2.0
+just release 0.2.8
 ```
 
 That recipe:
@@ -15,7 +15,7 @@ That recipe:
    `gui/src-tauri/Cargo.lock`, and `gui/package.json`.
 2. Refreshes the root `Cargo.lock`.
 3. Commits the version bumps, pushes the branch, then triggers
-   `release.yml` via `gh workflow run` with `tag=v0.2.0`.
+   `release.yml` via `gh workflow run` with `tag=v0.2.8`.
 
 The release workflow runs on `push: tags: v*` and on
 `workflow_dispatch` (which is what step 3 uses), then for each of

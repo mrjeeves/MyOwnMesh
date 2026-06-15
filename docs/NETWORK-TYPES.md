@@ -1,6 +1,6 @@
 # Network types: open and closed
 
-**Status: implemented in v0.1.2.** Types live in
+**Status: implemented and shipped.** Types live in
 [`crates/myownmesh-core/src/network_state.rs`](../crates/myownmesh-core/src/network_state.rs);
 wire frames are in
 [`crates/myownmesh-core/src/protocol/`](../crates/myownmesh-core/src/protocol/);
@@ -175,8 +175,8 @@ floor. The lifecycle:
    open and the close is removed from the pending log. The closer
    can re-propose later or never.
 4. **Timeout with partial signatures → split.** After
-   `STATE_PROPOSAL_TIMEOUT_S` (default **3 minutes**, tunable
-   per-network) some members are still silent. **Only the
+   `STATE_PROPOSAL_TIMEOUT_S` (default **3 minutes**) some members
+   are still silent. **Only the
    would-be owner of the closed network — i.e. the original
    proposer — can fire the split**: they publish
    `network_state_split` carrying the signers they have so far.
@@ -378,9 +378,10 @@ The four foundational choices, settled:
   their identity file, the network is unrecoverable without an
   out-of-band reset. A "recovery key" mechanism is a follow-up.
 
-## Implementation notes (non-binding)
+## Implementation map
 
-When this becomes code, the touch points are:
+This feature is implemented and shipped; the touch points across the
+code are:
 
 - `crates/myownmesh-core/src/roster.rs` — add a `role` field to
   `AuthorizedPeer` (default `Member` for backward-compat), the
@@ -406,6 +407,5 @@ When this becomes code, the touch points are:
 - `crates/myownmesh-core/src/lib.rs` — export
   `SIGN_DOMAIN_TAG_STATE`, `NetworkKind`, `Role`.
 
-None of that is committed by this design doc — the doc is the
-contract, the code lands in a follow-up PR once the four questions
-above are settled.
+All of the above is implemented and shipped; this document remains the
+design contract those changes follow.

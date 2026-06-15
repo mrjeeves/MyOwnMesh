@@ -6,7 +6,7 @@ in-process-only doesn't pay for the Nostr / WebSocket dependency
 stack.
 
 ```toml
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.0" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
 ```
 
 ## What's in here
@@ -16,11 +16,12 @@ myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0
   `Mesh` instances in one process.
 - **`nostr::driver`** — production Nostr signaling. Connects N relays
   in parallel (deterministic top-N selection per `(app_id,
-  network_id)`), publishes stored NIP-01 regular events (kind 1077),
-  subscribes by `#r` tag. Stored kind so late joiners receive every
-  existing peer's announce on `REQ since=now-300s` replay; ephemeral
-  (20000–29999) was discarded by relays and produced a star-around-
-  first-peer failure mode.
+  network_id)`), subscribes by `#r` tag, and splits the wire by message
+  class: **presence/announce** on stored kind `1077` (so late joiners
+  receive every existing peer's announce on `REQ since=now-300s`
+  replay), and **connection negotiation** (offer/answer/candidate/leave)
+  on ephemeral kind `21077` (forwarded live, never persisted, so a stale
+  offer can't be replayed onto a new session). See upstream fix #8.
 
 ## Trystero compat & upstream fixes
 
@@ -40,6 +41,15 @@ catalogued in [`src/upstream.rs`](src/upstream.rs):
 3. Inbound-recency-based zombie clearing (`STALE_INBOUND_MS = 25_000`).
 4. Offer-pool flush on peer drop, throttled (`10 s`).
 5. State-transition logging only — no per-event spam.
+6. Cross-relay event deduplication — a bounded seen-event-id ring
+   drops duplicate copies of one event delivered by multiple relays
+   (re-applying a duplicate offer would wedge the connection).
+7. Adaptive announce cadence — a single global announcer (replacing
+   the per-relay timers): a brief startup re-publish, then a steady
+   2-minute cadence.
+8. Presence stored, negotiation ephemeral — announce on stored kind
+   `1077`, offer/answer/candidate/leave on ephemeral kind `21077`, so a
+   stale negotiation event can't replay onto a future session.
 
 Every `[trystero-patch]` prefix in the driver logs corresponds to
 one of those entries — naming the entry in a bug report saves
