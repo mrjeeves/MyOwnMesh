@@ -127,10 +127,28 @@ fn main() -> ExitCode {
         "webrtc_turn=error",
     );
     let log_level = std::env::var("MYOWNMESH_LOG").unwrap_or_else(|_| default_filter.to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
-        .with_target(false)
-        .init();
+    // `MYOWNMESH_LOG_FORMAT=json` switches the daemon to line-delimited
+    // JSON logs — one object per event, with the structured fields
+    // (peer, ice, pc, tier, changed, …) the connection tracer emits
+    // under the `conn_trace` target as first-class keys. That makes a
+    // daemon log directly machine-parseable for cross-machine timeline
+    // correlation (pair it with `ctl trace` for the pure ConnTrace
+    // stream). Default stays the human-readable formatter.
+    let json_logs = std::env::var("MYOWNMESH_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+            .with_target(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+            .with_target(false)
+            .init();
+    }
 
     // Bare `myownmesh` (no subcommand) opens the desktop GUI, mirroring
     // MyOwnLLM where a bare invocation launches the app and subcommands

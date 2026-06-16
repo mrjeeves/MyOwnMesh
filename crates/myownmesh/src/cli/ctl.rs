@@ -27,6 +27,17 @@ pub enum CtlCmd {
         /// Network id to list peers from.
         network: String,
     },
+    /// Stream live connection-state transitions for a network as
+    /// JSONL — one record per line, each carrying the full liveness
+    /// snapshot (status, tier, ICE/PC state, selected-pair class,
+    /// rtt). Runs until interrupted; redirect to a file to capture a
+    /// session for `scripts/merge-traces.py`:
+    ///
+    ///   myownmesh ctl trace home > trace-$(hostname).jsonl
+    Trace {
+        /// Network id to trace.
+        network: String,
+    },
     /// Roster ops on a saved network.
     #[command(subcommand)]
     Roster(RosterCmd),
@@ -101,6 +112,9 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         // Services toggles are a read-modify-write against the live
         // config, so they take a dedicated path rather than one request.
         CtlCmd::Services(services_cmd) => return run_services(services_cmd).await,
+        // Trace is a long-lived server-push stream, not a single
+        // request/response, so it takes a dedicated streaming path.
+        CtlCmd::Trace { network } => return run_trace(network).await,
         CtlCmd::Status => Request::Status,
         CtlCmd::Networks(NetworksCmd::List) => Request::NetworksList,
         CtlCmd::Networks(NetworksCmd::Join { network_id }) => {
@@ -169,6 +183,59 @@ async fn run_services(cmd: ServicesCmd) -> Result<()> {
         ServicesCmd::Enable { service } => set_service(&service, true).await,
         ServicesCmd::Disable { service } => set_service(&service, false).await,
     }
+}
+
+/// Open a connection-state trace stream and print each `ConnTrace`
+/// record verbatim, one JSON object per line, until interrupted
+/// (Ctrl-C) or the daemon shuts down. Output is clean JSONL by design
+/// — pipe it straight into a file per machine and feed the files to
+/// `scripts/merge-traces.py` to reconstruct a single cross-machine
+/// timeline. See `docs/DEBUGGING-CONNECTIONS.md`.
+async fn run_trace(network: String) -> Result<()> {
+    let stream = connect_socket().await?;
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+
+    let line = serde_json::to_string(&Request::TraceSubscribe { network })? + "\n";
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .context("write trace request")?;
+    writer.flush().await.context("flush")?;
+
+    // First line back is the subscribe ack (or an error for an unknown
+    // network); everything after is the trace stream.
+    let mut buf = String::new();
+    let n = reader.read_line(&mut buf).await.context("read ack")?;
+    if n == 0 {
+        return Err(anyhow!("daemon closed connection without an ack"));
+    }
+    let ack: Response =
+        serde_json::from_str(buf.trim()).with_context(|| format!("parse ack: {buf}"))?;
+    if !ack.ok {
+        bail!(
+            "daemon error: {}",
+            ack.error.unwrap_or_else(|| "(no error message)".into())
+        );
+    }
+
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    loop {
+        buf.clear();
+        let n = reader
+            .read_line(&mut buf)
+            .await
+            .context("read trace line")?;
+        if n == 0 {
+            break; // daemon closed the stream
+        }
+        // `buf` already includes the trailing newline — print verbatim
+        // so the output is byte-for-byte the daemon's JSONL.
+        print!("{buf}");
+        let _ = stdout.flush();
+    }
+    Ok(())
 }
 
 async fn set_service(service: &str, enabled: bool) -> Result<()> {

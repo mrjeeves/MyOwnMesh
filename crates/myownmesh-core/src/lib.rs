@@ -110,6 +110,7 @@ pub use config::{
     ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig,
     TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
 };
+pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};

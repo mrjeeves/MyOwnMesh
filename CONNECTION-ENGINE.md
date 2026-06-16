@@ -9,6 +9,12 @@ constant and timing decision here is load-bearing edge-case
 handling discovered through MyOwnLLM's field operation; don't
 relax one without understanding why it's there.
 
+> **Debugging connection-state reliability?** See
+> [`docs/DEBUGGING-CONNECTIONS.md`](docs/DEBUGGING-CONNECTIONS.md) for
+> the connection tracer (`myownmesh ctl trace`), the cross-machine
+> timeline merger, and the reproduction scenarios — the measure-first
+> tooling for finding where the several liveness signals disagree.
+
 ## The four layers
 
 The engine runs four independent state machines that compose:

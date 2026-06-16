@@ -18,6 +18,7 @@
 //! and are documented in `CONNECTION-ENGINE.md`. Do not relax them
 //! without understanding the corresponding field-discovered bug.
 
+pub mod conn_trace;
 pub mod connection;
 pub mod governance;
 pub mod handshake;
@@ -156,6 +157,11 @@ pub async fn run_driver(
     network_watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut network_watch = network_watch::NetworkWatch::new().await;
     let mut wake_detector = wake::WakeDetector::new();
+    // Phase-0 connection tracer. Observes per-peer connection-state
+    // transitions after each driver-loop iteration. Zero cost unless a
+    // `ctl trace` subscriber is attached or `MYOWNMESH_CONN_TRACE` is
+    // set — see `engine::conn_trace`.
+    let mut conn_tracer = conn_trace::ConnTracer::new();
 
     loop {
         tokio::select! {
@@ -201,6 +207,11 @@ pub async fn run_driver(
                 network_watch.poll(&state).await;
             }
         }
+
+        // Observe the post-event connection state. Cheap no-op unless
+        // someone is watching; never holds a per-peer lock across an
+        // await (the handler above has already returned).
+        conn_tracer.sweep(&state);
     }
 
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver stopping");
