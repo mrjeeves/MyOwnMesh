@@ -75,12 +75,12 @@ serve *ARGS:
 [unix]
 [doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
 serve-trace *ARGS:
-    @MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG="info,myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug,conn_trace=info,webrtc_ice=warn" cargo run --bin myownmesh -- serve {{ARGS}}
+    @MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG_EXTRA="myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug" cargo run --bin myownmesh -- serve {{ARGS}}
 
 [windows]
 [doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
 serve-trace *ARGS:
-    @$env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG = "info,myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug,conn_trace=info,webrtc_ice=warn"; cargo run --bin myownmesh -- serve {{ARGS}}
+    @$env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
 # Stream a network's connection-state trace as JSONL — one ConnTrace
 # per line. Needs a running daemon (`just serve-trace`, or any

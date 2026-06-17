@@ -104,11 +104,20 @@ Tag the file with the hostname so the merge tool can label rows.
 > spawning its own. (`just serve-trace` is just the daemon with
 > `MYOWNMESH_CONN_TRACE=1` and a connection-debugging log filter.)
 
+> **Log filter — use `MYOWNMESH_LOG_EXTRA`, not `MYOWNMESH_LOG`.** Setting
+> `MYOWNMESH_LOG` *replaces* the default filter, which is what keeps the
+> `webrtc-rs` sibling crates pinned to `error` — drop it and you get a
+> firehose of per-candidate `pingAllCandidates` / `could not listen udp …`
+> noise. `MYOWNMESH_LOG_EXTRA` instead *appends* to the default, so you
+> bump our crates to debug while the webrtc quieting stays in place. (Use
+> `MYOWNMESH_LOG` only when you deliberately want raw webrtc detail, e.g.
+> `MYOWNMESH_LOG="info,webrtc_ice=debug"`.)
+
 **macOS / Linux**
 
 ```sh
-# shell 1 — daemon (verbose engine logs; JSON optional)
-MYOWNMESH_LOG="info,myownmesh=debug,webrtc_ice=warn" myownmesh serve
+# shell 1 — daemon (verbose OUR-crate logs; webrtc stays quiet)
+MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG_EXTRA="myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug" myownmesh serve
 
 # shell 2 — connection trace to a per-host file
 myownmesh ctl trace home > "trace-$(hostname -s).jsonl"
@@ -118,11 +127,13 @@ myownmesh ctl trace home > "trace-$(hostname -s).jsonl"
 
 ```powershell
 # shell 1 — daemon
-$env:MYOWNMESH_LOG = "info,myownmesh=debug,webrtc_ice=warn"; myownmesh serve
+$env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug"; myownmesh serve
 
 # shell 2 — connection trace
 myownmesh ctl trace home > "trace-$env:COMPUTERNAME.jsonl"
 ```
+
+(`just serve-trace` sets exactly these for you.)
 
 If you'd rather not keep a `ctl trace` shell open, set
 `MYOWNMESH_CONN_TRACE=1` on the daemon and the transitions land in the
