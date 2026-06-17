@@ -1,6 +1,7 @@
-//! Periodic ping / pong on every active peer. The Tier 4
-//! re-handshake fires when a peer's last_recv_at gap exceeds
-//! `HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS`.
+//! Periodic ping / pong on every active peer. A peer whose
+//! `last_recv_at` gap exceeds
+//! `HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS` is treated as
+//! a dead transport and dropped for rebuild (see [`tick`]).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +17,7 @@ use super::state::NetworkState;
 
 /// Periodic engine tick — fired by the driver every
 /// `HEARTBEAT_INTERVAL_MS`. Sends a ping to every active peer and
-/// triggers Tier 4 for peers past `HEARTBEAT_TIMEOUT_MS`.
+/// drops + rebuilds any peer silent past `HEARTBEAT_TIMEOUT_MS`.
 pub async fn tick(state: &Arc<NetworkState>) {
     let now = Instant::now();
     let to_ping: Vec<String> = state
@@ -34,11 +35,10 @@ pub async fn tick(state: &Arc<NetworkState>) {
         send_ping(state, peer_id).await;
     }
 
-    // Check for silent peers past the heartbeat timeout. Surface
-    // Tier 4 for any that exceed the (timeout + wake threshold)
-    // combined window — the wake-threshold buffer prevents a
-    // long-paused tokio runtime from immediately re-handshaking
-    // every peer the moment it resumes.
+    // Check for silent peers past the heartbeat timeout. Drop + rebuild
+    // any that exceed the (timeout + wake threshold) combined window —
+    // the wake-threshold buffer prevents a long-paused tokio runtime
+    // from immediately tearing down every peer the moment it resumes.
     let stale_cutoff_ms = HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS;
     let stale: Vec<String> = state
         .peers

@@ -1,7 +1,7 @@
 # Debugging connection-state reliability
 
 A field runbook for the connection-reliability work. The engine is
-heavily layered — a 7-tier reconnection ladder, an ICE watchdog, a wake
+heavily layered — a graduated recovery ladder, an ICE watchdog, a wake
 detector, a network watcher (see [`CONNECTION-ENGINE.md`](../CONNECTION-ENGINE.md)).
 When node connection state is nonetheless unreliable, the cause is
 almost never a missing tier. It's one of two structural things:
@@ -222,8 +222,9 @@ you LAN→STUN→TURN).
 
 If you host signaling (`ctl services enable signaling`), kill it and
 watch peers fall back. Even on public Nostr you can block it at the
-firewall to simulate a relay blackout. Look for room-rejoin (Tier 5) and
-the relay-rescue redial.
+firewall to simulate a relay blackout. Look for the forced relay redial,
+the buffered offers replaying on reconnect, and peers rebuilding via
+discovery once signaling is back.
 
 ```sh
 # on the signaling host

@@ -19,7 +19,7 @@ catalogue and the path to crates.io.
 - **Wire protocol** — `MeshMessage` variants, capability matrix.
 - **Topology** — Ring (default) / Star / FullMesh selectors. Pure functions; symmetric across peers.
 - **Transport** — webrtc-rs wrapper. `PeerSession` per peer, event mpsc the engine drains.
-- **Engine** — `hello` → `auth_response` handshake, ping/pong heartbeat, the 7-tier reconnection ladder (`Steady`, `WakeProbe`, `IceWatchdog`, `IceRestart`, `Rehandshake`, `RoomRejoin`, `StopStart`), topology shelving.
+- **Engine** — `hello` → `auth_response` handshake, ping/pong heartbeat, recovery driven by reliable transport signals (in-place ICE restart confirmed by inbound traffic, clean rebuild on failure), topology shelving.
 - **Channels** — typed pub/sub via `Channel<T>`.
 - **RPC** — generic `Rpc::call` / `serve` / `call_stream` / `serve_stream`.
 - **Facade** — `Mesh` → `MeshHandle` → `JoinedNetwork`.

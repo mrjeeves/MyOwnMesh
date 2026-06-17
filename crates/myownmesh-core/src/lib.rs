@@ -56,8 +56,9 @@
 //! - [`transport`] — webrtc-rs wrapper; one [`PeerSession`](transport::PeerSession)
 //!   per peer with an event mpsc the engine drains.
 //! - [`engine`] — connection engine: hello state machine, heartbeat,
-//!   the 7-tier reconnection ladder, topology shelving. See
-//!   `CONNECTION-ENGINE.md`.
+//!   recovery from reliable transport signals (in-place ICE restart
+//!   confirmed by inbound traffic, clean rebuild on failure), topology
+//!   shelving. See `CONNECTION-ENGINE.md`.
 //! - [`Channel<T>`] — typed publish/subscribe between peers.
 //! - [`Rpc`] — generic request/response with streaming.
 //!

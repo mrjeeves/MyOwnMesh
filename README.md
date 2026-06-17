@@ -205,7 +205,7 @@ protocol-message checklist, and the topology-mode checklist.
 ## What it gives you
 
 - **ed25519 mutual auth, with eyeballs.** Every peer encounter exchanges a `hello` + `auth_response` where each side signs the other's nonce under `myownmesh-mesh-auth-v1:`. A 6-char `[a-z0-9]` verification code rides along for out-of-band confirmation ("the code I see matches what you read me"). Approved peers land in a per-network roster and skip the prompt on reconnect.
-- **A 7-tier reconnection ladder.** Steady → Wake probe → ICE watchdog → ICE restart → Re-handshake → Room rejoin → Stop-and-start. Each tier is the cheapest action that still recovers from the failure class above it. Every tunable constant is documented in [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) with the field bug it was discovered through.
+- **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. A graduated ladder — Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start — does the cheapest action that still recovers from the failure class above it, and never tears a live link down on an ICE-state blip. Every tunable constant is documented in [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) with the field bug it was discovered through.
 - **Trystero-wire-compatible Nostr signaling.** Same room-handle derivation as JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), same deterministic relay shuffle. Eight published-fix patches against `@trystero-p2p/core` are baked in natively — catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs) so upstream-tracking is a code-level diff, not a patches/ folder.
 - **Host your own infrastructure.** A device can be any combination of a mesh node and hosted services: a relay (roster-gated routing), an **intelligent signaling relay** (a NIP-01 server the built-in driver speaks to unchanged — with live presence, instant-departure coordination, and flood limits, so it's safe to run publicly), and STUN / TURN servers (RFC 5389 / 5766, the latter with a per-connection bandwidth cap). Turn off the node role for a **pure-infrastructure box**. Toggle everything from the GUI (Settings → Services), the CLI (`myownmesh ctl services …`), or `config.json`; hosts advertise their roles + endpoints so the fleet self-discovers them. This is what makes a **fully internet-isolated network** trivial — no Google STUN, no Cloudflare TURN, no public relay. See [`docs/SERVICES.md`](docs/SERVICES.md).
 - **Selectable topologies.** Ring (default — sorted-lex with 2 neighbours + shortcuts), Star (explicit hub), FullMesh (everyone to everyone). All built on the same shelving primitive; both sides of every pair run the same pure-function selector over the same sorted input, so the result is symmetric without coordination.
@@ -280,7 +280,7 @@ Ubuntu 22.04 (glibc 2.35) so binaries run on Debian 12, Ubuntu
 
 MyOwnMesh started as [MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM)'s
 `src/mesh-*.ts` + `src-tauri/src/mesh/` substrate. The connection
-engine's seven tiers, the Trystero-patch catalogue, the 6-char
+engine's recovery ladder, the Trystero-patch catalogue, the 6-char
 verification-code UX, the per-network roster model — all of it was
 field-tested inside MyOwnLLM first, then lifted into pure Rust and
 generalised so any app that wants a peer-to-peer substrate can
@@ -294,7 +294,7 @@ relationship to the original TypeScript modules.
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — wire-protocol reference ·
 [`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
-[`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) — the 7-tier ladder, every tunable ·
+[`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) — the recovery ladder, every tunable ·
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, conventions, testing ·
 [`RELEASE.md`](RELEASE.md) — cutting a release ·
 [`gui/README.md`](gui/README.md) — desktop GUI ·
