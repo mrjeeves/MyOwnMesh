@@ -92,7 +92,7 @@ src/engine/
 ├── connection.rs           # per-peer status / tier / diag watermarks
 ├── handshake.rs            # hello → auth_response state machine + watchdog
 ├── heartbeat.rs            # ping / pong + silent-peer detection
-├── ladder.rs               # 7-tier reconnection state machine
+├── ladder.rs               # connection-tier enum + topology selector pass
 ├── ice_watchdog.rs         # Tier 2.5 — restart_ice() before Trystero's 5s timeout
 ├── wake.rs                 # tick-gap → wake event coalescing
 ├── network_watch.rs        # OS network-change detection → fast rejoin
@@ -103,7 +103,7 @@ src/engine/
 └── signaling_bridge.rs     # adapters: attach_local / attach_nostr
 ```
 
-See `CONNECTION-ENGINE.md` for the 7-tier ladder, every tunable
+See `CONNECTION-ENGINE.md` for the recovery model, every tunable
 constant, and the edge cases the engine handles.
 
 ## Trust model

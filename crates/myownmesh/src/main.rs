@@ -93,7 +93,7 @@ fn main() -> ExitCode {
     // IPv6 address that won't bind, every `pingAllCandidates`
     // wakeup, every SRTP/SCTP teardown after a flapping connection)
     // that swamp the real signal. The meaningful state transitions
-    // (`peer ACTIVE`, `ICE failed — Tier 4 immediately`, relay
+    // (`peer ACTIVE`, `ICE failed — renegotiating`, relay
     // connect/recovery) all come from our own code, so silencing
     // the sibling crates doesn't hide anything we care about.
     //

@@ -1,7 +1,7 @@
 //! Heartbeat frames: `ping` / `pong`. Sent on every active connection
-//! at a configurable interval (default 30s). The 7-tier reconnection
-//! ladder uses gaps in inbound traffic (no ping or app message in
-//! >75s) as the trigger for per-peer re-handshake.
+//! at a configurable interval (default 30s). The recovery ladder uses
+//! gaps in inbound traffic (no ping or app message past the heartbeat
+//! timeout) as the trigger to drop and rebuild a silent peer.
 
 use serde::{Deserialize, Serialize};
 

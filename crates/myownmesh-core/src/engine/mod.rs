@@ -141,14 +141,6 @@ pub async fn run_driver(
     let mut heartbeat =
         tokio::time::interval(Duration::from_millis(scheduler::HEARTBEAT_INTERVAL_MS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut offline_check = tokio::time::interval(Duration::from_millis(
-        scheduler::OFFLINE_ROSTERED_CHECK_INTERVAL_MS,
-    ));
-    offline_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut reconnect_prune = tokio::time::interval(Duration::from_millis(
-        scheduler::RECONNECT_PRUNE_INTERVAL_MS,
-    ));
-    reconnect_prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ice_poll =
         tokio::time::interval(Duration::from_millis(scheduler::ICE_POLL_INTERVAL_MS));
     ice_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -189,14 +181,6 @@ pub async fn run_driver(
                     debug!(network = %state.network_id, "wake event observed");
                     wake::on_wake(&state).await;
                 }
-            }
-
-            _ = offline_check.tick() => {
-                ladder::offline_check_tick(&state).await;
-            }
-
-            _ = reconnect_prune.tick() => {
-                ladder::reconnect_prune_tick(&state).await;
             }
 
             _ = ice_poll.tick() => {

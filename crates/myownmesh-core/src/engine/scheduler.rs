@@ -5,7 +5,7 @@
 
 /// Time-to-live on the hello → auth_response watchdog. If the
 /// peer doesn't reply in this window the connection is torn down
-/// and re-attempted from Tier 4.
+/// and rebuilt from scratch.
 pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 
 /// Delays between hello retries inside a single handshake.
@@ -16,20 +16,12 @@ pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 /// not coming back.
 pub const HANDSHAKE_HELLO_RETRY_SCHEDULE_MS: &[u64] = &[5_000, 7_000, 10_000];
 
-/// ±20 % jitter applied to every re-handshake delay.
-pub const REHANDSHAKE_JITTER_FRACTION: f64 = 0.2;
-
-/// Re-handshake backoff inside Tier 4. Five attempts before
-/// escalating to Tier 5.
-pub const REHANDSHAKE_BACKOFF_MS_SCHEDULE: &[u64] = &[2_000, 5_000, 10_000, 20_000, 30_000];
-
-/// Tier 4 rescue attempts before escalating to Tier 5.
-pub const REHANDSHAKE_RESCUE_ATTEMPTS: u32 = 3;
-
 /// Heartbeat ping cadence on active connections.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 
-/// Peer silent past this triggers Tier 4 re-handshake.
+/// Peer silent past this (no inbound ping or app frame) triggers a
+/// drop + rebuild — the link is treated as dead and re-established
+/// from scratch rather than restarted in place.
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
 
 /// Tick gap above this counts as a wake event (~ resume from sleep).
@@ -103,21 +95,12 @@ pub const RELAY_RESCUE_MIN_INTERVAL_MS: u64 = 30_000;
 /// checking-timeout watchdog rebuilds anything still stuck afterward.
 pub const NETWORK_CHANGE_RESTART_COOLDOWN_MS: u64 = 5_000;
 
-/// Tier 5 maximum wait before pruning a reconnecting entry.
+/// Grace window, surfaced in [`crate::events::PeerEvent::Dropped`],
+/// during which a fresh reconnect from a just-dropped (previously
+/// approved) peer skips the user-approval prompt. Not a timer the engine
+/// itself waits on — the embedder/GUI uses it to decide how long a
+/// "reconnecting" affordance stays warm before treating the peer as gone.
 pub const RECONNECTING_GRACE_MS: u64 = 90_000;
-
-/// Sweep cadence for stale reconnecting entries.
-pub const RECONNECT_PRUNE_INTERVAL_MS: u64 = 10_000;
-
-/// Tier 5 trigger for rostered-but-offline peers.
-pub const OFFLINE_ROSTERED_CHECK_INTERVAL_MS: u64 = 60_000;
-
-/// Tier 5 redocking backoff schedule.
-pub const REDISCOVERY_BACKOFF_SCHEDULE_MS: &[u64] = &[90_000, 180_000, 300_000, 600_000];
-
-/// Tier 5 — gap between leave() and joinRoom() so the relay sees
-/// the leave-presence before the new join.
-pub const REDISCOVERY_REJOIN_GAP_MS: u64 = 1_500;
 
 /// Inbound-message staleness threshold for zombie clearing. When a
 /// fresh announce/offer arrives from a peer we already hold but
@@ -143,12 +126,3 @@ pub const NETWORK_WATCH_POLL_MS: u64 = 3_000;
 
 /// Diag log ring buffer cap per network.
 pub const DIAG_MAX: usize = 80;
-
-/// Named scheduler tick ids — surfaced in diag entries so a gap
-/// can be attributed to a specific timer.
-pub mod ticks {
-    pub const HEARTBEAT: &str = "heartbeat";
-    pub const OFFLINE_CHECK: &str = "offline-check";
-    pub const RECONNECT_PRUNE: &str = "reconnect-prune";
-    pub const ICE_POLL: &str = "ice-poll";
-}
