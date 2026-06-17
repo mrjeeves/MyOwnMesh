@@ -312,6 +312,24 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
     true
 }
 
+/// True when a session has been *connecting* (its data channel never
+/// opened) for at least `grace_ms`. A fresh offer arriving on such a
+/// session is better answered by a clean rebuild than by renegotiating
+/// onto the stuck PC: re-applying `set_remote_description` only re-resets
+/// ICE, and when both sides are stuck-and-re-offering it deadlocks (the
+/// answerer keeps mis-applying the offerer's offers, the data channel
+/// never opens — observed in the field as a peer pinned at Sighted over
+/// TURN). The grace lets a legitimately-still-negotiating attempt finish
+/// before a re-offer triggers a rebuild, so a burst of re-offers can't
+/// churn it.
+fn connecting_stuck_past_grace(data: &connection::PeerStateData, grace_ms: u64) -> bool {
+    !data.data_channel_open
+        && data
+            .session_started_at
+            .map(|t| t.elapsed() >= Duration::from_millis(grace_ms))
+            .unwrap_or(false)
+}
+
 async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbound) {
     match sig {
         SignalingInbound::PeerAnnounced { device_id } => {
@@ -457,6 +475,37 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
             clear_stale_session_if_zombie(state, &device_id).await;
+            // If our session for this peer has been stuck connecting (data
+            // channel never opened) past the grace, this fresh offer is the
+            // mutual-renegotiation deadlock: re-applying it onto the stuck
+            // PC just re-resets ICE and the channel never opens. Drop the
+            // corpse so the offer below builds a clean fresh PC whose data
+            // channel — created by the offerer in this very offer — can
+            // actually open, aligning our generation to theirs. The grace
+            // (via `connecting_stuck_past_grace`) keeps a burst of
+            // re-offers from churning a still-negotiating attempt.
+            let stuck = state
+                .peers
+                .get(&device_id)
+                .map(|p| {
+                    connecting_stuck_past_grace(
+                        &p.state.read(),
+                        scheduler::RESTART_TRAFFIC_GRACE_MS,
+                    )
+                })
+                .unwrap_or(false);
+            if stuck {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Info,
+                    "signaling",
+                    format!(
+                        "fresh offer for stuck-connecting {} — rebuilding to answer cleanly",
+                        short_peer(&device_id)
+                    ),
+                    serde_json::json!({ "peer": device_id, "reason": "stuck_connecting" }),
+                );
+                drop_peer(state, &device_id, DropReason::IceFailed).await;
+            }
             ensure_peer_session(state, device_id.clone(), role).await;
             apply_remote_sdp(state, &device_id, RTCSdpType::Offer, sdp).await;
             // Build the answer. Extract the session under the lock,
@@ -2164,6 +2213,41 @@ mod tests {
             !state.peers.contains_key("stuck-peer"),
             "a session whose data channel never opened past the deadline must be reclaimed"
         );
+    }
+
+    #[test]
+    fn connecting_stuck_detection_keys_off_data_channel_and_age() {
+        let grace = scheduler::RESTART_TRAFFIC_GRACE_MS;
+        let old = Instant::now()
+            .checked_sub(Duration::from_millis(grace + 1_000))
+            .expect("clock headroom");
+
+        // Fresh session, channel not open yet → still legitimately
+        // negotiating, NOT stuck (don't churn a new attempt).
+        let fresh = connection::PeerStateData {
+            session_started_at: Some(Instant::now()),
+            data_channel_open: false,
+            ..Default::default()
+        };
+        assert!(!connecting_stuck_past_grace(&fresh, grace));
+
+        // Old session, channel still never opened → stuck; a fresh offer
+        // should rebuild rather than renegotiate onto the corpse.
+        let stuck = connection::PeerStateData {
+            session_started_at: Some(old),
+            data_channel_open: false,
+            ..Default::default()
+        };
+        assert!(connecting_stuck_past_grace(&stuck, grace));
+
+        // Channel opened → never "stuck" regardless of age; liveness is the
+        // heartbeat's job from here, and an offer is a real renegotiation.
+        let open = connection::PeerStateData {
+            session_started_at: Some(old),
+            data_channel_open: true,
+            ..Default::default()
+        };
+        assert!(!connecting_stuck_past_grace(&open, grace));
     }
 
     #[tokio::test]
