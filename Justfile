@@ -50,17 +50,25 @@ dev *ARGS:
     @cargo build -p myownmesh
     @cd gui; pnpm install --silent; pnpm tauri dev {{ARGS}}
 
-# Run the daemon in the foreground with debug logging. The GUI's
-# `just dev` connects to this over the control socket.
+# Run the daemon in the foreground. The GUI's `just dev` connects to this
+# over the control socket.
+#
+# Logging uses the daemon's *tuned default* filter (our crates at info,
+# one clean line per connection event, with the webrtc-rs sibling crates
+# pinned to error) plus our own binary at debug — set via MYOWNMESH_LOG_EXTRA
+# so it *appends* to that default. A bare `MYOWNMESH_LOG="debug,…"` here would
+# instead *replace* the default and un-pin webrtc-rs, turning the console into
+# an unreadable ICE firehose. For candidate-level engine/signaling detail
+# (still webrtc-quiet), use `just serve-trace`.
 [unix]
-[doc("Run the daemon in foreground with debug logging.")]
+[doc("Run the daemon in foreground (clean default logs; use serve-trace for detail).")]
 serve *ARGS:
-    @MYOWNMESH_LOG="debug,myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
+    @MYOWNMESH_LOG_EXTRA="myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
 
 [windows]
-[doc("Run the daemon in foreground with debug logging.")]
+[doc("Run the daemon in foreground (clean default logs; use serve-trace for detail).")]
 serve *ARGS:
-    @$env:MYOWNMESH_LOG = "debug,myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
+    @$env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
 # Run the daemon standalone with connection-state tracing on — the
 # reliable way to capture detailed connection logs on EVERY OS. On
