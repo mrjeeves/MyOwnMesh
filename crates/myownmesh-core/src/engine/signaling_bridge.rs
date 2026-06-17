@@ -296,5 +296,9 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
     // once instead of waiting out a zombie socket. See
     // `wake::on_wake` and `NetworkState::request_relay_reconnect`.
     state.set_relay_reconnect(handle.reconnect_signal());
+    // …and the relay-connected signal, so a network-change renegotiation can
+    // wait for signaling to actually come back before it offers (see
+    // `network_watch::on_network_change`).
+    state.set_relay_connected_signal(handle.connected_signal());
     Some(handle)
 }

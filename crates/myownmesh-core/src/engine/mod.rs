@@ -797,13 +797,20 @@ pub(crate) async fn renegotiate_ice(
         }),
     );
 
-    if let Err(e) = session.restart_ice().await {
-        // Benign when a gather from a previous trigger is still in flight;
-        // the next watchdog poll picks it up once that settles.
-        debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
-    }
-
     if offerer {
+        // Re-gather *our* candidates against a fresh ufrag, then offer them.
+        // Only the offerer restarts ICE here. If the answerer also called
+        // `restart_ice()` it would put its own agent into gathering, and
+        // applying this restart offer on its side then fails with "ICE Agent
+        // can not be restarted when gathering" — the glare both ends hit when
+        // a network change fires `force_ice_restart_all` on each of them at
+        // once. The answerer re-gathers implicitly when it applies this offer
+        // (the design this function's header already describes).
+        if let Err(e) = session.restart_ice().await {
+            // Benign when a gather from a previous trigger is still in flight;
+            // the next watchdog poll picks it up once that settles.
+            debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
+        }
         match session.create_offer().await {
             Ok(desc) => {
                 // The single INFO line for this restart is the `trigger=…`
@@ -830,9 +837,12 @@ pub(crate) async fn renegotiate_ice(
             Err(e) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
         }
     } else {
-        // Answerer: avoid glare. Nudge the offerer to send the restart
-        // offer; the reactive announce is globally rate-limited so this
-        // can't add signaling load.
+        // Answerer: avoid glare. Deliberately do NOT restart our own ICE —
+        // applying the offerer's restart offer is what re-gathers us, and
+        // self-gathering here is exactly what makes that offer bounce off our
+        // side with "can not be restarted when gathering". Just nudge the
+        // offerer to send the restart offer; the reactive announce is globally
+        // rate-limited so this can't add signaling load.
         state.log_diag_with(
             crate::events::DiagLevel::Debug,
             "ice",

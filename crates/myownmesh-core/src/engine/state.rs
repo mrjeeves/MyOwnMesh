@@ -270,6 +270,13 @@ pub struct NetworkState {
     /// attached (e.g. the in-process local broker used in tests).
     relay_reconnect: Mutex<Option<Arc<watch::Sender<u64>>>>,
 
+    /// The signaling driver's relay-connected generation (its
+    /// `relay_connected`); bumped on every fresh relay session. After a
+    /// network change asks for a redial, the change handler waits for the
+    /// next bump before renegotiating ICE, so the offer isn't published into
+    /// a relay that hasn't reconnected yet. `None` when no driver is attached.
+    relay_connected: Mutex<Option<Arc<watch::Sender<u64>>>>,
+
     /// Last time the ICE-failure path forced a relay redial via
     /// [`request_relay_reconnect_throttled`]. Gates the "no remote
     /// candidates arrived" rescue (see
@@ -374,6 +381,7 @@ impl NetworkState {
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             last_reactive_announce_at: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
+            relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
             offline: std::sync::atomic::AtomicBool::new(false),
             conn_trace_tx,
@@ -395,6 +403,21 @@ impl NetworkState {
     /// once when the Nostr driver is attached.
     pub fn set_relay_reconnect(&self, signal: Arc<watch::Sender<u64>>) {
         *self.relay_reconnect.lock() = Some(signal);
+    }
+
+    /// Register the signaling driver's relay-connected signal (its
+    /// `relay_connected` generation). Called once when the Nostr driver is
+    /// attached, alongside [`set_relay_reconnect`].
+    pub fn set_relay_connected_signal(&self, signal: Arc<watch::Sender<u64>>) {
+        *self.relay_connected.lock() = Some(signal);
+    }
+
+    /// A receiver for the relay-connected generation, or `None` when no
+    /// driver is attached (tests, the in-process broker). Callers
+    /// `borrow_and_update()` to set a baseline, then `changed()` to wait for
+    /// the next fresh relay session.
+    pub fn relay_connected_rx(&self) -> Option<watch::Receiver<u64>> {
+        self.relay_connected.lock().as_ref().map(|s| s.subscribe())
     }
 
     /// Ask every relay to drop its socket and redial immediately,

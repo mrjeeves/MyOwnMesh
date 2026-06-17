@@ -254,17 +254,58 @@ async fn on_network_change(
     // generation every relay task watches, so they drop the zombie and
     // reconnect on the new interface at once. Same fix the wake path uses
     // for the identical post-suspend zombie (see `engine::wake::on_wake`).
-    if state.request_relay_reconnect() {
+    //
+    // The fan-out is then *driven by* that reconnect rather than raced
+    // against it: an offer published while the relays are still redialing
+    // reaches nobody (the stall above), so we subscribe to the relay-connected
+    // signal before asking for the redial and renegotiate the instant a fresh
+    // relay session lands. Reactive, not timed — if signaling never returns
+    // there is nothing to offer into anyway, and the moment it does, this
+    // fires. (The data-channel-open watchdog remains the only teardown clock.)
+    let mut connected_rx = state.relay_connected_rx();
+    if let Some(rx) = connected_rx.as_mut() {
+        rx.borrow_and_update();
+    }
+    let redialing = state.request_relay_reconnect();
+    if redialing {
         debug!(network = %state.network_id, "network change — forcing relay reconnect");
     }
 
+    // With a driver attached, hand the fan-out to a task that wakes on the
+    // relay-connected signal. Without one (tests / the in-process broker) or
+    // if the redial didn't take, fan out inline as before.
+    if redialing {
+        if let Some(mut rx) = connected_rx {
+            let state = state.clone();
+            tokio::spawn(async move {
+                // Wakes when a relay establishes a fresh session; errs only if
+                // the driver shut down (nothing left to renegotiate).
+                if rx.changed().await.is_ok() {
+                    debug!(
+                        network = %state.network_id,
+                        "relay reconnected after network change — renegotiating"
+                    );
+                    fan_out_restart(&state).await;
+                }
+            });
+            return;
+        }
+    }
+
+    fan_out_restart(state).await;
+}
+
+/// Renegotiate ICE with every active peer and re-seed discovery. Split out so
+/// the network-change handler can run it either inline or reactively, once a
+/// relay is confirmed back (see [`on_network_change`]).
+async fn fan_out_restart(state: &Arc<NetworkState>) {
     ice_watchdog::force_ice_restart_all(state).await;
-    // Re-seed discovery as well: peers we lost while off-network (or
-    // that were torn down by the checking-timeout watchdog) rediscover
-    // on the next announce round-trip instead of waiting for their own
-    // schedule — so rejoining a network the peer is on reconnects in
-    // about a second. Rate-limited through the shared guard so this
-    // can't add relay load on top of the restart fan-out.
+    // Re-seed discovery as well: peers we lost while off-network (or that were
+    // torn down by the data-channel-open watchdog) rediscover on the next
+    // announce round-trip instead of waiting for their own schedule — so
+    // rejoining a network the peer is on reconnects in about a second.
+    // Rate-limited through the shared guard so this can't add relay load on
+    // top of the restart fan-out.
     super::maybe_reactive_announce(state);
     debug!(network = %state.network_id, "ICE restart fan-out complete");
 }

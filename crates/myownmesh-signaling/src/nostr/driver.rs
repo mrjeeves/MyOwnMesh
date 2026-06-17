@@ -138,6 +138,10 @@ pub fn start(
     // shared by the driver tasks (which `.subscribe()` receivers) and
     // the engine (which holds a clone to bump it).
     let force_reconnect = Arc::new(watch::channel(0u64).0);
+    // Bumped on every fresh relay connection so the engine can wait for
+    // signaling to actually come back after a network change before it
+    // renegotiates (see `relay_connected` on `DriverShared`).
+    let relay_connected = Arc::new(watch::channel(0u64).0);
     let shared = Arc::new(DriverShared {
         identity,
         room_handle,
@@ -146,6 +150,7 @@ pub fn start(
         outbound: tokio::sync::Mutex::new(Some(outbound_rx)),
         publish_tx,
         force_reconnect: force_reconnect.clone(),
+        relay_connected: relay_connected.clone(),
         seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
             SEEN_EVENT_CAPACITY,
         )),
@@ -225,6 +230,7 @@ pub fn start(
     NostrDriverHandle {
         cancellers,
         force_reconnect,
+        relay_connected,
     }
 }
 
@@ -233,6 +239,7 @@ pub fn start(
 pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
     force_reconnect: Arc<watch::Sender<u64>>,
+    relay_connected: Arc<watch::Sender<u64>>,
 }
 
 impl NostrDriverHandle {
@@ -248,6 +255,15 @@ impl NostrDriverHandle {
     /// resume from sleep, when the existing sockets are stale.
     pub fn reconnect_signal(&self) -> Arc<watch::Sender<u64>> {
         self.force_reconnect.clone()
+    }
+
+    /// Clone of the relay-connected signal. The engine subscribes and, after
+    /// asking for a redial on a network change, waits for the next bump (a
+    /// fresh relay session) before renegotiating ICE — so the offer isn't
+    /// published into a not-yet-reconnected relay. See
+    /// `engine::state::NetworkState::set_relay_connected_signal`.
+    pub fn connected_signal(&self) -> Arc<watch::Sender<u64>> {
+        self.relay_connected.clone()
     }
 }
 
@@ -271,6 +287,13 @@ struct DriverShared {
     /// and redials without waiting out the backoff. See the comment
     /// at the channel's creation in [`start`].
     force_reconnect: Arc<watch::Sender<u64>>,
+    /// Monotonic counter bumped each time a relay establishes a fresh
+    /// session. The engine waits on a change to this (after asking for a
+    /// redial) before it fans out an ICE-restart offer, so the offer isn't
+    /// published into a relay that hasn't reconnected yet — those ephemeral
+    /// offers/candidates would reach nobody (the "0 remote candidates
+    /// arrived" stall). See `engine::network_watch::on_network_change`.
+    relay_connected: Arc<watch::Sender<u64>>,
     /// Cross-relay event-ID dedupe ring. Each Nostr event has a
     /// sha256 `id`; the same event published once to N relays
     /// arrives N times if we don't dedupe. Without this, the engine
@@ -352,6 +375,12 @@ async fn run_relay(
                 }
                 consecutive_failures = 0;
                 backoff_attempt = 0;
+                // Tell the engine a relay is freshly up so a network-change
+                // renegotiation can publish into a live relay instead of a
+                // redialing one (the "0 remote candidates arrived" stall).
+                shared
+                    .relay_connected
+                    .send_modify(|g| *g = g.wrapping_add(1));
                 // Count this live session so the fallback supervisor can
                 // tell whether any primary relay is currently connected.
                 // `None` for fallback tasks (they don't gate themselves).
@@ -1115,6 +1144,7 @@ mod tests {
             outbound: tokio::sync::Mutex::new(Some(out_rx)),
             publish_tx,
             force_reconnect: Arc::new(watch::channel(0u64).0),
+            relay_connected: Arc::new(watch::channel(0u64).0),
             seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
                 SEEN_EVENT_CAPACITY,
             )),
