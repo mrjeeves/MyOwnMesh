@@ -124,13 +124,26 @@ impl NetworkWatch {
         }
         let prev = std::mem::replace(&mut self.last, current.clone());
         let now = Instant::now();
-        let in_cooldown = self
-            .last_restart_at
-            .map(|t| {
-                now.duration_since(t) < Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS)
-            })
-            .unwrap_or(false);
-        if in_cooldown {
+
+        // The offline edges are never coalesced. Going fully offline
+        // latches the hold flag; the interface *returning* must force the
+        // full relay-redial + ICE-restart fan-out (and clear the flag) —
+        // that's the load-bearing recovery step the macOS-wake / network-
+        // handoff path depends on. The cooldown exists only to fold the
+        // burst of primary-IP flips a single Wi-Fi↔cellular handoff
+        // produces (v4 swaps, then v6 appears) into one restart — i.e.
+        // online→online churn.
+        //
+        // Coalescing the return-from-offline was a bug seen in the field:
+        // the going-offline event armed the cooldown, so the return a
+        // second or two later got swallowed — no redial (the relay sat on
+        // its dead socket grinding through backoff for ~20 s), no ICE
+        // restart, and the offline flag never cleared (leaving in-place
+        // recovery gated off), forcing every handoff down the slow drop-
+        // and-rebuild path.
+        let now_offline = current.v4.is_none() && current.v6.is_none();
+        let is_offline_edge = now_offline || state.is_offline();
+        if cooldown_coalesces(is_offline_edge, self.last_restart_at, now) {
             debug!(
                 network = %state.network_id,
                 prev_v4 = ?prev.v4, next_v4 = ?current.v4,
@@ -139,9 +152,31 @@ impl NetworkWatch {
             );
             return;
         }
-        self.last_restart_at = Some(now);
+        // Only an actual restart fan-out arms the cooldown. Latching the
+        // offline flag must NOT consume the slot, or the return that
+        // follows it a moment later would be coalesced — the bug above.
+        if !now_offline {
+            self.last_restart_at = Some(now);
+        }
         on_network_change(state, &prev, &current).await;
     }
+}
+
+/// Whether a network change should be coalesced (skipped) under the
+/// restart cooldown. Offline edges — going down, or returning from down —
+/// are never coalesced; only an online→online primary-IP flip within
+/// [`NETWORK_CHANGE_RESTART_COOLDOWN_MS`] of the last restart is.
+fn cooldown_coalesces(
+    is_offline_edge: bool,
+    last_restart_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if is_offline_edge {
+        return false;
+    }
+    last_restart_at
+        .map(|t| now.duration_since(t) < Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS))
+        .unwrap_or(false)
 }
 
 async fn on_network_change(
@@ -261,5 +296,36 @@ mod tests {
             v6: Some(Ipv6Addr::LOCALHOST),
         };
         assert_ne!(a, d);
+    }
+
+    #[test]
+    fn offline_edges_bypass_the_restart_cooldown() {
+        let now = Instant::now();
+        // An online→online flip a moment after a restart coalesces…
+        assert!(cooldown_coalesces(false, Some(now), now));
+        // …but an offline edge (going down, or the interface returning)
+        // never does, even squarely inside the cooldown window. This is
+        // the fix: the return-from-offline must always run the full
+        // redial + restart handler.
+        assert!(!cooldown_coalesces(true, Some(now), now));
+    }
+
+    #[test]
+    fn online_flip_coalesces_only_within_the_window() {
+        let base = Instant::now();
+        let within = base + Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS / 2);
+        let after = base + Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS + 1);
+        assert!(
+            cooldown_coalesces(false, Some(base), within),
+            "a flip inside the window coalesces onto the in-flight restart"
+        );
+        assert!(
+            !cooldown_coalesces(false, Some(base), after),
+            "a flip after the window fires its own restart"
+        );
+        assert!(
+            !cooldown_coalesces(false, None, base),
+            "the first-ever change always fires"
+        );
     }
 }
