@@ -36,6 +36,7 @@ use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -923,6 +924,16 @@ impl PeerSession {
     /// remote description is set.
     pub async fn remote_fingerprint(&self) -> Option<String> {
         sdp_fingerprint(&self.pc.remote_description().await?.sdp)
+    }
+
+    /// True when the peer connection is awaiting a remote Answer — i.e. we
+    /// have a local offer outstanding (`have-local-offer`). An Answer that
+    /// arrives in any other state is stale (a duplicate from relay redundancy,
+    /// or the answer to an offer we've since superseded); applying it throws
+    /// webrtc-rs's "invalid proposed signaling state transition from stable"
+    /// error and wedges the negotiation, so the engine drops it instead.
+    pub fn awaiting_answer(&self) -> bool {
+        self.pc.signaling_state() == RTCSignalingState::HaveLocalOffer
     }
 
     /// Build an answer SDP. Answerer-only; call after

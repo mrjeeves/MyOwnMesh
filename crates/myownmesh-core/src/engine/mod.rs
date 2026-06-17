@@ -1072,6 +1072,25 @@ async fn apply_remote_sdp(
         }
         return;
     };
+    // A stale Answer — one that arrives when we're not holding a local offer
+    // (a duplicate from relay redundancy, or the answer to an offer we've since
+    // superseded by a restart/rebuild) — can't be applied: webrtc-rs rejects it
+    // ("invalid proposed signaling state transition from stable") and the failed
+    // apply wedges the PC. Drop it and let a throttled re-offer re-open
+    // negotiation cleanly instead of logging an error and churning.
+    if sdp_type == RTCSdpType::Answer && !session.awaiting_answer() {
+        state.log_diag_with(
+            crate::events::DiagLevel::Debug,
+            "signaling",
+            format!(
+                "stale answer from {} ignored — not awaiting one",
+                short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "reason": "not_awaiting_answer" }),
+        );
+        reoffer_after_failed_answer(state, device_id).await;
+        return;
+    }
     let desc = match sdp_type {
         RTCSdpType::Offer => RTCSessionDescription::offer(sdp).ok(),
         RTCSdpType::Answer => RTCSessionDescription::answer(sdp).ok(),
@@ -1460,13 +1479,22 @@ async fn handle_ice_state_change(
                 false
             }
             RTCIceConnectionState::Failed => {
-                // Restart in place rather than tear down: webrtc-rs reports
-                // `Failed` even while a nominated pair is succeeding, so a
-                // teardown here throws away a working-or-recoverable link.
-                // `on_failed` re-gathers and re-offers; if the link is
-                // genuinely gone, the data-channel-open timeout (still
-                // connecting) or inbound silence (was up) reclaims it.
-                true
+                // webrtc-rs fires `Failed` even while a nominated candidate
+                // pair is succeeding and the path is delivering frames — seen
+                // in the field as "ICE failed: a pair is nominated and
+                // succeeded — the path is up". Acting on that lie tears down a
+                // working link: the renegotiate disrupts it, then the
+                // restart-verify watchdog can't confirm traffic and rebuilds.
+                // Trust inbound traffic over the ICE state — only escalate when
+                // the path isn't actually carrying anything. A genuinely dead
+                // link has no recent inbound (escalated here, or reclaimed by
+                // the heartbeat); a network move is driven by the
+                // network-change handler regardless of this.
+                let carrying_traffic = data
+                    .last_recv_at
+                    .map(|t| t.elapsed() < Duration::from_millis(scheduler::HEARTBEAT_TIMEOUT_MS))
+                    .unwrap_or(false);
+                !carrying_traffic
             }
             _ => false,
         }
