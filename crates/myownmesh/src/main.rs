@@ -126,11 +126,52 @@ fn main() -> ExitCode {
         "turn=error,",
         "webrtc_turn=error",
     );
-    let log_level = std::env::var("MYOWNMESH_LOG").unwrap_or_else(|_| default_filter.to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
-        .with_target(false)
-        .init();
+    let log_level = match std::env::var("MYOWNMESH_LOG") {
+        // Full override — power users get complete control of the filter.
+        Ok(full) => full,
+        Err(_) => {
+            // Default filter (keeps the webrtc-rs sibling crates pinned to
+            // ERROR so their per-candidate flood stays out of the log).
+            // `MYOWNMESH_LOG_EXTRA` appends to it, so `just serve-trace`
+            // and friends can bump *our* crates to debug WITHOUT re-listing
+            // the whole default — and crucially without dropping the
+            // webrtc quieting (the cause of the firehose when a recipe set
+            // a bare `MYOWNMESH_LOG`). Later directives win on conflict, so
+            // an extra `myownmesh_core=debug` overrides the default's
+            // `myownmesh_core=info`.
+            let mut filter = default_filter.to_string();
+            if let Ok(extra) = std::env::var("MYOWNMESH_LOG_EXTRA") {
+                let extra = extra.trim();
+                if !extra.is_empty() {
+                    filter.push(',');
+                    filter.push_str(extra);
+                }
+            }
+            filter
+        }
+    };
+    // `MYOWNMESH_LOG_FORMAT=json` switches the daemon to line-delimited
+    // JSON logs — one object per event, with the structured fields
+    // (peer, ice, pc, tier, changed, …) the connection tracer emits
+    // under the `conn_trace` target as first-class keys. That makes a
+    // daemon log directly machine-parseable for cross-machine timeline
+    // correlation (pair it with `ctl trace` for the pure ConnTrace
+    // stream). Default stays the human-readable formatter.
+    let json_logs = std::env::var("MYOWNMESH_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+            .with_target(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+            .with_target(false)
+            .init();
+    }
 
     // Bare `myownmesh` (no subcommand) opens the desktop GUI, mirroring
     // MyOwnLLM where a bare invocation launches the app and subcommands

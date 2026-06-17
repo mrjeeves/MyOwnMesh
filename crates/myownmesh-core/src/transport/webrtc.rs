@@ -229,6 +229,16 @@ impl Transport {
             }
             keep
         }));
+        // Drop link-local addresses (v6 `fe80::/10`, v4 `169.254/16`) from
+        // gathering. They can't be bound without a scope/zone id, so the
+        // agent's bind fails on every one — a dozen per gather on a typical
+        // macOS box — flooding the log with `could not listen udp fe80::… :
+        // Can't assign requested address` while producing zero usable
+        // candidates. Returning `false` excludes the address; routable host
+        // addresses (global v4/v6, RFC-1918, ULA `fc00::/7`) and the
+        // STUN/TURN base addresses are all kept. Loopback is already
+        // excluded upstream unless explicitly enabled.
+        setting_engine.set_ip_filter(Box::new(|ip: std::net::IpAddr| !is_link_local_ip(&ip)));
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -790,6 +800,23 @@ fn is_private_lan_ip(ip: &str) -> bool {
     }
 }
 
+/// True for v4 link-local (`169.254/16`) or v6 link-local (`fe80::/10`)
+/// addresses. These can't be bound for ICE gathering without a
+/// scope/zone id, so the agent's bind fails on every one; we filter them
+/// out of gathering up front (see the `set_ip_filter` call in
+/// [`Transport::new`]) instead of letting each fail and log. Unlike
+/// [`is_private_lan_ip`], unique-local (`fc00::/7`) is deliberately *not*
+/// matched — ULAs are bindable, routable on the local network, and make
+/// perfectly good host candidates.
+fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        // fe80::/10 — the first 10 bits are 1111 1110 10.
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 /// Render an ICE candidate as a compact `kind net addr:port` string
 /// for the connectivity-check snapshot — e.g. `host udp4
 /// 192.168.1.50:54321`. Keeps the log line readable while still
@@ -1222,6 +1249,32 @@ mod tests {
                 !is_virtual_interface(name),
                 "{name} should keep gathering ICE candidates"
             );
+        }
+    }
+
+    #[test]
+    fn link_local_ips_are_filtered_routable_ones_kept() {
+        use std::net::IpAddr;
+        // Link-local — the unbindable addresses we drop from gathering.
+        for s in ["fe80::1", "fe80::ce81:b1c:bd2c:69e", "169.254.10.20"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_link_local_ip(&ip), "{s} should be filtered");
+        }
+        // Kept: RFC-1918, CGNAT, ULA, and globals all make usable host
+        // candidates. ULA (`fdb8::`/`fd…`) in particular must survive —
+        // it's bindable and routes on the local network.
+        for s in [
+            "192.168.88.15",
+            "10.0.0.5",
+            "172.20.10.2",
+            "100.64.0.7",
+            "fdb8:7b28:9cfa:0:1c5f:1ecb:63c0:1a03",
+            "2600:382:2187:2bf1::1",
+            "127.0.0.1",
+            "::1",
+        ] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_link_local_ip(&ip), "{s} should be kept");
         }
     }
 

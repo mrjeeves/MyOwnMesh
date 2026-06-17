@@ -137,6 +137,17 @@ pub enum Request {
     /// state changes without polling.
     EventsSubscribe,
 
+    /// Subscribe to one network's connection-state transition trace.
+    /// Like [`EventsSubscribe`](Request::EventsSubscribe) the
+    /// connection becomes a one-way push stream after this op, but it
+    /// carries only [`myownmesh_core::ConnTrace`] records — one compact
+    /// JSON object per line — for `ctl trace`. Subscribing is what
+    /// turns the engine's connection tracer on (it's a no-op while
+    /// nobody watches), so this is the Phase-0 debugging entry point.
+    TraceSubscribe {
+        network: String,
+    },
+
     // ---- closed-network governance --------------------------------
     /// Snapshot the per-network signed governance state — kind,
     /// roles, transition log, pending proposals, splits. The GUI
@@ -553,6 +564,35 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             result?;
             break;
         }
+        // TraceSubscribe is the same server-push pattern as
+        // EventsSubscribe but carries only ConnTrace records and needs
+        // no ClientId (it routes nothing back in). An unknown network
+        // is reported as a plain error response and the connection
+        // stays open for another request.
+        if let Request::TraceSubscribe { network } = &request {
+            let network = network.clone();
+            match state.registry.get(&network) {
+                Some(net) => {
+                    let ack = Response::ok(serde_json::json!({
+                        "subscribed": true,
+                        "stream": "conn_trace",
+                        "network": network,
+                    }));
+                    let line = serde_json::to_string(&ack)? + "\n";
+                    writer.write_all(line.as_bytes()).await?;
+                    let rx = net.state().subscribe_conn_trace();
+                    let result = run_trace_stream(&mut writer, rx).await;
+                    result?;
+                    break;
+                }
+                None => {
+                    let resp = Response::err(format!("unknown network: {network}"));
+                    let line = serde_json::to_string(&resp)? + "\n";
+                    writer.write_all(line.as_bytes()).await?;
+                    continue;
+                }
+            }
+        }
         let resp = dispatch(&state, request).await;
         let line = serde_json::to_string(&resp)? + "\n";
         writer.write_all(line.as_bytes()).await?;
@@ -698,6 +738,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // Handled by `handle_client` before reaching dispatch.
             // If we somehow get here, surface the bug.
             Response::err("events_subscribe must be handled upstream")
+        }
+        Request::TraceSubscribe { .. } => {
+            // Handled by `handle_client` before reaching dispatch, like
+            // events_subscribe.
+            Response::err("trace_subscribe must be handled upstream")
         }
 
         // ---- governance ----
@@ -1518,6 +1563,43 @@ where
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
+        }
+    }
+}
+
+/// Stream one network's connection-state transitions to a connected
+/// `ctl trace` client. Writes each [`myownmesh_core::ConnTrace`] as a
+/// compact JSON object on its own line (clean JSONL for
+/// `scripts/merge-traces.py` and `jq`). On broadcast lag — a
+/// transition storm outran a slow reader — emits a `{"lagged":N}`
+/// marker rather than silently skipping, so a gap in the timeline is
+/// always explicit. Returns when the client disconnects or the network
+/// shuts down.
+async fn run_trace_stream<W>(
+    writer: &mut W,
+    mut rx: broadcast::Receiver<myownmesh_core::ConnTrace>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        match rx.recv().await {
+            Ok(trace) => {
+                let line = serde_json::to_string(&trace)? + "\n";
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    return Ok(());
+                }
+                if writer.flush().await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                let line = serde_json::to_string(&serde_json::json!({ "lagged": n }))? + "\n";
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }
 }

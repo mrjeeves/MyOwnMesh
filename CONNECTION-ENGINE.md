@@ -9,6 +9,12 @@ constant and timing decision here is load-bearing edge-case
 handling discovered through MyOwnLLM's field operation; don't
 relax one without understanding why it's there.
 
+> **Debugging connection-state reliability?** See
+> [`docs/DEBUGGING-CONNECTIONS.md`](docs/DEBUGGING-CONNECTIONS.md) for
+> the connection tracer (`myownmesh ctl trace`), the cross-machine
+> timeline merger, and the reproduction scenarios — the measure-first
+> tooling for finding where the several liveness signals disagree.
+
 ## The four layers
 
 The engine runs four independent state machines that compose:
@@ -49,10 +55,34 @@ prior tier fails to recover.
 | **1. Steady** | App message arrives | Reset `last_recv_at`. | No-op recovery path. |
 | **2. Wake probe** | Wake event (OS or tick gap > `WAKE_DETECTION_THRESHOLD_MS`) | Ping all peers + wait `WAKE_PROBE_DELAY_MS` (1.5 s). | Catches resume-from-sleep where heartbeats were paused. |
 | **2.5. ICE watchdog** | Per-peer `iceConnectionState == disconnected` | After `ICE_DISCONNECTED_RESTART_MS` (1 s), **renegotiate ICE**: `pc.restart_ice()` *and* send a fresh offer (`renegotiate_ice`). Re-driven each `ICE_POLL_INTERVAL_MS` while the link stays down. | **Fires before Trystero's 5 s timeout.** A bare `restart_ice()` only re-gathers *our* candidates + rotates our ufrag — the peer never hears about it, so the link can't actually come back; the offer is the other half. |
-| **3. ICE restart** | Network change (primary IP moved) or ICE failed | Same `renegotiate_ice` per peer, forced past the stale `Connected` state a just-moved interface still reports. The data channel survives; the periodic poll retries until ICE reconnects, or the checking-timeout rebuilds. | Recovers a network handoff (LTE↔Wi-Fi) in place, in seconds — no teardown, no fall to TURN. Only the deterministic offerer emits the offer (no glare); single-flighted so the watchdog + network-watch don't flood signaling. |
+| **3. ICE restart** | Network change (primary IP moved) or ICE failed | Same `renegotiate_ice` per peer, forced past the stale `Connected` state a just-moved interface still reports. The data channel survives; the periodic poll retries until ICE reconnects, or — if the channel never (re)opens within the connect-timeout — the session is rebuilt. | Recovers a network handoff (LTE↔Wi-Fi) in place, in seconds — no teardown, no fall to TURN. Only the deterministic offerer emits the offer (no glare); single-flighted so the watchdog + network-watch don't flood signaling. |
 | **4. Re-handshake** | Silence > `HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS` (~75 s) or Tier 3 failed | Per-peer `hello` cycle on `REHANDSHAKE_BACKOFF_MS_SCHEDULE` (2 / 5 / 10 / 20 / 30 s) with `REHANDSHAKE_JITTER_FRACTION` (±20 %) jitter. Up to `REHANDSHAKE_RESCUE_ATTEMPTS` (3) rounds. | Jitter prevents the thundering-herd retry when two peers wake simultaneously. |
 | **5. Room rejoin** | Three Tier-4 rounds failed, OR rostered peer offline > `OFFLINE_ROSTERED_CHECK_INTERVAL_MS` (60 s) | Trystero room `leave` + `joinRoom`. Backed off via `REDISCOVERY_BACKOFF_SCHEDULE_MS` (90 s / 3 min / 5 min / 10 min). | Throttle prevents relay-spam after persistent failure. |
 | **6. Stop + Start** | Signaling / STUN / TURN config edit | Reconcile teardown + fresh start, immediately. | Triggered only by user action — never as an automatic recovery. |
+
+## Teardown authority
+
+The ladder *recovers* a link; what decides a link is **dead** is
+deliberately narrow and keyed only off reliable signals — never
+webrtc-rs's ICE connection state, which has been observed reporting
+`Failed` / `Disconnected` on links carrying traffic and `Connected` (with
+a "nominated, succeeded" pair) on links whose data channel never opened. A
+peer is torn down and rebuilt by exactly three things:
+
+1. **Connect-timeout** — a session whose **data channel never opened**
+   within `DATA_CHANNEL_OPEN_TIMEOUT_MS` of creation. The data-channel
+   `open` event (DTLS + SCTP genuinely up) is the one unambiguous
+   "we connected" milestone, so this is the single clock for a
+   *connecting* peer. It replaced the old ICE-`Checking` timeout and its
+   succeeded-but-not-nominated grace window.
+2. **Data-channel close** — a `DataChannelClosed` / PC-`Closed` event, the
+   authoritative transport-dead signal for an *open* peer.
+3. **Inbound silence** — no frame received past the heartbeat grace
+   (zombie clearing), the liveness backstop for an *open* peer.
+
+Everything else — ICE `Disconnected` / `Failed`, a stale nominated pair —
+only ever *schedules an in-place restart* (`renegotiate_ice`); it never
+tears a peer down on its own.
 
 ## Tunables
 

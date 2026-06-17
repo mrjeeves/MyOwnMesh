@@ -132,6 +132,7 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(WAKE_PROBE_DELAY_MS)).await;
         let now = Instant::now();
+        let mut any_rebuilt = false;
         for peer_id in peers {
             let stale = {
                 let Some(peer) = state_clone.peers.get(&peer_id) else {
@@ -144,9 +145,22 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                     > WAKE_PROBE_DELAY_MS
             };
             if stale {
-                debug!(peer = %peer_id, "wake probe — peer silent, escalating");
-                super::ladder::escalate_to_rehandshake(&state_clone, &peer_id).await;
+                // The peer didn't answer the wake probe — its transport
+                // didn't survive the suspend. Re-handshaking over a dead
+                // channel can't work; rebuild and let discovery
+                // re-establish it (same reasoning as the heartbeat path).
+                debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
+                super::drop_peer(
+                    &state_clone,
+                    &peer_id,
+                    crate::events::DropReason::HeartbeatTimeout,
+                )
+                .await;
+                any_rebuilt = true;
             }
+        }
+        if any_rebuilt {
+            super::maybe_reactive_announce(&state_clone);
         }
     });
 }

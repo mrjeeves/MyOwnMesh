@@ -57,18 +57,32 @@ pub async fn tick(state: &Arc<NetworkState>) {
             }
         })
         .collect();
-    for peer_id in stale {
-        state.log_diag_with(
-            crate::events::DiagLevel::Warn,
-            "heartbeat",
-            format!("peer silent past heartbeat timeout — escalating to Tier 4: {peer_id}"),
-            serde_json::json!({ "peer": peer_id }),
-        );
-        super::ladder::escalate_to_rehandshake(state, &peer_id).await;
+    // Silence past the ping/pong window means the *transport* is dead, not
+    // that app state went stale: a live channel keeps `last_recv_at` fresh
+    // via the heartbeat pong every interval, so anything past this
+    // threshold has stopped carrying frames regardless of what ICE reports.
+    // Re-handshaking `hello` over a dead channel can't work — it lands in
+    // the void (observed: three "Connected"-on-TURN peers stuck at
+    // Handshaking for minutes after a network change). Rebuild instead and
+    // let discovery re-establish a fresh connection.
+    if !stale.is_empty() {
+        for peer_id in &stale {
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "heartbeat",
+                format!("peer silent past heartbeat timeout — rebuilding: {peer_id}"),
+                serde_json::json!({ "peer": peer_id }),
+            );
+            super::drop_peer(state, peer_id, crate::events::DropReason::HeartbeatTimeout).await;
+        }
+        // Re-seed discovery so the rebuilt peers rediscover promptly rather
+        // than waiting for their next scheduled announce. Rate-limited, so
+        // a wave of timeouts collapses into one publish.
+        super::maybe_reactive_announce(state);
     }
 }
 
-async fn send_ping(state: &Arc<NetworkState>, device_id: &str) {
+pub(super) async fn send_ping(state: &Arc<NetworkState>, device_id: &str) {
     let t = monotonic_ms();
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();

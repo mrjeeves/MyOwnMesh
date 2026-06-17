@@ -149,6 +149,7 @@ pub fn start(
         seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
             SEEN_EVENT_CAPACITY,
         )),
+        outbound_replay: Mutex::new(std::collections::VecDeque::new()),
     });
     {
         let mut relays = shared.relays.lock();
@@ -282,6 +283,19 @@ struct DriverShared {
     /// busiest realistic mesh comfortably without growing
     /// unboundedly.
     seen_event_ids: Mutex<std::collections::VecDeque<String>>,
+    /// Outbound *directed* events (offers / answers / candidates) buffered
+    /// while every relay socket was mid-reconnect, when `publish_tx` has no
+    /// subscribers and a plain send would be dropped. This is the
+    /// network-change race: the engine fires its ICE-restart offers the
+    /// same instant the relay redials (both triggered by the IP change),
+    /// so without buffering the restart offers vanish into the ~1 s
+    /// reconnect window — the peer never hears them and the Offerer side
+    /// never recovers (observed directly in the field). The next relay to
+    /// (re)connect drains and replays these; see `run_outbound_pump` and
+    /// the relay session's subscribe path. Bounded ([`OUTBOUND_REPLAY_CAP`])
+    /// and TTL'd ([`OUTBOUND_REPLAY_TTL_MS`]) so a long outage can't grow it
+    /// unboundedly or replay an offer the negotiation has moved past.
+    outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>>,
 }
 
 /// Window size of `seen_event_ids` — re-exported from
@@ -577,6 +591,30 @@ async fn run_relay_session(
     // publish rate doesn't scale with relay count.
     let mut publish_rx = shared.publish_tx.subscribe();
 
+    // Replay any directed events buffered while every relay was
+    // mid-reconnect (the network-change race — see
+    // `DriverShared::outbound_replay`). Now that this socket is subscribed,
+    // re-publish them so they fan out to every connected relay and reach
+    // the peer; draining means only the first relay back replays. This is
+    // what lets the Offerer side's ICE-restart offers survive the relay
+    // redial instead of being dropped.
+    {
+        let fresh = {
+            let mut buf = shared.outbound_replay.lock();
+            drain_fresh_outbound(&mut buf, std::time::Instant::now())
+        };
+        if !fresh.is_empty() {
+            debug!(
+                relay = %short(url),
+                count = fresh.len(),
+                "replaying buffered outbound events after relay reconnect"
+            );
+            for event in fresh {
+                let _ = shared.publish_tx.send(event);
+            }
+        }
+    }
+
     // One-shot "hello, I'm on this relay" publish so a freshly
     // (re)connected relay immediately learns we're here, rather
     // than waiting up to ANNOUNCE_STEADY_MS for the next global
@@ -849,6 +887,47 @@ fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     )
 }
 
+/// Cap on the outbound replay buffer — see [`DriverShared::outbound_replay`].
+/// A network change produces a handful of offers plus a candidate trickle
+/// per peer; 256 covers a large mesh's burst with headroom while bounding
+/// memory if every relay stays down.
+const OUTBOUND_REPLAY_CAP: usize = 256;
+
+/// Buffered outbound events older than this are stale — the ICE
+/// negotiation they belonged to has moved on — and are dropped rather than
+/// replayed. Comfortably longer than a relay reconnect (sub-second to
+/// ~2 s), shorter than the engine's checking-timeout, so a replay always
+/// lands inside the attempt it was meant for.
+const OUTBOUND_REPLAY_TTL_MS: u64 = 10_000;
+
+/// Push an outbound event onto the replay buffer, evicting the oldest if
+/// it would exceed [`OUTBOUND_REPLAY_CAP`].
+fn push_outbound_replay(
+    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>,
+    now: std::time::Instant,
+    event: Arc<NostrEvent>,
+) {
+    buf.push_back((now, event));
+    while buf.len() > OUTBOUND_REPLAY_CAP {
+        buf.pop_front();
+    }
+}
+
+/// Drain the replay buffer, returning the events still within
+/// [`OUTBOUND_REPLAY_TTL_MS`] in order. Stale entries are discarded; the
+/// buffer is emptied either way, so the first relay back replays and the
+/// rest see nothing.
+fn drain_fresh_outbound(
+    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>,
+    now: std::time::Instant,
+) -> Vec<Arc<NostrEvent>> {
+    let ttl = Duration::from_millis(OUTBOUND_REPLAY_TTL_MS);
+    buf.drain(..)
+        .filter(|(t, _)| now.duration_since(*t) <= ttl)
+        .map(|(_, e)| e)
+        .collect()
+}
+
 async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut rx_guard = shared.outbound.lock().await;
     let Some(mut rx) = rx_guard.take() else {
@@ -896,7 +975,23 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
         // active-handshake path that's the periodic announce
         // running on each relay's own timer.
         if shared.publish_tx.receiver_count() == 0 {
-            debug!("no relay subscribers ready; outbound event dropped");
+            // Every relay is mid-reconnect. Buffer directed negotiation
+            // (offers / answers / candidates, on the ephemeral kind) so the
+            // next relay up replays it — without this the network-change
+            // ICE-restart offers are lost to the reconnect window and the
+            // Offerer side never recovers. Announce rides the stored kind
+            // and is self-healing (the periodic tick + each relay's
+            // open-announce re-send it), so buffering it would only add a
+            // redundant publish.
+            if kind == SIGNALING_EPHEMERAL_KIND {
+                let mut buf = shared.outbound_replay.lock();
+                push_outbound_replay(&mut buf, std::time::Instant::now(), event);
+                debug!(
+                    "no relay subscribers ready; buffered directed event for replay on reconnect"
+                );
+            } else {
+                debug!("no relay subscribers ready; announce dropped (re-ticks on reconnect)");
+            }
             continue;
         }
         let _ = shared.publish_tx.send(event);
@@ -954,6 +1049,60 @@ mod tests {
         assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
     }
 
+    fn test_event(signer: &NostrIdentity, n: u8) -> Arc<NostrEvent> {
+        let envelope = SignalingEnvelope {
+            from: "peer".into(),
+            to: Some("self-device".into()),
+            msg: SignalingMessage::Announce {
+                peer_id: format!("p{n}"),
+            },
+        };
+        Arc::new(crate::nostr::event::make_event(
+            signer,
+            SIGNALING_EPHEMERAL_KIND,
+            vec![vec!["r".into(), "test-room".into()]],
+            serde_json::to_string(&envelope).unwrap(),
+            1_700_000_000,
+        ))
+    }
+
+    #[test]
+    fn outbound_replay_caps_at_limit_evicting_oldest() {
+        use std::collections::VecDeque;
+        let id = NostrIdentity::generate();
+        let now = std::time::Instant::now();
+        let mut buf: VecDeque<(std::time::Instant, Arc<NostrEvent>)> = VecDeque::new();
+        for n in 0..(OUTBOUND_REPLAY_CAP as u32 + 50) {
+            push_outbound_replay(&mut buf, now, test_event(&id, n as u8));
+        }
+        assert_eq!(
+            buf.len(),
+            OUTBOUND_REPLAY_CAP,
+            "buffer must not grow past the cap"
+        );
+    }
+
+    #[test]
+    fn drain_fresh_outbound_keeps_recent_drops_stale_and_empties() {
+        use std::collections::VecDeque;
+        let id = NostrIdentity::generate();
+        // Use Add (not Sub) to build a reference "now" 60 s ahead of the
+        // stale timestamp — avoids any Instant underflow on a freshly
+        // booted host while still putting the first event well past the TTL.
+        let base = std::time::Instant::now();
+        let now = base + Duration::from_secs(60);
+        let mut buf: VecDeque<(std::time::Instant, Arc<NostrEvent>)> = VecDeque::new();
+        push_outbound_replay(&mut buf, base, test_event(&id, 1)); // 60 s old → stale
+        push_outbound_replay(&mut buf, now, test_event(&id, 2)); // fresh
+        push_outbound_replay(&mut buf, now, test_event(&id, 3)); // fresh
+        let fresh = drain_fresh_outbound(&mut buf, now);
+        assert_eq!(fresh.len(), 2, "only the two fresh events should replay");
+        assert!(
+            buf.is_empty(),
+            "drain empties the buffer regardless of which entries were stale"
+        );
+    }
+
     fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();
         let (publish_tx, _) = broadcast::channel::<Arc<NostrEvent>>(16);
@@ -969,6 +1118,7 @@ mod tests {
             seen_event_ids: Mutex::new(std::collections::VecDeque::with_capacity(
                 SEEN_EVENT_CAPACITY,
             )),
+            outbound_replay: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 

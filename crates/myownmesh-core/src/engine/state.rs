@@ -22,6 +22,7 @@ use crate::topology::Topology;
 use crate::transport::webrtc::{AudioSample, VideoSample};
 use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 
+use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
 use super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS;
 
@@ -289,6 +290,19 @@ pub struct NetworkState {
     /// doomed attempt. Cleared the moment an interface returns, at which
     /// point the network-change handler drives a clean restart fan-out.
     offline: std::sync::atomic::AtomicBool,
+
+    /// Broadcast of per-peer connection-state transitions for the
+    /// Phase-0 connection tracer (`engine::conn_trace`). Kept separate
+    /// from `events_tx` so trace volume can never evict real Peer /
+    /// Phase events from the GUI's subscriber, and so `receiver_count()`
+    /// cleanly reflects whether anyone is watching — which is what gates
+    /// the sweep's cost in the driver loop.
+    pub conn_trace_tx: broadcast::Sender<ConnTrace>,
+    /// When true, the connection tracer emits even with no live
+    /// subscriber, so daemon file logs capture transitions. Read once
+    /// from `MYOWNMESH_CONN_TRACE` at construction (any non-empty value
+    /// other than `0` enables it).
+    conn_trace_force_on: bool,
 }
 
 impl NetworkState {
@@ -328,6 +342,13 @@ impl NetworkState {
         // beyond that a slow consumer should lose frames, not delay them.
         let (video_subscribers, _) = broadcast::channel(16);
         let (audio_subscribers, _) = broadcast::channel(64);
+        // Deep enough to ride out a transition storm (a sleep/wake
+        // fan-out re-handshaking every peer) without the watcher lagging;
+        // lossy past that, with a `lagged` marker surfaced to the stream.
+        let (conn_trace_tx, _) = broadcast::channel(512);
+        let conn_trace_force_on = std::env::var("MYOWNMESH_CONN_TRACE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
         let (signaling_tx, signaling_outbound_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (signaling_inbound_tx, signaling_inbound_rx) = mpsc::unbounded_channel();
@@ -355,6 +376,8 @@ impl NetworkState {
             relay_reconnect: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
             offline: std::sync::atomic::AtomicBool::new(false),
+            conn_trace_tx,
+            conn_trace_force_on,
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
     }
@@ -447,6 +470,29 @@ impl NetworkState {
     /// than spam on every emit.
     pub fn emit(&self, event: MeshEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    /// Subscribe to this network's connection-state transition trace.
+    /// The control socket's `trace_subscribe` op hands the receiver to
+    /// a `ctl trace` client; subscribing is also what flips
+    /// [`conn_trace_enabled`](Self::conn_trace_enabled) on, so the
+    /// driver's sweep starts emitting.
+    pub fn subscribe_conn_trace(&self) -> broadcast::Receiver<ConnTrace> {
+        self.conn_trace_tx.subscribe()
+    }
+
+    /// Whether the connection tracer should do any work this sweep.
+    /// True when forced on via `MYOWNMESH_CONN_TRACE`, or when at least
+    /// one subscriber is attached. The driver loop checks this first so
+    /// the production path with no observer pays only one atomic load.
+    pub fn conn_trace_enabled(&self) -> bool {
+        self.conn_trace_force_on || self.conn_trace_tx.receiver_count() > 0
+    }
+
+    /// Emit one connection-state trace record. Lossy like
+    /// [`emit`](Self::emit) — drops if there is no subscriber.
+    pub fn emit_conn_trace(&self, trace: ConnTrace) {
+        let _ = self.conn_trace_tx.send(trace);
     }
 
     /// Emit a structured diagnostic — both to the tracing layer

@@ -70,20 +70,21 @@ pub struct PeerStateData {
     pub last_ping_t: Option<i64>,
     pub rtt_ms: Option<u32>,
     pub ice_disconnected_since: Option<Instant>,
-    /// When ICE entered `Checking` for the current attempt. Set on the
-    /// transition into Checking, cleared the moment it reaches
-    /// Connected (or goes Disconnected/Failed/Closed). The
-    /// checking-timeout watchdog reads this to rebuild a peer that's
-    /// been stuck mid-negotiation too long instead of waiting out
-    /// webrtc-rs's ~30 s internal timer.
-    pub ice_checking_since: Option<Instant>,
-    /// How many times the checking-timeout has *extended* this attempt
-    /// instead of tearing it down, because the agent had succeeded pairs
-    /// (connectivity exists) but hadn't nominated yet. Bounds the grace so
-    /// a pair that succeeds-but-never-nominates can't stall a peer
-    /// forever; reset whenever ICE leaves Checking. See
-    /// `ice_watchdog::on_checking_timeout`.
-    pub checking_grace_used: u8,
+    /// When this peer's transport session (the `RTCPeerConnection`) was
+    /// created. The single clock for a *connecting* peer: if its data
+    /// channel hasn't opened within `DATA_CHANNEL_OPEN_TIMEOUT_MS` of
+    /// this, the attempt is treated as failed and rebuilt. Replaces the
+    /// old ICE-`Checking` timeout — we time the reliable milestone (a data
+    /// channel that actually opened) instead of webrtc-rs's unreliable ICE
+    /// connection state. `None` only for the session-less peers some unit
+    /// tests insert; set in `ensure_peer_session` when the session opens.
+    pub session_started_at: Option<Instant>,
+    /// True once this session's data channel has fired `on_open` — the one
+    /// reliable "transport is up" signal (DTLS + SCTP genuinely
+    /// established). The connect-timeout watchdog only reclaims a peer
+    /// whose channel never opened; once it's open, liveness is governed by
+    /// inbound-frame recency (heartbeat), not by ICE state.
+    pub data_channel_open: bool,
     pub handshake_started_at: Option<Instant>,
     pub hello_attempt: u32,
     pub rehandshake_attempt: u32,
@@ -144,8 +145,8 @@ impl Default for PeerStateData {
             last_ping_t: None,
             rtt_ms: None,
             ice_disconnected_since: None,
-            ice_checking_since: None,
-            checking_grace_used: 0,
+            session_started_at: None,
+            data_channel_open: false,
             handshake_started_at: None,
             hello_attempt: 0,
             rehandshake_attempt: 0,

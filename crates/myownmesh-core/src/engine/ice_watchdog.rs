@@ -18,7 +18,10 @@ use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::scheduler::{CHECKING_GRACE_MAX, ICE_CHECKING_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
+use super::ladder::ConnectionTier;
+use super::scheduler::{
+    DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
+};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -97,16 +100,15 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
         super::record_selected_pair(state, &peer_id).await;
     }
 
-    // Live ICE-establishment progress. For any peer still in
-    // `Checking`, emit a one-line snapshot each poll so the user can
-    // watch — in real time — how many candidate pairs have reached
+    // Live ICE-establishment progress — diagnostic only. For any peer
+    // still in `Checking`, emit a one-line snapshot each poll so the user
+    // can watch, in real time, how many candidate pairs have reached
     // `succeeded` and whether anything is nominated yet (the only pair
     // fields webrtc-ice actually maintains; see `diag::IcePairSnapshot`).
-    // "succeeded pairs climbing but none nominated" is the fingerprint of
-    // the nomination stall the checking-timeout grace below now holds open
-    // instead of rebuilding. Self-limiting: a peer only sits in Checking
-    // for the ~30 s before ICE gives up, so this quiets down on its own
-    // once it connects or fails.
+    // This drives no decisions — the connect-timeout below keys off the
+    // data channel, not this — it's purely the "why isn't it connecting"
+    // trail. Self-limiting: a peer only sits in Checking briefly before it
+    // connects, fails, or hits the connect-timeout.
     let checking: Vec<String> = state
         .peers
         .iter()
@@ -123,136 +125,115 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
         super::log_ice_check_snapshot(state, &peer_id, "checking", false).await;
     }
 
-    // Checking-timeout watchdog. A peer that's sat in `Checking` past
-    // ICE_CHECKING_TIMEOUT_MS isn't going to connect on this attempt;
-    // webrtc-rs would otherwise wait its ~30 s internal timer before
-    // flipping to Failed. Tear it down and re-seed discovery so a
-    // usable path — e.g. the instant the laptop rejoins a network the
-    // peer is actually on — is retried in seconds rather than half a
-    // minute. The natural ~15 s cycle plus the shared announce
-    // rate-limit keeps this from churning the relays.
-    let stuck: Vec<String> = state
+    // Connect-timeout watchdog — the single teardown clock for a
+    // *connecting* peer. A session whose data channel hasn't opened within
+    // DATA_CHANNEL_OPEN_TIMEOUT_MS of being created isn't going to on this
+    // attempt; rebuild it (and re-seed discovery) rather than waiting out
+    // webrtc-rs's ~30 s internal ICE timer. Keyed off the reliable
+    // milestone — `data_channel_open` — not ICE state, which has been seen
+    // to lie in both directions. A peer whose channel already opened is
+    // never a candidate here; its liveness is the heartbeat.
+    let timed_out: Vec<String> = state
         .peers
         .iter()
         .filter_map(|e| {
-            let since = e.value().state.read().ice_checking_since?;
-            (now.saturating_duration_since(since).as_millis() as u64 >= ICE_CHECKING_TIMEOUT_MS)
+            let data = e.value().state.read();
+            if data.data_channel_open {
+                return None;
+            }
+            let started = data.session_started_at?;
+            (now.saturating_duration_since(started).as_millis() as u64
+                >= DATA_CHANNEL_OPEN_TIMEOUT_MS)
                 .then(|| e.key().clone())
         })
         .collect();
-    for peer_id in stuck {
-        on_checking_timeout(state, &peer_id).await;
+    for peer_id in timed_out {
+        on_connect_timeout(state, &peer_id).await;
+    }
+
+    // Restart-verify watchdog. A peer recovering from an ICE restart stays
+    // in the IceRestart tier until *inbound traffic* confirms the path —
+    // ICE-Connected alone doesn't (it's been seen Connected on a dead TURN
+    // path that delivered nothing for 90 s). Rebuild one whose restart
+    // never produced traffic: a short grace once ICE is up (a live path
+    // pongs the confirm-ping within an RTT), or the full connect-timeout
+    // while it's still re-gathering — the clock is re-stamped to the moment
+    // ICE reconnects, so a restart legitimately crossing slow signaling
+    // isn't killed early.
+    let restart_unconfirmed: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|e| {
+            let started = match e.value().state.read().tier {
+                ConnectionTier::IceRestart { started } => started,
+                _ => return None,
+            };
+            let ice_up = e
+                .value()
+                .session
+                .lock()
+                .as_ref()
+                .map(|s| {
+                    matches!(
+                        s.ice_connection_state(),
+                        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+                    )
+                })
+                .unwrap_or(false);
+            let deadline = if ice_up {
+                RESTART_TRAFFIC_GRACE_MS
+            } else {
+                DATA_CHANNEL_OPEN_TIMEOUT_MS
+            };
+            (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
+                .then(|| e.key().clone())
+        })
+        .collect();
+    for peer_id in restart_unconfirmed {
+        on_restart_unconfirmed(state, &peer_id).await;
     }
 }
 
-/// A peer sat in ICE `Checking` past the timeout without connecting.
+/// A connecting peer whose data channel never opened within the timeout.
+/// The attempt failed — rebuild it. (An already-open peer is never a
+/// candidate for this; its liveness is the heartbeat.)
 ///
-/// Before rebuilding, check whether the agent actually has connectivity:
-/// webrtc-ice marks a pair `succeeded` once its check passes. If some
-/// pairs have succeeded but none is nominated yet, the path *works* and
-/// we're only waiting on the controlling side to send USE-CANDIDATE.
-/// Tearing the agent down then rebuilding (re-gather, re-prime the
-/// checklist, re-run every check) resets that nomination race from
-/// scratch — and if both ends do it on the same 15 s clock, neither ever
-/// finishes nominating. That is the dominant driver of the observed
-/// connect→stuck→rebuild flap. So in that state we *extend* the attempt
-/// (up to [`CHECKING_GRACE_MAX`] windows) instead of rebuilding.
-///
-/// Only when there's no such progress — no succeeded pair, or the grace
-/// budget is spent — do we surface *why* (full check snapshot), drop the
-/// peer, and re-seed discovery so a fresh PeerConnection is built rather
-/// than waiting out webrtc-rs's ~30 s internal ICE-failure timer. The
-/// re-announce is rate-limited via the shared reactive-announce guard so
-/// a wave of timeouts can't flood the relays.
-async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
-    // While the host is offline (no primary interface) every peer will
-    // time out its checking window, but tearing them all down now just
-    // means re-discovering them from scratch a second later when the
-    // interface returns. Hold the peers in place — the network-change
-    // handler restarts ICE on all of them once we're back online. The
-    // window stays armed, so this simply no-ops each poll until then.
+/// Unlike the old ICE-`Checking` timeout, the data-channel-open milestone
+/// is unambiguous, so there's no "succeeded-but-not-nominated" grace to
+/// weigh and no nominated-pair heuristic to second-guess: if the channel
+/// didn't open, the attempt didn't work. We still surface *why* (the full
+/// connectivity-check snapshot) and, when the fingerprint is "no remote
+/// candidates ever arrived" (a signaling problem, not a network block),
+/// force a throttled relay redial before rebuilding — a wedged relay
+/// socket left by a network blip is the usual cause, and redialing is what
+/// unblocks candidate delivery for the rebuilt session. The re-announce is
+/// rate-limited so a wave of timeouts can't flood the relays.
+async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    // While the host is offline (no primary interface) every peer will time
+    // out, but tearing them all down now just means re-discovering them a
+    // second later when the interface returns. Hold in place — the
+    // network-change handler restarts everything once we're back online.
     if state.is_offline() {
         return;
-    }
-    // Pull a live snapshot first — its pair states drive the
-    // extend-vs-rebuild decision below.
-    let snapshot = {
-        let session = {
-            let Some(peer) = state.peers.get(device_id) else {
-                return;
-            };
-            let session = peer.session.lock().clone();
-            session
-        };
-        match session {
-            Some(s) => s.ice_check_snapshot().await,
-            None => return,
-        }
-    };
-
-    // Connectivity exists (a pair succeeded) but nothing is nominated yet:
-    // extend rather than rebuild, bounded by the grace budget. The condition
-    // deliberately excludes the *already-nominated* case: a pair that is
-    // nominated yet the agent still reads `Checking` 15 s on is a wedged
-    // connection, not a forming one — a healthy nominated pair flips ICE to
-    // `Connected`. Extending the nominated case (tried, reverted) was worse:
-    // it pins a wedged session in limbo for the whole grace budget — often
-    // while a `stuck at Sighted` re-offer loop keeps the data channel from
-    // ever opening — and then rebuilds anyway. Rebuilding promptly gives a
-    // fresh session a clean shot at the handshake instead.
-    if snapshot.succeeded_pairs() > 0 && !snapshot.has_nominated_pair() {
-        let extended = {
-            let Some(peer) = state.peers.get(device_id) else {
-                return;
-            };
-            let mut data = peer.state.write();
-            if data.checking_grace_used < CHECKING_GRACE_MAX {
-                data.checking_grace_used += 1;
-                // Re-arm the window without an ICE state change, so the
-                // grace budget (reset only on a real Checking transition)
-                // is preserved across extensions.
-                data.ice_checking_since = Some(Instant::now());
-                Some(data.checking_grace_used)
-            } else {
-                None
-            }
-        };
-        if let Some(used) = extended {
-            state.log_diag_with(
-                DiagLevel::Debug,
-                "ice",
-                format!(
-                    "ICE for {} has {} succeeded pair(s) but none nominated yet — extending \
-                     the checking window ({used}/{CHECKING_GRACE_MAX}) instead of rebuilding",
-                    super::short_peer(device_id),
-                    snapshot.succeeded_pairs(),
-                ),
-                serde_json::json!({
-                    "peer": device_id,
-                    "succeeded_pairs": snapshot.succeeded_pairs(),
-                    "grace_used": used,
-                    "grace_max": CHECKING_GRACE_MAX,
-                }),
-            );
-            return;
-        }
-        // Budget exhausted — fall through to the rebuild path.
     }
 
     state.log_diag_with(
         DiagLevel::Warn,
         "ice",
         format!(
-            "ICE stuck in checking > {}s for {} — rebuilding",
-            ICE_CHECKING_TIMEOUT_MS / 1000,
+            "data channel never opened within {}s for {} — rebuilding",
+            DATA_CHANNEL_OPEN_TIMEOUT_MS / 1000,
             super::short_peer(device_id),
         ),
-        serde_json::json!({ "peer": device_id, "checking_timeout_ms": ICE_CHECKING_TIMEOUT_MS }),
+        serde_json::json!({
+            "peer": device_id,
+            "connect_timeout_ms": DATA_CHANNEL_OPEN_TIMEOUT_MS,
+        }),
     );
     // The full snapshot (candidates + per-pair states + a plain-language
     // diagnosis) is the record of why this attempt never completed — log
     // it before the teardown removes the agent.
-    super::log_ice_check_snapshot(state, device_id, "stuck in checking", true).await;
+    super::log_ice_check_snapshot(state, device_id, "connect timed out", true).await;
 
     // Zero remote candidates is the fingerprint of wedged signaling, not a
     // blocked network: the peer's candidates never crossed the relay (or
@@ -332,6 +313,28 @@ async fn on_checking_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // Nudge discovery so we don't wait for the peer's next scheduled
     // announce; rate-limited, so several simultaneous timeouts collapse
     // into a single publish.
+    super::maybe_reactive_announce(state);
+}
+
+/// A peer whose ICE restart reconnected (or should have) but never produced
+/// inbound traffic — the restart didn't actually restore the link. Rebuild
+/// rather than ride a dead "connected" peer until the heartbeat notices a
+/// minute later. (Real traffic would have promoted it back to Steady in
+/// `handle_inbound_frame`, taking it out of this watchdog's sights.)
+async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str) {
+    if state.is_offline() {
+        return;
+    }
+    state.log_diag_with(
+        DiagLevel::Warn,
+        "ice",
+        format!(
+            "ICE restart for {} did not restore traffic — rebuilding",
+            super::short_peer(device_id),
+        ),
+        serde_json::json!({ "peer": device_id }),
+    );
+    super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
     super::maybe_reactive_announce(state);
 }
 
