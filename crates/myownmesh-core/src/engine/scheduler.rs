@@ -69,6 +69,17 @@ pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 /// regardless, so this only ever bounds a *failure*.
 pub const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 30_000;
 
+/// After an in-place ICE restart reconnects, how long to wait for *inbound
+/// traffic* to confirm the path actually carries frames before giving up
+/// and rebuilding. ICE reaching `Connected` is **not** proof — webrtc-rs
+/// reports it on dead TURN paths that never deliver a byte (seen in the
+/// field after a Wi-Fi→hotspot handoff: three peers "Connected" on TURN,
+/// zero frames for 90 s). A real path pongs the post-restart confirm-ping
+/// within a round-trip, so this only needs to cover that RTT plus jitter.
+/// Kept short so a restart that "connected" but is actually dead is rebuilt
+/// in seconds, not at the heartbeat timeout a minute later.
+pub const RESTART_TRAFFIC_GRACE_MS: u64 = 10_000;
+
 /// Minimum gap between relay redials forced by the "connect timed out with
 /// zero remote candidates" rescue (see
 /// [`crate::engine::state::NetworkState::request_relay_reconnect_throttled`]).

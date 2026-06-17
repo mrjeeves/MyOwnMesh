@@ -18,7 +18,10 @@ use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 
 use super::connection::PeerStatus;
-use super::scheduler::{DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS};
+use super::ladder::ConnectionTier;
+use super::scheduler::{
+    DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
+};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -147,6 +150,48 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     for peer_id in timed_out {
         on_connect_timeout(state, &peer_id).await;
     }
+
+    // Restart-verify watchdog. A peer recovering from an ICE restart stays
+    // in the IceRestart tier until *inbound traffic* confirms the path —
+    // ICE-Connected alone doesn't (it's been seen Connected on a dead TURN
+    // path that delivered nothing for 90 s). Rebuild one whose restart
+    // never produced traffic: a short grace once ICE is up (a live path
+    // pongs the confirm-ping within an RTT), or the full connect-timeout
+    // while it's still re-gathering — the clock is re-stamped to the moment
+    // ICE reconnects, so a restart legitimately crossing slow signaling
+    // isn't killed early.
+    let restart_unconfirmed: Vec<String> = state
+        .peers
+        .iter()
+        .filter_map(|e| {
+            let started = match e.value().state.read().tier {
+                ConnectionTier::IceRestart { started } => started,
+                _ => return None,
+            };
+            let ice_up = e
+                .value()
+                .session
+                .lock()
+                .as_ref()
+                .map(|s| {
+                    matches!(
+                        s.ice_connection_state(),
+                        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+                    )
+                })
+                .unwrap_or(false);
+            let deadline = if ice_up {
+                RESTART_TRAFFIC_GRACE_MS
+            } else {
+                DATA_CHANNEL_OPEN_TIMEOUT_MS
+            };
+            (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
+                .then(|| e.key().clone())
+        })
+        .collect();
+    for peer_id in restart_unconfirmed {
+        on_restart_unconfirmed(state, &peer_id).await;
+    }
 }
 
 /// A connecting peer whose data channel never opened within the timeout.
@@ -268,6 +313,28 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // Nudge discovery so we don't wait for the peer's next scheduled
     // announce; rate-limited, so several simultaneous timeouts collapse
     // into a single publish.
+    super::maybe_reactive_announce(state);
+}
+
+/// A peer whose ICE restart reconnected (or should have) but never produced
+/// inbound traffic — the restart didn't actually restore the link. Rebuild
+/// rather than ride a dead "connected" peer until the heartbeat notices a
+/// minute later. (Real traffic would have promoted it back to Steady in
+/// `handle_inbound_frame`, taking it out of this watchdog's sights.)
+async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str) {
+    if state.is_offline() {
+        return;
+    }
+    state.log_diag_with(
+        DiagLevel::Warn,
+        "ice",
+        format!(
+            "ICE restart for {} did not restore traffic — rebuilding",
+            super::short_peer(device_id),
+        ),
+        serde_json::json!({ "peer": device_id }),
+    );
+    super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
     super::maybe_reactive_announce(state);
 }
 
