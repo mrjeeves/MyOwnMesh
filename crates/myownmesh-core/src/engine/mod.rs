@@ -141,12 +141,13 @@ pub async fn run_driver(
     let mut heartbeat =
         tokio::time::interval(Duration::from_millis(scheduler::HEARTBEAT_INTERVAL_MS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut ice_poll =
-        tokio::time::interval(Duration::from_millis(scheduler::ICE_POLL_INTERVAL_MS));
-    ice_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut network_watch_tick =
-        tokio::time::interval(Duration::from_millis(scheduler::NETWORK_WATCH_POLL_MS));
-    network_watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // One periodic pass replaces the old separate ICE-watchdog and
+    // network-watch intervals. Recovery is event-driven first; this is the
+    // secondary safety-net tick (see `scheduler::STATE_WATCH_INTERVAL_MS`)
+    // that confirms state and handles the inherently time-based conditions.
+    let mut state_watch =
+        tokio::time::interval(Duration::from_millis(scheduler::STATE_WATCH_INTERVAL_MS));
+    state_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut network_watch = network_watch::NetworkWatch::new().await;
     let mut wake_detector = wake::WakeDetector::new();
     // Phase-0 connection tracer. Observes per-peer connection-state
@@ -183,12 +184,14 @@ pub async fn run_driver(
                 }
             }
 
-            _ = ice_poll.tick() => {
+            _ = state_watch.tick() => {
+                // Secondary safety net only — events drive recovery. Confirm
+                // per-peer state (connect-timeout / restart-verify / ICE
+                // re-drive), check for a primary-IP change, and retry any
+                // reconnect intent whose backoff has come due.
                 ice_watchdog::poll_all(&state).await;
-            }
-
-            _ = network_watch_tick.tick() => {
                 network_watch.poll(&state).await;
+                service_reconnect_intents(&state).await;
             }
         }
 
@@ -657,6 +660,48 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
         let _ = state.signaling_tx.send(SignalingOutbound::Announce);
     }
     due
+}
+
+/// Re-offer to a peer we hold a reconnect intent for, when conditions allow:
+/// we're online, we're the deterministic offerer, and no session is already
+/// in flight. Best-effort — a no-op while offline (the relay-reconnect flush
+/// and the tick pick it up once we're back) or when a session already exists
+/// (its own lifecycle carries it). Nudges discovery first so the remote
+/// answerer learns we're trying and reflects an announce, giving its side a
+/// clean rebuild to meet our fresh offer. Shared by the event paths
+/// (relay-reconnect flush) and the tick's backstop retry.
+pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
+    if state.is_offline() {
+        return;
+    }
+    if state.peers.contains_key(device_id) {
+        return;
+    }
+    // Only the deterministic offerer (lex-lower id) re-offers; the answerer
+    // waits for that offer rather than sending a competing one.
+    if state.identity.public_id() >= device_id {
+        return;
+    }
+    maybe_reactive_announce(state);
+    ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
+}
+
+/// The state-watch tick's backstop for offerer-side reconnects. Events
+/// re-offer immediately (a relay reconnect flushes every intent; an inbound
+/// announce rebuilds); this re-offers any intent whose backoff has come due
+/// and that no event has resolved, while `due_reconnect_intents` expires the
+/// ones past the reconnecting grace.
+async fn service_reconnect_intents(state: &Arc<NetworkState>) {
+    // Nothing to do while we have no interface — a re-offer can't bind a
+    // socket, and burning the backoff schedule on no-op retries would leave
+    // an intent over-backed-off when we return. The offline→online edge
+    // flushes every intent at once (see `network_watch::fan_out_restart`).
+    if state.is_offline() {
+        return;
+    }
+    for device_id in state.due_reconnect_intents() {
+        try_reoffer(state, &device_id).await;
+    }
 }
 
 /// Re-establish ICE on a *live* peer by renegotiating the SDP — the half
@@ -1244,6 +1289,9 @@ async fn handle_transport_event(
             if let Some(peer) = state.peers.get(&device_id) {
                 peer.state.write().data_channel_open = true;
             }
+            // The link is back — retire any reconnect intent we were driving
+            // for this peer so the tick stops re-offering it.
+            state.clear_reconnect_intent(&device_id);
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "transport",
@@ -2096,6 +2144,10 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
     let removed = state.peers.remove(device_id);
     if let Some((_, peer)) = removed {
+        // Did we ever have a working transport with this peer? Only a peer we
+        // were genuinely connected to is "owed" a reconnect; a never-opened
+        // attempt falls back to normal discovery instead of spinning.
+        let was_connected = peer.state.read().data_channel_open;
         let session = peer.session.lock().clone();
         if let Some(session) = session {
             // Spawn the close so the driver loop never blocks on
@@ -2116,6 +2168,36 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
             format!("{} dropped ({reason:?})", short_peer(device_id)),
             serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
         );
+
+        // Self-drive the reconnect for a peer we were the *offerer* for and
+        // had a live link with, lost to a recoverable transport failure.
+        // Without this, an offerer-role peer dropped on a network shift is
+        // never re-offered — it only comes back on the peer's slow (~120 s)
+        // steady-state announce, because the *answerer* side waits for our
+        // offer and never sends its own. Events drive the actual re-offer
+        // (a relay reconnect flushes intents, an inbound announce rebuilds);
+        // the state-watch tick is the backstop. Recovery vs. intentional
+        // teardown is the reason: a UserLeft / Denied / AuthFailed must not
+        // be retried.
+        let we_offer = state.identity.public_id() < device_id;
+        let recoverable = matches!(
+            reason,
+            DropReason::IceFailed
+                | DropReason::HeartbeatTimeout
+                | DropReason::TransportError { .. }
+        );
+        if recoverable {
+            // Record only when we had a link (was_connected) AND we're the
+            // offerer. A failed *rebuild* attempt (never opened) deliberately
+            // neither records nor clears — the original intent stands so its
+            // bounded backoff keeps retrying until the grace expires.
+            if was_connected && we_offer {
+                state.record_reconnect_intent(device_id);
+            }
+        } else {
+            // Intentional removal / leave / auth failure — stop retrying.
+            state.clear_reconnect_intent(device_id);
+        }
     }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
@@ -2309,6 +2391,72 @@ mod tests {
         assert!(
             state.peers.contains_key("live-peer"),
             "once the data channel has opened, the connect-timeout must never reclaim the peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_intent_is_due_once_then_backs_off() {
+        // A freshly recorded intent is due immediately (so the next tick
+        // re-offers it), then the backoff pushes it out — it must NOT come due
+        // on every tick (that would publish an offer per tick).
+        let state = build_test_state("reconnect-intent-due");
+        state.record_reconnect_intent("peer-x");
+        assert_eq!(
+            state.due_reconnect_intents(),
+            vec!["peer-x".to_string()],
+            "a fresh intent is due immediately"
+        );
+        assert!(
+            state.due_reconnect_intents().is_empty(),
+            "after servicing, the intent backs off and isn't due again on the very next tick"
+        );
+        assert!(
+            state.has_reconnect_intent("peer-x"),
+            "backing off keeps the intent — it's retried later, not dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_intent_cleared_on_success() {
+        let state = build_test_state("reconnect-intent-clear");
+        state.record_reconnect_intent("peer-y");
+        assert!(state.has_reconnect_intent("peer-y"));
+        state.clear_reconnect_intent("peer-y");
+        assert!(!state.has_reconnect_intent("peer-y"));
+        assert!(state.due_reconnect_intents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_intent_expires_after_grace() {
+        // Past the reconnecting grace, an intent is given up — dropped, never
+        // retried — so a peer that genuinely went away can't spin forever.
+        let state = build_test_state("reconnect-intent-expire");
+        state.record_reconnect_intent("peer-z");
+        {
+            let mut map = state.reconnect_intents.lock();
+            let intent = map.get_mut("peer-z").expect("intent present");
+            intent.give_up_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        assert!(
+            state.due_reconnect_intents().is_empty(),
+            "an intent past its grace is given up, not retried"
+        );
+        assert!(!state.has_reconnect_intent("peer-z"));
+    }
+
+    #[tokio::test]
+    async fn flush_reconnect_intents_returns_all_and_backs_off() {
+        // The relay-reconnect event flushes every owed intent at once; flushing
+        // advances each backoff so the tick doesn't immediately re-offer them.
+        let state = build_test_state("reconnect-intent-flush");
+        state.record_reconnect_intent("a");
+        state.record_reconnect_intent("b");
+        let mut flushed = state.flush_reconnect_intents();
+        flushed.sort();
+        assert_eq!(flushed, vec!["a".to_string(), "b".to_string()]);
+        assert!(
+            state.due_reconnect_intents().is_empty(),
+            "flushing advanced the backoff, so the tick won't double-offer the same intents"
         );
     }
 

@@ -38,11 +38,28 @@ pub const WAKE_PROBE_DELAY_MS: u64 = 1_500;
 /// timeout by firing at 1 s after `ice_disconnected`.
 pub const ICE_DISCONNECTED_RESTART_MS: u64 = 1_000;
 
-/// Periodic ICE state poll cadence. Also the retry cadence for an
-/// in-progress ICE renegotiation: while a peer's link stays down the
-/// watchdog re-drives the (single-flighted) `renegotiate_ice` here, so a
-/// lost restart offer is re-sent within a poll rather than escalating.
-pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
+/// Cadence of the single **state-watch tick** — the one periodic pass that
+/// remains after folding the old separate ICE-watchdog and network-watch
+/// intervals together. Recovery is event-driven first (ICE-state changes, a
+/// data-channel close, a relay reconnect, an inbound announce all act
+/// immediately); this tick is the secondary safety net that confirms
+/// everything still looks right and enforces the inherently time-based
+/// conditions no single event can signal — a data channel that never opens,
+/// a restart that never carries traffic, a reconnect intent that needs
+/// another nudge, a primary-IP change. Kept inside the WebRTC
+/// consent-freshness window so the worst-case "events missed it" latency is
+/// still a couple seconds, not the stack's ~30 s internal timer.
+pub const STATE_WATCH_INTERVAL_MS: u64 = 2_000;
+
+/// Backoff schedule for the offerer-side reconnect retry. After we drop a
+/// peer we were the *offerer* for (a recoverable `IceFailed`), we keep a
+/// reconnect *intent* and re-offer on this backoff until the link comes
+/// back or [`RECONNECTING_GRACE_MS`] elapses — the offerer-side counterpart
+/// to an answerer recovering from the remote's re-offers. Events re-offer
+/// immediately (a relay reconnect flushes every intent at once); this backoff
+/// only paces the tick's safety-net retries so a peer that genuinely went
+/// away doesn't spin the relays. First retry is quick, then it backs off.
+pub const RECONNECT_RETRY_BACKOFF_MS: &[u64] = &[2_000, 4_000, 8_000, 15_000];
 
 /// How long to wait for a session's **data channel to open** before
 /// declaring the connection attempt failed and rebuilding. This is the
@@ -116,13 +133,6 @@ pub use myownmesh_signaling::upstream::STALE_INBOUND_MS;
 /// Periodic diag emit so a long-stable connection still reports
 /// status to the UI.
 pub const SIGNALING_DIAG_HEARTBEAT_MS: u64 = 5 * 60 * 1000;
-
-/// Network-change watcher poll cadence. Cheap (one UDP bind +
-/// connect per network per tick, microseconds of work) so we run
-/// it often — 3 s gets us inside the WebRTC consent-freshness
-/// window so the user sees recovery in seconds rather than waiting
-/// 30 s for ICE to notice the network moved.
-pub const NETWORK_WATCH_POLL_MS: u64 = 3_000;
 
 /// Diag log ring buffer cap per network.
 pub const DIAG_MAX: usize = 80;

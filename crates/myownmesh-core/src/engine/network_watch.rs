@@ -32,9 +32,11 @@
 //! detection is `last != current`, so any transition counts,
 //! including up→down and down→up.
 //!
-//! Cost is one UDP socket bind + connect per poll, on the order
-//! of microseconds. Frequency is tuned to be responsive without
-//! being noisy; see `NETWORK_WATCH_POLL_MS` in `scheduler.rs`.
+//! Cost is one UDP socket bind + connect per poll, on the order of
+//! microseconds. It runs on the shared state-watch tick (see
+//! `STATE_WATCH_INTERVAL_MS` in `scheduler.rs`) rather than its own
+//! interval — one periodic pass covers network-change detection alongside
+//! the per-peer state confirmation.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -300,6 +302,14 @@ async fn on_network_change(
 /// relay is confirmed back (see [`on_network_change`]).
 async fn fan_out_restart(state: &Arc<NetworkState>) {
     ice_watchdog::force_ice_restart_all(state).await;
+    // Re-offer every peer we owe an offer to (offerer-role peers dropped on
+    // the way down). A fresh relay session after a handoff is exactly when a
+    // dropped peer's offer can finally cross — flush them all at once here,
+    // event-driven, rather than waiting for each intent's backoff on the
+    // tick. `try_reoffer` no-ops for any that already rebuilt.
+    for device_id in state.flush_reconnect_intents() {
+        super::try_reoffer(state, &device_id).await;
+    }
     // Re-seed discovery as well: peers we lost while off-network (or that were
     // torn down by the data-channel-open watchdog) rediscover on the next
     // announce round-trip instead of waiting for their own schedule — so

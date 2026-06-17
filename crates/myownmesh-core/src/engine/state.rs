@@ -24,7 +24,9 @@ use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 
 use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
-use super::scheduler::RELAY_RESCUE_MIN_INTERVAL_MS;
+use super::scheduler::{
+    RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_MIN_INTERVAL_MS,
+};
 
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
@@ -42,6 +44,40 @@ pub struct InboundAudioSample {
     /// Sending peer's device id.
     pub from: String,
     pub sample: AudioSample,
+}
+
+/// Bookkeeping for an offerer-side reconnect intent. When we drop a peer we
+/// were the *offerer* for (a recoverable `IceFailed`), we keep one of these
+/// in [`NetworkState::reconnect_intents`] and the single state-watch tick
+/// re-offers on a backoff until the link comes back or `give_up_at` passes.
+/// This is the offerer-side counterpart to an answerer recovering from the
+/// remote's re-offers — without it, an offerer-role peer that drops on a
+/// network shift is never re-offered (it only comes back on the peer's slow
+/// steady-state announce). The backoff (`next_retry_at`/`attempt`) keeps the
+/// recovery from publishing an offer on every tick — one re-offer per
+/// backoff step, never cadence traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconnectIntent {
+    /// Stop retrying after this instant (drop time + `RECONNECTING_GRACE_MS`).
+    pub give_up_at: std::time::Instant,
+    /// Earliest instant for the next re-offer; advanced by the backoff each
+    /// time the tick services this intent.
+    pub next_retry_at: std::time::Instant,
+    /// Number of re-offers issued so far — indexes `RECONNECT_RETRY_BACKOFF_MS`.
+    pub attempt: usize,
+}
+
+/// Bump a reconnect intent's backoff after a re-offer: advance the attempt
+/// and push `next_retry_at` out by the next step (saturating at the last
+/// one). One offer per backoff window — never a per-tick publish.
+fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
+    let step = RECONNECT_RETRY_BACKOFF_MS
+        .get(intent.attempt)
+        .copied()
+        .or_else(|| RECONNECT_RETRY_BACKOFF_MS.last().copied())
+        .unwrap_or(15_000);
+    intent.attempt = intent.attempt.saturating_add(1);
+    intent.next_retry_at = now + std::time::Duration::from_millis(step);
 }
 
 /// Engine command queue entry. Anything that mutates per-peer
@@ -250,6 +286,14 @@ pub struct NetworkState {
     /// bring up their signaling task.
     signaling_outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<SignalingOutbound>>>,
 
+    /// Offerer-side reconnect intents (see [`ReconnectIntent`]). Keyed by
+    /// device id; an entry lives from the moment we drop a peer we owe an
+    /// offer to until the link is re-established or the reconnecting grace
+    /// expires. Events re-offer these immediately (relay reconnect, the
+    /// peer's announce); the state-watch tick is the backstop that retries
+    /// on a backoff for the cases no event covers.
+    pub reconnect_intents: Mutex<std::collections::HashMap<String, ReconnectIntent>>,
+
     /// Last time we reflected a peer's announce with one of our
     /// own. Rate-limited so a room with N peers all reacting to
     /// each other's announces doesn't degenerate into a publish
@@ -379,6 +423,7 @@ impl NetworkState {
             signaling_inbound_tx,
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
@@ -397,6 +442,64 @@ impl NetworkState {
         self: &Arc<Self>,
     ) -> Option<mpsc::UnboundedReceiver<SignalingOutbound>> {
         self.signaling_outbound_rx.lock().take()
+    }
+
+    /// Remember that we owe `device_id` a fresh offer after a recoverable
+    /// drop, so the engine self-drives the reconnect instead of waiting for
+    /// the peer's slow steady-state announce. Idempotent — a repeat drop just
+    /// refreshes the grace and re-arms an immediate retry.
+    pub fn record_reconnect_intent(&self, device_id: &str) {
+        let now = std::time::Instant::now();
+        self.reconnect_intents.lock().insert(
+            device_id.to_string(),
+            ReconnectIntent {
+                give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
+                next_retry_at: now,
+                attempt: 0,
+            },
+        );
+    }
+
+    /// Forget a reconnect intent — the link is back (or the peer was
+    /// explicitly removed). Cheap no-op if none was held.
+    pub fn clear_reconnect_intent(&self, device_id: &str) {
+        self.reconnect_intents.lock().remove(device_id);
+    }
+
+    /// Whether we're currently holding a reconnect intent for this peer.
+    pub fn has_reconnect_intent(&self, device_id: &str) -> bool {
+        self.reconnect_intents.lock().contains_key(device_id)
+    }
+
+    /// Intent ids whose backoff is due now. Drops expired intents (past the
+    /// reconnecting grace) and advances the backoff of the ones returned, so
+    /// the state-watch tick re-offers each at most once per backoff step.
+    pub fn due_reconnect_intents(&self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut map = self.reconnect_intents.lock();
+        map.retain(|_, i| now < i.give_up_at);
+        let mut due = Vec::new();
+        for (id, intent) in map.iter_mut() {
+            if now >= intent.next_retry_at {
+                due.push(id.clone());
+                advance_backoff(intent, now);
+            }
+        }
+        due
+    }
+
+    /// All live intent ids, with their backoff advanced. Used when a strong
+    /// event — a relay reconnect after a network shift — makes it worth
+    /// re-offering everything we owe at once, rather than waiting for each
+    /// one's backoff to come due on the tick.
+    pub fn flush_reconnect_intents(&self) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut map = self.reconnect_intents.lock();
+        map.retain(|_, i| now < i.give_up_at);
+        for intent in map.values_mut() {
+            advance_backoff(intent, now);
+        }
+        map.keys().cloned().collect()
     }
 
     /// Register the signaling driver's force-reconnect signal. Called
