@@ -62,6 +62,34 @@ serve *ARGS:
 serve *ARGS:
     @$env:MYOWNMESH_LOG = "debug,myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
+# Run the daemon standalone with connection-state tracing on — the
+# reliable way to capture detailed connection logs on EVERY OS. On
+# Windows the windowless GUI can't forward the daemon's stdout, so
+# `just dev` shows nothing there; run this in a terminal instead. If
+# you also want the GUI, run `just dev` in another terminal — it
+# detects this daemon on the control socket and attaches rather than
+# spawning (and silencing) its own. MYOWNMESH_CONN_TRACE=1 turns on
+# the per-peer connection tracer; the filter keeps engine + signaling
+# detail without the full webrtc-ice firehose (add webrtc_ice=debug
+# when you need candidate-level detail).
+[unix]
+[doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
+serve-trace *ARGS:
+    @MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG="info,myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug,conn_trace=info,webrtc_ice=warn" cargo run --bin myownmesh -- serve {{ARGS}}
+
+[windows]
+[doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
+serve-trace *ARGS:
+    @$env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG = "info,myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug,conn_trace=info,webrtc_ice=warn"; cargo run --bin myownmesh -- serve {{ARGS}}
+
+# Stream a network's connection-state trace as JSONL — one ConnTrace
+# per line. Needs a running daemon (`just serve-trace`, or any
+# `myownmesh serve`). Redirect to a per-machine file and feed the
+# files to scripts/merge-traces.py for one cross-machine timeline:
+#   just trace home > trace-$(hostname).jsonl
+trace NETWORK:
+    @cargo run --bin myownmesh -- ctl trace {{NETWORK}}
+
 run *ARGS:
     @cargo run --release --bin myownmesh -- {{ARGS}}
 

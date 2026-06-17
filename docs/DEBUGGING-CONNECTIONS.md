@@ -93,6 +93,17 @@ the lifetime markers `appeared` / `vanished`.
 Run the daemon and, in a second shell, the trace, on **each** machine.
 Tag the file with the hostname so the merge tool can label rows.
 
+> **Running the GUI (`just dev`)?** The GUI auto-spawns the daemon and
+> forwards its logs to your terminal — **except on Windows**, where the
+> GUI is a windowless process with no console for the daemon's stdout to
+> inherit, so you see nothing. On every OS the robust path is to run the
+> daemon **standalone** and let the GUI attach to it: `just serve-trace`
+> in one terminal (full logs + the connection tracer, on Windows too),
+> and — if you want the GUI — `just dev` in another. The GUI probes the
+> control socket, finds the running daemon, and attaches instead of
+> spawning its own. (`just serve-trace` is just the daemon with
+> `MYOWNMESH_CONN_TRACE=1` and a connection-debugging log filter.)
+
 **macOS / Linux**
 
 ```sh
