@@ -857,6 +857,18 @@ fn pair_state_str(s: webrtc::ice::candidate::CandidatePairState) -> String {
 /// One peer's WebRTC session — peer connection, application data
 /// channel, the provisioned pool of video + audio track lanes (see
 /// [`MEDIA_LANES`]), and transport-level event sink.
+/// Extract the DTLS fingerprint (`a=fingerprint:<hash> <value>`) from an SDP
+/// blob, lowercased for stable comparison. Returns the first one found —
+/// session-level or the first media section; for our single-bundle sessions
+/// they're identical. Used to tell a peer's in-place ICE restart (same
+/// fingerprint) from a full rebuild (new fingerprint) on the answerer side.
+pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("a=fingerprint:"))
+        .map(|v| v.trim().to_ascii_lowercase())
+}
+
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -899,6 +911,18 @@ impl PeerSession {
             .set_remote_description(desc)
             .await
             .map_err(|e| Error::Transport(format!("set_remote_description: {e}")))
+    }
+
+    /// DTLS fingerprint of the currently-applied remote description, if any.
+    /// A *restart* offer keeps this fingerprint (same peer connection, new ICE
+    /// ufrag); a *rebuild* offer carries a new one (the peer tore its PC down
+    /// and built fresh). The answerer compares the incoming offer's fingerprint
+    /// to this to decide between renegotiating in place and dropping for a
+    /// clean rebuild — applying a rebuild offer onto the stale PC deadlocks
+    /// (it lands on a corpse and no candidates ever flow). `None` before any
+    /// remote description is set.
+    pub async fn remote_fingerprint(&self) -> Option<String> {
+        sdp_fingerprint(&self.pc.remote_description().await?.sdp)
     }
 
     /// Build an answer SDP. Answerer-only; call after
@@ -1191,6 +1215,37 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdp_fingerprint_extracts_and_normalises() {
+        let sdp = "v=0\r\n\
+                   o=- 1 2 IN IP4 127.0.0.1\r\n\
+                   a=group:BUNDLE 0\r\n\
+                   a=fingerprint:sha-256 AA:BB:CC:DD\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+        assert_eq!(
+            sdp_fingerprint(sdp).as_deref(),
+            Some("sha-256 aa:bb:cc:dd"),
+            "the fingerprint is extracted and lowercased for stable comparison"
+        );
+
+        // A rebuild carries a different fingerprint; a restart keeps it.
+        let restart = sdp.replace("a=ice-ufrag:x", "a=ice-ufrag:y");
+        assert_eq!(
+            sdp_fingerprint(&restart),
+            sdp_fingerprint(sdp),
+            "same PC (restart) → same fingerprint"
+        );
+        let rebuilt = sdp.replace("AA:BB:CC:DD", "11:22:33:44");
+        assert_ne!(
+            sdp_fingerprint(&rebuilt),
+            sdp_fingerprint(sdp),
+            "fresh PC (rebuild) → different fingerprint"
+        );
+
+        // No fingerprint line → None (glare / not-yet-applied).
+        assert_eq!(sdp_fingerprint("v=0\r\nm=application 9\r\n"), None);
+    }
 
     #[test]
     fn track_id_carries_its_lane() {

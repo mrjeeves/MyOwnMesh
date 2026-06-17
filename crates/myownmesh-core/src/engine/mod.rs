@@ -31,6 +31,7 @@ pub mod reconcile;
 pub mod scheduler;
 pub mod signaling_bridge;
 pub mod state;
+pub mod tick;
 pub mod wake;
 
 pub use signaling_bridge::{attach_local, attach_nostr};
@@ -148,7 +149,20 @@ pub async fn run_driver(
     let mut state_watch =
         tokio::time::interval(Duration::from_millis(scheduler::STATE_WATCH_INTERVAL_MS));
     state_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut network_watch = network_watch::NetworkWatch::new().await;
+    // The secondary control path: a registry of time-based subsystems run on
+    // each state-watch tick. Events drive state; these confirm and repair the
+    // conditions no event can signal. New network-intelligence systems plug in
+    // here — see `engine::tick`.
+    let mut tick_registry = tick::TickRegistry::new()
+        .register(tick::IceWatchdogTicker)
+        .register(tick::NetworkWatchTicker::new().await)
+        .register(tick::ReconnectSupervisor);
+    state.log_diag_with(
+        crate::events::DiagLevel::Debug,
+        "engine",
+        format!("state-watch tick registry: {:?}", tick_registry.names()),
+        serde_json::json!({ "tickers": tick_registry.names() }),
+    );
     let mut wake_detector = wake::WakeDetector::new();
     // Phase-0 connection tracer. Observes per-peer connection-state
     // transitions after each driver-loop iteration. Zero cost unless a
@@ -185,13 +199,10 @@ pub async fn run_driver(
             }
 
             _ = state_watch.tick() => {
-                // Secondary safety net only — events drive recovery. Confirm
-                // per-peer state (connect-timeout / restart-verify / ICE
-                // re-drive), check for a primary-IP change, and retry any
-                // reconnect intent whose backoff has come due.
-                ice_watchdog::poll_all(&state).await;
-                network_watch.poll(&state).await;
-                service_reconnect_intents(&state).await;
+                // Secondary safety net only — events drive recovery. Each
+                // registered ticker confirms its slice of state and repairs the
+                // time-based conditions no event can signal.
+                tick_registry.run(&state).await;
             }
         }
 
@@ -462,6 +473,32 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
             clear_stale_session_if_zombie(state, &device_id).await;
+            // A *rebuild* offer — one carrying a different DTLS fingerprint
+            // than the remote description we last applied — means the peer tore
+            // its peer connection down and built a fresh one. Renegotiating our
+            // existing PC onto it applies the offer to a corpse: no candidates
+            // ever cross and the link wedges (the "0 remote candidates" stall,
+            // and the answerer half of the post-handoff deadlock). Drop our
+            // side so the fresh answerer PC built below matches theirs. A
+            // *restart* offer (same fingerprint, new ufrag) has a matching
+            // fingerprint and is left to renegotiate in place. Read the
+            // session out of the map first so no DashMap ref is held across the
+            // await.
+            let existing_session = state
+                .peers
+                .get(&device_id)
+                .and_then(|p| p.session.lock().clone());
+            let rebuilt = match existing_session {
+                Some(session) => match session.remote_fingerprint().await {
+                    Some(prev) => crate::transport::webrtc::sdp_fingerprint(&sdp)
+                        .map(|now| now != prev)
+                        .unwrap_or(false),
+                    // No remote applied yet (we offered, they're now offering —
+                    // glare) — nothing to mismatch; fall through.
+                    None => false,
+                },
+                None => false,
+            };
             // If our session for this peer has been stuck connecting (data
             // channel never opened) past the grace, this fresh offer is the
             // mutual-renegotiation deadlock: re-applying it onto the stuck
@@ -481,15 +518,23 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     )
                 })
                 .unwrap_or(false);
-            if stuck {
+            if rebuilt || stuck {
+                let reason = if rebuilt {
+                    "peer rebuilt (new DTLS fingerprint)"
+                } else {
+                    "stuck connecting"
+                };
                 state.log_diag_with(
                     crate::events::DiagLevel::Info,
                     "signaling",
                     format!(
-                        "fresh offer for stuck-connecting {} — rebuilding to answer cleanly",
+                        "fresh offer from {} ({reason}) — rebuilding to answer cleanly",
                         short_peer(&device_id)
                     ),
-                    serde_json::json!({ "peer": device_id, "reason": "stuck_connecting" }),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "reason": if rebuilt { "peer_rebuilt" } else { "stuck_connecting" },
+                    }),
                 );
                 drop_peer(state, &device_id, DropReason::IceFailed).await;
             }
@@ -2144,10 +2189,6 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
     let removed = state.peers.remove(device_id);
     if let Some((_, peer)) = removed {
-        // Did we ever have a working transport with this peer? Only a peer we
-        // were genuinely connected to is "owed" a reconnect; a never-opened
-        // attempt falls back to normal discovery instead of spinning.
-        let was_connected = peer.state.read().data_channel_open;
         let session = peer.session.lock().clone();
         if let Some(session) = session {
             // Spawn the close so the driver loop never blocks on
@@ -2169,16 +2210,19 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
             serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
         );
 
-        // Self-drive the reconnect for a peer we were the *offerer* for and
-        // had a live link with, lost to a recoverable transport failure.
-        // Without this, an offerer-role peer dropped on a network shift is
-        // never re-offered — it only comes back on the peer's slow (~120 s)
-        // steady-state announce, because the *answerer* side waits for our
-        // offer and never sends its own. Events drive the actual re-offer
-        // (a relay reconnect flushes intents, an inbound announce rebuilds);
-        // the state-watch tick is the backstop. Recovery vs. intentional
-        // teardown is the reason: a UserLeft / Denied / AuthFailed must not
-        // be retried.
+        // Self-drive the reconnect for any peer we are the *offerer* for that
+        // we lost to a recoverable transport failure — whether it was fully
+        // connected (a network shift tore it down) or never completed its
+        // first connect (a signaling race delivered zero remote candidates).
+        // Either way the *answerer* side waits for our offer and won't
+        // re-initiate, so without this an offerer-role peer only comes back on
+        // its slow (~120 s) steady-state announce. Events drive the actual
+        // re-offer (a relay reconnect flushes intents, an inbound announce
+        // rebuilds); the reconnect-supervisor ticker is the backstop. The
+        // intent is bounded by the reconnecting grace and is NOT extended by
+        // repeated failed rebuilds (see `record_reconnect_intent`), so a peer
+        // that genuinely went away ages out instead of spinning. Intentional
+        // teardown (UserLeft / Denied / AuthFailed) must never be retried.
         let we_offer = state.identity.public_id() < device_id;
         let recoverable = matches!(
             reason,
@@ -2186,15 +2230,9 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
                 | DropReason::HeartbeatTimeout
                 | DropReason::TransportError { .. }
         );
-        if recoverable {
-            // Record only when we had a link (was_connected) AND we're the
-            // offerer. A failed *rebuild* attempt (never opened) deliberately
-            // neither records nor clears — the original intent stands so its
-            // bounded backoff keeps retrying until the grace expires.
-            if was_connected && we_offer {
-                state.record_reconnect_intent(device_id);
-            }
-        } else {
+        if recoverable && we_offer {
+            state.record_reconnect_intent(device_id);
+        } else if !recoverable {
             // Intentional removal / leave / auth failure — stop retrying.
             state.clear_reconnect_intent(device_id);
         }

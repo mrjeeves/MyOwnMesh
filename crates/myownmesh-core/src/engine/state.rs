@@ -446,18 +446,23 @@ impl NetworkState {
 
     /// Remember that we owe `device_id` a fresh offer after a recoverable
     /// drop, so the engine self-drives the reconnect instead of waiting for
-    /// the peer's slow steady-state announce. Idempotent — a repeat drop just
-    /// refreshes the grace and re-arms an immediate retry.
+    /// the peer's slow steady-state announce. The *first* drop opens the
+    /// grace window; subsequent drops while the intent is still live (a failed
+    /// rebuild that never opened a channel) deliberately do NOT extend it, so
+    /// a peer that never comes back ages out at the grace instead of spinning
+    /// forever. A genuine reconnect clears the intent
+    /// ([`clear_reconnect_intent`](Self::clear_reconnect_intent) on
+    /// `DataChannelOpen`), so the next loss opens a fresh window.
     pub fn record_reconnect_intent(&self, device_id: &str) {
         let now = std::time::Instant::now();
-        self.reconnect_intents.lock().insert(
-            device_id.to_string(),
-            ReconnectIntent {
+        self.reconnect_intents
+            .lock()
+            .entry(device_id.to_string())
+            .or_insert(ReconnectIntent {
                 give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
                 next_retry_at: now,
                 attempt: 0,
-            },
-        );
+            });
     }
 
     /// Forget a reconnect intent — the link is back (or the peer was
