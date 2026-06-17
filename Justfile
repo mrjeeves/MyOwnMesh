@@ -56,19 +56,24 @@ dev *ARGS:
 # Logging uses the daemon's *tuned default* filter (our crates at info,
 # one clean line per connection event, with the webrtc-rs sibling crates
 # pinned to error) plus our own binary at debug — set via MYOWNMESH_LOG_EXTRA
-# so it *appends* to that default. A bare `MYOWNMESH_LOG="debug,…"` here would
+# so it *appends* to that default. A bare `MYOWNMESH_LOG="debug,…"` would
 # instead *replace* the default and un-pin webrtc-rs, turning the console into
-# an unreadable ICE firehose. For candidate-level engine/signaling detail
-# (still webrtc-quiet), use `just serve-trace`.
+# an unreadable ICE firehose (a single loopback connection: 24 lines clean vs
+# 173 with 107 DEBUG lines un-pinned). So we also clear any MYOWNMESH_LOG the
+# caller has exported — otherwise a stray one inherited from the shell (or a
+# past experiment) would silently override MYOWNMESH_LOG_EXTRA and re-open the
+# firehose. For candidate-level engine/signaling detail (still webrtc-quiet),
+# use `just serve-trace`; for full raw control, run `cargo run --bin myownmesh
+# -- serve` with your own MYOWNMESH_LOG.
 [unix]
 [doc("Run the daemon in foreground (clean default logs; use serve-trace for detail).")]
 serve *ARGS:
-    @MYOWNMESH_LOG_EXTRA="myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
+    @env -u MYOWNMESH_LOG MYOWNMESH_LOG_EXTRA="myownmesh=debug" cargo run --bin myownmesh -- serve {{ARGS}}
 
 [windows]
 [doc("Run the daemon in foreground (clean default logs; use serve-trace for detail).")]
 serve *ARGS:
-    @$env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
+    @Remove-Item Env:\MYOWNMESH_LOG -ErrorAction SilentlyContinue; $env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
 # Run the daemon standalone with connection-state tracing on — the
 # reliable way to capture detailed connection logs on EVERY OS. On
@@ -83,12 +88,12 @@ serve *ARGS:
 [unix]
 [doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
 serve-trace *ARGS:
-    @MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG_EXTRA="myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug" cargo run --bin myownmesh -- serve {{ARGS}}
+    @env -u MYOWNMESH_LOG MYOWNMESH_CONN_TRACE=1 MYOWNMESH_LOG_EXTRA="myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug" cargo run --bin myownmesh -- serve {{ARGS}}
 
 [windows]
 [doc("Daemon standalone with connection tracing on (detailed logs on every OS).")]
 serve-trace *ARGS:
-    @$env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
+    @Remove-Item Env:\MYOWNMESH_LOG -ErrorAction SilentlyContinue; $env:MYOWNMESH_CONN_TRACE = "1"; $env:MYOWNMESH_LOG_EXTRA = "myownmesh=debug,myownmesh_core=debug,myownmesh_signaling=debug"; cargo run --bin myownmesh -- serve {{ARGS}}
 
 # Stream a network's connection-state trace as JSONL — one ConnTrace
 # per line. Needs a running daemon (`just serve-trace`, or any
