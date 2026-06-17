@@ -840,6 +840,11 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         device_id.clone(),
         Some(session.clone()),
     ));
+    // Start the connect-timeout clock the moment the session exists: if the
+    // data channel hasn't opened within DATA_CHANNEL_OPEN_TIMEOUT_MS of
+    // now, the attempt is reclaimed and rebuilt (see
+    // `ice_watchdog::poll_all`).
+    peer.state.write().session_started_at = Some(Instant::now());
     state.peers.insert(device_id.clone(), peer.clone());
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
@@ -1190,6 +1195,12 @@ async fn handle_transport_event(
             handle_pc_state_change(state, &device_id, pc_state).await;
         }
         TransportEvent::DataChannelOpen => {
+            // The reliable "transport is up" milestone — record it so the
+            // connect-timeout watchdog knows this session made it, and stops
+            // counting it as a connecting peer that might need rebuilding.
+            if let Some(peer) = state.peers.get(&device_id) {
+                peer.state.write().data_channel_open = true;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "transport",
@@ -1262,11 +1273,18 @@ async fn handle_ice_state_change(
         };
         let mut data = peer.state.write();
         data.diag.ice_transitions += 1;
+        // ICE state never tears a peer down — it only clears or schedules
+        // the in-place restart. Teardown is the data channel's job: a
+        // connecting peer whose channel never opens hits the
+        // data-channel-open timeout; an open peer that goes silent is
+        // reclaimed by the heartbeat; a real close fires DataChannelClosed.
+        // We trust webrtc-rs's ICE state here only to *drive recovery*,
+        // never to decide a link is dead — it has been observed reporting
+        // Failed/Disconnected on links carrying traffic and Connected on
+        // links whose channel never came up.
         match ice {
             RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
                 data.ice_disconnected_since = None;
-                data.ice_checking_since = None;
-                data.checking_grace_used = 0;
                 if matches!(
                     data.tier,
                     ConnectionTier::IceWatchdog { .. } | ConnectionTier::IceRestart { .. }
@@ -1275,24 +1293,11 @@ async fn handle_ice_state_change(
                 }
                 false
             }
-            RTCIceConnectionState::Checking => {
-                // Arm the checking-timeout watchdog for this attempt.
-                // Refresh on every entry into Checking (initial connect
-                // and post-restart re-gather both pass through here).
-                // A real transition into Checking is a fresh attempt, so
-                // reset the grace budget (our own timeout-extension resets
-                // `ice_checking_since` directly without an ICE state
-                // change, so it never lands here — the budget persists
-                // across extensions, as intended).
-                data.ice_checking_since = Some(Instant::now());
-                data.checking_grace_used = 0;
-                false
-            }
             RTCIceConnectionState::Disconnected => {
-                // A drop from an established link — owned by the
-                // disconnected watchdog, not the checking timeout.
-                data.ice_checking_since = None;
-                data.checking_grace_used = 0;
+                // A consent-freshness drop on a previously-live link. Latch
+                // the timestamp + tier so the disconnected-watchdog drives
+                // an in-place `renegotiate_ice` (the data channel survives
+                // a restart). No teardown.
                 if data.ice_disconnected_since.is_none() {
                     data.ice_disconnected_since = Some(Instant::now());
                     data.tier = ConnectionTier::IceWatchdog {
@@ -1302,19 +1307,12 @@ async fn handle_ice_state_change(
                 false
             }
             RTCIceConnectionState::Failed => {
-                // Restart-before-drop: instead of tearing the peer down
-                // the instant ICE fails (the old PC-Failed behaviour, which
-                // pre-empted the in-place restart by ~1 ms and forced a full
-                // reconnect every time), we kick `renegotiate_ice` below and
-                // give it a bounded window to recover. Arm the
-                // checking-timeout watchdog as the backstop: if the restart
-                // re-enters Checking it re-arms with a fresh grace budget; if
-                // it recovers to Connected the window is cleared; if it never
-                // makes progress, `on_checking_timeout` reclaims the peer one
-                // window later — the same teardown as before, just deferred
-                // far enough to let the cheap restart win when it can.
-                data.ice_checking_since = Some(Instant::now());
-                data.checking_grace_used = 0;
+                // Restart in place rather than tear down: webrtc-rs reports
+                // `Failed` even while a nominated pair is succeeding, so a
+                // teardown here throws away a working-or-recoverable link.
+                // `on_failed` re-gathers and re-offers; if the link is
+                // genuinely gone, the data-channel-open timeout (still
+                // connecting) or inbound silence (was up) reclaims it.
                 true
             }
             _ => false,
@@ -1532,35 +1530,15 @@ async fn handle_pc_state_change(
     device_id: &str,
     pc: RTCPeerConnectionState,
 ) {
-    match pc {
-        // `Failed` no longer drops here. The ICE-connection `Failed`
-        // callback (`handle_ice_state_change`) owns recovery now: it
-        // kicks the in-place `renegotiate_ice` restart and arms the
-        // checking-timeout backstop, so a transient failure recovers
-        // without paying for a full reconnect. This handler used to win
-        // a ~1 ms race and tear the peer down before that restart could
-        // run — the bug the wake-from-sleep logs pinned down.
-        //
-        // As a safety net for the rare PC-`Failed`-without-ICE-`Failed`
-        // path (e.g. a DTLS-level failure), make sure the checking-timeout
-        // watchdog is armed so an orphaned peer is still reclaimed; the
-        // ICE-`Failed` arm normally sets this first, in which case we
-        // leave its (possibly already-progressed) window untouched.
-        RTCPeerConnectionState::Failed => {
-            if let Some(peer) = state.peers.get(device_id) {
-                let mut data = peer.state.write();
-                if data.ice_checking_since.is_none() {
-                    data.ice_checking_since = Some(Instant::now());
-                    data.checking_grace_used = 0;
-                }
-            }
-        }
-        // A closed connection is a real teardown, not a recoverable
-        // failure — drop the peer and let discovery rebuild it.
-        RTCPeerConnectionState::Closed => {
-            drop_peer(state, device_id, DropReason::IceFailed).await;
-        }
-        _ => {}
+    // A closed connection is a real teardown — drop and let discovery
+    // rebuild. Every other PC state, `Failed` included, is a no-op:
+    // ICE-`Failed` (`handle_ice_state_change`) already kicks the in-place
+    // restart, and teardown of a still-connecting peer comes from the
+    // data-channel-open timeout while an already-open peer is reclaimed by
+    // inbound silence. (`Failed` used to arm the old checking-timeout; that
+    // machinery is gone — ICE/PC state no longer tears anyone down.)
+    if pc == RTCPeerConnectionState::Closed {
+        drop_peer(state, device_id, DropReason::IceFailed).await;
     }
 }
 
@@ -1986,11 +1964,11 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
                         match data.tier {
                             ConnectionTier::IceRestart { started } => {
                                 started.elapsed()
-                                    < Duration::from_millis(scheduler::ICE_CHECKING_TIMEOUT_MS)
+                                    < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
                             }
                             ConnectionTier::IceWatchdog { since } => {
                                 since.elapsed()
-                                    < Duration::from_millis(scheduler::ICE_CHECKING_TIMEOUT_MS)
+                                    < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
                             }
                             _ => false,
                         }
@@ -2118,6 +2096,56 @@ mod tests {
         Instant::now()
             .checked_sub(Duration::from_millis(scheduler::STALE_INBOUND_MS + 5_000))
             .expect("test host monotonic clock has enough headroom")
+    }
+
+    fn pre_connect_timeout_instant() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(
+                scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS + 5_000,
+            ))
+            .expect("test host monotonic clock has enough headroom")
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_reclaims_a_peer_whose_data_channel_never_opened() {
+        // A session created long ago whose data channel never opened is a
+        // failed attempt — the connect-timeout watchdog must reclaim it so
+        // discovery rebuilds. This is the teardown authority that replaced
+        // the ICE-checking timeout; it keys off the reliable milestone.
+        let state = build_test_state("connect-timeout-drop");
+        insert_session_less_peer(&state, "stuck-peer", None);
+        {
+            let peer = state.peers.get("stuck-peer").expect("peer present");
+            let mut d = peer.state.write();
+            d.session_started_at = Some(pre_connect_timeout_instant());
+            d.data_channel_open = false;
+        }
+        ice_watchdog::poll_all(&state).await;
+        assert!(
+            !state.peers.contains_key("stuck-peer"),
+            "a session whose data channel never opened past the deadline must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_spares_a_peer_whose_data_channel_opened() {
+        // Same old session clock, but the data channel opened — so liveness
+        // is the heartbeat's job now, not the connect-timeout's. ICE state
+        // could say anything; once the channel is up this watchdog must
+        // never touch the peer.
+        let state = build_test_state("connect-timeout-keep");
+        insert_session_less_peer(&state, "live-peer", None);
+        {
+            let peer = state.peers.get("live-peer").expect("peer present");
+            let mut d = peer.state.write();
+            d.session_started_at = Some(pre_connect_timeout_instant());
+            d.data_channel_open = true;
+        }
+        ice_watchdog::poll_all(&state).await;
+        assert!(
+            state.peers.contains_key("live-peer"),
+            "once the data channel has opened, the connect-timeout must never reclaim the peer"
+        );
     }
 
     #[tokio::test]

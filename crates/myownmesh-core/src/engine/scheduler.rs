@@ -52,40 +52,34 @@ pub const ICE_DISCONNECTED_RESTART_MS: u64 = 1_000;
 /// lost restart offer is re-sent within a poll rather than escalating.
 pub const ICE_POLL_INTERVAL_MS: u64 = 3_000;
 
-/// A peer stuck in ICE `Checking` this long without reaching
-/// `Connected` is treated as a failed attempt and rebuilt, rather than
-/// waiting out webrtc-rs's internal ~30 s ICE-failure timer (the
-/// "connection loss is slow to report, and everything after is slow"
-/// symptom). Sized comfortably above a slow gather — cellular STUN
-/// during a Wi-Fi→hotspot handoff has been seen to take ~8 s just to
-/// finish gathering — so we never tear down a link that's still
-/// legitimately forming, while still cutting the dead-path detection
-/// time roughly in half.
-pub const ICE_CHECKING_TIMEOUT_MS: u64 = 15_000;
+/// How long to wait for a session's **data channel to open** before
+/// declaring the connection attempt failed and rebuilding. This is the
+/// single teardown clock for a *connecting* peer, and it keys off the one
+/// reliable transport signal — the `DataChannelOpen` event (DTLS + SCTP
+/// genuinely established) — not webrtc-rs's ICE connection state, which
+/// has been observed reporting `Connected`/`nominated` on links whose data
+/// channel never came up and `Failed`/`Disconnected` on links that were
+/// fine. ICE-state changes now only ever trigger an in-place restart
+/// (recovery); they never tear a peer down. Sized to outlast the worst
+/// recoverable case — a relay redial on a fresh interface (seconds) plus a
+/// slow signaling round-trip plus ICE gather + DTLS — so a connection
+/// that's merely slow to negotiate is never torn down mid-flight, while a
+/// genuinely dead one is still reclaimed without waiting out webrtc-rs's
+/// ~30 s internal timer. A successful connect opens its channel in 1-2 s
+/// regardless, so this only ever bounds a *failure*.
+pub const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 30_000;
 
-/// How many times the checking-timeout will *extend* an attempt (rather
-/// than tear it down) when the agent has succeeded pairs but hasn't
-/// nominated one yet. Connectivity demonstrably exists in that state, so
-/// rebuilding only resets the nomination race — the dominant cause of the
-/// observed connect→stuck→rebuild flap. Each extension grants another
-/// `ICE_CHECKING_TIMEOUT_MS` (15 s); the bound caps a succeeds-but-never-
-/// nominates pathology at `CHECKING_GRACE_MAX × 15 s` of grace before we
-/// finally give up and rebuild. Four windows (~60 s) comfortably covers a
-/// slow controlling-side nomination without letting a wedged peer linger
-/// indefinitely.
-pub const CHECKING_GRACE_MAX: u8 = 4;
-
-/// Minimum gap between relay redials forced by the "ICE timed out with
+/// Minimum gap between relay redials forced by the "connect timed out with
 /// zero remote candidates" rescue (see
 /// [`crate::engine::state::NetworkState::request_relay_reconnect_throttled`]).
 /// A peer whose candidates never cross the relay re-times-out every
-/// `ICE_CHECKING_TIMEOUT_MS` (15 s); without this throttle the rescue
-/// would bounce the relay sockets on every one of those cycles. One
-/// redial per 30 s is enough to recover a socket that actually went
-/// stale after a network blip, while leaving healthy sockets — the ones
-/// already delivering candidates for other peers — undisturbed between
-/// windows. Comfortably above `ICE_CHECKING_TIMEOUT_MS` so a single stuck
-/// peer maps to at most one redial per two of its timeout cycles.
+/// `DATA_CHANNEL_OPEN_TIMEOUT_MS`; without this throttle the rescue would
+/// bounce the relay sockets on every one of those cycles. One redial per
+/// this window is enough to recover a socket that actually went stale
+/// after a network blip, while leaving healthy sockets — the ones already
+/// delivering candidates for other peers — undisturbed. Matched to the
+/// connect-timeout so a single stuck peer maps to at most one redial per
+/// timeout cycle.
 pub const RELAY_RESCUE_MIN_INTERVAL_MS: u64 = 30_000;
 
 /// After a network change kicks an ICE-restart fan-out, ignore further
