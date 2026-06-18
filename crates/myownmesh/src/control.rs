@@ -1322,8 +1322,10 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     };
 
     if !needs_restart {
-        // Topology / label / auto_approve / roster — apply in place,
-        // no peers dropped.
+        // STUN/TURN / topology / label / auto_approve / roster — apply in
+        // place, no peers dropped. ICE servers are read fresh on the next
+        // connect, so a credential rotation reaches new connections without
+        // tearing down the live ones (see `reconcile::apply_hot`).
         if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
             return Response::err(format!("apply config: {e}"));
         }
