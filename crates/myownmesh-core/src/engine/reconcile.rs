@@ -127,7 +127,10 @@ mod tests {
 
         let cfg = state.config.read();
         assert_eq!(cfg.turn_servers.len(), 1);
-        assert_eq!(cfg.turn_servers[0].credential.as_deref(), Some("fresh-secret"));
+        assert_eq!(
+            cfg.turn_servers[0].credential.as_deref(),
+            Some("fresh-secret")
+        );
         assert_eq!(cfg.stun_servers[0].urls[0], "stun:fresh.example.com:3478");
     }
 }
