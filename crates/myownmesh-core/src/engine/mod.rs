@@ -170,21 +170,28 @@ pub async fn run_driver(
     // set — see `engine::conn_trace`.
     let mut conn_tracer = conn_trace::ConnTracer::new();
 
-    loop {
+    // Why the loop below exits — surfaced in the "driver stopping" line so a
+    // restart's *cause* is greppable. A network re-join (leave + re-join) is
+    // the only way a fresh `run_driver`/Nostr driver appears mid-run, and
+    // chasing one in the field is otherwise guesswork: "shutdown command" is a
+    // deliberate leave/`network_update`/`network_remove`, "command channel
+    // closed" is the registry dropping us, "signaling channel closed" is the
+    // relay/signaling feed dying.
+    let stop_reason: &str = loop {
         tokio::select! {
             biased;
 
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break };
+                let Some(cmd) = cmd else { break "command channel closed" };
                 if !handle_command(&state, cmd).await {
-                    break;
+                    break "shutdown command";
                 }
             }
 
             sig = signaling_inbound.recv() => {
                 let Some(sig) = sig else {
                     warn!(network = %state.network_id, "signaling channel closed");
-                    break;
+                    break "signaling channel closed";
                 };
                 handle_signaling_inbound(&state, sig).await;
             }
@@ -210,9 +217,14 @@ pub async fn run_driver(
         // someone is watching; never holds a per-peer lock across an
         // await (the handler above has already returned).
         conn_tracer.sweep(&state);
-    }
+    };
 
-    state.log_diag(crate::events::DiagLevel::Info, "engine", "driver stopping");
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "engine",
+        format!("driver stopping ({stop_reason})"),
+        serde_json::json!({ "reason": stop_reason }),
+    );
     state.shutdown().await;
 }
 
