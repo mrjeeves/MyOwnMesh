@@ -700,9 +700,18 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Ok(cfg) => Response::ok(serde_json::json!({ "config": cfg })),
             Err(e) => Response::err(e.to_string()),
         },
-        Request::NetworkAdd { config } => network_add(state, config).await,
-        Request::NetworkRemove { network } => network_remove(state, &network).await,
-        Request::NetworkUpdate { config } => network_update(state, config).await,
+        Request::NetworkAdd { config } => {
+            info!(network = %config.network_id, config_id = %config.id, "control: network_add");
+            network_add(state, config).await
+        }
+        Request::NetworkRemove { network } => {
+            info!(%network, "control: network_remove");
+            network_remove(state, &network).await
+        }
+        Request::NetworkUpdate { config } => {
+            info!(network = %config.network_id, config_id = %config.id, "control: network_update");
+            network_update(state, config).await
+        }
 
         // ---- self-update ----
         Request::UpdateStatus => match myownmesh_updater::status() {
@@ -1316,14 +1325,31 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     // Compare the incoming config against the engine's live config to
     // decide hot-apply vs. transport restart.
     let net_state = joined.state();
-    let needs_restart = {
+    let (needs_restart, signaling_changed, network_id_changed) = {
         let current = net_state.config.read().clone();
-        myownmesh_core::engine::reconcile::requires_restart(&current, &config)
+        (
+            myownmesh_core::engine::reconcile::requires_restart(&current, &config),
+            current.signaling != config.signaling,
+            current.network_id != config.network_id,
+        )
     };
+    // Name the path taken so a config-driven flap is greppable: a hot-apply
+    // keeps every live peer; a restart drops them. Only network_id/signaling
+    // force the restart now (STUN/TURN are hot — see `reconcile`).
+    info!(
+        network = %config.network_id,
+        needs_restart,
+        signaling_changed,
+        network_id_changed,
+        "network_update: {}",
+        if needs_restart { "transport restart (drops live peers)" } else { "hot-applied in place" }
+    );
 
     if !needs_restart {
-        // Topology / label / auto_approve / roster — apply in place,
-        // no peers dropped.
+        // STUN/TURN / topology / label / auto_approve / roster — apply in
+        // place, no peers dropped. ICE servers are read fresh on the next
+        // connect, so a credential rotation reaches new connections without
+        // tearing down the live ones (see `reconcile::apply_hot`).
         if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
             return Response::err(format!("apply config: {e}"));
         }
