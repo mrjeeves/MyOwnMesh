@@ -92,6 +92,19 @@ Everything else — ICE `Disconnected` / `Failed`, a stale nominated pair —
 only ever *schedules an in-place restart* (`renegotiate_ice`); it never
 tears a peer down on its own.
 
+The one signal *outside* this set that drops a peer is an explicit
+**`Leave`** over signaling (`PeerLeft` → `drop_peer(UserLeft)`): not a
+transport judgement but the peer telling us it's gone. A peer making a
+deliberate exit (network remove / transport restart / daemon shutdown)
+self-announces a `Leave` — the dual of its presence announce — so the
+others drop it *now* and re-handshake on its next announce, instead of
+sitting on a dead session for the ~90 s it takes inbound-silence to fire.
+This is what makes a "reconnect" (a leave-then-rejoin) come back promptly:
+the default public relays never synthesise a `Leave` for a departing peer,
+so without the self-announce the rejoiner shows online-but-unconnectable
+until the heartbeat backstop reaps the stale session. See
+`SignalingOutbound::Leave` and `JoinedNetwork::announce_leave`.
+
 ## Tunables
 
 Live in `crates/myownmesh-core/src/engine/scheduler.rs` as `pub const`s.

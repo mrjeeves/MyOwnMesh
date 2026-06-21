@@ -429,6 +429,11 @@ async fn join_configured(mesh: &MeshHandle, registry: &NetworkRegistry) {
 
 /// Leave every joined network — the node-disable transition.
 async fn leave_all(registry: &NetworkRegistry) {
+    // Announce a graceful departure first so peers drop our sessions now
+    // instead of waiting out their heartbeat timeout (~90 s) — without it,
+    // disabling the node leaves us showing online-but-unconnectable on every
+    // peer for over a minute.
+    registry.announce_all_departures().await;
     for net in registry.take_all() {
         if let Err(e) = net.leave().await {
             warn!("leave failed: {e:#}");

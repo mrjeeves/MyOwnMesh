@@ -53,6 +53,9 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 SignalingOutbound::Announce => LocalOutbound::Announce {
                     device_id: device_id_for_out.clone(),
                 },
+                SignalingOutbound::Leave => LocalOutbound::Leave {
+                    device_id: device_id_for_out.clone(),
+                },
                 SignalingOutbound::Offer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Offer {
@@ -201,6 +204,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         while let Some(outbound) = outbound_rx.recv().await {
             let translated = match outbound {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
+                SignalingOutbound::Leave => NostrOutbound::Leave,
                 SignalingOutbound::Offer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Offer {

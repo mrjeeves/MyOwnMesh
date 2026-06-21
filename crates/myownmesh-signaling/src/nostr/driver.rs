@@ -74,7 +74,16 @@ pub enum NostrInbound {
 #[derive(Debug, Clone)]
 pub enum NostrOutbound {
     Announce,
-    DirectedToPeer { to: String, msg: SignalingMessage },
+    /// Graceful departure broadcast — the dual of [`Announce`]. Publishes a
+    /// `leave` envelope so peers tear our session down promptly instead of
+    /// waiting out their heartbeat timeout. Rides the ephemeral kind (like
+    /// the rest of the live negotiation traffic) so a relay never replays it
+    /// onto a future session.
+    Leave,
+    DirectedToPeer {
+        to: String,
+        msg: SignalingMessage,
+    },
 }
 
 /// Start the driver. Spawns a coordinator task per relay; returns
@@ -980,6 +989,20 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
                     },
                 },
                 SIGNALING_EVENT_KIND,
+            ),
+            // A departure is a broadcast (no `to`) on the ephemeral kind —
+            // same envelope shape an intelligent signaling server synthesises
+            // on a socket close (see `server::build_leave_event`), so
+            // receivers handle a self-announced leave identically.
+            NostrOutbound::Leave => (
+                SignalingEnvelope {
+                    from: shared.device_id.clone(),
+                    to: None,
+                    msg: SignalingMessage::Leave {
+                        peer_id: shared.device_id.clone(),
+                    },
+                },
+                SIGNALING_EPHEMERAL_KIND,
             ),
             NostrOutbound::DirectedToPeer { to, msg } => (
                 SignalingEnvelope {

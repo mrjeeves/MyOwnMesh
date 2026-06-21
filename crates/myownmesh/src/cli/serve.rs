@@ -97,6 +97,10 @@ pub async fn run() -> Result<()> {
     let _ = shutdown_tx.send(());
     // Stop hosted services before tearing down networks.
     service_manager.shutdown().await;
+    // Say goodbye before we go: a graceful `leave` per network so peers drop
+    // our sessions immediately on a clean quit, rather than showing us online
+    // (and failing to connect) until their heartbeat times out ~90 s later.
+    registry.announce_all_departures().await;
     // Drain the registry — `take_all` returns owned `JoinedNetwork`s
     // for those that aren't still held by an in-flight control
     // request. Anything still pinned by a control client will tear

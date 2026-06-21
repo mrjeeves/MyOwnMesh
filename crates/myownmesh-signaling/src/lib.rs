@@ -54,12 +54,21 @@ pub enum SignalingMessage {
         #[serde(default)]
         username_fragment: Option<String>,
     },
-    /// A peer's signaling connection dropped. Emitted by an intelligent
-    /// [`server`] relay the instant a member's WebSocket closes, so other
-    /// members tear the peer down promptly instead of waiting out a
-    /// heartbeat timeout. Public relays never send this; receivers that
-    /// don't get it simply fall back to timeout-based detection, so it's
-    /// a pure accelerator.
+    /// A peer left the room. Sent two ways, both as a pure accelerator over
+    /// the heartbeat-timeout fallback:
+    ///
+    /// - **Self-announced** by a peer making a deliberate exit (network
+    ///   remove, transport restart, daemon shutdown) so the others drop its
+    ///   session immediately rather than stranding on a dead connection
+    ///   whose ICE still reports `Connected` for ~90 s. This is what makes a
+    ///   "reconnect" (leave-then-rejoin) come back promptly.
+    /// - **Synthesised** by an intelligent [`server`] relay the instant a
+    ///   member's WebSocket closes, covering crashes / yanked cables where
+    ///   the peer never got to announce.
+    ///
+    /// Public relays never synthesise it; on those, a deliberate exit still
+    /// self-announces, and an ungraceful one falls back to timeout-based
+    /// detection.
     Leave {
         peer_id: String,
     },

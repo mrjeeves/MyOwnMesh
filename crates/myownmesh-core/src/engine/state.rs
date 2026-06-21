@@ -220,6 +220,15 @@ pub enum SignalingInbound {
 #[derive(Debug)]
 pub enum SignalingOutbound {
     Announce,
+    /// Graceful departure broadcast — the dual of [`Announce`]. Tells every
+    /// peer in the room to tear our session down *now* instead of waiting
+    /// out the heartbeat timeout (~90 s). Emitted on a deliberate leave
+    /// (network remove / transport restart / daemon shutdown) so that a
+    /// "reconnect" — which is a leave-then-rejoin — doesn't strand peers
+    /// holding a dead session whose ICE still falsely reports `Connected`.
+    /// Public relays never synthesise a `Leave` for us (only an intelligent
+    /// signaling server does), so the departing peer announces its own.
+    Leave,
     Offer {
         device_id: String,
         sdp: String,
@@ -971,6 +980,17 @@ impl NetworkState {
             let _ = s.close().await;
         }
         self.peers.clear();
+    }
+
+    /// Broadcast a graceful departure so peers drop our session immediately
+    /// rather than waiting out the ~90 s heartbeat timeout. Fire-and-forget,
+    /// like every other signaling publish: the message is handed to the
+    /// signaling driver and rides the relays best-effort. Callers tearing
+    /// the network down (see [`crate::JoinedNetwork::announce_leave`]) should
+    /// emit this *before* dropping the signaling driver and give it a brief
+    /// moment to reach the relays.
+    pub fn announce_departure(&self) {
+        let _ = self.signaling_tx.send(SignalingOutbound::Leave);
     }
 }
 

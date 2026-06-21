@@ -212,6 +212,78 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     server.stop();
 }
 
+// End-to-end: a driver that makes a *deliberate* exit announces its own
+// `leave`, and a peer surfaces it as `NostrInbound::PeerLeft` — no
+// intelligent relay required. This is the path that makes the app's
+// "reconnect" (leave-then-rejoin) come back promptly on the default public
+// relays, which never synthesise a leave for us.
+#[tokio::test]
+async fn driver_self_announced_leave_reaches_peer() {
+    use myownmesh_signaling::nostr::driver::{
+        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+    };
+    use tokio::sync::mpsc;
+
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let mk = |device: &str| NostrDriverConfig {
+        app_id: "myownmesh-test".into(),
+        network_id: "self-leave-net".into(),
+        device_id: device.into(),
+        servers: vec![url.clone()],
+        denylist: vec![],
+        redundancy: 1,
+        public_fallback: false,
+    };
+
+    let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
+    let _driver_a = start(mk("device-aaa"), out_rx_a, in_tx_a);
+
+    let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
+    let _driver_b = start(mk("device-bbb"), out_rx_b, in_tx_b);
+
+    // B discovers A first.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = in_rx_b.recv().await {
+            if matches!(ev, NostrInbound::PeerAnnounced { device_id } if device_id == "device-aaa")
+            {
+                return;
+            }
+        }
+        panic!("B never discovered A");
+    })
+    .await
+    .expect("discovery timed out");
+
+    // A announces a graceful departure while still connected. The driver
+    // stays alive (we don't drop it) — the leave rides the relay like any
+    // other publish, and B surfaces it as PeerLeft.
+    out_tx_a
+        .send(NostrOutbound::Leave)
+        .expect("queue A's leave");
+
+    let saw_leave = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = in_rx_b.recv().await {
+            if matches!(ev, NostrInbound::PeerLeft { device_id } if device_id == "device-aaa") {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for self-announced PeerLeft");
+    assert!(saw_leave, "B never saw A's self-announced leave");
+
+    drop(out_tx_a);
+    drop(out_tx_b);
+    server.stop();
+}
+
 // Intelligent-relay behaviour: when a member's socket drops, the relay
 // emits a `leave` to the room so others tear down promptly.
 #[tokio::test]
