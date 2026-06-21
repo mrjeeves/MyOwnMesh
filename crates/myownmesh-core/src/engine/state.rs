@@ -152,6 +152,9 @@ pub enum NetworkCmd {
     /// the caller can correlate acks.
     ProposeTransition {
         variant: crate::network_state::TransitionVariant,
+        /// Per-device custody second factor, if the network requires one on
+        /// this device. `None` when no custody lock is enrolled.
+        mfa_code: Option<String>,
         reply: oneshot::Sender<Result<String>>,
     },
     /// Sign an existing pending proposal. Verifies the local user
@@ -162,6 +165,8 @@ pub enum NetworkCmd {
     /// transition in the same step.
     SignProposal {
         proposal_id: String,
+        /// Per-device custody second factor (see `ProposeTransition`).
+        mfa_code: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Deny a pending proposal. Any single deny invalidates the

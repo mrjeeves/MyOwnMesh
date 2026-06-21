@@ -164,22 +164,32 @@ pub enum Request {
         network: String,
         /// Target kind. Must differ from the current one.
         to: myownmesh_core::NetworkKind,
+        /// Per-device custody second factor, if this device enrolled one for
+        /// the network (see the `GovernanceMfa*` ops). Omitted otherwise.
+        #[serde(default)]
+        mfa_code: Option<String>,
     },
     /// Float a role-grant proposal.
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
         role: myownmesh_core::Role,
+        #[serde(default)]
+        mfa_code: Option<String>,
     },
     /// Float a role-revoke proposal.
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,
+        #[serde(default)]
+        mfa_code: Option<String>,
     },
     /// Sign a pending proposal.
     GovernanceSign {
         network: String,
         proposal_id: String,
+        #[serde(default)]
+        mfa_code: Option<String>,
     },
     /// Deny a pending proposal. Single-shot kill switch.
     GovernanceDeny {
@@ -196,6 +206,23 @@ pub enum Request {
     GovernanceSpawnSplit {
         network: String,
         proposal_id: String,
+    },
+    /// Enroll a per-device TOTP custody lock for `network` on this daemon.
+    /// Returns the secret (base32 + `otpauth://` URI for a QR) and the
+    /// one-time recovery codes — shown to the user exactly once. Fails if an
+    /// enrollment already exists (disable it first).
+    GovernanceMfaEnroll {
+        network: String,
+    },
+    /// Whether this device holds a custody enrollment for `network`.
+    GovernanceMfaStatus {
+        network: String,
+    },
+    /// Remove the custody lock for `network` — requires a valid code, so the
+    /// lock can't be lifted by someone who can't already satisfy it.
+    GovernanceMfaDisable {
+        network: String,
+        code: String,
     },
 
     // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------
@@ -762,25 +789,16 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             },
             None => Response::err(format!("unknown network: {network}")),
         },
-        Request::GovernanceProposeKindChange { network, to } => {
-            match state.registry.get(&network) {
-                Some(net) => match net
-                    .propose_transition(myownmesh_core::TransitionVariant::KindChange { to })
-                    .await
-                {
-                    Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
-                    Err(e) => Response::err(e.to_string()),
-                },
-                None => Response::err(format!("unknown network: {network}")),
-            }
-        }
-        Request::GovernanceProposeRoleGrant {
+        Request::GovernanceProposeKindChange {
             network,
-            target,
-            role,
+            to,
+            mfa_code,
         } => match state.registry.get(&network) {
             Some(net) => match net
-                .propose_transition(myownmesh_core::TransitionVariant::RoleGrant { target, role })
+                .propose_transition(
+                    myownmesh_core::TransitionVariant::KindChange { to },
+                    mfa_code,
+                )
                 .await
             {
                 Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
@@ -788,23 +806,47 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             },
             None => Response::err(format!("unknown network: {network}")),
         },
-        Request::GovernanceProposeRoleRevoke { network, target } => {
-            match state.registry.get(&network) {
-                Some(net) => match net
-                    .propose_transition(myownmesh_core::TransitionVariant::RoleRevoke { target })
-                    .await
-                {
-                    Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
-                    Err(e) => Response::err(e.to_string()),
-                },
-                None => Response::err(format!("unknown network: {network}")),
-            }
-        }
+        Request::GovernanceProposeRoleGrant {
+            network,
+            target,
+            role,
+            mfa_code,
+        } => match state.registry.get(&network) {
+            Some(net) => match net
+                .propose_transition(
+                    myownmesh_core::TransitionVariant::RoleGrant { target, role },
+                    mfa_code,
+                )
+                .await
+            {
+                Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceProposeRoleRevoke {
+            network,
+            target,
+            mfa_code,
+        } => match state.registry.get(&network) {
+            Some(net) => match net
+                .propose_transition(
+                    myownmesh_core::TransitionVariant::RoleRevoke { target },
+                    mfa_code,
+                )
+                .await
+            {
+                Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
         Request::GovernanceSign {
             network,
             proposal_id,
+            mfa_code,
         } => match state.registry.get(&network) {
-            Some(net) => match net.sign_proposal(&proposal_id).await {
+            Some(net) => match net.sign_proposal(&proposal_id, mfa_code).await {
                 Ok(_) => Response::ok(serde_json::json!({ "signed": proposal_id })),
                 Err(e) => Response::err(e.to_string()),
             },
@@ -840,6 +882,28 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             },
             None => Response::err(format!("unknown network: {network}")),
         },
+        // ---- custody MFA (per-device, local to this daemon) ----------
+        // These act on this daemon's secrets store keyed by network id; they
+        // do not require the network to be live in the registry.
+        Request::GovernanceMfaEnroll { network } => {
+            match myownmesh_core::custody::enroll(&network, &network) {
+                Ok(e) => Response::ok(serde_json::json!({
+                    "secret": e.secret_b32,
+                    "otpauth_uri": e.otpauth_uri,
+                    "recovery_codes": e.recovery_codes,
+                })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::GovernanceMfaStatus { network } => Response::ok(serde_json::json!({
+            "enrolled": myownmesh_core::custody::is_enrolled(&network),
+        })),
+        Request::GovernanceMfaDisable { network, code } => {
+            match myownmesh_core::custody::disable(&network, &code) {
+                Ok(()) => Response::ok(serde_json::json!({ "disabled": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
 
         // ---- RPC handler claims --------------------------------------
         Request::RpcRegister {

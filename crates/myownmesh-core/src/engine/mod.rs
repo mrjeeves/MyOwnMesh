@@ -295,12 +295,20 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         }
 
         // ---- governance ops ----
-        NetworkCmd::ProposeTransition { variant, reply } => {
-            let result = governance::propose(state, variant).await;
+        NetworkCmd::ProposeTransition {
+            variant,
+            mfa_code,
+            reply,
+        } => {
+            let result = governance::propose(state, variant, mfa_code.as_deref()).await;
             let _ = reply.send(result);
         }
-        NetworkCmd::SignProposal { proposal_id, reply } => {
-            let result = governance::sign_proposal(state, &proposal_id).await;
+        NetworkCmd::SignProposal {
+            proposal_id,
+            mfa_code,
+            reply,
+        } => {
+            let result = governance::sign_proposal(state, &proposal_id, mfa_code.as_deref()).await;
             let _ = reply.send(result);
         }
         NetworkCmd::DenyProposal { proposal_id, reply } => {

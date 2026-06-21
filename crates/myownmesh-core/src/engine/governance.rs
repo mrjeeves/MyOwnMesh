@@ -117,7 +117,16 @@ pub fn snapshot(state: &Arc<EngineState>) -> network_state::NetworkState {
 
 /// Float a new signed transition from this device. Signs with the
 /// local identity, persists to pending, broadcasts to peers.
-pub async fn propose(state: &Arc<EngineState>, variant: TransitionVariant) -> Result<String> {
+pub async fn propose(
+    state: &Arc<EngineState>,
+    variant: TransitionVariant,
+    mfa_code: Option<&str>,
+) -> Result<String> {
+    // Custody lock: authoring a governance transition is a custody-affecting
+    // act. If this device enrolled a second factor for this network, a fresh
+    // code is required here; otherwise this is a no-op. Composes with — does
+    // not replace — the cryptographic owner-quorum checked at ratification.
+    crate::custody::require(&state.network_id, mfa_code)?;
     let self_pubkey = state.identity.public_id().to_string();
     let signature =
         network_state::sign_transition(&state.network_id, &variant, state.identity.signing_key());
@@ -166,7 +175,11 @@ pub async fn propose(state: &Arc<EngineState>, variant: TransitionVariant) -> Re
 /// re-sign — a no-op if the local pubkey is already in the signer
 /// list). Broadcasts the signed ack. If the signature satisfies the
 /// quorum, ratifies the transition in the same step.
-pub async fn sign_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
+pub async fn sign_proposal(
+    state: &Arc<EngineState>,
+    proposal_id: &str,
+    mfa_code: Option<&str>,
+) -> Result<()> {
     let self_pubkey = state.identity.public_id().to_string();
     let (variant, signature) = {
         let mut gov = state.governance_state.write();
@@ -181,6 +194,10 @@ pub async fn sign_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Resul
         if gov.pending[idx].signers.iter().any(|s| s == &self_pubkey) {
             return Err(Error::Other("already signed".into()));
         }
+        // Custody lock: co-signing is authoring. Gate here — after the
+        // proposal is known valid and unsigned by us — so a one-time recovery
+        // code is never spent on a sign that wouldn't have happened anyway.
+        crate::custody::require(&state.network_id, mfa_code)?;
         let variant = gov.pending[idx].variant.clone();
         let signature = network_state::sign_transition(
             &state.network_id,
