@@ -400,9 +400,16 @@ mod tests {
     }
 
     fn tmp() -> PathBuf {
+        // A process-global counter guarantees a distinct path per call even
+        // when tests run concurrently and the clock is too coarse to separate
+        // them (observed flaking on macOS, where two disk tests collided on
+        // one file and stomped each other's store).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "mom-custody-test-{}-{}.json",
+            "mom-custody-test-{}-{}-{}.json",
             std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
             now_unix_nanos()
         ))
     }
