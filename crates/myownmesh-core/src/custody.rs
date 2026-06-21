@@ -205,6 +205,11 @@ fn hotp(secret: &[u8], counter: u64) -> u32 {
     bin % 10u32.pow(DIGITS)
 }
 
+// Computing a code *from the secret* is what an authenticator app does, not
+// the daemon — the whole point of the second factor is that it comes from a
+// separate device. So this lives test-only; production never derives its own
+// code (it only ever `verify`s one supplied from outside).
+#[cfg(test)]
 fn totp_at(secret: &[u8], unix: u64) -> String {
     format!(
         "{:0width$}",
