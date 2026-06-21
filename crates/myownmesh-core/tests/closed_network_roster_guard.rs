@@ -27,7 +27,7 @@ use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::state::NetworkState;
 use myownmesh_core::engine::{governance, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::protocol::governance::{RosterEntry, RosterEntriesMessage};
+use myownmesh_core::protocol::governance::{RosterEntriesMessage, RosterEntry};
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{NetworkKind, Role};
 
@@ -99,8 +99,7 @@ async fn roster_membership_authority_gate() {
     {
         let mut gov = alice.governance_state.write();
         gov.kind = NetworkKind::Closed;
-        gov.roles
-            .insert(bob.public_id().to_string(), Role::Member);
+        gov.roles.insert(bob.public_id().to_string(), Role::Member);
         gov.roles
             .insert(carol.public_id().to_string(), Role::Controller);
     }
@@ -114,14 +113,24 @@ async fn roster_membership_authority_gate() {
         .expect("seed carol");
 
     // (a) A MEMBER (Bob) gossips a brand-new id → MUST be refused.
-    governance::on_roster_entries(&alice, bob.public_id(), vouch(mallory.public_id(), "mallory")).await;
+    governance::on_roster_entries(
+        &alice,
+        bob.public_id(),
+        vouch(mallory.public_id(), "mallory"),
+    )
+    .await;
     assert!(
         !rostered(&alice, mallory.public_id()),
         "MOM-01: a Member's gossip conscripted a new member into a closed network"
     );
 
     // (b) An UNKNOWN sender (role defaults to Member) gossips → MUST be refused.
-    governance::on_roster_entries(&alice, mallory.public_id(), vouch(mallory.public_id(), "mallory")).await;
+    governance::on_roster_entries(
+        &alice,
+        mallory.public_id(),
+        vouch(mallory.public_id(), "mallory"),
+    )
+    .await;
     assert!(
         !rostered(&alice, mallory.public_id()),
         "MOM-01: an unrostered stranger's gossip added a member to a closed network"
