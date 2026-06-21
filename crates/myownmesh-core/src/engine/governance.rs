@@ -698,11 +698,37 @@ pub async fn on_roster_request(
 /// persist if the roster changed, and — if it did — re-summarise to our
 /// peers so the new member propagates onward (gossip convergence).
 pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
-    let kind = state.governance_state.read().kind;
+    // Who is allowed to *introduce* a new member via gossip?
+    //
+    //   * `open` network — anyone the gossip reached. Membership is
+    //     permissionless by design: "a member is anyone any current member
+    //     has vouched for" (see the module note above).
+    //   * `closed` network — only a Controller/Owner. The Role model is
+    //     explicit: a Controller "can add member peers to the roster"; a
+    //     Member has "no roster-edit authority". Without this gate any
+    //     authenticated peer — a freshly-approved Member, or an attacker who
+    //     cleared a single approval — could gossip arbitrary device ids into
+    //     the roster, and a rostered peer is auto-approved on every future
+    //     connection (`auto = cfg.auto_approve || rostered`). That is the
+    //     MOM-01 escalation: connection ≠ authority to expand membership.
+    //
+    // The sender (`peer_id`) is the cryptographically-authenticated peer the
+    // frame arrived from, so its role is a trustworthy authority signal.
+    // `can_grant(Role::Member)` is precisely "may admit members" (false for
+    // Member, true for Controller/Owner).
+    let (kind, sender_may_admit) = {
+        let gov = state.governance_state.read();
+        let may = gov.kind == NetworkKind::Open
+            || gov
+                .role_of(crate::signing::pubkey_part(peer_id))
+                .can_grant(Role::Member);
+        (gov.kind, may)
+    };
     let self_pk = state.identity.public_id().to_string();
-    let added = {
+    let (added, refused) = {
         let mut roster = state.roster.write();
         let mut added = 0usize;
+        let mut refused = 0usize;
         for entry in &msg.entries {
             let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
             // Our own entry is locally authoritative; never let a peer's
@@ -714,6 +740,14 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
             // label / timestamp from a peer can't clobber ours and a
             // local removal can't be undone by a no-op rewrite.
             if crate::roster::is_authorized(&roster, &pubkey) {
+                continue;
+            }
+            // MOM-01 guard: on a closed network, refuse member introductions
+            // from a sender that lacks roster-edit authority. (Existing
+            // members are skipped above, so this only blocks *new* additions —
+            // legitimate members already in the roster are unaffected.)
+            if !sender_may_admit {
+                refused += 1;
                 continue;
             }
             crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
@@ -737,8 +771,21 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
                 );
             }
         }
-        added
+        (added, refused)
     };
+    if refused > 0 {
+        // Security-relevant: surface attempts to expand a closed network's
+        // membership from an unauthorized peer so they're visible in diags.
+        diag(
+            state,
+            crate::events::DiagLevel::Warn,
+            format!(
+                "roster: refused {refused} unauthorized member add(s) gossiped by {} \
+                 (closed network; sender holds no roster-edit authority)",
+                &peer_id[..peer_id.len().min(12)]
+            ),
+        );
+    }
     if added > 0 {
         diag(
             state,
