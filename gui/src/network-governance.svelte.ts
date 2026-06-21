@@ -159,12 +159,22 @@ function createGovernanceStore() {
     _selfPubkey: string,
     peerPubkey: string,
     role: Role,
+    mfaCode?: string,
   ): Promise<{ ok: boolean; reason?: string }> {
     try {
       if (role === "member") {
-        await meshClient.governanceProposeRoleRevoke(configId, peerPubkey);
+        await meshClient.governanceProposeRoleRevoke(
+          configId,
+          peerPubkey,
+          mfaCode,
+        );
       } else {
-        await meshClient.governanceProposeRoleGrant(configId, peerPubkey, role);
+        await meshClient.governanceProposeRoleGrant(
+          configId,
+          peerPubkey,
+          role,
+          mfaCode,
+        );
       }
       return { ok: true };
     } catch (e) {
@@ -176,8 +186,9 @@ function createGovernanceStore() {
     configId: string,
     selfPubkey: string,
     peerPubkey: string,
+    mfaCode?: string,
   ): Promise<{ ok: boolean; reason?: string }> {
-    return setPeerRole(configId, selfPubkey, peerPubkey, "member");
+    return setPeerRole(configId, selfPubkey, peerPubkey, "member", mfaCode);
   }
 
   // ---- mutations: kind transitions ----
@@ -186,9 +197,14 @@ function createGovernanceStore() {
     configId: string,
     _selfPubkey: string,
     to: NetworkKind,
+    mfaCode?: string,
   ): Promise<{ ok: boolean; proposalId?: string; reason?: string }> {
     try {
-      const id = await meshClient.governanceProposeKindChange(configId, to);
+      const id = await meshClient.governanceProposeKindChange(
+        configId,
+        to,
+        mfaCode,
+      );
       return { ok: true, proposalId: id };
     } catch (e) {
       return { ok: false, reason: String(e) };
@@ -199,9 +215,51 @@ function createGovernanceStore() {
     configId: string,
     _selfPubkey: string,
     proposalId: string,
+    mfaCode?: string,
   ): Promise<{ ok: boolean; reason?: string }> {
     try {
-      await meshClient.governanceSign(configId, proposalId);
+      await meshClient.governanceSign(configId, proposalId, mfaCode);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: String(e) };
+    }
+  }
+
+  // ---- per-device custody MFA (TOTP) ----
+
+  async function mfaStatus(configId: string): Promise<boolean> {
+    try {
+      return await meshClient.governanceMfaStatus(configId);
+    } catch {
+      return false;
+    }
+  }
+
+  async function mfaEnroll(
+    configId: string,
+  ): Promise<
+    | { ok: true; secret: string; otpauthUri: string; recoveryCodes: string[] }
+    | { ok: false; reason: string }
+  > {
+    try {
+      const r = await meshClient.governanceMfaEnroll(configId);
+      return {
+        ok: true,
+        secret: r.secret,
+        otpauthUri: r.otpauth_uri,
+        recoveryCodes: r.recovery_codes,
+      };
+    } catch (e) {
+      return { ok: false, reason: String(e) };
+    }
+  }
+
+  async function mfaDisable(
+    configId: string,
+    code: string,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    try {
+      await meshClient.governanceMfaDisable(configId, code);
       return { ok: true };
     } catch (e) {
       return { ok: false, reason: String(e) };
@@ -269,6 +327,9 @@ function createGovernanceStore() {
     withdrawProposal,
     spawnSplit,
     splitsFor,
+    mfaStatus,
+    mfaEnroll,
+    mfaDisable,
     recordOrphan,
     discardOrphan,
     reconcileOrphans,

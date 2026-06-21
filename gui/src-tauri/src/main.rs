@@ -346,10 +346,15 @@ async fn mesh_governance_propose_kind_change(
     state: State<'_, AppState>,
     network: String,
     to: String,
+    mfa_code: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let resp = state
         .client
-        .request(&Request::GovernanceProposeKindChange { network, to })
+        .request(&Request::GovernanceProposeKindChange {
+            network,
+            to,
+            mfa_code,
+        })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -361,6 +366,7 @@ async fn mesh_governance_propose_role_grant(
     network: String,
     target: String,
     role: String,
+    mfa_code: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let resp = state
         .client
@@ -368,6 +374,7 @@ async fn mesh_governance_propose_role_grant(
             network,
             target,
             role,
+            mfa_code,
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -379,10 +386,15 @@ async fn mesh_governance_propose_role_revoke(
     state: State<'_, AppState>,
     network: String,
     target: String,
+    mfa_code: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let resp = state
         .client
-        .request(&Request::GovernanceProposeRoleRevoke { network, target })
+        .request(&Request::GovernanceProposeRoleRevoke {
+            network,
+            target,
+            mfa_code,
+        })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -393,13 +405,55 @@ async fn mesh_governance_sign(
     state: State<'_, AppState>,
     network: String,
     proposal_id: String,
+    mfa_code: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let resp = state
         .client
         .request(&Request::GovernanceSign {
             network,
             proposal_id,
+            mfa_code,
         })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_enroll(
+    state: State<'_, AppState>,
+    network: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaEnroll { network })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_status(
+    state: State<'_, AppState>,
+    network: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaStatus { network })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_disable(
+    state: State<'_, AppState>,
+    network: String,
+    code: String,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaDisable { network, code })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -629,6 +683,9 @@ fn main() {
             mesh_governance_deny,
             mesh_governance_withdraw,
             mesh_governance_spawn_split,
+            mesh_governance_mfa_enroll,
+            mesh_governance_mfa_status,
+            mesh_governance_mfa_disable,
             update_status,
             update_check,
             update_apply,

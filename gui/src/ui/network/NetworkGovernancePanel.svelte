@@ -36,6 +36,35 @@
   let actionError = $state<string | null>(null);
   let busy = $state(false);
 
+  // ---- per-device custody MFA (TOTP) ----
+  // When this device has enrolled a custody lock for the network, the daemon
+  // refuses to author/sign a governance change without a fresh code. We pass
+  // whatever the user typed in `mfaCode`; an empty value is sent as undefined
+  // (no factor), and any daemon refusal surfaces in `actionError`.
+  let mfaEnrolled = $state(false);
+  let mfaCode = $state("");
+  let mfaBusy = $state(false);
+  let mfaError = $state<string | null>(null);
+  let mfaEnrollResult = $state<{
+    secret: string;
+    otpauthUri: string;
+    recoveryCodes: string[];
+  } | null>(null);
+  let mfaDisableCode = $state("");
+
+  $effect(() => {
+    // Re-load enrollment status whenever the selected network changes.
+    const id = network.config_id;
+    governance.mfaStatus(id).then((on) => {
+      if (network.config_id === id) mfaEnrolled = on;
+    });
+  });
+
+  function codeArg(): string | undefined {
+    const c = mfaCode.trim();
+    return c.length ? c : undefined;
+  }
+
   async function propose(to: "open" | "closed") {
     if (!selfPubkey) {
       actionError = "Local identity not loaded yet — try again in a moment.";
@@ -43,8 +72,14 @@
     }
     busy = true;
     actionError = null;
-    const r = await governance.proposeKindChange(network.config_id, selfPubkey, to);
+    const r = await governance.proposeKindChange(
+      network.config_id,
+      selfPubkey,
+      to,
+      codeArg(),
+    );
     if (!r.ok) actionError = r.reason ?? "Couldn't float proposal.";
+    else mfaCode = "";
     busy = false;
   }
 
@@ -52,9 +87,49 @@
     if (!selfPubkey) return;
     busy = true;
     actionError = null;
-    const r = await governance.signProposal(network.config_id, selfPubkey, p.id);
+    const r = await governance.signProposal(
+      network.config_id,
+      selfPubkey,
+      p.id,
+      codeArg(),
+    );
     if (!r.ok) actionError = r.reason ?? "Couldn't sign.";
+    else mfaCode = "";
     busy = false;
+  }
+
+  async function enrollMfa() {
+    mfaBusy = true;
+    mfaError = null;
+    const r = await governance.mfaEnroll(network.config_id);
+    if (r.ok) {
+      mfaEnrollResult = {
+        secret: r.secret,
+        otpauthUri: r.otpauthUri,
+        recoveryCodes: r.recoveryCodes,
+      };
+      mfaEnrolled = true;
+    } else {
+      mfaError = r.reason ?? "Couldn't enroll.";
+    }
+    mfaBusy = false;
+  }
+
+  async function disableMfa() {
+    mfaBusy = true;
+    mfaError = null;
+    const r = await governance.mfaDisable(
+      network.config_id,
+      mfaDisableCode.trim(),
+    );
+    if (r.ok) {
+      mfaEnrolled = false;
+      mfaEnrollResult = null;
+      mfaDisableCode = "";
+    } else {
+      mfaError = r.reason ?? "Couldn't disable (wrong code?).";
+    }
+    mfaBusy = false;
   }
 
   async function deny(p: PendingProposal) {
@@ -180,6 +255,84 @@
         </button>
       {/if}
     </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Device security · authenticator (MFA)</div>
+    <p class="mfa-note">
+      A per-device second factor. When enrolled, this device won't author or
+      co-sign a governance change (owner grant/revoke, kind change) without a
+      fresh code from your authenticator app. It guards <em>this device's</em>
+      signing key; it doesn't replace the network's owner-quorum.
+    </p>
+
+    {#if mfaEnrolled}
+      <div class="info-banner" role="status">
+        ✓ An authenticator is enrolled on this device for this network.
+      </div>
+
+      <label class="mfa-field">
+        <span>Authenticator code — used when you propose / sign below</span>
+        <input
+          type="text"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          placeholder="6-digit code or a recovery code"
+          bind:value={mfaCode}
+        />
+      </label>
+
+      <details class="mfa-disable">
+        <summary>Remove this device's authenticator</summary>
+        <label class="mfa-field">
+          <span>Enter a current code to confirm</span>
+          <input
+            type="text"
+            bind:value={mfaDisableCode}
+            placeholder="6-digit code or a recovery code"
+          />
+        </label>
+        <button
+          class="btn"
+          disabled={mfaBusy || !mfaDisableCode.trim()}
+          onclick={disableMfa}
+        >
+          Disable MFA
+        </button>
+      </details>
+    {:else}
+      <button class="btn primary" disabled={mfaBusy} onclick={enrollMfa}>
+        Enroll an authenticator
+      </button>
+    {/if}
+
+    {#if mfaEnrollResult}
+      <div class="mfa-enroll-result">
+        <p>
+          <strong>Add this to your authenticator app now, and save the
+          recovery codes</strong> — they won't be shown again.
+        </p>
+        <div class="mfa-kv"><span>Secret</span><code>{mfaEnrollResult.secret}</code></div>
+        <div class="mfa-kv">
+          <span>otpauth URI</span><code class="wrap">{mfaEnrollResult.otpauthUri}</code>
+        </div>
+        <div class="mfa-kv">
+          <span>Recovery codes</span>
+          <ul class="mfa-recovery">
+            {#each mfaEnrollResult.recoveryCodes as rc (rc)}
+              <li><code>{rc}</code></li>
+            {/each}
+          </ul>
+        </div>
+        <button class="btn" onclick={() => (mfaEnrollResult = null)}>
+          I've saved these
+        </button>
+      </div>
+    {/if}
+
+    {#if mfaError}
+      <div class="mfa-error" role="alert">{mfaError}</div>
+    {/if}
   </div>
 
   {#if govView.pending.length > 0}
@@ -600,5 +753,66 @@
   }
   .mono {
     font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+
+  /* ---- custody MFA section ---- */
+  .mfa-note {
+    margin: 0 0 0.6rem;
+    font-size: 0.8rem;
+    opacity: 0.8;
+  }
+  .mfa-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin: 0.6rem 0;
+    font-size: 0.78rem;
+  }
+  .mfa-field input {
+    padding: 0.4rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid rgba(127, 127, 127, 0.4);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  .mfa-disable {
+    margin-top: 0.6rem;
+    font-size: 0.78rem;
+  }
+  .mfa-disable summary {
+    cursor: pointer;
+    opacity: 0.8;
+  }
+  .mfa-enroll-result {
+    margin-top: 0.7rem;
+    padding: 0.7rem;
+    border: 1px solid rgba(127, 127, 127, 0.35);
+    border-radius: 8px;
+  }
+  .mfa-kv {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+    margin: 0.35rem 0;
+    font-size: 0.78rem;
+  }
+  .mfa-kv > span {
+    min-width: 6.5rem;
+    opacity: 0.7;
+  }
+  .mfa-kv code.wrap {
+    word-break: break-all;
+  }
+  .mfa-recovery {
+    margin: 0;
+    padding-left: 1rem;
+    columns: 2;
+  }
+  .mfa-error {
+    margin-top: 0.6rem;
+    padding: 0.4rem 0.6rem;
+    border-radius: 6px;
+    background: rgba(220, 70, 70, 0.12);
+    color: #c0392b;
+    font-size: 0.8rem;
   }
 </style>
