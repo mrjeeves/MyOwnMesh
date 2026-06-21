@@ -27,6 +27,13 @@ use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
+/// How long [`JoinedNetwork::announce_leave`] waits after queuing the
+/// departure broadcast before returning, so the publish reaches the
+/// already-connected relay sockets before the caller drops the signaling
+/// driver. Long enough for one WebSocket frame on a live socket, short
+/// enough to be imperceptible on a user-initiated reconnect.
+const LEAVE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
 /// across all joined networks.
@@ -393,6 +400,31 @@ impl JoinedNetwork {
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         rx.await
             .map_err(|_| Error::Network("engine dropped split reply".into()))?
+    }
+
+    /// Announce a graceful departure to the room, then briefly wait for it
+    /// to reach the relays. Peers tear our session down immediately on the
+    /// `leave` (instead of waiting out the ~90 s heartbeat timeout), so a
+    /// deliberate reconnect — leave-then-rejoin — doesn't strand them on a
+    /// dead session whose ICE still falsely reports `Connected`.
+    ///
+    /// Call this on the *live* handle **before** the signaling driver is
+    /// dropped (the registry drops it inside `remove`): once the driver is
+    /// gone there's no socket left to publish on. Best-effort — the short
+    /// flush window lets the publish hit the already-connected relay sockets
+    /// without blocking teardown on a delivery confirmation the signaling
+    /// layer never provides anyway.
+    pub async fn announce_leave(&self) {
+        self.request_departure();
+        tokio::time::sleep(LEAVE_FLUSH).await;
+    }
+
+    /// Queue the departure broadcast without waiting for it to flush. Bulk
+    /// teardown (daemon shutdown) emits one per network and then does a
+    /// single combined flush before draining, rather than paying the
+    /// per-network wait [`Self::announce_leave`] does.
+    pub fn request_departure(&self) {
+        self.state.announce_departure();
     }
 
     /// Stop the network. Tears down all peer sessions, signals

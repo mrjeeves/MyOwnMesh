@@ -26,11 +26,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use myownmesh_core::JoinedNetwork;
 use myownmesh_signaling::nostr::driver::NostrDriverHandle;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+
+/// How long [`NetworkRegistry::announce_all_departures`] waits after queuing
+/// the per-network `leave` broadcasts before returning, so they reach the
+/// already-connected relay sockets before the registry is drained on
+/// shutdown. Mirrors core's per-network `JoinedNetwork::announce_leave`
+/// flush window.
+const DEPARTURE_FLUSH: Duration = Duration::from_millis(250);
 
 /// Snapshot view of one joined network for ctl / GUI consumers.
 /// Cheap to compute — every field is already cached on the
@@ -188,6 +196,35 @@ impl NetworkRegistry {
                 Err(_) => RemoveResult::StillBorrowed,
             },
             Err(_) => RemoveResult::StillBorrowed,
+        }
+    }
+
+    /// Broadcast a graceful `leave` on every joined network, then wait
+    /// briefly for the publishes to reach the relays, before the caller
+    /// drains the registry on daemon shutdown. Peers drop our sessions
+    /// immediately on the `leave` instead of waiting out their ~90 s
+    /// heartbeat timeout — the same courtesy `network_remove` extends for a
+    /// single network. The read lock is held only for the synchronous emit
+    /// (dropped before the flush wait), so this never holds a `parking_lot`
+    /// guard across `.await`.
+    pub async fn announce_all_departures(&self) {
+        let mut emitted = false;
+        {
+            let map = self.inner.read();
+            // Dedup by entry pointer — both id aliases point at the same Arc.
+            let mut seen: Vec<*const Entry> = Vec::new();
+            for entry in map.values() {
+                let ptr = Arc::as_ptr(entry);
+                if seen.contains(&ptr) {
+                    continue;
+                }
+                seen.push(ptr);
+                entry.joined.request_departure();
+                emitted = true;
+            }
+        }
+        if emitted {
+            tokio::time::sleep(DEPARTURE_FLUSH).await;
         }
     }
 

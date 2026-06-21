@@ -1267,6 +1267,18 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
 /// tasks.
 async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
     let key_owned = key.to_string();
+    // Tell peers we're leaving *before* the registry drops the signaling
+    // driver — a self-announced `leave` so they tear our session down now
+    // instead of waiting out the ~90 s heartbeat timeout. The reconnect
+    // button is a leave-then-rejoin, and without this the rejoined device
+    // strands peers holding a dead session whose ICE still reports
+    // `Connected`. Scoped so the cloned handle is released before `remove`,
+    // which would otherwise see it borrowed and report StillBorrowed.
+    {
+        if let Some(joined) = state.registry.get(key) {
+            joined.announce_leave().await;
+        }
+    }
     match state.registry.remove(key) {
         RemoveResult::Removed(joined) => {
             let config_id = joined.config_id().to_string();
@@ -1370,6 +1382,12 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
     // registry can reclaim ownership and `leave()` the old driver
     // cleanly rather than reporting StillBorrowed.
     let old_config = net_state.config.read().clone();
+    // Same graceful-departure courtesy as network_remove: peers drop our
+    // session now rather than waiting out the heartbeat timeout, so the
+    // rebuild under the new transport reconnects promptly instead of
+    // racing the stale-session recovery path. Emitted while the signaling
+    // driver is still live (before the registry remove below drops it).
+    joined.announce_leave().await;
     drop(net_state);
     drop(joined);
 

@@ -473,6 +473,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 }
             }
             clear_stale_session_if_zombie(state, &device_id).await;
+            // `clear_stale_session_if_zombie` drops a stale session only when
+            // ICE itself admits the link is dead; one whose ICE falsely
+            // reports `Connected` survives it. Confirm *that* case with real
+            // traffic so a peer that restarted without a `Leave` recovers
+            // from its announce instead of stranding on the corpse.
+            confirm_active_session_on_announce(state, &device_id).await;
             ensure_peer_session(state, device_id, role).await;
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -2226,6 +2232,140 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
     }
 }
 
+/// Confirm an *established* peer session is really carrying traffic when the
+/// peer re-announces — instead of trusting webrtc-rs's ICE state, which the
+/// engine elsewhere treats as a liar. The announce path otherwise takes an
+/// `Active`/`Shelved` session at face value: the re-offer only fires for a
+/// `Sighted` session, the in-place renegotiate only fires when ICE reports
+/// *not* connected, and `clear_stale_session_if_zombie` bails the moment ICE
+/// claims `Connected`. So a session whose ICE falsely reports `Connected`
+/// while it carries no frames — exactly the corpse a peer that restarted (or
+/// crashed, or lost power) leaves on the other end — is invisible to all of
+/// them, and only the ~90 s heartbeat backstop ever reclaims it. That
+/// backstop is unreliable here: the rejoiner re-announces (so it *looks*
+/// online) but, where it's the answerer, it waits for an offer its offerer —
+/// still believing the link is up — never sends, a standoff that strands it
+/// indefinitely. This is the "appears online, no connections, and even the
+/// 90 s heartbeat doesn't fix it" report.
+///
+/// Drive recovery from the announce itself: if we hold the peer Active or
+/// Shelved but haven't received a frame in `STALE_INBOUND_MS`, ping it and,
+/// after `WAKE_PROBE_DELAY_MS`, rebuild it if it's still silent — the same
+/// traffic-confirmed probe [`wake::on_wake`] runs, here triggered by the
+/// peer's presence rather than an OS resume. The rebuild drops as
+/// `HeartbeatTimeout` (a *recoverable* reason), so the offerer re-offers and
+/// the answerer accepts a fresh offer and both ends realign — without
+/// depending on the departing peer having managed to send a `Leave`. (The
+/// `Leave` stays the instant fast-path for a *deliberate* exit; this is the
+/// backstop that also covers crashes, power loss, and a lost `Leave`.)
+///
+/// Gated so a steady-state announce cadence can't churn healthy peers: only
+/// established sessions, only past the inbound-silence threshold (a live
+/// link's heartbeat pong keeps `last_recv_at` fresh), single-flighted via
+/// `last_liveness_probe_at`, and skipped while an in-place restart owns the
+/// recovery window. The teardown is still keyed off inbound traffic, never
+/// ICE — the probe only decides *whether to ask*.
+async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id: &str) {
+    // Decide under the peer lock, stamping the single-flight marker so a
+    // burst of announces produces at most one probe. Yields the session
+    // epoch to probe, or `None` to skip.
+    let probe_epoch = match state.peers.get(device_id) {
+        Some(peer) => {
+            let mut data = peer.state.write();
+            let established = matches!(data.status, PeerStatus::Active | PeerStatus::Shelved);
+            let silent = data
+                .last_recv_at
+                .map(|t| t.elapsed().as_millis() as u64 > scheduler::STALE_INBOUND_MS)
+                .unwrap_or(false);
+            // An in-flight in-place restart is mid-recovery; let it own its
+            // window rather than racing a rebuild against it (the same guard
+            // the zombie clear uses).
+            let restart_in_flight = match data.tier {
+                ConnectionTier::IceRestart { started } => {
+                    started.elapsed()
+                        < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                }
+                ConnectionTier::IceWatchdog { since } => {
+                    since.elapsed() < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                }
+                _ => false,
+            };
+            let probed_recently = data
+                .last_liveness_probe_at
+                .map(|t| {
+                    t.elapsed() < Duration::from_millis(scheduler::LIVENESS_PROBE_MIN_INTERVAL_MS)
+                })
+                .unwrap_or(false);
+            if established && silent && !restart_in_flight && !probed_recently {
+                data.last_liveness_probe_at = Some(Instant::now());
+                Some(peer.epoch)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let Some(probe_epoch) = probe_epoch else {
+        return;
+    };
+
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "signaling",
+        format!(
+            "{} re-announced but its session has been silent > {} ms — probing before trusting ICE",
+            short_peer(device_id),
+            scheduler::STALE_INBOUND_MS,
+        ),
+        serde_json::json!({
+            "peer": device_id,
+            "stale_inbound_ms": scheduler::STALE_INBOUND_MS,
+        }),
+    );
+    heartbeat::send_ping(state, device_id).await;
+
+    // Confirm by inbound traffic — not by ICE: wait the probe delay, then
+    // rebuild the peer if it still hasn't sent us a frame. The epoch guard
+    // makes sure we only reclaim the *same* session we probed — a rebuild
+    // that happened during the grace (a fresh offer landed, say) carries a
+    // new epoch and is left alone.
+    let state = state.clone();
+    let device_id = device_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS)).await;
+        let still_silent = match state.peers.get(&device_id) {
+            Some(peer) if peer.epoch == probe_epoch => peer
+                .state
+                .read()
+                .last_recv_at
+                .map(|t| t.elapsed().as_millis() as u64 > scheduler::WAKE_PROBE_DELAY_MS)
+                .unwrap_or(true),
+            // Gone, or already rebuilt to a newer session — nothing to do.
+            _ => false,
+        };
+        if still_silent {
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "signaling",
+                format!(
+                    "{} didn't answer the announce-driven probe — rebuilding",
+                    short_peer(&device_id)
+                ),
+                serde_json::json!({ "peer": device_id }),
+            );
+            drop_peer(
+                &state,
+                &device_id,
+                crate::events::DropReason::HeartbeatTimeout,
+            )
+            .await;
+            // Re-seed discovery so the rebuilt peer reconnects on the next
+            // round-trip rather than waiting for its own announce schedule.
+            maybe_reactive_announce(&state);
+        }
+    });
+}
+
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
     let removed = state.peers.remove(device_id);
     if let Some((_, peer)) = removed {
@@ -2663,6 +2803,150 @@ mod tests {
         assert!(
             state.peers.contains_key("peer-restarting"),
             "a peer with an in-flight ICE restart must survive the stale-inbound zombie check"
+        );
+    }
+
+    /// The headline case: an Active session that's gone silent (its ICE
+    /// would falsely read `Connected`, so the zombie clear leaves it) is
+    /// confirmed by traffic on the peer's re-announce and rebuilt when no
+    /// frame answers — recovery driven by presence, not by a `Leave`.
+    #[tokio::test]
+    async fn silent_active_session_rebuilt_on_reannounce() {
+        let state = build_test_state("announce-probe-drop");
+        insert_session_less_peer(&state, "peer-silent", Some(stale_instant()));
+        state
+            .peers
+            .get("peer-silent")
+            .expect("peer present")
+            .state
+            .write()
+            .status = PeerStatus::Active;
+
+        confirm_active_session_on_announce(&state, "peer-silent").await;
+
+        // The probe pinged (no session, so the ping no-ops) and scheduled a
+        // confirm sweep; with nothing answering, the silent session is
+        // reclaimed within the probe delay.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.peers.contains_key("peer-silent") {
+            if Instant::now() > deadline {
+                panic!("a silent Active session must be rebuilt after the announce-driven probe");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_answered_by_traffic_keeps_the_session() {
+        // The teardown is keyed off inbound traffic, never a timer or ICE
+        // state: if a frame arrives during the confirm window — a pong
+        // answering the probe — the session is genuinely alive and must
+        // survive, even though `last_recv_at` looked stale when we pinged.
+        let state = build_test_state("announce-probe-answered");
+        insert_session_less_peer(&state, "peer-answers", Some(stale_instant()));
+        state
+            .peers
+            .get("peer-answers")
+            .expect("peer present")
+            .state
+            .write()
+            .status = PeerStatus::Active;
+
+        confirm_active_session_on_announce(&state, "peer-answers").await;
+        // Inbound traffic answers the probe partway through the confirm
+        // window — a real pong refreshes `last_recv_at` exactly this way,
+        // landing well before the sweep at `WAKE_PROBE_DELAY_MS`.
+        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS / 3)).await;
+        state
+            .peers
+            .get("peer-answers")
+            .expect("peer present")
+            .state
+            .write()
+            .last_recv_at = Some(Instant::now());
+
+        // Wait past the sweep; the session must survive because traffic
+        // confirmed it, even though it looked stale when we pinged.
+        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS)).await;
+        assert!(
+            state.peers.contains_key("peer-answers"),
+            "a probe answered by inbound traffic must not rebuild the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_active_session_not_probed_on_reannounce() {
+        // A peer we've heard from within the staleness window is healthy —
+        // its heartbeat pong keeps `last_recv_at` fresh — so a routine
+        // re-announce must not probe (let alone rebuild) it.
+        let state = build_test_state("announce-probe-fresh");
+        insert_session_less_peer(&state, "peer-fresh", Some(Instant::now()));
+        state
+            .peers
+            .get("peer-fresh")
+            .expect("peer present")
+            .state
+            .write()
+            .status = PeerStatus::Active;
+
+        confirm_active_session_on_announce(&state, "peer-fresh").await;
+
+        let peer = state
+            .peers
+            .get("peer-fresh")
+            .expect("fresh peer must survive");
+        assert!(
+            peer.state.read().last_liveness_probe_at.is_none(),
+            "a peer we've heard from recently must not be probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_established_session_not_probed_on_reannounce() {
+        // Only Active/Shelved sessions are probed — a still-connecting
+        // (Sighted) peer is handled by the re-offer / connect-timeout paths,
+        // not by an inbound-silence rebuild.
+        let state = build_test_state("announce-probe-sighted");
+        insert_session_less_peer(&state, "peer-sighted", Some(stale_instant()));
+        // Default status is Sighted.
+
+        confirm_active_session_on_announce(&state, "peer-sighted").await;
+
+        let peer = state
+            .peers
+            .get("peer-sighted")
+            .expect("sighted peer must survive the probe gate");
+        assert!(
+            peer.state.read().last_liveness_probe_at.is_none(),
+            "only established (Active/Shelved) sessions are probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_active_session_not_probed_on_reannounce() {
+        // A session mid in-place ICE restart is recovering, not wedged; the
+        // probe must leave it alone so it owns its window (the same guard the
+        // zombie clear honours).
+        let state = build_test_state("announce-probe-restart");
+        insert_session_less_peer(&state, "peer-restarting", Some(stale_instant()));
+        {
+            let peer = state.peers.get("peer-restarting").expect("peer present");
+            let mut d = peer.state.write();
+            d.status = PeerStatus::Active;
+            d.tier = ConnectionTier::IceRestart {
+                started: Instant::now(),
+            };
+        }
+
+        confirm_active_session_on_announce(&state, "peer-restarting").await;
+
+        let peer = state
+            .peers
+            .get("peer-restarting")
+            .expect("recovering peer must survive");
+        assert!(
+            peer.state.read().last_liveness_probe_at.is_none(),
+            "a session mid in-place restart owns its recovery window"
         );
     }
 }

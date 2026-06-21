@@ -92,6 +92,19 @@ Everything else — ICE `Disconnected` / `Failed`, a stale nominated pair —
 only ever *schedules an in-place restart* (`renegotiate_ice`); it never
 tears a peer down on its own.
 
+The one signal *outside* this set that drops a peer is an explicit
+**`Leave`** over signaling (`PeerLeft` → `drop_peer(UserLeft)`): not a
+transport judgement but the peer telling us it's gone. A peer making a
+deliberate exit (network remove / transport restart / daemon shutdown)
+self-announces a `Leave` — the dual of its presence announce — so the
+others drop it *now* and re-handshake on its next announce, instead of
+sitting on a dead session for the ~90 s it takes inbound-silence to fire.
+This is what makes a "reconnect" (a leave-then-rejoin) come back promptly:
+the default public relays never synthesise a `Leave` for a departing peer,
+so without the self-announce the rejoiner shows online-but-unconnectable
+until the heartbeat backstop reaps the stale session. See
+`SignalingOutbound::Leave` and `JoinedNetwork::announce_leave`.
+
 ## Tunables
 
 Live in `crates/myownmesh-core/src/engine/scheduler.rs` as `pub const`s.
@@ -104,7 +117,8 @@ HEARTBEAT_INTERVAL_MS               = 30_000              // ping cadence on act
 HEARTBEAT_TIMEOUT_MS                = 30_000              // silence past TIMEOUT + WAKE_DETECTION → rebuild
 WAKE_DETECTION_THRESHOLD_MS         = HEARTBEAT_INTERVAL_MS * 2  // 60s tick gap = "we slept"
 WAKE_COALESCE_MS                    = 2_000               // dedupe wake events fired close together
-WAKE_PROBE_DELAY_MS                 = 1_500               // tier-2 probe wait
+WAKE_PROBE_DELAY_MS                 = 1_500               // tier-2 probe wait (also the announce-driven probe's confirm window)
+LIVENESS_PROBE_MIN_INTERVAL_MS      = 5_000               // single-flight floor for the announce-driven liveness probe
 
 ICE_DISCONNECTED_RESTART_MS         = 1_000               // tier-2.5 watchdog: how long Disconnected before restart
 ICE_POLL_INTERVAL_MS                = 3_000               // ICE watchdog poll + renegotiation retry cadence
@@ -143,6 +157,24 @@ the source files carry the rationale; this section is the index.
   `last_recv_at` fresh via the heartbeat pong, so silence past the window
   means the *transport* is dead — re-sending `hello` over it can't work.
   The heartbeat and wake-probe paths drop + rebuild instead.
+
+- **A re-announce confirms the link with traffic, not with ICE.** A peer
+  that restarted, crashed, or lost power re-announces but can't always send a
+  `Leave`, and the session it left on our end may have ICE still (falsely)
+  reporting `Connected` — invisible to the re-offer (Sighted-only), the
+  in-place renegotiate (fires on ICE *not* connected), and the zombie clear
+  (bails on `Connected`). So an announce from a peer we hold Active/Shelved
+  whose inbound has gone silent past `STALE_INBOUND_MS` fires a confirm-ping
+  and, after `WAKE_PROBE_DELAY_MS`, rebuilds if still silent — the wake probe,
+  driven by presence instead of an OS resume. The rebuild is `HeartbeatTimeout`
+  (recoverable), so the offerer re-offers and the answerer takes a fresh offer
+  and both realign without a `Leave`. Single-flighted
+  (`LIVENESS_PROBE_MIN_INTERVAL_MS`) and gated on inbound-silence so a
+  steady-state announce cadence never churns a healthy peer
+  (`confirm_active_session_on_announce`). Self-announced `Leave` is the
+  instant fast-path for a deliberate exit; this is the backstop for the
+  rest. Replaces the old ~90 s heartbeat-only recovery that stranded an
+  answerer-role peer indefinitely after a reconnect.
 
 - **Stuck answerer rebuilds on a fresh offer.** The offerer creates the
   data channel, so an answerer whose data channel never opened can't fix
