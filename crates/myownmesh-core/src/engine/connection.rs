@@ -67,6 +67,15 @@ pub struct PeerStateData {
     /// offers. `None` until we've sent the first offer for this
     /// session; cleared on `drop_peer`.
     pub last_offer_sent_at: Option<Instant>,
+    /// Wall-clock of the most recent announce-driven liveness probe we
+    /// fired for this peer. When a peer we believe is connected re-announces
+    /// but its inbound has gone silent, we ping it and rebuild if no traffic
+    /// confirms the link (see `confirm_active_session_on_announce`). This
+    /// single-flights that probe so an announce burst (REQ replay) can't
+    /// stack a dozen probe tasks on one peer. `None` until the first probe;
+    /// cleared with the rest of the state on `drop_peer` (a rebuild starts a
+    /// fresh `PeerStateData`).
+    pub last_liveness_probe_at: Option<Instant>,
     pub last_ping_t: Option<i64>,
     pub rtt_ms: Option<u32>,
     pub ice_disconnected_since: Option<Instant>,
@@ -141,6 +150,7 @@ impl Default for PeerStateData {
             last_recv_at: None,
             last_ping_sent_at: None,
             last_offer_sent_at: None,
+            last_liveness_probe_at: None,
             last_ping_t: None,
             rtt_ms: None,
             ice_disconnected_since: None,

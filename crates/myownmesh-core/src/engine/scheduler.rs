@@ -34,6 +34,16 @@ pub const WAKE_COALESCE_MS: u64 = 2_000;
 /// Tier 2 wake-probe wait after pinging every peer.
 pub const WAKE_PROBE_DELAY_MS: u64 = 1_500;
 
+/// Minimum gap between announce-driven liveness probes for the same peer.
+/// When a peer we hold as Active/Shelved re-announces but its inbound has
+/// gone silent past `STALE_INBOUND_MS`, we ping it and rebuild if no traffic
+/// confirms within `WAKE_PROBE_DELAY_MS` (see
+/// `confirm_active_session_on_announce`). This floor single-flights that
+/// probe so a REQ-replay burst of announces can't stack probe tasks on one
+/// peer; sized comfortably above the probe's own grace so a new probe never
+/// starts while the previous one's confirm window is still open.
+pub const LIVENESS_PROBE_MIN_INTERVAL_MS: u64 = 5_000;
+
 /// Tier 2.5 ICE watchdog — beats Trystero's ~5 s consent freshness
 /// timeout by firing at 1 s after `ice_disconnected`.
 pub const ICE_DISCONNECTED_RESTART_MS: u64 = 1_000;
