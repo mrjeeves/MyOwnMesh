@@ -120,13 +120,23 @@ check:
     @cargo clippy --workspace --all-targets -- -D warnings
     @cargo test --workspace --no-fail-fast
 
-# Cut a release: bump every crate's version, commit, push, trigger
-# the workflow. Mirrors MyOwnLLM's flow — the user runs
-# `just release 0.2.0` and the release.yml workflow runs to verify
-# manifests, build per-platform bundles, and publish the GitHub
-# release. Bash script — release flow runs from a Linux/macOS box.
+# Cut a release: bump every crate's version, commit, push, then push
+# the `v{{VERSION}}` tag to trigger the workflow. Mirrors MyOwnLLM's
+# flow — the user runs `just release 0.2.0` and the release.yml workflow
+# verifies manifests, builds per-platform bundles, and publishes the
+# GitHub release. Bash script — release flow runs from a Linux/macOS box.
+#
+# We trigger by pushing the tag (not `gh workflow run`) so the build is
+# deterministic. The tag is an immutable ref pinned to the bump commit, so
+# the workflow's `actions/checkout` lands exactly on the version we just
+# committed. The old `gh workflow run release.yml` used workflow_dispatch,
+# which resolves `main` at dispatch time and raced the preceding `git push`:
+# GitHub could still see the pre-bump HEAD, check that out, build the old
+# version, and fail the "Verify tag matches manifest versions" gate (this
+# bit AllMyStuff's v0.1.21 release). release.yml keeps its workflow_dispatch
+# trigger as a manual escape hatch for re-running an existing tag.
 [unix]
-[doc("Cut a release: bump versions, commit, push, trigger the workflow.")]
+[doc("Cut a release: bump versions, commit, push, tag to trigger the workflow.")]
 release VERSION:
     @./scripts/bump-version.sh {{VERSION}}
     @if ! git diff --quiet Cargo.toml Cargo.lock gui/src-tauri/Cargo.toml gui/src-tauri/Cargo.lock gui/package.json; then \
@@ -134,4 +144,9 @@ release VERSION:
         git commit -m "chore(release): {{VERSION}}"; \
     fi
     @git push
-    @gh workflow run release.yml -f tag=v{{VERSION}}
+    @git tag v{{VERSION}}
+    @git push origin v{{VERSION}}
+    @echo ""
+    @echo "✓ pushed tag v{{VERSION}} — the release workflow is building."
+    @echo "  watch it:   gh run watch"
+    @echo "  list runs:  gh run list --workflow=release.yml"
