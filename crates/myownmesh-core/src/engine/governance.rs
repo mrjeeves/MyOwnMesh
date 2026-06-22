@@ -36,6 +36,7 @@ use std::sync::Arc;
 use rand::Rng;
 
 use crate::error::{Error, Result};
+use crate::events::DropReason;
 use crate::network_state::{self, NetworkKind, Proposal, Role, Transition, TransitionVariant};
 use crate::protocol::{
     AckDecision, MeshMessage, NetworkStateAckMessage, NetworkStateBroadcast,
@@ -44,7 +45,7 @@ use crate::protocol::{
 };
 
 use super::connection::PeerStatus;
-use super::state::NetworkState as EngineState;
+use super::state::{NetworkCmd, NetworkState as EngineState};
 
 // ---- helpers --------------------------------------------------------
 
@@ -117,7 +118,16 @@ pub fn snapshot(state: &Arc<EngineState>) -> network_state::NetworkState {
 
 /// Float a new signed transition from this device. Signs with the
 /// local identity, persists to pending, broadcasts to peers.
-pub async fn propose(state: &Arc<EngineState>, variant: TransitionVariant) -> Result<String> {
+pub async fn propose(
+    state: &Arc<EngineState>,
+    variant: TransitionVariant,
+    mfa_code: Option<&str>,
+) -> Result<String> {
+    // Custody lock: authoring a governance transition is a custody-affecting
+    // act. If this device enrolled a second factor for this network, a fresh
+    // code is required here; otherwise this is a no-op. Composes with — does
+    // not replace — the cryptographic owner-quorum checked at ratification.
+    crate::custody::require(&state.network_id, mfa_code)?;
     let self_pubkey = state.identity.public_id().to_string();
     let signature =
         network_state::sign_transition(&state.network_id, &variant, state.identity.signing_key());
@@ -166,7 +176,11 @@ pub async fn propose(state: &Arc<EngineState>, variant: TransitionVariant) -> Re
 /// re-sign — a no-op if the local pubkey is already in the signer
 /// list). Broadcasts the signed ack. If the signature satisfies the
 /// quorum, ratifies the transition in the same step.
-pub async fn sign_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
+pub async fn sign_proposal(
+    state: &Arc<EngineState>,
+    proposal_id: &str,
+    mfa_code: Option<&str>,
+) -> Result<()> {
     let self_pubkey = state.identity.public_id().to_string();
     let (variant, signature) = {
         let mut gov = state.governance_state.write();
@@ -181,6 +195,10 @@ pub async fn sign_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Resul
         if gov.pending[idx].signers.iter().any(|s| s == &self_pubkey) {
             return Err(Error::Other("already signed".into()));
         }
+        // Custody lock: co-signing is authoring. Gate here — after the
+        // proposal is known valid and unsigned by us — so a one-time recovery
+        // code is never spent on a sign that wouldn't have happened anyway.
+        crate::custody::require(&state.network_id, mfa_code)?;
         let variant = gov.pending[idx].variant.clone();
         let signature = network_state::sign_transition(
             &state.network_id,
@@ -698,11 +716,37 @@ pub async fn on_roster_request(
 /// persist if the roster changed, and — if it did — re-summarise to our
 /// peers so the new member propagates onward (gossip convergence).
 pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
-    let kind = state.governance_state.read().kind;
+    // Who is allowed to *introduce* a new member via gossip?
+    //
+    //   * `open` network — anyone the gossip reached. Membership is
+    //     permissionless by design: "a member is anyone any current member
+    //     has vouched for" (see the module note above).
+    //   * `closed` network — only a Controller/Owner. The Role model is
+    //     explicit: a Controller "can add member peers to the roster"; a
+    //     Member has "no roster-edit authority". Without this gate any
+    //     authenticated peer — a freshly-approved Member, or an attacker who
+    //     cleared a single approval — could gossip arbitrary device ids into
+    //     the roster, and a rostered peer is auto-approved on every future
+    //     connection (`auto = cfg.auto_approve || rostered`). That is the
+    //     MOM-01 escalation: connection ≠ authority to expand membership.
+    //
+    // The sender (`peer_id`) is the cryptographically-authenticated peer the
+    // frame arrived from, so its role is a trustworthy authority signal.
+    // `can_grant(Role::Member)` is precisely "may admit members" (false for
+    // Member, true for Controller/Owner).
+    let (kind, sender_may_admit) = {
+        let gov = state.governance_state.read();
+        let may = gov.kind == NetworkKind::Open
+            || gov
+                .role_of(crate::signing::pubkey_part(peer_id))
+                .can_grant(Role::Member);
+        (gov.kind, may)
+    };
     let self_pk = state.identity.public_id().to_string();
-    let added = {
+    let (added, refused) = {
         let mut roster = state.roster.write();
         let mut added = 0usize;
+        let mut refused = 0usize;
         for entry in &msg.entries {
             let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
             // Our own entry is locally authoritative; never let a peer's
@@ -714,6 +758,14 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
             // label / timestamp from a peer can't clobber ours and a
             // local removal can't be undone by a no-op rewrite.
             if crate::roster::is_authorized(&roster, &pubkey) {
+                continue;
+            }
+            // MOM-01 guard: on a closed network, refuse member introductions
+            // from a sender that lacks roster-edit authority. (Existing
+            // members are skipped above, so this only blocks *new* additions —
+            // legitimate members already in the roster are unaffected.)
+            if !sender_may_admit {
+                refused += 1;
                 continue;
             }
             crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
@@ -737,8 +789,21 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
                 );
             }
         }
-        added
+        (added, refused)
     };
+    if refused > 0 {
+        // Security-relevant: surface attempts to expand a closed network's
+        // membership from an unauthorized peer so they're visible in diags.
+        diag(
+            state,
+            crate::events::DiagLevel::Warn,
+            format!(
+                "roster: refused {refused} unauthorized member add(s) gossiped by {} \
+                 (closed network; sender holds no roster-edit authority)",
+                &peer_id[..peer_id.len().min(12)]
+            ),
+        );
+    }
     if added > 0 {
         diag(
             state,
@@ -865,6 +930,30 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             }
             crate::roster::set_role_in(&mut roster, &self_pk, Role::Owner);
             crate::roster::save(&roster)?;
+        }
+        if let TransitionVariant::Evict { target } = &transition.variant {
+            // The evict's whole purpose: drop the target from the roster
+            // projection so it loses authorisation here. Because every
+            // peer that ratifies this transition runs the same mirror,
+            // the removal propagates across the closed network (unlike a
+            // bare roster remove, which is local + additive-gossip only).
+            let removed = {
+                let mut roster = state.roster.write();
+                let was = crate::roster::is_authorized(&roster, target);
+                if was {
+                    crate::roster::remove_peer_in(&mut roster, target);
+                    crate::roster::save(&roster)?;
+                }
+                was
+            };
+            if removed {
+                // Tear down any live session to the evicted device so it
+                // can't keep riding an already-open data channel.
+                let _ = state.cmd_tx.send(NetworkCmd::DropPeer {
+                    device_id: target.clone(),
+                    reason: DropReason::Denied,
+                });
+            }
         }
 
         diag(

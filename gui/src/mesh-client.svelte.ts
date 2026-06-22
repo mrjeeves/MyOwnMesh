@@ -274,10 +274,12 @@ function createMeshClient() {
   async function governanceProposeKindChange(
     network: string,
     to: "open" | "closed",
+    mfaCode?: string,
   ): Promise<string> {
     const resp = (await invoke("mesh_governance_propose_kind_change", {
       network,
       to,
+      mfaCode,
     })) as { proposal_id: string };
     await refreshGovernance(network);
     return resp.proposal_id;
@@ -287,11 +289,13 @@ function createMeshClient() {
     network: string,
     target: string,
     role: "member" | "controller" | "owner",
+    mfaCode?: string,
   ): Promise<string> {
     const resp = (await invoke("mesh_governance_propose_role_grant", {
       network,
       target,
       role,
+      mfaCode,
     })) as { proposal_id: string };
     await refreshGovernance(network);
     return resp.proposal_id;
@@ -300,19 +304,50 @@ function createMeshClient() {
   async function governanceProposeRoleRevoke(
     network: string,
     target: string,
+    mfaCode?: string,
   ): Promise<string> {
     const resp = (await invoke("mesh_governance_propose_role_revoke", {
       network,
       target,
+      mfaCode,
     })) as { proposal_id: string };
     await refreshGovernance(network);
     return resp.proposal_id;
   }
 
-  async function governanceSign(network: string, proposalId: string) {
-    await invoke("mesh_governance_sign", { network, proposalId });
+  async function governanceSign(
+    network: string,
+    proposalId: string,
+    mfaCode?: string,
+  ) {
+    await invoke("mesh_governance_sign", { network, proposalId, mfaCode });
     await refreshGovernance(network);
     await refreshRoster(network);
+  }
+
+  // ---- per-device custody MFA (TOTP) ----------------------------------
+
+  async function governanceMfaEnroll(network: string): Promise<{
+    secret: string;
+    otpauth_uri: string;
+    recovery_codes: string[];
+  }> {
+    return (await invoke("mesh_governance_mfa_enroll", { network })) as {
+      secret: string;
+      otpauth_uri: string;
+      recovery_codes: string[];
+    };
+  }
+
+  async function governanceMfaStatus(network: string): Promise<boolean> {
+    const resp = (await invoke("mesh_governance_mfa_status", {
+      network,
+    })) as { enrolled: boolean };
+    return resp.enrolled;
+  }
+
+  async function governanceMfaDisable(network: string, code: string) {
+    await invoke("mesh_governance_mfa_disable", { network, code });
   }
 
   async function governanceDeny(network: string, proposalId: string) {
@@ -682,6 +717,9 @@ function createMeshClient() {
     governanceDeny,
     governanceWithdraw,
     governanceSpawnSplit,
+    governanceMfaEnroll,
+    governanceMfaStatus,
+    governanceMfaDisable,
   };
 }
 

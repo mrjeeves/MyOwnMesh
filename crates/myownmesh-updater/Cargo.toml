@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Detached Ed25519 (minisign) verification of release artifacts. Pure-Rust,
+# verify-only — no signing in the client. Activated when a release public key
+# is baked in at build time (see `RELEASE_PUBKEY`).
+minisign-verify = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

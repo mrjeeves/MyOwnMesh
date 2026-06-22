@@ -120,6 +120,7 @@ async fn two_peers_ratify_open_to_closed_transition() {
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
         },
+        None,
     )
     .await
     .expect("propose");
@@ -138,7 +139,7 @@ async fn two_peers_ratify_open_to_closed_transition() {
 
     // Bob signs → unanimous-of-members quorum is satisfied →
     // the engine ratifies + applies + broadcasts the new state.
-    myownmesh_core::engine::governance::sign_proposal(&bob_state, &proposal_id)
+    myownmesh_core::engine::governance::sign_proposal(&bob_state, &proposal_id, None)
         .await
         .expect("bob sign");
 
@@ -257,6 +258,7 @@ async fn deny_invalidates_proposal_on_both_sides() {
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
         },
+        None,
     )
     .await
     .expect("propose");

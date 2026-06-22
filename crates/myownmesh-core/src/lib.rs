@@ -89,6 +89,7 @@
 
 pub mod channels;
 pub mod config;
+pub mod custody;
 pub mod dirs;
 pub mod engine;
 pub mod error;

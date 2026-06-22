@@ -1303,6 +1303,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1351,6 +1357,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
  "myownmesh-signaling",
  "parking_lot",
  "pin-project-lite",
@@ -1358,6 +1365,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
@@ -1411,6 +1419,7 @@ name = "myownmesh-updater"
 version = "0.2.9"
 dependencies = [
  "hex",
+ "minisign-verify",
  "myownmesh-core",
  "reqwest",
  "serde",

@@ -45,6 +45,70 @@ pub enum CtlCmd {
     /// STUN / TURN.
     #[command(subcommand)]
     Services(ServicesCmd),
+    /// Closed-network governance: state, proposals, signing, and the
+    /// per-device custody MFA that guards owner/kind changes.
+    #[command(subcommand)]
+    Governance(GovernanceCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GovernanceCmd {
+    /// Show governance state (kind, roles, transition log, pending).
+    State { network: String },
+    /// Propose a kind change. `to` is `open` or `closed`.
+    ProposeKind {
+        network: String,
+        to: String,
+        /// Custody second factor, if this device enrolled one (`mfa enroll`).
+        #[arg(long)]
+        mfa_code: Option<String>,
+    },
+    /// Propose granting `target` a role: `member` | `controller` | `owner`.
+    GrantRole {
+        network: String,
+        target: String,
+        role: String,
+        #[arg(long)]
+        mfa_code: Option<String>,
+    },
+    /// Propose revoking `target`'s role (back to member).
+    RevokeRole {
+        network: String,
+        target: String,
+        #[arg(long)]
+        mfa_code: Option<String>,
+    },
+    /// Sign a pending proposal.
+    Sign {
+        network: String,
+        proposal_id: String,
+        #[arg(long)]
+        mfa_code: Option<String>,
+    },
+    /// Deny a pending proposal (single-shot kill switch).
+    Deny {
+        network: String,
+        proposal_id: String,
+    },
+    /// Withdraw a proposal this device floated.
+    Withdraw {
+        network: String,
+        proposal_id: String,
+    },
+    /// Per-device custody MFA (TOTP) that gates governance authoring.
+    #[command(subcommand)]
+    Mfa(MfaCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MfaCmd {
+    /// Enroll a TOTP authenticator for a network on this device. Prints the
+    /// secret, an `otpauth://` URI (for a QR), and one-time recovery codes.
+    Enroll { network: String },
+    /// Report whether this device holds a custody lock for a network.
+    Status { network: String },
+    /// Remove the custody lock (requires a valid current code).
+    Disable { network: String, code: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,9 +217,92 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         CtlCmd::Roster(RosterCmd::Remove { network, device_id }) => {
             Request::RosterRemove { network, device_id }
         }
+        CtlCmd::Governance(GovernanceCmd::State { network }) => {
+            Request::GovernanceState { network }
+        }
+        CtlCmd::Governance(GovernanceCmd::ProposeKind {
+            network,
+            to,
+            mfa_code,
+        }) => Request::GovernanceProposeKindChange {
+            network,
+            to: parse_kind(&to)?,
+            mfa_code,
+        },
+        CtlCmd::Governance(GovernanceCmd::GrantRole {
+            network,
+            target,
+            role,
+            mfa_code,
+        }) => Request::GovernanceProposeRoleGrant {
+            network,
+            target,
+            role: parse_role(&role)?,
+            mfa_code,
+        },
+        CtlCmd::Governance(GovernanceCmd::RevokeRole {
+            network,
+            target,
+            mfa_code,
+        }) => Request::GovernanceProposeRoleRevoke {
+            network,
+            target,
+            mfa_code,
+        },
+        CtlCmd::Governance(GovernanceCmd::Sign {
+            network,
+            proposal_id,
+            mfa_code,
+        }) => Request::GovernanceSign {
+            network,
+            proposal_id,
+            mfa_code,
+        },
+        CtlCmd::Governance(GovernanceCmd::Deny {
+            network,
+            proposal_id,
+        }) => Request::GovernanceDeny {
+            network,
+            proposal_id,
+        },
+        CtlCmd::Governance(GovernanceCmd::Withdraw {
+            network,
+            proposal_id,
+        }) => Request::GovernanceWithdraw {
+            network,
+            proposal_id,
+        },
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Enroll { network })) => {
+            Request::GovernanceMfaEnroll { network }
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Status { network })) => {
+            Request::GovernanceMfaStatus { network }
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Disable { network, code })) => {
+            Request::GovernanceMfaDisable { network, code }
+        }
     };
     let response = roundtrip(&request).await?;
     print_response(response)
+}
+
+/// Parse a CLI network-kind argument.
+fn parse_kind(s: &str) -> Result<myownmesh_core::NetworkKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "open" => Ok(myownmesh_core::NetworkKind::Open),
+        "closed" => Ok(myownmesh_core::NetworkKind::Closed),
+        other => bail!("invalid kind '{other}' — expected open | closed"),
+    }
+}
+
+/// Parse a CLI role argument.
+fn parse_role(s: &str) -> Result<myownmesh_core::Role> {
+    match s.to_ascii_lowercase().as_str() {
+        "member" => Ok(myownmesh_core::Role::Member),
+        "controller" => Ok(myownmesh_core::Role::Controller),
+        "owner" => Ok(myownmesh_core::Role::Owner),
+        other => bail!("invalid role '{other}' — expected member | controller | owner"),
+    }
 }
 
 /// Pretty-print a daemon response's data payload, or bail on error.

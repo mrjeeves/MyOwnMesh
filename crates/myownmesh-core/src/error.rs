@@ -52,6 +52,12 @@ pub enum Error {
     #[error("network: {0}")]
     Network(String),
 
+    /// Per-device custody MFA: enrollment, verification, or a gate
+    /// refusal (a custody-affecting governance change attempted without
+    /// a valid second factor). See [`crate::custody`].
+    #[error("custody: {0}")]
+    Custody(String),
+
     /// The peer signature didn't verify under its claimed Device ID.
     /// Treated as a hard auth failure — the connection is torn down
     /// and the peer goes back to PendingApproval the next time it

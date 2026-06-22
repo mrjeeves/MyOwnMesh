@@ -326,11 +326,16 @@ impl JoinedNetwork {
     pub async fn propose_transition(
         &self,
         variant: crate::network_state::TransitionVariant,
+        mfa_code: Option<String>,
     ) -> Result<String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.state
             .cmd_tx
-            .send(NetworkCmd::ProposeTransition { variant, reply })
+            .send(NetworkCmd::ProposeTransition {
+                variant,
+                mfa_code,
+                reply,
+            })
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         rx.await
             .map_err(|_| Error::Network("engine dropped propose reply".into()))?
@@ -339,12 +344,13 @@ impl JoinedNetwork {
     /// Sign a pending proposal floated by another peer (or by this
     /// device). The engine broadcasts the signed ack and attempts
     /// ratification atomically.
-    pub async fn sign_proposal(&self, proposal_id: &str) -> Result<()> {
+    pub async fn sign_proposal(&self, proposal_id: &str, mfa_code: Option<String>) -> Result<()> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.state
             .cmd_tx
             .send(NetworkCmd::SignProposal {
                 proposal_id: proposal_id.to_string(),
+                mfa_code,
                 reply,
             })
             .map_err(|_| Error::Network("engine command queue closed".into()))?;

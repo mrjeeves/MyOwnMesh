@@ -106,20 +106,30 @@ pub enum Request {
         /// serialises snake_case so we keep this stringly-typed on
         /// the GUI side rather than re-deriving the enum here.
         to: String,
+        /// Per-device custody second factor, when this device enrolled one
+        /// for the network (the `GovernanceMfa*` ops). Omitted otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
     },
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
         /// `"member"` | `"controller"` | `"owner"`.
         role: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
     },
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
     },
     GovernanceSign {
         network: String,
         proposal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
     },
     GovernanceDeny {
         network: String,
@@ -132,6 +142,20 @@ pub enum Request {
     GovernanceSpawnSplit {
         network: String,
         proposal_id: String,
+    },
+    /// Enroll a per-device TOTP custody lock for `network`. Returns the
+    /// secret (base32 + `otpauth://` URI) and one-time recovery codes.
+    GovernanceMfaEnroll {
+        network: String,
+    },
+    /// Whether this device holds a custody enrollment for `network`.
+    GovernanceMfaStatus {
+        network: String,
+    },
+    /// Remove the custody lock for `network` (requires a valid code).
+    GovernanceMfaDisable {
+        network: String,
+        code: String,
     },
 
     // ---- self-update ----------------------------------------------
