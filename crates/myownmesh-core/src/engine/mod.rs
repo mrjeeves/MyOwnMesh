@@ -1756,7 +1756,32 @@ async fn handle_pc_state_change(
     }
 }
 
+/// The largest inbound frame we'll even attempt to decode (MOM-04). A peer
+/// can't drive memory growth by sending a giant JSON frame: anything past this
+/// is dropped *before* `serde_json` allocates the (potentially far larger)
+/// parsed value — the opaque user-channel payloads are `serde_json::Value`,
+/// which a crafted frame can amplify well beyond its wire size. Generous — far
+/// above any real handshake / roster / governance / RPC / user-channel frame —
+/// so it only ever bites a pathological one. (Per-peer byte-rate budgets are a
+/// deeper follow-up; this is the hard per-frame ceiling.)
+const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether an inbound frame is small enough to decode. Split out so the
+/// [`MAX_INBOUND_FRAME_BYTES`] boundary is unit-tested.
+fn frame_within_cap(len: usize) -> bool {
+    len <= MAX_INBOUND_FRAME_BYTES
+}
+
 async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes: Bytes) {
+    // Reject an oversize frame before the deserializer allocates for it.
+    if !frame_within_cap(bytes.len()) {
+        warn!(
+            peer = %device_id,
+            len = bytes.len(),
+            "dropping oversize inbound frame (> {MAX_INBOUND_FRAME_BYTES} bytes)"
+        );
+        return;
+    }
     let msg: MeshMessage = match serde_json::from_slice(&bytes) {
         Ok(m) => m,
         Err(e) => {
@@ -2494,6 +2519,32 @@ mod tests {
                 scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS + 5_000,
             ))
             .expect("test host monotonic clock has enough headroom")
+    }
+
+    #[test]
+    fn frame_cap_rejects_oversize_inbound_frames() {
+        assert!(frame_within_cap(0));
+        assert!(frame_within_cap(MAX_INBOUND_FRAME_BYTES));
+        assert!(!frame_within_cap(MAX_INBOUND_FRAME_BYTES + 1));
+        // The ceiling is generous (far above any real control frame) but
+        // bounded — a regression that zeroed or ballooned it would trip here.
+        assert!((1 << 20..=1 << 26).contains(&MAX_INBOUND_FRAME_BYTES));
+    }
+
+    #[tokio::test]
+    async fn handle_inbound_frame_drops_an_oversize_frame() {
+        // MOM-04: a giant frame short-circuits before the deserializer — no
+        // parse attempt, no panic, and the peer's frame counter doesn't move.
+        let state = build_test_state("oversize-frame");
+        insert_session_less_peer(&state, "flooder", None);
+        let huge = Bytes::from(vec![b' '; MAX_INBOUND_FRAME_BYTES + 1]);
+        handle_inbound_frame(&state, "flooder", huge).await;
+        let peer = state.peers.get("flooder").expect("peer present");
+        assert_eq!(
+            peer.state.read().diag.frames_in,
+            0,
+            "an oversize frame must be dropped before it counts as received"
+        );
     }
 
     #[tokio::test]
