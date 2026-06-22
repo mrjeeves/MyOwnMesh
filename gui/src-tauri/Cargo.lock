@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-gui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
