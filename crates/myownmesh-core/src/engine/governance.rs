@@ -36,6 +36,7 @@ use std::sync::Arc;
 use rand::Rng;
 
 use crate::error::{Error, Result};
+use crate::events::DropReason;
 use crate::network_state::{self, NetworkKind, Proposal, Role, Transition, TransitionVariant};
 use crate::protocol::{
     AckDecision, MeshMessage, NetworkStateAckMessage, NetworkStateBroadcast,
@@ -44,7 +45,7 @@ use crate::protocol::{
 };
 
 use super::connection::PeerStatus;
-use super::state::NetworkState as EngineState;
+use super::state::{NetworkCmd, NetworkState as EngineState};
 
 // ---- helpers --------------------------------------------------------
 
@@ -929,6 +930,30 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             }
             crate::roster::set_role_in(&mut roster, &self_pk, Role::Owner);
             crate::roster::save(&roster)?;
+        }
+        if let TransitionVariant::Evict { target } = &transition.variant {
+            // The evict's whole purpose: drop the target from the roster
+            // projection so it loses authorisation here. Because every
+            // peer that ratifies this transition runs the same mirror,
+            // the removal propagates across the closed network (unlike a
+            // bare roster remove, which is local + additive-gossip only).
+            let removed = {
+                let mut roster = state.roster.write();
+                let was = crate::roster::is_authorized(&roster, target);
+                if was {
+                    crate::roster::remove_peer_in(&mut roster, target);
+                    crate::roster::save(&roster)?;
+                }
+                was
+            };
+            if removed {
+                // Tear down any live session to the evicted device so it
+                // can't keep riding an already-open data channel.
+                let _ = state.cmd_tx.send(NetworkCmd::DropPeer {
+                    device_id: target.clone(),
+                    reason: DropReason::Denied,
+                });
+            }
         }
 
         diag(

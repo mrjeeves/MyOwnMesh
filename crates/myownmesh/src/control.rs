@@ -184,6 +184,14 @@ pub enum Request {
         #[serde(default)]
         mfa_code: Option<String>,
     },
+    /// Float an evict proposal — remove a peer from the closed network's
+    /// roster entirely (the propagating lost/stolen-device kick).
+    GovernanceProposeEvict {
+        network: String,
+        target: String,
+        #[serde(default)]
+        mfa_code: Option<String>,
+    },
     /// Sign a pending proposal.
     GovernanceSign {
         network: String,
@@ -832,6 +840,23 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Some(net) => match net
                 .propose_transition(
                     myownmesh_core::TransitionVariant::RoleRevoke { target },
+                    mfa_code,
+                )
+                .await
+            {
+                Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                Err(e) => Response::err(e.to_string()),
+            },
+            None => Response::err(format!("unknown network: {network}")),
+        },
+        Request::GovernanceProposeEvict {
+            network,
+            target,
+            mfa_code,
+        } => match state.registry.get(&network) {
+            Some(net) => match net
+                .propose_transition(
+                    myownmesh_core::TransitionVariant::Evict { target },
                     mfa_code,
                 )
                 .await

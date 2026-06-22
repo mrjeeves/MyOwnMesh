@@ -126,6 +126,14 @@ pub enum TransitionVariant {
     /// Drop a peer's role tag back to `Member` (or remove from the
     /// closed-network's controlling set).
     RoleRevoke { target: String },
+    /// Evict a peer from the closed network entirely: drop its role
+    /// *and* remove it from the roster, so every member that ratifies
+    /// this transition stops authorising it. Where [`Self::RoleRevoke`]
+    /// only demotes (the peer stays a `Member`), an evict is the
+    /// propagating removal — the lost/stolen-device kick. Authority
+    /// mirrors revoke: over a member needs a controller/owner, over a
+    /// controller needs an owner, over an owner needs unanimous owners.
+    Evict { target: String },
     /// Spawn a new closed network derived from this one. Carried in
     /// the log of the *parent* network so members can discover the
     /// new network's existence via gossip.
@@ -170,6 +178,9 @@ pub fn transition_payload(network_id: &str, variant: &TransitionVariant) -> Vec<
         ),
         TransitionVariant::RoleRevoke { target } => {
             format!("role_revoke|target={target}")
+        }
+        TransitionVariant::Evict { target } => {
+            format!("evict|target={target}")
         }
         TransitionVariant::Split {
             new_network_id,
@@ -537,6 +548,44 @@ pub fn verify_quorum(
             // Cosmetic on open kind; any signer accepted.
         }
 
+        (TransitionVariant::Evict { target }, NetworkKind::Closed) => {
+            // Eviction authority is authority over the *target's* current
+            // role — identical to revoke, since an evict subsumes a revoke
+            // (it also strips roster membership).
+            let target_role = state_before.role_of(target);
+            match target_role {
+                Role::Owner => {
+                    for o in &owners {
+                        if !signers.contains(o) {
+                            return Err(Error::Protocol(format!(
+                                "evict owner needs unanimous owner consent; missing {}",
+                                &o[..o.len().min(12)]
+                            )));
+                        }
+                    }
+                }
+                Role::Controller => {
+                    if !signers.iter().any(|s| owners.contains(s)) {
+                        return Err(Error::Protocol(
+                            "evict controller needs ≥ 1 owner signature".into(),
+                        ));
+                    }
+                }
+                Role::Member => {
+                    if !signers.iter().any(|s| controllers_and_owners.contains(s)) {
+                        return Err(Error::Protocol(
+                            "evict member needs ≥ 1 controller or owner signature".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        (TransitionVariant::Evict { .. }, NetworkKind::Open) => {
+            // An open network's roster is permissionless (gossip re-adds
+            // anyone), so an evict can't stick — accept the signer set but
+            // it has no lasting effect. Closed is the meaningful case.
+        }
+
         (TransitionVariant::Split { .. }, _) => {
             if signers.len() != 1 {
                 return Err(Error::Protocol(
@@ -577,6 +626,12 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
             state.roles.insert(target.clone(), *role);
         }
         TransitionVariant::RoleRevoke { target } => {
+            state.roles.remove(target);
+        }
+        TransitionVariant::Evict { target } => {
+            // Strip any role here; the roster projection (where the
+            // device's authorisation actually lives) is removed by the
+            // engine when it mirrors this ratified transition.
             state.roles.remove(target);
         }
         TransitionVariant::Split {
@@ -970,6 +1025,58 @@ mod tests {
         let after = apply_transition(s, &t);
         assert_eq!(after.kind, NetworkKind::Closed);
         assert_eq!(after.role_of(&pk), Role::Owner);
+        assert_eq!(after.transitions.len(), 1);
+    }
+
+    #[test]
+    fn quorum_evict_member_needs_controller_or_owner() {
+        let (_, owner) = fixture_key(1);
+        let (_, member) = fixture_key(2);
+        let (_, target) = fixture_key(3);
+        let mut state = NetworkState::empty_for("net-1");
+        state.kind = NetworkKind::Closed;
+        state.roles.insert(owner.clone(), Role::Owner);
+        // `target` is a plain member (absent from roles → defaults Member).
+        let members = vec![owner.clone(), member.clone(), target.clone()];
+
+        // A member-only signer can't evict.
+        let t_bad = Transition {
+            at: 0,
+            variant: TransitionVariant::Evict {
+                target: target.clone(),
+            },
+            signers: vec![member],
+            signatures: vec![String::new()],
+        };
+        assert!(verify_quorum(&state, &t_bad, &members).is_err());
+
+        // The owner can — single-signer, the fleet's lost-device kick.
+        let t_ok = Transition {
+            at: 0,
+            variant: TransitionVariant::Evict { target },
+            signers: vec![owner],
+            signatures: vec![String::new()],
+        };
+        verify_quorum(&state, &t_ok, &members).unwrap();
+    }
+
+    #[test]
+    fn apply_evict_strips_role_and_logs() {
+        let mut s = NetworkState::empty_for("net-1");
+        s.kind = NetworkKind::Closed;
+        s.roles.insert("alice".into(), Role::Controller);
+        let t = Transition {
+            at: 0,
+            variant: TransitionVariant::Evict {
+                target: "alice".into(),
+            },
+            signers: vec!["owner".into()],
+            signatures: vec![String::new()],
+        };
+        let after = apply_transition(s, &t);
+        // Role gone (roster removal is the engine's job, tested there).
+        assert_eq!(after.role_of("alice"), Role::Member);
+        assert!(!after.roles.contains_key("alice"));
         assert_eq!(after.transitions.len(), 1);
     }
 
