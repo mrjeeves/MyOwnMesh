@@ -648,7 +648,16 @@ pub async fn on_state_broadcast(
             ),
         );
     }
-    maybe_request_roster(state, peer_id, &msg.roster_root).await;
+    // Pull the peer's roster — which now carries the signed governance log —
+    // when *either* our membership root differs or the peer's log is ahead of
+    // ours. The log half is what converges roles (who the owner is) fleet-wide:
+    // a role grant (or the founder election) bumps `transitions_count` without
+    // necessarily changing membership, so a membership-only check would miss it.
+    let membership_differs =
+        crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
+    if membership_differs || msg.transitions_count > local_count {
+        request_roster(state, peer_id).await;
+    }
 }
 
 // ---- roster gossip --------------------------------------------------
@@ -706,7 +715,15 @@ pub async fn on_roster_request(
         .iter()
         .map(RosterEntry::from)
         .collect();
-    let msg = MeshMessage::RosterEntries(RosterEntriesMessage { entries });
+    // Carry the signed governance log with the roster so roles converge with
+    // membership: the requester verifies it from genesis and re-derives who is
+    // owner/controller, instead of trusting a gossiped role tag. Empty on an
+    // open network (no signed log).
+    let transitions = state.governance_state.read().transitions.clone();
+    let msg = MeshMessage::RosterEntries(RosterEntriesMessage {
+        entries,
+        transitions,
+    });
     if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
         tracing::debug!(peer = %peer_id, err = %e, "roster entries reply send failed");
     }
@@ -815,6 +832,142 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
         );
         broadcast_roster_summary(state).await;
     }
+    // Roles ride the roster: the reply carries the signed governance log, so a
+    // closed network converges *who holds which role* (the owner most of all)
+    // the same way it converges membership — by verifying the peer's log and
+    // re-deriving roles, not by trusting the gossiped `role` tag (which a closed
+    // network deliberately ignores above).
+    adopt_transition_log(state, peer_id, &msg.transitions).await;
+}
+
+/// Adopt a peer's signed governance log when it **extends** our own. The log
+/// is verified from genesis ([`crate::network_state::verify_log`]) — every
+/// transition's signatures and quorum re-checked against state reconstructed
+/// from the log itself — so an invalid or forged log is rejected whole and our
+/// state is left untouched. We adopt only when the incoming log shares our
+/// prefix and is strictly longer, which means a peer can extend governance
+/// (a role grant we hadn't seen, the founder election we're learning for the
+/// first time) but can never rewrite our genesis — and the owner it elected —
+/// out from under us. On adoption we replace the ratified state (keeping our
+/// in-flight pending proposals), mirror the converged roles into the roster's
+/// `role` projection, and re-gossip so the news ripples on.
+async fn adopt_transition_log(state: &Arc<EngineState>, peer_id: &str, incoming: &[Transition]) {
+    if incoming.is_empty() {
+        return;
+    }
+    // Fork/length guard under a read lock: only ever extend our own log.
+    {
+        let gov = state.governance_state.read();
+        if incoming.len() <= gov.transitions.len() {
+            return; // nothing newer
+        }
+        for (i, ours) in gov.transitions.iter().enumerate() {
+            // Compare the *content* (variant + signer set) — the same ratified
+            // transition, not a different one that happens to sit at this index.
+            if incoming[i].variant != ours.variant || incoming[i].signers != ours.signers {
+                diag(
+                    state,
+                    crate::events::DiagLevel::Warn,
+                    format!(
+                        "rejecting forked governance log from {} (diverges at transition {i})",
+                        &peer_id[..peer_id.len().min(12)]
+                    ),
+                );
+                return;
+            }
+        }
+    }
+    // Verify the whole log from genesis (pure; no locks held).
+    let rebuilt = match network_state::verify_log(&state.network_id, incoming) {
+        Ok(s) => s,
+        Err(e) => {
+            diag(
+                state,
+                crate::events::DiagLevel::Warn,
+                format!(
+                    "rejecting invalid governance log from {}: {e}",
+                    &peer_id[..peer_id.len().min(12)]
+                ),
+            );
+            return;
+        }
+    };
+    // Adopt under the write lock; re-check length in case it raced.
+    let roles = {
+        let mut gov = state.governance_state.write();
+        if rebuilt.transitions.len() <= gov.transitions.len() {
+            return;
+        }
+        gov.kind = rebuilt.kind;
+        gov.roles = rebuilt.roles.clone();
+        gov.transitions = rebuilt.transitions.clone();
+        gov.splits = rebuilt.splits.clone();
+        if let Err(e) = network_state::save(&gov) {
+            diag(
+                state,
+                crate::events::DiagLevel::Warn,
+                format!("persist after adopting governance log failed: {e}"),
+            );
+        }
+        gov.roles.clone()
+    };
+    // Mirror the converged roles into the roster's `role` projection so every
+    // peer row — and AllMyStuff's fleet view, which reads this projection —
+    // renders the right authority without re-reading the log.
+    {
+        let mut roster = state.roster.write();
+        if mirror_roles_to_roster(&roles, &mut roster) {
+            if let Err(e) = crate::roster::save(&roster) {
+                diag(
+                    state,
+                    crate::events::DiagLevel::Warn,
+                    format!("persist roster after role mirror failed: {e}"),
+                );
+            }
+        }
+    }
+    diag(
+        state,
+        crate::events::DiagLevel::Info,
+        format!(
+            "adopted converged governance log ({} transitions) from {}",
+            incoming.len(),
+            &peer_id[..peer_id.len().min(12)]
+        ),
+    );
+    // Tell our own peers — both the new membership (the owner may have been
+    // added to our roster) and the new governance count — so it ripples on.
+    broadcast_roster_summary(state).await;
+    broadcast_state(state).await;
+}
+
+/// Mirror a [`crate::network_state::NetworkState::roles`] map into the roster's
+/// per-entry `role` projection. Role-bearing pubkeys missing from the roster
+/// are added (a bare entry, so the owner shows up even before membership gossip
+/// reaches us); any entry no longer carrying a role is reset to
+/// [`Role::Member`], so a converged revoke doesn't leave a stale tag. Returns
+/// whether the roster changed (to gate the disk write).
+fn mirror_roles_to_roster(
+    roles: &std::collections::BTreeMap<String, Role>,
+    roster: &mut crate::roster::Roster,
+) -> bool {
+    let mut changed = false;
+    for (pubkey, role) in roles {
+        if !crate::roster::is_authorized(roster, pubkey) {
+            crate::roster::add_peer_in(roster, pubkey, "");
+            changed = true;
+        }
+        if crate::roster::set_role_in(roster, pubkey, *role) {
+            changed = true;
+        }
+    }
+    for entry in roster.authorized_devices.iter_mut() {
+        if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
+            entry.role = Role::Member;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// If `their_root` (a membership root) differs from ours, send a targeted
@@ -827,6 +980,14 @@ async fn maybe_request_roster(state: &Arc<EngineState>, peer_id: &str, their_roo
     if our_root == their_root {
         return;
     }
+    request_roster(state, peer_id).await;
+}
+
+/// Send a targeted full-roster request to one peer. The reply
+/// ([`on_roster_request`]) carries both the membership entries and the signed
+/// governance log, so this is the single pull that converges *both* membership
+/// and roles.
+async fn request_roster(state: &Arc<EngineState>, peer_id: &str) {
     let msg = MeshMessage::RosterRequest(RosterRequestMessage {
         include_all: true,
         subtree_hashes: Vec::new(),

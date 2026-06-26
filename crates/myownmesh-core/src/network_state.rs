@@ -650,6 +650,57 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
     state
 }
 
+/// Verify a whole signed transition log from genesis and return the state it
+/// produces. Every transition must (a) carry valid signatures
+/// ([`verify_transition_signatures`]) and (b) satisfy the quorum table
+/// ([`verify_quorum`]) against the state it applies to — both *reconstructed
+/// from the log itself*, so the authority chain is checked end-to-end with no
+/// external trust. The member set each step is quorum-checked against is the
+/// union of every pubkey seen so far as a signer or role target; for the
+/// genesis founder election that set is empty (the single-signer self-election
+/// the quorum table accepts), and it grows as the log does — exactly the set
+/// the owners had in hand when they authored each later step.
+///
+/// This is what lets a node converge governance — most importantly *who the
+/// owner is* — by pulling a peer's log and re-deriving the roles itself, rather
+/// than trusting a gossiped role tag. A log that fails any check is rejected
+/// whole (returns `Err`); the caller keeps its current state untouched.
+///
+/// Adoption policy (whether a verified log *replaces* the local one) is the
+/// caller's: the engine only adopts a log that **extends** its own (shared
+/// prefix), so a peer can never rewrite a genesis — and the owner it elected —
+/// out from under a node that already holds one.
+pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<NetworkState> {
+    use std::collections::BTreeSet;
+    let mut state = NetworkState::empty_for(network_id);
+    let mut members: BTreeSet<String> = BTreeSet::new();
+    for t in transitions {
+        verify_transition_signatures(network_id, t)?;
+        let members_vec: Vec<String> = members.iter().cloned().collect();
+        verify_quorum(&state, t, &members_vec)?;
+        // Grow the reconstructed member set from this transition's participants
+        // before applying the next, mirroring how authority accrues live.
+        for s in &t.signers {
+            members.insert(s.clone());
+        }
+        match &t.variant {
+            TransitionVariant::RoleGrant { target, .. }
+            | TransitionVariant::RoleRevoke { target }
+            | TransitionVariant::Evict { target } => {
+                members.insert(target.clone());
+            }
+            TransitionVariant::Split { members: m, .. } => {
+                for x in m {
+                    members.insert(x.clone());
+                }
+            }
+            TransitionVariant::KindChange { .. } => {}
+        }
+        state = apply_transition(state, t);
+    }
+    Ok(state)
+}
+
 // ---- on-disk persistence -------------------------------------------
 
 fn state_path(network_id: &str) -> Result<PathBuf> {
@@ -1113,5 +1164,98 @@ mod tests {
             let back: NetworkKind = serde_json::from_str(&s).unwrap();
             assert_eq!(k, back);
         }
+    }
+
+    // ---- verify_log (from-genesis replay) -----------------------------
+
+    #[test]
+    fn verify_log_replays_founder_and_grant_from_genesis() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, member) = fixture_key(2);
+        let net = "fleet-1";
+        // Genesis: founder self-elects (open → closed), single signer.
+        let v0 = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let t0 = Transition {
+            at: 1,
+            variant: v0.clone(),
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v0, &owner_sk)],
+        };
+        // Owner grants the member a controller role.
+        let v1 = TransitionVariant::RoleGrant {
+            target: member.clone(),
+            role: Role::Controller,
+        };
+        let t1 = Transition {
+            at: 2,
+            variant: v1.clone(),
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v1, &owner_sk)],
+        };
+        let state = verify_log(net, &[t0, t1]).expect("a well-formed log verifies");
+        assert_eq!(state.kind, NetworkKind::Closed);
+        // The whole fleet can re-derive *who the owner is* from the log alone.
+        assert_eq!(state.role_of(&owner), Role::Owner);
+        assert_eq!(state.role_of(&member), Role::Controller);
+        assert_eq!(state.transitions.len(), 2);
+    }
+
+    #[test]
+    fn verify_log_rejects_forged_signature() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, victim) = fixture_key(2);
+        let net = "fleet-1";
+        let v0 = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let t0 = Transition {
+            at: 1,
+            variant: v0.clone(),
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v0, &owner_sk)],
+        };
+        // A grant that *claims* the owner signed it, but the signature is junk.
+        let v1 = TransitionVariant::RoleGrant {
+            target: victim,
+            role: Role::Owner,
+        };
+        let t1 = Transition {
+            at: 2,
+            variant: v1,
+            signers: vec![owner],
+            signatures: vec!["not-a-real-signature".into()],
+        };
+        assert!(verify_log(net, &[t0, t1]).is_err());
+    }
+
+    #[test]
+    fn verify_log_rejects_unauthorized_grant_on_closed_net() {
+        // A non-owner can't self-promote on a closed network: the quorum check,
+        // reconstructed from the log, needs an owner's signature for the grant.
+        let (owner_sk, owner) = fixture_key(1);
+        let (att_sk, attacker) = fixture_key(9);
+        let net = "fleet-1";
+        let v0 = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let t0 = Transition {
+            at: 1,
+            variant: v0.clone(),
+            signers: vec![owner],
+            signatures: vec![sign_transition(net, &v0, &owner_sk)],
+        };
+        let v1 = TransitionVariant::RoleGrant {
+            target: attacker.clone(),
+            role: Role::Controller,
+        };
+        let t1 = Transition {
+            at: 2,
+            variant: v1.clone(),
+            signers: vec![attacker],
+            signatures: vec![sign_transition(net, &v1, &att_sk)],
+        };
+        assert!(verify_log(net, &[t0, t1]).is_err());
     }
 }
