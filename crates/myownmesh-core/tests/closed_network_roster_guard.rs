@@ -63,6 +63,9 @@ fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
             // this field, so its value is irrelevant to the decision.
             granted_by: String::new(),
         }],
+        // No governance log on this gossip — exercises the membership-only path
+        // (and the `#[serde(default)]` skew an older peer's reply would take).
+        transitions: Vec::new(),
     }
 }
 

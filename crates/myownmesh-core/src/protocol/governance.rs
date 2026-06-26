@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::network_state::{NetworkKind, Role, TransitionVariant};
+use crate::network_state::{NetworkKind, Role, Transition, TransitionVariant};
 use crate::roster::AuthorizedPeer;
 
 /// "This is what I think the network looks like." Emitted on every
@@ -173,6 +173,16 @@ pub struct RosterRequestMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RosterEntriesMessage {
     pub entries: Vec<RosterEntry>,
+    /// The network's signed governance log, carried alongside the roster so
+    /// **roles converge with membership** — the receiver re-derives who holds
+    /// which role (most importantly *who the owner is*) by verifying this log
+    /// from genesis ([`crate::network_state::verify_log`]), rather than trusting
+    /// a gossiped role tag. The receiver only adopts a log that extends its own,
+    /// so a peer can't rewrite a genesis. Empty on an open network (no signed
+    /// log) and, via `#[serde(default)]`, absent from an older peer's reply —
+    /// which then behaves exactly as before (membership-only gossip).
+    #[serde(default)]
+    pub transitions: Vec<Transition>,
 }
 
 /// A single rosterable peer. Mirrors [`AuthorizedPeer`] plus the
