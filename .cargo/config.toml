@@ -1,0 +1,16 @@
+# Cross-compilation for the NanoKVM SoC (Sophgo SG2002 / T-Head C906,
+# riscv64 + musl). This section is inert for normal host builds — it only
+# applies when you target riscv64gc-unknown-linux-musl (see `just build-nanokvm`
+# and docs/NANOKVM.md). It points rustc's linker and ring's C build at the same
+# musl cross-toolchain NanoKVM already uses to build its Go server
+# (`riscv64-unknown-linux-musl-gcc`), so the lone native dependency (ring's
+# riscv64 asm) links cleanly into a static musl daemon binary.
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "riscv64-unknown-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CC_riscv64gc_unknown_linux_musl = "riscv64-unknown-linux-musl-gcc"
+AR_riscv64gc_unknown_linux_musl = "riscv64-unknown-linux-musl-ar"
+CFLAGS_riscv64gc_unknown_linux_musl = "-mcpu=c906fdv -mabi=lp64d"

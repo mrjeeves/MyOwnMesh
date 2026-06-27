@@ -33,6 +33,19 @@ build:
 build-release:
     @cargo build --workspace --release
 
+# Cross-build *just the daemon* for the NanoKVM SoC (Sophgo SG2002, T-Head
+# C906, riscv64 + musl) so a KVM can run a real MyOwnMesh node. Only the
+# `myownmesh` daemon is built — not the GUI/updater — and myownmesh-core is
+# pure Rust (ring + rustls, no OpenSSL), so the lone native dep is ring's
+# riscv64 asm. Needs the same toolchain NanoKVM builds Go with on $PATH:
+# `riscv64-unknown-linux-musl-gcc` (see .cargo/config.toml) and the target:
+# `rustup target add riscv64gc-unknown-linux-musl`. The KVM ships this binary
+# beside NanoKVM-Server; its Go mesh bridge then speaks to it over
+# ~/.myownmesh/daemon.sock. See docs/NANOKVM.md.
+build-nanokvm:
+    @rustup target add riscv64gc-unknown-linux-musl
+    @cargo build --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+
 # Run the GUI (Tauri + Svelte) with hot reload. The GUI auto-spawns
 # the daemon as a child process, so this is the only command you
 # need for a normal dev session. We pre-build the daemon binary so
