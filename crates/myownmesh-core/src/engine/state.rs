@@ -113,9 +113,7 @@ pub enum NetworkCmd {
     /// the gentle recovery the GUI's refresh / reconnect controls drive
     /// instead of the old `NetworkRemove` + `NetworkAdd`. See
     /// [`super::network_watch::reconnect_all_in_place`].
-    Reconnect {
-        peer: Option<String>,
-    },
+    Reconnect { peer: Option<String> },
     /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
     /// one peer.
     SendChannelFrame {

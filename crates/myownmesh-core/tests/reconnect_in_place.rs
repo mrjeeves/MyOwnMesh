@@ -76,7 +76,12 @@ async fn in_place_reconnect_does_not_announce_a_leave() {
     // A generous window: well past the LEAVE flush + broker round-trip, so if a
     // leave were going out it would have landed.
     assert!(
-        !saw_user_left(&mut bob_events, alice_id.public_id(), Duration::from_secs(3)).await,
+        !saw_user_left(
+            &mut bob_events,
+            alice_id.public_id(),
+            Duration::from_secs(3)
+        )
+        .await,
         "an in-place reconnect must not announce a leave — Bob should never see UserLeft"
     );
 }
