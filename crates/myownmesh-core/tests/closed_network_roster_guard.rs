@@ -9,9 +9,12 @@
 //! arbitrary identities into a *closed* network and have them auto-approved
 //! network-wide.
 //!
-//! The fix gates membership *introductions* on a closed network behind
-//! `Role::can_grant(Role::Member)` (true only for Controller/Owner). Open
-//! networks stay permissionless by design (a member is anyone any current
+//! The fix makes closed-network membership owner-**signed**: it rides the
+//! signed transition log (a ratified `RoleGrant`), and the unsigned
+//! roster-entry gossip is never a trust input on a closed network — not even
+//! from a Controller/Owner. Authority over the *messenger* is not authority
+//! over the *data*: the membership data itself must be signed by an authority.
+//! Open networks stay permissionless by design (a member is anyone any current
 //! member has vouched for).
 //!
 //! The test drives `on_roster_entries` directly against a closed-network
@@ -139,12 +142,18 @@ async fn roster_membership_authority_gate() {
         "MOM-01: an unrostered stranger's gossip added a member to a closed network"
     );
 
-    // (c) A CONTROLLER (Carol) gossips a new member → MUST be accepted, so
-    //     legitimate authority-driven convergence is preserved (no regression).
+    // (c) Even a CONTROLLER's *unsigned* gossip is now ignored on a closed
+    //     network. Membership is owner-**signed**: it rides the signed
+    //     transition log (a ratified RoleGrant), never the unsigned roster-entry
+    //     gossip. Authority over the *messenger* is no longer authority over the
+    //     *data* — the strong form of MOM-01. A Controller admits members by
+    //     authoring a ratified RoleGrant (the signed path is exercised in
+    //     `closed_network_governance.rs`).
     governance::on_roster_entries(&alice, carol.public_id(), vouch(dave.public_id(), "dave")).await;
     assert!(
-        rostered(&alice, dave.public_id()),
-        "a Controller's gossip should still admit members on a closed network"
+        !rostered(&alice, dave.public_id()),
+        "closed-network membership must be owner-signed: even a Controller's \
+         unsigned roster gossip must not admit a member"
     );
 
     // ---- Scenario 2: OPEN network stays permissionless ------------------

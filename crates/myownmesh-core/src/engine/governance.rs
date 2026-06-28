@@ -123,6 +123,22 @@ pub async fn propose(
     variant: TransitionVariant,
     mfa_code: Option<&str>,
 ) -> Result<String> {
+    // Idempotency short-circuit — placed *before* the custody gate, because
+    // re-asserting an already-applied grant authorizes nothing and must never
+    // spend an MFA code. A `RoleGrant` whose target already sits at that exact
+    // role in the signed state is a no-op: signing it again would append a
+    // redundant transition and grow the log on every re-assertion. (The owner
+    // re-signs its fleet members on each startup to keep the signed roster
+    // authoritative; with closed-network membership now riding the log, that
+    // re-assertion has to be free.) We check the *explicit* role map, not
+    // `role_of` — an absent target reads as the default `Member` there but is
+    // NOT yet signed into the log, so granting it Member is meaningful and must
+    // proceed (this is exactly how a not-yet-signed member gets admitted).
+    if let TransitionVariant::RoleGrant { target, role } = &variant {
+        if state.governance_state.read().roles.get(target).copied() == Some(*role) {
+            return Ok(String::new());
+        }
+    }
     // Custody lock: authoring a governance transition is a custody-affecting
     // act. If this device enrolled a second factor for this network, a fresh
     // code is required here; otherwise this is a no-op. Composes with — does
@@ -733,110 +749,92 @@ pub async fn on_roster_request(
 /// persist if the roster changed, and — if it did — re-summarise to our
 /// peers so the new member propagates onward (gossip convergence).
 pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
-    // Who is allowed to *introduce* a new member via gossip?
+    // Membership trust is split by network kind:
     //
-    //   * `open` network — anyone the gossip reached. Membership is
-    //     permissionless by design: "a member is anyone any current member
-    //     has vouched for" (see the module note above).
-    //   * `closed` network — only a Controller/Owner. The Role model is
-    //     explicit: a Controller "can add member peers to the roster"; a
-    //     Member has "no roster-edit authority". Without this gate any
-    //     authenticated peer — a freshly-approved Member, or an attacker who
-    //     cleared a single approval — could gossip arbitrary device ids into
-    //     the roster, and a rostered peer is auto-approved on every future
-    //     connection (`auto = cfg.auto_approve || rostered`). That is the
-    //     MOM-01 escalation: connection ≠ authority to expand membership.
-    //
-    // The sender (`peer_id`) is the cryptographically-authenticated peer the
-    // frame arrived from, so its role is a trustworthy authority signal.
-    // `can_grant(Role::Member)` is precisely "may admit members" (false for
-    // Member, true for Controller/Owner).
-    let (kind, sender_may_admit) = {
-        let gov = state.governance_state.read();
-        let may = gov.kind == NetworkKind::Open
-            || gov
-                .role_of(crate::signing::pubkey_part(peer_id))
-                .can_grant(Role::Member);
-        (gov.kind, may)
-    };
-    let self_pk = state.identity.public_id().to_string();
-    let (added, refused) = {
-        let mut roster = state.roster.write();
-        let mut added = 0usize;
-        let mut refused = 0usize;
-        for entry in &msg.entries {
-            let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
-            // Our own entry is locally authoritative; never let a peer's
-            // gossip rewrite how we see ourselves.
-            if pubkey == self_pk {
-                continue;
+    //   * `open` network — permissionless gossip: "a member is anyone any
+    //     current member has vouched for" (see the module note). The unsigned
+    //     `entries` are merged additively.
+    //   * `closed` network — owner-**signed** only. Membership rides the signed
+    //     transition log (a ratified `RoleGrant`) and is derived from the
+    //     verified log in `adopt_transition_log` below. The unsigned `entries`
+    //     are NOT a trust input here — not even from a Controller/Owner. The
+    //     stance is deliberately the strong form of MOM-01: the *data* must be
+    //     signed by an authority, not merely vouched for by an authenticated
+    //     sender. An authenticated peer (a freshly-approved Member, or an
+    //     attacker who cleared one approval) gossiping `entries` can no longer
+    //     conscript anyone into a closed network — there is simply no unsigned
+    //     path in. A closed network's roster is exactly the verified,
+    //     owner-signed log: complete, self-sufficient, and identical on every
+    //     member that has adopted the log.
+    let kind = { state.governance_state.read().kind };
+    if kind == NetworkKind::Open {
+        let self_pk = state.identity.public_id().to_string();
+        let added = {
+            let mut roster = state.roster.write();
+            let mut added = 0usize;
+            for entry in &msg.entries {
+                let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
+                // Our own entry is locally authoritative; never let a peer's
+                // gossip rewrite how we see ourselves.
+                if pubkey == self_pk {
+                    continue;
+                }
+                // Additive only — skip members we already hold so a stale
+                // label / timestamp from a peer can't clobber ours and a local
+                // removal can't be undone by a no-op rewrite.
+                if crate::roster::is_authorized(&roster, &pubkey) {
+                    continue;
+                }
+                crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
+                // On an open network the role tag is cosmetic; adopt whatever
+                // the gossip carried.
+                if entry.role != Role::Member {
+                    crate::roster::set_role_in(&mut roster, &pubkey, entry.role);
+                }
+                added += 1;
             }
-            // Additive only — skip members we already hold so a stale
-            // label / timestamp from a peer can't clobber ours and a
-            // local removal can't be undone by a no-op rewrite.
-            if crate::roster::is_authorized(&roster, &pubkey) {
-                continue;
+            if added > 0 {
+                if let Err(e) = crate::roster::save(&roster) {
+                    diag(
+                        state,
+                        crate::events::DiagLevel::Warn,
+                        format!("persist after roster merge failed: {e}"),
+                    );
+                }
             }
-            // MOM-01 guard: on a closed network, refuse member introductions
-            // from a sender that lacks roster-edit authority. (Existing
-            // members are skipped above, so this only blocks *new* additions —
-            // legitimate members already in the roster are unaffected.)
-            if !sender_may_admit {
-                refused += 1;
-                continue;
-            }
-            crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
-            // Role authority: on an `open` network the tag is cosmetic, so
-            // adopt whatever the gossip carried. On a `closed` network the
-            // signed transition log is the only source of authority, so a
-            // freshly-learned member lands as the default `Member` and is
-            // promoted (if at all) by a ratified RoleGrant, never by raw
-            // gossip.
-            if kind == NetworkKind::Open && entry.role != Role::Member {
-                crate::roster::set_role_in(&mut roster, &pubkey, entry.role);
-            }
-            added += 1;
-        }
+            added
+        };
         if added > 0 {
-            if let Err(e) = crate::roster::save(&roster) {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!("persist after roster merge failed: {e}"),
-                );
-            }
+            diag(
+                state,
+                crate::events::DiagLevel::Info,
+                format!(
+                    "roster: merged {added} member(s) from {}",
+                    &peer_id[..peer_id.len().min(12)]
+                ),
+            );
+            broadcast_roster_summary(state).await;
         }
-        (added, refused)
-    };
-    if refused > 0 {
-        // Security-relevant: surface attempts to expand a closed network's
-        // membership from an unauthorized peer so they're visible in diags.
+    } else if !msg.entries.is_empty() {
+        // A closed network ignores unsigned membership gossip outright. Surface
+        // it at debug so a pre-signed-membership peer (or a probe) is visible
+        // without alarming — any legitimate membership it carries arrives
+        // signed in the log below.
         diag(
             state,
-            crate::events::DiagLevel::Warn,
+            crate::events::DiagLevel::Debug,
             format!(
-                "roster: refused {refused} unauthorized member add(s) gossiped by {} \
-                 (closed network; sender holds no roster-edit authority)",
+                "roster: ignored {} unsigned entry(ies) on a closed network from {} \
+                 (membership is owner-signed; deriving from the log)",
+                msg.entries.len(),
                 &peer_id[..peer_id.len().min(12)]
             ),
         );
     }
-    if added > 0 {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "roster: merged {added} member(s) from {}",
-                &peer_id[..peer_id.len().min(12)]
-            ),
-        );
-        broadcast_roster_summary(state).await;
-    }
-    // Roles ride the roster: the reply carries the signed governance log, so a
-    // closed network converges *who holds which role* (the owner most of all)
-    // the same way it converges membership — by verifying the peer's log and
-    // re-deriving roles, not by trusting the gossiped `role` tag (which a closed
-    // network deliberately ignores above).
+    // Roles AND closed-network membership ride the signed log: verify the
+    // peer's log, adopt it when it extends ours, and re-derive the roster from
+    // it. On a closed network this is the *only* membership source — every
+    // member is a ratified `RoleGrant` authored by an owner/controller.
     adopt_transition_log(state, peer_id, &msg.transitions).await;
 }
 

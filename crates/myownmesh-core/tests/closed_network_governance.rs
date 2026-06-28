@@ -217,6 +217,117 @@ async fn two_peers_ratify_open_to_closed_transition() {
 }
 
 #[tokio::test]
+async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
+    // Closed-network membership is owner-**signed**: an owner admits a member
+    // by authoring a ratified `RoleGrant`, and that membership converges to
+    // every other member through the verified signed log — NOT through unsigned
+    // roster gossip, and WITHOUT the new member needing to be present. This is
+    // the regression guard for the fleet bug where a member couldn't see its
+    // co-members until the owner re-gossiped: the signed log is complete and
+    // self-sufficient, so any member that has adopted it holds the full roster.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral());
+    let bob_id = Arc::new(Identity::ephemeral());
+    // Carol is a third device — admitted by the owner's signature, never
+    // connected in this test. She must still surface on Bob's roster.
+    let carol_id = Arc::new(Identity::ephemeral());
+
+    let network_id = "signed-membership-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bd) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    // Close the network: Alice becomes founder-owner, Bob a member.
+    let close = myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("propose close");
+    wait_for(Duration::from_secs(10), || {
+        bob_state
+            .governance_state
+            .read()
+            .pending
+            .iter()
+            .any(|p| p.id == close)
+    })
+    .await;
+    myownmesh_core::engine::governance::sign_proposal(&bob_state, &close, None)
+        .await
+        .expect("bob sign close");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+
+    // Alice (Owner) admits Carol with a single signed `RoleGrant` — the quorum
+    // for a Member grant is ≥1 owner/controller, so it ratifies on Alice at
+    // once (no co-signer, and Carol need not be present).
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("propose member grant");
+
+    // Carol lands in the OWNER's roster immediately (ratified + mirrored locally).
+    wait_for(Duration::from_secs(10), || {
+        rostered(&alice_state, carol_id.public_id())
+    })
+    .await;
+
+    // The whole point: Carol converges into BOB's roster too — derived from
+    // Alice's verified signed log — even though Carol is offline and only the
+    // owner ever signed her in. Before signed membership, Bob could learn a
+    // co-member only from live owner gossip; now the log carries it, complete.
+    wait_for(Duration::from_secs(10), || {
+        rostered(&bob_state, carol_id.public_id())
+    })
+    .await;
+    assert_eq!(
+        bob_state
+            .governance_state
+            .read()
+            .role_of(carol_id.public_id()),
+        Role::Member,
+        "Carol must converge as a Member on Bob via the signed log alone"
+    );
+}
+
+#[tokio::test]
 async fn deny_invalidates_proposal_on_both_sides() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
@@ -324,4 +435,9 @@ async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("wait_for predicate never satisfied within {timeout:?}");
+}
+
+/// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
+fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> bool {
+    myownmesh_core::roster::is_authorized(&state.roster.read(), id)
 }
