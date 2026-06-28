@@ -242,35 +242,43 @@ async fn on_network_change(
         }),
     }));
 
-    // FIRST, redial the relays. This is the half that was missing — and
-    // why renegotiation alone never fixed the handoff. When the primary
-    // interface moves, every relay WebSocket was bound to the old route
-    // and is now a zombie: the TCP connection wasn't torn down (no
-    // FIN/RST crossed the dead path), so our side still thinks it's open
-    // and the kernel won't notice for *minutes*. Until those sockets
-    // redial we are deaf and mute on signaling — the renegotiation offer
-    // and the ICE candidates below get published to nowhere (they ride an
-    // ephemeral Nostr kind, so they're forwarded to current subscribers
-    // or dropped, never stored), which is exactly the "0 remote
-    // candidates arrived" stall. `request_relay_reconnect` bumps the
-    // generation every relay task watches, so they drop the zombie and
-    // reconnect on the new interface at once. Same fix the wake path uses
-    // for the identical post-suspend zombie (see `engine::wake::on_wake`).
-    //
-    // The fan-out is then *driven by* that reconnect rather than raced
-    // against it: an offer published while the relays are still redialing
-    // reaches nobody (the stall above), so we subscribe to the relay-connected
-    // signal before asking for the redial and renegotiate the instant a fresh
-    // relay session lands. Reactive, not timed — if signaling never returns
-    // there is nothing to offer into anyway, and the moment it does, this
-    // fires. (The data-channel-open watchdog remains the only teardown clock.)
+    // Redial the relays, then renegotiate ICE with every peer once a fresh
+    // relay session lands. Shared with the manual reconnect controls (see
+    // [`redial_then_fan_out`]).
+    redial_then_fan_out(state).await;
+}
+
+/// Redial the relay sockets, then renegotiate ICE with every active peer —
+/// driven by the relay-connected signal so the offers don't race the redial
+/// into a still-reconnecting socket. Shared by the automatic network-change
+/// handler and the manual [`reconnect_all_in_place`].
+///
+/// Redialing the relays first is the half that was missing — and why
+/// renegotiation alone never fixed a handoff. When the primary interface
+/// moves, every relay WebSocket was bound to the old route and is now a
+/// zombie: the TCP connection wasn't torn down (no FIN/RST crossed the dead
+/// path), so our side still thinks it's open and the kernel won't notice for
+/// *minutes*. Until those sockets redial we are deaf and mute on signaling —
+/// the renegotiation offer and the ICE candidates get published to nowhere
+/// (they ride an ephemeral Nostr kind, forwarded to current subscribers or
+/// dropped, never stored), which is exactly the "0 remote candidates arrived"
+/// stall. `request_relay_reconnect` bumps the generation every relay task
+/// watches, so they drop the zombie and reconnect at once. Same fix the wake
+/// path uses for the identical post-suspend zombie (see `engine::wake::on_wake`).
+///
+/// The fan-out is then *driven by* that reconnect rather than raced against
+/// it: we subscribe to the relay-connected signal before asking for the
+/// redial and renegotiate the instant a fresh relay session lands. Reactive,
+/// not timed — if signaling never returns there is nothing to offer into
+/// anyway, and the moment it does, this fires.
+async fn redial_then_fan_out(state: &Arc<NetworkState>) {
     let mut connected_rx = state.relay_connected_rx();
     if let Some(rx) = connected_rx.as_mut() {
         rx.borrow_and_update();
     }
     let redialing = state.request_relay_reconnect();
     if redialing {
-        debug!(network = %state.network_id, "network change — forcing relay reconnect");
+        debug!(network = %state.network_id, "forcing relay reconnect before ICE fan-out");
     }
 
     // With a driver attached, hand the fan-out to a task that wakes on the
@@ -285,7 +293,7 @@ async fn on_network_change(
                 if rx.changed().await.is_ok() {
                     debug!(
                         network = %state.network_id,
-                        "relay reconnected after network change — renegotiating"
+                        "relay reconnected — renegotiating"
                     );
                     fan_out_restart(&state).await;
                 }
@@ -295,6 +303,71 @@ async fn on_network_change(
     }
 
     fan_out_restart(state).await;
+}
+
+/// Manually triggered in-place reconnect for a whole network — the
+/// non-destructive twin of a leave-then-rejoin. Redials signaling and
+/// renegotiates ICE with every active peer *without* leaving the room or
+/// tearing any session down, so peers never see a `Leave` and no app-level
+/// state (capabilities, routes, presence caches) is dropped. This is what the
+/// GUI's global "refresh / reconnect" control drives: the same recovery the
+/// network-change watcher runs automatically on an interface flip, on demand.
+/// See [`on_network_change`].
+pub(crate) async fn reconnect_all_in_place(state: &Arc<NetworkState>) {
+    // A redial / ICE restart can't bind a socket while the interface is down;
+    // the network-watch returning edge drives recovery there. Don't fight it.
+    if state.is_offline() {
+        debug!(
+            network = %state.network_id,
+            "reconnect requested while offline — deferring to network-watch"
+        );
+        return;
+    }
+    state.emit(MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
+        network_id: state.network_id.clone(),
+        level: DiagLevel::Info,
+        category: "network".to_string(),
+        message: "Reconnecting: redialing signaling and renegotiating ICE with every peer."
+            .to_string(),
+        detail: serde_json::json!({ "manual": true }),
+    }));
+    redial_then_fan_out(state).await;
+}
+
+/// Manually triggered in-place reconnect for a *single* peer — the per-node
+/// twin of [`reconnect_all_in_place`], for AllMyStuff's per-node refresh. ICE-
+/// restarts the one session in place (no teardown) and re-seeds discovery so a
+/// peer we'd already lost rebuilds on the next announce round-trip. Scoped to
+/// the one peer: it does **not** redial the shared relay sockets the way the
+/// whole-network reconnect does, so refreshing one node never churns signaling
+/// for the others.
+pub(crate) async fn reconnect_peer_in_place(state: &Arc<NetworkState>, device_id: &str) {
+    if state.is_offline() {
+        debug!(
+            network = %state.network_id,
+            peer = %device_id,
+            "peer reconnect requested while offline — deferring to network-watch"
+        );
+        return;
+    }
+    state.emit(MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
+        network_id: state.network_id.clone(),
+        level: DiagLevel::Info,
+        category: "network".to_string(),
+        message: format!("Reconnecting peer {device_id} in place."),
+        detail: serde_json::json!({ "manual": true, "peer": device_id }),
+    }));
+    // Force past a stale `Connected` — a manual refresh is the user telling us
+    // the link is quiet despite what ICE reports, the same reason the
+    // network-change watcher passes `force = true`. A no-op if we hold no
+    // session for the peer.
+    super::renegotiate_ice(state, device_id, true, "manual-reconnect").await;
+    // If we'd lost the peer entirely, nudge discovery (and flush any owed
+    // offer) so it rebuilds rather than waiting for its own announce schedule.
+    super::try_reoffer(state, device_id).await;
+    super::maybe_reactive_announce(state);
 }
 
 /// Renegotiate ICE with every active peer and re-seed discovery. Split out so

@@ -68,6 +68,24 @@ retained as wire/UI variants but the engine no longer produces them.
 | **4. Rebuild** | A restart that reached `Connected` but got no traffic within `RESTART_TRAFFIC_GRACE_MS` (10 s); a session whose data channel never opened within `DATA_CHANNEL_OPEN_TIMEOUT_MS` (30 s); a closed data channel; or inbound silence past the heartbeat. | Drop the peer; discovery builds a fresh `RTCPeerConnection` (fresh DTLS + data channel). On the answerer side, a fresh offer for a stuck-connecting peer rebuilds to align generations. | The in-place restart is fragile across some handoffs (webrtc-rs reports `Connected` on a dead TURN path); a clean rebuild is the reliable fallback. Replaces the old re-handshake / room-rejoin loops. |
 | **6. Stop + Start** | Signaling / STUN / TURN config edit | Reconcile teardown + fresh start, immediately. | Triggered only by user action — never automatic recovery. |
 
+### Manual reconnect (the refresh button)
+
+A user-facing "refresh / reconnect" control should drive **tier 3 in place**,
+not a leave-then-rejoin. `NetworkState::reconnect(peer)` (control:
+`NetworkReconnect { network, peer }`, CLI: `ctl networks reconnect`) runs the
+*same* redial-signaling-then-renegotiate-ICE path the network-change watcher
+uses (`network_watch::reconnect_all_in_place` / `reconnect_peer_in_place`),
+with no `Leave` and no teardown. `peer` omitted reconnects every peer on the
+network; `peer` set reconnects one (a per-node refresh).
+
+This matters because a leave-then-rejoin is **tier 6 aimed at the wrong
+problem**: it announces a departure (peers drop the session, per [Teardown
+authority](#teardown-authority)) and, in an embedder that caches per-peer
+app-state keyed off presence, throws that cache away — so a refresh on *one*
+side strands the *other* on a stale session until it, too, refreshes. The
+in-place reconnect keeps every session and all app-level state, so a refresh
+nudges a quiet link back without taking the peer down with it.
+
 ## Teardown authority
 
 The ladder *recovers* a link; what decides a link is **dead** is

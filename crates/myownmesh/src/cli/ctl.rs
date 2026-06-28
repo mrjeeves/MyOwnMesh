@@ -145,6 +145,15 @@ pub enum NetworksCmd {
     Leave {
         network_id: String,
     },
+    /// Reconnect a network in place — redial signaling and renegotiate ICE
+    /// without leaving the room (the non-destructive twin of leave+rejoin).
+    /// Accepts the network id or local config id; pass `--peer <id>` to
+    /// reconnect just one peer instead of every peer on the network.
+    Reconnect {
+        network_id: String,
+        #[arg(long)]
+        peer: Option<String>,
+    },
     Topology {
         network_id: String,
         /// `ring`, `star`, or `full_mesh`.
@@ -194,6 +203,12 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         CtlCmd::Networks(NetworksCmd::Leave { network_id }) => Request::NetworkRemove {
             network: network_id,
         },
+        CtlCmd::Networks(NetworksCmd::Reconnect { network_id, peer }) => {
+            Request::NetworkReconnect {
+                network: network_id,
+                peer,
+            }
+        }
         CtlCmd::Networks(NetworksCmd::Topology {
             network_id,
             topology,
