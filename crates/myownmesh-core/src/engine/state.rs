@@ -105,6 +105,15 @@ pub enum NetworkCmd {
         device_id: String,
         reason: DropReason,
     },
+    /// Manually triggered in-place reconnect — the non-destructive twin of a
+    /// leave-then-rejoin. `peer == None` reconnects the whole network (redial
+    /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
+    /// reconnects just that one peer. Nothing is torn down and no `Leave` is
+    /// announced, so peers keep their sessions and app-level state — this is
+    /// the gentle recovery the GUI's refresh / reconnect controls drive
+    /// instead of the old `NetworkRemove` + `NetworkAdd`. See
+    /// [`super::network_watch::reconnect_all_in_place`].
+    Reconnect { peer: Option<String> },
     /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
     /// one peer.
     SendChannelFrame {
@@ -996,6 +1005,18 @@ impl NetworkState {
     /// moment to reach the relays.
     pub fn announce_departure(&self) {
         let _ = self.signaling_tx.send(SignalingOutbound::Leave);
+    }
+
+    /// Queue an in-place reconnect on the engine driver — redial signaling and
+    /// renegotiate ICE without leaving the room. `peer == None` reconnects
+    /// every peer on this network; `peer == Some(id)` reconnects just that one.
+    /// The non-destructive twin of [`Self::announce_departure`] + rejoin: no
+    /// `Leave` is announced and no session is torn down, so peers keep their
+    /// connections and app-level state. The actual work runs on the driver via
+    /// [`NetworkCmd::Reconnect`] so it's serialized with every other per-peer
+    /// mutation. See [`super::network_watch::reconnect_all_in_place`].
+    pub fn reconnect(&self, peer: Option<String>) {
+        let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
     }
 }
 

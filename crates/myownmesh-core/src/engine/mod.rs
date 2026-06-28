@@ -258,6 +258,10 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::DropPeer { device_id, reason } => {
             drop_peer(state, &device_id, reason).await;
         }
+        NetworkCmd::Reconnect { peer } => match peer {
+            Some(device_id) => network_watch::reconnect_peer_in_place(state, &device_id).await,
+            None => network_watch::reconnect_all_in_place(state).await,
+        },
         NetworkCmd::SendChannelFrame {
             peer,
             channel,

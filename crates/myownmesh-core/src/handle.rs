@@ -433,6 +433,18 @@ impl JoinedNetwork {
         self.state.announce_departure();
     }
 
+    /// Reconnect in place — the non-destructive twin of a leave-then-rejoin.
+    /// `peer == None` redials signaling and renegotiates ICE with every peer on
+    /// this network; `peer == Some(id)` reconnects just that one peer (for a
+    /// per-node refresh). Nothing is torn down and no `Leave` is announced, so
+    /// peers keep their sessions and app-level state — the gentle recovery a
+    /// "refresh / reconnect" control should drive instead of removing and
+    /// re-adding the network. Fire-and-forget: the work runs on the engine
+    /// driver so it's serialized with every other per-peer mutation.
+    pub fn reconnect(&self, peer: Option<String>) {
+        self.state.reconnect(peer);
+    }
+
     /// Stop the network. Tears down all peer sessions, signals
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.

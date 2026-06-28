@@ -115,6 +115,19 @@ pub enum Request {
     NetworkUpdate {
         config: NetworkConfig,
     },
+    /// Reconnect a joined network in place — the non-destructive twin of a
+    /// `NetworkRemove` + `NetworkAdd`. Redials signaling and renegotiates ICE
+    /// without leaving the room or announcing a `Leave`, so peers keep their
+    /// sessions and app-level state. `peer` omitted reconnects every peer on
+    /// the network; `peer` set reconnects just that one (a per-node refresh).
+    /// This is what a GUI "refresh / reconnect" control should call instead of
+    /// the destructive remove+re-add. No-op-with-error if the network isn't
+    /// currently joined.
+    NetworkReconnect {
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+    },
     /// Snapshot which infrastructure services this device hosts
     /// (relay / signaling / STUN / TURN): live runtime status plus the
     /// persisted config. The GUI's Services settings section reads this
@@ -746,6 +759,10 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         Request::NetworkUpdate { config } => {
             info!(network = %config.network_id, config_id = %config.id, "control: network_update");
             network_update(state, config).await
+        }
+        Request::NetworkReconnect { network, peer } => {
+            info!(%network, ?peer, "control: network_reconnect");
+            network_reconnect(state, &network, peer)
         }
 
         // ---- self-update ----
@@ -1396,6 +1413,23 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
             )
         }
         RemoveResult::NotFound => Response::err(format!("unknown network: {key_owned}")),
+    }
+}
+
+/// Reconnect a joined network in place — the non-destructive twin of
+/// [`network_remove`] + [`network_add`]. Hands the live `JoinedNetwork` a
+/// reconnect request (redial signaling + renegotiate ICE) without leaving the
+/// room, so peers keep their sessions and app-level state. `peer` omitted
+/// reconnects every peer; `peer` set reconnects just that one (a per-node
+/// refresh). Fire-and-forget — the engine driver runs the reconnect, so this
+/// returns as soon as the request is queued.
+fn network_reconnect(state: &Arc<ControlState>, key: &str, peer: Option<String>) -> Response {
+    match state.registry.get(key) {
+        Some(joined) => {
+            joined.reconnect(peer);
+            Response::ok(serde_json::json!({ "reconnecting": key }))
+        }
+        None => Response::err(format!("unknown network: {key}")),
     }
 }
 
