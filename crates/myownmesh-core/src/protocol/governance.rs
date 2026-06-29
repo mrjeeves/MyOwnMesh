@@ -51,6 +51,13 @@ pub struct NetworkStateBroadcast {
     /// shorter knows it's behind and requests the missing transitions
     /// via the catch-up path.
     pub transitions_count: u32,
+    /// Sender's **member**-log length. The member tier is union-merged, not
+    /// strict-prefix, so its length alone isn't a total order — but a receiver
+    /// whose own member log is shorter knows it's missing entries and pulls.
+    /// `#[serde(default)]` so an older peer (which omits it, → 0) never makes us
+    /// think we're behind on a tier it doesn't track.
+    #[serde(default)]
+    pub member_log_count: u32,
     /// Base32-lowercase Merkle root over the sender's current
     /// roster. Receivers compare to their own; equal roots = caught
     /// up, unequal = trigger a `RosterRequest`.
@@ -183,6 +190,14 @@ pub struct RosterEntriesMessage {
     /// which then behaves exactly as before (membership-only gossip).
     #[serde(default)]
     pub transitions: Vec<Transition>,
+    /// The network's signed **member** log — per-member admit/remove entries,
+    /// each authored by one owner/manager. Carried alongside the governance log
+    /// so membership converges by **union-merge** ([`crate::network_state::merge_member_logs`]):
+    /// two managers' concurrent (offline) admissions both survive, where the
+    /// strict-prefix governance log would fork. `#[serde(default)]`, so an older
+    /// peer that doesn't send it just contributes no member entries.
+    #[serde(default)]
+    pub member_log: Vec<Transition>,
 }
 
 /// A single rosterable peer. Mirrors [`AuthorizedPeer`] plus the
