@@ -33,18 +33,27 @@ build:
 build-release:
     @cargo build --workspace --release
 
+# One-time: add the riscv64 musl Rust target. The C cross-toolchain
+# (`riscv64-unknown-linux-musl-gcc`, used by ring + the linker — see
+# .cargo/config.toml) must already be on $PATH. On a box without it, build via
+# the NanoKVM repo's `just build-daemon`, which supplies the toolchain in Docker.
+setup-risc:
+    @rustup target add riscv64gc-unknown-linux-musl
+    @command -v riscv64-unknown-linux-musl-gcc >/dev/null 2>&1 \
+        && echo "toolchain OK: $(riscv64-unknown-linux-musl-gcc --version | head -1)" \
+        || echo "NOTE: riscv64-unknown-linux-musl-gcc not on PATH — see docs/NANOKVM.md (or build via NanoKVM's 'just build-daemon')."
+
 # Cross-build *just the daemon* for the NanoKVM SoC (Sophgo SG2002, T-Head
 # C906, riscv64 + musl) so a KVM can run a real MyOwnMesh node. Only the
-# `myownmesh` daemon is built — not the GUI/updater — and myownmesh-core is
-# pure Rust (ring + rustls, no OpenSSL), so the lone native dep is ring's
-# riscv64 asm. Needs the same toolchain NanoKVM builds Go with on $PATH:
-# `riscv64-unknown-linux-musl-gcc` (see .cargo/config.toml) and the target:
-# `rustup target add riscv64gc-unknown-linux-musl`. The KVM ships this binary
-# beside NanoKVM-Server; its Go mesh bridge then speaks to it over
-# ~/.myownmesh/daemon.sock. See docs/NANOKVM.md.
-build-nanokvm:
-    @rustup target add riscv64gc-unknown-linux-musl
+# `myownmesh` daemon is built — not the GUI — and myownmesh-core is pure Rust
+# (ring + rustls, no OpenSSL), so the lone native dep is ring's riscv64 asm. The
+# KVM ships this binary beside NanoKVM-Server; its Go mesh bridge then speaks to
+# it over $MYOWNMESH_HOME/daemon.sock. See docs/NANOKVM.md.
+build-risc: setup-risc
     @cargo build --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+
+# Back-compat alias for the original recipe name.
+alias build-nanokvm := build-risc
 
 # Run the GUI (Tauri + Svelte) with hot reload. The GUI auto-spawns
 # the daemon as a child process, so this is the only command you
