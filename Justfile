@@ -33,24 +33,29 @@ build:
 build-release:
     @cargo build --workspace --release
 
-# One-time: add the riscv64 musl Rust target. The C cross-toolchain
-# (`riscv64-unknown-linux-musl-gcc`, used by ring + the linker — see
-# .cargo/config.toml) must already be on $PATH. On a box without it, build via
-# the NanoKVM repo's `just build-daemon`, which supplies the toolchain in Docker.
+# One-time: add the riscv64 musl Rust target + the Zig-based cross toolchain.
+# We build with cargo-zigbuild (Zig = C compiler + linker), NOT the device's
+# Sophgo C906 gcc: its vendor ISA (rv64imafdcv0p7xthead) can't be linked against
+# rustc's standard rv64gc objects — see .cargo/config.toml. Zig is the most
+# reliable way to get a standard rv64gc musl toolchain anywhere. Install zig via
+# your package manager (`brew install zig`, `apt install zig`) or `pip install
+# ziglang`; see docs/NANOKVM.md.
 setup-risc:
     @rustup target add riscv64gc-unknown-linux-musl
-    @command -v riscv64-unknown-linux-musl-gcc >/dev/null 2>&1 \
-        && echo "toolchain OK: $(riscv64-unknown-linux-musl-gcc --version | head -1)" \
-        || echo "NOTE: riscv64-unknown-linux-musl-gcc not on PATH — see docs/NANOKVM.md (or build via NanoKVM's 'just build-daemon')."
+    @command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
+    @command -v zig >/dev/null 2>&1 \
+        && echo "zig OK: $(zig version)" \
+        || echo "NOTE: 'zig' not on PATH — install it ('brew install zig', 'apt install zig', or 'pip install ziglang'). See docs/NANOKVM.md."
 
 # Cross-build *just the daemon* for the NanoKVM SoC (Sophgo SG2002, T-Head
 # C906, riscv64 + musl) so a KVM can run a real MyOwnMesh node. Only the
 # `myownmesh` daemon is built — not the GUI — and myownmesh-core is pure Rust
-# (ring + rustls, no OpenSSL), so the lone native dep is ring's riscv64 asm. The
-# KVM ships this binary beside NanoKVM-Server; its Go mesh bridge then speaks to
-# it over $MYOWNMESH_HOME/daemon.sock. See docs/NANOKVM.md.
+# (ring + rustls, no OpenSSL), so the lone native dep is ring's riscv64 asm,
+# which Zig cross-compiles cleanly into a static musl binary. The KVM ships this
+# binary beside NanoKVM-Server; its Go mesh bridge then speaks to it over
+# $MYOWNMESH_HOME/daemon.sock. See docs/NANOKVM.md.
 build-risc: setup-risc
-    @cargo build --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+    @cargo zigbuild --release --bin myownmesh --target riscv64gc-unknown-linux-musl
 
 # Back-compat alias for the original recipe name.
 alias build-nanokvm := build-risc

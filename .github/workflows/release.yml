@@ -227,20 +227,29 @@ jobs:
           workspaces: . -> target
           key: daemon-riscv64
 
-      # The same Sophgo host-tools NanoKVM's docker/Dockerfile installs; provides
-      # riscv64-unknown-linux-musl-gcc on PATH for ring's C build + the linker.
-      - name: Install RISC-V musl toolchain (Sophgo host-tools)
+      # Build the static rv64gc musl binary with Zig as the C compiler + linker
+      # (cargo-zigbuild). We deliberately do NOT use the device's Sophgo C906
+      # host-tools: that gcc defaults to the T-Head vendor ISA
+      # (rv64imafdcv0p7xthead), but rustc emits standard rv64gc objects, and GNU
+      # ld cannot merge the vendor arch attributes with them — it dies with
+      # "failed to merge target specific data of file ... libc.a(...)" when
+      # linking Rust's self-contained musl libc. Zig links them cleanly, and a
+      # static-musl rv64gc binary still runs on the C906 (full rv64gc base ISA).
+      # Sourced from PyPI + crates.io (no fragile musl-gcc download). See
+      # .cargo/config.toml and docs/NANOKVM.md.
+      - name: Install Zig + cargo-zigbuild
         run: |
           set -e
-          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/host-tools.tar.gz \
-            https://sophon-file.sophon.cn/sophon-prod-s3/drive/23/03/07/16/host-tools.tar.gz
-          sudo tar -C /usr/local -xzf /tmp/host-tools.tar.gz
-          echo "/usr/local/host-tools/gcc/riscv64-linux-musl-x86_64/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --upgrade "ziglang==0.13.0"
+          printf '#!/usr/bin/env bash\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+          cargo install cargo-zigbuild --locked
 
       - name: Build daemon (riscv64 musl)
         run: |
-          riscv64-unknown-linux-musl-gcc --version | head -1
-          cargo build --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+          zig version
+          cargo zigbuild --release --bin myownmesh --target riscv64gc-unknown-linux-musl
 
       - name: Package portable daemon binary
         shell: bash
