@@ -202,6 +202,9 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         }
         CtlCmd::Networks(NetworksCmd::Leave { network_id }) => Request::NetworkRemove {
             network: network_id,
+            // `ctl networks leave` is a deliberate forget — purge the signed
+            // state + roster so a later rejoin doesn't reload a stale genesis.
+            purge: true,
         },
         CtlCmd::Networks(NetworksCmd::Reconnect { network_id, peer }) => {
             Request::NetworkReconnect {
