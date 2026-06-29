@@ -69,8 +69,7 @@ async fn cross_approve(
 
 #[tokio::test]
 async fn two_peers_ratify_open_to_closed_transition() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+    shared_home();
 
     let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
@@ -225,8 +224,7 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     // the regression guard for the fleet bug where a member couldn't see its
     // co-members until the owner re-gossiped: the signed log is complete and
     // self-sufficient, so any member that has adopted it holds the full roster.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+    shared_home();
 
     let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
@@ -335,8 +333,7 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     // log), and converges to the owner by union-merge even though the owner
     // never signed it. This is the cert chain in motion: the owner issues the
     // manager (governance log), the manager issues the member (member log).
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+    shared_home();
 
     let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
@@ -473,8 +470,7 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
 
 #[tokio::test]
 async fn deny_invalidates_proposal_on_both_sides() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+    shared_home();
 
     let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
@@ -584,4 +580,18 @@ async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
 /// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
 fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
+}
+
+/// All tests in this file share ONE `MYOWNMESH_HOME` for the process lifetime.
+/// Each `#[tokio::test]` runs on its own thread, but `MYOWNMESH_HOME` is a
+/// process-global env var — per-test tempdirs would clobber each other, and
+/// when one test's tempdir drops, another test's `network_state::save` writes
+/// under a path that no longer exists (a flaky `NotFound`). A single
+/// process-lifetime tempdir, set idempotently by every test, plus distinct
+/// per-test `network_id`s, keeps state files apart without the env-var race.
+fn shared_home() {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let dir = HOME.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+    std::env::set_var("MYOWNMESH_HOME", dir.path());
 }
