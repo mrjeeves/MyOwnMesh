@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "clap",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-services"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "myownmesh-core",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-signaling"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-updater"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "hex",
  "minisign-verify",
