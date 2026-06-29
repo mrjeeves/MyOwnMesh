@@ -203,6 +203,66 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # The NanoKVM device target (Sophgo SG2002, T-Head C906 — riscv64 + musl).
+  # Daemon ONLY: the Tauri GUI doesn't cross-compile here and isn't wanted on an
+  # appliance. Built with the same Sophgo host-tools toolchain the NanoKVM
+  # firmware uses, so `riscv64-unknown-linux-musl-gcc` matches .cargo/config.toml
+  # exactly (no env overrides). Ships a static-musl myownmesh-linux-riscv64.tar.gz
+  # — the asset a NanoKVM installs at its pinned `.myownmesh-rev`. See
+  # docs/NANOKVM.md. A separate job (not a `bundles` matrix row) because that
+  # matrix also builds the GUI, which has no riscv64 target.
+  daemon-riscv64:
+    name: Build (linux-riscv64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: riscv64gc-unknown-linux-musl
+
+      - name: Cache (daemon workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: daemon-riscv64
+
+      # The same Sophgo host-tools NanoKVM's docker/Dockerfile installs; provides
+      # riscv64-unknown-linux-musl-gcc on PATH for ring's C build + the linker.
+      - name: Install RISC-V musl toolchain (Sophgo host-tools)
+        run: |
+          set -e
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/host-tools.tar.gz \
+            https://sophon-file.sophon.cn/sophon-prod-s3/drive/23/03/07/16/host-tools.tar.gz
+          sudo tar -C /usr/local -xzf /tmp/host-tools.tar.gz
+          echo "/usr/local/host-tools/gcc/riscv64-linux-musl-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Build daemon (riscv64 musl)
+        run: |
+          riscv64-unknown-linux-musl-gcc --version | head -1
+          cargo build --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+
+      - name: Package portable daemon binary
+        shell: bash
+        run: |
+          set -e
+          BIN=target/riscv64gc-unknown-linux-musl/release/myownmesh
+          [[ -f "$BIN" ]] || { echo "daemon binary not found at $BIN"; exit 1; }
+          mkdir -p dist-bin
+          NAME="myownmesh-linux-riscv64"
+          cp "$BIN" "dist-bin/myownmesh"
+          tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
+          (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          rm -f dist-bin/myownmesh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist-bin/myownmesh-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # Detached Ed25519 (minisign) signatures over the portable archives, so the
   # self-updater can prove provenance, not just integrity. Runs once after all
   # platform bundles upload, and is a NO-OP until the maintainer configures the
@@ -211,7 +271,7 @@ jobs:
   # still releases exactly as before.
   sign:
     name: Sign release artifacts (minisign)
-    needs: bundles
+    needs: [bundles, daemon-riscv64]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

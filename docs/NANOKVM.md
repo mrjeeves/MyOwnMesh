@@ -62,10 +62,18 @@ The KVM ships joined to the `cec-backend-client-mesh` network on the standard
 public venue and advertises itself as **claimable**, so the machine it is wired
 to adopts it into that owner's fleet (the NanoKVM bridge drives the claim).
 
+## Released artifact
+
+The release pipeline builds and publishes the daemon for this target on every
+release: a static-musl **`myownmesh-linux-riscv64.tar.gz`** (+ `.sha256`, and a
+`.minisig` once signing is configured), built with the Sophgo host-tools so it's
+the same toolchain the device firmware uses. A NanoKVM pins a MyOwnMesh release
+in its `.myownmesh-rev` and installs that asset — no on-device or sibling build.
+
 ## Status
 
-The daemon is pure-Rust + `ring`; webrtc 0.13 → `riscv64gc-unknown-linux-musl`
-has not yet been validated end-to-end on real SG2002 hardware (no public CI
-runner for this target). Treat the cross-build recipe as the starting point for
-on-device bring-up; the protocol/bridge layers above it are exercised by the
-NanoKVM repo's host-side contract tests (`go test ./service/mesh/...`).
+The daemon is pure-Rust + `ring`, and webrtc 0.13 cross-compiles cleanly to
+`riscv64gc-unknown-linux-*` (verified). What remains unproven is **runtime on
+real SG2002 hardware** (RAM headroom, NAT-traversal from the device's network);
+the protocol/bridge layers above it are exercised by the NanoKVM repo's
+host-side contract tests (`go test ./service/mesh/...`).
