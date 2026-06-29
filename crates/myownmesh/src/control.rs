@@ -100,6 +100,14 @@ pub enum Request {
     /// reported as success-with-warning.
     NetworkRemove {
         network: String,
+        /// Also purge the network's persisted **governance state + roster** —
+        /// a genuine *forget* (e.g. leaving a fleet), not just unloading the
+        /// live network. Default `false` so a teardown keeps the signed state
+        /// for a later rejoin; only a deliberate leave sets it. Leaving it on
+        /// disk is exactly what makes a leave-then-rejoin reload a stale (and
+        /// possibly forked) genesis.
+        #[serde(default)]
+        purge: bool,
     },
     /// Update an already-joined network's config in place. Hot-
     /// reloadable changes (topology / label / auto_approve / roster
@@ -752,9 +760,9 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             info!(network = %config.network_id, config_id = %config.id, "control: network_add");
             network_add(state, config).await
         }
-        Request::NetworkRemove { network } => {
-            info!(%network, "control: network_remove");
-            network_remove(state, &network).await
+        Request::NetworkRemove { network, purge } => {
+            info!(%network, purge, "control: network_remove");
+            network_remove(state, &network, purge).await
         }
         Request::NetworkUpdate { config } => {
             info!(network = %config.network_id, config_id = %config.id, "control: network_update");
@@ -1371,7 +1379,20 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
 /// `leave()` to flush the engine driver cleanly. The signaling
 /// driver dropped inside `registry.remove` tears down its own
 /// tasks.
-async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
+/// Drop a network's persisted **governance state + roster** — the on-disk half
+/// of forgetting a network. Best-effort + logged: a leave that can't delete the
+/// files isn't worth failing the request over, but leaving them is precisely
+/// what made a rejoin reload a stale/forked genesis, so we try.
+fn purge_network_state(network_id: &str) {
+    if let Err(e) = myownmesh_core::network_state::delete(network_id) {
+        warn!(%network_id, "purge: network_state delete failed: {e:#}");
+    }
+    if let Err(e) = myownmesh_core::roster::delete(network_id) {
+        warn!(%network_id, "purge: roster delete failed: {e:#}");
+    }
+}
+
+async fn network_remove(state: &Arc<ControlState>, key: &str, purge: bool) -> Response {
     let key_owned = key.to_string();
     // Tell peers we're leaving *before* the registry drops the signaling
     // driver — a self-announced `leave` so they tear our session down now
@@ -1396,6 +1417,9 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
             if let Err(e) = persist_network_remove(&config_id, &network_id) {
                 return Response::err(format!("network left but config.json save failed: {e}"));
             }
+            if purge {
+                purge_network_state(&network_id);
+            }
             Response::ok(serde_json::json!({ "removed": config_id }))
         }
         RemoveResult::StillBorrowed => {
@@ -1407,6 +1431,12 @@ async fn network_remove(state: &Arc<ControlState>, key: &str) -> Response {
             state.services.on_network_removed(&key_owned).await;
             if let Err(e) = persist_network_remove(&key_owned, &key_owned) {
                 return Response::err(format!("network removed but config.json save failed: {e}"));
+            }
+            if purge {
+                // We couldn't unwrap the JoinedNetwork, so we only have the key
+                // we were given; it doubles as the network id for the alias the
+                // caller used (same basis `persist_network_remove` relies on).
+                purge_network_state(&key_owned);
             }
             Response::ok(
                 serde_json::json!({ "removed": key_owned, "warning": "engine teardown deferred — request was in flight" }),
