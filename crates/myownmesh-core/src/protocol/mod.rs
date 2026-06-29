@@ -163,6 +163,7 @@ mod tests {
         let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
             kind: NetworkKind::Closed,
             transitions_count: 4,
+            member_log_count: 2,
             roster_root: "abcdefghij".into(),
         });
         let s = serde_json::to_string(&msg).unwrap();
@@ -171,6 +172,7 @@ mod tests {
             MeshMessage::NetworkState(b) => {
                 assert_eq!(b.kind, NetworkKind::Closed);
                 assert_eq!(b.transitions_count, 4);
+                assert_eq!(b.member_log_count, 2);
                 assert_eq!(b.roster_root, "abcdefghij");
             }
             _ => panic!("did not round-trip as NetworkState"),
@@ -186,6 +188,7 @@ mod tests {
         let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
             kind: crate::network_state::NetworkKind::Open,
             transitions_count: 0,
+            member_log_count: 0,
             roster_root: "x".into(),
         });
         let s = serde_json::to_string(&msg).unwrap();

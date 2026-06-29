@@ -328,6 +328,150 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
 }
 
 #[tokio::test]
+async fn manager_admits_a_member_which_converges_via_the_member_log() {
+    // The two-key model end to end: an owner promotes a peer to **manager**
+    // (Controller), and that manager — not just the owner — admits a member.
+    // The admission rides the multi-writer **member log** (not the governance
+    // log), and converges to the owner by union-merge even though the owner
+    // never signed it. This is the cert chain in motion: the owner issues the
+    // manager (governance log), the manager issues the member (member log).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("MYOWNMESH_HOME", tmp.path());
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral()); // owner
+    let bob_id = Arc::new(Identity::ephemeral()); // promoted to manager
+    let dave_id = Arc::new(Identity::ephemeral()); // admitted by the manager, offline
+
+    let network_id = "manager-admit-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bd) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    // Close: Alice founder-owner, Bob a member.
+    let close = myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("propose close");
+    wait_for(Duration::from_secs(10), || {
+        bob_state
+            .governance_state
+            .read()
+            .pending
+            .iter()
+            .any(|p| p.id == close)
+    })
+    .await;
+    myownmesh_core::engine::governance::sign_proposal(&bob_state, &close, None)
+        .await
+        .expect("bob sign close");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+
+    // Alice promotes Bob to manager (Controller) — owner-only authority. This
+    // rides the governance log and converges to Bob.
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: bob_id.public_id().to_string(),
+            role: Role::Controller,
+        },
+        None,
+    )
+    .await
+    .expect("grant controller");
+    wait_for(Duration::from_secs(10), || {
+        bob_state
+            .governance_state
+            .read()
+            .role_of(bob_id.public_id())
+            == Role::Controller
+    })
+    .await;
+
+    // Bob — now a manager — admits Dave. Authority for a member grant is ≥1
+    // controller/owner; Bob qualifies, so it ratifies on Bob alone and lands in
+    // his MEMBER log (Dave need not be present).
+    myownmesh_core::engine::governance::propose(
+        &bob_state,
+        TransitionVariant::RoleGrant {
+            target: dave_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("manager admits dave");
+    wait_for(Duration::from_secs(10), || {
+        rostered(&bob_state, dave_id.public_id())
+    })
+    .await;
+
+    // The admission rode the member log, NOT the governance log.
+    {
+        let bob_view = bob_state.governance_state.read();
+        assert!(
+            bob_view.member_log.iter().any(|t| matches!(
+                &t.variant,
+                TransitionVariant::RoleGrant { target, role: Role::Member } if target == dave_id.public_id()
+            )),
+            "Dave's admit must be in the manager's member log"
+        );
+        assert!(
+            !bob_view.transitions.iter().any(|t| matches!(
+                &t.variant,
+                TransitionVariant::RoleGrant { target, .. } if target == dave_id.public_id()
+            )),
+            "a manager's member admit must NOT extend the governance (owner) log"
+        );
+    }
+
+    // And it converges to the OWNER by union-merge: Alice never signed Dave, yet
+    // recognises Bob's manager-authored admission and surfaces Dave as a member.
+    wait_for(Duration::from_secs(10), || {
+        rostered(&alice_state, dave_id.public_id())
+    })
+    .await;
+    assert_eq!(
+        alice_state
+            .governance_state
+            .read()
+            .role_of(dave_id.public_id()),
+        Role::Member,
+        "Dave converges as a Member on the owner via the union-merged member log"
+    );
+}
+
+#[tokio::test]
 async fn deny_invalidates_proposal_on_both_sides() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());

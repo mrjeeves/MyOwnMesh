@@ -646,9 +646,13 @@ pub async fn on_state_broadcast(
     peer_id: &str,
     msg: NetworkStateBroadcast,
 ) {
-    let (local_kind, local_count) = {
+    let (local_kind, local_count, local_member_count) = {
         let gov = state.governance_state.read();
-        (gov.kind, gov.transitions.len() as u32)
+        (
+            gov.kind,
+            gov.transitions.len() as u32,
+            gov.member_log.len() as u32,
+        )
     };
     if local_kind != msg.kind || local_count != msg.transitions_count {
         diag(
@@ -671,7 +675,10 @@ pub async fn on_state_broadcast(
     // necessarily changing membership, so a membership-only check would miss it.
     let membership_differs =
         crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
-    if membership_differs || msg.transitions_count > local_count {
+    if membership_differs
+        || msg.transitions_count > local_count
+        || msg.member_log_count > local_member_count
+    {
         request_roster(state, peer_id).await;
     }
 }
@@ -735,10 +742,14 @@ pub async fn on_roster_request(
     // membership: the requester verifies it from genesis and re-derives who is
     // owner/controller, instead of trusting a gossiped role tag. Empty on an
     // open network (no signed log).
-    let transitions = state.governance_state.read().transitions.clone();
+    let (transitions, member_log) = {
+        let gov = state.governance_state.read();
+        (gov.transitions.clone(), gov.member_log.clone())
+    };
     let msg = MeshMessage::RosterEntries(RosterEntriesMessage {
         entries,
         transitions,
+        member_log,
     });
     if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
         tracing::debug!(peer = %peer_id, err = %e, "roster entries reply send failed");
@@ -835,83 +846,140 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
     // peer's log, adopt it when it extends ours, and re-derive the roster from
     // it. On a closed network this is the *only* membership source — every
     // member is a ratified `RoleGrant` authored by an owner/controller.
-    adopt_transition_log(state, peer_id, &msg.transitions).await;
+    adopt_transition_log(state, peer_id, &msg.transitions, &msg.member_log).await;
 }
 
-/// Adopt a peer's signed governance log when it **extends** our own. The log
-/// is verified from genesis ([`crate::network_state::verify_log`]) — every
-/// transition's signatures and quorum re-checked against state reconstructed
-/// from the log itself — so an invalid or forged log is rejected whole and our
-/// state is left untouched. We adopt only when the incoming log shares our
-/// prefix and is strictly longer, which means a peer can extend governance
-/// (a role grant we hadn't seen, the founder election we're learning for the
-/// first time) but can never rewrite our genesis — and the owner it elected —
-/// out from under us. On adoption we replace the ratified state (keeping our
-/// in-flight pending proposals), mirror the converged roles into the roster's
-/// `role` projection, and re-gossip so the news ripples on.
-async fn adopt_transition_log(state: &Arc<EngineState>, peer_id: &str, incoming: &[Transition]) {
-    if incoming.is_empty() {
-        return;
+/// Re-derive the full role projection from both logs: owners and managers from
+/// the verified **governance** log, plus the union-merged **member** set as
+/// `Member`. With a member tier, the governance log alone no longer carries
+/// members, so this is the single source of truth for `gov.roles`. A governance
+/// log that fails to verify (never expected for our own ratified state) falls
+/// back to no governance roles rather than panicking.
+fn project_roles(
+    network_id: &str,
+    transitions: &[Transition],
+    member_log: &[Transition],
+) -> std::collections::BTreeMap<String, Role> {
+    let gov = network_state::verify_log(network_id, transitions)
+        .unwrap_or_else(|_| network_state::NetworkState::empty_for(network_id));
+    let mut roles = gov.roles.clone();
+    for m in network_state::verify_member_log(&gov, member_log, network_id) {
+        roles.entry(m).or_insert(Role::Member);
     }
-    // Fork/length guard under a read lock: only ever extend our own log.
-    {
-        let gov = state.governance_state.read();
-        if incoming.len() <= gov.transitions.len() {
-            return; // nothing newer
-        }
-        for (i, ours) in gov.transitions.iter().enumerate() {
-            // Compare the *content* (variant + signer set) — the same ratified
-            // transition, not a different one that happens to sit at this index.
-            if incoming[i].variant != ours.variant || incoming[i].signers != ours.signers {
+    roles
+}
+
+/// Adopt a peer's two signed logs, converging both tiers of the cert chain.
+///
+/// The **governance** log (kind changes, owner/manager grants and removals,
+/// splits) is verified from genesis ([`crate::network_state::verify_log`]) and
+/// adopted only when it **extends** ours — shares our prefix and is strictly
+/// longer — so a peer can add a grant or the founder election we hadn't seen
+/// but can never rewrite our genesis (and the owner it elected) out from under
+/// us. A divergent log is rejected whole, leaving our state untouched.
+///
+/// The **member** log (per-member admits/removals) is **union-merged**
+/// ([`crate::network_state::merge_member_logs`]) — commutative, so two
+/// managers' concurrent offline admissions both survive instead of forking the
+/// way a strict-prefix log would. Either tier may change independently; if
+/// either does we reproject the full role map from both logs, mirror it into
+/// the roster, and re-gossip so it ripples on. We keep our in-flight pending
+/// proposals throughout.
+async fn adopt_transition_log(
+    state: &Arc<EngineState>,
+    peer_id: &str,
+    incoming_gov: &[Transition],
+    incoming_members: &[Transition],
+) {
+    // Governance log: decide adoption (verified, fork-guarded) without holding
+    // the write lock across verify_log.
+    let rebuilt: Option<network_state::NetworkState> = {
+        let extends = {
+            let gov = state.governance_state.read();
+            let longer = incoming_gov.len() > gov.transitions.len();
+            let shares_prefix = incoming_gov
+                .iter()
+                .zip(gov.transitions.iter())
+                .all(|(a, b)| a.variant == b.variant && a.signers == b.signers);
+            if longer && !shares_prefix {
                 diag(
                     state,
                     crate::events::DiagLevel::Warn,
                     format!(
-                        "rejecting forked governance log from {} (diverges at transition {i})",
+                        "rejecting forked governance log from {}",
                         &peer_id[..peer_id.len().min(12)]
                     ),
                 );
-                return;
+            }
+            longer && shares_prefix
+        };
+        if extends {
+            match network_state::verify_log(&state.network_id, incoming_gov) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    diag(
+                        state,
+                        crate::events::DiagLevel::Warn,
+                        format!(
+                            "rejecting invalid governance log from {}: {e}",
+                            &peer_id[..peer_id.len().min(12)]
+                        ),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    // Apply both tiers under the write lock; reproject + mirror if either moved.
+    let (changed, roles) = {
+        let mut gov = state.governance_state.write();
+        let mut changed = false;
+
+        if let Some(rebuilt) = rebuilt {
+            // Re-check length in case it raced another adopter.
+            if rebuilt.transitions.len() > gov.transitions.len() {
+                gov.kind = rebuilt.kind;
+                gov.transitions = rebuilt.transitions;
+                gov.splits = rebuilt.splits;
+                changed = true;
             }
         }
+
+        if !incoming_members.is_empty() {
+            let merged = network_state::merge_member_logs(&gov.member_log, incoming_members);
+            // Union only ever grows; a longer result means new entries.
+            if merged.len() > gov.member_log.len() {
+                gov.member_log = merged;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            (false, gov.roles.clone())
+        } else {
+            let projected = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
+            gov.roles = projected.clone();
+            if let Err(e) = network_state::save(&gov) {
+                diag(
+                    state,
+                    crate::events::DiagLevel::Warn,
+                    format!("persist after adopting logs failed: {e}"),
+                );
+            }
+            (true, projected)
+        }
+    };
+
+    if !changed {
+        return;
     }
-    // Verify the whole log from genesis (pure; no locks held).
-    let rebuilt = match network_state::verify_log(&state.network_id, incoming) {
-        Ok(s) => s,
-        Err(e) => {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!(
-                    "rejecting invalid governance log from {}: {e}",
-                    &peer_id[..peer_id.len().min(12)]
-                ),
-            );
-            return;
-        }
-    };
-    // Adopt under the write lock; re-check length in case it raced.
-    let roles = {
-        let mut gov = state.governance_state.write();
-        if rebuilt.transitions.len() <= gov.transitions.len() {
-            return;
-        }
-        gov.kind = rebuilt.kind;
-        gov.roles = rebuilt.roles.clone();
-        gov.transitions = rebuilt.transitions.clone();
-        gov.splits = rebuilt.splits.clone();
-        if let Err(e) = network_state::save(&gov) {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!("persist after adopting governance log failed: {e}"),
-            );
-        }
-        gov.roles.clone()
-    };
+
     // Mirror the converged roles into the roster's `role` projection so every
     // peer row — and AllMyStuff's fleet view, which reads this projection —
-    // renders the right authority without re-reading the log.
+    // renders the right authority/membership without re-reading the logs.
     {
         let mut roster = state.roster.write();
         if mirror_roles_to_roster(&roles, &mut roster) {
@@ -928,13 +996,12 @@ async fn adopt_transition_log(state: &Arc<EngineState>, peer_id: &str, incoming:
         state,
         crate::events::DiagLevel::Info,
         format!(
-            "adopted converged governance log ({} transitions) from {}",
-            incoming.len(),
+            "adopted converged logs from {}",
             &peer_id[..peer_id.len().min(12)]
         ),
     );
-    // Tell our own peers — both the new membership (the owner may have been
-    // added to our roster) and the new governance count — so it ripples on.
+    // Tell our own peers — both the new membership and the new governance
+    // counts — so it ripples on.
     broadcast_roster_summary(state).await;
     broadcast_state(state).await;
 }
@@ -1052,9 +1119,28 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
         }
 
         let transition = candidate;
-        // Apply, drop from pending, persist.
-        let after = network_state::apply_transition(gov.clone(), &transition);
-        *gov = after;
+        // Route by tier: a member admit/removal rides the union-merged member
+        // log (so two managers' concurrent offline admissions don't fork);
+        // everything else (kind change, owner/manager grant or removal, split)
+        // extends the strict governance log. A removal is member-tier iff its
+        // target is currently a plain member.
+        let member_tier = match &transition.variant {
+            TransitionVariant::RoleGrant {
+                role: Role::Member, ..
+            } => true,
+            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
+                gov.role_of(target) == Role::Member
+            }
+            _ => false,
+        };
+        if member_tier {
+            gov.member_log.push(transition.clone());
+            gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
+        } else {
+            // Apply to the governance log (also advances `gov.roles`).
+            let after = network_state::apply_transition(gov.clone(), &transition);
+            *gov = after;
+        }
         gov.pending.retain(|p| p.id != proposal_id);
         network_state::save(&gov)?;
         (transition, true)
@@ -1120,6 +1206,9 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             crate::events::DiagLevel::Info,
             format!("ratified transition: {:?}", transition.variant),
         );
+        // Membership/roles may have changed — summarise so peers reconcile (a
+        // member admit shows up as a roster-root + member-log-count bump).
+        broadcast_roster_summary(state).await;
         broadcast_state(state).await;
     }
 
@@ -1132,9 +1221,13 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
 /// after every mutation to keep peers in sync without waiting on
 /// the next ACTIVE transition.
 pub async fn broadcast_state(state: &Arc<EngineState>) {
-    let (kind, transitions_count) = {
+    let (kind, transitions_count, member_log_count) = {
         let gov = state.governance_state.read();
-        (gov.kind, gov.transitions.len() as u32)
+        (
+            gov.kind,
+            gov.transitions.len() as u32,
+            gov.member_log.len() as u32,
+        )
     };
     // Membership root (not the full merkle root) so peers reconcile on
     // *who is in the network*, not on per-node label / timestamp churn —
@@ -1143,6 +1236,7 @@ pub async fn broadcast_state(state: &Arc<EngineState>) {
     let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
         kind,
         transitions_count,
+        member_log_count,
         roster_root,
     });
     broadcast(state, msg).await;

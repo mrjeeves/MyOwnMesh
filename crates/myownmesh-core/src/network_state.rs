@@ -35,7 +35,11 @@ use crate::error::{Error, Result};
 pub const SIGN_DOMAIN_TAG_STATE: &str = "myownmesh-network-state-v1:";
 
 /// File-format schema version for the per-network state log.
-pub const NETWORK_STATE_VERSION: u32 = 1;
+///
+/// v2 split the single transition log into the governance log (`transitions`)
+/// and the multi-writer `member_log`. A v1 file still loads — [`load`] migrates
+/// it via [`split_member_tier`] — so the bump is a forward, not a break.
+pub const NETWORK_STATE_VERSION: u32 = 2;
 
 // ---- kinds + roles --------------------------------------------------
 
@@ -254,8 +258,21 @@ pub struct NetworkState {
     /// networks, presence in this map is what gives a peer their
     /// authority; absence defaults to `Member`.
     pub roles: std::collections::BTreeMap<String, Role>,
-    /// Append-only signed log. Most recent last.
+    /// Append-only signed **governance** log: kind changes, owner and manager
+    /// (controller) grants/revokes/evicts, and splits. Strict-prefix-extend on
+    /// adoption — the slow-changing root + intermediate tiers of the cert
+    /// chain. Most recent last.
     pub transitions: Vec<Transition>,
+    /// Signed **member** log: per-entry admits (`RoleGrant{Member}`) and
+    /// removals (`RoleRevoke`/`Evict`) of plain members, each authored by a
+    /// single owner/manager. Multi-writer: union-merged on adoption so
+    /// distributed managers can admit concurrently (offline) without forking —
+    /// the leaf tier of the cert chain. Projected via [`verify_member_log`];
+    /// merged via [`merge_member_logs`]. `#[serde(default)]` so a pre-split
+    /// (legacy single-log) state still loads, then [`split_member_tier`]
+    /// migrates it.
+    #[serde(default)]
+    pub member_log: Vec<Transition>,
     /// Pending proposals awaiting ratification.
     pub pending: Vec<Proposal>,
     /// Splits this network has spawned. Each entry was derived from
@@ -277,6 +294,7 @@ impl NetworkState {
             kind: NetworkKind::Open,
             roles: Default::default(),
             transitions: Vec::new(),
+            member_log: Vec::new(),
             pending: Vec::new(),
             splits: Vec::new(),
         }
@@ -701,6 +719,169 @@ pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<Networ
     Ok(state)
 }
 
+// ---- member tier (multi-writer leaf of the cert chain) --------------
+
+/// Stable, collision-resistant identity for a ratified member-tier entry: its
+/// timestamp, canonical signed variant, and exact signer/signature set. Two
+/// byte-identical entries share a key (so a union-merge dedupes them); any
+/// difference yields a distinct key. Used for both dedup and a deterministic
+/// sort tiebreak, so every peer derives the same membership from the same set.
+fn member_entry_key(t: &Transition) -> String {
+    serde_json::to_string(t).unwrap_or_default()
+}
+
+/// True if `variant`, applied when the target held `target_role`, is a
+/// member-tier change (admit/remove of a plain member) rather than a
+/// governance-tier one (kind change, owner/manager grant, owner/manager
+/// removal, or split). Drives [`split_member_tier`].
+fn is_member_tier(variant: &TransitionVariant, target_role: Role) -> bool {
+    match variant {
+        TransitionVariant::RoleGrant {
+            role: Role::Member, ..
+        } => true,
+        TransitionVariant::RoleRevoke { .. } | TransitionVariant::Evict { .. } => {
+            target_role == Role::Member
+        }
+        _ => false,
+    }
+}
+
+/// Project the member-tier log against the governance state, returning the set
+/// of devices that currently hold membership.
+///
+/// The member tier is **multi-writer**: any current owner or manager
+/// (controller) may author an admit (`RoleGrant{Member}`) or a removal
+/// (`RoleRevoke`/`Evict`) of a member, each entry individually signed by its
+/// author. Entries from every author merge by union; for a given device the
+/// latest entry (by `at`, then [`member_entry_key`]) wins, so an admit and a
+/// later removal converge to "removed" regardless of the order two peers
+/// received them — the property a strict-prefix log can't give concurrent
+/// writers.
+///
+/// Authority is evaluated against the *current* governance roles: an entry
+/// counts only if at least one of its signers is presently an owner or manager,
+/// and only `Member` may be granted here (owner/manager grants live in the
+/// owner-signed governance log). Any entry that fails its signature, authority,
+/// or shape check is silently skipped — never counted, but also never able to
+/// poison the rest of the set, so one malformed entry can't deny-of-service the
+/// whole membership. Skipped entries stay in the log and are re-evaluated as
+/// governance converges (e.g. once the manager who authored them is known).
+pub fn verify_member_log(
+    gov: &NetworkState,
+    member_log: &[Transition],
+    network_id: &str,
+) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let authorities: BTreeSet<&str> = gov
+        .roles
+        .iter()
+        .filter(|(_, r)| matches!(r, Role::Controller | Role::Owner))
+        .map(|(k, _)| k.as_str())
+        .collect();
+
+    // Deterministic order: by timestamp, then a stable per-entry key.
+    let mut ordered: Vec<&Transition> = member_log.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.at.cmp(&b.at)
+            .then_with(|| member_entry_key(a).cmp(&member_entry_key(b)))
+    });
+
+    let mut present: BTreeMap<String, bool> = BTreeMap::new();
+    for t in ordered {
+        // Skip anything that doesn't cleanly verify — fail-safe, never fatal.
+        if verify_transition_signatures(network_id, t).is_err() {
+            continue;
+        }
+        if !t.signers.iter().any(|s| authorities.contains(s.as_str())) {
+            continue;
+        }
+        match &t.variant {
+            TransitionVariant::RoleGrant {
+                target,
+                role: Role::Member,
+            } => {
+                present.insert(target.clone(), true);
+            }
+            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
+                present.insert(target.clone(), false);
+            }
+            // A controller/owner grant, kind change, or split is not a
+            // member-tier change — ignored here (those ride the governance log).
+            _ => {}
+        }
+    }
+    present
+        .into_iter()
+        .filter(|(_, p)| *p)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Union-merge two member-tier logs: keep every distinct entry from either
+/// side, deduped by [`member_entry_key`]. Commutative and idempotent, so two
+/// managers' concurrent admissions converge without the fork a strict-prefix
+/// log would hit. Ordering is irrelevant — [`verify_member_log`] re-sorts.
+pub fn merge_member_logs(local: &[Transition], incoming: &[Transition]) -> Vec<Transition> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<String, Transition> = BTreeMap::new();
+    for t in local.iter().chain(incoming.iter()) {
+        by_key
+            .entry(member_entry_key(t))
+            .or_insert_with(|| t.clone());
+    }
+    by_key.into_values().collect()
+}
+
+/// Migrate a legacy single-log state into the two-tier shape: member-tier
+/// admits/removes move out of `transitions` into `member_log`; the governance
+/// log keeps kind changes, owner/manager grants and removals, and splits. The
+/// projected roster is unchanged — a migrated member is still re-derived into
+/// the roles map by [`verify_member_log`]. Idempotent: re-running on an
+/// already-split state is a no-op, because the governance log then holds no
+/// member-tier entry.
+pub fn split_member_tier(state: &mut NetworkState) {
+    // Replay to learn each target's role at the instant a revoke/evict applied,
+    // so removals are classified by the tier they actually touched.
+    let mut roles: std::collections::BTreeMap<String, Role> = std::collections::BTreeMap::new();
+    let mut governance: Vec<Transition> = Vec::new();
+    let mut members: Vec<Transition> = Vec::new();
+    for t in std::mem::take(&mut state.transitions) {
+        let target_role = match &t.variant {
+            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
+                roles.get(target).copied().unwrap_or(Role::Member)
+            }
+            _ => Role::Member,
+        };
+        let member_tier = is_member_tier(&t.variant, target_role);
+        // Advance the replay roles so later transitions classify correctly.
+        match &t.variant {
+            TransitionVariant::RoleGrant { target, role } => {
+                roles.insert(target.clone(), *role);
+            }
+            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
+                roles.remove(target);
+            }
+            TransitionVariant::KindChange { to } => {
+                if matches!(to, NetworkKind::Closed) {
+                    if let Some(founder) = t.signers.first() {
+                        roles.insert(founder.clone(), Role::Owner);
+                    }
+                }
+            }
+            TransitionVariant::Split { .. } => {}
+        }
+        if member_tier {
+            members.push(t);
+        } else {
+            governance.push(t);
+        }
+    }
+    // Preserve anything already in the member log (defensive; empty pre-split).
+    members.append(&mut state.member_log);
+    state.transitions = governance;
+    state.member_log = members;
+}
+
 // ---- on-disk persistence -------------------------------------------
 
 fn state_path(network_id: &str) -> Result<PathBuf> {
@@ -717,13 +898,22 @@ pub fn load(network_id: &str) -> Result<NetworkState> {
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Other(format!("read network_state at {}: {e}", path.display())))?;
-    let state: NetworkState = serde_json::from_str(&raw)
+    let mut state: NetworkState = serde_json::from_str(&raw)
         .map_err(|e| Error::Other(format!("parse network_state at {}: {e}", path.display())))?;
-    if state.version != NETWORK_STATE_VERSION {
-        return Err(Error::Other(format!(
-            "network_state version {} unsupported (this build expects v{})",
-            state.version, NETWORK_STATE_VERSION
-        )));
+    match state.version {
+        // v1 (legacy single log): split the member tier out of `transitions`
+        // into `member_log`, then it is a v2 state. Idempotent and roster-
+        // preserving — a migrated member still re-derives into the roles map.
+        1 => {
+            split_member_tier(&mut state);
+            state.version = NETWORK_STATE_VERSION;
+        }
+        NETWORK_STATE_VERSION => {}
+        other => {
+            return Err(Error::Other(format!(
+                "network_state version {other} unsupported (this build expects v{NETWORK_STATE_VERSION})"
+            )));
+        }
     }
     if state.network_id != network_id {
         // Filename is the index of truth; on mismatch, start fresh.
@@ -1200,6 +1390,172 @@ mod tests {
         assert_eq!(state.role_of(&owner), Role::Owner);
         assert_eq!(state.role_of(&member), Role::Controller);
         assert_eq!(state.transitions.len(), 2);
+    }
+
+    // ---- member tier (multi-writer leaf) ------------------------------
+
+    fn member_grant(
+        net: &str,
+        target: &str,
+        author_sk: &SigningKey,
+        author_pk: &str,
+        at: u64,
+    ) -> Transition {
+        let v = TransitionVariant::RoleGrant {
+            target: target.to_string(),
+            role: Role::Member,
+        };
+        Transition {
+            at,
+            signers: vec![author_pk.to_string()],
+            signatures: vec![sign_transition(net, &v, author_sk)],
+            variant: v,
+        }
+    }
+
+    fn member_evict(
+        net: &str,
+        target: &str,
+        author_sk: &SigningKey,
+        author_pk: &str,
+        at: u64,
+    ) -> Transition {
+        let v = TransitionVariant::Evict {
+            target: target.to_string(),
+        };
+        Transition {
+            at,
+            signers: vec![author_pk.to_string()],
+            signatures: vec![sign_transition(net, &v, author_sk)],
+            variant: v,
+        }
+    }
+
+    fn closed_gov(net: &str, roles: &[(&str, Role)]) -> NetworkState {
+        let mut gov = NetworkState::empty_for(net);
+        gov.kind = NetworkKind::Closed;
+        for (pk, r) in roles {
+            gov.roles.insert((*pk).to_string(), *r);
+        }
+        gov
+    }
+
+    #[test]
+    fn member_log_owner_and_manager_admits_union_merge() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (mgr_sk, mgr) = fixture_key(2);
+        let (_, a) = fixture_key(3);
+        let (_, b) = fixture_key(4);
+        let net = "fleet-m";
+        let gov = closed_gov(net, &[(&owner, Role::Owner), (&mgr, Role::Controller)]);
+        // Independent authors (owner admits A, manager admits B) — the two
+        // concurrent admissions a strict-prefix log would fork on.
+        let log = vec![
+            member_grant(net, &a, &owner_sk, &owner, 10),
+            member_grant(net, &b, &mgr_sk, &mgr, 11),
+        ];
+        let members = verify_member_log(&gov, &log, net);
+        assert!(members.contains(&a) && members.contains(&b));
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn member_log_skips_a_member_authored_admit() {
+        let (_, owner) = fixture_key(1);
+        let (rogue_sk, rogue) = fixture_key(5); // plain member: absent from roles
+        let (_, victim) = fixture_key(6);
+        let net = "fleet-m";
+        let gov = closed_gov(net, &[(&owner, Role::Owner)]);
+        // A non-authority's admit is skipped, not honoured — so a member can't
+        // conscript identities into the closed network (the strong MOM-01 form).
+        let log = vec![member_grant(net, &victim, &rogue_sk, &rogue, 10)];
+        assert!(!verify_member_log(&gov, &log, net).contains(&victim));
+    }
+
+    #[test]
+    fn member_log_evict_tombstones_a_prior_admit_order_independent() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, a) = fixture_key(3);
+        let net = "fleet-m";
+        let gov = closed_gov(net, &[(&owner, Role::Owner)]);
+        let admit = member_grant(net, &a, &owner_sk, &owner, 10);
+        let evict = member_evict(net, &a, &owner_sk, &owner, 20);
+        // The later removal wins regardless of the order the entries arrive in.
+        assert!(verify_member_log(&gov, &[admit.clone(), evict.clone()], net).is_empty());
+        assert!(verify_member_log(&gov, &[evict, admit], net).is_empty());
+    }
+
+    #[test]
+    fn member_log_ignores_a_non_member_grant() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, x) = fixture_key(3);
+        let net = "fleet-m";
+        let gov = closed_gov(net, &[(&owner, Role::Owner)]);
+        // Even owner-signed, a controller grant grants no membership here: roles
+        // are set by the governance log, not the member log.
+        let v = TransitionVariant::RoleGrant {
+            target: x.clone(),
+            role: Role::Controller,
+        };
+        let t = Transition {
+            at: 10,
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v, &owner_sk)],
+            variant: v,
+        };
+        assert!(verify_member_log(&gov, &[t], net).is_empty());
+    }
+
+    #[test]
+    fn merge_member_logs_is_commutative_and_dedups() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, a) = fixture_key(3);
+        let (_, b) = fixture_key(4);
+        let net = "fleet-m";
+        let ga = member_grant(net, &a, &owner_sk, &owner, 10);
+        let gb = member_grant(net, &b, &owner_sk, &owner, 11);
+        let left = vec![ga.clone(), ga.clone()]; // includes a duplicate
+        let right = vec![gb.clone()];
+        let m1 = merge_member_logs(&left, &right);
+        let m2 = merge_member_logs(&right, &left);
+        assert_eq!(m1.len(), 2); // ga deduped + gb
+        assert_eq!(m1, m2); // union is order-independent
+    }
+
+    #[test]
+    fn split_member_tier_splits_then_is_idempotent() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, a) = fixture_key(3);
+        let net = "fleet-m";
+        // Legacy single log: founder election + a member grant in `transitions`.
+        let v0 = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let t0 = Transition {
+            at: 1,
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v0, &owner_sk)],
+            variant: v0,
+        };
+        let mut state = NetworkState::empty_for(net);
+        state.kind = NetworkKind::Closed;
+        state.transitions = vec![t0, member_grant(net, &a, &owner_sk, &owner, 2)];
+        split_member_tier(&mut state);
+        assert_eq!(
+            state.transitions.len(),
+            1,
+            "founder election stays in gov log"
+        );
+        assert_eq!(state.member_log.len(), 1, "the member grant moved out");
+        // The migrated member still re-derives: roles come from the governance
+        // log (founder election → owner), and the owner authored the admit.
+        let gov = verify_log(net, &state.transitions).expect("gov log verifies");
+        assert!(verify_member_log(&gov, &state.member_log, net).contains(&a));
+        // Idempotent.
+        let (gov_before, mem_before) = (state.transitions.clone(), state.member_log.clone());
+        split_member_tier(&mut state);
+        assert_eq!(state.transitions, gov_before);
+        assert_eq!(state.member_log, mem_before);
     }
 
     #[test]
