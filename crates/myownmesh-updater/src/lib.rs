@@ -753,6 +753,13 @@ fn current_platform() -> &'static str {
     {
         "linux-aarch64"
     }
+    // RISC-V Linux — e.g. the NanoKVM SoC (Sophgo SG2002). No mesh release
+    // asset ships for this triple (the device updates via its own OTA), but
+    // the daemon must still *compile* and report a sensible platform string.
+    #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+    {
+        "linux-riscv64"
+    }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
         "macos-x86_64"
@@ -765,7 +772,18 @@ fn current_platform() -> &'static str {
     {
         "windows-x86_64"
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    // Anything not explicitly handled above. Spelled as the exact negation of
+    // the handled (os, arch) set — not just "non-linux/macos/windows" — so a
+    // Linux build on an unlisted arch (the bug this fixes) returns "unknown"
+    // instead of falling through to an empty body that fails to compile.
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "riscv64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "windows",
+    )))]
     {
         "unknown"
     }
