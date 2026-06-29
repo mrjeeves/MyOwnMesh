@@ -36,10 +36,13 @@ log: every transition (kind change, role grant, role revoke, split)
 carries the ed25519 signatures of the members whose authority makes
 it valid. A peer that receives a `network_state_propose` it didn't
 ask for, or whose signer set doesn't satisfy the quorum table for
-its operation, drops the frame at the protocol layer. Same for
-inbound `roster_entries` — a controller can author a member-add,
-but a member who tries to author a controller-add produces a frame
-that fails verification on every honest receiver.
+its operation, drops the frame at the protocol layer. On a closed
+network the unsigned `roster_entries` gossip carries no authority at
+all — membership rides two signed logs (see [Closed
+networks](#closed-networks-a-two-log-cert-chain)). A member-add is a
+signed entry in the member log; a member who gossips a roster entry, or
+who tries to author a controller-add, produces something that fails
+verification on every honest receiver.
 
 The GUI's role checks (`canGrant()`, the disabled role-radio
 buttons, the propose-close button gating) are convenience —
@@ -60,7 +63,7 @@ propagates to the rest of the network rather than living on one box.
 | Kind | Who can add to the roster | Roster sync |
 |---|---|---|
 | `open`   | any current member | gossip with merge |
-| `closed` | controllers + owners (members may *propose*) | controllers/owners author; gossip with merge |
+| `closed` | owners, managers (controllers); members may *propose* | two signed logs (governance + member); unsigned gossip ignored |
 
 Network kind is part of the per-network state — signed (alongside
 the role assignments and the transition log) by everyone who has
@@ -98,18 +101,43 @@ expires after `TOMBSTONE_TTL`). Without tombstones, a peer who
 didn't see your delete would re-add the entry on the next gossip
 round and the delete would never converge.
 
-## Closed networks
+## Closed networks: a two-log cert chain
 
-Same gossip, but only roster proposals **signed by an authorised
-role** are merged. A peer holding `controller` signs a proposal to
-add a `member`; everyone receiving the proposal verifies the
-signature against the proposer's authority *at the proposer's
-view of the network state*.
+A closed network's membership is **entirely signed** — it does NOT
+trust unsigned roster gossip, not even from a controller/owner. The
+`entries` in a `roster_entries` frame are ignored on a closed network;
+membership is re-derived from two signed logs that together form a
+certificate chain rooted at the founder:
 
-Members that can't write to the roster can still **propose** an
-addition (signed by the proposer + the candidate) and surface it as
-an Approval-tab entry on every controller/owner; the addition lands
-when an authorised role co-signs.
+| Section | What it holds | Who signs | Convergence |
+|---|---|---|---|
+| **governance log** (`transitions`) | kind changes, **owner** + **manager** (controller) grants/revokes/evicts, splits | owners (unanimous for an owner grant; ≥1 owner for a manager grant) | strict-prefix-extend: a peer can only *extend* the shared prefix, never rewrite the genesis (and the owner it elected) |
+| **member log** (`member_log`) | per-member admit/remove entries | any one owner/manager (≥1 authority) | **union-merge**: every distinct entry from either side is kept, deduped by content; latest-per-device wins (removals are tombstones) |
+
+This is the cert chain in motion: the **owner** is the root and issues
+**managers** (governance log); a **manager** issues **members** (member
+log). Every member re-verifies the whole chain from genesis —
+`verify_log` for the governance log, `verify_member_log` for the member
+log — so authority over the *messenger* is never authority over the
+*data*. The data itself must be signed by the right tier: a member who
+gossips a roster entry, or a manager who tries to grant `controller` in
+the member log, produces something every honest peer ignores.
+
+**Why two logs.** Owner and manager changes are rare and need
+coordinated authority (an owner grant is unanimous), so the governance
+log is a single strict-prefix chain and a fork is rejected outright.
+Member changes are frequent and **multi-writer**: two managers, each
+offline, can admit different members at the same time. A strict-prefix
+log would fork on that and neither side would adopt the other; the
+union-merged member log keeps both admissions and converges with no
+fork. Per-device identity keys throughout — being admitted to a role
+adds *your* pubkey to that tier's authorized signer set and you sign
+with your own key, so there are no shared secrets to leak or rotate and
+every change is attributable to a specific device.
+
+Members that can't write to the roster can still **propose** an addition
+and surface it as an Approval-tab entry on every controller/owner; the
+addition lands when an authorised role signs it into the member log.
 
 ### Role bootstrapping
 
@@ -121,10 +149,16 @@ the founder.
 
 From that point forward:
 
-- New `controller` grants need ≥1 `owner` signature.
-- New `owner` grants need every current owner's signature.
+- New `controller` (manager) grants need ≥1 `owner` signature, and
+  ride the **governance log**.
+- New `owner` grants need every current owner's signature, on the
+  governance log.
+- **Member admits ride the member log**: a single owner/manager signs
+  the admit and the union-merged member log converges it to everyone —
+  see [Closed networks](#closed-networks-a-two-log-cert-chain).
 - Removals of any role need the same authority as additions of that
-  role.
+  role (a member removal is a tombstone in the member log; an
+  owner/manager removal rides the governance log).
 
 ## Network-kind transitions
 
@@ -140,14 +174,27 @@ Each transition appends to `network_state.json`'s transition log:
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "kind": "closed",
+  // Governance log (root + manager tiers): kind changes, owner and
+  // manager grants/revokes/evicts, splits. Strict-prefix-extend.
   "transitions": [
     {
-      "to": "closed",
-      "at": "@1718000000",
+      "variant": { "kind": "kind_change", "to": "closed" },
+      "at": 1718000000,
       "signers":    ["<owner_pubkey>", "<member_pubkey>", "..."],
       "signatures": ["<base32 sig>", "<base32 sig>", "..."]
+    }
+  ],
+  // Member log (leaf tier): per-member admits/removes, each signed by a
+  // single owner/manager. Union-merged across peers, so two managers'
+  // concurrent offline admits both survive.
+  "member_log": [
+    {
+      "variant": { "kind": "role_grant", "target": "<member_pubkey>", "role": "member" },
+      "at": 1718000100,
+      "signers":    ["<manager_pubkey>"],
+      "signatures": ["<base32 sig>"]
     }
   ]
 }
@@ -315,13 +362,13 @@ build) silently ignore them.
 
 | Kind | Direction | Purpose |
 |---|---|---|
-| `network_state` | broadcast on ACTIVE | "This is what I think the network looks like." Carries `kind`, transition log, and the roster Merkle root. |
+| `network_state` | broadcast on ACTIVE | "This is what I think the network looks like." Carries `kind`, the governance-log length, the **member-log length**, and the roster Merkle root — a receiver behind on *either* log (or on membership) pulls. |
 | `network_state_propose` | targeted | "I propose this transition" — closed-network kind change or role grant. Signed by the proposer. |
 | `network_state_ack` | targeted | "I sign / deny your proposal." Co-signature by another authorised role; the `decision` field is `"sign"` or `"deny"`. |
 | `network_state_split` | targeted | "Stuck close — I'm spawning a derived closed network from the signers I have." Signed by the proposer + every signer who's opted in. Receivers verify, then add the new network to their available-to-join list. |
 | `roster_summary` | broadcast on ACTIVE | Merkle root + count + last-edit-ts of the sender's current roster view. |
 | `roster_request` | targeted | "Send me the entries under hash X." Merkle-tree diff walk. |
-| `roster_entries` | targeted | The requested entries; receiver merges into local roster after authority verification. |
+| `roster_entries` | targeted | The roster entries **plus both signed logs** (governance + member). On an `open` network the receiver merges the entries; on a `closed` network the entries are ignored and membership is re-derived from the logs — governance strict-prefix-extend, member union-merge. |
 
 Domain-separation tag for state signatures:
 `SIGN_DOMAIN_TAG_STATE = "myownmesh-network-state-v1:"`, distinct
