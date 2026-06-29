@@ -20,28 +20,41 @@ lone native dependency is ring's riscv64 assembly.
 
 ## Build the daemon for the device
 
-This needs the same musl cross-toolchain NanoKVM builds its Go server with —
-`riscv64-unknown-linux-musl-gcc` / `-ar` on `$PATH` (the Sophgo host-tools, the
-toolchain NanoKVM's `server/build.sh` and `docker/Dockerfile` already use):
+The daemon is built with **`cargo-zigbuild`** — Zig supplies the C compiler and
+linker for a static `rv64gc` musl binary. All you need is the Rust target, Zig,
+and cargo-zigbuild:
 
 ```sh
-just setup-risc            # add the Rust target + check the toolchain is present
+just setup-risc            # add the Rust target + cargo-zigbuild (install zig once)
 just build-risc            # cross-build the daemon  (alias: just build-nanokvm)
 # → target/riscv64gc-unknown-linux-musl/release/myownmesh
 ```
 
-`.cargo/config.toml` wires the linker and ring's C build to that toolchain, so a
-host build is unaffected and only the riscv64 target uses it.
+Install Zig however suits your box — `brew install zig`, `apt install zig`, or
+`pip install ziglang` (then a `zig` shim, or set `ZIG_COMMAND="python3 -m
+ziglang"`). On a Mac this is the whole story: no Docker, no hunting for a musl
+gcc.
 
-**No musl toolchain on your box (e.g. a Mac)?** Don't install one — build via the
-NanoKVM repo instead, which supplies the toolchain inside Docker and builds both
-the daemon and the server together:
+### Why Zig, not the Sophgo C906 toolchain
 
-```sh
-cd ../NanoKVM
-just setup-risc            # one-time: Docker builder image + Rust toolchain
-just build-risc            # builds the daemon (from this checkout) AND the server
+NanoKVM's Go server is built with the device's Sophgo host-tools
+(`riscv64-unknown-linux-musl-gcc`), and it's tempting to reuse it here. **Don't.**
+That gcc defaults to the T-Head **vendor** ISA (`rv64imafdcv0p7xthead` — draft-0.7
+vector + xthead custom extensions), but rustc always emits **standard** `rv64gc`
+objects for `riscv64gc-unknown-linux-musl`. GNU `ld` can't reconcile the vendor
+arch attributes with the standard ones and aborts the link:
+
 ```
+ld: failed to merge target specific data of file
+    .../riscv64gc-unknown-linux-musl/lib/self-contained/libc.a(close.lo)
+```
+
+The Go server dodges this because it *dynamically* links the C906 `libkvm.so`
+(no static-archive attribute merge); the Rust daemon links static musl, so it
+hits the conflict head-on. A standard `rv64gc` toolchain (Zig) links cleanly,
+and the resulting static-musl binary runs fine on the C906, which implements the
+full `rv64gc` base ISA — the vendor extensions only matter to code that uses them,
+and the daemon doesn't. `.cargo/config.toml` documents this too.
 
 ## On the device
 
@@ -66,9 +79,10 @@ to adopts it into that owner's fleet (the NanoKVM bridge drives the claim).
 
 The release pipeline builds and publishes the daemon for this target on every
 release: a static-musl **`myownmesh-linux-riscv64.tar.gz`** (+ `.sha256`, and a
-`.minisig` once signing is configured), built with the Sophgo host-tools so it's
-the same toolchain the device firmware uses. A NanoKVM pins a MyOwnMesh release
-in its `.myownmesh-rev` and installs that asset — no on-device or sibling build.
+`.minisig` once signing is configured), cross-compiled with cargo-zigbuild (a
+standard `rv64gc` musl toolchain — see *Why Zig* above). A NanoKVM pins a
+MyOwnMesh release in its `.myownmesh-rev` and installs that asset — no on-device
+or sibling build.
 
 ## Status
 
