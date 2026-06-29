@@ -20,23 +20,28 @@ lone native dependency is ring's riscv64 assembly.
 
 ## Build the daemon for the device
 
-Prerequisites (the same musl cross-toolchain NanoKVM builds its Go server with):
+This needs the same musl cross-toolchain NanoKVM builds its Go server with —
+`riscv64-unknown-linux-musl-gcc` / `-ar` on `$PATH` (the Sophgo host-tools, the
+toolchain NanoKVM's `server/build.sh` and `docker/Dockerfile` already use):
 
 ```sh
-rustup target add riscv64gc-unknown-linux-musl
-# riscv64-unknown-linux-musl-gcc / -ar must be on $PATH (Sophgo host-tools,
-# the toolchain NanoKVM's server/build.sh and docker/Dockerfile already use).
-```
-
-Then:
-
-```sh
-just build-nanokvm
+just setup-risc            # add the Rust target + check the toolchain is present
+just build-risc            # cross-build the daemon  (alias: just build-nanokvm)
 # → target/riscv64gc-unknown-linux-musl/release/myownmesh
 ```
 
 `.cargo/config.toml` wires the linker and ring's C build to that toolchain, so a
 host build is unaffected and only the riscv64 target uses it.
+
+**No musl toolchain on your box (e.g. a Mac)?** Don't install one — build via the
+NanoKVM repo instead, which supplies the toolchain inside Docker and builds both
+the daemon and the server together:
+
+```sh
+cd ../NanoKVM
+just setup-risc            # one-time: Docker builder image + Rust toolchain
+just build-risc            # builds the daemon (from this checkout) AND the server
+```
 
 ## On the device
 
