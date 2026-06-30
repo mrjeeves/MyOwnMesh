@@ -235,17 +235,29 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                     break;
                 }
             };
-            let frame = ServerOut::VideoInbound {
-                network: network_key.clone(),
-                from: inbound.from,
-                stream: inbound.sample.lane,
-                rtp_timestamp: inbound.sample.rtp_timestamp,
-                key: inbound.sample.key,
-                data: data_encoding::BASE64.encode(&inbound.sample.data),
-            };
+            // Binary body for clients on a media-source pipe; built once.
+            let body = crate::control::encode_inbound_frame(
+                crate::control::MEDIA_KIND_VIDEO,
+                inbound.sample.key,
+                inbound.sample.lane,
+                inbound.sample.rtp_timestamp,
+                &inbound.from,
+                &inbound.sample.data,
+            );
             for client_id in subscribers {
                 if let Some(client) = registry.client(client_id) {
-                    client.send(frame.clone());
+                    if let Some(sink) = client.media_sink() {
+                        let _ = sink.send(body.clone());
+                    } else {
+                        client.send(ServerOut::VideoInbound {
+                            network: network_key.clone(),
+                            from: inbound.from.clone(),
+                            stream: inbound.sample.lane,
+                            rtp_timestamp: inbound.sample.rtp_timestamp,
+                            key: inbound.sample.key,
+                            data: data_encoding::BASE64.encode(&inbound.sample.data),
+                        });
+                    }
                 }
             }
         }
@@ -277,16 +289,28 @@ pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: 
                     break;
                 }
             };
-            let frame = ServerOut::AudioInbound {
-                network: network_key.clone(),
-                from: inbound.from,
-                stream: inbound.sample.lane,
-                rtp_timestamp: inbound.sample.rtp_timestamp,
-                data: data_encoding::BASE64.encode(&inbound.sample.data),
-            };
+            // Binary body for clients on a media-source pipe; built once.
+            let body = crate::control::encode_inbound_frame(
+                crate::control::MEDIA_KIND_AUDIO,
+                false,
+                inbound.sample.lane,
+                inbound.sample.rtp_timestamp,
+                &inbound.from,
+                &inbound.sample.data,
+            );
             for client_id in subscribers {
                 if let Some(client) = registry.client(client_id) {
-                    client.send(frame.clone());
+                    if let Some(sink) = client.media_sink() {
+                        let _ = sink.send(body.clone());
+                    } else {
+                        client.send(ServerOut::AudioInbound {
+                            network: network_key.clone(),
+                            from: inbound.from.clone(),
+                            stream: inbound.sample.lane,
+                            rtp_timestamp: inbound.sample.rtp_timestamp,
+                            data: data_encoding::BASE64.encode(&inbound.sample.data),
+                        });
+                    }
                 }
             }
         }

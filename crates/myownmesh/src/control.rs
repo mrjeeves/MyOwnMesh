@@ -396,6 +396,15 @@ pub enum Request {
     /// Opus frames with no base64 and no per-frame JSON. Nothing else rides
     /// this connection; MJPEG/PCM/route signalling stay on the JSON pipe.
     MediaTrackPipe,
+    /// Convert this connection into a dedicated **binary media-source pipe**
+    /// for `client_id` (its `EventsSubscribe` id): after the ack, the daemon
+    /// pushes length-prefixed inbound media frames (`[u32 len][body]`, see
+    /// [`encode_inbound_frame`]) for everything that client is subscribed to —
+    /// no base64, no JSON. While registered, inbound media routes here instead
+    /// of as base64 `video_inbound`/`audio_inbound` on the event socket.
+    MediaSourcePipe {
+        client_id: crate::ipc::ClientId,
+    },
     /// Route assembled video access units arriving from this network's
     /// peers to this client's event socket as `video_inbound` frames.
     VideoSubscribe {
@@ -669,6 +678,32 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             run_media_track_pipe(&state, reader).await?;
             break;
         }
+        // MediaSourcePipe is the reverse: the daemon pushes inbound media frames
+        // (binary) to this connection for the named client, instead of base64
+        // events on its event socket. Register a sink on that client, then drain
+        // it to the wire until either side closes.
+        if let Request::MediaSourcePipe { client_id } = &request {
+            let client_id = *client_id;
+            let Some(client) = state.clients.client(client_id) else {
+                let resp = Response::err(format!("unknown client_id: {client_id}"));
+                writer
+                    .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                    .await?;
+                continue;
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            client.set_media_sink(tx);
+            let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
+            writer
+                .write_all((serde_json::to_string(&ack)? + "\n").as_bytes())
+                .await?;
+            writer.flush().await?;
+            let reader = lines.into_inner();
+            let result = run_media_source_pipe(reader, &mut writer, rx).await;
+            client.clear_media_sink();
+            result?;
+            break;
+        }
         let resp = dispatch(&state, request).await;
         let line = serde_json::to_string(&resp)? + "\n";
         writer.write_all(line.as_bytes()).await?;
@@ -730,6 +765,43 @@ where
         };
         if let Err(e) = result {
             debug!("media-track send failed: {e}");
+        }
+    }
+}
+
+/// Drain a client's binary media-source sink to its [`Request::MediaSourcePipe`]
+/// connection: each `body` (an `encode_inbound_frame` payload) goes out as
+/// `[u32 len][body]`. One-way (daemon → client); the only thing read back is
+/// EOF, which — like a dropped sink — ends the loop so the caller clears the
+/// client's sink and the pumps fall back to base64 events.
+async fn run_media_source_pipe<R, W>(
+    mut reader: R,
+    writer: &mut W,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            body = rx.recv() => {
+                let Some(body) = body else { return Ok(()) };
+                let len = (body.len() as u32).to_le_bytes();
+                if writer.write_all(&len).await.is_err() {
+                    return Ok(());
+                }
+                if writer.write_all(&body).await.is_err() {
+                    return Ok(());
+                }
+                if writer.flush().await.is_err() {
+                    return Ok(());
+                }
+            }
+            // The client never writes after the handshake, so any completion of
+            // this read — a stray byte or (normally) EOF — means it's gone.
+            _ = reader.read_u8() => return Ok(()),
         }
     }
 }
@@ -1382,9 +1454,12 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
 
-        // Handled in `handle_client` (it converts the whole connection); never
-        // reaches the per-request dispatcher.
+        // Handled in `handle_client` (they convert the whole connection); never
+        // reach the per-request dispatcher.
         Request::MediaTrackPipe => Response::err("media_track_pipe must open its own connection"),
+        Request::MediaSourcePipe { .. } => {
+            Response::err("media_source_pipe must open its own connection")
+        }
     }
 }
 
@@ -1947,6 +2022,31 @@ pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
     })
 }
 
+/// Serialize an inbound frame body (no length prefix). The daemon only encodes
+/// (it pushes inbound frames); the client decodes via `allmystuff-protocol`'s
+/// `decode_inbound_frame`, kept byte-for-byte identical. Layout:
+/// `kind u8 · key u8 · stream u8 · rtp_timestamp u32 · from_len u16 · from ·
+/// data…`, integers little-endian.
+pub fn encode_inbound_frame(
+    kind: u8,
+    key: bool,
+    stream: u8,
+    rtp_timestamp: u32,
+    from: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let from = from.as_bytes();
+    let mut out = Vec::with_capacity(9 + from.len() + data.len());
+    out.push(kind);
+    out.push(key as u8);
+    out.push(stream);
+    out.extend_from_slice(&rtp_timestamp.to_le_bytes());
+    out.extend_from_slice(&(from.len() as u16).to_le_bytes());
+    out.extend_from_slice(from);
+    out.extend_from_slice(data);
+    out
+}
+
 #[cfg(test)]
 mod media_frame_tests {
     use super::*;
@@ -2005,5 +2105,30 @@ mod media_frame_tests {
         for cut in 0..14 + "home".len() + "peer".len() {
             assert!(decode_media_frame(&body[..cut]).is_none(), "short {cut}");
         }
+    }
+
+    #[test]
+    fn inbound_frame_layout_matches_spec() {
+        // Guards against drift from allmystuff-protocol's decode_inbound_frame:
+        // kind, key, stream, rtp(LE u32), from_len(LE u16), from, data.
+        let body = encode_inbound_frame(MEDIA_KIND_VIDEO, true, 2, 0x0001_0203, "ab", &[9, 8]);
+        assert_eq!(
+            body,
+            vec![
+                MEDIA_KIND_VIDEO,
+                1, // key
+                2, // stream
+                0x03,
+                0x02,
+                0x01,
+                0x00, // rtp_timestamp LE
+                2,
+                0, // from_len LE
+                b'a',
+                b'b', // from
+                9,
+                8, // data
+            ]
+        );
     }
 }
