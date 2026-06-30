@@ -1384,9 +1384,7 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
 
         // Handled in `handle_client` (it converts the whole connection); never
         // reaches the per-request dispatcher.
-        Request::MediaTrackPipe => {
-            Response::err("media_track_pipe must open its own connection")
-        }
+        Request::MediaTrackPipe => Response::err("media_track_pipe must open its own connection"),
     }
 }
 
@@ -1931,9 +1929,13 @@ pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
     let stream = rd(body, &mut p, 1)?[0];
     let duration_us = u64::from_le_bytes(rd(body, &mut p, 8)?.try_into().ok()?);
     let net_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let network = std::str::from_utf8(rd(body, &mut p, net_len)?).ok()?.to_string();
+    let network = std::str::from_utf8(rd(body, &mut p, net_len)?)
+        .ok()?
+        .to_string();
     let peer_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
-    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?).ok()?.to_string();
+    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?)
+        .ok()?
+        .to_string();
     let data = body.get(p..)?.to_vec();
     Some(MediaFrame {
         kind,
@@ -1975,7 +1977,14 @@ mod media_frame_tests {
 
     #[test]
     fn round_trips_video_and_audio() {
-        let v = encode_media_frame(MEDIA_KIND_VIDEO, 3, 33_333, "home", "peerpub", &[1, 2, 3, 9]);
+        let v = encode_media_frame(
+            MEDIA_KIND_VIDEO,
+            3,
+            33_333,
+            "home",
+            "peerpub",
+            &[1, 2, 3, 9],
+        );
         let f = decode_media_frame(&v).expect("decode");
         assert_eq!(f.kind, MEDIA_KIND_VIDEO);
         assert_eq!(f.stream, 3);
