@@ -183,7 +183,20 @@ fn main() -> ExitCode {
         return cli::gui::launch();
     };
 
+    // Floor the worker-thread count. tokio defaults `worker_threads` to the CPU
+    // core count, which is 1 on constrained single-core devices (e.g. the
+    // NanoKVM's Sophgo SG2002 — one T-Head C906). With a single worker, one
+    // CPU-bound engine task (ICE / crypto during peer connection) monopolizes the
+    // only thread and starves everything else — most visibly the control socket,
+    // which then never answers `events_subscribe` and wedges the local IPC. A
+    // small floor lets the OS time-share the threads so the control socket and
+    // the ICE state machine keep making progress even while a peer is connecting.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(4);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
     {
