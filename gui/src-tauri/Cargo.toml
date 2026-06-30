@@ -6,7 +6,7 @@
 
 [package]
 name = "myownmesh-gui"
-version = "0.2.17"
+version = "0.2.18"
 description = "MyOwnMesh GUI — Tauri shell that talks to the daemon over the control socket."
 authors = ["Chris Paul"]
 license = "MIT"
