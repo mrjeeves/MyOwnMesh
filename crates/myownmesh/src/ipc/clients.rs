@@ -114,6 +114,12 @@ pub struct ClientHandle {
     pub video_subs: Arc<DashSet<String>>,
     /// Audio-lane subscriptions (by network) this client holds.
     pub audio_subs: Arc<DashSet<String>>,
+    /// When this client has opened a dedicated binary media-source pipe, the
+    /// sender that pushes pre-encoded inbound media frames (`[u32 len][body]`)
+    /// to it. `Some` means the media pumps route inbound H.264/Opus here as raw
+    /// binary instead of base64 `video_inbound`/`audio_inbound` on the event
+    /// socket. Cleared when the pipe disconnects.
+    pub media_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl ClientHandle {
@@ -121,6 +127,22 @@ impl ClientHandle {
         // Best effort: a dropped writer means the connection is
         // gone; the registry will clean up the handle shortly.
         let _ = self.writer_tx.send(frame);
+    }
+
+    /// Register this client's binary media-source pipe sender.
+    pub fn set_media_sink(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+        *self.media_tx.lock() = Some(tx);
+    }
+
+    /// Drop the media-source sender (pipe disconnected) — pumps fall back to
+    /// base64 events.
+    pub fn clear_media_sink(&self) {
+        *self.media_tx.lock() = None;
+    }
+
+    /// The current media-source sender, if a binary pipe is open.
+    pub fn media_sink(&self) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
+        self.media_tx.lock().clone()
     }
 }
 
@@ -174,6 +196,7 @@ impl ClientRegistry {
             channel_subs: Arc::new(DashSet::new()),
             video_subs: Arc::new(DashSet::new()),
             audio_subs: Arc::new(DashSet::new()),
+            media_tx: Arc::new(Mutex::new(None)),
         });
         self.inner.clients.insert(id, handle.clone());
         handle

@@ -161,10 +161,16 @@ exists or is needed. An idle lane sends nothing and costs nothing;
 embedders write encoded access units with
 `NetworkState::send_video_sample` and subscribe to assembled inbound
 units with `subscribe_video` (the daemon mirrors both as `video_send`
-/ `video_subscribe` control ops). Media rides RTP/UDP with the
-default interceptors (NACK retransmission, reports) — lossy-fresh
-semantics, unlike the reliable-ordered data channel; the engine
-neither encodes nor decodes, it moves Annex-B access units.
+/ `video_subscribe` control ops). For the high-rate H.264/Opus path the
+daemon also exposes two **dedicated binary media pipes** over the control
+socket, so the bitstream crosses the IPC with no base64 or per-frame JSON:
+`media_track_pipe` (a client streams length-prefixed access units in) and
+`media_source_pipe` (the daemon pushes a subscribed client's inbound frames
+out). The base64 `video_send` / `video_inbound` ops remain for clients that
+don't open the binary pipes. Media rides RTP/UDP with the default
+interceptors (NACK retransmission, reports) — lossy-fresh semantics, unlike
+the reliable-ordered data channel; the engine neither encodes nor decodes,
+it moves Annex-B access units.
 
 ## Signaling
 
