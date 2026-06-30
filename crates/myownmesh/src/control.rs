@@ -23,7 +23,7 @@ use interprocess::local_socket::{
 use myownmesh_core::{MeshConfig, MeshHandle, NetworkConfig, ServicesConfig, TopologyMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -390,6 +390,12 @@ pub enum Request {
         duration_us: u64,
         data: String,
     },
+    /// Convert this connection into a dedicated **binary media-track pipe**:
+    /// after the ack, the client streams length-prefixed binary frames
+    /// (`[u32 len][body]`, see [`decode_media_frame`]) — H.264 access units and
+    /// Opus frames with no base64 and no per-frame JSON. Nothing else rides
+    /// this connection; MJPEG/PCM/route signalling stay on the JSON pipe.
+    MediaTrackPipe,
     /// Route assembled video access units arriving from this network's
     /// peers to this client's event socket as `video_inbound` frames.
     VideoSubscribe {
@@ -649,11 +655,83 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 }
             }
         }
+        // MediaTrackPipe converts the connection into a one-way binary stream
+        // of media frames (H.264/Opus), exactly the EventsSubscribe pattern but
+        // reading instead of writing. After the ack the connection speaks only
+        // length-prefixed binary frames — no per-frame JSON or base64.
+        if matches!(request, Request::MediaTrackPipe) {
+            let ack = Response::ok(serde_json::json!({ "media_track_pipe": true }));
+            let line = serde_json::to_string(&ack)? + "\n";
+            writer.write_all(line.as_bytes()).await?;
+            writer.flush().await?;
+            // Recover the buffered reader (it may already hold the first frame).
+            let reader = lines.into_inner();
+            run_media_track_pipe(&state, reader).await?;
+            break;
+        }
         let resp = dispatch(&state, request).await;
         let line = serde_json::to_string(&resp)? + "\n";
         writer.write_all(line.as_bytes()).await?;
     }
     Ok(())
+}
+
+/// Read length-prefixed binary media frames off a [`Request::MediaTrackPipe`]
+/// connection and route each to its peer's track lane — the binary, base64-free
+/// twin of the [`Request::VideoSend`]/[`Request::AudioSend`] handlers. Sends
+/// nothing back per frame: errors are logged here (rate-limited by the caller's
+/// own cadence) rather than answered, which is the whole latency win. Returns
+/// when the client disconnects.
+async fn run_media_track_pipe<R>(state: &Arc<ControlState>, mut reader: R) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        let mut len_buf = [0u8; 4];
+        // A clean EOF (client closed the pipe) ends the loop; a short read is
+        // a torn frame and ends it too.
+        if reader.read_exact(&mut len_buf).await.is_err() {
+            return Ok(());
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_MEDIA_FRAME_BYTES {
+            warn!("media-track frame too large ({len} bytes) — dropping connection");
+            return Ok(());
+        }
+        let mut body = vec![0u8; len];
+        if reader.read_exact(&mut body).await.is_err() {
+            return Ok(());
+        }
+        let Some(frame) = decode_media_frame(&body) else {
+            warn!("malformed media-track frame ({len} bytes) — skipped");
+            continue;
+        };
+        let Some(net) = state.registry.get(&frame.network) else {
+            // The network went away between negotiation and this frame; the
+            // viewer reads it as a brief gap and the next IDR recovers.
+            continue;
+        };
+        let dur = std::time::Duration::from_micros(frame.duration_us);
+        let result = match frame.kind {
+            MEDIA_KIND_VIDEO => {
+                net.state()
+                    .send_video_sample(&frame.peer, frame.stream, frame.data.into(), dur)
+                    .await
+            }
+            MEDIA_KIND_AUDIO => {
+                net.state()
+                    .send_audio_sample(&frame.peer, frame.stream, frame.data.into(), dur)
+                    .await
+            }
+            other => {
+                warn!("unknown media-track frame kind {other} — skipped");
+                continue;
+            }
+        };
+        if let Err(e) = result {
+            debug!("media-track send failed: {e}");
+        }
+    }
 }
 
 async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
@@ -1303,6 +1381,12 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // Passive pump teardown, exactly like video.
             Response::ok(serde_json::json!({ "unsubscribed": true }))
         }
+
+        // Handled in `handle_client` (it converts the whole connection); never
+        // reaches the per-request dispatcher.
+        Request::MediaTrackPipe => {
+            Response::err("media_track_pipe must open its own connection")
+        }
     }
 }
 
@@ -1806,3 +1890,111 @@ where
 /// state without changing the protocol.
 #[allow(dead_code)]
 static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(None);
+
+// ---- binary media-track pipe frame codec -----------------------------------
+//
+// Mirror of `allmystuff-protocol`'s codec (keep byte-for-byte identical): the
+// frames a [`Request::MediaTrackPipe`] connection carries. Each frame on the
+// wire is `[u32 len LE][body]`; `body` is what these encode/parse. Round-trip
+// tested below.
+
+/// `kind` byte for an H.264 access unit.
+pub const MEDIA_KIND_VIDEO: u8 = 0;
+/// `kind` byte for an Opus frame.
+pub const MEDIA_KIND_AUDIO: u8 = 1;
+/// Defensive cap on one frame body — a corrupt length never allocates more.
+pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// One decoded media-track frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaFrame {
+    pub kind: u8,
+    pub stream: u8,
+    pub duration_us: u64,
+    pub network: String,
+    pub peer: String,
+    pub data: Vec<u8>,
+}
+
+/// Parse a media frame body (the bytes after the `u32` length prefix). Returns
+/// `None` on any truncation or non-UTF-8 id — a malformed frame is dropped,
+/// never panics.
+pub fn decode_media_frame(body: &[u8]) -> Option<MediaFrame> {
+    fn rd<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Option<&'a [u8]> {
+        let end = p.checked_add(n)?;
+        let s = b.get(*p..end)?;
+        *p = end;
+        Some(s)
+    }
+    let mut p = 0;
+    let kind = rd(body, &mut p, 1)?[0];
+    let stream = rd(body, &mut p, 1)?[0];
+    let duration_us = u64::from_le_bytes(rd(body, &mut p, 8)?.try_into().ok()?);
+    let net_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
+    let network = std::str::from_utf8(rd(body, &mut p, net_len)?).ok()?.to_string();
+    let peer_len = u16::from_le_bytes(rd(body, &mut p, 2)?.try_into().ok()?) as usize;
+    let peer = std::str::from_utf8(rd(body, &mut p, peer_len)?).ok()?.to_string();
+    let data = body.get(p..)?.to_vec();
+    Some(MediaFrame {
+        kind,
+        stream,
+        duration_us,
+        network,
+        peer,
+        data,
+    })
+}
+
+#[cfg(test)]
+mod media_frame_tests {
+    use super::*;
+
+    /// Local copy of the encoder (the daemon only needs to decode) so the
+    /// round-trip can be asserted against the exact layout the client writes.
+    fn encode_media_frame(
+        kind: u8,
+        stream: u8,
+        duration_us: u64,
+        network: &str,
+        peer: &str,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let net = network.as_bytes();
+        let peer = peer.as_bytes();
+        let mut out = Vec::with_capacity(14 + net.len() + peer.len() + data.len());
+        out.push(kind);
+        out.push(stream);
+        out.extend_from_slice(&duration_us.to_le_bytes());
+        out.extend_from_slice(&(net.len() as u16).to_le_bytes());
+        out.extend_from_slice(net);
+        out.extend_from_slice(&(peer.len() as u16).to_le_bytes());
+        out.extend_from_slice(peer);
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn round_trips_video_and_audio() {
+        let v = encode_media_frame(MEDIA_KIND_VIDEO, 3, 33_333, "home", "peerpub", &[1, 2, 3, 9]);
+        let f = decode_media_frame(&v).expect("decode");
+        assert_eq!(f.kind, MEDIA_KIND_VIDEO);
+        assert_eq!(f.stream, 3);
+        assert_eq!(f.duration_us, 33_333);
+        assert_eq!(f.network, "home");
+        assert_eq!(f.peer, "peerpub");
+        assert_eq!(f.data, vec![1, 2, 3, 9]);
+
+        let a = encode_media_frame(MEDIA_KIND_AUDIO, 0, 20_000, "n", "p", &[]);
+        let f = decode_media_frame(&a).expect("decode");
+        assert_eq!(f.kind, MEDIA_KIND_AUDIO);
+        assert!(f.data.is_empty());
+    }
+
+    #[test]
+    fn truncation_is_none_not_panic() {
+        let body = encode_media_frame(MEDIA_KIND_VIDEO, 1, 1, "home", "peer", &[7, 7, 7]);
+        for cut in 0..14 + "home".len() + "peer".len() {
+            assert!(decode_media_frame(&body[..cut]).is_none(), "short {cut}");
+        }
+    }
+}
