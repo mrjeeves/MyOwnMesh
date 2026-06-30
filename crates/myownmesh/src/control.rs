@@ -817,6 +817,11 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // streams to one peer it can send at full quality (the rest fall
             // back to MJPEG); absent means a pre-pool daemon — one lane.
             "media_lanes": myownmesh_core::transport::MEDIA_LANES,
+            // Whether this daemon speaks the binary media pipes (media_track_pipe
+            // / media_source_pipe). A capability flag, not a version gate: a
+            // client uses the binary path only when this is true, else the base64
+            // video_send/audio_send ops. Absent on daemons that predate it.
+            "media_pipes": true,
         })),
         Request::IdentityShow => Response::ok(serde_json::json!({
             "device_id": state.mesh.identity().display_id(),
