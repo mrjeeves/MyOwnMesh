@@ -751,6 +751,134 @@ async fn re_admitting_an_evicted_member_supersedes_the_tombstone() {
     );
 }
 
+#[tokio::test]
+async fn two_owners_converge_their_rosters() {
+    // The reported symptom, inverted into a guarantee: a fleet with two owners
+    // where the rosters never converge and only one behaves like the "real"
+    // owner. With flat peer authority (any owner is a full owner), an
+    // order-independent governance log (both recognise the same shared prefix
+    // regardless of ack order), and the union-merged member tier, the two owners
+    // must each recognise the other, and a member admitted by *either* must
+    // appear on *both*.
+    shared_home();
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral()); // founder-owner
+    let bob_id = Arc::new(Identity::ephemeral()); // promoted to a second owner
+    let carol_id = Arc::new(Identity::ephemeral()); // admitted by Alice, offline
+    let dave_id = Arc::new(Identity::ephemeral()); // admitted by Bob, offline
+
+    let network_id = "two-owner-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bd) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    use myownmesh_core::engine::governance::propose;
+    // Alice founds; then promotes Bob to a *second owner* — peer authority, so a
+    // single owner's signature suffices (no unanimous round to stall on).
+    propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: bob_id.public_id().to_string(),
+            role: Role::Owner,
+        },
+        None,
+    )
+    .await
+    .expect("grant bob owner");
+
+    // Both sides must agree Bob is a *full* owner — not just on Alice's view.
+    // (This is the "only one acts like the real owner" half of the symptom.)
+    wait_for(Duration::from_secs(10), || {
+        alice_state
+            .governance_state
+            .read()
+            .role_of(bob_id.public_id())
+            == Role::Owner
+            && bob_state
+                .governance_state
+                .read()
+                .role_of(bob_id.public_id())
+                == Role::Owner
+    })
+    .await;
+
+    // Each owner independently admits a different member (both offline).
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("alice admits carol");
+    propose(
+        &bob_state,
+        TransitionVariant::RoleGrant {
+            target: dave_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("bob admits dave");
+
+    // The union-merged member log must converge: BOTH owners end up holding BOTH
+    // members. This is the "rosters never converge between the two owners"
+    // symptom turned into a passing assertion.
+    wait_for(Duration::from_secs(15), || {
+        rostered(&alice_state, carol_id.public_id())
+            && rostered(&alice_state, dave_id.public_id())
+            && rostered(&bob_state, carol_id.public_id())
+            && rostered(&bob_state, dave_id.public_id())
+    })
+    .await;
+    assert!(
+        rostered(&alice_state, dave_id.public_id()),
+        "Alice must see the member Bob admitted"
+    );
+    assert!(
+        rostered(&bob_state, carol_id.public_id()),
+        "Bob must see the member Alice admitted"
+    );
+}
+
 // ---- helpers --------------------------------------------------------
 
 async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>, peer_id: &str) {
