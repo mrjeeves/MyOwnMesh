@@ -405,9 +405,15 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         }));
         phase::recompute(state);
         super::ladder::reevaluate_topology(state).await;
-        // Advertise the updated roster so the rest of the network pulls
-        // the newly-confirmed member (anti-entropy; see governance::).
+        // Advertise both anti-entropy channels to the freshly-active link.
+        // The roster summary carries only the *membership* root, which is blind
+        // to role changes by design — so a peer that missed a promote/demote or
+        // any other governance transition while offline wouldn't detect it from
+        // the summary alone. Also emitting the governance snapshot (transition +
+        // member-log counts) lets `on_state_broadcast` notice the divergence and
+        // pull the log, so roles converge on reconnect, not just membership.
         super::governance::broadcast_roster_summary(state).await;
+        super::governance::broadcast_state(state).await;
     }
 }
 

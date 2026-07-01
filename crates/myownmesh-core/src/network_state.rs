@@ -389,7 +389,8 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 /// (the network state in effect just prior to this transition).
 ///
 /// Quorum table:
-///   - `KindChange { to: Closed }` — unanimous of current members.
+///   - `KindChange { to: Closed }` — single signer (the founder
+///     self-elects; everyone already present becomes a member).
 ///   - `KindChange { to: Open }` — unanimous of current owners.
 ///   - `RoleGrant { role: Owner }` — unanimous of current owners.
 ///   - `RoleGrant { role: Controller }` — ≥ 1 owner.
@@ -398,15 +399,16 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 ///   - `Split` — single signer (the proposer), who becomes
 ///     founder-owner of the derived network.
 ///
-/// `state_before` reflects the *full* member set of the network at
-/// this transition's `at`. For the genesis transition (founder
-/// self-elects on `open → closed`) the state_before is the empty
-/// open network — exactly one signer (the founder) is acceptable.
-pub fn verify_quorum(
-    state_before: &NetworkState,
-    transition: &Transition,
-    members: &[String],
-) -> Result<()> {
+/// Every check reads authority off `state_before.roles`, which a
+/// converging peer reconstructs from the signed log itself
+/// ([`verify_log`]). Genesis is deliberately **single-signer**: the
+/// founder self-elects, and no other check depends on an external
+/// member roster. That matters for convergence — a peer replaying the
+/// log has no way to reconstruct who *else* was in the open network at
+/// close time, so a multi-signer "unanimous member consent" genesis
+/// could never be re-verified downstream. Existing peers become plain
+/// members of the closed network and may leave if they object.
+pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Result<()> {
     use std::collections::BTreeSet;
 
     let signers: BTreeSet<&str> = transition.signers.iter().map(|s| s.as_str()).collect();
@@ -425,30 +427,25 @@ pub fn verify_quorum(
         .collect();
 
     match (&transition.variant, state_before.kind) {
-        // Founder self-election: `open → closed` with no existing
-        // members or with the founder as sole signer.
+        // Founder self-election: `open → closed` is authored by exactly
+        // one signer, the founder, regardless of how many peers the open
+        // network already held. Those peers become plain members of the
+        // new closed network; they don't consent to (or co-sign) the
+        // close. This is the *only* genesis rule the quorum table has, and
+        // it's the one [`verify_log`] can reproduce from the log alone — a
+        // converging peer replays genesis against an empty member set and
+        // must reach the same verdict, so genesis has to stand on the
+        // founder's lone signature and nothing external.
         (
             TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
             NetworkKind::Open,
         ) => {
-            if members.is_empty() {
-                if signers.len() != 1 {
-                    return Err(Error::Protocol(
-                        "founder self-election needs exactly one signer".into(),
-                    ));
-                }
-            } else {
-                // Every existing member must sign.
-                for m in members {
-                    if !signers.contains(m.as_str()) {
-                        return Err(Error::Protocol(format!(
-                            "open → closed needs unanimous member consent; missing {}",
-                            &m[..m.len().min(12)]
-                        )));
-                    }
-                }
+            if signers.len() != 1 {
+                return Err(Error::Protocol(
+                    "founder self-election needs exactly one signer".into(),
+                ));
             }
         }
         (
@@ -684,36 +681,22 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
 /// than trusting a gossiped role tag. A log that fails any check is rejected
 /// whole (returns `Err`); the caller keeps its current state untouched.
 ///
+/// Every step is quorum-checked against the state reconstructed *from the log
+/// so far* — genesis against the empty open network (single-signer founder
+/// election), each later grant/revoke against the roles the prior transitions
+/// established. No external member roster is consulted, which is exactly why
+/// genesis must be single-signer: there is nothing here to reconstruct a
+/// pre-close member set from.
+///
 /// Adoption policy (whether a verified log *replaces* the local one) is the
 /// caller's: the engine only adopts a log that **extends** its own (shared
 /// prefix), so a peer can never rewrite a genesis — and the owner it elected —
 /// out from under a node that already holds one.
 pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<NetworkState> {
-    use std::collections::BTreeSet;
     let mut state = NetworkState::empty_for(network_id);
-    let mut members: BTreeSet<String> = BTreeSet::new();
     for t in transitions {
         verify_transition_signatures(network_id, t)?;
-        let members_vec: Vec<String> = members.iter().cloned().collect();
-        verify_quorum(&state, t, &members_vec)?;
-        // Grow the reconstructed member set from this transition's participants
-        // before applying the next, mirroring how authority accrues live.
-        for s in &t.signers {
-            members.insert(s.clone());
-        }
-        match &t.variant {
-            TransitionVariant::RoleGrant { target, .. }
-            | TransitionVariant::RoleRevoke { target }
-            | TransitionVariant::Evict { target } => {
-                members.insert(target.clone());
-            }
-            TransitionVariant::Split { members: m, .. } => {
-                for x in m {
-                    members.insert(x.clone());
-                }
-            }
-            TransitionVariant::KindChange { .. } => {}
-        }
+        verify_quorum(&state, t)?;
         state = apply_transition(state, t);
     }
     Ok(state)
@@ -1156,38 +1139,40 @@ mod tests {
             signers: vec![pk],
             signatures: vec![String::new()], // signature shape is irrelevant for quorum
         };
-        verify_quorum(&state, &t, &[]).unwrap();
+        verify_quorum(&state, &t).unwrap();
     }
 
     #[test]
-    fn quorum_open_to_closed_needs_every_member() {
+    fn quorum_open_to_closed_is_single_signer() {
+        // Genesis is a lone founder self-election, no matter how populated the
+        // open network was. A multi-signer close is rejected — it could never
+        // be re-verified by a peer converging the log (which replays genesis
+        // against an empty member set), so we forbid it at authoring time too.
         let (_, pk_alice) = fixture_key(1);
         let (_, pk_bob) = fixture_key(2);
-        let (_, pk_carol) = fixture_key(3);
         let state = NetworkState::empty_for("net-1");
-        let members = vec![pk_alice.clone(), pk_bob.clone(), pk_carol.clone()];
 
-        // Missing Carol's signature → reject.
+        // Two signers on a genesis close → reject.
         let t = Transition {
             at: 0,
             variant: TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
-            signers: vec![pk_alice.clone(), pk_bob.clone()],
+            signers: vec![pk_alice.clone(), pk_bob],
             signatures: vec![String::new(), String::new()],
         };
-        assert!(verify_quorum(&state, &t, &members).is_err());
+        assert!(verify_quorum(&state, &t).is_err());
 
-        // All three signed → accept.
+        // The lone founder → accept.
         let t_ok = Transition {
             at: 0,
             variant: TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
-            signers: vec![pk_alice, pk_bob, pk_carol],
-            signatures: vec![String::new(), String::new(), String::new()],
+            signers: vec![pk_alice],
+            signatures: vec![String::new()],
         };
-        verify_quorum(&state, &t_ok, &members).unwrap();
+        verify_quorum(&state, &t_ok).unwrap();
     }
 
     #[test]
@@ -1210,8 +1195,7 @@ mod tests {
             signers: vec![member],
             signatures: vec![String::new()],
         };
-        let members = vec![owner.clone(), candidate];
-        assert!(verify_quorum(&state, &t, &members).is_err());
+        assert!(verify_quorum(&state, &t).is_err());
     }
 
     #[test]
@@ -1224,8 +1208,6 @@ mod tests {
         state.roles.insert(owner_a.clone(), Role::Owner);
         state.roles.insert(owner_b.clone(), Role::Owner);
 
-        let members = vec![owner_a.clone(), owner_b.clone(), candidate.clone()];
-
         // Only owner_a signed — owner grant needs unanimous → reject.
         let t = Transition {
             at: 0,
@@ -1236,7 +1218,7 @@ mod tests {
             signers: vec![owner_a.clone()],
             signatures: vec![String::new()],
         };
-        assert!(verify_quorum(&state, &t, &members).is_err());
+        assert!(verify_quorum(&state, &t).is_err());
 
         // Both owners signed → accept.
         let t_ok = Transition {
@@ -1248,7 +1230,7 @@ mod tests {
             signers: vec![owner_a, owner_b],
             signatures: vec![String::new(), String::new()],
         };
-        verify_quorum(&state, &t_ok, &members).unwrap();
+        verify_quorum(&state, &t_ok).unwrap();
     }
 
     #[test]
@@ -1278,7 +1260,6 @@ mod tests {
         state.kind = NetworkKind::Closed;
         state.roles.insert(owner.clone(), Role::Owner);
         // `target` is a plain member (absent from roles → defaults Member).
-        let members = vec![owner.clone(), member.clone(), target.clone()];
 
         // A member-only signer can't evict.
         let t_bad = Transition {
@@ -1289,7 +1270,7 @@ mod tests {
             signers: vec![member],
             signatures: vec![String::new()],
         };
-        assert!(verify_quorum(&state, &t_bad, &members).is_err());
+        assert!(verify_quorum(&state, &t_bad).is_err());
 
         // The owner can — single-signer, the fleet's lost-device kick.
         let t_ok = Transition {
@@ -1298,7 +1279,7 @@ mod tests {
             signers: vec![owner],
             signatures: vec![String::new()],
         };
-        verify_quorum(&state, &t_ok, &members).unwrap();
+        verify_quorum(&state, &t_ok).unwrap();
     }
 
     #[test]

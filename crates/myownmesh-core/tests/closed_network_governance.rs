@@ -1,10 +1,9 @@
 //! End-to-end engine integration test: closed-network governance.
 //!
-//! Two peers handshake through an in-process LocalBroker, exchange
-//! a `KindChange { to: Closed }` proposal across the wire, ratify
-//! it once both sides sign, and end with matching signed
-//! transition logs + the proposer (Alice) installed as founder
-//! owner on both sides.
+//! Two peers handshake through an in-process LocalBroker; the founder
+//! (Alice) self-elects the network `Closed` with a single signature
+//! even though Bob is already present, and both sides end with matching
+//! single-signer genesis logs + Alice installed as founder owner.
 //!
 //! Companion to `two_peer_handshake.rs` which covers the open-
 //! network roster-approve flow; this one drives the
@@ -68,7 +67,7 @@ async fn cross_approve(
 }
 
 #[tokio::test]
-async fn two_peers_ratify_open_to_closed_transition() {
+async fn founder_self_elects_open_to_closed_even_when_populated() {
     shared_home();
 
     let broker = LocalBroker::new();
@@ -103,8 +102,13 @@ async fn two_peers_ratify_open_to_closed_transition() {
     wait_for_approval(&mut alice_events, bob_id.public_id()).await;
     wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
-    // Stamp each peer into the other's roster so the open→closed
-    // quorum has a real member set to evaluate against.
+    // Stamp Bob into Alice's roster (and vice-versa) *before* the close, so the
+    // open network is already populated when Alice founds. This is the exact
+    // condition that used to strand a fleet: the old quorum demanded unanimous
+    // consent from every rostered peer, so a lone founder could never close a
+    // populated open network — and even if it had, the multi-signer genesis
+    // couldn't be re-verified downstream. Founding must now stand on the
+    // founder's single signature regardless of who else is already present.
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
     // Sanity: both sides start in `Open` with no transitions logged.
@@ -112,9 +116,11 @@ async fn two_peers_ratify_open_to_closed_transition() {
     assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Open);
     assert!(alice_state.governance_state.read().transitions.is_empty());
 
-    // Alice proposes `KindChange { to: Closed }`. The proposer also
-    // signs at issue time, so this is one signature so far.
-    let proposal_id = myownmesh_core::engine::governance::propose(
+    // Alice proposes `KindChange { to: Closed }`. She self-signs at issue time,
+    // which alone satisfies the genesis quorum — so this ratifies on Alice
+    // immediately (no co-signer needed) and propagates to Bob, who adopts the
+    // single-signer genesis and converges without ever signing it.
+    let _proposal_id = myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
@@ -124,24 +130,6 @@ async fn two_peers_ratify_open_to_closed_transition() {
     .await
     .expect("propose");
 
-    // The proposal should land in Bob's pending list via the
-    // `NetworkStatePropose` broadcast.
-    wait_for(Duration::from_secs(10), || {
-        bob_state
-            .governance_state
-            .read()
-            .pending
-            .iter()
-            .any(|p| p.id == proposal_id)
-    })
-    .await;
-
-    // Bob signs → unanimous-of-members quorum is satisfied →
-    // the engine ratifies + applies + broadcasts the new state.
-    myownmesh_core::engine::governance::sign_proposal(&bob_state, &proposal_id, None)
-        .await
-        .expect("bob sign");
-
     // Wait until both sides see the ratified transition.
     wait_for(Duration::from_secs(10), || {
         alice_state.governance_state.read().kind == NetworkKind::Closed
@@ -149,8 +137,8 @@ async fn two_peers_ratify_open_to_closed_transition() {
     })
     .await;
 
-    // Founder election: Alice (the proposer) is now Owner; Bob is
-    // a co-signer, so he's still Member.
+    // Founder election: Alice (the sole signer) is Owner; Bob, already present
+    // in the open network, lands as a plain Member of the closed one.
     let alice_view = alice_state.governance_state.read();
     let bob_view = bob_state.governance_state.read();
 
@@ -170,7 +158,7 @@ async fn two_peers_ratify_open_to_closed_transition() {
     assert_eq!(
         alice_view.role_of(bob_id.public_id()),
         Role::Member,
-        "bob is a co-signer, not an owner"
+        "bob was present at founding but is a plain member, not an owner"
     );
     assert_eq!(
         bob_view.role_of(bob_id.public_id()),
@@ -181,8 +169,7 @@ async fn two_peers_ratify_open_to_closed_transition() {
     // Both transition logs should have one entry (the close).
     assert_eq!(alice_view.transitions.len(), 1);
     assert_eq!(bob_view.transitions.len(), 1);
-    // And the proposal should have left the pending list on both
-    // sides.
+    // And the proposal should have left the pending list on both sides.
     assert!(
         alice_view.pending.is_empty(),
         "alice still has pending: {:?}",
@@ -194,25 +181,30 @@ async fn two_peers_ratify_open_to_closed_transition() {
         bob_view.pending
     );
 
-    // Both transitions should carry the same signer set + matching
-    // variant — the signed log is byte-identical across peers when
-    // the close ratifies cleanly.
+    // Byte-identical genesis on both peers, carrying exactly one signer — the
+    // founder. This is what lets any later joiner re-verify the log from
+    // genesis (see `verify_log`): a multi-signer genesis would be rejected.
     assert_eq!(
         alice_view.transitions[0].variant,
         bob_view.transitions[0].variant
     );
-    let mut alice_signers = alice_view.transitions[0].signers.clone();
-    let mut bob_signers = bob_view.transitions[0].signers.clone();
-    alice_signers.sort();
-    bob_signers.sort();
     assert_eq!(
-        alice_signers, bob_signers,
-        "both peers' transition log entries should record the same signer set\n\
+        alice_view.transitions[0].signers, bob_view.transitions[0].signers,
+        "both peers record the identical single-signer genesis\n\
          alice = {:?}\n\
          bob   = {:?}",
         alice_view.transitions[0], bob_view.transitions[0],
     );
-    assert_eq!(alice_signers.len(), 2, "alice + bob both signed");
+    assert_eq!(
+        alice_view.transitions[0].signers,
+        vec![alice_id.public_id().to_string()],
+        "genesis is the founder's lone self-election"
+    );
+
+    // The genesis log must re-verify standalone — the guarantee a third peer
+    // relies on when it converges the fleet purely from gossip.
+    myownmesh_core::network_state::verify_log(network_id, &alice_view.transitions)
+        .expect("single-signer genesis must verify from scratch");
 }
 
 #[tokio::test]
@@ -260,7 +252,9 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
     // Close the network: Alice becomes founder-owner, Bob a member.
-    let close = myownmesh_core::engine::governance::propose(
+    // Alice founds the closed network with her lone signature; it ratifies on
+    // her at once and converges to Bob (single-signer genesis needs no co-sign).
+    myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
@@ -269,18 +263,6 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        bob_state
-            .governance_state
-            .read()
-            .pending
-            .iter()
-            .any(|p| p.id == close)
-    })
-    .await;
-    myownmesh_core::engine::governance::sign_proposal(&bob_state, &close, None)
-        .await
-        .expect("bob sign close");
     wait_for(Duration::from_secs(10), || {
         alice_state.governance_state.read().kind == NetworkKind::Closed
             && bob_state.governance_state.read().kind == NetworkKind::Closed
@@ -326,6 +308,113 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
 }
 
 #[tokio::test]
+async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
+    // The lost/stolen-device kick must propagate. When the owner evicts a
+    // member, every peer that learned that member *through gossip* (not by
+    // ratifying the evict locally) has to drop it from its roster too, so the
+    // device loses authorisation network-wide — not just on the owner. This is
+    // the regression guard for the bug where the gossip-adopt path re-projected
+    // roles but never removed the evicted row, so evicted devices lingered
+    // (still authorised) on every co-member.
+    shared_home();
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral()); // owner
+    let bob_id = Arc::new(Identity::ephemeral()); // co-member, online
+    let carol_id = Arc::new(Identity::ephemeral()); // admitted then evicted, offline
+
+    let network_id = "evict-gossip-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bd) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    // Found, then admit Carol into the signed member log (she never connects).
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("propose close");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("admit carol");
+
+    // Carol converges into Bob's roster via the signed log — Bob only ever
+    // learns her through gossip, never a direct connection.
+    wait_for(Duration::from_secs(10), || {
+        rostered(&bob_state, carol_id.public_id())
+    })
+    .await;
+
+    // Alice evicts Carol (the propagating lost-device kick).
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::Evict {
+            target: carol_id.public_id().to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("evict carol");
+
+    // Gone on the owner (local ratify path already removed her)...
+    wait_for(Duration::from_secs(10), || {
+        !rostered(&alice_state, carol_id.public_id())
+    })
+    .await;
+    // ...and — the fix — gone on Bob too, who learned the evict only via gossip.
+    wait_for(Duration::from_secs(10), || {
+        !rostered(&bob_state, carol_id.public_id())
+    })
+    .await;
+    assert!(
+        !rostered(&bob_state, carol_id.public_id()),
+        "an evicted member must be dropped from a gossip peer's roster"
+    );
+    // The owner is still authorised on Bob (the prune keeps genuine members).
+    assert!(
+        rostered(&bob_state, alice_id.public_id()),
+        "the owner must remain in the roster after an unrelated evict"
+    );
+}
+
+#[tokio::test]
 async fn manager_admits_a_member_which_converges_via_the_member_log() {
     // The two-key model end to end: an owner promotes a peer to **manager**
     // (Controller), and that manager — not just the owner — admits a member.
@@ -367,7 +456,9 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
     // Close: Alice founder-owner, Bob a member.
-    let close = myownmesh_core::engine::governance::propose(
+    // Alice founds the closed network with her lone signature; it ratifies on
+    // her at once and converges to Bob (single-signer genesis needs no co-sign).
+    myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
@@ -376,18 +467,6 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     )
     .await
     .expect("propose close");
-    wait_for(Duration::from_secs(10), || {
-        bob_state
-            .governance_state
-            .read()
-            .pending
-            .iter()
-            .any(|p| p.id == close)
-    })
-    .await;
-    myownmesh_core::engine::governance::sign_proposal(&bob_state, &close, None)
-        .await
-        .expect("bob sign close");
     wait_for(Duration::from_secs(10), || {
         alice_state.governance_state.read().kind == NetworkKind::Closed
             && bob_state.governance_state.read().kind == NetworkKind::Closed
@@ -504,7 +583,10 @@ async fn deny_invalidates_proposal_on_both_sides() {
 
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
-    let proposal_id = myownmesh_core::engine::governance::propose(
+    // A deny only has something to veto when the proposer can't ratify alone,
+    // so first build a two-owner network. A single-signer genesis close ratifies
+    // instantly and is never up for a vote.
+    myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::KindChange {
             to: NetworkKind::Closed,
@@ -512,7 +594,43 @@ async fn deny_invalidates_proposal_on_both_sides() {
         None,
     )
     .await
-    .expect("propose");
+    .expect("propose close");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+
+    // Alice promotes Bob to a second Owner — unanimous of current owners is just
+    // Alice, so this ratifies and converges to Bob.
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: bob_id.public_id().to_string(),
+            role: Role::Owner,
+        },
+        None,
+    )
+    .await
+    .expect("propose grant bob owner");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().role_of(bob_id.public_id()) == Role::Owner
+            && bob_state.governance_state.read().role_of(bob_id.public_id()) == Role::Owner
+    })
+    .await;
+
+    // Now Alice proposes to re-open the network. `closed → open` needs unanimous
+    // owner consent (Alice *and* Bob), so Alice's lone signature can't ratify it
+    // — it sits pending, up for Bob's vote.
+    let proposal_id = myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Open,
+        },
+        None,
+    )
+    .await
+    .expect("propose reopen");
 
     wait_for(Duration::from_secs(10), || {
         bob_state
@@ -537,13 +655,13 @@ async fn deny_invalidates_proposal_on_both_sides() {
     })
     .await;
 
-    // The network kind must NOT have transitioned to Closed —
-    // deny is a hard kill switch.
-    assert_eq!(alice_state.governance_state.read().kind, NetworkKind::Open);
-    assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Open);
-    // And the transition log stays empty.
-    assert!(alice_state.governance_state.read().transitions.is_empty());
-    assert!(bob_state.governance_state.read().transitions.is_empty());
+    // The reopen was vetoed — the network stays Closed on both sides, and the
+    // denied transition was never appended (only the close + the owner grant
+    // remain in the log).
+    assert_eq!(alice_state.governance_state.read().kind, NetworkKind::Closed);
+    assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Closed);
+    assert_eq!(alice_state.governance_state.read().transitions.len(), 2);
+    assert_eq!(bob_state.governance_state.read().transitions.len(), 2);
 }
 
 // ---- helpers --------------------------------------------------------

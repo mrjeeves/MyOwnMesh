@@ -900,7 +900,7 @@ async fn adopt_transition_log(
             let shares_prefix = incoming_gov
                 .iter()
                 .zip(gov.transitions.iter())
-                .all(|(a, b)| a.variant == b.variant && a.signers == b.signers);
+                .all(|(a, b)| a.variant == b.variant && same_signer_set(a, b));
             if longer && !shares_prefix {
                 diag(
                     state,
@@ -934,7 +934,7 @@ async fn adopt_transition_log(
     };
 
     // Apply both tiers under the write lock; reproject + mirror if either moved.
-    let (changed, roles) = {
+    let (changed, roles, kind) = {
         let mut gov = state.governance_state.write();
         let mut changed = false;
 
@@ -957,8 +957,9 @@ async fn adopt_transition_log(
             }
         }
 
+        let kind = gov.kind;
         if !changed {
-            (false, gov.roles.clone())
+            (false, gov.roles.clone(), kind)
         } else {
             let projected = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
             gov.roles = projected.clone();
@@ -969,7 +970,7 @@ async fn adopt_transition_log(
                     format!("persist after adopting logs failed: {e}"),
                 );
             }
-            (true, projected)
+            (true, projected, kind)
         }
     };
 
@@ -979,10 +980,17 @@ async fn adopt_transition_log(
 
     // Mirror the converged roles into the roster's `role` projection so every
     // peer row — and AllMyStuff's fleet view, which reads this projection —
-    // renders the right authority/membership without re-reading the logs.
+    // renders the right authority/membership without re-reading the logs. On a
+    // **closed** network the roster *is* the signed membership, so we also prune
+    // anyone the logs no longer carry — this is how an eviction learned only via
+    // gossip actually de-authorises the target (the local-ratify path removes it
+    // directly; without this the two paths disagreed and evictions never
+    // converged).
     {
         let mut roster = state.roster.write();
-        if mirror_roles_to_roster(&roles, &mut roster) {
+        let prune = kind == NetworkKind::Closed && !roles.is_empty();
+        let self_pk = state.identity.public_id().to_string();
+        if mirror_roles_to_roster(&roles, &mut roster, prune, &self_pk) {
             if let Err(e) = crate::roster::save(&roster) {
                 diag(
                     state,
@@ -1009,12 +1017,24 @@ async fn adopt_transition_log(
 /// Mirror a [`crate::network_state::NetworkState::roles`] map into the roster's
 /// per-entry `role` projection. Role-bearing pubkeys missing from the roster
 /// are added (a bare entry, so the owner shows up even before membership gossip
-/// reaches us); any entry no longer carrying a role is reset to
-/// [`Role::Member`], so a converged revoke doesn't leave a stale tag. Returns
-/// whether the roster changed (to gate the disk write).
+/// reaches us). Returns whether the roster changed (to gate the disk write).
+///
+/// `roles` here is the **complete** membership projection: `project_roles` folds
+/// every member of the signed member-log in as [`Role::Member`], so a device
+/// absent from `roles` is genuinely not a member.
+///
+/// `prune_to_membership` should be set for a **closed** network, whose roster is
+/// exactly the signed membership. Then any roster entry not in `roles` is
+/// **removed** — except this device (`self_pubkey`), which is always locally
+/// authoritative — so an `Evict`/`RoleRevoke` that reaches us only through
+/// gossip actually drops the target. On an open network it stays unset: `roles`
+/// is empty there and membership isn't the signed logs, so we merely clear a
+/// stale role tag rather than delete rows.
 fn mirror_roles_to_roster(
     roles: &std::collections::BTreeMap<String, Role>,
     roster: &mut crate::roster::Roster,
+    prune_to_membership: bool,
+    self_pubkey: &str,
 ) -> bool {
     let mut changed = false;
     for (pubkey, role) in roles {
@@ -1026,10 +1046,21 @@ fn mirror_roles_to_roster(
             changed = true;
         }
     }
-    for entry in roster.authorized_devices.iter_mut() {
-        if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
-            entry.role = Role::Member;
+    if prune_to_membership {
+        let self_pk = crate::signing::pubkey_part(self_pubkey);
+        let before = roster.authorized_devices.len();
+        roster
+            .authorized_devices
+            .retain(|e| roles.contains_key(&e.device_id) || e.device_id == self_pk);
+        if roster.authorized_devices.len() != before {
             changed = true;
+        }
+    } else {
+        for entry in roster.authorized_devices.iter_mut() {
+            if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
+                entry.role = Role::Member;
+                changed = true;
+            }
         }
     }
     changed
@@ -1064,6 +1095,56 @@ async fn request_roster(state: &Arc<EngineState>, peer_id: &str) {
 
 // ---- ratification ---------------------------------------------------
 
+/// Reorder a transition's `(signer, signature)` pairs into a canonical,
+/// peer-independent order: the proposer first, then every other signer sorted
+/// by pubkey, each signature carried with its signer. Signatures are matched to
+/// signers positionally by [`network_state::verify_transition_signatures`], so
+/// the two vectors are permuted together.
+///
+/// Ratification runs the assembled transition through this so that two peers
+/// which gathered the same co-signatures in different ack-arrival orders record
+/// the *byte-identical* entry. That is what the shared-prefix fork guard in
+/// [`adopt_transition_log`] — and any future hash over the log — depend on.
+/// ed25519 signatures are deterministic, so once the signer order agrees the
+/// whole entry agrees. Keeping the proposer first preserves the
+/// `signers.first() == founder/proposer` convention `apply_transition` relies
+/// on (genesis and splits are single-signer, so this is a no-op for them).
+fn canonicalize_signers(
+    proposer: &str,
+    signers: &[String],
+    signatures: &[String],
+) -> (Vec<String>, Vec<String>) {
+    // A malformed pending record with mismatched lengths is left as-is so the
+    // downstream signature check rejects it cleanly rather than mis-pairing.
+    if signers.len() != signatures.len() {
+        return (signers.to_vec(), signatures.to_vec());
+    }
+    let mut pairs: Vec<(&String, &String)> = signers.iter().zip(signatures.iter()).collect();
+    pairs.sort_by(|a, b| {
+        let ka = (if a.0 == proposer { 0 } else { 1 }, a.0);
+        let kb = (if b.0 == proposer { 0 } else { 1 }, b.0);
+        ka.cmp(&kb)
+    });
+    pairs
+        .into_iter()
+        .map(|(s, g)| (s.clone(), g.clone()))
+        .unzip()
+}
+
+/// Whether two transitions carry the same signer *set*, order-independent.
+/// The shared-prefix fork guard uses this so the same ratified transition,
+/// recorded with its co-signers in different orders on two peers, is recognised
+/// as the same entry rather than a fork. New ratifications are canonicalised by
+/// [`canonicalize_signers`]; this also tolerates logs written before that.
+fn same_signer_set(a: &Transition, b: &Transition) -> bool {
+    if a.signers.len() != b.signers.len() {
+        return false;
+    }
+    let a_set: std::collections::BTreeSet<&str> = a.signers.iter().map(String::as_str).collect();
+    let b_set: std::collections::BTreeSet<&str> = b.signers.iter().map(String::as_str).collect();
+    a_set == b_set
+}
+
 /// If `proposal_id`'s pending entry has gathered enough signatures
 /// to satisfy the quorum table for its variant — and hasn't been
 /// denied — fold it into the signed transition log, apply, persist,
@@ -1082,39 +1163,33 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
         }
         let p = &gov.pending[idx];
 
-        // Verify every signature in the set re-derives correctly.
-        let signers = p.signers.clone();
-        let signatures = p.signatures.clone();
+        // Fold the (signer, signature) pairs into a canonical order —
+        // proposer first, then the rest sorted by signer pubkey — so that two
+        // peers who collected the same co-signatures in different ack-arrival
+        // orders record the *byte-identical* transition. Without this, the
+        // shared-prefix fork guard in `adopt_transition_log` would see two
+        // orderings of the same multi-signer transition as divergent logs and
+        // refuse to converge. ed25519 signatures are deterministic, so once the
+        // signer order agrees the whole entry agrees. Genesis and splits are
+        // single-signer, so `first()` still resolves to the founder/proposer
+        // (canonicalisation is a no-op there).
+        let (signers, signatures) = canonicalize_signers(&p.proposer, &p.signers, &p.signatures);
         let candidate = Transition {
             at: p.created_at,
             variant: p.variant.clone(),
-            signers: signers.clone(),
-            signatures: signatures.clone(),
+            signers,
+            signatures,
         };
         if network_state::verify_transition_signatures(&state.network_id, &candidate).is_err() {
             // Should never happen — we verified each at intake.
             return Ok(());
         }
 
-        // Quorum check.
-        let members = {
-            // Members for quorum = everyone in the roster *plus* the
-            // role-tagged peers in the governance state. We dedupe so
-            // a peer who happens to be in both isn't counted twice.
-            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for entry in state.roster.read().authorized_devices.iter() {
-                set.insert(entry.device_id.clone());
-            }
-            for k in gov.roles.keys() {
-                set.insert(k.clone());
-            }
-            // The local identity is always implicitly a member (it
-            // owns the daemon). Without this, founder self-election
-            // wouldn't find the founder in the member set.
-            set.insert(state.identity.public_id().to_string());
-            set.into_iter().collect::<Vec<_>>()
-        };
-        if network_state::verify_quorum(&gov, &candidate, &members).is_err() {
+        // Quorum check. Authority is read entirely off the signed state
+        // (`gov.roles`), reconstructed from the log — no external roster is
+        // consulted, so this matches what a converging peer's `verify_log`
+        // will re-derive.
+        if network_state::verify_quorum(&gov, &candidate).is_err() {
             return Ok(());
         }
 
