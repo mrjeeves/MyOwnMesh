@@ -155,10 +155,41 @@ pub struct AudioSample {
 /// idle lane costs nothing: no samples written, no RTP sent. Lane 0 is the
 /// original single lane: a peer that predates the pool negotiates only it,
 /// and everything still works on lane 0.
+///
+/// This is the DEFAULT and the ceiling. The per-connection count is resolved
+/// at [`Transport::new`] from `MYOWNMESH_MEDIA_LANES` (see [`resolve_media_lanes`]):
+/// a device that never streams media over the mesh — e.g. the NanoKVM, whose
+/// video rides its tunnelled web UI, not a mesh track — sets it to 1 (or 0) so
+/// each peer connection negotiates 2 media m-lines instead of 16. On a single,
+/// slow core (the Sophgo SG2002's lone in-order C906) the 16-m-line
+/// offer/answer + 16× SRTP/track setup is the dominant per-connect cost, and it
+/// measurably pushes a connect's completion past
+/// [`super::super::engine::scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS`], so the
+/// attempt is torn down and rebuilt before its data channel ever opens — a
+/// permanent connect/rebuild churn that pegs the core and starves the control
+/// socket. Fewer lanes let the data channel (all a data-only appliance needs)
+/// open well inside the timeout.
 pub const MEDIA_LANES: usize = 8;
 
+/// Per-connection media-lane count, resolved once at transport construction.
+/// `MYOWNMESH_MEDIA_LANES` overrides the [`MEDIA_LANES`] default; it's clamped
+/// to `0..=MEDIA_LANES` so track-id parsing (capped at [`MEDIA_LANES`]) stays
+/// valid and a typo can't request an unbounded track pool. 0 is data-channel
+/// only (no media m-lines at all).
+fn resolve_media_lanes() -> usize {
+    match std::env::var("MYOWNMESH_MEDIA_LANES") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) => n.min(MEDIA_LANES),
+            Err(_) => MEDIA_LANES,
+        },
+        Err(_) => MEDIA_LANES,
+    }
+}
+
 /// The lane a track id encodes (`"video-3"` → 3). A bare `"video"` /
-/// `"audio"` id — a peer from before the lane pool — is lane 0.
+/// `"audio"` id — a peer from before the lane pool — is lane 0. Parsing is
+/// capped at the [`MEDIA_LANES`] ceiling (not the local per-connection count),
+/// so a peer that provisioned more lanes than we did is still routed correctly.
 fn lane_of_track_id(id: &str) -> u8 {
     id.rsplit_once('-')
         .and_then(|(_, n)| n.parse::<u8>().ok())
@@ -192,6 +223,8 @@ impl LocalIceCandidate {
 #[derive(Clone)]
 pub struct Transport {
     api: Arc<webrtc::api::API>,
+    /// Media lanes provisioned per peer connection (see [`resolve_media_lanes`]).
+    media_lanes: usize,
 }
 
 impl Transport {
@@ -253,7 +286,18 @@ impl Transport {
             excluded = VIRTUAL_IFACE_PREFIXES.len(),
             "ICE interface filter active — Docker/virtual interfaces excluded from candidate gathering"
         );
-        Ok(Self { api: Arc::new(api) })
+        let media_lanes = resolve_media_lanes();
+        if media_lanes != MEDIA_LANES {
+            info!(
+                media_lanes,
+                default = MEDIA_LANES,
+                "media-lane pool overridden via MYOWNMESH_MEDIA_LANES"
+            );
+        }
+        Ok(Self {
+            api: Arc::new(api),
+            media_lanes,
+        })
     }
 
     /// Open a new [`PeerSession`] for the given peer with the
@@ -300,9 +344,9 @@ impl Transport {
         // share — and so interleave on — a single track. An idle lane costs
         // nothing: no samples written, no RTP sent. Lane 0 is the original
         // single lane, so a peer that predates the pool negotiates just it.
-        let mut video_tracks = Vec::with_capacity(MEDIA_LANES);
-        let mut audio_tracks = Vec::with_capacity(MEDIA_LANES);
-        for lane in 0..MEDIA_LANES {
+        let mut video_tracks = Vec::with_capacity(self.media_lanes);
+        let mut audio_tracks = Vec::with_capacity(self.media_lanes);
+        for lane in 0..self.media_lanes {
             let video_track = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_H264.to_owned(),
