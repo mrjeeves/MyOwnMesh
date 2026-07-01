@@ -111,7 +111,7 @@ certificate chain rooted at the founder:
 
 | Section | What it holds | Who signs | Convergence |
 |---|---|---|---|
-| **governance log** (`transitions`) | kind changes, **owner** + **manager** (controller) grants/revokes/evicts, splits | owners (unanimous for an owner grant; ≥1 owner for a manager grant) | strict-prefix-extend: a peer can only *extend* the shared prefix, never rewrite the genesis (and the owner it elected) |
+| **governance log** (`transitions`) | kind changes, **owner** + **manager** (controller) grants/revokes/evicts, splits | ≥ 1 **owner** for an owner grant/revoke; ≥ 1 **controller or owner** for a manager grant/revoke (flat peer authority, single-signer) | strict-prefix-extend: a peer can only *extend* the shared prefix, never rewrite the genesis (and the owner it elected) |
 | **member log** (`member_log`) | per-member admit/remove entries | any one owner/manager (≥1 authority) | **union-merge**: every distinct entry from either side is kept, deduped by content; latest-per-device wins (removals are tombstones) |
 
 This is the cert chain in motion: the **owner** is the root and issues
@@ -123,10 +123,13 @@ log — so authority over the *messenger* is never authority over the
 gossips a roster entry, or a manager who tries to grant `controller` in
 the member log, produces something every honest peer ignores.
 
-**Why two logs.** Owner and manager changes are rare and need
-coordinated authority (an owner grant is unanimous), so the governance
-log is a single strict-prefix chain and a fork is rejected outright.
-Member changes are frequent and **multi-writer**: two managers, each
+**Why two logs.** Owner and manager changes are rare and sit at the
+root/intermediate tiers of the cert chain, so the governance log is a
+single strict-prefix chain and a fork is rejected outright. (Authority
+there is still flat and single-signer — any owner mints owners, any
+manager mints managers — the strict-prefix shape is about ordering the
+rare high-tier changes, not about requiring a quorum.) Member changes are
+frequent and **multi-writer**: two managers, each
 offline, can admit different members at the same time. A strict-prefix
 log would fork on that and neither side would adopt the other; the
 union-merged member log keeps both admissions and converges with no
@@ -167,8 +170,19 @@ signed state-update appended to the per-network state log.
 
 | From | To | Authority |
 |---|---|---|
-| `open`   | `closed` | every current member must sign (= unanimous member consent) |
+| `open`   | `closed` | the founder alone signs (single-signer self-election) |
 | `closed` | `open`   | every current owner must sign |
+
+Founding a closed network is a **single-signer founder self-election**:
+the proposer signs, becomes the sole owner, and everyone already present
+in the open network becomes a plain `member` of the closed one (they can
+leave if they object). It is deliberately *not* a consent vote. A
+converging peer replays the log from genesis against an **empty** member
+set (`verify_log`) and has no way to reconstruct who *else* was in the
+open network at close time — so a multi-signer "unanimous consent"
+genesis could never be re-verified downstream. Standing genesis on the
+founder's lone signature is what makes the closed network's authority
+chain verifiable by anyone who later pulls the log.
 
 Each transition appends to `network_state.json`'s transition log:
 
@@ -182,8 +196,8 @@ Each transition appends to `network_state.json`'s transition log:
     {
       "variant": { "kind": "kind_change", "to": "closed" },
       "at": 1718000000,
-      "signers":    ["<owner_pubkey>", "<member_pubkey>", "..."],
-      "signatures": ["<base32 sig>", "<base32 sig>", "..."]
+      "signers":    ["<founder_pubkey>"],
+      "signatures": ["<base32 sig>"]
     }
   ],
   // Member log (leaf tier): per-member admits/removes, each signed by a
@@ -204,53 +218,39 @@ Verification: a peer accepts a `network_state` from another peer
 only when the chain of transitions back to the founder is fully
 signed by the right authorities at each step.
 
-### Resolving a stuck close proposal
+### Founding is immediate — there is no stalled close
 
-Unanimous consent is the ceiling; voluntary participation is the
-floor. The lifecycle:
+Because founding is single-signer, a close never stalls. The founder
+publishes `network_state_propose { transition: { to: "closed" } }`,
+self-signs, and it ratifies **at once** on the founder and converges to
+every other peer via gossip — each adopts the single-signer genesis
+without being asked to co-sign. A closed network's identity is its
+`network_id` (at the app layer, derived from a shared key) plus the
+members on its signed roster — never its display label. Two unrelated
+closed networks may carry the same human name; they never collide,
+because convergence is on the key-derived id and the roster, not the
+name. There is no consent round, no pending
+Approvals card for a close, and therefore no "some members are still
+silent" state to resolve. (A *deny* still applies to a proposal the
+proposer can't authorize alone — e.g. a **member** proposing an admission
+for an owner/manager to co-sign — just not to founding, which the founder
+signs by itself.)
 
-1. **Propose.** The would-be owner publishes a
-   `network_state_propose { transition: { to: "closed" } }`. Every
-   currently-rostered member sees it as a pending Approvals-tab
-   card.
-2. **Unanimous sign → clean close.** Every member returns
-   `network_state_ack { decision: "sign" }`; the transition lands
-   network-wide. Done.
-3. **Any deny → proposal dead.** A signed
-   `network_state_ack { decision: "deny" }` from any current member
-   invalidates the proposal. The closer's local view rewinds to
-   open and the close is removed from the pending log. The closer
-   can re-propose later or never.
-4. **Timeout with partial signatures → split.** After
-   `STATE_PROPOSAL_TIMEOUT_S` (default **3 minutes**) some members
-   are still silent. **Only the
-   would-be owner of the closed network — i.e. the original
-   proposer — can fire the split**: they publish
-   `network_state_split` carrying the signers they have so far.
-   That message spawns a new closed network derived from the
-   original; the proposer is its founder-owner. Co-signers join
-   automatically with the role they ack'd to in the original
-   close (default `member`); non-signers stay in the original
-   network unchanged.
+> **Legacy note (split fallback).** Earlier revisions required *unanimous
+> member consent* to close, with a timeout-driven **split** fallback for
+> when signatures stalled: after `STATE_PROPOSAL_TIMEOUT_S` the would-be
+> owner published `network_state_split` to spawn a derived closed network
+> from the signers gathered so far. Single-signer founding removes the
+> stall that fallback existed for, so **the close path no longer triggers
+> a split.** The split primitive still lives in the codebase (its wire
+> type `network_state_split` and the deterministic id derivation below are
+> unchanged) but is no longer reached via close; removing or repurposing
+> it is a follow-up, not a behaviour this path relies on.
 
-The split is not the closer's first move — it's the fallback for
-when getting everyone aligned is taking longer than they're
-willing to wait. Step 2 stays the happy path; step 4 stays a
-deliberate "I'm proceeding without the silent members" decision,
-made by the person whose ownership the close was about in the
-first place.
+### Split id derivation (retained)
 
-Three minutes (not 24 hours) is deliberate: a proposal that's
-lingered past a few minutes is either getting consensus or it
-isn't, and a longer wait would have the would-be owner staring
-at a "pending" badge long after they'd given up. Short enough
-that the split feels like a sibling action to the close itself.
-
-### Splits in detail
-
-A split's wire effect is to **spawn a new network**, not to mutate
-the original. The new network's id is derived deterministically
-from the original's id and the signer set:
+A split spawns a **new** network rather than mutating the original. Its
+id is derived deterministically from the original's id and the signer set:
 
 ```
 new_network_id = base32_lowercase(SHA-256(
@@ -384,17 +384,18 @@ The four foundational choices, settled:
    than OR-Set CRDT, matches the existing append-mostly roster
    file shape, and the partition risk in the deployments this
    targets (friend-mesh / office-mesh) is low.
-2. **Resolving a stuck close — would-be-owner-initiated split.**
-   Unanimous-of-rostered is the ceiling. If silent members stall
-   the proposal past `STATE_PROPOSAL_TIMEOUT_S` (default 3
-   minutes), **only the original proposer — the would-be founder
-   owner — can fire the split.** Publishing
-   `network_state_split` spawns a derived closed network from the
-   signers they have. Nodes that want the closed governance join
-   the split; nodes that don't, stay where they are. No
-   automatic-on-reconnect prompt, no M-of-N override — the close
-   either gets everyone or it splits, and the new closed network
-   is governed by the person who wanted it that way.
+2. **Founding a closed network — single-signer self-election.**
+   The founder alone signs `to: "closed"` and becomes sole owner;
+   peers already present become plain members. This is what a
+   converging peer can re-verify from the log (genesis replays
+   against an empty member set), so a close never stalls and needs
+   no consent round. *(Superseded design: founding once required
+   unanimous member consent with a would-be-owner-initiated
+   **split** fallback after `STATE_PROPOSAL_TIMEOUT_S` when
+   signatures stalled. That stall can't happen under single-signer
+   founding, so the split fallback is no longer on the close path —
+   the `network_state_split` primitive remains in the code pending a
+   follow-up cleanup.)*
 3. **Forks are governance scope, not connectivity scope.** A
    fork's existence does not break the peer connections that the
    original network's signaling brought together. Two peers in

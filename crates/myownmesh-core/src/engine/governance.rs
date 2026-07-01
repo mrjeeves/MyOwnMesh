@@ -150,7 +150,7 @@ pub async fn propose(
     let id = new_proposal_id();
     let proposal = Proposal {
         id: id.clone(),
-        created_at: now_unix(),
+        created_at: member_tier_timestamp(state, &variant),
         proposer: self_pubkey.clone(),
         variant: variant.clone(),
         signers: vec![self_pubkey.clone()],
@@ -1129,6 +1129,50 @@ fn canonicalize_signers(
         .into_iter()
         .map(|(s, g)| (s.clone(), g.clone()))
         .unzip()
+}
+
+/// The pubkey a member-tier transition acts on, if it is one.
+fn member_entry_target(t: &Transition) -> Option<&str> {
+    match &t.variant {
+        TransitionVariant::RoleGrant { target, .. }
+        | TransitionVariant::RoleRevoke { target }
+        | TransitionVariant::Evict { target } => Some(target.as_str()),
+        _ => None,
+    }
+}
+
+/// Timestamp to stamp on a newly-authored transition. Member-tier entries
+/// (member admit/remove) converge by last-writer-wins on `at`
+/// ([`network_state::verify_member_log`]), so a re-admit that follows an evict
+/// of the same device must carry a **strictly-later** `at` — otherwise the
+/// evict tombstone keeps winning and the re-admit silently no-ops. We stamp one
+/// past the newest existing member-log entry for that target (across every
+/// author, since the member log is union-merged), never earlier than the wall
+/// clock. Governance-tier transitions order by log position, not `at`, so they
+/// just take the wall clock.
+fn member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) -> u64 {
+    let now = now_unix();
+    let gov = state.governance_state.read();
+    let target = match variant {
+        TransitionVariant::RoleGrant {
+            target,
+            role: Role::Member,
+        } => target.as_str(),
+        TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target }
+            if gov.role_of(target) == Role::Member =>
+        {
+            target.as_str()
+        }
+        _ => return now,
+    };
+    let newest = gov
+        .member_log
+        .iter()
+        .filter(|t| member_entry_target(t) == Some(target))
+        .map(|t| t.at)
+        .max()
+        .unwrap_or(0);
+    now.max(newest.saturating_add(1))
 }
 
 /// Whether two transitions carry the same signer *set*, order-independent.

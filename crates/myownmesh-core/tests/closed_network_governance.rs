@@ -553,8 +553,9 @@ async fn deny_invalidates_proposal_on_both_sides() {
 
     let broker = LocalBroker::new();
     let transport = Transport::new().expect("transport");
-    let alice_id = Arc::new(Identity::ephemeral());
-    let bob_id = Arc::new(Identity::ephemeral());
+    let alice_id = Arc::new(Identity::ephemeral()); // owner
+    let bob_id = Arc::new(Identity::ephemeral()); // plain member
+    let carol_id = Arc::new(Identity::ephemeral()); // whom Bob proposes to admit
 
     let network_id = "deny-test-net";
     let (alice_state, _ad) = spawn_network(
@@ -583,9 +584,7 @@ async fn deny_invalidates_proposal_on_both_sides() {
 
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
-    // A deny only has something to veto when the proposer can't ratify alone,
-    // so first build a two-owner network. A single-signer genesis close ratifies
-    // instantly and is never up for a vote.
+    // Found the fleet: Alice is owner, Bob a plain member.
     myownmesh_core::engine::governance::propose(
         &alice_state,
         TransitionVariant::KindChange {
@@ -601,47 +600,34 @@ async fn deny_invalidates_proposal_on_both_sides() {
     })
     .await;
 
-    // Alice promotes Bob to a second Owner — unanimous of current owners is just
-    // Alice, so this ratifies and converges to Bob.
-    myownmesh_core::engine::governance::propose(
-        &alice_state,
+    // Bob is a member, so he has no authority to admit anyone — but a member
+    // *may propose* an admission for an owner/manager to co-sign. Bob's lone
+    // signature can't satisfy the "≥ 1 controller or owner" quorum, so his
+    // proposal to admit Carol sits pending, up for Alice's decision.
+    let proposal_id = myownmesh_core::engine::governance::propose(
+        &bob_state,
         TransitionVariant::RoleGrant {
-            target: bob_id.public_id().to_string(),
-            role: Role::Owner,
+            target: carol_id.public_id().to_string(),
+            role: Role::Member,
         },
         None,
     )
     .await
-    .expect("propose grant bob owner");
-    wait_for(Duration::from_secs(10), || {
-        alice_state
+    .expect("bob proposes admitting carol");
+    // It did NOT ratify on Bob — he lacks the authority to self-sign it.
+    assert!(
+        bob_state
             .governance_state
             .read()
-            .role_of(bob_id.public_id())
-            == Role::Owner
-            && bob_state
-                .governance_state
-                .read()
-                .role_of(bob_id.public_id())
-                == Role::Owner
-    })
-    .await;
+            .pending
+            .iter()
+            .any(|p| p.id == proposal_id),
+        "a member's admit proposal must stay pending, not self-ratify"
+    );
 
-    // Now Alice proposes to re-open the network. `closed → open` needs unanimous
-    // owner consent (Alice *and* Bob), so Alice's lone signature can't ratify it
-    // — it sits pending, up for Bob's vote.
-    let proposal_id = myownmesh_core::engine::governance::propose(
-        &alice_state,
-        TransitionVariant::KindChange {
-            to: NetworkKind::Open,
-        },
-        None,
-    )
-    .await
-    .expect("propose reopen");
-
+    // It reaches Alice as a pending decision.
     wait_for(Duration::from_secs(10), || {
-        bob_state
+        alice_state
             .governance_state
             .read()
             .pending
@@ -650,11 +636,11 @@ async fn deny_invalidates_proposal_on_both_sides() {
     })
     .await;
 
-    // Bob denies. The proposal should disappear from both sides on
-    // the next ratification pass.
-    myownmesh_core::engine::governance::deny_proposal(&bob_state, &proposal_id)
+    // Alice denies. The proposal should disappear from both sides on the next
+    // ratification pass, and Carol must never be admitted.
+    myownmesh_core::engine::governance::deny_proposal(&alice_state, &proposal_id)
         .await
-        .expect("bob deny");
+        .expect("alice deny");
 
     wait_for(Duration::from_secs(10), || {
         let a = alice_state.governance_state.read();
@@ -663,16 +649,106 @@ async fn deny_invalidates_proposal_on_both_sides() {
     })
     .await;
 
-    // The reopen was vetoed — the network stays Closed on both sides, and the
-    // denied transition was never appended (only the close + the owner grant
-    // remain in the log).
-    assert_eq!(
-        alice_state.governance_state.read().kind,
-        NetworkKind::Closed
+    assert!(
+        !rostered(&alice_state, carol_id.public_id()),
+        "a denied admit must not add the target to the roster"
     );
-    assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Closed);
-    assert_eq!(alice_state.governance_state.read().transitions.len(), 2);
-    assert_eq!(bob_state.governance_state.read().transitions.len(), 2);
+    // The denied admit was recorded in neither tier of the log (a member admit
+    // would ride the member log; only the genesis close should be present).
+    {
+        let a = alice_state.governance_state.read();
+        assert_eq!(a.transitions.len(), 1, "only the genesis close is logged");
+        assert!(
+            a.member_log.is_empty(),
+            "the denied admit must not ride the member log"
+        );
+    }
+    assert!(bob_state.governance_state.read().member_log.is_empty());
+}
+
+#[tokio::test]
+async fn re_admitting_an_evicted_member_supersedes_the_tombstone() {
+    // Member-tier convergence is last-writer-wins on `at`. A re-admit that
+    // follows an evict of the same device must supersede the tombstone even when
+    // both are authored within the same wall-clock second — otherwise the evict
+    // sticks and the re-invite silently no-ops. The engine stamps member-tier
+    // authoring monotonically to guarantee this. Single engine: the owner
+    // authors admit → evict → re-admit back to back, and we read the projected
+    // membership (`roles`), which is where the tombstone would otherwise win.
+    shared_home();
+
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral());
+    let carol_id = Arc::new(Identity::ephemeral());
+    let carol_pk = carol_id.public_id().to_string();
+
+    let network_id = "re-admit-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+
+    use myownmesh_core::engine::governance::propose;
+    propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found");
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_pk.clone(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("admit");
+    propose(
+        &alice_state,
+        TransitionVariant::Evict {
+            target: carol_pk.clone(),
+        },
+        None,
+    )
+    .await
+    .expect("evict");
+    assert!(
+        !alice_state
+            .governance_state
+            .read()
+            .roles
+            .contains_key(carol_pk.as_str()),
+        "an evicted member must be absent from the projected membership"
+    );
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_pk.clone(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("re-admit");
+
+    // Even authored back-to-back in the same wall-clock second, the re-admit
+    // must win the member-tier LWW and put Carol back in the membership.
+    assert!(
+        alice_state
+            .governance_state
+            .read()
+            .roles
+            .contains_key(carol_pk.as_str()),
+        "re-admitting an evicted member must supersede the tombstone"
+    );
 }
 
 // ---- helpers --------------------------------------------------------

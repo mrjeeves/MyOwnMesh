@@ -66,11 +66,12 @@ pub enum Role {
     /// owner/controller for co-signature.
     #[default]
     Member,
-    /// Can add `member` peers to the roster. Cannot grant
-    /// `controller` or `owner`.
+    /// Can admit/demote `member`s **and** mint or demote other
+    /// `controller`s (managers make managers). Cannot grant `owner`.
     Controller,
-    /// Can grant any role + approve network-kind transitions.
-    /// Every owner grant needs unanimous owner consent.
+    /// Can grant/demote any role (owners make owners) and approve
+    /// network-kind transitions. Flat peer authority — a single owner
+    /// signature suffices; there is no unanimous-owner requirement.
     Owner,
 }
 
@@ -135,8 +136,8 @@ pub enum TransitionVariant {
     /// this transition stops authorising it. Where [`Self::RoleRevoke`]
     /// only demotes (the peer stays a `Member`), an evict is the
     /// propagating removal — the lost/stolen-device kick. Authority
-    /// mirrors revoke: over a member needs a controller/owner, over a
-    /// controller needs an owner, over an owner needs unanimous owners.
+    /// mirrors revoke: over a member or controller needs a
+    /// controller/owner, over an owner needs an owner.
     Evict { target: String },
     /// Spawn a new closed network derived from this one. Carried in
     /// the log of the *parent* network so members can discover the
@@ -388,16 +389,26 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 /// table for its variant *against the supplied `state_before`*
 /// (the network state in effect just prior to this transition).
 ///
-/// Quorum table:
+/// Quorum table — **flat peer authority**: a holder of a tier may grant or
+/// demote at that tier or below, on a single signature, with no consensus
+/// round:
 ///   - `KindChange { to: Closed }` — single signer (the founder
 ///     self-elects; everyone already present becomes a member).
-///   - `KindChange { to: Open }` — unanimous of current owners.
-///   - `RoleGrant { role: Owner }` — unanimous of current owners.
-///   - `RoleGrant { role: Controller }` — ≥ 1 owner.
+///   - `KindChange { to: Open }` — ≥ 1 owner.
+///   - `RoleGrant { role: Owner }` — ≥ 1 owner (owners make owners).
+///   - `RoleGrant { role: Controller }` — ≥ 1 controller or owner
+///     (managers make managers).
 ///   - `RoleGrant { role: Member }` — ≥ 1 controller or owner.
-///   - `RoleRevoke` — same authority as the corresponding grant.
+///   - `RoleRevoke` / `Evict` — authority at the target's *current* tier:
+///     an owner over an owner; a controller or owner over a controller or
+///     member.
 ///   - `Split` — single signer (the proposer), who becomes
 ///     founder-owner of the derived network.
+///
+/// This is deliberately permissive: a lone rogue owner can mint or demote
+/// owners; a lone manager can mint or demote managers. That danger is the
+/// *application* layer's to guard (approval UX, out-of-band confirmation) —
+/// the network layer stays flat, single-signer, and self-similar.
 ///
 /// Every check reads authority off `state_before.roles`, which a
 /// converging peer reconstructs from the signed log itself
@@ -454,18 +465,10 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
             },
             NetworkKind::Closed,
         ) => {
-            if owners.is_empty() {
+            if !signers.iter().any(|s| owners.contains(s)) {
                 return Err(Error::Protocol(
-                    "closed → open requires owners; network has none".into(),
+                    "reopen (closed → open) needs ≥ 1 owner signature".into(),
                 ));
-            }
-            for o in &owners {
-                if !signers.contains(o) {
-                    return Err(Error::Protocol(format!(
-                        "closed → open needs unanimous owner consent; missing {}",
-                        &o[..o.len().min(12)]
-                    )));
-                }
             }
         }
         // Same-kind transitions don't make sense.
@@ -481,21 +484,13 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
             },
             NetworkKind::Closed,
         ) => {
-            if owners.is_empty() {
-                // First owner after a clean close lands via the
-                // founder self-election above, not via a separate
-                // grant. Reject here.
+            // Owners make owners: any single existing owner suffices. The first
+            // owner lands via the founder self-election (genesis) above, so a
+            // closed network always has ≥ 1 owner to author this.
+            if !signers.iter().any(|s| owners.contains(s)) {
                 return Err(Error::Protocol(
-                    "grant owner needs at least one existing owner".into(),
+                    "grant owner needs ≥ 1 owner signature".into(),
                 ));
-            }
-            for o in &owners {
-                if !signers.contains(o) {
-                    return Err(Error::Protocol(format!(
-                        "grant owner needs unanimous owner consent; missing {}",
-                        &o[..o.len().min(12)]
-                    )));
-                }
             }
         }
         (
@@ -505,9 +500,11 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
             },
             NetworkKind::Closed,
         ) => {
-            if !signers.iter().any(|s| owners.contains(s)) {
+            // Managers make managers: a controller can mint a controller, and so
+            // can an owner (the higher tier).
+            if !signers.iter().any(|s| controllers_and_owners.contains(s)) {
                 return Err(Error::Protocol(
-                    "grant controller needs ≥ 1 owner signature".into(),
+                    "grant controller needs ≥ 1 controller or owner signature".into(),
                 ));
             }
         }
@@ -530,30 +527,22 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
 
         (TransitionVariant::RoleRevoke { target }, NetworkKind::Closed) => {
             let target_role = state_before.role_of(target);
-            // Revocation requires authority over the *target's*
-            // current role.
+            // Demotion requires authority at the *target's* current tier: an
+            // owner demotes an owner; a controller (or owner) demotes a
+            // controller or a member. Flat peer authority — no consensus round.
             match target_role {
                 Role::Owner => {
-                    for o in &owners {
-                        if !signers.contains(o) {
-                            return Err(Error::Protocol(format!(
-                                "revoke owner needs unanimous owner consent; missing {}",
-                                &o[..o.len().min(12)]
-                            )));
-                        }
-                    }
-                }
-                Role::Controller => {
                     if !signers.iter().any(|s| owners.contains(s)) {
                         return Err(Error::Protocol(
-                            "revoke controller needs ≥ 1 owner signature".into(),
+                            "revoke owner needs ≥ 1 owner signature".into(),
                         ));
                     }
                 }
-                Role::Member => {
+                Role::Controller | Role::Member => {
                     if !signers.iter().any(|s| controllers_and_owners.contains(s)) {
                         return Err(Error::Protocol(
-                            "revoke member needs ≥ 1 controller or owner signature".into(),
+                            "revoke controller/member needs ≥ 1 controller or owner signature"
+                                .into(),
                         ));
                     }
                 }
@@ -564,32 +553,23 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
         }
 
         (TransitionVariant::Evict { target }, NetworkKind::Closed) => {
-            // Eviction authority is authority over the *target's* current
-            // role — identical to revoke, since an evict subsumes a revoke
-            // (it also strips roster membership).
+            // Eviction authority is authority over the *target's* current tier —
+            // identical to revoke, since an evict subsumes a revoke (it also
+            // strips roster membership).
             let target_role = state_before.role_of(target);
             match target_role {
                 Role::Owner => {
-                    for o in &owners {
-                        if !signers.contains(o) {
-                            return Err(Error::Protocol(format!(
-                                "evict owner needs unanimous owner consent; missing {}",
-                                &o[..o.len().min(12)]
-                            )));
-                        }
-                    }
-                }
-                Role::Controller => {
                     if !signers.iter().any(|s| owners.contains(s)) {
                         return Err(Error::Protocol(
-                            "evict controller needs ≥ 1 owner signature".into(),
+                            "evict owner needs ≥ 1 owner signature".into(),
                         ));
                     }
                 }
-                Role::Member => {
+                Role::Controller | Role::Member => {
                     if !signers.iter().any(|s| controllers_and_owners.contains(s)) {
                         return Err(Error::Protocol(
-                            "evict member needs ≥ 1 controller or owner signature".into(),
+                            "evict controller/member needs ≥ 1 controller or owner signature"
+                                .into(),
                         ));
                     }
                 }
@@ -1176,61 +1156,63 @@ mod tests {
     }
 
     #[test]
-    fn quorum_member_cannot_grant_controller() {
+    fn quorum_controller_grant_is_peer_authority() {
         let (_, owner) = fixture_key(1);
         let (_, member) = fixture_key(2);
-        let (_, candidate) = fixture_key(3);
+        let (_, controller) = fixture_key(3);
+        let (_, candidate) = fixture_key(4);
         let mut state = NetworkState::empty_for("net-1");
         state.kind = NetworkKind::Closed;
         state.roles.insert(owner.clone(), Role::Owner);
         state.roles.insert(member.clone(), Role::Member);
+        state.roles.insert(controller.clone(), Role::Controller);
 
-        // Member-only signer → must be rejected.
-        let t = Transition {
+        let grant_controller = |signer: &str| Transition {
             at: 0,
             variant: TransitionVariant::RoleGrant {
                 target: candidate.clone(),
                 role: Role::Controller,
             },
-            signers: vec![member],
+            signers: vec![signer.to_string()],
             signatures: vec![String::new()],
         };
-        assert!(verify_quorum(&state, &t).is_err());
+
+        // A member has no authority → rejected.
+        assert!(verify_quorum(&state, &grant_controller(&member)).is_err());
+        // Managers make managers: a controller alone can mint a controller.
+        verify_quorum(&state, &grant_controller(&controller)).unwrap();
+        // An owner (higher tier) can too.
+        verify_quorum(&state, &grant_controller(&owner)).unwrap();
     }
 
     #[test]
-    fn quorum_owner_grant_needs_every_owner() {
+    fn quorum_owner_grant_needs_one_owner() {
+        // Owners make owners: a single existing owner suffices (no unanimous
+        // requirement). A non-owner can't.
         let (_, owner_a) = fixture_key(1);
         let (_, owner_b) = fixture_key(2);
-        let (_, candidate) = fixture_key(3);
+        let (_, controller) = fixture_key(3);
+        let (_, candidate) = fixture_key(4);
         let mut state = NetworkState::empty_for("net-1");
         state.kind = NetworkKind::Closed;
         state.roles.insert(owner_a.clone(), Role::Owner);
         state.roles.insert(owner_b.clone(), Role::Owner);
+        state.roles.insert(controller.clone(), Role::Controller);
 
-        // Only owner_a signed — owner grant needs unanimous → reject.
-        let t = Transition {
+        let grant_owner = |signers: Vec<String>| Transition {
             at: 0,
             variant: TransitionVariant::RoleGrant {
                 target: candidate.clone(),
                 role: Role::Owner,
             },
-            signers: vec![owner_a.clone()],
-            signatures: vec![String::new()],
+            signatures: vec![String::new(); signers.len()],
+            signers,
         };
-        assert!(verify_quorum(&state, &t).is_err());
 
-        // Both owners signed → accept.
-        let t_ok = Transition {
-            at: 0,
-            variant: TransitionVariant::RoleGrant {
-                target: candidate,
-                role: Role::Owner,
-            },
-            signers: vec![owner_a, owner_b],
-            signatures: vec![String::new(), String::new()],
-        };
-        verify_quorum(&state, &t_ok).unwrap();
+        // One owner alone → accept.
+        verify_quorum(&state, &grant_owner(vec![owner_a.clone()])).unwrap();
+        // A controller can't mint an owner (only same-or-higher tier).
+        assert!(verify_quorum(&state, &grant_owner(vec![controller])).is_err());
     }
 
     #[test]
