@@ -741,6 +741,40 @@ pub fn verify_member_log(
     member_log: &[Transition],
     network_id: &str,
 ) -> std::collections::BTreeSet<String> {
+    member_log_verdict(gov, member_log, network_id)
+        .into_iter()
+        .filter(|(_, p)| *p)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Devices the signed member log has **explicitly removed** — the latest
+/// authorised entry for the device is an `Evict`/`RoleRevoke`. These are the
+/// only devices the roster mirror deletes on adoption; a device merely *absent*
+/// from the signed log (e.g. one added by `roster_approve` but not yet signed
+/// in) is left alone, never pruned.
+pub fn member_log_removed(
+    gov: &NetworkState,
+    member_log: &[Transition],
+    network_id: &str,
+) -> std::collections::BTreeSet<String> {
+    member_log_verdict(gov, member_log, network_id)
+        .into_iter()
+        .filter(|(_, p)| !*p)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// The member-tier verdict: device → currently a member (`true`) or explicitly
+/// removed (`false`). Only entries that verify and are authored by a current
+/// owner/manager count; for each device the latest such entry (by `at`, then a
+/// stable key) wins. A device with no authorised member-tier entry does not
+/// appear at all.
+fn member_log_verdict(
+    gov: &NetworkState,
+    member_log: &[Transition],
+    network_id: &str,
+) -> std::collections::BTreeMap<String, bool> {
     use std::collections::{BTreeMap, BTreeSet};
     let authorities: BTreeSet<&str> = gov
         .roles
@@ -781,10 +815,6 @@ pub fn verify_member_log(
         }
     }
     present
-        .into_iter()
-        .filter(|(_, p)| *p)
-        .map(|(k, _)| k)
-        .collect()
 }
 
 /// Union-merge two member-tier logs: keep every distinct entry from either
@@ -1202,6 +1232,62 @@ mod tests {
     }
 
     #[test]
+    fn member_log_removed_lists_only_tombstoned_devices() {
+        // The surgical-removal contract: `member_log_removed` returns exactly the
+        // devices the log has evicted/revoked — never a device that is merely
+        // absent from the projection. That is what keeps the roster mirror from
+        // over-pruning a device added out-of-band (e.g. `roster_approve`).
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, m) = fixture_key(2);
+        let (_, n) = fixture_key(3);
+        let net = "surgical-net";
+        let mut gov = NetworkState::empty_for(net);
+        gov.kind = NetworkKind::Closed;
+        gov.roles.insert(owner.clone(), Role::Owner);
+
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(net, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(&owner_sk, &payload)],
+                signers: vec![owner.clone()],
+                variant,
+            }
+        };
+        let member_log = vec![
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: m.clone(),
+                    role: Role::Member,
+                },
+                1,
+            ),
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: n.clone(),
+                    role: Role::Member,
+                },
+                1,
+            ),
+            // M is evicted later; N is untouched.
+            signed(TransitionVariant::Evict { target: m.clone() }, 2),
+        ];
+
+        let present = verify_member_log(&gov, &member_log, net);
+        let removed = member_log_removed(&gov, &member_log, net);
+        assert!(present.contains(&n), "N is still a member");
+        assert!(!present.contains(&m), "M was evicted");
+        assert!(
+            removed.contains(&m) && removed.len() == 1,
+            "only the explicitly-evicted M is tombstoned, not merely-absent devices"
+        );
+        assert!(
+            !removed.contains(&n),
+            "an active member is never in the removed set"
+        );
+    }
+
+    #[test]
     fn quorum_controller_grant_is_peer_authority() {
         let (_, owner) = fixture_key(1);
         let (_, member) = fixture_key(2);
@@ -1308,6 +1394,66 @@ mod tests {
             signatures: vec![String::new()],
         };
         verify_quorum(&state, &t_ok).unwrap();
+    }
+
+    #[test]
+    fn quorum_evict_authority_matrix() {
+        // The full spec: owners evict anyone; managers (controllers) evict
+        // managers and members but NOT owners; members evict nothing.
+        let (_, owner) = fixture_key(1);
+        let (_, manager) = fixture_key(2);
+        let (_, member) = fixture_key(3);
+        let (_, other_owner) = fixture_key(4);
+        let (_, other_manager) = fixture_key(5);
+        let (_, other_member) = fixture_key(6);
+
+        let mut state = NetworkState::empty_for("net-1");
+        state.kind = NetworkKind::Closed;
+        state.roles.insert(owner.clone(), Role::Owner);
+        state.roles.insert(other_owner.clone(), Role::Owner);
+        state.roles.insert(manager.clone(), Role::Controller);
+        state.roles.insert(other_manager.clone(), Role::Controller);
+        // `member` / `other_member` are absent → default Member.
+
+        let can_evict = |signer: &str, target: &str| {
+            verify_quorum(
+                &state,
+                &Transition {
+                    at: 0,
+                    variant: TransitionVariant::Evict {
+                        target: target.to_string(),
+                    },
+                    signers: vec![signer.to_string()],
+                    signatures: vec![String::new()],
+                },
+            )
+            .is_ok()
+        };
+
+        // Owners evict anyone.
+        assert!(can_evict(&owner, &other_owner), "owner evicts owner");
+        assert!(can_evict(&owner, &manager), "owner evicts manager");
+        assert!(can_evict(&owner, &member), "owner evicts member");
+        // Managers evict managers + members, but never owners.
+        assert!(
+            can_evict(&manager, &other_manager),
+            "manager evicts manager"
+        );
+        assert!(can_evict(&manager, &member), "manager evicts member");
+        assert!(
+            !can_evict(&manager, &owner),
+            "manager must NOT evict an owner"
+        );
+        // Members evict nothing.
+        assert!(!can_evict(&member, &owner), "member evicts nothing (owner)");
+        assert!(
+            !can_evict(&member, &manager),
+            "member evicts nothing (manager)"
+        );
+        assert!(
+            !can_evict(&member, &other_member),
+            "member evicts nothing (member)"
+        );
     }
 
     #[test]

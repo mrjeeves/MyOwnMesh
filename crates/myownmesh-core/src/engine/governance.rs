@@ -934,7 +934,7 @@ async fn adopt_transition_log(
     };
 
     // Apply both tiers under the write lock; reproject + mirror if either moved.
-    let (changed, roles, kind) = {
+    let (changed, roles, removed) = {
         let mut gov = state.governance_state.write();
         let mut changed = false;
 
@@ -957,11 +957,16 @@ async fn adopt_transition_log(
             }
         }
 
-        let kind = gov.kind;
         if !changed {
-            (false, gov.roles.clone(), kind)
+            (false, gov.roles.clone(), Default::default())
         } else {
             let projected = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
+            // Devices the signed log explicitly evicted/revoked — the only ones
+            // the roster mirror deletes.
+            let verified = network_state::verify_log(&state.network_id, &gov.transitions)
+                .unwrap_or_else(|_| network_state::NetworkState::empty_for(&state.network_id));
+            let removed =
+                network_state::member_log_removed(&verified, &gov.member_log, &state.network_id);
             gov.roles = projected.clone();
             if let Err(e) = network_state::save(&gov) {
                 diag(
@@ -970,7 +975,7 @@ async fn adopt_transition_log(
                     format!("persist after adopting logs failed: {e}"),
                 );
             }
-            (true, projected, kind)
+            (true, projected, removed)
         }
     };
 
@@ -978,19 +983,15 @@ async fn adopt_transition_log(
         return;
     }
 
-    // Mirror the converged roles into the roster's `role` projection so every
-    // peer row — and AllMyStuff's fleet view, which reads this projection —
-    // renders the right authority/membership without re-reading the logs. On a
-    // **closed** network the roster *is* the signed membership, so we also prune
-    // anyone the logs no longer carry — this is how an eviction learned only via
-    // gossip actually de-authorises the target (the local-ratify path removes it
-    // directly; without this the two paths disagreed and evictions never
-    // converged).
+    // Mirror the converged roles into the roster: add role-bearers, update tags,
+    // and delete only the devices the signed log explicitly evicted/revoked
+    // (`removed`). This is how an eviction learned via gossip de-authorises the
+    // target on this node, matching the local-ratify path — without over-pruning
+    // devices that are simply not (yet) in the signed projection.
     {
         let mut roster = state.roster.write();
-        let prune = kind == NetworkKind::Closed && !roles.is_empty();
         let self_pk = state.identity.public_id().to_string();
-        if mirror_roles_to_roster(&roles, &mut roster, prune, &self_pk) {
+        if mirror_roles_to_roster(&roles, &mut roster, &removed, &self_pk) {
             if let Err(e) = crate::roster::save(&roster) {
                 diag(
                     state,
@@ -1014,26 +1015,23 @@ async fn adopt_transition_log(
     broadcast_state(state).await;
 }
 
-/// Mirror a [`crate::network_state::NetworkState::roles`] map into the roster's
-/// per-entry `role` projection. Role-bearing pubkeys missing from the roster
-/// are added (a bare entry, so the owner shows up even before membership gossip
-/// reaches us). Returns whether the roster changed (to gate the disk write).
+/// Mirror the converged signed state into the roster. Role-bearing pubkeys
+/// missing from the roster are added (so the owner shows up even before
+/// membership gossip reaches us) and role tags are updated. Returns whether the
+/// roster changed (to gate the disk write).
 ///
-/// `roles` here is the **complete** membership projection: `project_roles` folds
-/// every member of the signed member-log in as [`Role::Member`], so a device
-/// absent from `roles` is genuinely not a member.
-///
-/// `prune_to_membership` should be set for a **closed** network, whose roster is
-/// exactly the signed membership. Then any roster entry not in `roles` is
-/// **removed** — except this device (`self_pubkey`), which is always locally
-/// authoritative — so an `Evict`/`RoleRevoke` that reaches us only through
-/// gossip actually drops the target. On an open network it stays unset: `roles`
-/// is empty there and membership isn't the signed logs, so we merely clear a
-/// stale role tag rather than delete rows.
+/// `removed` is the set of devices the signed member log has **explicitly
+/// tombstoned** (an `Evict`/`RoleRevoke`). Those — and only those — are deleted
+/// from the roster (never this device, `self_pubkey`), so an eviction learned
+/// only through gossip actually de-authorises the target, matching the
+/// local-ratify path. Crucially we do **not** prune "anyone not in the signed
+/// projection": a device added by `roster_approve` (or one whose signed admit
+/// this node can't verify yet) is left in place rather than silently dropped —
+/// that over-pruning is what made members vanish and re-appear.
 fn mirror_roles_to_roster(
     roles: &std::collections::BTreeMap<String, Role>,
     roster: &mut crate::roster::Roster,
-    prune_to_membership: bool,
+    removed: &std::collections::BTreeSet<String>,
     self_pubkey: &str,
 ) -> bool {
     let mut changed = false;
@@ -1046,21 +1044,20 @@ fn mirror_roles_to_roster(
             changed = true;
         }
     }
-    if prune_to_membership {
-        let self_pk = crate::signing::pubkey_part(self_pubkey);
-        let before = roster.authorized_devices.len();
-        roster
-            .authorized_devices
-            .retain(|e| roles.contains_key(&e.device_id) || e.device_id == self_pk);
-        if roster.authorized_devices.len() != before {
+    // Drop only the explicitly-evicted, and never ourselves.
+    let self_pk = crate::signing::pubkey_part(self_pubkey);
+    let before = roster.authorized_devices.len();
+    roster
+        .authorized_devices
+        .retain(|e| e.device_id == self_pk || !removed.contains(&e.device_id));
+    if roster.authorized_devices.len() != before {
+        changed = true;
+    }
+    // Clear a stale role tag on any entry the signed roles no longer cover.
+    for entry in roster.authorized_devices.iter_mut() {
+        if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
+            entry.role = Role::Member;
             changed = true;
-        }
-    } else {
-        for entry in roster.authorized_devices.iter_mut() {
-            if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
-                entry.role = Role::Member;
-                changed = true;
-            }
         }
     }
     changed
