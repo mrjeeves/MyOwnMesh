@@ -614,8 +614,16 @@ async fn deny_invalidates_proposal_on_both_sides() {
     .await
     .expect("propose grant bob owner");
     wait_for(Duration::from_secs(10), || {
-        alice_state.governance_state.read().role_of(bob_id.public_id()) == Role::Owner
-            && bob_state.governance_state.read().role_of(bob_id.public_id()) == Role::Owner
+        alice_state
+            .governance_state
+            .read()
+            .role_of(bob_id.public_id())
+            == Role::Owner
+            && bob_state
+                .governance_state
+                .read()
+                .role_of(bob_id.public_id())
+                == Role::Owner
     })
     .await;
 
@@ -658,7 +666,10 @@ async fn deny_invalidates_proposal_on_both_sides() {
     // The reopen was vetoed — the network stays Closed on both sides, and the
     // denied transition was never appended (only the close + the owner grant
     // remain in the log).
-    assert_eq!(alice_state.governance_state.read().kind, NetworkKind::Closed);
+    assert_eq!(
+        alice_state.governance_state.read().kind,
+        NetworkKind::Closed
+    );
     assert_eq!(bob_state.governance_state.read().kind, NetworkKind::Closed);
     assert_eq!(alice_state.governance_state.read().transitions.len(), 2);
     assert_eq!(bob_state.governance_state.read().transitions.len(), 2);
