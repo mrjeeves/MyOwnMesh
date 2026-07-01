@@ -106,9 +106,9 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
     // open network is already populated when Alice founds. This is the exact
     // condition that used to strand a fleet: the old quorum demanded unanimous
     // consent from every rostered peer, so a lone founder could never close a
-    // populated open network — and even if it had, the multi-signer genesis
-    // couldn't be re-verified downstream. Founding must now stand on the
-    // founder's single signature regardless of who else is already present.
+    // populated open network. Founding now stands on the founder's own signature
+    // (the founder is `signers.first()`) regardless of who else is present — a
+    // co-signed genesis is fine too, but no co-signer is *required*.
     cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
 
     // Sanity: both sides start in `Open` with no transitions logged.
@@ -181,9 +181,9 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
         bob_view.pending
     );
 
-    // Byte-identical genesis on both peers, carrying exactly one signer — the
-    // founder. This is what lets any later joiner re-verify the log from
-    // genesis (see `verify_log`): a multi-signer genesis would be rejected.
+    // Byte-identical genesis on both peers. A lone founder signs this one (a
+    // co-signed genesis is also valid — `verify_log` elects `signers.first()`
+    // either way); here we assert the single-signer shape the engine authors.
     assert_eq!(
         alice_view.transitions[0].variant,
         bob_view.transitions[0].variant

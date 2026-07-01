@@ -392,8 +392,10 @@ pub fn verify_transition_signatures(network_id: &str, transition: &Transition) -
 /// Quorum table — **flat peer authority**: a holder of a tier may grant or
 /// demote at that tier or below, on a single signature, with no consensus
 /// round:
-///   - `KindChange { to: Closed }` — single signer (the founder
-///     self-elects; everyone already present becomes a member).
+///   - `KindChange { to: Closed }` — the founder self-elects
+///     (`signers.first()` becomes owner); ≥ 1 signer. Multi-signer capable:
+///     a close may be co-signed (a peer mesh can't assume one always-online
+///     founder), and only the empty signer set is rejected.
 ///   - `KindChange { to: Open }` — ≥ 1 owner.
 ///   - `RoleGrant { role: Owner }` — ≥ 1 owner (owners make owners).
 ///   - `RoleGrant { role: Controller }` — ≥ 1 controller or owner
@@ -438,24 +440,29 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
         .collect();
 
     match (&transition.variant, state_before.kind) {
-        // Founder self-election: `open → closed` is authored by exactly
-        // one signer, the founder, regardless of how many peers the open
-        // network already held. Those peers become plain members of the
-        // new closed network; they don't consent to (or co-sign) the
-        // close. This is the *only* genesis rule the quorum table has, and
-        // it's the one [`verify_log`] can reproduce from the log alone — a
-        // converging peer replays genesis against an empty member set and
-        // must reach the same verdict, so genesis has to stand on the
-        // founder's lone signature and nothing external.
+        // Founder self-election: `open → closed`. `apply_transition` elects
+        // `signers.first()` — the founder — as the sole owner; any peers already
+        // present become plain members (ownership is then distributed via
+        // peer-authority owner grants, so the mesh never depends on the founder
+        // staying online).
+        //
+        // Genesis is **multi-signer capable** — a peer mesh can't assume one
+        // always-online founder, so a close may be co-signed. We accept **≥ 1**
+        // signer and elect the first; the rest gain nothing at genesis. Requiring
+        // exactly one would fail `verify_log` for the whole log on every adopting
+        // peer — silently dropping every member admit on the adopting side while
+        // the authoring owner still holds it locally (its ratify-time roster
+        // mirror runs unconditionally). That is exactly the "one owner sees the
+        // device, the other never does" split.
         (
             TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
             NetworkKind::Open,
         ) => {
-            if signers.len() != 1 {
+            if signers.is_empty() {
                 return Err(Error::Protocol(
-                    "founder self-election needs exactly one signer".into(),
+                    "founder self-election needs a signer".into(),
                 ));
             }
         }
@@ -1123,36 +1130,75 @@ mod tests {
     }
 
     #[test]
-    fn quorum_open_to_closed_is_single_signer() {
-        // Genesis is a lone founder self-election, no matter how populated the
-        // open network was. A multi-signer close is rejected — it could never
-        // be re-verified by a peer converging the log (which replays genesis
-        // against an empty member set), so we forbid it at authoring time too.
+    fn quorum_open_to_closed_elects_the_first_signer() {
+        // Genesis is a founder self-election: the first signer becomes owner.
+        // New fleets sign it alone, but a multi-signer genesis (from the retired
+        // unanimous-consent model) must still verify so an older fleet converges
+        // on upgrade rather than being stranded — only the empty signer set is
+        // rejected.
         let (_, pk_alice) = fixture_key(1);
         let (_, pk_bob) = fixture_key(2);
         let state = NetworkState::empty_for("net-1");
 
-        // Two signers on a genesis close → reject.
-        let t = Transition {
+        let close = |signers: Vec<String>| Transition {
             at: 0,
             variant: TransitionVariant::KindChange {
                 to: NetworkKind::Closed,
             },
-            signers: vec![pk_alice.clone(), pk_bob],
-            signatures: vec![String::new(), String::new()],
+            signatures: vec![String::new(); signers.len()],
+            signers,
         };
-        assert!(verify_quorum(&state, &t).is_err());
 
-        // The lone founder → accept.
-        let t_ok = Transition {
-            at: 0,
-            variant: TransitionVariant::KindChange {
-                to: NetworkKind::Closed,
-            },
-            signers: vec![pk_alice],
-            signatures: vec![String::new()],
+        // Lone founder → accept.
+        verify_quorum(&state, &close(vec![pk_alice.clone()])).unwrap();
+        // Multi-signer genesis → still accepted (founder = first signer).
+        verify_quorum(&state, &close(vec![pk_alice.clone(), pk_bob])).unwrap();
+        // No signer at all → reject.
+        assert!(verify_quorum(&state, &close(vec![])).is_err());
+
+        // apply_transition elects the *first* signer as the sole owner,
+        // regardless of how many co-signers rode along.
+        let after = apply_transition(state, &close(vec![pk_alice.clone(), "someone".into()]));
+        assert_eq!(after.role_of(&pk_alice), Role::Owner);
+        assert_eq!(after.role_of("someone"), Role::Member);
+    }
+
+    #[test]
+    fn verify_log_accepts_a_multi_signer_genesis_and_elects_the_founder() {
+        // The heal path: an older fleet's genesis may carry more than one signer
+        // (unanimous-consent era). `verify_log` must accept it — electing the
+        // first signer as owner — so the whole log verifies and members converge,
+        // rather than the log failing wholesale and every admit being dropped on
+        // the adopting side (the "one owner sees the device, the other doesn't"
+        // split).
+        let (alice_sk, alice) = fixture_key(1);
+        let (bob_sk, bob) = fixture_key(2);
+        let net = "heal-net";
+        let variant = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
         };
-        verify_quorum(&state, &t_ok).unwrap();
+        let payload = transition_payload(net, &variant);
+        let genesis = Transition {
+            at: 1,
+            variant,
+            signers: vec![alice.clone(), bob.clone()],
+            signatures: vec![
+                crate::signing::sign_with(&alice_sk, &payload),
+                crate::signing::sign_with(&bob_sk, &payload),
+            ],
+        };
+        let state = verify_log(net, std::slice::from_ref(&genesis))
+            .expect("a multi-signer genesis must still verify");
+        assert_eq!(
+            state.role_of(&alice),
+            Role::Owner,
+            "the founder (first signer) is owner"
+        );
+        assert_eq!(
+            state.role_of(&bob),
+            Role::Member,
+            "a genesis co-signer is a plain member, not a second owner"
+        );
     }
 
     #[test]

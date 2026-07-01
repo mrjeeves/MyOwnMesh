@@ -170,19 +170,23 @@ signed state-update appended to the per-network state log.
 
 | From | To | Authority |
 |---|---|---|
-| `open`   | `closed` | the founder alone signs (single-signer self-election) |
-| `closed` | `open`   | every current owner must sign |
+| `open`   | `closed` | founder self-election — `signers.first()` becomes owner (≥ 1 signer; co-signing allowed) |
+| `closed` | `open`   | ≥ 1 owner |
 
-Founding a closed network is a **single-signer founder self-election**:
-the proposer signs, becomes the sole owner, and everyone already present
-in the open network becomes a plain `member` of the closed one (they can
-leave if they object). It is deliberately *not* a consent vote. A
-converging peer replays the log from genesis against an **empty** member
-set (`verify_log`) and has no way to reconstruct who *else* was in the
-open network at close time — so a multi-signer "unanimous consent"
-genesis could never be re-verified downstream. Standing genesis on the
-founder's lone signature is what makes the closed network's authority
-chain verifiable by anyone who later pulls the log.
+Founding a closed network is a **founder self-election**: `signers.first()`
+becomes the owner, and everyone already present in the open network becomes
+a plain `member` of the closed one (ownership is then distributed via
+peer-authority owner grants, so the network never depends on the founder
+staying online). It is *not* a consent vote — the founder needs no one
+else's signature.
+
+Genesis is **multi-signer capable**: because a peer mesh can't assume a
+single always-online founder, a close may be co-signed, and `verify_log`
+accepts any non-empty signer set (electing the first). What it does *not*
+do is try to prove "unanimous consent" — a converging peer replays from an
+empty member set and can't reconstruct who else was present, so genesis
+authority rests on the elected founder alone, not on a headcount. This is
+what keeps the whole log verifiable by anyone who later pulls it.
 
 Each transition appends to `network_state.json`'s transition log:
 
@@ -220,11 +224,12 @@ signed by the right authorities at each step.
 
 ### Founding is immediate — there is no stalled close
 
-Because founding is single-signer, a close never stalls. The founder
+Because founding needs no co-signers, a close never stalls. The founder
 publishes `network_state_propose { transition: { to: "closed" } }`,
 self-signs, and it ratifies **at once** on the founder and converges to
-every other peer via gossip — each adopts the single-signer genesis
-without being asked to co-sign. A closed network's identity is its
+every other peer via gossip — each adopts the genesis (electing
+`signers.first()`) without being asked to co-sign. A closed network's
+identity is its
 `network_id` (at the app layer, derived from a shared key) plus the
 members on its signed roster — never its display label. Two unrelated
 closed networks may carry the same human name; they never collide,
@@ -384,12 +389,14 @@ The four foundational choices, settled:
    than OR-Set CRDT, matches the existing append-mostly roster
    file shape, and the partition risk in the deployments this
    targets (friend-mesh / office-mesh) is low.
-2. **Founding a closed network — single-signer self-election.**
-   The founder alone signs `to: "closed"` and becomes sole owner;
-   peers already present become plain members. This is what a
-   converging peer can re-verify from the log (genesis replays
-   against an empty member set), so a close never stalls and needs
-   no consent round. *(Superseded design: founding once required
+2. **Founding a closed network — founder self-election.**
+   `signers.first()` signs `to: "closed"` and becomes owner; peers
+   already present become plain members, and ownership spreads from
+   there via peer-authority grants so the mesh never leans on the
+   founder being online. Genesis is multi-signer capable (a close may
+   be co-signed), but authority rests on the elected founder, not on a
+   consent headcount — so a close never stalls and needs no consent
+   round. *(Superseded design: founding once required
    unanimous member consent with a would-be-owner-initiated
    **split** fallback after `STATE_PROPOSAL_TIMEOUT_S` when
    signatures stalled. That stall can't happen under single-signer
