@@ -436,7 +436,8 @@ async fn run_relay(
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        // Reconnect backoff: 1 / 2 / 4 / 8 / 16 s capped at 60 s. A
+        // Reconnect backoff: 2 / 4 / 8 / 16 / 32 s capped at 60 s — the
+        // increment precedes the shift, so a 1 s wait is unreachable. A
         // forced-reconnect bump cuts the wait short so resume-from-sleep
         // recovery doesn't sit through a backoff that accrued while the
         // host was suspended.

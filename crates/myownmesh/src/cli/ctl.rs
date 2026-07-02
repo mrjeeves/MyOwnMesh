@@ -535,9 +535,21 @@ async fn roundtrip(request: &Request) -> Result<Response> {
 }
 
 async fn connect_socket() -> Result<LocalSocketStream> {
-    let path = myownmesh_core::dirs::data_dir()
-        .context("data_dir")?
-        .join("daemon.sock");
+    // Honor config.daemon.control_socket — the field exists precisely so
+    // `myownmesh ctl` can reach a daemon whose socket was pinned elsewhere
+    // (e.g. appliances whose data dir is exFAT, which cannot hold a Unix
+    // socket at all — the NanoKVM pins it to tmpfs). Falling back to the
+    // derived default keeps the no-config case working; a config that fails
+    // to load falls back too rather than blocking a diagnostic tool.
+    let pinned = myownmesh_core::MeshConfig::load()
+        .ok()
+        .and_then(|cfg| cfg.daemon.control_socket);
+    let path = match pinned {
+        Some(p) => p,
+        None => myownmesh_core::dirs::data_dir()
+            .context("data_dir")?
+            .join("daemon.sock"),
+    };
     #[cfg(unix)]
     let name = path
         .as_path()
