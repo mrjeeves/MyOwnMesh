@@ -816,7 +816,10 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             // provisions. A client reads this to know how many simultaneous
             // streams to one peer it can send at full quality (the rest fall
             // back to MJPEG); absent means a pre-pool daemon — one lane.
-            "media_lanes": myownmesh_core::transport::MEDIA_LANES,
+            // The RESOLVED count (honoring MYOWNMESH_MEDIA_LANES), not the
+            // compile-time ceiling: a device provisioning 1 lane must not
+            // promise 8 — sends on the phantom lanes fail per-frame.
+            "media_lanes": myownmesh_core::transport::resolved_media_lanes(),
             // Whether this daemon speaks the binary media pipes (media_track_pipe
             // / media_source_pipe). A capability flag, not a version gate: a
             // client uses the binary path only when this is true, else the base64

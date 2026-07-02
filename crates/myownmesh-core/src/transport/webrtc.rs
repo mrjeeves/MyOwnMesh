@@ -186,6 +186,16 @@ fn resolve_media_lanes() -> usize {
     }
 }
 
+/// The process-wide resolved lane count — what every new [`Transport`]
+/// actually provisions per peer connection. Public so the control plane's
+/// `status` reports the provisioned count rather than the compile-time
+/// ceiling: a client sizing its simultaneous streams to `media_lanes: 8`
+/// while the device provisions 1 gets per-frame "no video lane N" failures
+/// on lanes it was promised.
+pub fn resolved_media_lanes() -> usize {
+    resolve_media_lanes()
+}
+
 /// The lane a track id encodes (`"video-3"` → 3). A bare `"video"` /
 /// `"audio"` id — a peer from before the lane pool — is lane 0. Parsing is
 /// capped at the [`MEDIA_LANES`] ceiling (not the local per-connection count),
@@ -287,6 +297,21 @@ impl Transport {
             "ICE interface filter active — Docker/virtual interfaces excluded from candidate gathering"
         );
         let media_lanes = resolve_media_lanes();
+        // A malformed override must be LOUD: it silently resolves to the
+        // 8-lane default, which on a slow single-core device silently restores
+        // the exact 16-m-line connect churn the variable exists to prevent —
+        // and because resolved == default, the override info-line below never
+        // fires either. A typo in an init script would otherwise be invisible
+        // until the device wedges.
+        if let Ok(v) = std::env::var("MYOWNMESH_MEDIA_LANES") {
+            if v.trim().parse::<usize>().is_err() {
+                warn!(
+                    value = %v,
+                    default = MEDIA_LANES,
+                    "MYOWNMESH_MEDIA_LANES is set but not a number — using the default lane count"
+                );
+            }
+        }
         if media_lanes != MEDIA_LANES {
             info!(
                 media_lanes,
