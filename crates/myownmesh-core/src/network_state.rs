@@ -783,10 +783,31 @@ fn member_log_verdict(
         .map(|(k, _)| k.as_str())
         .collect();
 
-    // Deterministic order: by timestamp, then a stable per-entry key.
+    // Deterministic order: by timestamp, then tombstones *before* grants,
+    // then a stable per-entry key. The middle term is the tie-break that
+    // matters: the fold below is last-writer-wins, so at an equal `at` the
+    // grant is applied after the tombstone and membership survives. Live
+    // authoring stamps member-tier entries strictly past the newest existing
+    // entry, so an evict that *means* to remove a member always lands later
+    // than the grant it removes — an equal-stamp pair only arises from legacy
+    // logs where a re-admit raced its evict inside one wall-clock second (or
+    // the authors' clocks were skewed), and there the re-admit was the later
+    // intent. Letting the tombstone win that tie is what silently stranded
+    // devices out of every fleet roster on upgrade (remote control refused
+    // fleet-wide while video kept streaming).
+    let is_member_grant = |t: &&Transition| {
+        matches!(
+            t.variant,
+            TransitionVariant::RoleGrant {
+                role: Role::Member,
+                ..
+            }
+        )
+    };
     let mut ordered: Vec<&Transition> = member_log.iter().collect();
     ordered.sort_by(|a, b| {
         a.at.cmp(&b.at)
+            .then_with(|| is_member_grant(a).cmp(&is_member_grant(b)))
             .then_with(|| member_entry_key(a).cmp(&member_entry_key(b)))
     });
 
@@ -1285,6 +1306,68 @@ mod tests {
             !removed.contains(&n),
             "an active member is never in the removed set"
         );
+    }
+
+    #[test]
+    fn equal_stamp_readmit_beats_the_tombstone() {
+        // The legacy re-admit race: before authoring stamped member-tier
+        // entries strictly past the newest existing one, a re-admit could
+        // carry the same wall-clock second as the evict it undoes (same
+        // author, or a skewed second author). The verdict's tie-break must
+        // resolve that pair to *membership* — the re-admit was the later
+        // intent — or the device is stranded evicted, the roster mirror
+        // deletes it on every peer at adoption, and remote control is
+        // refused fleet-wide while video keeps streaming.
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, m) = fixture_key(2);
+        let net = "tie-net";
+        let mut gov = NetworkState::empty_for(net);
+        gov.kind = NetworkKind::Closed;
+        gov.roles.insert(owner.clone(), Role::Owner);
+
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(net, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(&owner_sk, &payload)],
+                signers: vec![owner.clone()],
+                variant,
+            }
+        };
+        // Admitted at 1, evicted at 5, re-admitted in the same second.
+        let member_log = vec![
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: m.clone(),
+                    role: Role::Member,
+                },
+                1,
+            ),
+            signed(TransitionVariant::Evict { target: m.clone() }, 5),
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: m.clone(),
+                    role: Role::Member,
+                },
+                5,
+            ),
+        ];
+
+        let present = verify_member_log(&gov, &member_log, net);
+        let removed = member_log_removed(&gov, &member_log, net);
+        assert!(
+            present.contains(&m),
+            "an equal-stamp evict/re-admit pair resolves to membership"
+        );
+        assert!(
+            removed.is_empty(),
+            "a re-admitted device is never handed to the roster mirror for deletion"
+        );
+        // A *strictly later* evict still wins — deliberate removals stand.
+        let mut evicted_later = member_log;
+        evicted_later.push(signed(TransitionVariant::Evict { target: m.clone() }, 6));
+        assert!(!verify_member_log(&gov, &evicted_later, net).contains(&m));
+        assert!(member_log_removed(&gov, &evicted_later, net).contains(&m));
     }
 
     #[test]
