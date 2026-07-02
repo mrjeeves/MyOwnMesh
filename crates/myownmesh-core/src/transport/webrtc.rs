@@ -853,7 +853,7 @@ fn is_private_lan_ip(ip: &str) -> bool {
 /// [`is_private_lan_ip`], unique-local (`fc00::/7`) is deliberately *not*
 /// matched — ULAs are bindable, routable on the local network, and make
 /// perfectly good host candidates.
-fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),

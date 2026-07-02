@@ -21,15 +21,22 @@
 //!
 //! How we sample
 //! -------------
-//! No new dependencies — we use the well-known "bind a UDP socket
-//! and connect to a public address" trick to ask the OS which
-//! local IP it would use for outbound traffic. `connect()` on a
-//! UDP socket doesn't actually send anything; it just sets the
-//! default destination so `local_addr()` returns the source IP
-//! the OS picked. We do this once for v4 (8.8.8.8:53) and once
-//! for v6 (Google's public v6 resolver). Either or both may be
-//! `None` (no v6 connectivity, no v4, offline entirely) — change
-//! detection is `last != current`, so any transition counts,
+//! Two complementary reads per poll:
+//!
+//! - **Primary source probes** — the well-known "bind a UDP socket and
+//!   connect" trick: `connect()` on a UDP socket sends nothing, it just
+//!   sets the default destination so `local_addr()` returns the source IP
+//!   the OS picked. Probed toward the mesh's *own* STUN host when one is
+//!   configured (the interface that routes to this mesh's relays is the
+//!   one that matters, especially multi-homed), falling back to the
+//!   public resolvers (8.8.8.8:53 / Google's v6) otherwise.
+//! - **The full local address set** (via `if-addrs`), fingerprinted — v4
+//!   addresses and v6 /64 prefixes, loopback/link-local excluded. This is
+//!   what sees a change on a box with *no default route at all* (an
+//!   internet-isolated LAN fleet: both probes read `None` forever) or on
+//!   the interface the default route doesn't cover.
+//!
+//! Change detection is `last != current`, so any transition counts,
 //! including up→down and down→up.
 //!
 //! Cost is one UDP socket bind + connect per poll, on the order of
@@ -38,7 +45,7 @@
 //! interval — one periodic pass covers network-change detection alongside
 //! the per-peer state confirmation.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,20 +58,81 @@ use super::ice_watchdog;
 use super::scheduler::NETWORK_CHANGE_RESTART_COOLDOWN_MS;
 use super::state::NetworkState;
 
-/// Snapshot of the OS's chosen primary outbound IPs. Compared by
-/// value — any transition (v4 changes, v4 appears, v6 disappears,
-/// etc.) triggers the change handler.
+/// Snapshot of the OS's chosen primary outbound IPs **plus a fingerprint of
+/// the whole usable local address set**. Compared by value — any transition
+/// (v4 changes, v6 disappears, an interface gains or loses an address)
+/// triggers the change handler.
+///
+/// The default-route probes alone were blind in exactly the deployments the
+/// hosted-services story sells: an internet-isolated LAN fleet has no
+/// default route, so both probes read `None` forever and no change ever
+/// fired; a multi-homed box (mesh on one interface, internet on another)
+/// had its mesh-side changes invisible and its internet-side flips firing
+/// spurious restarts. The local-set fingerprint catches every interface
+/// change; the probes still say which addresses are *primary*.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkSnapshot {
     pub v4: Option<Ipv4Addr>,
     pub v6: Option<Ipv6Addr>,
+    /// Order-insensitive hash of the usable local addresses — v4 addresses
+    /// plus v6 **/64 prefixes** (a privacy-extension rotation mints a new
+    /// suffix inside the same prefix on a schedule; hashing full v6
+    /// addresses would fire a pointless restart every rotation). Loopback
+    /// and link-local are out, matching what ICE gathers.
+    pub local_set: u64,
+    /// How many addresses fed the fingerprint — the "is anything up at all"
+    /// half of the offline verdict (a LAN-only box has no primary outbound
+    /// IPs but is emphatically not offline).
+    pub local_count: usize,
 }
 
 impl NetworkSnapshot {
-    pub async fn sample() -> Self {
-        let v4 = primary_v4().await;
-        let v6 = primary_v6().await;
-        Self { v4, v6 }
+    /// `probe` — the mesh's own signaling/STUN host when one is configured,
+    /// so the primary-source question is asked toward the host that
+    /// actually matters for this mesh; `None` falls back to the public
+    /// resolvers, exactly the old behaviour.
+    pub async fn sample(probe: Option<SocketAddr>) -> Self {
+        let (v4, v6) = match probe {
+            Some(addr @ SocketAddr::V4(_)) => (
+                probe_source(addr)
+                    .await
+                    .or(primary_v4().await.map(IpAddr::V4)),
+                primary_v6().await.map(IpAddr::V6),
+            ),
+            Some(addr @ SocketAddr::V6(_)) => (
+                primary_v4().await.map(IpAddr::V4),
+                probe_source(addr)
+                    .await
+                    .or(primary_v6().await.map(IpAddr::V6)),
+            ),
+            None => (
+                primary_v4().await.map(IpAddr::V4),
+                primary_v6().await.map(IpAddr::V6),
+            ),
+        };
+        let v4 = match v4 {
+            Some(IpAddr::V4(a)) => Some(a),
+            _ => None,
+        };
+        let v6 = match v6 {
+            Some(IpAddr::V6(a)) => Some(a),
+            _ => None,
+        };
+        let (local_set, local_count) = local_fingerprint();
+        Self {
+            v4,
+            v6,
+            local_set,
+            local_count,
+        }
+    }
+
+    /// Fully offline: no primary outbound source *and* no usable local
+    /// address at all. The second clause is what keeps an internet-isolated
+    /// LAN fleet (both probes `None` by construction) from reading as
+    /// offline and gating ICE recovery off.
+    pub fn offline(&self) -> bool {
+        self.v4.is_none() && self.v6.is_none() && self.local_count == 0
     }
 }
 
@@ -88,27 +156,112 @@ async fn primary_v6() -> Option<Ipv6Addr> {
     }
 }
 
+/// Which local source the OS picks toward `addr` — the same connect-a-UDP-
+/// socket trick as the public probes, aimed at the mesh's own server.
+async fn probe_source(addr: SocketAddr) -> Option<IpAddr> {
+    let bind = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind).await.ok()?;
+    socket.connect(addr).await.ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// The mesh's own probe target: its first configured STUN server's
+/// host:port, resolved through the OS resolver (bounded — a dead resolver
+/// must not stall the tick). `None` on a mesh with no STUN configured or a
+/// name that doesn't resolve; the sampler then falls back to the public
+/// probes, exactly the old behaviour. Pointing the probe at the mesh's own
+/// server is what makes the "primary source" answer meaningful on a
+/// multi-homed box: the interface that routes to *this mesh's* relays is
+/// the one whose changes matter here.
+async fn resolve_probe(state: &Arc<NetworkState>) -> Option<SocketAddr> {
+    let url = {
+        let cfg = state.config.read();
+        cfg.stun_servers
+            .iter()
+            .flat_map(|s| s.urls.iter())
+            .next()
+            .cloned()
+    }?;
+    let bare = url
+        .strip_prefix("stun://")
+        .or_else(|| url.strip_prefix("stun:"))
+        .unwrap_or(&url);
+    let bare = bare.split('?').next().unwrap_or(bare);
+    let target = if bare.contains(':') {
+        bare.to_string()
+    } else {
+        format!("{bare}:3478")
+    };
+    tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(target))
+        .await
+        .ok()?
+        .ok()?
+        .next()
+}
+
+/// Hash of the usable local address set (+ its size): v4 addresses and v6
+/// /64 prefixes, loopback/link-local excluded — the same class of addresses
+/// ICE gathers (see `transport::webrtc::is_link_local_ip`).
+fn local_fingerprint() -> (u64, usize) {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<String> = if_addrs::get_if_addrs()
+        .map(|ifs| {
+            ifs.into_iter()
+                .filter(|i| !i.is_loopback())
+                .filter_map(|i| match i.addr.ip() {
+                    ip if crate::transport::webrtc::is_link_local_ip(&ip) => None,
+                    IpAddr::V4(v4) => Some(v4.to_string()),
+                    // /64 prefix only: privacy-extension suffixes rotate on
+                    // a schedule inside a stable prefix.
+                    IpAddr::V6(v6) => {
+                        let s = v6.segments();
+                        Some(format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    keys.sort();
+    keys.dedup();
+    let count = keys.len();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    keys.hash(&mut h);
+    (h.finish(), count)
+}
+
 /// Holds the last observed snapshot. Lives inside the driver loop
 /// so we don't need a Mutex — single owner.
 pub struct NetworkWatch {
-    last: NetworkSnapshot,
+    /// `None` until the first poll: that poll adopts its snapshot silently
+    /// (no change event), so daemon startup doesn't kick a useless ICE
+    /// restart — and the adopted baseline is already probed toward the
+    /// mesh's own server, so the probe switching over from the public
+    /// fallback can't read as a change either.
+    last: Option<NetworkSnapshot>,
     /// When we last fired a change-triggered ICE-restart fan-out. Used
     /// to coalesce the burst of primary-IP flips a Wi-Fi→cellular
     /// handoff produces into a single restart (see
     /// `NETWORK_CHANGE_RESTART_COOLDOWN_MS`).
     last_restart_at: Option<Instant>,
+    /// The mesh's own probe target (its first configured STUN host),
+    /// resolved lazily and re-resolved on a slow TTL — never per tick.
+    probe: Option<SocketAddr>,
+    probe_checked_at: Option<Instant>,
 }
 
 impl NetworkWatch {
-    /// Build a watcher pre-seeded with the current snapshot. The
-    /// first `poll` after construction won't fire a change event
-    /// unless the network actually moves between init and that
-    /// poll — desirable so daemon startup doesn't kick a useless
-    /// ICE restart.
+    /// Build an empty watcher; the first `poll` seeds the baseline (see
+    /// [`NetworkWatch::last`]).
     pub async fn new() -> Self {
         Self {
-            last: NetworkSnapshot::sample().await,
+            last: None,
             last_restart_at: None,
+            probe: None,
+            probe_checked_at: None,
         }
     }
 
@@ -120,11 +273,26 @@ impl NetworkWatch {
     /// network is still settling. Leading-edge: the first change in a
     /// burst fires immediately (responsive), the rest coalesce.
     pub async fn poll(&mut self, state: &Arc<NetworkState>) {
-        let current = NetworkSnapshot::sample().await;
-        if current == self.last {
+        // Keep the probe target fresh on a slow TTL: the config's STUN host
+        // can change, DNS can move — but a lookup per tick would be waste.
+        const PROBE_TTL: Duration = Duration::from_secs(300);
+        if self
+            .probe_checked_at
+            .is_none_or(|t| t.elapsed() >= PROBE_TTL)
+        {
+            self.probe_checked_at = Some(Instant::now());
+            self.probe = resolve_probe(state).await;
+        }
+        let current = NetworkSnapshot::sample(self.probe).await;
+        let Some(last) = &self.last else {
+            // First poll: adopt the baseline silently (see `last`).
+            self.last = Some(current);
+            return;
+        };
+        if &current == last {
             return;
         }
-        let prev = std::mem::replace(&mut self.last, current.clone());
+        let prev = self.last.replace(current.clone()).expect("checked above");
         let now = Instant::now();
 
         // The offline edges are never coalesced. Going fully offline
@@ -143,7 +311,7 @@ impl NetworkWatch {
         // restart, and the offline flag never cleared (leaving in-place
         // recovery gated off), forcing every handoff down the slow drop-
         // and-rebuild path.
-        let now_offline = current.v4.is_none() && current.v6.is_none();
+        let now_offline = current.offline();
         let is_offline_edge = now_offline || state.is_offline();
         if cooldown_coalesces(is_offline_edge, self.last_restart_at, now) {
             debug!(
@@ -196,7 +364,7 @@ async fn on_network_change(
     // checking-timeout watchdog) and wait. The *next* change — the
     // interface returning — is an offline→online edge that runs the full
     // handler below and restarts everything cleanly on the new route.
-    let now_offline = current.v4.is_none() && current.v6.is_none();
+    let now_offline = current.offline();
     let was_offline = state.set_offline(now_offline);
     if now_offline {
         info!(
@@ -398,28 +566,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_equality_compares_v4_and_v6() {
+    fn snapshot_equality_compares_every_field() {
         let a = NetworkSnapshot {
             v4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             v6: None,
+            ..Default::default()
         };
         let b = NetworkSnapshot {
             v4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             v6: None,
+            ..Default::default()
         };
         assert_eq!(a, b);
 
         let c = NetworkSnapshot {
             v4: Some(Ipv4Addr::new(192, 168, 1, 6)),
             v6: None,
+            ..Default::default()
         };
         assert_ne!(a, c);
 
         let d = NetworkSnapshot {
             v4: Some(Ipv4Addr::new(192, 168, 1, 5)),
             v6: Some(Ipv6Addr::LOCALHOST),
+            ..Default::default()
         };
         assert_ne!(a, d);
+
+        // An interface change with identical primaries still reads as a
+        // change — the whole point of the local-set fingerprint (the
+        // default-route probes are blind off the default route).
+        let e = NetworkSnapshot {
+            local_set: 7,
+            local_count: 2,
+            ..a.clone()
+        };
+        assert_ne!(a, e);
+    }
+
+    #[test]
+    fn lan_only_is_not_offline() {
+        // No default route (both primary probes None) but interfaces up:
+        // the exact shape of an internet-isolated LAN fleet. Reading this
+        // as "offline" used to gate ICE recovery off on the deployments
+        // that need it most.
+        let lan_only = NetworkSnapshot {
+            v4: None,
+            v6: None,
+            local_set: 42,
+            local_count: 1,
+        };
+        assert!(!lan_only.offline());
+        // Genuinely nothing up: offline.
+        let dark = NetworkSnapshot {
+            v4: None,
+            v6: None,
+            local_set: 0,
+            local_count: 0,
+        };
+        assert!(dark.offline());
     }
 
     #[test]
