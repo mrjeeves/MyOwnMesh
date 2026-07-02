@@ -327,6 +327,12 @@ pub struct NetworkState {
     /// for the discovery rationale.
     pub last_reactive_announce_at: Mutex<Option<std::time::Instant>>,
 
+    /// Latched state of the passive clock-skew diagnostic — warn once when
+    /// this device's wall clock has disagreed with its peers' (measured off
+    /// the heartbeat pings they already send) for several consecutive
+    /// ticks, clear once when it resolves. See `heartbeat::watch_clock_skew`.
+    pub clock_skew_watch: Mutex<super::heartbeat::ClockSkewWatch>,
+
     /// Force-reconnect handle for the signaling driver, stashed by
     /// [`crate::engine::signaling_bridge::attach_nostr`] once the
     /// Nostr driver is up. Bumping the generation makes every relay
@@ -448,6 +454,7 @@ impl NetworkState {
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
+            clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
             last_relay_rescue_at: Mutex::new(None),
@@ -934,6 +941,7 @@ impl NetworkState {
                     status: data.status,
                     tier: data.tier,
                     rtt_ms: data.rtt_ms,
+                    clock_skew_ms: data.clock_skew_ms,
                     label: data.label.clone(),
                     capabilities: data.capabilities.clone(),
                     local_shelved: data.local_shelved,
@@ -965,6 +973,7 @@ impl NetworkState {
             status: data.status,
             tier: data.tier,
             rtt_ms: data.rtt_ms,
+            clock_skew_ms: data.clock_skew_ms,
             label: data.label.clone(),
             capabilities: data.capabilities.clone(),
             local_shelved: data.local_shelved,
