@@ -25,4 +25,23 @@
 # See docs/NANOKVM.md and .github/workflows/release.yml.
 
 [target.riscv64gc-unknown-linux-musl]
-rustflags = ["-C", "target-feature=+crt-static"]
+# -u getrandom: force musl's getrandom(2) wrapper into the static link.
+#
+# The workspace carries two generations of the `getrandom` crate (0.2 via
+# rand, 0.4 via uuid). 0.2 declares the libc symbol `getrandom` as a WEAK
+# extern (its runtime-availability probe); a weak undefined reference does
+# not extract members from a static archive, so musl's getrandom.o is never
+# pulled in and the symbol resolves to address 0. getrandom 0.4 then calls
+# `libc::getrandom` directly, and LLD materializes its PC-relative call
+# against address 0 as `auipc ra,0; jalr ra` — a call that jumps to ITSELF.
+# The result on the NanoKVM was an uninterruptible, syscall-free infinite
+# spin the first time anything minted a UUIDv4 (webrtc-ice's Agent::new,
+# 16 random bytes) — inline on the mesh engine driver, freezing the whole
+# engine on every boot. Dynamic-glibc builds (every x86 dev box) resolve
+# the symbol at runtime, which is why this never reproduced off-device.
+# `-u` makes the reference strong, the archive member gets linked, and
+# every caller lands on real code.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,-u,getrandom",
+]
