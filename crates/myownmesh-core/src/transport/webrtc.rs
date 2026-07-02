@@ -960,18 +960,19 @@ impl PeerSession {
     }
 
     /// Build an offer SDP. Offerer-only (answerer never calls this).
-    /// The stage traces exist because this pair is the engine's one
-    /// inline-on-the-driver excursion into webrtc-rs: when it wedges (seen
-    /// on the NanoKVM), nothing in the window logs, so these two lines are
-    /// the only way a debug capture can say which half died.
+    /// The stage logs are plain INFO on purpose: this pair is the engine's
+    /// inline-on-the-driver excursion into webrtc-rs, it wedges on the
+    /// NanoKVM with nothing inside logging, and a stage line that only shows
+    /// under a special log filter has already cost deploy cycles. They fire
+    /// once per connect attempt — negligible in a healthy log.
     pub async fn create_offer(&self) -> Result<RTCSessionDescription> {
-        debug!("create_offer: building SDP (pc.create_offer)");
+        info!("create_offer: building SDP (pc.create_offer)");
         let offer = self
             .pc
             .create_offer(None)
             .await
             .map_err(|e| Error::Transport(format!("create_offer: {e}")))?;
-        debug!(
+        info!(
             sdp_bytes = offer.sdp.len(),
             "create_offer: applying local description (starts ICE gathering)"
         );
@@ -979,14 +980,22 @@ impl PeerSession {
             .set_local_description(offer.clone())
             .await
             .map_err(|e| Error::Transport(format!("set_local_description (offer): {e}")))?;
-        debug!("create_offer: local description applied");
+        info!("create_offer: local description applied");
         Ok(offer)
     }
 
     /// Apply the remote SDP. Both sides call this — offerer with
     /// the answer they got back, answerer with the offer they
-    /// received first.
+    /// received first. Stage-logged like create_offer: the answer path runs
+    /// the same inline-on-the-driver webrtc-rs machinery (and processes the
+    /// REMOTE side's media sections regardless of our own lane count), so it
+    /// is equally capable of freezing the engine invisibly.
     pub async fn set_remote_description(&self, desc: RTCSessionDescription) -> Result<()> {
+        info!(
+            sdp_type = %desc.sdp_type,
+            sdp_bytes = desc.sdp.len(),
+            "set_remote_description: applying remote SDP"
+        );
         self.pc
             .set_remote_description(desc)
             .await
@@ -1016,17 +1025,24 @@ impl PeerSession {
     }
 
     /// Build an answer SDP. Answerer-only; call after
-    /// [`Self::set_remote_description`].
+    /// [`Self::set_remote_description`]. Stage-logged like create_offer —
+    /// same inline-on-the-driver machinery, same invisible-freeze potential.
     pub async fn create_answer(&self) -> Result<RTCSessionDescription> {
+        info!("create_answer: building SDP (pc.create_answer)");
         let answer = self
             .pc
             .create_answer(None)
             .await
             .map_err(|e| Error::Transport(format!("create_answer: {e}")))?;
+        info!(
+            sdp_bytes = answer.sdp.len(),
+            "create_answer: applying local description (starts ICE gathering)"
+        );
         self.pc
             .set_local_description(answer.clone())
             .await
             .map_err(|e| Error::Transport(format!("set_local_description (answer): {e}")))?;
+        info!("create_answer: local description applied");
         Ok(answer)
     }
 
