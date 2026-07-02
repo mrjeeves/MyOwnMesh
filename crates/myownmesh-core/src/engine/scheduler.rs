@@ -88,6 +88,18 @@ pub const RECONNECT_RETRY_BACKOFF_MS: &[u64] = &[2_000, 4_000, 8_000, 15_000];
 /// regardless, so this only ever bounds a *failure*.
 pub const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 30_000;
 
+/// How long a **local offer build** (create_offer + set_local_description —
+/// pure local computation, no network round-trip) may take before the engine
+/// abandons the attempt. This runs INLINE on the driver task, so an offer
+/// build that never returns doesn't just lose one peer — it freezes the
+/// entire network's engine: commands, timers, and every other peer queue
+/// behind it, which is precisely the wedge observed on the NanoKVM (single
+/// slow riscv64 core: driver parked in the offer path forever, control-socket
+/// ops timing out, node never claimable). A healthy build takes single-digit
+/// milliseconds on x86 and well under a second on the slowest supported
+/// device, so ten seconds only ever bounds a failure.
+pub const OFFER_BUILD_TIMEOUT_MS: u64 = 10_000;
+
 /// After an in-place ICE restart reconnects, how long to wait for *inbound
 /// traffic* to confirm the path actually carries frames before giving up
 /// and rebuilding. ICE reaching `Connected` is **not** proof — webrtc-rs

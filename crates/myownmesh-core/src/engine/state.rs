@@ -230,6 +230,19 @@ pub enum SignalingInbound {
     },
 }
 
+impl SignalingInbound {
+    /// Variant name for driver-liveness traces — cheap, no payload.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SignalingInbound::PeerAnnounced { .. } => "peer_announced",
+            SignalingInbound::Offer { .. } => "offer",
+            SignalingInbound::Answer { .. } => "answer",
+            SignalingInbound::Candidate { .. } => "candidate",
+            SignalingInbound::PeerLeft { .. } => "peer_left",
+        }
+    }
+}
+
 /// Outbound signaling messages from the engine to the signaling task.
 #[derive(Debug)]
 pub enum SignalingOutbound {

@@ -960,16 +960,26 @@ impl PeerSession {
     }
 
     /// Build an offer SDP. Offerer-only (answerer never calls this).
+    /// The stage traces exist because this pair is the engine's one
+    /// inline-on-the-driver excursion into webrtc-rs: when it wedges (seen
+    /// on the NanoKVM), nothing in the window logs, so these two lines are
+    /// the only way a debug capture can say which half died.
     pub async fn create_offer(&self) -> Result<RTCSessionDescription> {
+        debug!("create_offer: building SDP (pc.create_offer)");
         let offer = self
             .pc
             .create_offer(None)
             .await
             .map_err(|e| Error::Transport(format!("create_offer: {e}")))?;
+        debug!(
+            sdp_bytes = offer.sdp.len(),
+            "create_offer: applying local description (starts ICE gathering)"
+        );
         self.pc
             .set_local_description(offer.clone())
             .await
             .map_err(|e| Error::Transport(format!("set_local_description (offer): {e}")))?;
+        debug!("create_offer: local description applied");
         Ok(offer)
     }
 

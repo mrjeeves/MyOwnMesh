@@ -208,7 +208,10 @@ pub async fn run_driver(
             _ = state_watch.tick() => {
                 // Secondary safety net only — events drive recovery. Each
                 // registered ticker confirms its slice of state and repairs the
-                // time-based conditions no event can signal.
+                // time-based conditions no event can signal. The trace doubles
+                // as the driver's liveness heartbeat in debug captures: when
+                // the driver wedges, this is the line that stops.
+                trace!(network = %state.network_id, "driver: state-watch tick");
                 tick_registry.run(&state).await;
             }
         }
@@ -353,6 +356,10 @@ fn connecting_stuck_past_grace(data: &connection::PeerStateData, grace_ms: u64) 
 }
 
 async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbound) {
+    // Entry trace: signaling handlers run inline on the driver, so in a
+    // debug capture the last of these lines names the message being handled
+    // when the driver stopped.
+    trace!(network = %state.network_id, kind = sig.kind_name(), "driver: signaling inbound");
     match sig {
         SignalingInbound::PeerAnnounced { device_id } => {
             // Whoever holds the lex-lower id initiates so we don't
@@ -980,6 +987,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     if state.peers.contains_key(&device_id) {
         return;
     }
+    debug!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
     let (session, mut rx) = match state
         .transport
@@ -1021,10 +1029,22 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         serde_json::json!({ "peer": device_id, "role": format!("{role:?}") }),
     );
 
-    // For offerer, kick off SDP exchange immediately.
+    // For offerer, kick off SDP exchange immediately. The offer build is
+    // bounded: it runs INLINE on the driver task, so if it never returned,
+    // every command, timer, and other peer on this network would die with it
+    // — exactly the wedge observed on the NanoKVM's single slow core, where
+    // the daemon sat with one worker spinning and the driver parked here
+    // forever while the control socket timed out op after op. A stuck offer
+    // now costs this one attempt (the watchdog rebuilds it), not the engine.
+    debug!(peer = %short_peer(&device_id), "ensure_peer_session: building offer");
     if role == Role::Offerer {
-        match session.create_offer().await {
-            Ok(desc) => {
+        let built = tokio::time::timeout(
+            Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
+            session.create_offer(),
+        )
+        .await;
+        match built {
+            Ok(Ok(desc)) => {
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
                     "signaling",
@@ -1039,7 +1059,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                     p.state.write().last_offer_sent_at = Some(Instant::now());
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 state.log_diag_with(
                     crate::events::DiagLevel::Error,
                     "signaling",
@@ -1047,6 +1067,19 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                     serde_json::json!({ "peer": device_id, "error": e.to_string() }),
                 );
                 warn!(peer = %device_id, "create_offer failed: {e}");
+            }
+            Err(_) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Error,
+                    "signaling",
+                    format!(
+                        "create_offer for {} did not complete within {} ms — abandoning this attempt (the connect watchdog will rebuild it)",
+                        short_peer(&device_id),
+                        scheduler::OFFER_BUILD_TIMEOUT_MS
+                    ),
+                    serde_json::json!({ "peer": device_id }),
+                );
+                warn!(peer = %device_id, "create_offer timed out — engine driver kept alive");
             }
         }
     }
