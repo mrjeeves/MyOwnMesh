@@ -78,6 +78,17 @@ pub struct PeerStateData {
     pub last_liveness_probe_at: Option<Instant>,
     pub last_ping_t: Option<i64>,
     pub rtt_ms: Option<u32>,
+    /// Rolling clock-skew samples against this peer, newest last (ms;
+    /// positive = the peer's wall clock reads ahead of ours). Each inbound
+    /// heartbeat ping contributes one — its `t` is the sender's wall clock,
+    /// corrected by half our measured RTT — so the estimate is purely
+    /// passive: no extra traffic to any node. Capped at
+    /// `heartbeat::SKEW_WINDOW`.
+    pub clock_skew_samples: Vec<i64>,
+    /// Median of [`Self::clock_skew_samples`] — the per-peer estimate
+    /// surfaced in `PeerInfo` and folded into the network-wide check in
+    /// `heartbeat::tick`. `None` until the first inbound ping.
+    pub clock_skew_ms: Option<i64>,
     pub ice_disconnected_since: Option<Instant>,
     /// When this peer's transport session (the `RTCPeerConnection`) was
     /// created. The single clock for a *connecting* peer: if its data
@@ -153,6 +164,8 @@ impl Default for PeerStateData {
             last_liveness_probe_at: None,
             last_ping_t: None,
             rtt_ms: None,
+            clock_skew_samples: Vec::new(),
+            clock_skew_ms: None,
             ice_disconnected_since: None,
             session_started_at: None,
             data_channel_open: false,

@@ -486,6 +486,13 @@ pub struct PeerInfo {
     pub status: PeerStatus,
     pub tier: ConnectionTier,
     pub rtt_ms: Option<u32>,
+    /// How far this peer's wall clock reads from ours (ms; positive = the
+    /// peer is ahead), estimated passively from the heartbeat pings it
+    /// already sends (RTT-corrected median over a short window). `None`
+    /// until its first inbound ping. `#[serde(default)]` so a snapshot
+    /// from an older daemon still decodes.
+    #[serde(default)]
+    pub clock_skew_ms: Option<i64>,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
     pub local_shelved: bool,
