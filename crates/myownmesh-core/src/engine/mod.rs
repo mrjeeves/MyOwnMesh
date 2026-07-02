@@ -2552,6 +2552,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_approve_send_unlatches_so_a_later_trigger_can_resend() {
+        // The one-way trust wedge: a roster-driven approve can fire before
+        // the peer's data channel opens, and the send fails. Leaving
+        // `local_approve_sent` latched true meant every later call
+        // short-circuited on "already sent" — the peer never received our
+        // approve and sat in PendingApproval refusing our app traffic,
+        // while we went Active the moment theirs landed. A failed send
+        // must reset the latch so the handshake that starts when the
+        // channel opens re-runs auto-approve and actually delivers it.
+        let state = build_test_state("approve-unlatch");
+        insert_session_less_peer(&state, "early-peer", None); // no session → the send fails
+        handshake::send_local_approve(&state, "early-peer").await;
+        let peer = state.peers.get("early-peer").expect("peer present");
+        assert!(
+            !peer.state.read().local_approve_sent,
+            "a failed approve send must not read as delivered"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_timeout_reclaims_a_peer_whose_data_channel_never_opened() {
         // A session created long ago whose data channel never opened is a
         // failed attempt — the connect-timeout watchdog must reclaim it so

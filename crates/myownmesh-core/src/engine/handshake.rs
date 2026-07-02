@@ -448,6 +448,18 @@ pub async fn send_local_approve(state: &Arc<NetworkState>, device_id: &str) {
     }
     if let Err(e) = send_to_peer(state, device_id, &MeshMessage::Approve(ApproveMessage {})).await {
         warn!(peer = %device_id, "send approve failed: {e}");
+        // Un-latch: the frame never left. Leaving `local_approve_sent` true
+        // here was a one-way trust wedge — every later call short-circuited
+        // on "already sent", the peer never received our approve and sat in
+        // PendingApproval refusing our app traffic, while *we* went Active
+        // the moment their approve landed (the flag said we'd answered).
+        // Roster-driven approves fire the instant a session exists, which
+        // can be before its data channel opens ("DataChannel is not
+        // opened") — with the flag reset, the handshake that starts when
+        // the channel *does* open re-runs auto-approve and delivers it.
+        if let Some(peer) = state.peers.get(device_id) {
+            peer.state.write().local_approve_sent = false;
+        }
         return;
     }
     // If the peer already sent us their approve, transitioning
