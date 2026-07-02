@@ -18,9 +18,7 @@ use std::time::Duration;
 fn jiffies() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     let f: Vec<&str> = stat.split_whitespace().collect();
-    f.get(13)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0)
+    f.get(13).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
         + f.get(14).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
 }
 
@@ -99,8 +97,7 @@ async fn main() {
     )
     .await
     {
-        if let Some(Ok(offer)) =
-            staged("F create_offer (STUN+TURN)", session.create_offer()).await
+        if let Some(Ok(offer)) = staged("F create_offer (STUN+TURN)", session.create_offer()).await
         {
             println!("[probe] F sdp bytes = {}", offer.sdp.len());
         }
