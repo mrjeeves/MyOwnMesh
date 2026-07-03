@@ -919,8 +919,26 @@ pub fn load(network_id: &str) -> Result<NetworkState> {
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Other(format!("read network_state at {}: {e}", path.display())))?;
-    let mut state: NetworkState = serde_json::from_str(&raw)
-        .map_err(|e| Error::Other(format!("parse network_state at {}: {e}", path.display())))?;
+    // Corrupt (a power cut mid-write leaves a truncated file) → the
+    // same treatment as missing: quarantine + fresh, loudly. Failing
+    // here failed every subsequent join of the network. Governance
+    // state re-converges from the network's signed transition
+    // broadcasts, so empty is always recoverable.
+    let mut state: NetworkState = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            let kept = crate::persist::quarantine(&path);
+            tracing::error!(
+                network = network_id,
+                path = %path.display(),
+                quarantined = ?kept,
+                "network_state file is corrupt ({e}) — starting fresh; \
+                 governance re-converges from the network's signed \
+                 transitions"
+            );
+            return Ok(NetworkState::empty_for(network_id));
+        }
+    };
     match state.version {
         // v1 (legacy single log): split the member tier out of `transitions`
         // into `member_log`, then it is a v2 state. Idempotent and roster-
@@ -951,7 +969,7 @@ pub fn save(state: &NetworkState) -> Result<()> {
     std::fs::create_dir_all(parent)
         .map_err(|e| Error::Other(format!("create states dir at {}: {e}", parent.display())))?;
     let serialized = serde_json::to_string_pretty(state)?;
-    std::fs::write(&path, serialized)
+    crate::persist::write_atomic(&path, serialized.as_bytes())
         .map_err(|e| Error::Other(format!("write network_state to {}: {e}", path.display())))?;
     restrict_file_permissions(&path)?;
     Ok(())

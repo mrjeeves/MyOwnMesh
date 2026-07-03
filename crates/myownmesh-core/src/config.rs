@@ -571,8 +571,27 @@ impl MeshConfig {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-        let cfg: MeshConfig = serde_json::from_str(&raw)
-            .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
+        // Corrupt config (power cut mid-write on an appliance, or a
+        // hand-edit gone wrong) → quarantine + defaults, loudly. A
+        // parse error here used to stop the daemon from starting at
+        // all — the worst brick, since embedders (NanoKVM, AllMyStuff)
+        // re-add their networks over the control socket and rewrite
+        // this file on their own once the daemon is up. Defaults are
+        // fail-safe: no networks joined, no services exposed.
+        let cfg: MeshConfig = match serde_json::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                let kept = crate::persist::quarantine(&path);
+                tracing::error!(
+                    path = %path.display(),
+                    quarantined = ?kept,
+                    "config file is corrupt ({e}) — starting from \
+                     defaults; the previous contents were kept at the \
+                     quarantine path for hand-recovery"
+                );
+                return Ok(Self::default());
+            }
+        };
         if cfg.version != CONFIG_VERSION {
             return Err(Error::Config(format!(
                 "config version {} unsupported (this build expects v{})",
@@ -592,7 +611,7 @@ impl MeshConfig {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Config(format!("create {}: {e}", parent.display())))?;
         let serialized = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, serialized)
+        crate::persist::write_atomic(&path, serialized.as_bytes())
             .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
         Ok(())
     }

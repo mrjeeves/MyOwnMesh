@@ -206,7 +206,10 @@ fn create_new(path: &Path) -> Result<Identity> {
     };
 
     let serialized = serde_json::to_string_pretty(&anchor)?;
-    std::fs::write(path, serialized).map_err(|e| {
+    // Atomic: a truncated anchor is unrecoverable (the secret key is
+    // gone) and load_or_create deliberately refuses to regenerate over
+    // a corrupt file — so this write must never be able to produce one.
+    crate::persist::write_atomic(path, serialized.as_bytes()).map_err(|e| {
         Error::Identity(format!("write identity anchor to {}: {e}", path.display()))
     })?;
     restrict_file_permissions(path)?;
@@ -306,7 +309,7 @@ pub fn set_label(label: &str) -> Result<()> {
     let mut anchor: Anchor = serde_json::from_str(&raw)?;
     anchor.label = label.to_string();
     let serialized = serde_json::to_string_pretty(&anchor)?;
-    std::fs::write(&path, serialized).map_err(|e| {
+    crate::persist::write_atomic(&path, serialized.as_bytes()).map_err(|e| {
         Error::Identity(format!("write identity anchor to {}: {e}", path.display()))
     })?;
     restrict_file_permissions(&path)?;

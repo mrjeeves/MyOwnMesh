@@ -330,7 +330,13 @@ fn save_at(path: &Path, store: &CustodyStore) -> Result<()> {
         restrict_dir(parent);
     }
     let bytes = serde_json::to_vec_pretty(store)?;
-    std::fs::write(path, bytes).map_err(|e| Error::Custody(format!("write custody store: {e}")))?;
+    // Atomic so a power cut can't truncate the store. Note load_at
+    // deliberately stays hard-fail on a corrupt file: falling back to
+    // an empty store would silently turn OFF custody (MFA) for every
+    // enrolled network — fail-open. Corruption is prevented here
+    // instead of forgiven there.
+    crate::persist::write_atomic(path, &bytes)
+        .map_err(|e| Error::Custody(format!("write custody store: {e}")))?;
     restrict_file(path);
     Ok(())
 }
