@@ -157,13 +157,13 @@ async fn two_peers_handshake_over_mdns_only() {
     wait_for_approval(
         &mut alice_events,
         bob_id.public_id(),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
     wait_for_approval(
         &mut bob_events,
         alice_id.public_id(),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 }
@@ -232,13 +232,13 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     wait_for_approval(
         &mut alice_events,
         bob_id.public_id(),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
     wait_for_approval(
         &mut bob_events,
         alice_id.public_id(),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 }

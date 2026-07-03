@@ -268,7 +268,10 @@ struct Shared {
     /// DNS-SD fullname → device id, so a `ServiceRemoved` (which only
     /// carries the fullname) maps back to the peer it withdraws.
     fullname_to_peer: Mutex<HashMap<String, String>>,
-    /// Cached outbound exchange connections: device id → writer.
+    /// Live exchange connections, either direction: device id →
+    /// writer. Outbound dials register at connect; inbound accepts
+    /// register under the first `from` their frames carry, so a reply
+    /// can ride the same socket the request arrived on.
     conns: Mutex<HashMap<String, ConnHandle>>,
     conn_gen: AtomicU64,
     inbound_tx: mpsc::UnboundedSender<MdnsInbound>,
@@ -389,7 +392,11 @@ async fn send_directed(shared: &Arc<Shared>, to: String, msg: SignalingMessage) 
         msg,
     });
 
-    // Fast path: an existing writer for this peer.
+    // Fast path: an existing connection for this peer — in either
+    // direction. An inbound connection the peer dialed serves our
+    // replies too (see `adopt_stream`), which is what lets a device
+    // answer an offer even when its own mDNS view of the offerer is
+    // missing or stale (asymmetric visibility).
     if let Some(handle) = shared.conns.lock().get(&to).cloned() {
         if handle.tx.send(line.clone()).is_ok() {
             return;
@@ -401,51 +408,132 @@ async fn send_directed(shared: &Arc<Shared>, to: String, msg: SignalingMessage) 
         debug!(peer = %&to[..to.len().min(16)], "mdns directed message for unknown peer dropped");
         return;
     };
-    for addr in &entry.addrs {
-        match timeout(DIAL_TIMEOUT, TcpStream::connect((*addr, entry.port))).await {
-            Ok(Ok(stream)) => {
-                let generation = shared.conn_gen.fetch_add(1, Ordering::SeqCst);
-                let (tx, rx) = mpsc::unbounded_channel::<String>();
-                let _ = tx.send(line);
-                shared
-                    .conns
-                    .lock()
-                    .insert(to.clone(), ConnHandle { generation, tx });
-                let shared_for_task = shared.clone();
-                let to_for_task = to.clone();
-                tokio::spawn(async move {
-                    run_writer(stream, rx).await;
-                    // Only unregister our own generation — a newer
-                    // dial may have replaced this entry already.
-                    let mut conns = shared_for_task.conns.lock();
-                    if conns
-                        .get(&to_for_task)
-                        .is_some_and(|h| h.generation == generation)
-                    {
-                        conns.remove(&to_for_task);
-                    }
-                });
-                return;
-            }
-            Ok(Err(e)) => {
-                trace!(%addr, "mdns dial failed: {e}");
-            }
-            Err(_) => {
-                trace!(%addr, "mdns dial timed out");
-            }
+    // All advertised addresses race concurrently and the first
+    // connect wins — a host advertises every interface (docker
+    // bridges, secondary NICs, …) and dialing serially would burn a
+    // full DIAL_TIMEOUT per dead address, longer than a handshake
+    // window.
+    let attempts: Vec<_> = entry
+        .addrs
+        .iter()
+        .map(|addr| {
+            let addr = *addr;
+            let port = entry.port;
+            Box::pin(async move {
+                timeout(DIAL_TIMEOUT, TcpStream::connect((addr, port)))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")
+                    })?
+            })
+        })
+        .collect();
+    match futures::future::select_ok(attempts).await {
+        Ok((stream, _rest)) => {
+            let tx = adopt_stream(shared, stream, Some(to));
+            let _ = tx.send(line);
+        }
+        Err(e) => {
+            debug!(
+                peer = %&to[..to.len().min(16)],
+                "mdns peer unreachable on every advertised address: {e}"
+            );
         }
     }
-    debug!(peer = %&to[..to.len().min(16)], "mdns peer unreachable on every advertised address");
 }
 
-async fn run_writer(mut stream: TcpStream, mut rx: mpsc::UnboundedReceiver<String>) {
+/// Take ownership of an exchange connection (dialed or accepted):
+/// register its writer in the connection table and spawn the writer +
+/// reader tasks. `known_peer` is the peer id for outbound dials;
+/// inbound connections register lazily under the first authenticated
+/// `from` their frames carry, so replies can ride the same socket.
+fn adopt_stream(
+    shared: &Arc<Shared>,
+    stream: TcpStream,
+    known_peer: Option<String>,
+) -> mpsc::UnboundedSender<String> {
+    let (read_half, write_half) = stream.into_split();
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let generation = shared.conn_gen.fetch_add(1, Ordering::SeqCst);
+    // The peer this connection is registered under — set at adopt
+    // time for outbound dials, on first frame for inbound accepts.
+    let registered_as = Arc::new(Mutex::new(None::<String>));
+    if let Some(peer) = known_peer {
+        shared.conns.lock().insert(
+            peer.clone(),
+            ConnHandle {
+                generation,
+                tx: tx.clone(),
+            },
+        );
+        *registered_as.lock() = Some(peer);
+    }
+
+    // Writer: drains the queue onto the socket; exits on idle, write
+    // error, or when every sender is gone.
+    {
+        let shared = shared.clone();
+        let registered_as = registered_as.clone();
+        tokio::spawn(async move {
+            run_writer(write_half, rx).await;
+            // Deregister — only our own generation; a newer connection
+            // may have replaced this entry already.
+            if let Some(peer) = registered_as.lock().clone() {
+                let mut conns = shared.conns.lock();
+                if conns.get(&peer).is_some_and(|h| h.generation == generation) {
+                    conns.remove(&peer);
+                }
+            }
+        });
+    }
+
+    // Reader: parses frames addressed to us and (for inbound
+    // connections) registers the writer under the sender's id.
+    {
+        let shared = shared.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            run_reader(&shared, read_half, |from| {
+                let mut reg = registered_as.lock();
+                if reg.is_none() {
+                    shared.conns.lock().insert(
+                        from.to_string(),
+                        ConnHandle {
+                            generation,
+                            tx: tx.clone(),
+                        },
+                    );
+                    *reg = Some(from.to_string());
+                }
+            })
+            .await;
+            // A dead read side means the conversation is over even if
+            // writes would still go through — deregister so the next
+            // exchange re-dials.
+            if let Some(peer) = registered_as.lock().clone() {
+                let mut conns = shared.conns.lock();
+                if conns.get(&peer).is_some_and(|h| h.generation == generation) {
+                    conns.remove(&peer);
+                }
+            }
+            trace!("mdns exchange connection closed");
+        });
+    }
+
+    tx
+}
+
+async fn run_writer(
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<String>,
+) {
     loop {
         match timeout(CONN_IDLE_TIMEOUT, rx.recv()).await {
             Ok(Some(line)) => {
-                if stream.write_all(line.as_bytes()).await.is_err() {
+                if write_half.write_all(line.as_bytes()).await.is_err() {
                     return;
                 }
-                if stream.write_all(b"\n").await.is_err() {
+                if write_half.write_all(b"\n").await.is_err() {
                     return;
                 }
             }
@@ -465,12 +553,8 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
     };
     loop {
         match listener.accept().await {
-            Ok((stream, remote)) => {
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    run_reader(shared, stream).await;
-                    trace!(%remote, "mdns exchange connection closed");
-                });
+            Ok((stream, _remote)) => {
+                let _ = adopt_stream(&shared, stream, None);
             }
             Err(e) => {
                 debug!("mdns accept error: {e}");
@@ -480,8 +564,12 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
     }
 }
 
-async fn run_reader(shared: Arc<Shared>, stream: TcpStream) {
-    let mut reader = BufReader::new(stream);
+async fn run_reader(
+    shared: &Arc<Shared>,
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    mut on_peer_frame: impl FnMut(&str),
+) {
+    let mut reader = BufReader::new(read_half);
     let mut buf: Vec<u8> = Vec::new();
     loop {
         buf.clear();
@@ -513,6 +601,7 @@ async fn run_reader(shared: Arc<Shared>, stream: TcpStream) {
             trace!("mdns frame for another room/recipient dropped");
             continue;
         }
+        on_peer_frame(&frame.from);
         let inbound = match frame.msg {
             SignalingMessage::Announce { .. } => MdnsInbound::PeerAnnounced {
                 device_id: frame.from,
@@ -534,7 +623,7 @@ async fn run_reader(shared: Arc<Shared>, stream: TcpStream) {
 /// errors if the line exceeds [`wire::MAX_FRAME_BYTES`] — bounding
 /// what an unauthenticated LAN peer can make us buffer.
 async fn read_bounded_line(
-    reader: &mut BufReader<TcpStream>,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<bool> {
     loop {
