@@ -122,10 +122,23 @@ pub struct TurnServer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SignalingConfig {
-    /// Which signaling strategy to use. Only `"nostr"` is supported in
-    /// v1; sibling crates can add others (BitTorrent trackers, MQTT,
-    /// IPFS, Firebase) and the engine picks via this field.
+    /// Which *remote* signaling strategy to use: `"nostr"` (default,
+    /// relay-based) or `"none"` (no remote signaling at all — pair
+    /// with `mdns` for a LAN-only network). Sibling crates can add
+    /// others (BitTorrent trackers, MQTT, IPFS, Firebase) and the
+    /// engine picks via this field. An unknown value attaches NO
+    /// remote driver, loudly — never a silent Nostr fallback, so a
+    /// privacy-motivated strategy can't quietly leak presence onto
+    /// public relays.
     pub strategy: String,
+    /// LAN-local mDNS/DNS-SD signaling, running alongside whatever
+    /// `strategy` selects. On by default: co-located peers discover
+    /// each other and exchange SDP over the local network, so a mesh
+    /// keeps forming/healing even when every relay or venue is
+    /// unreachable. Set `false` to stay silent on the local network.
+    /// The mDNS driver ignores the relay-oriented fields below
+    /// (`servers`, `redundancy`, `denylist`, `public_fallback`).
+    pub mdns: bool,
     /// Explicit relay URLs. Empty = use the built-in deterministic
     /// top-N defaults filtered by the denylist.
     pub servers: Vec<String>,
@@ -152,6 +165,7 @@ impl Default for SignalingConfig {
     fn default() -> Self {
         Self {
             strategy: "nostr".to_string(),
+            mdns: true,
             servers: Vec::new(),
             redundancy: DEFAULT_SIGNALING_REDUNDANCY,
             denylist: default_signaling_denylist(),

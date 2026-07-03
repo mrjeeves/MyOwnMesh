@@ -14,6 +14,16 @@ myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0
 - **`local::LocalBroker`** — in-process loopback. Used by the
   integration test suite and by embedders running multiple
   `Mesh` instances in one process.
+- **`mdns::driver`** — LAN-local DNS-SD signaling (pure-Rust
+  `mdns-sd`, no avahi/Bonjour binding). Registers one
+  `_myownmesh._tcp.local.` instance per network with the room handle
+  in TXT, browses for peers in the same room, and exchanges
+  offer/answer/candidate frames over a unicast TCP port advertised
+  in SRV (SDP is far too large for TXT). Clock-free — works on a
+  device whose RTC still reads the epoch. On by default alongside
+  the remote strategy (`SignalingConfig.mdns`), so co-located peers
+  mesh even with every relay unreachable; pair with
+  `strategy = "none"` for a fully LAN-local network.
 - **`nostr::driver`** — production Nostr signaling. Connects N relays
   in parallel (deterministic top-N selection per `(app_id,
   network_id)`), subscribes by `#r` tag, and splits the wire by message

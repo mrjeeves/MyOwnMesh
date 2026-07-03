@@ -1,6 +1,9 @@
-//! Signaling for MyOwnMesh. Today's only strategy is Nostr; sibling
-//! crates can add others (BitTorrent trackers, MQTT, IPFS, Firebase)
-//! and the engine picks at construction time.
+//! Signaling for MyOwnMesh. Two strategies ship today — [`nostr`]
+//! (the remote default, relay-based) and [`mdns`] (LAN-local DNS-SD
+//! discovery + unicast TCP exchange, on by default alongside the
+//! remote strategy) — and sibling crates can add others (BitTorrent
+//! trackers, MQTT, IPFS, Firebase); the engine picks at construction
+//! time.
 //!
 //! Wire-compatibility note: the room-handle derivation and relay
 //! shuffle in [`nostr`] are byte-compatible with upstream Trystero
@@ -15,6 +18,7 @@
 //! requiring users to apply patches.
 
 pub mod local;
+pub mod mdns;
 pub mod nostr;
 pub mod server;
 pub mod upstream;

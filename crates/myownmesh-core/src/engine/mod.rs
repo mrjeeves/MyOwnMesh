@@ -34,7 +34,9 @@ pub mod state;
 pub mod tick;
 pub mod wake;
 
-pub use signaling_bridge::{attach_local, attach_nostr};
+pub use signaling_bridge::{
+    attach_local, attach_mdns, attach_nostr, attach_signaling, SignalingDrivers,
+};
 
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound

@@ -402,11 +402,11 @@ pub(crate) async fn join_network(
     }
     match mesh.join(cfg.clone()).await {
         Ok(joined) => {
-            let nostr = myownmesh_core::engine::attach_nostr(&joined.state());
-            if nostr.is_none() {
-                warn!(network = %cfg.network_id, "nostr attach returned no handle");
+            let drivers = myownmesh_core::engine::attach_signaling(&joined.state());
+            if drivers.is_none() {
+                warn!(network = %cfg.network_id, "signaling attach returned no handle");
             }
-            registry.insert(joined, nostr);
+            registry.insert(joined, drivers);
             info!(network = %cfg.network_id, "joined network");
         }
         Err(e) => warn!(network = %cfg.network_id, "join failed: {e:#}"),

@@ -1509,17 +1509,18 @@ async fn network_add(state: &Arc<ControlState>, config: NetworkConfig) -> Respon
         "topology": joined.current_topology(),
     });
 
-    // Attach the production signaling driver. A `None` here means
-    // the bridge declined (e.g. signaling disabled in config); the
-    // network still works for in-process drivers attached by tests.
-    let nostr = {
+    // Attach the signaling driver(s) the network's config selects
+    // (Nostr and/or mDNS). A `None` here means the bridge declined
+    // (outbound receiver already taken, e.g. by an in-process test
+    // driver); the network still works for those.
+    let drivers = {
         let net_state = joined.state();
-        myownmesh_core::engine::attach_nostr(&net_state)
+        myownmesh_core::engine::attach_signaling(&net_state)
     };
-    if nostr.is_none() {
-        warn!(network = %config.network_id, "nostr attach returned no handle");
+    if drivers.is_none() {
+        warn!(network = %config.network_id, "signaling attach returned no handle");
     }
-    state.registry.insert(joined, nostr);
+    state.registry.insert(joined, drivers);
 
     // Start a relay forwarder for the new network if relay hosting is on,
     // and refresh the service-role advert so the new network advertises
@@ -1735,11 +1736,11 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
         Err(e) => {
             let rollback = match state.mesh.join(old_config).await {
                 Ok(restored) => {
-                    let nostr = {
+                    let drivers = {
                         let net_state = restored.state();
-                        myownmesh_core::engine::attach_nostr(&net_state)
+                        myownmesh_core::engine::attach_signaling(&net_state)
                     };
-                    state.registry.insert(restored, nostr);
+                    state.registry.insert(restored, drivers);
                     state.services.on_network_added(&config.id).await;
                     " — restored the previous config"
                 }
@@ -1758,14 +1759,14 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
         "phase": joined.current_phase(),
         "topology": joined.current_topology(),
     });
-    let nostr = {
+    let drivers = {
         let net_state = joined.state();
-        myownmesh_core::engine::attach_nostr(&net_state)
+        myownmesh_core::engine::attach_signaling(&net_state)
     };
-    if nostr.is_none() {
-        warn!(network = %config.network_id, "nostr attach returned no handle after update");
+    if drivers.is_none() {
+        warn!(network = %config.network_id, "signaling attach returned no handle after update");
     }
-    state.registry.insert(joined, nostr);
+    state.registry.insert(joined, drivers);
 
     // The old network (and its relay forwarder) was torn down; rebind a
     // fresh relay to the new network state if relay hosting is on.

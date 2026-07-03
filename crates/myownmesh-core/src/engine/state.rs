@@ -244,7 +244,9 @@ impl SignalingInbound {
 }
 
 /// Outbound signaling messages from the engine to the signaling task.
-#[derive(Debug)]
+/// `Clone` so the bridge's fan-out can hand one engine emission to
+/// several concurrently-attached drivers (Nostr + mDNS).
+#[derive(Debug, Clone)]
 pub enum SignalingOutbound {
     Announce,
     /// Graceful departure broadcast — the dual of [`Announce`]. Tells every
