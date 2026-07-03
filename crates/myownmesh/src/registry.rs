@@ -4,10 +4,11 @@
 //! topology changes, add/remove) without `serve.rs` having to thread a
 //! handle through every dispatch arm.
 //!
-//! Each entry pairs a `JoinedNetwork` with its `NostrDriverHandle` — the
-//! signaling driver is per-network, and dropping the handle stops it.
+//! Each entry pairs a `JoinedNetwork` with its `SignalingDrivers` — the
+//! signaling driver set (Nostr and/or mDNS, per the network's
+//! strategy) is per-network, and dropping the handle stops it.
 //! Bundling them means removing a network from the registry tears down
-//! both the engine driver (via `leave()`) and the signaling driver
+//! both the engine driver (via `leave()`) and the signaling drivers
 //! (via `Drop`) without serve.rs having to keep parallel vectors.
 //!
 //! `JoinedNetwork` is not [`Clone`] — its `leave(self)` consumes the
@@ -28,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use myownmesh_core::engine::SignalingDrivers;
 use myownmesh_core::JoinedNetwork;
-use myownmesh_signaling::nostr::driver::NostrDriverHandle;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 
@@ -64,12 +65,12 @@ pub struct NetworkSummary {
 }
 
 /// One row of the registry: the `JoinedNetwork` handle plus the
-/// `NostrDriverHandle` that keeps signaling alive. `nostr` is
+/// `SignalingDrivers` that keep signaling alive. `drivers` is
 /// `Mutex<Option<...>>` so we can `take()` it during a remove without
 /// requiring `&mut self` access through the `Arc` (which is shared).
 struct Entry {
     joined: Arc<JoinedNetwork>,
-    nostr: Mutex<Option<NostrDriverHandle>>,
+    drivers: Mutex<Option<SignalingDrivers>>,
 }
 
 /// Registry shared between `serve.rs` (which owns initial population
@@ -87,16 +88,16 @@ impl NetworkRegistry {
     }
 
     /// Insert a freshly-joined network together with its signaling
-    /// driver handle. Indexed by both the config record id and the
+    /// driver handles. Indexed by both the config record id and the
     /// wire-level network id so callers can use either as the lookup
     /// key (the CLI / GUI both have a habit of passing whichever
     /// happens to be in scope).
-    pub fn insert(&self, joined: JoinedNetwork, nostr: Option<NostrDriverHandle>) {
+    pub fn insert(&self, joined: JoinedNetwork, drivers: Option<SignalingDrivers>) {
         let config_id = joined.config_id().to_string();
         let network_id = joined.network_id().to_string();
         let entry = Arc::new(Entry {
             joined: Arc::new(joined),
-            nostr: Mutex::new(nostr),
+            drivers: Mutex::new(drivers),
         });
         let mut map = self.inner.write();
         map.insert(config_id, entry.clone());
@@ -153,8 +154,8 @@ impl NetworkRegistry {
     /// caller can retry shortly or just drop the registry handle
     /// and let the engine tear down via its command channel.
     ///
-    /// The accompanying `NostrDriverHandle`, if any, is dropped
-    /// inside this call — its `Drop` impl signals every signaling
+    /// The accompanying `SignalingDrivers`, if any, are dropped
+    /// inside this call — their `Drop` impls signal every signaling
     /// task to exit, so callers don't need to do anything else for
     /// the signaling side.
     pub fn remove(&self, key: &str) -> RemoveResult {
@@ -184,9 +185,9 @@ impl NetworkRegistry {
                 map.remove(k);
             }
         }
-        // Drop the signaling driver — its Drop signals every spawned
-        // task to exit.
-        drop(entry.nostr.lock().take());
+        // Drop the signaling drivers — their Drops signal every
+        // spawned task to exit.
+        drop(entry.drivers.lock().take());
         // Extract the JoinedNetwork. Three-step dance because we
         // have to unwrap the outer `Arc<Entry>` AND the inner
         // `Arc<JoinedNetwork>`.
@@ -245,8 +246,9 @@ impl NetworkRegistry {
         }
         let mut out = Vec::new();
         for (_, arc) in by_ptr {
-            // Drop the nostr handle first; we don't need it past this point.
-            drop(arc.nostr.lock().take());
+            // Drop the signaling drivers first; we don't need them
+            // past this point.
+            drop(arc.drivers.lock().take());
             if let Ok(Entry { joined, .. }) = Arc::try_unwrap(arc) {
                 if let Ok(joined) = Arc::try_unwrap(joined) {
                     out.push(joined);

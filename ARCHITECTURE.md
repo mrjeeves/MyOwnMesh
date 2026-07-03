@@ -174,7 +174,7 @@ it moves Annex-B access units.
 
 ## Signaling
 
-Today the production strategy is Nostr (5 relays by default,
+The remote production strategy is Nostr (5 relays by default,
 deterministic shuffle per app-id). The Trystero v0.24 wire format
 is preserved on the room-handle derivation so a future hybrid
 deployment with JS Trystero peers is possible if they share an
@@ -182,7 +182,25 @@ app-id. By default the app-ids differ
 (`myownmesh-cloud-mesh-v1` vs `myownllm-cloud-mesh-v1`) so the
 two ecosystems never meet on the wire.
 
-A second strategy — `local::LocalBroker` — runs entirely
+Alongside whatever the remote strategy is, every network also runs
+**mDNS/DNS-SD signaling on the local network by default**
+(`signaling.mdns`, on unless set `false`): each joined network
+registers a `_myownmesh._tcp.local.` instance carrying the room
+handle in TXT, browses for peers in the same room, and exchanges
+the SDP/candidate traffic over a unicast TCP port advertised in
+SRV. Co-located devices therefore discover each other and keep
+meshing even when every relay/venue is unreachable — and a network
+with `signaling.strategy = "none"` is fully LAN-local, touching no
+remote infrastructure at all (the shape local-only device claiming
+rides). The mDNS driver is clock-free (no TLS, no timestamps), so
+it works on devices that boot with an unset RTC. When both drivers
+are attached, the engine bridge fans each outbound signal to both
+and dedupes the cross-transport duplicate deliveries by content —
+applying the same offer twice would wedge WebRTC
+(`engine::signaling_bridge`). An unknown `signaling.strategy` value
+attaches NO remote driver, loudly — never a silent Nostr fallback.
+
+A further strategy — `local::LocalBroker` — runs entirely
 in-process for tests and for embedders that don't need network
 signaling.
 

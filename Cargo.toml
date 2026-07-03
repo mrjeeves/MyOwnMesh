@@ -47,6 +47,11 @@ webrtc-util = "0.11"
 # WebSocket (Nostr signaling)
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
+# DNS-SD / mDNS (LAN signaling). Pure Rust — no avahi/bonjour binding, so it
+# cross-compiles for the riscv64-musl NanoKVM target and coexists with an
+# avahi daemon on the same host (both bind 5353 with SO_REUSEADDR/PORT).
+mdns-sd = "0.20"
+
 # Cross-platform local IPC (control socket)
 interprocess = { version = "2", features = ["tokio"] }
 
