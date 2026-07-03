@@ -97,6 +97,7 @@ pub mod events;
 pub mod handle;
 pub mod identity;
 pub mod network_state;
+pub(crate) mod persist;
 pub mod protocol;
 pub mod roster;
 pub mod rpc;

@@ -283,6 +283,16 @@ pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
 /// its own file, so switching the active network preserves other
 /// networks' rosters untouched. The returned roster is in-memory;
 /// nothing is written until a caller invokes `save`.
+///
+/// A roster file that exists but doesn't parse is treated like a
+/// missing one: quarantined aside (`.corrupt`) with a loud warning,
+/// never a hard error. Failing the load used to fail every join of
+/// that network *forever* — a device that lost power mid-write (a
+/// truncated 0-byte roster) was bricked off its own fleet until
+/// someone SSH'd in and deleted the file. The roster is re-convergent
+/// state (it rebuilds from approvals / the owner's signed roster
+/// broadcast), so starting empty is always recoverable; the corrupt
+/// bytes are kept for forensics.
 pub fn load(current_network_id: &str) -> Result<Roster> {
     let path = roster_path(current_network_id)?;
     if !path.exists() {
@@ -290,8 +300,21 @@ pub fn load(current_network_id: &str) -> Result<Roster> {
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Roster(format!("read roster at {}: {e}", path.display())))?;
-    let roster: Roster = serde_json::from_str(&raw)
-        .map_err(|e| Error::Roster(format!("parse roster at {}: {e}", path.display())))?;
+    let roster: Roster = match serde_json::from_str(&raw) {
+        Ok(r) => r,
+        Err(e) => {
+            let kept = crate::persist::quarantine(&path);
+            tracing::error!(
+                network = current_network_id,
+                path = %path.display(),
+                quarantined = ?kept,
+                "roster file is corrupt ({e}) — starting this network's \
+                 roster fresh; it re-converges from approvals / the \
+                 owner's signed roster"
+            );
+            return Ok(empty_for(current_network_id));
+        }
+    };
     if roster.version != ROSTER_VERSION {
         return Err(Error::Roster(format!(
             "roster version {} unsupported (this build expects v{})",
@@ -315,7 +338,7 @@ pub fn save(roster: &Roster) -> Result<()> {
     std::fs::create_dir_all(parent)
         .map_err(|e| Error::Roster(format!("create rosters dir at {}: {e}", parent.display())))?;
     let serialized = serde_json::to_string_pretty(roster)?;
-    std::fs::write(&path, serialized)
+    crate::persist::write_atomic(&path, serialized.as_bytes())
         .map_err(|e| Error::Roster(format!("write roster to {}: {e}", path.display())))?;
     restrict_file_permissions(&path)?;
     Ok(())
