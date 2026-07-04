@@ -41,8 +41,8 @@ The **NanoKVM-Pro** (Axera AX630C, 2×Cortex-A53, aarch64, 1 GB, glibc Ubuntu
 22.04 rootfs) runs the same daemon, just cross-compiled for aarch64:
 
 ```sh
-just setup-pro             # add the aarch64 musl Rust target + cargo-zigbuild
-just build-pro             # cross-build the daemon  (alias: just build-nanokvm-pro)
+just setup-aarch64-musl    # add the aarch64 musl Rust target + cargo-zigbuild
+just build-aarch64-musl    # cross-build the daemon  (alias: just build-nanokvm-pro)
 # → target/aarch64-unknown-linux-musl/release/myownmesh
 ```
 

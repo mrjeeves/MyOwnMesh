@@ -8,12 +8,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   check:
     name: check / ${{ matrix.platform.name }}
     runs-on: ${{ matrix.platform.os }}
+    # -D warnings is scoped to this job on purpose: setting RUSTFLAGS at the
+    # workflow level would override (not merge with) the per-target rustflags in
+    # .cargo/config.toml, dropping the appliance cross-builds' +crt-static and
+    # -u getrandom guard. The daemon-cross job below must inherit those instead.
+    env:
+      RUSTFLAGS: "-D warnings"
     strategy:
       fail-fast: false
       matrix:
@@ -40,3 +45,47 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --no-fail-fast
+
+  # Validate the static-musl appliance daemons actually cross-compile on every
+  # PR — not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
+  # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,
+  # so a broken .cargo/config.toml, a dependency that won't cross-compile, or the
+  # static-musl getrandom link regression is caught here instead of at release.
+  # NOTE: this job deliberately has no RUSTFLAGS env, so .cargo/config.toml's
+  # per-target rustflags (+crt-static, -u getrandom) apply.
+  daemon-cross:
+    name: daemon cross-compile / ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv64gc-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the same toolchain as rust-toolchain.toml (channel 1.88.0) and the
+      # release jobs. `@stable` would add the cross target to the stable
+      # toolchain, but cargo honors rust-toolchain.toml's pin and builds with
+      # 1.88.0 — which would then lack the target ("can't find crate for core").
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: daemon-cross-${{ matrix.target }}
+
+      - name: Install Zig + cargo-zigbuild
+        run: |
+          set -e
+          python3 -m pip install --upgrade "ziglang==0.13.0"
+          printf '#!/usr/bin/env bash\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+          cargo install cargo-zigbuild --locked
+
+      - name: Cross-build daemon
+        run: cargo zigbuild --release --bin myownmesh --target ${{ matrix.target }}

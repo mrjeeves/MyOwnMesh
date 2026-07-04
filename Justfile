@@ -60,28 +60,29 @@ build-risc: setup-risc
 # Back-compat alias for the original recipe name.
 alias build-nanokvm := build-risc
 
-# One-time: add the aarch64 musl Rust target + the Zig-based cross toolchain,
-# for the NanoKVM-Pro (Axera AX630C, 2×Cortex-A53, aarch64). Same cargo-zigbuild
-# approach as setup-risc — aarch64 has no vendor-ISA linker conflict, so Zig is
-# used purely for toolchain-free CI parity, not out of necessity. See
-# docs/NANOKVM.md.
-setup-pro:
+# One-time: add the aarch64 musl Rust target + the Zig-based cross toolchain.
+# Same cargo-zigbuild approach as setup-risc — aarch64 has no vendor-ISA linker
+# conflict, so Zig is used purely for toolchain-free CI parity, not out of
+# necessity. This is the static-musl appliance build (e.g. the NanoKVM-Pro), NOT
+# the glibc desktop linux-aarch64 bundle. See docs/NANOKVM.md.
+setup-aarch64-musl:
     @rustup target add aarch64-unknown-linux-musl
     @command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
     @command -v zig >/dev/null 2>&1 \
         && echo "zig OK: $(zig version)" \
         || echo "NOTE: 'zig' not on PATH — install it ('brew install zig', 'apt install zig', or 'pip install ziglang'). See docs/NANOKVM.md."
 
-# Cross-build *just the daemon* for the NanoKVM-Pro SoC (Axera AX630C, 2×Cortex-
-# A53, aarch64 + musl) so a NanoKVM-Pro can run a real MyOwnMesh node — the same
-# static-musl appliance binary the riscv64 NanoKVM uses, just a different arch.
-# A static-musl aarch64 binary runs on the Pro's glibc Ubuntu rootfs without a
-# glibc-version dependency. See docs/NANOKVM.md.
-build-pro: setup-pro
+# Cross-build *just the daemon* as a static-musl aarch64 binary — the appliance
+# build for an aarch64 device (e.g. the NanoKVM-Pro, Axera AX630C), the same
+# static-musl appliance the riscv64 NanoKVM uses, just a different arch. Runs on
+# a glibc rootfs without a glibc-version dependency. The `-musl` in the name is
+# deliberate: this is DISTINCT from the glibc desktop `linux-aarch64` bundle the
+# release matrix builds (which needs the runner's glibc). See docs/NANOKVM.md.
+build-aarch64-musl: setup-aarch64-musl
     @cargo zigbuild --release --bin myownmesh --target aarch64-unknown-linux-musl
 
-# Alias mirroring build-nanokvm.
-alias build-nanokvm-pro := build-pro
+# Product alias, mirroring build-nanokvm := build-risc.
+alias build-nanokvm-pro := build-aarch64-musl
 
 # Run the GUI (Tauri + Svelte) with hot reload. The GUI auto-spawns
 # the daemon as a child process, so this is the only command you
