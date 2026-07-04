@@ -65,7 +65,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin to the same toolchain as rust-toolchain.toml (channel 1.88.0) and the
+      # release jobs. `@stable` would add the cross target to the stable
+      # toolchain, but cargo honors rust-toolchain.toml's pin and builds with
+      # 1.88.0 — which would then lack the target ("can't find crate for core").
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: ${{ matrix.target }}
 
