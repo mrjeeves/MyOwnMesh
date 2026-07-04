@@ -35,6 +35,16 @@ The release workflow runs on `push: tags: v*` and on
   `myownmesh` then opens the GUI).
 - Uploads everything to the GitHub release.
 
+Two extra **daemon-only** jobs run outside that matrix, building
+fully static musl binaries for the KVM appliances (no GUI, no glibc
+dependency): `daemon-riscv64` → `myownmesh-linux-riscv64.tar.gz`
+(NanoKVM) and `daemon-aarch64-musl` →
+`myownmesh-linux-aarch64-musl.tar.gz` (NanoKVM-Pro). Both are
+cross-compiled with `cargo-zigbuild`. Note the `-musl` suffix on the
+aarch64 appliance asset: the plain `myownmesh-linux-aarch64.tar.gz`
+is the dynamic-glibc **desktop** build, so the appliance name must
+not collide with it. See [`docs/NANOKVM.md`](docs/NANOKVM.md).
+
 The matrix mirrors MyOwnLLM's `release.yml` so behaviour is
 consistent across both apps.
 

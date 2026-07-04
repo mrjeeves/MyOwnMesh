@@ -45,3 +45,26 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-Wl,-u,getrandom",
 ]
+
+# Cross-compilation for the NanoKVM-Pro SoC (Axera AX630C / 2×Cortex-A53,
+# aarch64). Like the riscv64 daemon above, this ships as a fully static
+# **aarch64 musl** binary built with `cargo-zigbuild`. The NanoKVM-Pro rootfs
+# is glibc (Ubuntu 22.04 aarch64), so a static-musl binary runs on it without
+# depending on the device's glibc version — the same appliance philosophy as the
+# riscv64 build, and immune to CI-runner/rootfs glibc drift.
+#
+# None of the riscv64 vendor-ISA linker pain applies here: aarch64 has no
+# vendor-attribute merge conflict, so a standard musl toolchain links cleanly.
+# We still use Zig purely for toolchain-free CI parity with the riscv64 job.
+#
+# The `-u getrandom` guard IS required, though: it is a static-musl hazard, not
+# a riscv64 one. The workspace carries two `getrandom` generations (0.2 weak
+# extern, 0.4 direct call); on any static-musl target the weak undefined
+# reference fails to pull musl's getrandom.o from the archive, resolving the
+# symbol to address 0 and spinning forever on the first UUIDv4. See the detailed
+# explanation on the riscv64 target above.
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wl,-u,getrandom",
+]

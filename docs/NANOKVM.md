@@ -35,6 +35,29 @@ Install Zig however suits your box — `brew install zig`, `apt install zig`, or
 ziglang"`). On a Mac this is the whole story: no Docker, no hunting for a musl
 gcc.
 
+### NanoKVM-Pro (aarch64)
+
+The **NanoKVM-Pro** (Axera AX630C, 2×Cortex-A53, aarch64, 1 GB, glibc Ubuntu
+22.04 rootfs) runs the same daemon, just cross-compiled for aarch64:
+
+```sh
+just setup-pro             # add the aarch64 musl Rust target + cargo-zigbuild
+just build-pro             # cross-build the daemon  (alias: just build-nanokvm-pro)
+# → target/aarch64-unknown-linux-musl/release/myownmesh
+```
+
+We still build a **static `aarch64` musl** binary (not glibc): it runs on the
+Pro's glibc rootfs without a glibc-version dependency, exactly the appliance
+philosophy the riscv64 build follows. Note the two differences from riscv64:
+
+- **No vendor-ISA linker conflict.** The *Why Zig, not the vendor toolchain*
+  argument below is riscv64/Sophgo-specific — aarch64 has no draft-vector /
+  xthead attribute-merge problem, so a standard musl toolchain links cleanly.
+  We use Zig here purely for toolchain-free CI parity with the riscv64 job.
+- **The `-u getrandom` link guard still applies.** That fix (see
+  `.cargo/config.toml`) is a *static-musl* hazard, not a riscv64 one, so the
+  aarch64-musl target carries the same `-Wl,-u,getrandom` rustflag.
+
 ### Why Zig, not the Sophgo C906 toolchain
 
 NanoKVM's Go server is built with the device's Sophgo host-tools
@@ -77,12 +100,19 @@ to adopts it into that owner's fleet (the NanoKVM bridge drives the claim).
 
 ## Released artifact
 
-The release pipeline builds and publishes the daemon for this target on every
-release: a static-musl **`myownmesh-linux-riscv64.tar.gz`** (+ `.sha256`, and a
-`.minisig` once signing is configured), cross-compiled with cargo-zigbuild (a
-standard `rv64gc` musl toolchain — see *Why Zig* above). A NanoKVM pins a
-MyOwnMesh release in its `.myownmesh-rev` and installs that asset — no on-device
-or sibling build.
+The release pipeline builds and publishes a daemon for each device target on
+every release, both cross-compiled with cargo-zigbuild (+ `.sha256`, and a
+`.minisig` once signing is configured):
+
+- **`myownmesh-linux-riscv64.tar.gz`** — the NanoKVM (SG2002, riscv64), a
+  standard `rv64gc` musl toolchain (see *Why Zig* above).
+- **`myownmesh-linux-aarch64-musl.tar.gz`** — the NanoKVM-Pro (AX630C,
+  aarch64), static musl. The `-musl` suffix matters: the plain
+  `myownmesh-linux-aarch64.tar.gz` is the dynamic-glibc **desktop** build, so
+  the appliance asset must not collide with it.
+
+A NanoKVM (or NanoKVM-Pro) pins a MyOwnMesh release in its `.myownmesh-rev` and
+installs the matching asset — no on-device or sibling build.
 
 ## Status
 

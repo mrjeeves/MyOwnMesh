@@ -272,6 +272,72 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # The NanoKVM-Pro device target (Axera AX630C, 2×Cortex-A53 — aarch64 + musl).
+  # Daemon ONLY, same appliance rationale as daemon-riscv64: static-musl so it
+  # runs on the Pro's glibc Ubuntu rootfs without a glibc-version dependency, and
+  # immune to CI-runner/rootfs glibc drift. Built with cargo-zigbuild (Zig cross-
+  # compiles from the x86_64 runner — no arm runner needed). Ships
+  # myownmesh-linux-aarch64-musl.tar.gz — the asset a NanoKVM-Pro installs at its
+  # pinned `.myownmesh-rev`. NOTE the `-musl` suffix: the plain
+  # myownmesh-linux-aarch64.tar.gz name is already taken by the dynamic-glibc
+  # DESKTOP build (the `bundles` matrix), so the appliance asset must not collide
+  # with it. See .cargo/config.toml and docs/NANOKVM.md.
+  daemon-aarch64-musl:
+    name: Build (linux-aarch64-musl)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Cache (daemon workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: daemon-aarch64-musl
+
+      # Build the static aarch64 musl binary with Zig as the C compiler + linker
+      # (cargo-zigbuild). Unlike riscv64 there is no vendor-ISA attribute-merge
+      # conflict on aarch64; Zig is used purely for toolchain-free CI parity with
+      # the riscv64 job. The `-u getrandom` guard in .cargo/config.toml still
+      # applies — it is a static-musl hazard, not a riscv64 one.
+      - name: Install Zig + cargo-zigbuild
+        run: |
+          set -e
+          python3 -m pip install --upgrade "ziglang==0.13.0"
+          printf '#!/usr/bin/env bash\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+          cargo install cargo-zigbuild --locked
+
+      - name: Build daemon (aarch64 musl)
+        run: |
+          zig version
+          cargo zigbuild --release --bin myownmesh --target aarch64-unknown-linux-musl
+
+      - name: Package portable daemon binary
+        shell: bash
+        run: |
+          set -e
+          BIN=target/aarch64-unknown-linux-musl/release/myownmesh
+          [[ -f "$BIN" ]] || { echo "daemon binary not found at $BIN"; exit 1; }
+          mkdir -p dist-bin
+          NAME="myownmesh-linux-aarch64-musl"
+          cp "$BIN" "dist-bin/myownmesh"
+          tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
+          (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+          rm -f dist-bin/myownmesh
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist-bin/myownmesh-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # Detached Ed25519 (minisign) signatures over the portable archives, so the
   # self-updater can prove provenance, not just integrity. Runs once after all
   # platform bundles upload, and is a NO-OP until the maintainer configures the
@@ -280,7 +346,7 @@ jobs:
   # still releases exactly as before.
   sign:
     name: Sign release artifacts (minisign)
-    needs: [bundles, daemon-riscv64]
+    needs: [bundles, daemon-riscv64, daemon-aarch64-musl]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

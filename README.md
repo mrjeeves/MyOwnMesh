@@ -276,6 +276,12 @@ matrix builds and uploads bundles for all five. Linux is pinned to
 Ubuntu 22.04 (glibc 2.35) so binaries run on Debian 12, Ubuntu
 22.04+, and other distros still on glibc 2.35/2.36/2.38.
 
+Two **appliance** daemon-only builds ship alongside the desktop
+bundles as fully static musl binaries (no glibc dependency):
+`linux-riscv64` (`myownmesh-linux-riscv64.tar.gz`, the NanoKVM SoC)
+and `linux-aarch64-musl` (`myownmesh-linux-aarch64-musl.tar.gz`, the
+NanoKVM-Pro SoC). See [`docs/NANOKVM.md`](docs/NANOKVM.md).
+
 ## Lineage
 
 MyOwnMesh started as [MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM)'s
@@ -293,7 +299,7 @@ relationship to the original TypeScript modules.
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — embedder walkthrough ·
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — wire-protocol reference ·
 [`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
-[`docs/NANOKVM.md`](docs/NANOKVM.md) — cross-building the daemon for a NanoKVM (riscv64 + musl) ·
+[`docs/NANOKVM.md`](docs/NANOKVM.md) — cross-building the daemon for a NanoKVM (riscv64 + musl) or NanoKVM-Pro (aarch64 + musl) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
 [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) — the recovery ladder, every tunable ·
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, conventions, testing ·
