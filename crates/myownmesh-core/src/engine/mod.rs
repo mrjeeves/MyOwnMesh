@@ -940,8 +940,24 @@ pub(crate) async fn renegotiate_ice(
             // the next watchdog poll picks it up once that settles.
             debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
         }
-        match session.create_offer().await {
-            Ok(desc) => {
+        // create_offer runs INLINE on the single driver task, so an unbounded
+        // await here starves every command, timer, and other peer on this
+        // network until it returns — the same NanoKVM single-slow-core wedge
+        // the *initial* offer path is bounded against (see `ensure_peer_session`
+        // and `OFFER_BUILD_TIMEOUT_MS`). A network change fans this out across
+        // every peer at once, so a stuck offer must cost this one attempt (the
+        // watchdog retries next poll), never the engine. This is the path that
+        // froze the bridge's control socket for ~45 s when a USB gadget toggle
+        // mis-fired a full network-change fan-out. (restart_ice above is a quick
+        // ufrag/pwd flip, not a gather, so it isn't wrapped — and timing it out
+        // would cancel it mid-flight, which we don't know to be safe.)
+        let built = tokio::time::timeout(
+            Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
+            session.create_offer(),
+        )
+        .await;
+        match built {
+            Ok(Ok(desc)) => {
                 // The single INFO line for this restart is the `trigger=…`
                 // line above; the offer/nudge mechanics ride at DEBUG so a
                 // renegotiation is one line in the default stream.
@@ -963,7 +979,11 @@ pub(crate) async fn renegotiate_ice(
                     sdp: desc.sdp,
                 });
             }
-            Err(e) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
+            Ok(Err(e)) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
+            Err(_) => warn!(
+                peer = %device_id,
+                "renegotiate create_offer timed out on the driver — retrying next poll"
+            ),
         }
     } else {
         // Answerer: avoid glare. Deliberately do NOT restart our own ICE —
