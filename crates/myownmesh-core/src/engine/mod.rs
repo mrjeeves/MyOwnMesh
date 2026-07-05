@@ -1646,7 +1646,23 @@ pub(crate) async fn record_selected_pair(state: &Arc<NetworkState>, device_id: &
         session
     };
     let Some(session) = session else { return };
-    let pair = session.selected_candidate_pair().await;
+    // Bounded: reading the selected pair contends with the ICE agent's own
+    // lock, so on a single slow core mid-gather it can park the driver. This
+    // is a GUI/diagnostic read that drives no recovery, so skip it this pass
+    // rather than freeze command + signaling handling (see
+    // `scheduler::ICE_INTROSPECT_TIMEOUT_MS`).
+    let pair = match tokio::time::timeout(
+        Duration::from_millis(scheduler::ICE_INTROSPECT_TIMEOUT_MS),
+        session.selected_candidate_pair(),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => {
+            debug!(peer = %device_id, "selected_candidate_pair introspection timed out — skipping this tick");
+            return;
+        }
+    };
     let Some(pair) = pair else { return };
     if let Some(peer) = state.peers.get(device_id) {
         peer.state.write().selected_pair = Some(pair);
@@ -1711,7 +1727,23 @@ pub(crate) async fn log_ice_check_snapshot(
         session
     };
     let Some(session) = session else { return };
-    let snap = session.ice_check_snapshot().await;
+    // Bounded for the same reason as `record_selected_pair`: the snapshot walks
+    // the agent's candidate pairs under its lock, which a mid-gather agent on a
+    // single slow core can hold long enough to wedge the driver. Diagnostic
+    // only, so a timed-out pass just drops one log line (see
+    // `scheduler::ICE_INTROSPECT_TIMEOUT_MS`).
+    let snap = match tokio::time::timeout(
+        Duration::from_millis(scheduler::ICE_INTROSPECT_TIMEOUT_MS),
+        session.ice_check_snapshot(),
+    )
+    .await
+    {
+        Ok(snap) => snap,
+        Err(_) => {
+            debug!(peer = %device_id, "ice_check_snapshot introspection timed out — skipping this tick");
+            return;
+        }
+    };
     if snap.is_empty() {
         return;
     }
@@ -2141,7 +2173,18 @@ pub(crate) async fn send_to_peer(
     };
     let session = session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
     let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
-    let n = session.send(Bytes::from(serialized)).await?;
+    // Bounded: this send runs inline on the driver task (reachable via the
+    // heartbeat ping and the state-watch tick's shelve-unshelve), so a
+    // data-channel write that parks on a slow core mid-gather would wedge the
+    // whole driver. Best-effort by contract, so a timed-out control frame is
+    // just dropped and re-sent next cycle (see `scheduler::PEER_SEND_TIMEOUT_MS`;
+    // the reliable channels take `send_channel_frame`, not this path).
+    let n = tokio::time::timeout(
+        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        session.send(Bytes::from(serialized)),
+    )
+    .await
+    .map_err(|_| Error::Transport("peer send timed out".into()))??;
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
         data.diag.bytes_out += n as u64;

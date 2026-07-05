@@ -100,6 +100,44 @@ pub const DATA_CHANNEL_OPEN_TIMEOUT_MS: u64 = 30_000;
 /// device, so ten seconds only ever bounds a failure.
 pub const OFFER_BUILD_TIMEOUT_MS: u64 = 10_000;
 
+/// How long a **read-only ICE introspection** call (`selected_candidate_pair`
+/// / `ice_check_snapshot` — the diagnostic stats reads the state-watch tick
+/// makes to record the chosen path and log connectivity-check progress) may
+/// take before the tick abandons it for this pass. Like the offer build these
+/// run INLINE on the driver task, but unlike it they were never bounded — the
+/// blind spot that still froze a NanoKVM after `OFFER_BUILD_TIMEOUT_MS` landed.
+/// The reads contend with the ICE agent's own async lock, so on a single slow
+/// core mid-gather (a network change re-gathering on a flapping interface) the
+/// snapshot can park the whole driver — commands and signaling included — long
+/// enough to trip the bridge's control-socket timeout, exactly the wedge the
+/// offer bound fixed for the *offerer* but left open on the *answerer* (which
+/// never builds an offer, only introspects). These calls drive no recovery
+/// (the connect-timeout keys off `data_channel_open`, not them), so a pass that
+/// times out simply skips one diagnostic line / a momentary GUI transport label
+/// and self-heals next tick. A healthy read is sub-millisecond, so one second
+/// only ever bounds the pathological case — and stays under the tick interval
+/// (`STATE_WATCH_INTERVAL_MS`) so the driver always has slack to service
+/// commands between passes even when a peer trips both reads in one tick.
+pub const ICE_INTROSPECT_TIMEOUT_MS: u64 = 1_000;
+
+/// How long a **control-message send to one peer** (`send_to_peer` →
+/// `PeerSession::send` — an engine ping / shelve-unshelve / roster frame over
+/// the data channel) may take before the engine abandons it. Like the offer
+/// build and the ICE stats reads this runs INLINE on the driver task — reachable
+/// on the shared loop via `heartbeat::tick` → `send_ping` and via the
+/// state-watch tick's `drop_peer` → `reevaluate_topology` → `send_shelve_unshelve`
+/// — so a data-channel send that parks on a slow core mid-gather can wedge the
+/// whole driver, the same class of freeze the two constants above bound. This
+/// covers ONLY the best-effort control plane: `send_to_peer` is documented
+/// best-effort and its callers already handle a send failure, so a timed-out
+/// send is just one more dropped ping / shelve that the next tick re-sends. The
+/// reliable user-facing channels (site routes, media) go through
+/// `send_channel_frame`, NOT this path, and are deliberately left unbounded so
+/// their ordered delivery is never truncated. Generous enough to ride transient
+/// SCTP buffer pressure on a healthy link, far under the heartbeat / bridge
+/// control-socket timeouts a real wedge would trip.
+pub const PEER_SEND_TIMEOUT_MS: u64 = 2_000;
+
 /// After an in-place ICE restart reconnects, how long to wait for *inbound
 /// traffic* to confirm the path actually carries frames before giving up
 /// and rebuilding. ICE reaching `Connected` is **not** proof — webrtc-rs
