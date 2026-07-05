@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows_·_Pi-2ea44f.svg)](#platforms)
-[![Tests](https://img.shields.io/badge/tests-285_passing-2ea44f.svg)](crates/myownmesh-core/tests)
+[![Tests](https://img.shields.io/badge/tests-passing-2ea44f.svg)](crates/myownmesh-core/tests)
 
 </div>
 
@@ -23,7 +23,7 @@ myownmesh-gui            # desktop GUI (Tauri + Svelte 5)            (app: gui/)
 Plus three supporting library crates the daemon and embedders share:
 
 ```
-myownmesh-signaling      # Nostr signaling driver + LocalBroker + self-hosted NIP-01 relay
+myownmesh-signaling      # Nostr + mDNS/DNS-SD signaling drivers + LocalBroker + self-hosted NIP-01 relay
 myownmesh-services       # self-hosted STUN + TURN servers
 myownmesh-updater        # self-update with configurable release feed
 ```
@@ -113,8 +113,8 @@ so both crates resolve out of the same checkout:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }  # Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }  # Nostr + mDNS drivers
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -131,14 +131,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         label: "Home mesh".into(),
         kind: Default::default(),                 // Open governance
         topology: TopologyMode::default(),       // Ring
-        signaling: Default::default(),            // Nostr defaults
+        signaling: Default::default(),            // Nostr + mDNS defaults
         stun_servers: Default::default(),
         turn_servers: Default::default(),
         roster_path: None,
         auto_approve: false,
     }).await?;
 
-    let _nostr = myownmesh_core::engine::attach_nostr(&net.state());
+    let _signaling = myownmesh_core::engine::attach_signaling(&net.state());
 
     let mut events = mesh.events();
     while let Ok(event) = events.recv().await {
@@ -191,7 +191,7 @@ cargo run --example roster_demo   -p myownmesh-core   # approve / persist / reco
 ```bash
 just setup       # Rust toolchain via rustup (idempotent)
 just build       # cargo build --workspace
-just test        # cargo test --workspace        (285 tests today)
+just test        # cargo test --workspace
 just check       # fmt + clippy -D warnings + test
 just fmt         # cargo fmt --all
 just lint        # cargo clippy --workspace --all-targets -- -D warnings
@@ -207,10 +207,12 @@ protocol-message checklist, and the topology-mode checklist.
 - **ed25519 mutual auth, with eyeballs.** Every peer encounter exchanges a `hello` + `auth_response` where each side signs the other's nonce under `myownmesh-mesh-auth-v1:`. A 6-char `[a-z0-9]` verification code rides along for out-of-band confirmation ("the code I see matches what you read me"). Approved peers land in a per-network roster and skip the prompt on reconnect.
 - **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. A graduated ladder — Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start — does the cheapest action that still recovers from the failure class above it, and never tears a live link down on an ICE-state blip. Every tunable constant is documented in [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) with the field bug it was discovered through.
 - **Trystero-wire-compatible Nostr signaling.** Same room-handle derivation as JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), same deterministic relay shuffle. Eight published-fix patches against `@trystero-p2p/core` are baked in natively — catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs) so upstream-tracking is a code-level diff, not a patches/ folder.
+- **Zeroconf LAN discovery, on by default.** An mDNS/DNS-SD driver runs alongside Nostr: each network registers a `_myownmesh._tcp.local.` instance with the room handle in TXT, browses for peers in the same room, and exchanges SDP over a unicast TCP port advertised in SRV. Pure Rust (`mdns-sd` — no Avahi/Bonjour binding; coexists with system daemons on 5353) and clock-free, so it works on a device whose RTC still reads the epoch. Outbound signals fan out to both drivers and an inbound gate drops cross-transport duplicates, so co-located peers mesh even with every relay unreachable. Set `signaling.strategy = "none"` and keep `mdns = true` for a fully air-gapped mesh — zero remote infrastructure. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
 - **Host your own infrastructure.** A device can be any combination of a mesh node and hosted services: a relay (roster-gated routing), an **intelligent signaling relay** (a NIP-01 server the built-in driver speaks to unchanged — with live presence, instant-departure coordination, and flood limits, so it's safe to run publicly), and STUN / TURN servers (RFC 5389 / 5766, the latter with a per-connection bandwidth cap). Turn off the node role for a **pure-infrastructure box**. Toggle everything from the GUI (Settings → Services), the CLI (`myownmesh ctl services …`), or `config.json`; hosts advertise their roles + endpoints so the fleet self-discovers them. This is what makes a **fully internet-isolated network** trivial — no Google STUN, no Cloudflare TURN, no public relay. See [`docs/SERVICES.md`](docs/SERVICES.md).
 - **Selectable topologies.** Ring (default — sorted-lex with 2 neighbours + shortcuts), Star (explicit hub), FullMesh (everyone to everyone). All built on the same shelving primitive; both sides of every pair run the same pure-function selector over the same sorted input, so the result is symmetric without coordination.
 - **Typed pub/sub + generic RPC over one data channel.** `Channel<T>` is a typed publish/subscribe channel keyed by name. `Rpc::call` / `serve` / `call_stream` / `serve_stream` is the generic request/response surface. Embedders define their own message types — the mesh treats payloads opaquely.
 - **Embed without the GUI or updater.** The daemon, the library, and the desktop GUI are separate crates. An app embedding `myownmesh-core` doesn't pull in the HTTP self-updater or the Tauri stack. The GUI itself is a *client* of the daemon (over a local control socket) so crashing the UI never disturbs the running mesh.
+- **Appliance-ready daemon builds.** Every release ships two daemon-only, fully static musl tarballs — `myownmesh-linux-riscv64.tar.gz` (NanoKVM) and `myownmesh-linux-aarch64-musl.tar.gz` (NanoKVM-Pro) — one binary, no glibc. See [`docs/NANOKVM.md`](docs/NANOKVM.md).
 - **One identity, many networks.** Per-device long-lived ed25519 keypair under `~/.myownmesh/.secrets/identity.json` (0600). Per-network rosters at `~/.myownmesh/mesh/rosters/{network_id}.json`. Switching the active network swaps rosters but preserves identity.
 
 ## Daemon + CLI
@@ -245,7 +247,8 @@ auto-spawns the daemon for you. On a headless box
 with no display it prints a pointer to `myownmesh serve` instead, so
 servers run the daemon directly. Daemon reads `~/.myownmesh/config.json` (auto-created on first edit;
 sensible defaults until then), joins every network listed there,
-attaches the Nostr signaling driver per network, and listens for
+attaches the signaling drivers per network (Nostr, plus mDNS/DNS-SD
+LAN discovery on by default), and listens for
 `myownmesh ctl …` clients on a local socket
 (`~/.myownmesh/daemon.sock` on Unix, named pipe on Windows). Full
 reference in [`crates/myownmesh/README.md`](crates/myownmesh/README.md).
@@ -272,9 +275,10 @@ Layout / wire protocol in [`gui/README.md`](gui/README.md).
 
 `linux-x86_64` · `linux-aarch64` (incl. Raspberry Pi 4 / 5) ·
 `macos-aarch64` · `macos-x86_64` · `windows-x86_64`. The release
-matrix builds and uploads bundles for all five. Linux is pinned to
-Ubuntu 22.04 (glibc 2.35) so binaries run on Debian 12, Ubuntu
-22.04+, and other distros still on glibc 2.35/2.36/2.38.
+matrix builds and uploads bundles for all five, plus the two
+appliance targets below — seven release artifacts per tag. Linux
+is pinned to Ubuntu 22.04 (glibc 2.35) so binaries run on Debian
+12, Ubuntu 22.04+, and other distros still on glibc 2.35/2.36/2.38.
 
 Two **appliance** daemon-only builds ship alongside the desktop
 bundles as fully static musl binaries (no glibc dependency):

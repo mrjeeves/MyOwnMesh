@@ -4,7 +4,7 @@ Self-update for the `myownmesh` binary. Pulled separately so an
 embedder that ships its own update story doesn't inherit ours.
 
 ```toml
-myownmesh-updater = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
+myownmesh-updater = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
 ```
 
 ## Lifecycle

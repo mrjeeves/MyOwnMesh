@@ -6,7 +6,7 @@ in-process-only doesn't pay for the Nostr / WebSocket dependency
 stack.
 
 ```toml
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
 ```
 
 ## What's in here
