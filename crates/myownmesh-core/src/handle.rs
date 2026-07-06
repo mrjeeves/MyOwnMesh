@@ -58,10 +58,25 @@ struct NetworkEntry {
 }
 
 impl Mesh {
-    /// Build a fresh `Mesh`. Loads (or generates) the identity
-    /// anchor and constructs the shared WebRTC API.
-    pub async fn open(_config: MeshConfig) -> Result<MeshHandle> {
+    /// Build a fresh `Mesh`. Loads (or generates) the on-disk identity
+    /// anchor (`~/.myownmesh/.secrets/identity.json`) and constructs the
+    /// shared WebRTC API.
+    pub async fn open(config: MeshConfig) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
+        Self::open_with_identity(config, identity).await
+    }
+
+    /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
+    /// that manage their own key storage rather than the on-disk anchor — e.g.
+    /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
+    /// Keystore, or any host that has already loaded a key. Pair with
+    /// [`Identity::from_signing_key`](crate::identity::Identity::from_signing_key).
+    /// Otherwise identical to [`Mesh::open`]: same shared WebRTC stack, same
+    /// network join/leave surface.
+    pub async fn open_with_identity(
+        _config: MeshConfig,
+        identity: Arc<Identity>,
+    ) -> Result<MeshHandle> {
         let transport = Transport::new()?;
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
@@ -552,4 +567,28 @@ pub struct PeerInfo {
     /// describe what was tried, this describes what's in use. `None`
     /// until ICE reaches Connected/Completed.
     pub selected_pair: Option<SelectedCandidatePair>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    /// The injection seam adopts the caller's identity rather than the
+    /// on-disk anchor: the opened mesh's device id is the injected key's
+    /// public id. This is the path a phone uses to open the engine with a
+    /// key from its Keychain/Keystore (built via `Identity::from_signing_key`,
+    /// which `ephemeral()` also uses).
+    #[tokio::test]
+    async fn open_with_identity_adopts_the_injected_key() {
+        let identity = Arc::new(Identity::ephemeral());
+        let want = identity.public_id().to_string();
+
+        let mesh = Mesh::open_with_identity(MeshConfig::default(), identity)
+            .await
+            .expect("open_with_identity");
+
+        // The mesh's wire id derives from the injected key, not a disk anchor.
+        assert_eq!(mesh.device_id(), want);
+    }
 }
