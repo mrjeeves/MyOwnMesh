@@ -6,8 +6,13 @@
 //!
 //! Structure mirrors [`crate::nostr`]:
 //!
-//! - [`driver`] — socket lifecycle: the DNS-SD registration/browse
-//!   (via `mdns-sd`, pure Rust) and the TCP exchange listener.
+//! - [`driver`] — socket lifecycle: the DNS-SD registration/browse and
+//!   the TCP exchange listener.
+//! - [`discovery`] — the registration/browse backends: the pure-Rust
+//!   `mdns-sd` daemon by default, or the platform's own DNS-SD daemon
+//!   (the `dnssd` C API → mDNSResponder / Avahi) on iOS, where raw
+//!   multicast sockets are entitlement-gated. Both speak standard
+//!   mDNS/DNS-SD on the wire, so mixed backends interoperate.
 //! - [`wire`] — deterministic wire logic: service type, instance
 //!   naming, TXT records, and the JSON frame codec. Socket-free and
 //!   fully unit-tested.
@@ -16,6 +21,7 @@
 //! Nostr driver derives, so the two transports converge on one room
 //! per network without extra configuration.
 
+pub mod discovery;
 pub mod driver;
 pub mod wire;
 
