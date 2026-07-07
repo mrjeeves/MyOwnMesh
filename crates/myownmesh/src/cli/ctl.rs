@@ -1,6 +1,6 @@
 //! `myownmesh ctl …` — talk to a running daemon over its control
 //! socket. Wire format is line-delimited JSON; see
-//! [`crate::control`] for the request/response shapes.
+//! [`myownmesh::control`] for the request/response shapes.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
@@ -13,7 +13,7 @@ use myownmesh_core::{NetworkConfig, ServicesConfig};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::control::{Request, Response};
+use myownmesh::control::{Request, Response};
 
 #[derive(Subcommand, Debug)]
 pub enum CtlCmd {

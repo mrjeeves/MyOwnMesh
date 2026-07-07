@@ -1,117 +1,22 @@
 //! `myownmesh serve` — run the daemon in the foreground.
 //!
-//! Owns:
-//! - one [`myownmesh_core::Mesh`] instance bound to this device's
-//!   identity
-//! - a Nostr signaling driver per joined network
-//! - the updater tick loop
-//! - the network registry (so the control socket can address
-//!   per-network operations)
-//! - the control-socket listener that `myownmesh ctl …` + the GUI
-//!   talk to
-//! - signal handlers for clean shutdown
+//! A thin wrapper over [`myownmesh::embedded`]: load the config, start the
+//! daemon on this runtime, and hold it until SIGINT/SIGTERM asks for the
+//! graceful teardown. Everything the daemon *is* — the mesh instance, the
+//! network registry, hosted services, the updater tick, the control-socket
+//! listener — lives in the library, so an embedder (an iOS app, which can't
+//! spawn processes) runs the identical daemon in-process.
 
 use anyhow::{Context, Result};
-use tokio::sync::broadcast;
-use tracing::{info, warn};
-
-use crate::control;
-use crate::registry::NetworkRegistry;
-use crate::services::ServiceManager;
 
 pub async fn run() -> Result<()> {
     let cfg = myownmesh_core::MeshConfig::load().context("load config")?;
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        networks = cfg.networks.len(),
-        "daemon starting"
-    );
-
-    let mesh = myownmesh_core::Mesh::open(cfg.clone())
-        .await
-        .context("open mesh")?;
-    info!(device_id = %mesh.identity().display_id(), "identity ready");
-
-    // The registry holds every JoinedNetwork + its signaling driver
-    // handle so the control socket can address them by id (peers
-    // list, roster ops, topology, add/remove) without serve.rs
-    // threading handles through every dispatch arm.
-    //
-    // Node participation is itself a toggle: a pure-infrastructure box
-    // (`services.node.enabled = false`) hosts signaling / STUN / TURN
-    // without joining any network. The join path is shared with the
-    // runtime node-enable transition in `ServiceManager`.
-    let registry = NetworkRegistry::new();
-    if cfg.services.node.enabled {
-        for net in cfg.networks.iter() {
-            crate::services::join_network(&mesh, &registry, net.clone()).await;
-        }
-    } else {
-        info!("node participation disabled — pure-infrastructure mode (hosting services only)");
-    }
-
-    // Infrastructure services (relay / signaling / STUN / TURN). The
-    // manager reconciles the running set against config.services; an
-    // all-off config (the default) starts nothing. Service start
-    // failures are logged inside `apply`, not fatal.
-    let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
-    let report = service_manager.apply(cfg.services.clone()).await;
-    info!(
-        relay = report.relay.enabled,
-        signaling = report.signaling.running,
-        stun = report.stun.running,
-        turn = report.turn.running,
-        "services applied from config"
-    );
-
-    // Updater tick. Spawned even when disabled in config — the
-    // task just exits early.
-    let _updater = tokio::spawn(myownmesh_updater::tick_forever());
-
-    // Control socket. Holds clones of the mesh handle + the registry +
-    // the service manager so ctl commands can address the daemon's state.
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    let ctl_mesh = mesh.clone();
-    let ctl_registry = registry.clone();
-    let ctl_services = service_manager.clone();
-    let ctl_shutdown = shutdown_tx.subscribe();
-    let ctl_socket = cfg.daemon.control_socket.clone();
-    let _ctl_handle = tokio::spawn(async move {
-        if let Err(e) = control::serve(
-            ctl_mesh,
-            ctl_registry,
-            ctl_services,
-            ctl_socket,
-            ctl_shutdown,
-        )
-        .await
-        {
-            warn!("control socket exited with error: {e:#}");
-        }
-    });
+    let daemon = myownmesh::embedded::start(cfg).await?;
 
     // Wait for SIGINT (Ctrl-C) or SIGTERM.
     wait_for_shutdown_signal().await;
-    info!("shutdown requested");
-
-    let _ = shutdown_tx.send(());
-    // Stop hosted services before tearing down networks.
-    service_manager.shutdown().await;
-    // Say goodbye before we go: a graceful `leave` per network so peers drop
-    // our sessions immediately on a clean quit, rather than showing us online
-    // (and failing to connect) until their heartbeat times out ~90 s later.
-    registry.announce_all_departures().await;
-    // Drain the registry — `take_all` returns owned `JoinedNetwork`s
-    // for those that aren't still held by an in-flight control
-    // request. Anything still pinned by a control client will tear
-    // down via process exit; the engine driver task observes its
-    // command sender drop and shuts down.
-    for net in registry.take_all() {
-        if let Err(e) = net.leave().await {
-            warn!("leave failed: {e:#}");
-        }
-    }
-
+    tracing::info!("shutdown requested");
+    daemon.shutdown().await;
     Ok(())
 }
 
