@@ -14,10 +14,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod cli;
-mod control;
-mod ipc;
-mod registry;
-mod services;
 
 #[derive(Parser, Debug)]
 #[command(name = "myownmesh", version, about, long_about = None)]
