@@ -15,11 +15,19 @@ categories = ["network-programming", "asynchronous"]
 name = "myownmesh_signaling"
 path = "src/lib.rs"
 
+[features]
+# Use the platform's own DNS-SD daemon (the `dnssd` C API — mDNSResponder /
+# Avahi's compat shim) for mDNS discovery instead of the pure-Rust `mdns-sd`
+# sockets. Always on for iOS regardless of this feature (raw multicast is
+# entitlement-gated there); opt-in elsewhere, chiefly for verifying the
+# backend against Avahi on Linux (links `libdns_sd`:
+# `apt install libavahi-compat-libdnssd-dev`).
+system-dnssd = []
+
 [dependencies]
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
-mdns-sd = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
@@ -37,3 +45,12 @@ serde_json = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# The system DNS-SD backend's fd poll loop + sockaddr parsing.
+libc = { workspace = true }
+
+# The pure-Rust discovery backend — every target except iOS, where raw
+# multicast sockets need an Apple-granted entitlement and the system
+# backend (mDNSResponder via `dnssd`) is used instead.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+mdns-sd = { workspace = true }

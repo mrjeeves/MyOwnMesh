@@ -16,13 +16,12 @@
 //!   ed25519 mutual-auth handshake over the DTLS channel that this
 //!   signaling bootstraps remains the real authentication gate; a
 //!   forged frame can at worst waste a handshake attempt.
-//! - **Per-driver `ServiceDaemon`.** Each driver (one per joined
-//!   network) owns its own mDNS socket set; the OS delivers each
-//!   multicast packet to all of them (SO_REUSEADDR/SO_REUSEPORT +
-//!   multicast), which also lets the driver coexist with a system
-//!   avahi/Bonjour daemon. If per-network daemons ever measure as
-//!   too heavy, a process-global daemon can be introduced behind
-//!   this module without changing the driver API.
+//! - **Pluggable discovery backend.** The registration/browse half lives
+//!   behind [`super::discovery`]: the pure-Rust `mdns-sd` daemon by default
+//!   (per-driver socket set, coexists with a system daemon via
+//!   SO_REUSEADDR/SO_REUSEPORT), or the platform's own DNS-SD daemon through
+//!   the `dnssd` C API on iOS (raw multicast sockets are entitlement-gated
+//!   there; mDNSResponder isn't). The exchange below is backend-independent.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -30,7 +29,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +36,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
+use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
 use super::wire::{self, Frame};
 use crate::nostr::handle::derive_room_handle;
 use crate::{Error, SignalingMessage};
@@ -131,33 +130,23 @@ pub fn start(
         .set_nonblocking(true)
         .map_err(|e| Error::Bind("set_nonblocking".into(), e))?;
 
-    let daemon = ServiceDaemon::new().map_err(|e| Error::Other(format!("mdns daemon: {e}")))?;
-
     let instance = wire::instance_name(&room_handle, &config.device_id);
-    let host_name = format!("{instance}.local.");
-    let props: HashMap<String, String> = wire::txt_properties(&room_handle, &config.device_id)
-        .into_iter()
-        .collect();
-    let service_info = ServiceInfo::new(wire::SERVICE_TYPE, &instance, &host_name, "", port, props)
-        .map_err(|e| Error::Other(format!("mdns service info: {e}")))?
-        .enable_addr_auto();
-    let fullname = service_info.get_fullname().to_string();
+    // Browse starts inside the backend before the first register, so we never
+    // miss a burst of resolves racing our own announce.
+    let (discovery, browse_rx) = Discovery::start(&DiscoveryConfig {
+        service_type: wire::SERVICE_TYPE.to_string(),
+        instance,
+        port,
+        txt: wire::txt_properties(&room_handle, &config.device_id),
+    })?;
+    let discovery = Arc::new(discovery);
 
-    // Browse before registering so we never miss a burst of resolves
-    // racing our own announce.
-    let browse_rx = daemon
-        .browse(wire::SERVICE_TYPE)
-        .map_err(|e| Error::Other(format!("mdns browse: {e}")))?;
-
-    let registered = match daemon.register(service_info.clone()) {
-        Ok(()) => true,
-        Err(e) => {
-            // Soft failure (e.g. no usable interface yet) — the
-            // re-announce tick retries registration.
-            warn!("mdns register failed (will retry): {e}");
-            false
-        }
-    };
+    // Soft failure (e.g. no usable interface yet) — the re-announce tick
+    // retries registration.
+    let registered = discovery.register();
+    if !registered {
+        warn!("mdns register failed (will retry)");
+    }
 
     info!(
         network = %config.network_id,
@@ -169,12 +158,10 @@ pub fn start(
     let shared = Arc::new(Shared {
         room_handle,
         device_id: config.device_id,
-        daemon: daemon.clone(),
-        service_info,
-        fullname: fullname.clone(),
+        discovery: discovery.clone(),
         registered: AtomicBool::new(registered),
         peers: Mutex::new(HashMap::new()),
-        fullname_to_peer: Mutex::new(HashMap::new()),
+        key_to_peer: Mutex::new(HashMap::new()),
         conns: Mutex::new(HashMap::new()),
         conn_gen: AtomicU64::new(0),
         inbound_tx,
@@ -218,8 +205,7 @@ pub fn start(
     }
 
     Ok(MdnsDriverHandle {
-        daemon,
-        fullname,
+        discovery,
         tasks,
         stopped: AtomicBool::new(false),
     })
@@ -228,8 +214,7 @@ pub fn start(
 /// Handle returned by [`start`]. Drop or call [`Self::stop`] to
 /// withdraw the advertisement and stop every spawned task.
 pub struct MdnsDriverHandle {
-    daemon: ServiceDaemon,
-    fullname: String,
+    discovery: Arc<Discovery>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     stopped: AtomicBool,
 }
@@ -240,10 +225,10 @@ impl MdnsDriverHandle {
             return;
         }
         // Goodbye first (peers get PeerLeft promptly), then shut the
-        // daemon down (closes the browse channel), then abort the
+        // backend down (closes the browse stream), then abort the
         // tokio tasks parked on accept/recv.
-        let _ = self.daemon.unregister(&self.fullname);
-        let _ = self.daemon.shutdown();
+        self.discovery.unregister();
+        self.discovery.shutdown();
         for t in &self.tasks {
             t.abort();
         }
@@ -259,15 +244,13 @@ impl Drop for MdnsDriverHandle {
 struct Shared {
     room_handle: String,
     device_id: String,
-    daemon: ServiceDaemon,
-    service_info: ServiceInfo,
-    fullname: String,
+    discovery: Arc<Discovery>,
     registered: AtomicBool,
     /// Peers resolved in our room: device id → exchange endpoint.
     peers: Mutex<HashMap<String, PeerEntry>>,
-    /// DNS-SD fullname → device id, so a `ServiceRemoved` (which only
-    /// carries the fullname) maps back to the peer it withdraws.
-    fullname_to_peer: Mutex<HashMap<String, String>>,
+    /// Backend discovery key → device id, so a `Removed` (which only
+    /// carries the key) maps back to the peer it withdraws.
+    key_to_peer: Mutex<HashMap<String, String>>,
     /// Live exchange connections, either direction: device id →
     /// writer. Outbound dials register at connect; inbound accepts
     /// register under the first `from` their frames carry, so a reply
@@ -289,42 +272,29 @@ struct ConnHandle {
     tx: mpsc::UnboundedSender<String>,
 }
 
-async fn run_browse(shared: Arc<Shared>, browse_rx: mdns_sd::Receiver<ServiceEvent>) {
-    loop {
-        let event = match browse_rx.recv_async().await {
-            Ok(e) => e,
-            // Channel closes when the daemon shuts down.
-            Err(_) => return,
-        };
+async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<DiscoveryEvent>) {
+    // Stream closes when the backend shuts down.
+    while let Some(event) = browse_rx.recv().await {
         match event {
-            ServiceEvent::ServiceResolved(resolved) => {
-                if !resolved.is_valid() {
-                    continue;
-                }
+            DiscoveryEvent::Resolved {
+                key,
+                mut addrs,
+                port,
+                txt,
+            } => {
                 let advert = wire::parse_advert(
-                    |k| resolved.get_property_val_str(k).map(str::to_string),
+                    |k| txt.get(k).cloned(),
                     &shared.room_handle,
                     &shared.device_id,
                 );
                 let Some(advert) = advert else { continue };
-                let mut addrs: Vec<IpAddr> = resolved
-                    .get_addresses_v4()
-                    .into_iter()
-                    .map(IpAddr::V4)
-                    .collect();
                 if addrs.is_empty() {
                     trace!(peer = %advert.peer, "mdns advert without IPv4 address — skipped");
                     continue;
                 }
                 addrs.sort();
-                let entry = PeerEntry {
-                    addrs,
-                    port: resolved.get_port(),
-                };
-                shared
-                    .fullname_to_peer
-                    .lock()
-                    .insert(resolved.get_fullname().to_string(), advert.peer.clone());
+                let entry = PeerEntry { addrs, port };
+                shared.key_to_peer.lock().insert(key, advert.peer.clone());
                 shared.peers.lock().insert(advert.peer.clone(), entry);
                 debug!(peer = %&advert.peer[..advert.peer.len().min(16)], "mdns peer resolved");
                 // Every resolve (first sight or cache refresh) surfaces as
@@ -334,8 +304,8 @@ async fn run_browse(shared: Arc<Shared>, browse_rx: mdns_sd::Receiver<ServiceEve
                     device_id: advert.peer,
                 });
             }
-            ServiceEvent::ServiceRemoved(_ty, fullname) => {
-                let peer = shared.fullname_to_peer.lock().remove(&fullname);
+            DiscoveryEvent::Removed { key } => {
+                let peer = shared.key_to_peer.lock().remove(&key);
                 if let Some(peer) = peer {
                     shared.peers.lock().remove(&peer);
                     shared.conns.lock().remove(&peer);
@@ -345,7 +315,6 @@ async fn run_browse(shared: Arc<Shared>, browse_rx: mdns_sd::Receiver<ServiceEve
                         .send(MdnsInbound::PeerLeft { device_id: peer });
                 }
             }
-            _ => {}
         }
     }
 }
@@ -362,7 +331,7 @@ async fn run_outbound(shared: Arc<Shared>, mut outbound_rx: mpsc::UnboundedRecei
             }
             MdnsOutbound::Leave => {
                 if shared.registered.swap(false, Ordering::SeqCst) {
-                    let _ = shared.daemon.unregister(&shared.fullname);
+                    shared.discovery.unregister();
                 }
             }
             MdnsOutbound::DirectedToPeer { to, msg } => {
@@ -373,13 +342,10 @@ async fn run_outbound(shared: Arc<Shared>, mut outbound_rx: mpsc::UnboundedRecei
 }
 
 fn register(shared: &Shared) {
-    match shared.daemon.register(shared.service_info.clone()) {
-        Ok(()) => {
-            shared.registered.store(true, Ordering::SeqCst);
-        }
-        Err(e) => {
-            debug!("mdns register retry failed: {e}");
-        }
+    if shared.discovery.register() {
+        shared.registered.store(true, Ordering::SeqCst);
+    } else {
+        debug!("mdns register retry failed");
     }
 }
 
