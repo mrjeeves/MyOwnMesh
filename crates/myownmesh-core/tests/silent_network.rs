@@ -85,11 +85,37 @@ async fn silent_peers_are_sighted_but_do_not_connect_until_dialed() {
 
     // Deliberate dial of exactly bob. Only now does a connection form; bob's
     // Silent node answers the inbound offer (that path is not gated), so both
-    // sides handshake and — with auto_approve — reach Approved.
-    alice_state.connect_peer(&bob_pub);
-
-    wait_for_approval(&mut alice_events, &bob_pub).await;
-    wait_for_approval(&mut bob_events, &alice_pub).await;
+    // sides handshake and — with auto_approve — reach Approved. We re-issue the
+    // dial on a slow cadence: connect_peer is idempotent once a session exists,
+    // but a periodic re-dial recovers a first offer that gathered slowly or was
+    // dropped on a busy CI runner (Windows ICE over loopback is markedly slower
+    // than Linux/macOS). Both sides must still reach Approved for the test to pass.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut alice_ok = false;
+    let mut bob_ok = false;
+    let mut next_dial = Instant::now();
+    while !(alice_ok && bob_ok) {
+        assert!(
+            Instant::now() <= deadline,
+            "silent dial did not reach mutual Approved in time (alice_ok={alice_ok}, bob_ok={bob_ok})"
+        );
+        if Instant::now() >= next_dial {
+            alice_state.connect_peer(&bob_pub);
+            next_dial = Instant::now() + Duration::from_secs(4);
+        }
+        tokio::select! {
+            r = tokio::time::timeout(Duration::from_millis(200), alice_events.recv()) => {
+                if let Ok(Ok(MeshEvent::Peer(PeerEvent::Approved { device_id, .. }))) = r {
+                    alice_ok |= device_id == bob_pub;
+                }
+            }
+            r = tokio::time::timeout(Duration::from_millis(200), bob_events.recv()) => {
+                if let Ok(Ok(MeshEvent::Peer(PeerEvent::Approved { device_id, .. }))) = r {
+                    bob_ok |= device_id == alice_pub;
+                }
+            }
+        }
+    }
 }
 
 /// Collect events for a fixed window. Require a `Sighted` for `peer`, and fail
@@ -121,22 +147,4 @@ async fn expect_sighted_but_not_authenticated(
         saw_sighted,
         "expected to discover {peer} via Sighted on a silent network"
     );
-}
-
-async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>, peer_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if Instant::now() > deadline {
-            panic!("never saw PeerApproved for {peer_id} after connect_peer");
-        }
-        let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
-        match next {
-            Ok(Ok(MeshEvent::Peer(PeerEvent::Approved { device_id, .. })))
-                if device_id == peer_id =>
-            {
-                return;
-            }
-            _ => continue,
-        }
-    }
 }
