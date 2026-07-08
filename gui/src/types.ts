@@ -410,8 +410,10 @@ export interface AuthorizedPeer {
 
 /** Network kind. `open` is the default and matches the engine's
  *  current behaviour. `closed` adds role-based roster authority +
- *  signed network-state transitions. */
-export type NetworkKind = "open" | "closed";
+ *  signed network-state transitions. `silent` is open governance with
+ *  no auto-dial on presence (co-present peers surface as Sighted without
+ *  a session until deliberately dialed) and no roster gossip. */
+export type NetworkKind = "open" | "closed" | "silent";
 
 /** Three role tiers in a closed network. Members can only propose;
  *  controllers can add members; owners can add anything and approve

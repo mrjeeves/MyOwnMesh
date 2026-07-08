@@ -1,4 +1,4 @@
-# Network types: open and closed
+# Network types: open, closed, and silent
 
 **Status: implemented and shipped.** Types live in
 [`crates/myownmesh-core/src/network_state.rs`](../crates/myownmesh-core/src/network_state.rs);
@@ -64,6 +64,7 @@ propagates to the rest of the network rather than living on one box.
 |---|---|---|
 | `open`   | any current member | gossip with merge |
 | `closed` | owners, managers (controllers); members may *propose* | two signed logs (governance + member); unsigned gossip ignored |
+| `silent` | any current member (same as `open`) | **none** — membership is never gossiped |
 
 Network kind is part of the per-network state — signed (alongside
 the role assignments and the transition log) by everyone who has
@@ -100,6 +101,55 @@ Deletes are tombstones (entry with `tombstoned_at` timestamp,
 expires after `TOMBSTONE_TTL`). Without tombstones, a peer who
 didn't see your delete would re-add the entry on the next gossip
 round and the delete would never converge.
+
+## Silent networks
+
+**Status: implemented.** A `silent` network is governance-identical to
+`open` — permissionless, auto-accept, no signed cert chain — but changes two
+*connection* behaviours so that **nothing connects until a deliberate dial**,
+true at the transport layer. It's the shape a remote-support ("AnyDesk-style")
+product needs on a shared open mesh: a customer runs the app and becomes
+discoverable, reads their Support ID (derived from their device pubkey) to a
+technician, and only then does the technician dial that one peer.
+
+1. **No auto-dial on presence.** On `open`/`closed`/`silent` alike, a peer
+   announcing on signaling is *discovered*. On `open`/`closed` the engine then
+   opens a WebRTC session automatically. On `silent` it does **not** — the peer
+   is recorded as `Sighted` (visible in the `MeshEvent::Peer(Sighted)` stream
+   and in `JoinedNetwork::peers()`, status `Sighted`, no session) but no
+   ICE/DTLS/handshake runs. A connection is opened only by an explicit
+   [`JoinedNetwork::connect_peer(device_id)`](../crates/myownmesh-core/src/handle.rs)
+   or by answering a peer's inbound offer — so being co-present on the mesh
+   connects you to no one.
+2. **No roster gossip.** A silent network never broadcasts the `roster_summary`
+   / `roster_entries` anti-entropy (`gossip_roster_enabled()` is false). Every
+   connection is deliberate, so there is nothing to converge. Presence
+   (`Sighted`) and the per-peer approval handshake are unaffected.
+
+`connect_peer` always dials as the **offerer**, so a silent peer — which never
+auto-dials — is reached by the offer and answers over its (ungated) inbound-offer
+path. It is idempotent (a no-op if a live session already exists) and upgrades a
+discovery-only `Sighted` placeholder to a real session in place.
+
+**Daemon clients** (embedders that talk to a running `myownmesh` daemon over its
+control socket rather than linking the library) reach the same primitive through
+the `network_connect_peer` control op — `{ "op": "network_connect_peer",
+"network": "<id>", "peer": "<device_id>" }` — or the CLI wrapper
+`myownmesh ctl networks connect <network> <peer>`. The daemon resolves the joined
+network and calls `JoinedNetwork::connect_peer`; it's a single-shot op (the dial
+is queued on the engine, the outcome rides the event stream).
+
+Silent is a **creation-time** kind: set `NetworkConfig.kind = NetworkKind::Silent`
+(wire form `"kind": "silent"`, `#[serde(default)]` so old configs are untouched).
+It is not reached by a governance `kind_change` — there is no signed cert chain
+to transition into. Everything else about a silent network is exactly an open
+one: roles are cosmetic `member`, membership is permissionless, approval is the
+same bilateral verification-code handshake.
+
+The behaviour is exercised end-to-end in
+[`tests/silent_network.rs`](../crates/myownmesh-core/tests/silent_network.rs):
+two co-present silent peers reach `Sighted` but never authenticate on their own,
+then both reach `Approved` after a single `connect_peer`.
 
 ## Closed networks: a two-log cert chain
 

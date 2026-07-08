@@ -267,6 +267,7 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             Some(device_id) => network_watch::reconnect_peer_in_place(state, &device_id).await,
             None => network_watch::reconnect_all_in_place(state).await,
         },
+        NetworkCmd::ConnectPeer { device_id } => connect_peer(state, &device_id).await,
         NetworkCmd::SendChannelFrame {
             peer,
             channel,
@@ -500,7 +501,18 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // traffic so a peer that restarted without a `Leave` recovers
             // from its announce instead of stranding on the corpse.
             confirm_active_session_on_announce(state, &device_id).await;
-            ensure_peer_session(state, device_id, role).await;
+            // On a Silent network the engine never dials just because a peer
+            // announced — being co-present must not open a connection. Record
+            // the peer as discovered (Sighted, no WebRTC session) so the app
+            // can see it and later dial it deliberately via `connect_peer`;
+            // everywhere else, auto-dial on presence exactly as before. An
+            // inbound Offer is still honoured (that path is not gated), so a
+            // peer someone deliberately dials still gets answered.
+            if state.is_silent() {
+                note_sighted_without_dialing(state, &device_id);
+            } else {
+                ensure_peer_session(state, device_id, role).await;
+            }
         }
         SignalingInbound::Offer { device_id, sdp } => {
             // If we didn't already start an answerer, do so now.
@@ -1005,8 +1017,70 @@ pub(crate) async fn renegotiate_ice(
     }
 }
 
+/// Record a signaling-discovered peer as `Sighted` **without** opening a
+/// WebRTC session — the Silent-network discovery path. Inserts a session-less
+/// [`PeerConnection`] placeholder (default status `Sighted`) so the peer shows
+/// up in [`NetworkState::peer_snapshot`] / `JoinedNetwork::peers()` and emits a
+/// one-time [`PeerEvent::Sighted`], but no ICE/DTLS/handshake happens. The
+/// placeholder is upgraded to a real session later by [`connect_peer`] or by
+/// answering the peer's inbound offer (both go through `ensure_peer_session`,
+/// which replaces the placeholder). Idempotent: a re-announce for an
+/// already-tracked (or already-connected) peer is a no-op, so `Sighted` fires
+/// once per discovery, not once per announce.
+fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
+    if state.peers.contains_key(device_id) {
+        return;
+    }
+    state.peers.insert(
+        device_id.to_string(),
+        Arc::new(PeerConnection::new(device_id.to_string(), None)),
+    );
+    state.emit(MeshEvent::Peer(PeerEvent::Sighted {
+        network_id: state.network_id.clone(),
+        device_id: device_id.to_string(),
+    }));
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "peer",
+        format!(
+            "{} sighted on signaling (silent network — not dialing)",
+            short_peer(device_id)
+        ),
+        serde_json::json!({ "peer": device_id, "silent": true }),
+    );
+    // Recompute the rollup so a network that has only discovered (but not
+    // connected) peers reads as `Discovering`, not `Alone`.
+    phase::recompute(state);
+}
+
+/// Deliberately dial exactly one peer as the offerer — the manual-connect
+/// primitive behind [`crate::JoinedNetwork::connect_peer`] and the way a
+/// `Silent` network ever opens a connection. Always initiates as the offerer
+/// (rather than the lex-order role the announce path would pick) so the local
+/// side sends the offer and a Silent peer — which never auto-dials — is reached
+/// and answers via its (ungated) inbound-offer path. Idempotent: a no-op when a
+/// live session already exists; otherwise `ensure_peer_session` builds the
+/// session, upgrading any discovery-only `Sighted` placeholder in place.
+async fn connect_peer(state: &Arc<NetworkState>, device_id: &str) {
+    ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
+    // Nudge presence so the relays are warm and the remote sees us promptly;
+    // globally rate-limited, so this can't add signaling load.
+    maybe_reactive_announce(state);
+}
+
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
-    if state.peers.contains_key(&device_id) {
+    // Return only if we already hold a live *session* for this peer. A
+    // session-less discovery placeholder — what a Silent network records for a
+    // co-present peer it hasn't dialed (see `note_sighted_without_dialing`) —
+    // must be upgraded to a real session here (by a deliberate `connect_peer`
+    // or by answering that peer's inbound offer), not short-circuited. On every
+    // non-Silent network no session-less entry ever exists, so this is exactly
+    // the previous `contains_key` guard.
+    if state
+        .peers
+        .get(&device_id)
+        .is_some_and(|p| p.session.lock().is_some())
+    {
         return;
     }
     info!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
@@ -2621,6 +2695,88 @@ mod tests {
                 scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS + 5_000,
             ))
             .expect("test host monotonic clock has enough headroom")
+    }
+
+    #[tokio::test]
+    async fn silent_network_records_sighted_without_opening_a_session() {
+        // The load-bearing Silent behaviour: a peer announcing on signaling
+        // must be surfaced as discovered (Sighted, visible in `peers()`) but
+        // must NOT cause the engine to open a WebRTC session on its own.
+        let state = build_test_state("silent-no-autodial");
+        state.governance_state.write().kind = crate::network_state::NetworkKind::Silent;
+        assert!(state.is_silent());
+
+        let peer = "peerpubkeyzzz-customer";
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::PeerAnnounced {
+                device_id: peer.to_string(),
+            },
+        )
+        .await;
+
+        let entry = state
+            .peers
+            .get(peer)
+            .expect("a Silent network must still record the announced peer as discovered");
+        assert!(
+            entry.session.lock().is_none(),
+            "Silent must not open a WebRTC session just because a peer announced"
+        );
+        assert_eq!(entry.state.read().status, connection::PeerStatus::Sighted);
+        assert!(
+            !entry.state.read().authenticated,
+            "no handshake should have run"
+        );
+
+        // A re-announce is idempotent — still no session, still Sighted.
+        drop(entry);
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::PeerAnnounced {
+                device_id: peer.to_string(),
+            },
+        )
+        .await;
+        assert!(state.peers.get(peer).unwrap().session.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_peer_upgrades_a_silent_sighted_placeholder_to_a_session() {
+        // The explicit dial: `connect_peer` opens the WebRTC session the Silent
+        // announce path deliberately skipped, upgrading the discovery-only
+        // placeholder in place (rather than short-circuiting on the stub).
+        let state = build_test_state("silent-connect-peer");
+        state.governance_state.write().kind = crate::network_state::NetworkKind::Silent;
+
+        let peer = "peerpubkeyzzz-tech";
+        // Discover first (session-less placeholder), as an announce would.
+        note_sighted_without_dialing(&state, peer);
+        assert!(state.peers.get(peer).unwrap().session.lock().is_none());
+
+        // Deliberate dial opens a real session on the same entry.
+        connect_peer(&state, peer).await;
+        assert!(
+            state.peers.get(peer).unwrap().session.lock().is_some(),
+            "connect_peer must open a session, upgrading the Sighted placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_network_suppresses_roster_gossip_predicate() {
+        // The gossip gate: `broadcast_roster_summary` / `on_roster_request`
+        // early-return on `!gossip_roster_enabled()`, which is exactly
+        // "is this network Silent?".
+        let state = build_test_state("silent-gossip-gate");
+        assert!(
+            state.gossip_roster_enabled(),
+            "a non-silent network gossips its roster as before"
+        );
+        state.governance_state.write().kind = crate::network_state::NetworkKind::Silent;
+        assert!(
+            !state.gossip_roster_enabled(),
+            "a silent network must suppress roster gossip"
+        );
     }
 
     #[test]

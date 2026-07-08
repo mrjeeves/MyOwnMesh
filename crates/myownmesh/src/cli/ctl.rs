@@ -161,6 +161,14 @@ pub enum NetworksCmd {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Deliberately dial one peer by device id on a joined network. On a
+    /// `silent` network this is how a connection is opened at all (nothing
+    /// connects on its own); on other kinds it's rarely needed since they
+    /// auto-dial on presence.
+    Connect {
+        network_id: String,
+        peer: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,6 +216,12 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         },
         CtlCmd::Networks(NetworksCmd::Reconnect { network_id, peer }) => {
             Request::NetworkReconnect {
+                network: network_id,
+                peer,
+            }
+        }
+        CtlCmd::Networks(NetworksCmd::Connect { network_id, peer }) => {
+            Request::NetworkConnectPeer {
                 network: network_id,
                 peer,
             }
