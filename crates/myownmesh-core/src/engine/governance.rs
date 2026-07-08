@@ -713,6 +713,12 @@ pub async fn on_state_broadcast(
 /// Called when our roster changes (a peer is confirmed / approved) and on
 /// each ACTIVE transition so a freshly-connected peer reconciles at once.
 pub async fn broadcast_roster_summary(state: &Arc<EngineState>) {
+    // Silent networks never gossip membership — every connection is
+    // deliberate, so there is nothing to converge. Presence and the per-peer
+    // handshake are unaffected; only this anti-entropy advertise is suppressed.
+    if !state.gossip_roster_enabled() {
+        return;
+    }
     let summary = crate::roster::summary(&state.roster.read());
     broadcast(state, MeshMessage::RosterSummary(summary)).await;
 }
@@ -731,6 +737,12 @@ pub async fn on_roster_request(
     peer_id: &str,
     _msg: RosterRequestMessage,
 ) {
+    // A Silent network never emits roster entries — membership is not gossiped
+    // in either direction. (It also never sends summaries, so a well-behaved
+    // peer won't request; this guards the unsolicited case.)
+    if !state.gossip_roster_enabled() {
+        return;
+    }
     let entries: Vec<RosterEntry> = state
         .roster
         .read()
@@ -778,7 +790,11 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
     //     owner-signed log: complete, self-sufficient, and identical on every
     //     member that has adopted the log.
     let kind = { state.governance_state.read().kind };
-    if kind == NetworkKind::Open {
+    // Silent is governance-identical to Open (permissionless, additive merge).
+    // In practice a Silent network suppresses outbound gossip so this rarely
+    // fires, but if a peer does send entries we merge them the open way rather
+    // than treating Silent like a signed-authority closed network.
+    if kind.is_open_governance() {
         let self_pk = state.identity.public_id().to_string();
         let added = {
             let mut roster = state.roster.write();

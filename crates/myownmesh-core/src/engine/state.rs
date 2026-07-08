@@ -114,6 +114,16 @@ pub enum NetworkCmd {
     /// instead of the old `NetworkRemove` + `NetworkAdd`. See
     /// [`super::network_watch::reconnect_all_in_place`].
     Reconnect { peer: Option<String> },
+    /// Deliberately dial exactly one signaling-discovered peer as the
+    /// offerer, opening the WebRTC session the announce path would have
+    /// opened automatically on a non-Silent network. This is the manual
+    /// "dial by device id" a `Silent` network exposes (via
+    /// [`crate::JoinedNetwork::connect_peer`]): on a Silent mesh nothing
+    /// connects on its own, so a connection is initiated only here or by
+    /// answering an inbound offer. Idempotent — a no-op if a live session
+    /// already exists; upgrades a discovery-only `Sighted` placeholder to a
+    /// real session otherwise.
+    ConnectPeer { device_id: String },
     /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
     /// one peer.
     SendChannelFrame {
@@ -1041,6 +1051,40 @@ impl NetworkState {
     /// mutation. See [`super::network_watch::reconnect_all_in_place`].
     pub fn reconnect(&self, peer: Option<String>) {
         let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
+    }
+
+    /// Queue a deliberate offerer-side dial of exactly one peer on the engine
+    /// driver. The manual-connect primitive a `Silent` network needs: on a
+    /// Silent mesh the engine never auto-dials on presence, so a session is
+    /// opened only here (or by answering an inbound offer). Fire-and-forget,
+    /// like [`Self::reconnect`]; the work runs on the driver via
+    /// [`NetworkCmd::ConnectPeer`]. Backs [`crate::JoinedNetwork::connect_peer`].
+    pub fn connect_peer(&self, device_id: &str) {
+        let _ = self.cmd_tx.send(NetworkCmd::ConnectPeer {
+            device_id: device_id.to_string(),
+        });
+    }
+
+    /// True when this network's governance kind is `Silent`. The load-bearing
+    /// predicate for the two Silent behaviours: the engine suppresses
+    /// auto-dial-on-presence (see `handle_signaling_inbound`) and roster
+    /// gossip (see [`super::governance::broadcast_roster_summary`]). Read off
+    /// the authoritative signed-state kind, which is seeded from
+    /// `NetworkConfig.kind` at attach.
+    pub fn is_silent(&self) -> bool {
+        matches!(
+            self.governance_state.read().kind,
+            crate::network_state::NetworkKind::Silent
+        )
+    }
+
+    /// Whether this network gossips its roster (the membership summary /
+    /// entries anti-entropy). True everywhere except `Silent` networks, on
+    /// which membership is never advertised — every connection is deliberate,
+    /// so there is nothing to converge. Presence (`Sighted`) and the per-peer
+    /// handshake are unaffected; only the roster gossip is suppressed.
+    pub fn gossip_roster_enabled(&self) -> bool {
+        !self.is_silent()
     }
 }
 

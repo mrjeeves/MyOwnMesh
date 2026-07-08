@@ -136,6 +136,20 @@ pub enum Request {
         #[serde(default)]
         peer: Option<String>,
     },
+    /// Deliberately dial exactly one signaling-discovered peer on a joined
+    /// network, opening the WebRTC session on demand — the control-socket
+    /// surface for [`myownmesh_core::JoinedNetwork::connect_peer`]. This is how
+    /// a `Silent` network (which never auto-dials on presence) ever opens a
+    /// connection: a daemon-client embedder (e.g. a remote-support node) that
+    /// matched a peer's Support ID sends this to dial exactly that one peer.
+    /// The local side dials as the offerer, so a Silent peer is reached by the
+    /// offer and answers. No-op-with-error if the network isn't currently
+    /// joined; `Ok` means the dial was queued, not that the peer connected —
+    /// watch the event stream for the outcome.
+    NetworkConnectPeer {
+        network: String,
+        peer: String,
+    },
     /// Snapshot which infrastructure services this device hosts
     /// (relay / signaling / STUN / TURN): live runtime status plus the
     /// persisted config. The GUI's Services settings section reads this
@@ -930,6 +944,10 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             info!(%network, ?peer, "control: network_reconnect");
             network_reconnect(state, &network, peer)
         }
+        Request::NetworkConnectPeer { network, peer } => {
+            info!(%network, %peer, "control: network_connect_peer");
+            network_connect_peer(state, &network, &peer).await
+        }
 
         // ---- self-update ----
         Request::UpdateStatus => match myownmesh_updater::status() {
@@ -1629,6 +1647,21 @@ fn network_reconnect(state: &Arc<ControlState>, key: &str, peer: Option<String>)
     }
 }
 
+/// Deliberately dial one peer on a joined network — the control-socket wrapper
+/// around [`myownmesh_core::JoinedNetwork::connect_peer`]. Single-shot: queues
+/// the offerer-side dial on the engine and returns at once (the outcome rides
+/// the event stream), so a daemon client on a `Silent` network can open exactly
+/// one connection after matching a peer's Support ID.
+async fn network_connect_peer(state: &Arc<ControlState>, key: &str, peer: &str) -> Response {
+    match state.registry.get(key) {
+        Some(joined) => match joined.connect_peer(peer).await {
+            Ok(()) => Response::ok(serde_json::json!({ "connecting": peer, "network": key })),
+            Err(e) => Response::err(e.to_string()),
+        },
+        None => Response::err(format!("unknown network: {key}")),
+    }
+}
+
 /// Update an already-joined network in place. Hot-reloadable edits
 /// (topology / label / auto_approve / roster path) apply without
 /// touching live sessions; transport edits (signaling / STUN / TURN /
@@ -2114,6 +2147,28 @@ mod media_frame_tests {
         for cut in 0..14 + "home".len() + "peer".len() {
             assert!(decode_media_frame(&body[..cut]).is_none(), "short {cut}");
         }
+    }
+
+    /// The `network_connect_peer` op is what a daemon-client embedder sends to
+    /// dial one peer on a Silent network. Pin its wire tag + shape: it must
+    /// decode from the exact JSON a client writes, and round-trip.
+    #[test]
+    fn network_connect_peer_request_round_trips() {
+        let json = r#"{"op":"network_connect_peer","network":"cec-support","peer":"peerpubkey"}"#;
+        let req: Request = serde_json::from_str(json).expect("decode network_connect_peer");
+        match &req {
+            Request::NetworkConnectPeer { network, peer } => {
+                assert_eq!(network, "cec-support");
+                assert_eq!(peer, "peerpubkey");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // The `op` tag is the load-bearing discriminator; pin it on re-encode.
+        let value = serde_json::to_value(&req).expect("encode");
+        assert_eq!(value["op"], "network_connect_peer");
+        assert_eq!(value["peer"], "peerpubkey");
+        let back: Request = serde_json::from_value(value).expect("re-decode");
+        assert!(matches!(back, Request::NetworkConnectPeer { .. }));
     }
 
     #[test]

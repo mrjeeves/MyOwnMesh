@@ -460,6 +460,32 @@ impl JoinedNetwork {
         self.state.reconnect(peer);
     }
 
+    /// Deliberately dial exactly one signaling-discovered peer by device id,
+    /// opening the WebRTC session on demand. This is the manual-connect
+    /// primitive a [`Silent`](crate::NetworkKind::Silent) network needs: on a
+    /// Silent mesh the engine never dials just because a peer announced (a
+    /// co-present peer surfaces as [`crate::PeerEvent::Sighted`] / in
+    /// [`Self::peers`] with no session), so a connection is initiated only
+    /// here or by answering an inbound offer. The local side always takes the
+    /// offerer role, so a Silent peer — which never auto-dials — is reached by
+    /// our offer and answers normally. Idempotent: a no-op if a live session
+    /// already exists. Fire-and-forget past the queue hand-off — the dial runs
+    /// on the engine driver, serialized with every other per-peer mutation.
+    ///
+    /// On a non-Silent network this still works (dials the peer if not already
+    /// connected), but there it is rarely needed: those networks auto-dial on
+    /// presence. `Ok(())` means the command was queued, not that the peer
+    /// connected — observe [`crate::PeerEvent`]s for the outcome.
+    pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ConnectPeer {
+                device_id: device_id.to_string(),
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        Ok(())
+    }
+
     /// Stop the network. Tears down all peer sessions, signals
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.

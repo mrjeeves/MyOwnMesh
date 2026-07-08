@@ -203,8 +203,13 @@ pub struct NetworkConfig {
     /// default and matches the engine's behaviour through every
     /// release before `network_state_v1` shipped. Closed sets up
     /// the per-network signed state log so the founder
-    /// self-elects as `Owner` on first attach. Configs written by
-    /// older builds parse via #[serde(default)] without an
+    /// self-elects as `Owner` on first attach. Silent is Open
+    /// governance plus two connection-behaviour changes — no
+    /// auto-dial on presence (co-present peers surface as `Sighted`
+    /// without a WebRTC session until an explicit `connect_peer` or
+    /// an inbound offer) and no roster gossip — for a shared open
+    /// mesh where every connection is deliberate. Configs written
+    /// by older builds parse via #[serde(default)] without an
     /// explicit field.
     ///
     /// At runtime, the *authoritative* kind is the one in the
@@ -719,6 +724,38 @@ mod tests {
         assert_eq!(cfg.turn_servers, default_turn_servers());
         assert_eq!(cfg.turn_servers[0].username.as_deref(), Some("guest"));
         assert!(cfg.turn_servers[0].urls[0].contains("myownmesh"));
+    }
+
+    #[test]
+    fn network_kind_silent_round_trips_and_defaults_open() {
+        use crate::network_state::NetworkKind;
+        // Explicit `"kind": "silent"` decodes to Silent.
+        let json = r#"{ "id": "n1", "network_id": "t", "kind": "silent" }"#;
+        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.kind, NetworkKind::Silent);
+        // A round-trip preserves it.
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(s.contains("\"kind\":\"silent\""), "got: {s}");
+        let back: NetworkConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.kind, NetworkKind::Silent);
+        // An old config that omits `kind` keeps decoding to the default (Open),
+        // so existing networks are untouched.
+        let old = r#"{ "id": "n1", "network_id": "t" }"#;
+        let cfg: NetworkConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.kind, NetworkKind::Open);
+    }
+
+    #[test]
+    fn mesh_config_with_a_silent_network_round_trips() {
+        use crate::network_state::NetworkKind;
+        let mut cfg = MeshConfig::default();
+        let mut net = NetworkConfig::from_network_id("support", "cec-support");
+        net.kind = NetworkKind::Silent;
+        cfg.networks.push(net);
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: MeshConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(cfg, back);
+        assert_eq!(back.networks[0].kind, NetworkKind::Silent);
     }
 
     #[test]

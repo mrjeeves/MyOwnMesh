@@ -46,13 +46,33 @@ pub const NETWORK_STATE_VERSION: u32 = 2;
 /// Governance kind of a network. `Open` (default) has no role
 /// enforcement; any current member can author roster edits. `Closed`
 /// gates roster edits and kind transitions behind the signed authority
-/// chain in [`NetworkState`].
+/// chain in [`NetworkState`]. `Silent` is governance-identical to `Open`
+/// (permissionless roster, auto-accept — there is no signed cert chain to
+/// enforce) but changes two *connection* behaviours: the engine never
+/// auto-dials a peer just because it announced on signaling (it records the
+/// peer as `Sighted` without opening a WebRTC session — a session is opened
+/// only by an explicit [`crate::JoinedNetwork::connect_peer`] or by
+/// answering an inbound offer), and it never gossips the roster. That makes
+/// "nothing connects until a deliberate dial" true at the transport layer —
+/// the shape a remote-support ("AnyDesk-style") product needs on a shared
+/// open mesh. See `docs/NETWORK-TYPES.md`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkKind {
     #[default]
     Open,
     Closed,
+    Silent,
+}
+
+impl NetworkKind {
+    /// True for the kinds whose governance is permissionless / auto-accept
+    /// (`Open` and `Silent`) — i.e. NOT the signed-authority `Closed` model.
+    /// Every governance branch that asks "open vs closed?" routes `Silent`
+    /// down the open path through this predicate.
+    pub fn is_open_governance(self) -> bool {
+        matches!(self, NetworkKind::Open | NetworkKind::Silent)
+    }
 }
 
 /// Authority tier within a closed network. `Member` is the default
@@ -170,6 +190,10 @@ pub fn transition_payload(network_id: &str, variant: &TransitionVariant) -> Vec<
             match to {
                 NetworkKind::Open => "open",
                 NetworkKind::Closed => "closed",
+                // `Silent` is a creation-time config kind, never a KindChange
+                // target (the quorum table rejects transitioning *to* it), but
+                // the payload encoder must stay exhaustive over NetworkKind.
+                NetworkKind::Silent => "silent",
             }
         ),
         TransitionVariant::RoleGrant { target, role } => format!(
@@ -527,9 +551,10 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                 ));
             }
         }
-        (TransitionVariant::RoleGrant { .. }, NetworkKind::Open) => {
+        (TransitionVariant::RoleGrant { .. }, NetworkKind::Open | NetworkKind::Silent) => {
             // Roles are cosmetic on open networks. Any member signs.
-            // Engine accepts but doesn't enforce on open kind.
+            // Engine accepts but doesn't enforce on open kind. Silent is
+            // governance-identical to Open here.
         }
 
         (TransitionVariant::RoleRevoke { target }, NetworkKind::Closed) => {
@@ -555,8 +580,8 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                 }
             }
         }
-        (TransitionVariant::RoleRevoke { .. }, NetworkKind::Open) => {
-            // Cosmetic on open kind; any signer accepted.
+        (TransitionVariant::RoleRevoke { .. }, NetworkKind::Open | NetworkKind::Silent) => {
+            // Cosmetic on open kind; any signer accepted. Silent == Open.
         }
 
         (TransitionVariant::Evict { target }, NetworkKind::Closed) => {
@@ -582,10 +607,11 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                 }
             }
         }
-        (TransitionVariant::Evict { .. }, NetworkKind::Open) => {
+        (TransitionVariant::Evict { .. }, NetworkKind::Open | NetworkKind::Silent) => {
             // An open network's roster is permissionless (gossip re-adds
             // anyone), so an evict can't stick — accept the signer set but
-            // it has no lasting effect. Closed is the meaningful case.
+            // it has no lasting effect. Closed is the meaningful case. Silent
+            // is governance-identical to Open (and gossips nothing anyway).
         }
 
         (TransitionVariant::Split { .. }, _) => {
@@ -1043,6 +1069,22 @@ mod tests {
     fn default_role_is_member_default_kind_is_open() {
         assert_eq!(Role::default(), Role::Member);
         assert_eq!(NetworkKind::default(), NetworkKind::Open);
+    }
+
+    #[test]
+    fn silent_kind_serde_round_trips_and_is_open_governance() {
+        // Snake-case wire form.
+        assert_eq!(
+            serde_json::to_string(&NetworkKind::Silent).unwrap(),
+            "\"silent\""
+        );
+        let back: NetworkKind = serde_json::from_str("\"silent\"").unwrap();
+        assert_eq!(back, NetworkKind::Silent);
+        // Silent routes down the permissionless (open) governance path;
+        // Closed does not.
+        assert!(NetworkKind::Silent.is_open_governance());
+        assert!(NetworkKind::Open.is_open_governance());
+        assert!(!NetworkKind::Closed.is_open_governance());
     }
 
     #[test]
