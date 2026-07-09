@@ -293,6 +293,22 @@ impl NetworkWatch {
             return;
         }
         let prev = self.last.replace(current.clone()).expect("checked above");
+
+        // A change where the primary outbound IPs held (while we still have a
+        // primary) is benign secondary-interface churn — adopt the new
+        // fingerprint (done above) and stop, rather than churn every peer's ICE
+        // for an address nothing connects through. See
+        // [`is_benign_secondary_churn`].
+        if is_benign_secondary_churn(&prev, &current) {
+            debug!(
+                network = %state.network_id,
+                v4 = ?current.v4, v6 = ?current.v6,
+                "local address set changed but primary outbound IPs held — \
+                 benign secondary-interface churn, not renegotiating"
+            );
+            return;
+        }
+
         let now = Instant::now();
 
         // The offline edges are never coalesced. Going fully offline
@@ -330,6 +346,27 @@ impl NetworkWatch {
         }
         on_network_change(state, &prev, &current).await;
     }
+}
+
+/// Whether a snapshot transition is **benign secondary-interface churn** — the
+/// primary outbound IPs held *and* we still have a primary, so only the
+/// local-address fingerprint moved. That happens constantly from things no mesh
+/// peer connects through: a Windows Teredo/ISATAP tunnel address rotating its
+/// embedded prefix, a container/VPN adapter coming and going, a v6 temporary
+/// address minted in a fresh prefix. Renegotiating ICE on every peer for it is
+/// pure harm — it churns live sessions (data channels close, peers drop
+/// `IceFailed`), and on a just-dialed CEC customer it kills the connection
+/// before the approve handshake can complete.
+///
+/// A box with **no primary at all** (an internet-isolated LAN — both probes read
+/// `None`) returns `false`: there a fingerprint change is the only
+/// address-change signal it has, so it must still fire. A genuine primary move
+/// (Wi-Fi↔cellular, the mesh interface changing) changes `v4`/`v6` and returns
+/// `false` too.
+fn is_benign_secondary_churn(prev: &NetworkSnapshot, current: &NetworkSnapshot) -> bool {
+    let primary_held = current.v4 == prev.v4 && current.v6 == prev.v6;
+    let have_primary = current.v4.is_some() || current.v6.is_some();
+    primary_held && have_primary
 }
 
 /// Whether a network change should be coalesced (skipped) under the
@@ -625,6 +662,71 @@ mod tests {
             local_count: 0,
         };
         assert!(dark.offline());
+    }
+
+    #[test]
+    fn fingerprint_only_change_with_a_held_primary_is_benign() {
+        // Primary v4 held, v6 held (None) — only the local-address fingerprint
+        // moved. This is the storm from the field: a tunnel/virtual address
+        // rotating fires "IP changed" every few seconds and renegotiates the
+        // whole mesh, dropping live peers. Must read as benign.
+        let prev = NetworkSnapshot {
+            v4: Some(Ipv4Addr::new(192, 168, 88, 15)),
+            v6: None,
+            local_set: 100,
+            local_count: 3,
+        };
+        let current = NetworkSnapshot {
+            local_set: 200,
+            local_count: 3,
+            ..prev.clone()
+        };
+        assert_ne!(prev, current, "the fingerprint genuinely differs");
+        assert!(
+            is_benign_secondary_churn(&prev, &current),
+            "a fingerprint-only change with the primary held must not renegotiate"
+        );
+    }
+
+    #[test]
+    fn real_and_lan_only_changes_are_not_benign() {
+        // A genuine primary move (Wi-Fi↔cellular, mesh interface changing) fires.
+        let prev = NetworkSnapshot {
+            v4: Some(Ipv4Addr::new(192, 168, 88, 15)),
+            v6: None,
+            local_set: 100,
+            local_count: 3,
+        };
+        let primary_moved = NetworkSnapshot {
+            v4: Some(Ipv4Addr::new(10, 0, 0, 9)),
+            ..prev.clone()
+        };
+        assert!(!is_benign_secondary_churn(&prev, &primary_moved));
+
+        // v6 appearing is a real change too.
+        let v6_appeared = NetworkSnapshot {
+            v6: Some(Ipv6Addr::LOCALHOST),
+            ..prev.clone()
+        };
+        assert!(!is_benign_secondary_churn(&prev, &v6_appeared));
+
+        // Internet-isolated LAN: no primary at all — a fingerprint change is
+        // the ONLY address-change signal it has, so it must still fire.
+        let lan_prev = NetworkSnapshot {
+            v4: None,
+            v6: None,
+            local_set: 100,
+            local_count: 1,
+        };
+        let lan_next = NetworkSnapshot {
+            local_set: 200,
+            ..lan_prev.clone()
+        };
+        assert_ne!(lan_prev, lan_next);
+        assert!(
+            !is_benign_secondary_churn(&lan_prev, &lan_next),
+            "with no primary, a fingerprint change is the only signal — must fire"
+        );
     }
 
     #[test]
