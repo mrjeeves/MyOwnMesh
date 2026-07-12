@@ -156,10 +156,29 @@ pub enum NetworksCmd {
     },
     Topology {
         network_id: String,
-        /// `ring`, `star`, or `full_mesh`.
+        /// `ring`, `star`, `hubs`, or `full_mesh`. Local-config only —
+        /// refused when the network's topology is governed (see
+        /// `topology-propose`).
         topology: String,
+        /// Hub spec: `star` takes a device id; `hubs` takes
+        /// `id1,id2[,…][:spoke_redundancy]`.
         #[arg(long)]
         hub: Option<String>,
+    },
+    /// Propose the network-wide, owner-signed topology (closed
+    /// networks). Once ratified, every member's daemon converges on it
+    /// — this is how infra hubs are designated for the whole network.
+    TopologyPropose {
+        network_id: String,
+        /// `ring`, `star`, `hubs`, or `full_mesh`.
+        topology: String,
+        /// Hub spec: `star` takes a device id; `hubs` takes
+        /// `id1,id2[,…][:spoke_redundancy]`.
+        #[arg(long)]
+        hub: Option<String>,
+        /// Custody TOTP code, if this device enrolled one.
+        #[arg(long)]
+        mfa: Option<String>,
     },
     /// Deliberately dial one peer by device id on a joined network. On a
     /// `silent` network this is how a connection is opened at all (nothing
@@ -250,6 +269,17 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             network: network_id,
             topology,
             hub,
+        },
+        CtlCmd::Networks(NetworksCmd::TopologyPropose {
+            network_id,
+            topology,
+            hub,
+            mfa,
+        }) => Request::GovernanceProposeTopology {
+            network: network_id,
+            topology,
+            hub,
+            mfa_code: mfa,
         },
         CtlCmd::Peers { network } => Request::PeersList { network },
         CtlCmd::Roster(RosterCmd::List { network }) => Request::RosterList { network },

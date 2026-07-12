@@ -119,6 +119,17 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
+    /// Owner-signed network-wide topology (mode + hub set + spoke
+    /// redundancy) — same string encoding `TopologySet` takes; once
+    /// ratified, every member's daemon converges onto the shape.
+    GovernanceProposeTopology {
+        network: String,
+        topology: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,

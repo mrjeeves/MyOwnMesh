@@ -315,6 +315,29 @@ function createMeshClient() {
     return resp.proposal_id;
   }
 
+  /** Owner-signed network-wide topology (mode + hub set + spoke
+   *  redundancy). `topology`/`hub` use the daemon's TopologySet string
+   *  encoding — build them with `topologyToOpArgs`. Refreshes both the
+   *  governance snapshot (governed shape) and the network list (the
+   *  effective runtime topology follows ratification immediately on
+   *  this node). */
+  async function governanceProposeTopology(
+    network: string,
+    topology: string,
+    hub?: string | null,
+    mfaCode?: string,
+  ): Promise<string> {
+    const resp = (await invoke("mesh_governance_propose_topology", {
+      network,
+      topology,
+      hub: hub ?? undefined,
+      mfaCode,
+    })) as { proposal_id: string };
+    await refreshGovernance(network);
+    await refreshNetworks();
+    return resp.proposal_id;
+  }
+
   async function governanceSign(
     network: string,
     proposalId: string,
@@ -713,6 +736,7 @@ function createMeshClient() {
     governanceProposeKindChange,
     governanceProposeRoleGrant,
     governanceProposeRoleRevoke,
+    governanceProposeTopology,
     governanceSign,
     governanceDeny,
     governanceWithdraw,

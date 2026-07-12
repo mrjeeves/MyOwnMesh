@@ -243,9 +243,20 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
     match cmd {
         NetworkCmd::Shutdown => return false,
         NetworkCmd::SetTopology(mode) => {
-            *state.topology.write() = mode.clone();
-            *state.topology_impl.write() = crate::topology::from_mode(&mode);
-            ladder::reevaluate_topology(state).await;
+            // Backstop for the control-path check: once a ratified
+            // TopologyChange owns the shape, a local set must not
+            // fork this device off the governed topology.
+            if state.governance_state.read().topology.is_some() {
+                tracing::warn!(
+                    network = %state.network_id,
+                    "ignoring local topology set — this network's topology \
+                     is governed by a signed owner transition"
+                );
+            } else {
+                *state.topology.write() = mode.clone();
+                *state.topology_impl.write() = crate::topology::from_mode(&mode);
+                ladder::reevaluate_topology(state).await;
+            }
         }
         NetworkCmd::ApproveRoster {
             device_id,

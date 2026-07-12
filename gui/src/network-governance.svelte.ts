@@ -22,10 +22,12 @@
 import { meshClient } from "./mesh-client.svelte";
 import {
   ROLE_RANK,
+  topologyToOpArgs,
   type NetworkKind,
   type NetworkStateView,
   type Role,
   type SplitRecord,
+  type TopologyMode,
 } from "./types";
 import type { NetworkConfigInput } from "./types";
 
@@ -77,7 +79,11 @@ function coerce(raw: unknown): NetworkStateView {
   const splits: SplitRecord[] = Array.isArray(obj.splits)
     ? (obj.splits as SplitRecord[])
     : [];
-  return { kind, roles, transitions, pending, splits };
+  const topology =
+    typeof obj.topology === "object" && obj.topology
+      ? (obj.topology as TopologyMode)
+      : null;
+  return { kind, roles, transitions, pending, splits, topology };
 }
 
 function createGovernanceStore() {
@@ -196,7 +202,9 @@ function createGovernanceStore() {
   async function proposeKindChange(
     configId: string,
     _selfPubkey: string,
-    to: NetworkKind,
+    // `silent` is a creation-time kind, never a KindChange target —
+    // the daemon's quorum table rejects it, so don't let the UI offer it.
+    to: Extract<NetworkKind, "open" | "closed">,
     mfaCode?: string,
   ): Promise<{ ok: boolean; proposalId?: string; reason?: string }> {
     try {
@@ -209,6 +217,38 @@ function createGovernanceStore() {
     } catch (e) {
       return { ok: false, reason: String(e) };
     }
+  }
+
+  // ---- mutations: governed topology ----
+
+  /** Float the owner-signed, network-wide shape. On the owner this
+   *  ratifies immediately (single-signer quorum) and the daemon
+   *  reshapes live; every other member converges as the signed log
+   *  gossips to them. */
+  async function proposeTopology(
+    configId: string,
+    mode: TopologyMode,
+    mfaCode?: string,
+  ): Promise<{ ok: boolean; proposalId?: string; reason?: string }> {
+    try {
+      const { topology, hub } = topologyToOpArgs(mode);
+      const id = await meshClient.governanceProposeTopology(
+        configId,
+        topology,
+        hub,
+        mfaCode,
+      );
+      return { ok: true, proposalId: id };
+    } catch (e) {
+      return { ok: false, reason: String(e) };
+    }
+  }
+
+  /** The governed shape, when a ratified TopologyChange owns it —
+   *  `null` when this network's topology is still a per-device config
+   *  choice. */
+  function governedTopology(configId: string): TopologyMode | null {
+    return stateFor(configId).topology ?? null;
   }
 
   async function signProposal(
@@ -322,6 +362,8 @@ function createGovernanceStore() {
     setPeerRole,
     clearPeerRole,
     proposeKindChange,
+    proposeTopology,
+    governedTopology,
     signProposal,
     denyProposal,
     withdrawProposal,

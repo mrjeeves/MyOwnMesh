@@ -950,9 +950,10 @@ async fn adopt_transition_log(
     };
 
     // Apply both tiers under the write lock; reproject + mirror if either moved.
-    let (changed, roles, removed) = {
+    let (changed, roles, removed, adopted_topology) = {
         let mut gov = state.governance_state.write();
         let mut changed = false;
+        let mut adopted_topology = None;
 
         if let Some(rebuilt) = rebuilt {
             // Re-check length in case it raced another adopter.
@@ -960,6 +961,14 @@ async fn adopt_transition_log(
                 gov.kind = rebuilt.kind;
                 gov.transitions = rebuilt.transitions;
                 gov.splits = rebuilt.splits;
+                // A prefix-extending log can only carry topology forward
+                // (our Some came from our own prefix), so None never
+                // clobbers Some here; surface a real change so the
+                // runtime selector follows the adopted governance.
+                if rebuilt.topology != gov.topology {
+                    adopted_topology = rebuilt.topology.clone();
+                }
+                gov.topology = rebuilt.topology;
                 changed = true;
             }
         }
@@ -974,7 +983,7 @@ async fn adopt_transition_log(
         }
 
         if !changed {
-            (false, gov.roles.clone(), Default::default())
+            (false, gov.roles.clone(), Default::default(), None)
         } else {
             let projected = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
             // Devices the signed log explicitly evicted/revoked — the only ones
@@ -991,12 +1000,25 @@ async fn adopt_transition_log(
                     format!("persist after adopting logs failed: {e}"),
                 );
             }
-            (true, projected, removed)
+            (true, projected, removed, adopted_topology)
         }
     };
 
     if !changed {
         return;
+    }
+
+    if let Some(mode) = adopted_topology {
+        // Governance carried a topology this node hadn't applied yet —
+        // follow it live, exactly like a local ratification does.
+        *state.topology.write() = mode.clone();
+        *state.topology_impl.write() = crate::topology::from_mode(&mode);
+        super::ladder::reevaluate_topology(state).await;
+        diag(
+            state,
+            crate::events::DiagLevel::Info,
+            format!("governed topology adopted: {mode:?}"),
+        );
     }
 
     // Mirror the converged roles into the roster: add role-bearers, update tags,
@@ -1331,6 +1353,14 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
                     reason: DropReason::Denied,
                 });
             }
+        }
+        if let TransitionVariant::TopologyChange { to } = &transition.variant {
+            // The governed shape goes live the moment it ratifies —
+            // the same effect as `NetworkCmd::SetTopology`, run inline
+            // since ratification already happens on the driver.
+            *state.topology.write() = to.clone();
+            *state.topology_impl.write() = crate::topology::from_mode(to);
+            super::ladder::reevaluate_topology(state).await;
         }
 
         diag(

@@ -882,6 +882,106 @@ async fn two_owners_converge_their_rosters() {
 
 // ---- helpers --------------------------------------------------------
 
+#[tokio::test]
+async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
+    shared_home();
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+
+    let alice_id = Arc::new(Identity::ephemeral());
+    let bob_id = Arc::new(Identity::ephemeral());
+
+    let network_id = "governed-topology-net";
+    let (alice_state, _alice_driver) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bob_driver) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    // Close the network — Alice self-elects founder-owner.
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("close proposal");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+
+    // The owner designates herself the network's infra hub. One signed
+    // transition carries the whole shape (mode + hub set + redundancy).
+    let governed = TopologyMode::Hubs {
+        hubs: vec![alice_id.public_id().to_string()],
+        spoke_redundancy: Some(1),
+    };
+    myownmesh_core::engine::governance::propose(
+        &alice_state,
+        TransitionVariant::TopologyChange {
+            to: governed.clone(),
+        },
+        None,
+    )
+    .await
+    .expect("topology proposal");
+
+    // Both governance views AND both runtime selectors converge — Bob
+    // never signs anything; adopting the extended log reshapes him.
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().topology.as_ref() == Some(&governed)
+            && bob_state.governance_state.read().topology.as_ref() == Some(&governed)
+            && *alice_state.topology.read() == governed
+            && *bob_state.topology.read() == governed
+    })
+    .await;
+
+    // The governed log re-verifies from scratch — what a third node
+    // joining later replays to learn the shape with zero prior trust.
+    myownmesh_core::network_state::verify_log(
+        network_id,
+        &alice_state.governance_state.read().transitions,
+    )
+    .expect("governed log re-verifies standalone");
+
+    // Backstop: a manual local SetTopology on a governed network is
+    // ignored — one device can't fork itself off the owner's shape.
+    bob_state
+        .cmd_tx
+        .send(myownmesh_core::engine::state::NetworkCmd::SetTopology(
+            TopologyMode::FullMesh,
+        ))
+        .expect("send local set");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        *bob_state.topology.read(),
+        governed,
+        "local topology set must not override the governed shape"
+    );
+}
+
 async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>, peer_id: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {

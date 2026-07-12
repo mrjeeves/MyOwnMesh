@@ -24,8 +24,11 @@
   } from "../../network-settings";
   import {
     buildTopology,
+    topologyHubSet,
     type NetworkConfigInput,
     type NetworkSummary,
+    type TopologyKind,
+    type TopologyMode,
   } from "../../types";
 
   const {
@@ -37,8 +40,11 @@
   // ---- editable draft (seeded once per network) -----------------------
 
   let labelDraft = $state("");
-  let topology = $state<"ring" | "star" | "full_mesh">("full_mesh");
+  let topology = $state<TopologyKind>("full_mesh");
   let starHub = $state("");
+  let hubsDraft = $state<string[]>([]);
+  let hubRedundancy = $state<number | null>(null);
+  let hubInput = $state("");
   let signalingDraft = $state<string[]>([]);
   let stunDraft = $state<string[]>([]);
   let turnDraft = $state<TurnEntry[]>([]);
@@ -58,6 +64,8 @@
     if (loaded) return;
     void (async () => {
       try {
+        // Roster feeds the hub picker (pick hubs by label, not pubkey).
+        void meshClient.refreshRoster(network.config_id);
         const cfg = await meshClient.configShow();
         const net = cfg.networks.find(
           (n: NetworkConfigInput) =>
@@ -68,6 +76,10 @@
         } else {
           seedDefaults();
         }
+        // When a signed TopologyChange owns the shape, the draft edits
+        // THAT — the config value underneath is inert until ungoverned.
+        const g = governance.governedTopology(network.config_id);
+        if (g) seedTopoFrom(g);
       } catch (e) {
         actionError = `couldn't load current config: ${String(e)}`;
         seedDefaults();
@@ -77,11 +89,19 @@
     })();
   });
 
+  function seedTopoFrom(m: TopologyMode) {
+    topology = m.kind;
+    if (m.kind === "star") starHub = m.hub;
+    if (m.kind === "hubs") {
+      hubsDraft = [...m.hubs];
+      hubRedundancy = m.spoke_redundancy;
+    }
+  }
+
   function seedFrom(cfg: NetworkConfigInput) {
     labelDraft = cfg.label ?? "";
     if (cfg.topology) {
-      topology = cfg.topology.kind === "full_mesh" ? "full_mesh" : cfg.topology.kind;
-      if (cfg.topology.kind === "star") starHub = cfg.topology.hub;
+      seedTopoFrom(cfg.topology);
     } else {
       topology = "full_mesh";
     }
@@ -103,6 +123,108 @@
     stunDraft = [...DEFAULT_NETWORK_STUN];
     turnDraft = DEFAULT_NETWORK_TURN.map((t) => ({ ...t }));
     autoApprove = false;
+  }
+
+  // ---- governed topology (owner-signed, network-wide) -----------------
+  //
+  // Once a ratified TopologyChange owns the shape, the local picker
+  // above becomes read-only everywhere (the daemon refuses TopologySet
+  // and ignores the config field) and this section is the only writer —
+  // owner-gated, signed, and converging on every member via the log.
+
+  const selfPubkey = $derived(meshClient.identity?.pubkey ?? null);
+  const govState = $derived(governance.stateFor(network.config_id));
+  const governed = $derived(governance.governedTopology(network.config_id));
+  const myRole = $derived(
+    selfPubkey ? governance.localRole(network.config_id, selfPubkey) : "member",
+  );
+  const isOwner = $derived(myRole === "owner");
+  const isClosed = $derived(govState.kind === "closed");
+
+  /** Roster rows for the hub picker — id + label so the owner picks
+   *  hubs by name, not by pasting pubkeys. */
+  const rosterRows = $derived(
+    meshClient.rostersByNetwork[network.config_id] ?? [],
+  );
+
+  let proposeBusy = $state(false);
+  let proposeError = $state<string | null>(null);
+  let proposedAt = $state<number | null>(null);
+  /** Custody code — revealed only after the daemon asks for one. */
+  let mfaCode = $state("");
+  let needsMfa = $state(false);
+
+  function toggleHub(deviceId: string) {
+    hubsDraft = hubsDraft.includes(deviceId)
+      ? hubsDraft.filter((h) => h !== deviceId)
+      : [...hubsDraft, deviceId];
+  }
+
+  function addHubById() {
+    const v = hubInput.trim();
+    if (!v) return;
+    if (!hubsDraft.includes(v)) hubsDraft = [...hubsDraft, v];
+    hubInput = "";
+  }
+
+  /** Current draft as a TopologyMode — shared by local save and the
+   *  governed propose so the two paths can't drift. */
+  function draftMode(): TopologyMode {
+    return buildTopology(topology, starHub || null, hubsDraft, hubRedundancy);
+  }
+
+  async function proposeGoverned() {
+    if (proposeBusy) return;
+    if (topology === "hubs" && hubsDraft.length === 0) {
+      proposeError = "Pick at least one hub device.";
+      return;
+    }
+    proposeBusy = true;
+    proposeError = null;
+    proposedAt = null;
+    const res = await governance.proposeTopology(
+      network.config_id,
+      draftMode(),
+      needsMfa && mfaCode ? mfaCode : undefined,
+    );
+    proposeBusy = false;
+    if (res.ok) {
+      proposedAt = Date.now();
+      needsMfa = false;
+      mfaCode = "";
+      return;
+    }
+    const reason = res.reason ?? "proposal failed";
+    if (/custody|mfa|totp|code/i.test(reason) && !needsMfa) {
+      needsMfa = true;
+      proposeError =
+        "This device holds a custody lock for the network — enter the code and propose again.";
+    } else {
+      proposeError = reason;
+    }
+  }
+
+  function hubLabel(id: string): string {
+    const row = rosterRows.find(
+      (r) => id === r.device_id || id.startsWith(`${r.device_id}-`),
+    );
+    return row?.label ? row.label : `${id.slice(0, 12)}…`;
+  }
+
+  function describeGoverned(m: TopologyMode): string {
+    switch (m.kind) {
+      case "full_mesh":
+        return "Full mesh — every pair connects directly.";
+      case "ring":
+        return `Ring — each node keeps ${m.n_preferred ?? 3} preferred neighbors.`;
+      case "star":
+        return `Star — everything routes through ${hubLabel(m.hub)}.`;
+      case "hubs":
+        return (
+          `Hub tier — ${m.hubs.map(hubLabel).join(", ")}; ` +
+          `each spoke keeps ${m.spoke_redundancy ?? 2} hub link${(m.spoke_redundancy ?? 2) === 1 ? "" : "s"}.`
+        );
+    }
   }
 
   // ---- relay/STUN/TURN list editors -----------------------------------
@@ -179,7 +301,7 @@
       // Build the new wire payload, carrying THIS network's existing
       // config id so the daemon edits the same record in place rather
       // than creating a duplicate.
-      const topo = buildTopology(topology, starHub || null);
+      const topo = buildTopology(topology, starHub || null, hubsDraft, hubRedundancy);
       newCfg = buildNetworkConfig({
         id: network.config_id,
         networkId: network.network_id,
@@ -323,40 +445,179 @@
 
     <!-- Topology -->
     <div class="card">
-      <div class="card-title">Topology</div>
-      <div class="topo-row">
-        <button
-          class="topo-btn"
-          class:active={topology === "ring"}
-          onclick={() => (topology = "ring")}
-        >
-          Ring
-        </button>
-        <button
-          class="topo-btn"
-          class:active={topology === "full_mesh"}
-          onclick={() => (topology = "full_mesh")}
-        >
-          Full mesh
-        </button>
-        <button
-          class="topo-btn"
-          class:active={topology === "star"}
-          onclick={() => (topology = "star")}
-        >
-          Star
-        </button>
+      <div class="card-title">
+        Topology
+        {#if governed}
+          <span class="gov-badge" title="Owner-signed network-wide shape — every member's daemon follows it">
+            governed
+          </span>
+        {/if}
       </div>
-      {#if topology === "star"}
-        <label class="field" style="margin-top: 0.5rem">
-          <span class="field-label">Hub device id</span>
-          <input
-            type="text"
-            placeholder="base32-lowercase pubkey"
-            bind:value={starHub}
-            class="mono"
-          />
-        </label>
+
+      {#if governed && !isOwner}
+        <!-- Governed, and we're not the owner: the shape is the
+             owner's signed call; nothing here is writable. -->
+        <div class="gov-summary">{describeGoverned(governed)}</div>
+        <div class="hint subtle">
+          The owner signed this shape into the network's governance —
+          every member's daemon (this one included) follows it
+          automatically, and local topology settings are ignored.
+        </div>
+      {:else}
+        <div class="topo-row">
+          <button
+            class="topo-btn"
+            class:active={topology === "ring"}
+            onclick={() => (topology = "ring")}
+          >
+            Ring
+          </button>
+          <button
+            class="topo-btn"
+            class:active={topology === "full_mesh"}
+            onclick={() => (topology = "full_mesh")}
+          >
+            Full mesh
+          </button>
+          <button
+            class="topo-btn"
+            class:active={topology === "star"}
+            onclick={() => (topology = "star")}
+          >
+            Star
+          </button>
+          <button
+            class="topo-btn"
+            class:active={topology === "hubs"}
+            onclick={() => (topology = "hubs")}
+          >
+            Hubs
+          </button>
+        </div>
+        {#if topology === "star"}
+          <label class="field" style="margin-top: 0.5rem">
+            <span class="field-label">Hub device id</span>
+            <input
+              type="text"
+              placeholder="base32-lowercase pubkey"
+              bind:value={starHub}
+              class="mono"
+            />
+          </label>
+        {/if}
+        {#if topology === "hubs"}
+          <div class="hub-picker">
+            <div class="hint subtle">
+              Infra hubs full-mesh each other and carry everyone else:
+              spokes connect to a couple of them (rendezvous-assigned)
+              instead of to every peer, so nobody pays N². Pick the
+              always-on boxes — servers, NAS, the office machine.
+            </div>
+            {#if rosterRows.length > 0}
+              {#each rosterRows as row (row.device_id)}
+                <label class="checkbox hub-row">
+                  <input
+                    type="checkbox"
+                    checked={hubsDraft.includes(row.device_id)}
+                    onchange={() => toggleHub(row.device_id)}
+                  />
+                  <span>
+                    <strong>{row.label || "(unnamed device)"}</strong>
+                    <code class="mono muted-inline">
+                      {row.device_id.slice(0, 16)}…
+                    </code>
+                  </span>
+                </label>
+              {/each}
+            {/if}
+            {#each hubsDraft.filter((h) => !rosterRows.some((r) => r.device_id === h)) as extra (extra)}
+              <div class="list-row">
+                <code class="mono row-text">{extra}</code>
+                <button class="row-btn danger" onclick={() => toggleHub(extra)}>
+                  Remove
+                </button>
+              </div>
+            {/each}
+            <div class="add-row">
+              <input
+                type="text"
+                placeholder="add hub by device id (not yet in roster)"
+                bind:value={hubInput}
+                class="mono"
+                onkeydown={(e) => e.key === "Enter" && addHubById()}
+              />
+              <button class="row-btn" onclick={addHubById}>Add</button>
+            </div>
+            <label class="field" style="margin-top: 0.5rem">
+              <span class="field-label">
+                Hub links per spoke (default 2 — survives one hub restart)
+              </span>
+              <input
+                type="number"
+                min="1"
+                max={Math.max(hubsDraft.length, 1)}
+                placeholder="2"
+                value={hubRedundancy ?? ""}
+                oninput={(e) => {
+                  const v = (e.currentTarget as HTMLInputElement).value;
+                  hubRedundancy = v === "" ? null : Math.max(1, Number(v));
+                }}
+              />
+            </label>
+          </div>
+        {/if}
+
+        {#if isClosed && isOwner}
+          <div class="gov-cta">
+            {#if governed}
+              <div class="hint subtle">
+                This shape is governed: signing an update converges every
+                member's daemon onto it — no per-device setup.
+              </div>
+            {:else}
+              <div class="hint subtle">
+                You own this network. Signing the shape makes it
+                network-wide: every member's daemon converges onto it
+                automatically (headless boxes included) — the per-device
+                picker above stops mattering.
+              </div>
+            {/if}
+            {#if needsMfa}
+              <label class="field">
+                <span class="field-label">Custody code</span>
+                <input
+                  type="text"
+                  placeholder="123 456"
+                  bind:value={mfaCode}
+                  class="mono"
+                />
+              </label>
+            {/if}
+            {#if proposeError}
+              <div class="err">⚠ {proposeError}</div>
+            {/if}
+            {#if proposedAt}
+              <div class="ok">
+                ✓ signed — members converge as the log gossips to them
+              </div>
+            {/if}
+            <button
+              class="btn primary"
+              disabled={proposeBusy}
+              onclick={proposeGoverned}
+            >
+              {proposeBusy
+                ? "Signing…"
+                : governed
+                  ? "Sign updated network-wide topology"
+                  : "Sign & make network-wide"}
+            </button>
+          </div>
+        {:else if governed && isOwner}
+          <!-- governed open-network edge (shouldn't occur: governance
+               requires closed) — owner still sees the summary. -->
+          <div class="gov-summary">{describeGoverned(governed)}</div>
+        {/if}
       {/if}
     </div>
 
@@ -668,6 +929,58 @@
     display: flex;
     gap: 0.4rem;
     flex-wrap: wrap;
+  }
+  .gov-badge {
+    font-size: 0.64rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #b8b8ff;
+    background: #1a1a2a;
+    border: 1px solid #4a4a85;
+    border-radius: 999px;
+    padding: 0.08rem 0.5rem;
+  }
+  .gov-summary {
+    font-size: 0.82rem;
+    color: #e8e8e8;
+    background: #0d0d12;
+    border: 1px solid #2a2a35;
+    border-radius: 5px;
+    padding: 0.45rem 0.6rem;
+    margin-bottom: 0.4rem;
+    line-height: 1.45;
+  }
+  .gov-cta {
+    margin-top: 0.7rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid #1e1e25;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    align-items: flex-start;
+  }
+  .hub-picker {
+    margin-top: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .hub-row code {
+    margin-left: 0.4rem;
+  }
+  input[type="number"] {
+    background: #0d0d12;
+    border: 1px solid #2a2a35;
+    color: #e8e8e8;
+    padding: 0.35rem 0.55rem;
+    border-radius: 5px;
+    font: inherit;
+    font-size: 0.82rem;
+    width: 8rem;
+  }
+  input[type="number"]:focus {
+    outline: none;
+    border-color: #4a4a85;
   }
   .topo-btn {
     padding: 0.3rem 0.7rem;
