@@ -104,6 +104,11 @@ pub struct PeerStateData {
     /// connection state. `None` only for the session-less peers some unit
     /// tests insert; set in `ensure_peer_session` when the session opens.
     pub session_started_at: Option<Instant>,
+    /// A media lane opened or closed on this session and the SDP no
+    /// longer matches — the media-renegotiation pass owes this peer one
+    /// in-place offer. Coalesced: any number of lane changes between
+    /// passes costs a single renegotiation.
+    pub media_reneg_pending: bool,
     /// True once this session's data channel has fired `on_open` — the one
     /// reliable "transport is up" signal (DTLS + SCTP genuinely
     /// established). The connect-timeout watchdog only reclaims a peer
@@ -174,6 +179,7 @@ impl Default for PeerStateData {
             clock_skew_ms: None,
             ice_disconnected_since: None,
             session_started_at: None,
+            media_reneg_pending: false,
             data_channel_open: false,
             handshake_started_at: None,
             hello_attempt: 0,

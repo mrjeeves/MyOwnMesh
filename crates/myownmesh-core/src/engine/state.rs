@@ -141,6 +141,22 @@ pub enum NetworkCmd {
         /// the fire-and-forget contract.
         reply: Option<oneshot::Sender<Result<()>>>,
     },
+    /// Open the lowest free media lane of `kind` toward `peer`,
+    /// resolving with the lane id. The explicit twin of the
+    /// write-time auto-open.
+    MediaLaneOpen {
+        peer: String,
+        kind: crate::transport::webrtc::LaneKind,
+        reply: oneshot::Sender<Result<u8>>,
+    },
+    /// Close an open media lane (idempotent) — the track is removed
+    /// and the next renegotiation drops its m-line send side.
+    MediaLaneClose {
+        peer: String,
+        kind: crate::transport::webrtc::LaneKind,
+        lane: u8,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Queue a channel frame for acknowledged delivery (see
     /// [`super::reliable`]): parked until the peer's link is up,
     /// retransmitted across session rebuilds, resolved on the peer's
@@ -1208,6 +1224,44 @@ impl NetworkState {
         let mut snap = self.traffic.snapshot();
         snap.reliable_pending = super::reliable::pending_total(self) as u64;
         snap
+    }
+
+    /// Open the lowest free media lane of `kind` toward `peer`.
+    pub async fn media_lane_open(
+        &self,
+        peer: &str,
+        kind: crate::transport::webrtc::LaneKind,
+    ) -> Result<u8> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(NetworkCmd::MediaLaneOpen {
+                peer: peer.to_string(),
+                kind,
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped the lane open".into()))?
+    }
+
+    /// Close a media lane toward `peer` (idempotent).
+    pub async fn media_lane_close(
+        &self,
+        peer: &str,
+        kind: crate::transport::webrtc::LaneKind,
+        lane: u8,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(NetworkCmd::MediaLaneClose {
+                peer: peer.to_string(),
+                kind,
+                lane,
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped the lane close".into()))?
     }
 
     /// Whether `device_id` has a standing dial (config pin or runtime

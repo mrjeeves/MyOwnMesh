@@ -163,6 +163,22 @@ impl Ticker for TopologyShapeTicker {
     }
 }
 
+/// Coalesced media renegotiation — one in-place offer per peer whose
+/// lane set changed since the last pass (see
+/// `engine::service_media_renegotiations`). No-op when no lanes moved.
+pub(crate) struct MediaRenegotiationTicker;
+
+#[async_trait]
+impl Ticker for MediaRenegotiationTicker {
+    fn name(&self) -> &'static str {
+        "media-renegotiation"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        super::service_media_renegotiations(state).await;
+    }
+}
+
 /// Acked-delivery maintenance — expires lapsed outbox entries (their
 /// callers get an error instead of silence) and re-attempts flushes for
 /// peers holding unsent frames after a transient send failure. The event
