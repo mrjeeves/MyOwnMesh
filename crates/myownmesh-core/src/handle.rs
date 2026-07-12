@@ -512,6 +512,31 @@ impl JoinedNetwork {
         }
     }
 
+    /// Open the lowest free media lane of `kind` toward `peer` and
+    /// return its id — the explicit reservation twin of the write-time
+    /// auto-open (writing to a closed lane opens it transparently).
+    /// The new m-line goes live on the next coalesced renegotiation;
+    /// writes before that are no-ops, exactly like stream start.
+    pub async fn open_media_lane(
+        &self,
+        peer: &str,
+        kind: crate::transport::webrtc::LaneKind,
+    ) -> Result<u8> {
+        self.state.media_lane_open(peer, kind).await
+    }
+
+    /// Close a media lane toward `peer`, releasing its track and (on
+    /// the next renegotiation) its m-line send side. Idempotent — a
+    /// lane that isn't open is a no-op, so teardown can't double-fault.
+    pub async fn close_media_lane(
+        &self,
+        peer: &str,
+        kind: crate::transport::webrtc::LaneKind,
+        lane: u8,
+    ) -> Result<()> {
+        self.state.media_lane_close(peer, kind, lane).await
+    }
+
     /// Point-in-time traffic accounting for this network: frames and
     /// bytes by class (keepalive / control / gossip / app), signaling
     /// publish and receive counts split into presence vs pairwise

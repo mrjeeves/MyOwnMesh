@@ -162,6 +162,23 @@ pub enum Request {
         #[serde(default)]
         wait_ms: u64,
     },
+    /// Open the lowest free media lane (`kind`: "video" | "audio")
+    /// toward a connected peer, returning `{ lane }`. Lanes also open
+    /// transparently on first write; this is the explicit reservation.
+    MediaLaneOpen {
+        network: String,
+        peer: String,
+        kind: String,
+    },
+    /// Close a media lane toward a peer (idempotent). The track is
+    /// removed and the next renegotiation drops its m-line send side —
+    /// media capacity is paid only while a session uses it.
+    MediaLaneClose {
+        network: String,
+        peer: String,
+        kind: String,
+        lane: u8,
+    },
     /// Snapshot which infrastructure services this device hosts
     /// (relay / signaling / STUN / TURN): live runtime status plus the
     /// persisted config. The GUI's Services settings section reads this
@@ -979,6 +996,44 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         } => {
             info!(%network, %peer, pin, wait_ms, "control: network_connect_peer");
             network_connect_peer(state, &network, &peer, pin, wait_ms).await
+        }
+
+        Request::MediaLaneOpen {
+            network,
+            peer,
+            kind,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let Some(kind) = parse_lane_kind(&kind) else {
+                return Response::err(format!(
+                    "unknown lane kind '{kind}' — expected video | audio"
+                ));
+            };
+            match net.open_media_lane(&peer, kind).await {
+                Ok(lane) => Response::ok(serde_json::json!({ "lane": lane })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::MediaLaneClose {
+            network,
+            peer,
+            kind,
+            lane,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let Some(kind) = parse_lane_kind(&kind) else {
+                return Response::err(format!(
+                    "unknown lane kind '{kind}' — expected video | audio"
+                ));
+            };
+            match net.close_media_lane(&peer, kind, lane).await {
+                Ok(()) => Response::ok(serde_json::json!({ "closed": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
         }
 
         // ---- self-update ----
@@ -1962,6 +2017,16 @@ fn persist_network_update(net: &NetworkConfig) -> Result<()> {
     }
     cfg.save().map_err(anyhow::Error::msg)?;
     Ok(())
+}
+
+/// Map the wire's lane-kind string onto the transport enum.
+fn parse_lane_kind(kind: &str) -> Option<myownmesh_core::transport::webrtc::LaneKind> {
+    use myownmesh_core::transport::webrtc::LaneKind;
+    match kind {
+        "video" => Some(LaneKind::Video),
+        "audio" => Some(LaneKind::Audio),
+        _ => None,
+    }
 }
 
 fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<TopologyMode, String> {

@@ -114,6 +114,11 @@ pub enum TransportEvent {
     Message(Bytes),
     /// Data channel closed (peer initiated or local error).
     DataChannelClosed,
+    /// The local track set changed (a media lane opened or closed) and
+    /// the SDP no longer matches — the engine should renegotiate in
+    /// place (fresh offer, same DTLS fingerprint). Coalesced by the
+    /// engine per peer, so a burst of lane changes costs one offer.
+    RenegotiationNeeded,
     /// One assembled access unit from the peer's video track lane.
     VideoSample(VideoSample),
     /// One encoded audio frame from the peer's audio track lane.
@@ -146,60 +151,51 @@ pub struct AudioSample {
     pub data: Bytes,
 }
 
-/// How many independent media lanes (RTP tracks) every peer connection
-/// provisions, for video and for audio alike. One track per lane is added
-/// up front — both roles add them before SDP runs, so a single offer/answer
-/// negotiates them all and no renegotiation path need exist — so a peer can
-/// carry several simultaneous streams (e.g. two screens of one machine, each
-/// crisp H.264) without them sharing, and so interleaving, a single lane. An
-/// idle lane costs nothing: no samples written, no RTP sent. Lane 0 is the
-/// original single lane: a peer that predates the pool negotiates only it,
-/// and everything still works on lane 0.
+/// Ceiling on independent media lanes (RTP tracks) a peer connection
+/// may hold per kind, video and audio alike. Lanes are **not**
+/// provisioned up front: a fresh connection carries exactly
+/// [`PRE_PROVISIONED_LANES`] (lane 0 — the original single lane, so a
+/// pre-lifecycle peer negotiates just it and everything still works),
+/// and lanes 1+ come into being on demand — an explicit
+/// `open_*_lane`, or transparently on the first write to a lane that
+/// doesn't exist yet. Each open adds one track (id `video-N` /
+/// `audio-N`) and renegotiates in place; a close removes the track
+/// and renegotiates again, so media capacity is paid only while a
+/// session actually uses it.
 ///
-/// This is the DEFAULT and the ceiling. The per-connection count is resolved
-/// at [`Transport::new`] from `MYOWNMESH_MEDIA_LANES` (see [`resolve_media_lanes`]):
-/// a device that never streams media over the mesh — e.g. the NanoKVM, whose
-/// video rides its tunnelled web UI, not a mesh track — sets it to 1 (or 0) so
-/// each peer connection negotiates 2 media m-lines instead of 16. On a single,
-/// slow core (the Sophgo SG2002's lone in-order C906) the 16-m-line
-/// offer/answer + 16× SRTP/track setup is the dominant per-connect cost, and it
-/// measurably pushes a connect's completion past
-/// [`super::super::engine::scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS`], so the
-/// attempt is torn down and rebuilt before its data channel ever opens — a
-/// permanent connect/rebuild churn that pegs the core and starves the control
-/// socket. Fewer lanes let the data channel (all a data-only appliance needs)
-/// open well inside the timeout.
+/// `MYOWNMESH_MEDIA_LANES` still caps the ceiling per device (clamped
+/// to `1..=MEDIA_LANES`): a data-only appliance sets `1` and no lane
+/// beyond 0 can ever be opened toward it locally, exactly as before —
+/// except the SDP no longer hauls idle m-lines for anyone.
 pub const MEDIA_LANES: usize = 8;
 
-/// Per-connection media-lane count, resolved once at transport construction.
-/// `MYOWNMESH_MEDIA_LANES` overrides the [`MEDIA_LANES`] default; it's clamped
-/// to `0..=MEDIA_LANES` so track-id parsing (capped at [`MEDIA_LANES`]) stays
-/// valid and a typo can't request an unbounded track pool. 0 is data-channel
-/// only (no media m-lines at all).
+/// Lanes created at connection setup, before any media flows: lane 0
+/// only. Everything else is lifecycle-managed (see [`MEDIA_LANES`]).
+pub const PRE_PROVISIONED_LANES: usize = 1;
+
+/// Per-device media-lane ceiling, resolved once at transport
+/// construction. `MYOWNMESH_MEDIA_LANES` overrides the [`MEDIA_LANES`]
+/// default; clamped to `1..=MEDIA_LANES` so track-id parsing (capped at
+/// [`MEDIA_LANES`]) stays coherent and lane 0 always exists.
 fn resolve_media_lanes() -> usize {
     match std::env::var("MYOWNMESH_MEDIA_LANES") {
         Ok(v) => match v.trim().parse::<usize>() {
-            Ok(n) => n.min(MEDIA_LANES),
+            Ok(n) => n.clamp(1, MEDIA_LANES),
             Err(_) => MEDIA_LANES,
         },
         Err(_) => MEDIA_LANES,
     }
 }
 
-/// The process-wide resolved lane count — what every new [`Transport`]
-/// actually provisions per peer connection. Public so the control plane's
-/// `status` reports the provisioned count rather than the compile-time
-/// ceiling: a client sizing its simultaneous streams to `media_lanes: 8`
-/// while the device provisions 1 gets per-frame "no video lane N" failures
-/// on lanes it was promised.
+/// The process-wide resolved lane ceiling — how many simultaneous
+/// lanes a client may hold toward one peer on this device. Public so
+/// the control plane's Status can report it: apps size their
+/// concurrent streams to this. (Lanes open on demand up to it; nothing
+/// is pre-provisioned beyond lane 0.)
 pub fn resolved_media_lanes() -> usize {
     resolve_media_lanes()
 }
 
-/// The lane a track id encodes (`"video-3"` → 3). A bare `"video"` /
-/// `"audio"` id — a peer from before the lane pool — is lane 0. Parsing is
-/// capped at the [`MEDIA_LANES`] ceiling (not the local per-connection count),
-/// so a peer that provisioned more lanes than we did is still routed correctly.
 fn lane_of_track_id(id: &str) -> u8 {
     id.rsplit_once('-')
         .and_then(|(_, n)| n.parse::<u8>().ok())
@@ -359,56 +355,24 @@ impl Transport {
 
         register_callbacks(&pc, &events_tx, &data_channel);
 
-        // A pool of H.264 video lanes and Opus audio lanes, provisioned on
-        // **every** connection at setup — both roles add the local tracks
-        // before SDP runs, so the one offer/answer negotiates every
-        // sendrecv m-line once and for all, and no renegotiation path needs
-        // to exist anywhere. Each lane is a distinct track whose id carries
-        // its index (`video-0`…, `audio-0`…), so the far side knows which
-        // lane a sample arrived on and several streams to one peer never
-        // share — and so interleave on — a single track. An idle lane costs
-        // nothing: no samples written, no RTP sent. Lane 0 is the original
-        // single lane, so a peer that predates the pool negotiates just it.
-        let mut video_tracks = Vec::with_capacity(self.media_lanes);
-        let mut audio_tracks = Vec::with_capacity(self.media_lanes);
-        for lane in 0..self.media_lanes {
-            let video_track = Arc::new(TrackLocalStaticSample::new(
-                RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_owned(),
-                    ..Default::default()
-                },
-                format!("video-{lane}"),
-                "myownmesh".to_string(),
-            ));
-            let rtp_sender = pc
-                .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
-                .await
-                .map_err(|e| Error::Transport(format!("add_track (video lane {lane}): {e}")))?;
-            // Drain the sender's RTCP so its interceptors (NACK responder,
-            // reports) actually run; the task ends with the connection.
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 1500];
-                while rtp_sender.read(&mut buf).await.is_ok() {}
-            });
-            video_tracks.push(video_track);
-
-            let audio_track = Arc::new(TrackLocalStaticSample::new(
-                RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_OPUS.to_owned(),
-                    ..Default::default()
-                },
-                format!("audio-{lane}"),
-                "myownmesh".to_string(),
-            ));
-            let audio_sender = pc
-                .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal + Send + Sync>)
-                .await
-                .map_err(|e| Error::Transport(format!("add_track (audio lane {lane}): {e}")))?;
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 1500];
-                while audio_sender.read(&mut buf).await.is_ok() {}
-            });
-            audio_tracks.push(audio_track);
+        // Media lanes are lifecycle-managed: only lane 0 exists at
+        // setup (the original single lane, so pre-lifecycle peers
+        // negotiate exactly what they always did), and lanes 1+ are
+        // added on demand — an explicit open, or the first write to a
+        // lane that doesn't exist yet — with an in-place renegotiation
+        // carrying the new m-line. Slots are pre-sized to the device
+        // ceiling so a lane index is stable for the session's life.
+        let mut video_tracks: Vec<Option<Arc<TrackLocalStaticSample>>> =
+            vec![None; self.media_lanes];
+        let mut audio_tracks: Vec<Option<Arc<TrackLocalStaticSample>>> =
+            vec![None; self.media_lanes];
+        for lane in 0..PRE_PROVISIONED_LANES.min(self.media_lanes) {
+            let video_track = make_media_track(LaneKind::Video, lane as u8);
+            attach_track(&pc, &video_track).await?;
+            video_tracks[lane] = Some(video_track);
+            let audio_track = make_media_track(LaneKind::Audio, lane as u8);
+            attach_track(&pc, &audio_track).await?;
+            audio_tracks[lane] = Some(audio_track);
         }
 
         // Offerer creates the data channel synchronously so the
@@ -434,14 +398,57 @@ impl Transport {
             PeerSession {
                 pc,
                 data_channel,
-                video_tracks,
-                audio_tracks,
+                video_tracks: std::sync::Mutex::new(video_tracks),
+                audio_tracks: std::sync::Mutex::new(audio_tracks),
+                max_lanes: self.media_lanes,
                 events_tx,
                 role,
             },
             events_rx,
         ))
     }
+}
+
+/// Which media pool a lane belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneKind {
+    Video,
+    Audio,
+}
+
+/// Build the local track for one lane. The id carries the lane index
+/// (`video-3`) — that's how the far side routes inbound samples.
+fn make_media_track(kind: LaneKind, lane: u8) -> Arc<TrackLocalStaticSample> {
+    let (mime, prefix) = match kind {
+        LaneKind::Video => (MIME_TYPE_H264, "video"),
+        LaneKind::Audio => (MIME_TYPE_OPUS, "audio"),
+    };
+    Arc::new(TrackLocalStaticSample::new(
+        RTCRtpCodecCapability {
+            mime_type: mime.to_owned(),
+            ..Default::default()
+        },
+        format!("{prefix}-{lane}"),
+        "myownmesh".to_string(),
+    ))
+}
+
+/// Attach a local track to the connection and drain its sender's RTCP
+/// so the interceptors (NACK responder, reports) actually run; the
+/// drain task ends with the connection.
+async fn attach_track(
+    pc: &Arc<RTCPeerConnection>,
+    track: &Arc<TrackLocalStaticSample>,
+) -> Result<()> {
+    let sender = pc
+        .add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await
+        .map_err(|e| Error::Transport(format!("add_track ({}): {e}", track.id())))?;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        while sender.read(&mut buf).await.is_ok() {}
+    });
+    Ok(())
 }
 
 fn register_callbacks(
@@ -942,8 +949,14 @@ pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-    video_tracks: Vec<Arc<TrackLocalStaticSample>>,
-    audio_tracks: Vec<Arc<TrackLocalStaticSample>>,
+    /// Lifecycle-managed lane slots, index = lane id. `None` = lane not
+    /// open. Slot count is fixed at [`PeerSession::max_lanes`] so ids
+    /// stay stable; a std Mutex because holders only clone the Arc out
+    /// (never held across an await).
+    video_tracks: std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>>,
+    audio_tracks: std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>>,
+    /// Device lane ceiling (see [`resolve_media_lanes`]).
+    max_lanes: usize,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
     role: Role,
 }
@@ -1080,10 +1093,7 @@ impl PeerSession {
         data: Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let track = self
-            .video_tracks
-            .get(lane as usize)
-            .ok_or_else(|| Error::Transport(format!("no video lane {lane}")))?;
+        let track = self.ensure_lane(LaneKind::Video, lane).await?;
         track
             .write_sample(&Sample {
                 data,
@@ -1104,10 +1114,7 @@ impl PeerSession {
         data: Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let track = self
-            .audio_tracks
-            .get(lane as usize)
-            .ok_or_else(|| Error::Transport(format!("no audio lane {lane}")))?;
+        let track = self.ensure_lane(LaneKind::Audio, lane).await?;
         track
             .write_sample(&Sample {
                 data,
@@ -1116,6 +1123,112 @@ impl PeerSession {
             })
             .await
             .map_err(|e| Error::Transport(format!("audio write_sample (lane {lane}): {e}")))
+    }
+
+    fn pool(&self, kind: LaneKind) -> &std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>> {
+        match kind {
+            LaneKind::Video => &self.video_tracks,
+            LaneKind::Audio => &self.audio_tracks,
+        }
+    }
+
+    /// The lane's track, opening it on demand: the first write to a
+    /// lane that doesn't exist yet creates the track, attaches it, and
+    /// flags a renegotiation — writes are no-ops until the new m-line
+    /// negotiates, exactly the semantics callers already tolerate at
+    /// stream start. A lane at or past the device ceiling errors.
+    async fn ensure_lane(&self, kind: LaneKind, lane: u8) -> Result<Arc<TrackLocalStaticSample>> {
+        if lane as usize >= self.max_lanes {
+            let k = if kind == LaneKind::Video {
+                "video"
+            } else {
+                "audio"
+            };
+            return Err(Error::Transport(format!("no {k} lane {lane}")));
+        }
+        if let Some(track) = self.pool(kind).lock().expect("lane pool")[lane as usize].clone() {
+            return Ok(track);
+        }
+        let track = make_media_track(kind, lane);
+        attach_track(&self.pc, &track).await?;
+        // First writer wins if two racers opened the same lane; the
+        // loser's track was attached too, but the slot's track is the
+        // one everyone writes — the duplicate is harmless and gone on
+        // the next renegotiation sweep. (In practice lane opens are
+        // serialized by the engine driver.)
+        let stored = {
+            let mut pool = self.pool(kind).lock().expect("lane pool");
+            if pool[lane as usize].is_none() {
+                pool[lane as usize] = Some(track.clone());
+                track
+            } else {
+                pool[lane as usize].clone().expect("just checked")
+            }
+        };
+        let _ = self.events_tx.send(TransportEvent::RenegotiationNeeded);
+        Ok(stored)
+    }
+
+    /// Open the lowest free lane of `kind`, returning its id. The
+    /// explicit twin of the write-time auto-open, for callers that
+    /// want to reserve a lane before producing media.
+    pub async fn open_media_lane(&self, kind: LaneKind) -> Result<u8> {
+        let free = {
+            let pool = self.pool(kind).lock().expect("lane pool");
+            pool.iter().position(|slot| slot.is_none())
+        };
+        let Some(lane) = free else {
+            return Err(Error::Transport(format!(
+                "all {} media lanes are open (device ceiling)",
+                self.max_lanes
+            )));
+        };
+        self.ensure_lane(kind, lane as u8).await?;
+        Ok(lane as u8)
+    }
+
+    /// Close an open lane: remove its track from the connection (the
+    /// next renegotiation drops the m-line's send side) and free the
+    /// slot for reuse. Closing a lane that isn't open is a no-op —
+    /// idempotent by design, so teardown paths can't double-fault.
+    pub async fn close_media_lane(&self, kind: LaneKind, lane: u8) -> Result<()> {
+        if lane as usize >= self.max_lanes {
+            return Ok(());
+        }
+        let track = {
+            let mut pool = self.pool(kind).lock().expect("lane pool");
+            pool[lane as usize].take()
+        };
+        let Some(track) = track else {
+            return Ok(());
+        };
+        let track_id = track.id().to_string();
+        for sender in self.pc.get_senders().await {
+            let matches = sender
+                .track()
+                .await
+                .map(|t| t.id() == track_id)
+                .unwrap_or(false);
+            if matches {
+                self.pc
+                    .remove_track(&sender)
+                    .await
+                    .map_err(|e| Error::Transport(format!("remove_track ({track_id}): {e}")))?;
+            }
+        }
+        let _ = self.events_tx.send(TransportEvent::RenegotiationNeeded);
+        Ok(())
+    }
+
+    /// How many lanes of `kind` are currently open — surfaced in
+    /// status so an operator can see media capacity in use.
+    pub fn open_lane_count(&self, kind: LaneKind) -> usize {
+        self.pool(kind)
+            .lock()
+            .expect("lane pool")
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
     }
 
     /// Force ICE restart. Used by the engine's Tier 2.5 / Tier 3
@@ -1757,6 +1870,20 @@ mod tests {
             .await
             .expect("answerer");
 
+        // Lifecycle era: lane 3 doesn't exist until someone asks for
+        // it. Prime it with one pre-negotiation write — the write
+        // no-ops, but the auto-open attaches the track so the initial
+        // offer negotiates it (the engine-driven path renegotiates
+        // in place instead; transport tests have no engine).
+        offerer
+            .send_video(
+                3,
+                Bytes::from_static(b"\x00"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect("prime video lane 3");
+
         let offer = offerer.create_offer().await.expect("create_offer");
         answerer
             .set_remote_description(offer)
@@ -1837,6 +1964,20 @@ mod tests {
             .await
             .expect("answerer");
 
+        // Lifecycle era: lane 5 doesn't exist until someone asks for
+        // it. Prime it with one pre-negotiation write — the write
+        // no-ops, but the auto-open attaches the track so the initial
+        // offer negotiates it (the engine-driven path renegotiates
+        // in place instead; transport tests have no engine).
+        offerer
+            .send_audio(
+                5,
+                Bytes::from_static(b"\x00"),
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .expect("prime audio lane 5");
+
         let offer = offerer.create_offer().await.expect("create_offer");
         answerer
             .set_remote_description(offer)
@@ -1895,5 +2036,94 @@ mod tests {
 
         offerer.close().await.expect("close offerer");
         answerer.close().await.expect("close answerer");
+    }
+
+    #[tokio::test]
+    async fn lanes_are_lifecycle_managed_not_pre_pooled() {
+        let transport = Transport::new().expect("transport");
+        let (session, mut events) = transport
+            .open_peer(Role::Offerer, &[], &[])
+            .await
+            .expect("open");
+
+        // Setup provisions lane 0 only — no 8-lane SDP tax.
+        assert_eq!(
+            session.open_lane_count(LaneKind::Video),
+            PRE_PROVISIONED_LANES
+        );
+        assert_eq!(
+            session.open_lane_count(LaneKind::Audio),
+            PRE_PROVISIONED_LANES
+        );
+
+        // First write to a closed lane opens it transparently and flags
+        // a renegotiation; the write itself is a pre-negotiation no-op.
+        session
+            .send_video(
+                3,
+                Bytes::from_static(b"x"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect("auto-open write");
+        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
+        let mut saw_reneg = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, TransportEvent::RenegotiationNeeded) {
+                saw_reneg = true;
+            }
+        }
+        assert!(saw_reneg, "lane open must flag a renegotiation");
+
+        // A second write to the same lane is quiet — no new flag.
+        session
+            .send_video(
+                3,
+                Bytes::from_static(b"y"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect("write on open lane");
+        assert!(
+            events.try_recv().is_err(),
+            "an already-open lane never re-flags"
+        );
+
+        // Explicit open takes the lowest free slot (1: 0 is pre-opened,
+        // 3 is auto-opened).
+        let lane = session
+            .open_media_lane(LaneKind::Video)
+            .await
+            .expect("explicit open");
+        assert_eq!(lane, 1);
+
+        // Close frees the slot for reuse and is idempotent.
+        session
+            .close_media_lane(LaneKind::Video, 3)
+            .await
+            .expect("close");
+        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
+        session
+            .close_media_lane(LaneKind::Video, 3)
+            .await
+            .expect("double close is a no-op");
+        let lane = session
+            .open_media_lane(LaneKind::Video)
+            .await
+            .expect("reopen");
+        assert_eq!(lane, 2, "explicit open always takes the lowest free slot");
+
+        // The device ceiling still errors rather than mis-routing.
+        let err = session
+            .send_video(
+                MEDIA_LANES as u8,
+                Bytes::from_static(b"z"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect_err("past-ceiling lane must error");
+        assert!(err.to_string().contains("no video lane"));
+
+        session.close().await.expect("close");
     }
 }

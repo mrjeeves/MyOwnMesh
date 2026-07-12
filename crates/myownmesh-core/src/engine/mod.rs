@@ -163,7 +163,8 @@ pub async fn run_driver(
         .register(tick::NetworkWatchTicker::new().await)
         .register(tick::ReconnectSupervisor)
         .register(tick::ReliableSendTicker)
-        .register(tick::TopologyShapeTicker);
+        .register(tick::TopologyShapeTicker)
+        .register(tick::MediaRenegotiationTicker);
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "engine",
@@ -277,6 +278,33 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             sticky,
             reply,
         } => connect_peer(state, &device_id, sticky, reply).await,
+        NetworkCmd::MediaLaneOpen { peer, kind, reply } => {
+            let session = state
+                .peers
+                .get(&peer)
+                .and_then(|p| p.session.lock().clone());
+            let result = match session {
+                Some(s) => s.open_media_lane(kind).await,
+                None => Err(Error::Network(format!("peer not connected: {peer}"))),
+            };
+            let _ = reply.send(result);
+        }
+        NetworkCmd::MediaLaneClose {
+            peer,
+            kind,
+            lane,
+            reply,
+        } => {
+            let session = state
+                .peers
+                .get(&peer)
+                .and_then(|p| p.session.lock().clone());
+            let result = match session {
+                Some(s) => s.close_media_lane(kind, lane).await,
+                None => Ok(()), // no session, nothing open — close is idempotent
+            };
+            let _ = reply.send(result);
+        }
         NetworkCmd::SendChannelReliable {
             peer,
             channel,
@@ -840,6 +868,61 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     }
     maybe_reactive_announce(state);
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
+}
+
+/// Perform the coalesced in-place media renegotiations the transport
+/// flagged: one fresh offer per peer whose lane set changed, same DTLS
+/// fingerprint, so the remote's existing offer path renegotiates in
+/// place (never a rebuild). Runs on the state-watch tick; the flag is
+/// cleared only when the offer actually left, so a transient send
+/// failure retries next pass.
+pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
+    if state.is_offline() {
+        return;
+    }
+    let pending: Vec<String> = state
+        .peers
+        .iter()
+        .filter(|e| {
+            let d = e.value().state.read();
+            d.media_reneg_pending
+                && d.data_channel_open
+                && matches!(d.status, PeerStatus::Active | PeerStatus::Shelved)
+        })
+        .map(|e| e.key().clone())
+        .collect();
+    for device_id in pending {
+        let session = state
+            .peers
+            .get(&device_id)
+            .and_then(|p| p.session.lock().clone());
+        let Some(session) = session else { continue };
+        match session.create_offer().await {
+            Ok(desc) => {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Debug,
+                    "media",
+                    format!(
+                        "media renegotiation offer to {} (lane set changed)",
+                        short_peer(&device_id)
+                    ),
+                    serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
+                );
+                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                    device_id: device_id.clone(),
+                    sdp: desc.sdp,
+                });
+                if let Some(peer) = state.peers.get(&device_id) {
+                    let mut data = peer.state.write();
+                    data.media_reneg_pending = false;
+                    data.last_offer_sent_at = Some(Instant::now());
+                }
+            }
+            Err(e) => {
+                warn!(peer = %device_id, "media renegotiation create_offer failed (will retry): {e}");
+            }
+        }
+    }
 }
 
 /// The state-watch tick's backstop for offerer-side reconnects. Events
@@ -1499,6 +1582,15 @@ async fn handle_transport_event(
         }
     }
     match event {
+        TransportEvent::RenegotiationNeeded => {
+            // A lane opened/closed. Don't offer inline — a burst of lane
+            // changes (a screen share starting video + audio together)
+            // must collapse into one offer, and glare with the remote's
+            // own changes is least likely on the paced tick.
+            if let Some(peer) = state.peers.get(&device_id) {
+                peer.state.write().media_reneg_pending = true;
+            }
+        }
         TransportEvent::LocalIceCandidate(Some(cand)) => {
             // Classify before moving `cand` into the signaling
             // message so the no-TURN diagnostic
