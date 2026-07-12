@@ -37,7 +37,7 @@
   // ---- editable draft (seeded once per network) -----------------------
 
   let labelDraft = $state("");
-  let topology = $state<"ring" | "star" | "full_mesh">("ring");
+  let topology = $state<"ring" | "star" | "full_mesh">("full_mesh");
   let starHub = $state("");
   let signalingDraft = $state<string[]>([]);
   let stunDraft = $state<string[]>([]);
@@ -83,7 +83,7 @@
       topology = cfg.topology.kind === "full_mesh" ? "full_mesh" : cfg.topology.kind;
       if (cfg.topology.kind === "star") starHub = cfg.topology.hub;
     } else {
-      topology = "ring";
+      topology = "full_mesh";
     }
     signalingDraft = cfg.signaling?.servers ?? [];
     stunDraft = (cfg.stun_servers ?? []).flatMap((s) => s.urls);

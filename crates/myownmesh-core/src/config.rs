@@ -19,19 +19,21 @@ use crate::identity::DeviceId;
 /// config, the daemon, and the relay all share one shape.
 pub use myownmesh_signaling::server::Limits as SignalingLimits;
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Topology selector for a single network. Wire-form matches the
 /// JSON-tagged shape; embedders construct these directly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TopologyMode {
-    /// Default. Auto-healing ring with `n_preferred` neighbors (2
-    /// immediate + (n-2) shortcuts). Missing/null `n_preferred`
-    /// defaults to 3. Under connection-shaping (see
-    /// [`crate::topology::Topology::edge`]) each node dials only the
-    /// union of the two sides' preferred sets, and broadcasts flood
-    /// hop-by-hop around the ring.
+    /// A *shaped* auto-healing ring with `n_preferred` neighbors (2
+    /// immediate + (n-2) shortcuts; missing/null defaults to 3): each
+    /// node dials only the union of the two sides' preferred sets,
+    /// both-sides-shelved non-edges are closed, and broadcasts flood
+    /// hop-by-hop with per-node dedup (see
+    /// [`crate::topology::Topology::edge`]). This shapes the
+    /// signaling/control fabric only — a media session dials its pair
+    /// directly, on demand, regardless of mode.
     Ring {
         #[serde(default)]
         n_preferred: Option<u32>,
@@ -56,14 +58,18 @@ pub enum TopologyMode {
         #[serde(default)]
         spoke_redundancy: Option<u32>,
     },
-    /// Full mesh — every peer keeps every other peer active. N² cost;
-    /// only useful for small fixed-size deployments.
+    /// Full mesh — every pair connects and stays connected. The
+    /// default, and the truthful name for what every pre-0.2.34
+    /// network ran (the old "ring" only shelved app frames; it never
+    /// shaped connections). N² cost — fine for small fleets; pick
+    /// [`TopologyMode::Ring`] or [`TopologyMode::Hubs`] deliberately
+    /// when a network outgrows it.
     FullMesh,
 }
 
 impl Default for TopologyMode {
     fn default() -> Self {
-        TopologyMode::Ring { n_preferred: None }
+        TopologyMode::FullMesh
     }
 }
 
@@ -600,6 +606,24 @@ impl Default for MeshConfig {
     }
 }
 
+/// Forward-migrate an older on-disk config to the current shape.
+/// v1 → v2: `Ring` becomes [`TopologyMode::FullMesh`]. The v1 "ring"
+/// never shaped connections — it only shelved app frames, so every v1
+/// network genuinely ran a full mesh; from v2, `Ring` names the real
+/// shaped ring, and a network only runs it by choosing it. Idempotent,
+/// and a no-op for configs already at the current version.
+fn migrate(mut cfg: MeshConfig) -> MeshConfig {
+    if cfg.version < 2 {
+        for net in &mut cfg.networks {
+            if matches!(net.topology, TopologyMode::Ring { .. }) {
+                net.topology = TopologyMode::FullMesh;
+            }
+        }
+        cfg.version = 2;
+    }
+    cfg
+}
+
 impl MeshConfig {
     /// Load the config from the default location. Missing file
     /// returns [`MeshConfig::default`] — embedders should call
@@ -632,17 +656,20 @@ impl MeshConfig {
                 return Ok(Self::default());
             }
         };
-        if cfg.version != CONFIG_VERSION {
+        if cfg.version > CONFIG_VERSION {
             return Err(Error::Config(format!(
-                "config version {} unsupported (this build expects v{})",
+                "config version {} is from a newer build (this one expects v{})",
                 cfg.version, CONFIG_VERSION
             )));
         }
-        Ok(cfg)
+        Ok(migrate(cfg))
     }
 
     /// Persist to the default location. Pretty-printed JSON for
     /// easy hand-editing; the file isn't on a hot path.
+    ///
+    /// (Migrations live in [`migrate`], applied on every load; the
+    /// next save writes the migrated shape at [`CONFIG_VERSION`].)
     pub fn save(&self) -> Result<()> {
         let path = crate::dirs::config_path()?;
         let parent = path.parent().ok_or_else(|| {
@@ -680,12 +707,40 @@ mod tests {
     }
 
     #[test]
-    fn topology_default_is_ring() {
-        let t = TopologyMode::default();
-        match t {
-            TopologyMode::Ring { n_preferred } => assert!(n_preferred.is_none()),
-            _ => panic!("default topology should be ring"),
-        }
+    fn topology_default_is_full_mesh() {
+        // The truthful default: pre-0.2.34 networks all ran a full
+        // mesh (the old "ring" only shelved frames). `Ring` now names
+        // the shaped ring and is only ever chosen deliberately.
+        assert_eq!(TopologyMode::default(), TopologyMode::FullMesh);
+    }
+
+    #[test]
+    fn v1_config_ring_migrates_to_full_mesh() {
+        let mut cfg = MeshConfig::default();
+        cfg.version = 1;
+        let mut net = NetworkConfig::from_network_id("n1", "net-one");
+        net.topology = TopologyMode::Ring { n_preferred: None };
+        cfg.networks.push(net);
+        let mut chosen = NetworkConfig::from_network_id("n2", "net-two");
+        chosen.topology = TopologyMode::Star {
+            hub: "hub-id".into(),
+        };
+        cfg.networks.push(chosen);
+
+        let migrated = migrate(cfg);
+        assert_eq!(migrated.version, CONFIG_VERSION);
+        assert_eq!(
+            migrated.networks[0].topology,
+            TopologyMode::FullMesh,
+            "a v1 ring was a full mesh in practice — load it as one"
+        );
+        assert!(
+            matches!(migrated.networks[1].topology, TopologyMode::Star { .. }),
+            "deliberately-chosen modes migrate untouched"
+        );
+        // Idempotent: running the migration again changes nothing.
+        let again = migrate(migrated.clone());
+        assert_eq!(again, migrated);
     }
 
     #[test]
