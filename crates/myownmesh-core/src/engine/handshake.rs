@@ -298,6 +298,18 @@ pub async fn on_auth_response(
     }
 
     // Authentication succeeded.
+    //
+    // Before ANY admission path runs, the signed-eviction gate: a device
+    // this network's governance has evicted is denied here — with the
+    // signed log attached as proof so it can verify its own removal and
+    // stand down. Without this gate an evicted device that missed the
+    // news redialed forever and the flow below RESURRECTED it: pending-
+    // approval nudges at best, and on an auto-approve network (every
+    // fleet mesh) auto-approve → mutual ACTIVE → `approve_roster` put it
+    // straight back into the roster and gossiped it fleet-wide.
+    if super::governance::deny_if_evicted(state, device_id).await {
+        return;
+    }
     let (auto_approve, rostered, caps) = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
@@ -435,6 +447,17 @@ pub async fn on_deny(state: &Arc<NetworkState>, device_id: &str, deny: DenyMessa
         format!("peer denied us: {device_id} (reason: {:?})", deny.reason),
         serde_json::json!({ "peer": device_id, "reason": format!("{:?}", deny.reason) }),
     );
+    // An eviction denial carries the network's signed logs as proof.
+    // Nothing about the DENIER is trusted: the logs go through the same
+    // strict-extension verification every adoption takes, so a forged or
+    // foreign log changes nothing — but a genuine one finally teaches a
+    // device that was evicted while offline that it is out, flipping it
+    // to stood-down (and letting the embedding app clear its fleet
+    // state) instead of redialing into denials forever.
+    if !deny.transitions.is_empty() || !deny.member_log.is_empty() {
+        super::governance::adopt_deny_proof(state, device_id, &deny.transitions, &deny.member_log)
+            .await;
+    }
     super::drop_peer(state, device_id, DropReason::Denied).await;
 }
 

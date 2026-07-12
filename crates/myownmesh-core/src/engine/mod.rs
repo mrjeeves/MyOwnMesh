@@ -114,6 +114,12 @@ pub async fn run_driver(
     mut cmd_rx: mpsc::UnboundedReceiver<NetworkCmd>,
 ) {
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
+    // Settle the signed-eviction verdict from the persisted governance
+    // state before anything announces or dials: a device evicted in a
+    // previous run must come up stood-down (and re-emit the event so an
+    // embedding app that missed it can clean up), not spend another
+    // session redialing into denials.
+    governance::refresh_self_evicted(&state);
     // Surface the ICE-server configuration so users can confirm at
     // a glance whether they have any relay coverage. Mirrors
     // MyOwnLLM's pattern: when peers get stuck at ICE-checking with
@@ -425,6 +431,19 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
         .record_signaling_rx(matches!(sig, SignalingInbound::PeerAnnounced { .. }));
     match sig {
         SignalingInbound::PeerAnnounced { device_id } => {
+            // A stood-down engine (this device is signed-evicted from the
+            // network) ignores the mesh entirely: no reflect, no dial —
+            // every member would deny us anyway, with proof.
+            //
+            // Deliberately NO symmetric gate for announces FROM an
+            // evicted device: a session with it is the only channel the
+            // eviction proof can travel down. One handshake → one deny
+            // carrying the signed log → the device flips to stood-down
+            // and stops announcing — the mesh converges to silence in a
+            // single round trip, which no amount of ignoring achieves.
+            if state.self_evicted.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             // Whoever holds the lex-lower id initiates so we don't
             // glare on simultaneous discovery. Symmetric across
             // peers because base32 ids sort the same on both ends.

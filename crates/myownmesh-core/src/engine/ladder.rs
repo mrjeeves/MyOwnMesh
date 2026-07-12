@@ -72,6 +72,11 @@ impl Default for ConnectionTier {
 /// Re-run the topology selector and apply any preferred-set diff
 /// as shelve / unshelve frames.
 pub async fn reevaluate_topology(state: &Arc<NetworkState>) {
+    // A stood-down engine (signed-evicted from this network) plans no
+    // links: peers are dropping us and every dial would be denied.
+    if state.self_evicted.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let me = state.identity.public_id().to_string();
     let active_peers: Vec<String> = state
         .peers

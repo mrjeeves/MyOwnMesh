@@ -865,6 +865,146 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
     adopt_transition_log(state, peer_id, &msg.transitions, &msg.member_log).await;
 }
 
+// ---- eviction enforcement -------------------------------------------
+//
+// The signed log is a closed network's tombstone: an `Evict` in the
+// member tier is the durable, verifiable "this device is OUT." What was
+// missing was ENFORCEMENT at the boundary — an evicted device that never
+// heard the news (offline during the evict) redialed forever, and the
+// handshake treated it as a fresh face: pending-approval nudges at best,
+// and on an auto-approve network (every fleet mesh) it was re-approved,
+// re-rostered on mutual ACTIVE, and re-gossiped — resurrection on a loop.
+// The three pieces below close that loop: the verdict helpers, the
+// deny-with-proof at the handshake, and the self-evicted quiescence.
+
+/// Whether `device_id`'s pubkey is explicitly evicted by this network's
+/// signed state. Only meaningful on closed governance (open networks
+/// have no signed membership); false there. The verdict is the same
+/// [`network_state::member_log_removed`] the roster mirror prunes by,
+/// with a guard: a pubkey the governance log currently seats as
+/// owner/controller is never "evicted" (a stale member-tier entry can't
+/// outrank the governance tier).
+pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
+    let pubkey = pk(device_id);
+    let gov = state.governance_state.read();
+    if gov.kind.is_open_governance() {
+        return false;
+    }
+    if matches!(
+        gov.roles.get(&pubkey),
+        Some(Role::Owner) | Some(Role::Controller)
+    ) {
+        return false;
+    }
+    network_state::member_log_removed(&gov, &gov.member_log, &state.network_id).contains(&pubkey)
+}
+
+/// Recompute and cache whether the signed state has evicted THIS device
+/// (see [`EngineState::self_evicted`]). Called at driver startup and
+/// after every log adoption/ratification, so the verdict tracks the
+/// signed state in both directions: an eviction stands the engine down
+/// (announce/dial gates read the flag), and a later re-admit — the
+/// owner re-claiming the device signs a fresh member grant — clears it
+/// and the network comes back to life without a restart.
+///
+/// On the false→true edge this also clears every standing dial
+/// (reconnect intents, sticky dials) and emits the `governance` /
+/// `self_evicted` diag event — the signal an embedding app (AllMyStuff)
+/// uses to tear down its fleet state cleanly.
+pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
+    use std::sync::atomic::Ordering;
+    let verdict = log_evicted(state, state.identity.public_id());
+    let was = state.self_evicted.swap(verdict, Ordering::SeqCst);
+    if verdict && !was {
+        state.reconnect_intents.lock().clear();
+        state.sticky_peers.lock().clear();
+        state.log_diag_with(
+            crate::events::DiagLevel::Warn,
+            "governance",
+            "this device was EVICTED from the network by its signed governance — standing down \
+             (no more announces or dials here; a re-admit revives it)",
+            serde_json::json!({
+                "hint": "self_evicted",
+                "network": state.network_id.clone(),
+            }),
+        );
+    } else if !verdict && was {
+        state.log_diag(
+            crate::events::DiagLevel::Info,
+            "governance",
+            "re-admitted by the signed governance — this network is live again",
+        );
+    }
+}
+
+/// The handshake gate: if the authenticated `device_id` is evicted by
+/// our signed state, deny it WITH PROOF (the signed logs ride the deny)
+/// and drop the session. Returns true when the peer was denied — the
+/// caller must stop the admission flow (no pending-approval, no
+/// auto-approve; those were exactly the resurrection engine). The proof
+/// costs nothing to trust: the denied device verifies it independently
+/// through strict-extension adoption, so a spoofed deny changes nothing.
+pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
+    if !log_evicted(state, device_id) {
+        return false;
+    }
+    let (transitions, member_log) = {
+        let gov = state.governance_state.read();
+        (gov.transitions.clone(), gov.member_log.clone())
+    };
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "governance",
+        format!(
+            "denied {} — evicted by the signed state (proof attached so it can stand down)",
+            &device_id[..device_id.len().min(12)]
+        ),
+        serde_json::json!({ "peer": device_id, "reason": "evicted" }),
+    );
+    let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
+        reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
+        transitions,
+        member_log,
+    });
+    if let Err(e) = super::send_to_peer(state, device_id, &deny).await {
+        tracing::debug!(peer = %device_id, err = %e, "eviction deny send failed");
+    }
+    // Do NOT tear the session down in the same breath: the data channel's
+    // send is buffered, and closing the connection here reliably discards
+    // the deny before it flushes — the device never gets its proof and
+    // redials forever (observed: every retry denied, zero adoptions). The
+    // receiving side drops the link itself the moment the deny lands
+    // (`on_deny`); this delayed drop is only the janitor for a peer that
+    // never processes it. Until then the peer sits unauthenticated-for-
+    // app-traffic (never approved), so nothing rides the grace window.
+    let janitor = state.clone();
+    let dev = device_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        super::drop_peer(&janitor, &dev, DropReason::Denied).await;
+    });
+    true
+}
+
+/// Feed a deny's attached logs through the standard strict-extension
+/// adoption. Nothing about the *sender* is trusted: a forged or foreign
+/// log fails verification inside [`adopt_transition_log`] and changes
+/// nothing; a genuine one converges our state, and the adoption tail's
+/// [`refresh_self_evicted`] flips this engine to stood-down if the
+/// verified verdict really does evict us.
+pub(super) async fn adopt_deny_proof(
+    state: &Arc<EngineState>,
+    peer_id: &str,
+    transitions: &[Transition],
+    member_log: &[Transition],
+) {
+    adopt_transition_log(state, peer_id, transitions, member_log).await;
+    // The adoption tail refreshes only when something changed; a repeat
+    // deny carrying a log we already hold must still settle the verdict
+    // (e.g. first boot after the log was persisted by a previous run).
+    refresh_self_evicted(state);
+}
+
 /// Re-derive the full role projection from both logs: owners and managers from
 /// the verified **governance** log, plus the union-merged **member** set as
 /// `Member`. With a member tier, the governance log alone no longer carries
@@ -1047,6 +1187,9 @@ async fn adopt_transition_log(
             &peer_id[..peer_id.len().min(12)]
         ),
     );
+    // The adopted logs may have evicted (or re-admitted) THIS device —
+    // settle the cached verdict before telling anyone anything.
+    refresh_self_evicted(state);
     // Tell our own peers — both the new membership and the new governance
     // counts — so it ripples on.
     broadcast_roster_summary(state).await;
@@ -1368,6 +1511,11 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             crate::events::DiagLevel::Info,
             format!("ratified transition: {:?}", transition.variant),
         );
+        // A ratified Evict may target THIS device (the online-eviction
+        // case: we hold the network's log and just applied our own
+        // removal), and a ratified member grant may be our re-admit —
+        // settle the cached verdict either way.
+        refresh_self_evicted(state);
         // Membership/roles may have changed — summarise so peers reconcile (a
         // member admit shows up as a roster-root + member-log-count bump).
         broadcast_roster_summary(state).await;

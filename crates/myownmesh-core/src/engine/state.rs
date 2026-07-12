@@ -393,6 +393,16 @@ pub struct NetworkState {
     /// reconnect intent never expires. See `handle_signaling_inbound`.
     pub sticky_peers: Mutex<std::collections::HashSet<String>>,
 
+    /// Whether this network's **signed governance** has evicted *this
+    /// device* — the cached verdict of
+    /// [`super::governance::refresh_self_evicted`], recomputed at startup
+    /// and after every log adoption/ratification. While true the engine
+    /// stands down on this network: no announces out, no dialing on
+    /// announces in (every member would deny us anyway — with proof).
+    /// Derived state, never persisted: the adopted signed log IS the
+    /// durable record, so a restart recomputes the same verdict.
+    pub self_evicted: std::sync::atomic::AtomicBool,
+
     /// Acked-delivery outboxes, one per peer with frames pending (see
     /// [`super::reliable`]). Driver-serial like all engine state; the
     /// mutex guards snapshot readers only.
@@ -568,6 +578,7 @@ impl NetworkState {
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             sticky_peers: Mutex::new(pinned),
+            self_evicted: std::sync::atomic::AtomicBool::new(false),
             reliable_out: Mutex::new(std::collections::HashMap::new()),
             reliable_in: Mutex::new(std::collections::HashMap::new()),
             routing_seen: Mutex::new(std::collections::VecDeque::new()),
@@ -1029,6 +1040,34 @@ impl NetworkState {
     /// higher-level [`crate::JoinedNetwork::roster_approve`])
     /// to actually emit the `approve` frame.
     pub async fn approve_roster(&self, device_id: &str, label: &str) -> Result<()> {
+        // Defense in depth behind the handshake's eviction gate: on a
+        // closed network a device the signed state evicted can't be
+        // rostered by ANY path — not mutual-ACTIVE persistence, not a
+        // manual approve from a stale UI. Re-admission is a signed member
+        // grant (the owner re-claiming it), which flips the verdict first.
+        {
+            let gov = self.governance_state.read();
+            if !gov.kind.is_open_governance() {
+                let pubkey = crate::signing::pubkey_part(device_id).to_string();
+                let evicted = !matches!(
+                    gov.roles.get(&pubkey),
+                    Some(crate::network_state::Role::Owner)
+                        | Some(crate::network_state::Role::Controller)
+                ) && crate::network_state::member_log_removed(
+                    &gov,
+                    &gov.member_log,
+                    &self.network_id,
+                )
+                .contains(&pubkey);
+                if evicted {
+                    return Err(Error::Network(
+                        "this device was evicted by the network's signed governance — \
+                         re-admit it by signing it back in (re-claim), not by approving"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let mut roster = self.roster.write();
         crate::roster::add_peer_in(&mut roster, device_id, label);
         crate::roster::save(&roster)?;

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::rpc::CapabilityAdvert;
+use crate::network_state::Transition;
 
 /// Sent immediately on channel open by both ends. Carries the
 /// sender's claimed Device ID, a random nonce the other side must
@@ -82,13 +83,41 @@ pub struct AuthResponseMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproveMessage {}
 
+/// The `reason` a [`DenyMessage`] carries when the denial is "this
+/// network's signed governance EVICTED you." Such a deny also attaches
+/// the signed logs as proof, so the denied device can verify its own
+/// eviction and stand down instead of redialing forever.
+pub const DENY_REASON_EVICTED: &str = "evicted";
+
 /// Sent when the local side rejects the peer. The peer should not
 /// reconnect until the user approves again (the engine treats this
 /// as a hint, not a hard ban — repeated reconnect attempts after a
 /// deny just get re-denied, but the user can reverse the decision
 /// from the network browser).
+///
+/// One denial is different: `reason == `[`DENY_REASON_EVICTED`] means
+/// the network's **signed state** removed the peer, and the deny
+/// carries that state as proof (`transitions` + `member_log`). The
+/// denied device never trusts the denier — it routes the logs through
+/// the same strict-extension verification every log adoption takes
+/// (the owner's signatures are the authority), and only a verdict its
+/// OWN verified state agrees with makes it stand down. A device
+/// evicted while offline finally has a way to *learn* it: today it
+/// redialed forever and, on auto-approve networks, kept resurrecting
+/// itself into rosters ("offline and lost devices keep showing up").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenyMessage {
     #[serde(default)]
     pub reason: Option<String>,
+    /// The network's signed governance log (proof for an eviction
+    /// denial). Empty on ordinary denies; absent from older peers'
+    /// frames via `#[serde(default)]`, which also means an older
+    /// receiver simply ignores the extra fields — it is denied
+    /// exactly as before, just without the ability to self-verify.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<Transition>,
+    /// The signed member-tier log (the half that actually carries a
+    /// member's `Evict`). Same compat story as `transitions`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_log: Vec<Transition>,
 }
