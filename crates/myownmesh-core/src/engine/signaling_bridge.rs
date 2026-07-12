@@ -122,7 +122,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 }
                 LocalInbound::PeerLeft { device_id } => SignalingInbound::PeerLeft { device_id },
                 LocalInbound::Message { from, msg } => match msg {
-                    SignalingMessage::Announce { peer_id } => {
+                    SignalingMessage::Announce { peer_id, .. } => {
                         let _ = peer_id; // peer id is informational; we use `from`
                         SignalingInbound::PeerAnnounced { device_id: from }
                     }
@@ -254,7 +254,7 @@ fn dedup_key(msg: &SignalingInbound) -> Option<u64> {
 /// can't drift.
 fn translate_message(from: String, msg: SignalingMessage) -> SignalingInbound {
     match msg {
-        SignalingMessage::Announce { peer_id } => {
+        SignalingMessage::Announce { peer_id, .. } => {
             let _ = peer_id; // peer id is informational; we use `from`
             SignalingInbound::PeerAnnounced { device_id: from }
         }

@@ -224,6 +224,7 @@ mod tests {
             to: "b".into(),
             msg: SignalingMessage::Announce {
                 peer_id: "a".into(),
+                caps: Vec::new(),
             },
         };
         let value: serde_json::Value = serde_json::from_str(&encode_frame(&frame)).unwrap();
@@ -242,6 +243,7 @@ mod tests {
             to: "peer-2".into(),
             msg: SignalingMessage::Announce {
                 peer_id: "peer-1".into(),
+                caps: Vec::new(),
             },
         };
         assert!(frame_is_for_us(&frame, "roomA", "peer-2"));
