@@ -109,6 +109,11 @@ pub struct PeerStateData {
     /// in-place offer. Coalesced: any number of lane changes between
     /// passes costs a single renegotiation.
     pub media_reneg_pending: bool,
+    /// A media-renegotiation task is currently running for this peer
+    /// (spawned off the driver — see `service_media_renegotiations`).
+    /// Single-flight guard: the tick skips a peer whose offer is still
+    /// in flight instead of stacking a second one onto webrtc-rs.
+    pub media_reneg_inflight: bool,
     /// True once this session's data channel has fired `on_open` — the one
     /// reliable "transport is up" signal (DTLS + SCTP genuinely
     /// established). The connect-timeout watchdog only reclaims a peer
@@ -180,6 +185,7 @@ impl Default for PeerStateData {
             ice_disconnected_since: None,
             session_started_at: None,
             media_reneg_pending: false,
+            media_reneg_inflight: false,
             data_channel_open: false,
             handshake_started_at: None,
             hello_attempt: 0,
