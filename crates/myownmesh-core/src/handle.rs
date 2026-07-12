@@ -525,9 +525,11 @@ impl JoinedNetwork {
         self.state.media_lane_open(peer, kind).await
     }
 
-    /// Close a media lane toward `peer`, releasing its track and (on
-    /// the next renegotiation) its m-line send side. Idempotent — a
-    /// lane that isn't open is a no-op, so teardown can't double-fault.
+    /// Close a media lane toward `peer`. The close is a *drain*: the
+    /// track stays negotiated for a short grace so an immediate reopen
+    /// (a settings change's stop→start) is free, and the engine reaps
+    /// the m-line only once the grace lapses. Idempotent — a lane that
+    /// isn't open is a no-op, so teardown can't double-fault.
     pub async fn close_media_lane(
         &self,
         peer: &str,

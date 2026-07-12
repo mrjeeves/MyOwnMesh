@@ -870,58 +870,111 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
 }
 
-/// Perform the coalesced in-place media renegotiations the transport
-/// flagged: one fresh offer per peer whose lane set changed, same DTLS
-/// fingerprint, so the remote's existing offer path renegotiates in
-/// place (never a rebuild). Runs on the state-watch tick; the flag is
-/// cleared only when the offer actually left, so a transient send
-/// failure retries next pass.
+/// Drive the media-lane renegotiations the transport flagged — OFF the
+/// driver task. The tick only *selects* peers (pending flag, or drained
+/// lanes due for reaping) and spawns one task per peer; the webrtc-rs
+/// excursion (reap's remove_track, create_offer's ICE re-gather) runs
+/// there, so the driver — and every input frame queued behind it —
+/// never waits on SDP work. Glare-guarded: a peer whose signaling state
+/// isn't Stable is skipped and retried next tick rather than wedging
+/// webrtc-rs with a mid-negotiation offer. Single-flighted per peer via
+/// `media_reneg_inflight`.
 pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
     if state.is_offline() {
         return;
     }
-    let pending: Vec<String> = state
+    let candidates: Vec<String> = state
         .peers
         .iter()
         .filter(|e| {
             let d = e.value().state.read();
-            d.media_reneg_pending
+            !d.media_reneg_inflight
                 && d.data_channel_open
                 && matches!(d.status, PeerStatus::Active | PeerStatus::Shelved)
         })
         .map(|e| e.key().clone())
         .collect();
-    for device_id in pending {
-        let session = state
-            .peers
-            .get(&device_id)
-            .and_then(|p| p.session.lock().clone());
-        let Some(session) = session else { continue };
-        match session.create_offer().await {
-            Ok(desc) => {
-                state.log_diag_with(
-                    crate::events::DiagLevel::Debug,
-                    "media",
-                    format!(
-                        "media renegotiation offer to {} (lane set changed)",
-                        short_peer(&device_id)
-                    ),
-                    serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
-                );
-                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                    device_id: device_id.clone(),
-                    sdp: desc.sdp,
-                });
-                if let Some(peer) = state.peers.get(&device_id) {
-                    let mut data = peer.state.write();
-                    data.media_reneg_pending = false;
-                    data.last_offer_sent_at = Some(Instant::now());
+    for device_id in candidates {
+        let Some(entry) = state.peers.get(&device_id) else {
+            continue;
+        };
+        let Some(session) = entry.session.lock().clone() else {
+            continue;
+        };
+        let pending = {
+            let d = entry.state.read();
+            d.media_reneg_pending
+        };
+        // Anything draining past the grace? (Cheap read; the actual
+        // removal happens in the spawned task.)
+        if !pending && !session.has_reapable_lanes(crate::transport::webrtc::LANE_DRAIN_GRACE) {
+            continue;
+        }
+        {
+            let mut d = entry.state.write();
+            d.media_reneg_inflight = true;
+            d.media_reneg_pending = false;
+        }
+        drop(entry);
+        let state = state.clone();
+        tokio::spawn(async move {
+            let outcome = if session.signaling_state()
+                != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+            {
+                // Mid-negotiation (glare, or our own earlier offer still
+                // settling) — don't stack an offer on it, and don't touch
+                // the session either: unreaped drains keep the peer a
+                // candidate, and the Err below re-arms the pending flag.
+                Err("signaling not stable".to_string())
+            } else {
+                // Finalize due drains first so the offer below carries
+                // the removals too — one renegotiation for the whole
+                // delta.
+                let reaped = session
+                    .reap_drained_lanes(crate::transport::webrtc::LANE_DRAIN_GRACE)
+                    .await;
+                match session.create_offer().await {
+                    Ok(desc) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Debug,
+                            "media",
+                            format!(
+                                "media renegotiation offer to {} (lane set changed{})",
+                                short_peer(&device_id),
+                                if reaped > 0 { ", drains reaped" } else { "" }
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "sdp_bytes": desc.sdp.len(),
+                                "reaped": reaped,
+                            }),
+                        );
+                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                            device_id: device_id.clone(),
+                            sdp: desc.sdp,
+                        });
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            if let Some(peer) = state.peers.get(&device_id) {
+                let mut d = peer.state.write();
+                d.media_reneg_inflight = false;
+                match outcome {
+                    Ok(()) => {
+                        d.last_offer_sent_at = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        // Leave the work owed: the flag re-arms the next
+                        // tick's attempt instead of losing the lane change.
+                        d.media_reneg_pending = true;
+                        drop(d);
+                        debug!(peer = %device_id, "media renegotiation deferred: {e}");
+                    }
                 }
             }
-            Err(e) => {
-                warn!(peer = %device_id, "media renegotiation create_offer failed (will retry): {e}");
-            }
-        }
+        });
     }
 }
 
@@ -2470,6 +2523,22 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
+    // Only a shaped topology can ever route around a missing link, so
+    // only a shaped topology pays for keeping a copy. On full mesh the
+    // payload moves — this is the hot path for MJPEG / PCM / file
+    // chunks, and a per-frame clone of a 100 KB frame is real money.
+    let shaped = state.topology_impl.read().prunes();
+    if !shaped {
+        return send_to_peer(
+            state,
+            peer,
+            &MeshMessage::Channel {
+                channel: channel.to_string(),
+                payload,
+            },
+        )
+        .await;
+    }
     let direct = send_to_peer(
         state,
         peer,
@@ -2481,19 +2550,10 @@ async fn send_channel_frame(
     .await;
     match direct {
         Ok(()) => Ok(()),
-        Err(e) => {
-            // Under a shaped topology "no direct link" is the normal
-            // state for most pairs — hand the frame to the shape's
-            // forwarders instead of surfacing an error the caller
-            // can't act on. Anything else (a live link that failed)
-            // stays an error.
-            let shaped = state.topology_impl.read().prunes();
-            if shaped {
-                routing::send_routed(state, peer, channel, &payload).await
-            } else {
-                Err(e)
-            }
-        }
+        // Under a shaped topology "no direct link" is the normal state
+        // for most pairs — hand the frame to the shape's forwarders
+        // instead of surfacing an error the caller can't act on.
+        Err(_) => routing::send_routed(state, peer, channel, &payload).await,
     }
 }
 

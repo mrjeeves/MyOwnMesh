@@ -17,6 +17,7 @@
 //!    [`PeerSession::close`] for explicit shutdown.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -159,9 +160,11 @@ pub struct AudioSample {
 /// and lanes 1+ come into being on demand — an explicit
 /// `open_*_lane`, or transparently on the first write to a lane that
 /// doesn't exist yet. Each open adds one track (id `video-N` /
-/// `audio-N`) and renegotiates in place; a close removes the track
-/// and renegotiates again, so media capacity is paid only while a
-/// session actually uses it.
+/// `audio-N`) and renegotiates in place; a close *drains* — the track
+/// stays attached through [`LANE_DRAIN_GRACE`] so an immediate reopen
+/// is free, and only a drain that outlives the grace is actually torn
+/// down (one renegotiation per reap sweep). Media capacity is still
+/// paid only while a session actually uses it.
 ///
 /// `MYOWNMESH_MEDIA_LANES` still caps the ceiling per device (clamped
 /// to `1..=MEDIA_LANES`): a data-only appliance sets `1` and no lane
@@ -172,6 +175,21 @@ pub const MEDIA_LANES: usize = 8;
 /// Lanes created at connection setup, before any media flows: lane 0
 /// only. Everything else is lifecycle-managed (see [`MEDIA_LANES`]).
 pub const PRE_PROVISIONED_LANES: usize = 1;
+
+/// How long a closed lane keeps its track attached before the reaper
+/// finalizes the teardown (`remove_track` + one in-place renegotiation).
+///
+/// This grace is what makes a stop→start cycle — a settings change, a
+/// stream restart, a viewer toggling a feed — cost **zero SDP work**:
+/// the close only marks the slot draining, and a reopen inside the
+/// grace revives the same negotiated track, so samples flow again on
+/// the first write. That is exactly the smoothness the pre-lifecycle
+/// transport had (every lane always open); the grace buys it back
+/// without re-paying the always-on SDP tax. Five seconds comfortably
+/// covers an app-level release→reconfigure→restart round-trip (sub-
+/// second in practice) while keeping a genuinely-abandoned m-line's
+/// afterlife short.
+pub const LANE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Per-device media-lane ceiling, resolved once at transport
 /// construction. `MYOWNMESH_MEDIA_LANES` overrides the [`MEDIA_LANES`]
@@ -362,17 +380,15 @@ impl Transport {
         // lane that doesn't exist yet — with an in-place renegotiation
         // carrying the new m-line. Slots are pre-sized to the device
         // ceiling so a lane index is stable for the session's life.
-        let mut video_tracks: Vec<Option<Arc<TrackLocalStaticSample>>> =
-            vec![None; self.media_lanes];
-        let mut audio_tracks: Vec<Option<Arc<TrackLocalStaticSample>>> =
-            vec![None; self.media_lanes];
+        let mut video_tracks: Vec<Option<LaneSlot>> = vec![None; self.media_lanes];
+        let mut audio_tracks: Vec<Option<LaneSlot>> = vec![None; self.media_lanes];
         for lane in 0..PRE_PROVISIONED_LANES.min(self.media_lanes) {
             let video_track = make_media_track(LaneKind::Video, lane as u8);
             attach_track(&pc, &video_track).await?;
-            video_tracks[lane] = Some(video_track);
+            video_tracks[lane] = Some(LaneSlot::Open(video_track));
             let audio_track = make_media_track(LaneKind::Audio, lane as u8);
             attach_track(&pc, &audio_track).await?;
-            audio_tracks[lane] = Some(audio_track);
+            audio_tracks[lane] = Some(LaneSlot::Open(audio_track));
         }
 
         // Offerer creates the data channel synchronously so the
@@ -414,6 +430,21 @@ impl Transport {
 pub enum LaneKind {
     Video,
     Audio,
+}
+
+/// One lifecycle-managed lane slot's state. (`None` in the pool =
+/// never opened / fully reaped.)
+#[derive(Clone)]
+enum LaneSlot {
+    /// Negotiated (or negotiating) and writable.
+    Open(Arc<TrackLocalStaticSample>),
+    /// Closed by the app, track still attached: a reopen within
+    /// [`LANE_DRAIN_GRACE`] revives it with zero SDP work; the reaper
+    /// tears it down for real once the grace lapses.
+    Draining {
+        track: Arc<TrackLocalStaticSample>,
+        since: Instant,
+    },
 }
 
 /// Build the local track for one lane. The id carries the lane index
@@ -949,12 +980,14 @@ pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
-    /// Lifecycle-managed lane slots, index = lane id. `None` = lane not
-    /// open. Slot count is fixed at [`PeerSession::max_lanes`] so ids
-    /// stay stable; a std Mutex because holders only clone the Arc out
-    /// (never held across an await).
-    video_tracks: std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>>,
-    audio_tracks: std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>>,
+    /// Lifecycle-managed lane slots, index = lane id. `None` = lane
+    /// never opened (or fully reaped); see [`LaneSlot`] for the
+    /// open/draining split. Slot count is fixed at
+    /// [`PeerSession::max_lanes`] so ids stay stable; a std Mutex
+    /// because holders only clone the Arc out (never held across an
+    /// await).
+    video_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
+    audio_tracks: std::sync::Mutex<Vec<Option<LaneSlot>>>,
     /// Device lane ceiling (see [`resolve_media_lanes`]).
     max_lanes: usize,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
@@ -1125,7 +1158,7 @@ impl PeerSession {
             .map_err(|e| Error::Transport(format!("audio write_sample (lane {lane}): {e}")))
     }
 
-    fn pool(&self, kind: LaneKind) -> &std::sync::Mutex<Vec<Option<Arc<TrackLocalStaticSample>>>> {
+    fn pool(&self, kind: LaneKind) -> &std::sync::Mutex<Vec<Option<LaneSlot>>> {
         match kind {
             LaneKind::Video => &self.video_tracks,
             LaneKind::Audio => &self.audio_tracks,
@@ -1136,7 +1169,10 @@ impl PeerSession {
     /// lane that doesn't exist yet creates the track, attaches it, and
     /// flags a renegotiation — writes are no-ops until the new m-line
     /// negotiates, exactly the semantics callers already tolerate at
-    /// stream start. A lane at or past the device ceiling errors.
+    /// stream start. A *draining* lane revives in place: the track
+    /// never left the SDP, so the write flows immediately and nothing
+    /// is renegotiated — this is the settings stop→start fast path. A
+    /// lane at or past the device ceiling errors.
     async fn ensure_lane(&self, kind: LaneKind, lane: u8) -> Result<Arc<TrackLocalStaticSample>> {
         if lane as usize >= self.max_lanes {
             let k = if kind == LaneKind::Video {
@@ -1146,8 +1182,17 @@ impl PeerSession {
             };
             return Err(Error::Transport(format!("no {k} lane {lane}")));
         }
-        if let Some(track) = self.pool(kind).lock().expect("lane pool")[lane as usize].clone() {
-            return Ok(track);
+        {
+            let mut pool = self.pool(kind).lock().expect("lane pool");
+            match &pool[lane as usize] {
+                Some(LaneSlot::Open(track)) => return Ok(track.clone()),
+                Some(LaneSlot::Draining { track, .. }) => {
+                    let track = track.clone();
+                    pool[lane as usize] = Some(LaneSlot::Open(track.clone()));
+                    return Ok(track);
+                }
+                None => {}
+            }
         }
         let track = make_media_track(kind, lane);
         attach_track(&self.pc, &track).await?;
@@ -1158,26 +1203,37 @@ impl PeerSession {
         // serialized by the engine driver.)
         let stored = {
             let mut pool = self.pool(kind).lock().expect("lane pool");
-            if pool[lane as usize].is_none() {
-                pool[lane as usize] = Some(track.clone());
-                track
-            } else {
-                pool[lane as usize].clone().expect("just checked")
+            match &pool[lane as usize] {
+                None => {
+                    pool[lane as usize] = Some(LaneSlot::Open(track.clone()));
+                    track
+                }
+                Some(LaneSlot::Open(winner)) => winner.clone(),
+                Some(LaneSlot::Draining { track: winner, .. }) => {
+                    let winner = winner.clone();
+                    pool[lane as usize] = Some(LaneSlot::Open(winner.clone()));
+                    winner
+                }
             }
         };
         let _ = self.events_tx.send(TransportEvent::RenegotiationNeeded);
         Ok(stored)
     }
 
-    /// Open the lowest free lane of `kind`, returning its id. The
-    /// explicit twin of the write-time auto-open, for callers that
-    /// want to reserve a lane before producing media.
+    /// Open a lane of `kind`, returning its id. The explicit twin of
+    /// the write-time auto-open, for callers that want to reserve a
+    /// lane before producing media. Prefers reviving a draining lane
+    /// (its track is still negotiated — the open costs zero SDP work)
+    /// over claiming a fresh slot (one in-place renegotiation); errors
+    /// only when every slot is genuinely open.
     pub async fn open_media_lane(&self, kind: LaneKind) -> Result<u8> {
-        let free = {
+        let target = {
             let pool = self.pool(kind).lock().expect("lane pool");
-            pool.iter().position(|slot| slot.is_none())
+            pool.iter()
+                .position(|slot| matches!(slot, Some(LaneSlot::Draining { .. })))
+                .or_else(|| pool.iter().position(|slot| slot.is_none()))
         };
-        let Some(lane) = free else {
+        let Some(lane) = target else {
             return Err(Error::Transport(format!(
                 "all {} media lanes are open (device ceiling)",
                 self.max_lanes
@@ -1187,41 +1243,95 @@ impl PeerSession {
         Ok(lane as u8)
     }
 
-    /// Close an open lane: remove its track from the connection (the
-    /// next renegotiation drops the m-line's send side) and free the
-    /// slot for reuse. Closing a lane that isn't open is a no-op —
-    /// idempotent by design, so teardown paths can't double-fault.
+    /// Close an open lane — as a **drain**: the slot is marked closed
+    /// but the track stays attached through [`LANE_DRAIN_GRACE`], so a
+    /// quick reopen (a settings change's stop→start, a stream restart)
+    /// revives it with zero SDP work and the feed never freezes behind
+    /// a renegotiation. Nothing is signaled here — a close is instant
+    /// and free; only the reaper ([`Self::reap_drained_lanes`])
+    /// finalizes teardowns, for drains that outlived the grace.
+    /// Closing a lane that isn't open (or is already draining) is a
+    /// no-op — idempotent by design, so teardown paths can't
+    /// double-fault.
     pub async fn close_media_lane(&self, kind: LaneKind, lane: u8) -> Result<()> {
         if lane as usize >= self.max_lanes {
             return Ok(());
         }
-        let track = {
-            let mut pool = self.pool(kind).lock().expect("lane pool");
-            pool[lane as usize].take()
-        };
-        let Some(track) = track else {
-            return Ok(());
-        };
-        let track_id = track.id().to_string();
-        for sender in self.pc.get_senders().await {
-            let matches = sender
-                .track()
-                .await
-                .map(|t| t.id() == track_id)
-                .unwrap_or(false);
-            if matches {
-                self.pc
-                    .remove_track(&sender)
-                    .await
-                    .map_err(|e| Error::Transport(format!("remove_track ({track_id}): {e}")))?;
-            }
+        let mut pool = self.pool(kind).lock().expect("lane pool");
+        if let Some(LaneSlot::Open(track)) = &pool[lane as usize] {
+            pool[lane as usize] = Some(LaneSlot::Draining {
+                track: track.clone(),
+                since: Instant::now(),
+            });
         }
-        let _ = self.events_tx.send(TransportEvent::RenegotiationNeeded);
         Ok(())
     }
 
-    /// How many lanes of `kind` are currently open — surfaced in
-    /// status so an operator can see media capacity in use.
+    /// Whether any drained lane has outlived `grace` and owes the
+    /// connection a teardown. Cheap sync scan — the engine's tick uses
+    /// it to decide whether this peer needs a renegotiation pass at
+    /// all.
+    pub fn has_reapable_lanes(&self, grace: Duration) -> bool {
+        [LaneKind::Video, LaneKind::Audio].iter().any(|kind| {
+            self.pool(*kind)
+                .lock()
+                .expect("lane pool")
+                .iter()
+                .any(|slot| {
+                    matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace)
+                })
+        })
+    }
+
+    /// Finalize every drain that outlived `grace`: free the slots and
+    /// remove their tracks from the connection, so the caller's next
+    /// offer drops the m-lines' send side. Returns how many lanes were
+    /// reaped. Slots free first, under the lock, then the webrtc-rs
+    /// `remove_track` calls run outside it — a concurrent revive can't
+    /// resurrect a slot the reaper already committed to tearing down.
+    pub async fn reap_drained_lanes(&self, grace: Duration) -> usize {
+        let mut victims: Vec<Arc<TrackLocalStaticSample>> = Vec::new();
+        for kind in [LaneKind::Video, LaneKind::Audio] {
+            let mut pool = self.pool(kind).lock().expect("lane pool");
+            for slot in pool.iter_mut() {
+                let due = matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace);
+                if due {
+                    if let Some(LaneSlot::Draining { track, .. }) = slot.take() {
+                        victims.push(track);
+                    }
+                }
+            }
+        }
+        if victims.is_empty() {
+            return 0;
+        }
+        let victim_ids: Vec<String> = victims.iter().map(|t| t.id().to_string()).collect();
+        for sender in self.pc.get_senders().await {
+            let matches = match sender.track().await {
+                Some(t) => victim_ids.iter().any(|id| *id == t.id()),
+                None => false,
+            };
+            if matches {
+                if let Err(e) = self.pc.remove_track(&sender).await {
+                    // The slot is already free; a failed removal just
+                    // leaves a mute m-line until the next rebuild.
+                    warn!("reap: remove_track failed: {e}");
+                }
+            }
+        }
+        victims.len()
+    }
+
+    /// The peer connection's signaling state. The media-renegotiation
+    /// pass gates its in-place offers on `Stable` so it never stacks
+    /// an offer onto a negotiation that's still settling (glare).
+    pub fn signaling_state(&self) -> RTCSignalingState {
+        self.pc.signaling_state()
+    }
+
+    /// How many lanes of `kind` are currently occupied — surfaced in
+    /// status so an operator can see media capacity in use. Draining
+    /// lanes count: they still hold their m-line until reaped.
     pub fn open_lane_count(&self, kind: LaneKind) -> usize {
         self.pool(kind)
             .lock()
@@ -2090,28 +2200,77 @@ mod tests {
         );
 
         // Explicit open takes the lowest free slot (1: 0 is pre-opened,
-        // 3 is auto-opened).
+        // 3 is auto-opened) — a fresh slot, so it flags a renegotiation.
+        // Drain the flag so the close/revive checks below observe
+        // silence.
         let lane = session
             .open_media_lane(LaneKind::Video)
             .await
             .expect("explicit open");
         assert_eq!(lane, 1);
+        let mut saw_reneg = false;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, TransportEvent::RenegotiationNeeded) {
+                saw_reneg = true;
+            }
+        }
+        assert!(saw_reneg, "a fresh explicit open flags a renegotiation");
 
-        // Close frees the slot for reuse and is idempotent.
+        // Close is a *drain*: the slot keeps its m-line, nothing is
+        // signaled, and it's idempotent.
         session
             .close_media_lane(LaneKind::Video, 3)
             .await
             .expect("close");
-        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
+        assert_eq!(
+            session.open_lane_count(LaneKind::Video),
+            3,
+            "a draining lane still holds its m-line"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a drain is silent — no renegotiation on close"
+        );
         session
             .close_media_lane(LaneKind::Video, 3)
             .await
             .expect("double close is a no-op");
+
+        // Reopen within the grace revives the drained lane — same id,
+        // zero SDP work. This is the settings stop→start fast path.
         let lane = session
             .open_media_lane(LaneKind::Video)
             .await
             .expect("reopen");
-        assert_eq!(lane, 2, "explicit open always takes the lowest free slot");
+        assert_eq!(lane, 3, "reopen revives the draining lane");
+        assert!(
+            events.try_recv().is_err(),
+            "a revival is free — no renegotiation"
+        );
+
+        // A drain past the grace is reaped: slot freed, track removed.
+        // The reaper's caller carries the removal in its own offer, so
+        // no event fires here either.
+        session
+            .close_media_lane(LaneKind::Video, 3)
+            .await
+            .expect("re-close");
+        assert!(session.has_reapable_lanes(Duration::ZERO));
+        assert!(
+            !session.has_reapable_lanes(Duration::from_secs(3600)),
+            "a fresh drain is not yet due"
+        );
+        assert_eq!(session.reap_drained_lanes(Duration::ZERO).await, 1);
+        assert_eq!(session.open_lane_count(LaneKind::Video), 2);
+        assert!(!session.has_reapable_lanes(Duration::ZERO));
+
+        // With nothing draining, an explicit open claims the lowest
+        // free slot again.
+        let lane = session
+            .open_media_lane(LaneKind::Video)
+            .await
+            .expect("fresh open after reap");
+        assert_eq!(lane, 2, "explicit open takes the lowest free slot");
 
         // The device ceiling still errors rather than mis-routing.
         let err = session
