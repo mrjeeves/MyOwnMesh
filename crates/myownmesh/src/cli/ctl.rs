@@ -168,6 +168,17 @@ pub enum NetworksCmd {
     Connect {
         network_id: String,
         peer: String,
+        /// Record a standing dial: the daemon redials this peer on
+        /// every announce (even on a Silent network) and never gives
+        /// up on it — the shape a support session needs. Persisted
+        /// with the network config.
+        #[arg(long)]
+        pin: bool,
+        /// Wait up to this many milliseconds for the peer to reach
+        /// ACTIVE and report the real outcome (0 = return as soon as
+        /// the dial is queued).
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u64,
     },
 }
 
@@ -220,12 +231,17 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
                 peer,
             }
         }
-        CtlCmd::Networks(NetworksCmd::Connect { network_id, peer }) => {
-            Request::NetworkConnectPeer {
-                network: network_id,
-                peer,
-            }
-        }
+        CtlCmd::Networks(NetworksCmd::Connect {
+            network_id,
+            peer,
+            pin,
+            wait_ms,
+        }) => Request::NetworkConnectPeer {
+            network: network_id,
+            peer,
+            pin,
+            wait_ms,
+        },
         CtlCmd::Networks(NetworksCmd::Topology {
             network_id,
             topology,

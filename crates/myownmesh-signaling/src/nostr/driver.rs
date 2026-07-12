@@ -5,10 +5,15 @@
 //!
 //! Resilience features baked in (see `crate::upstream`):
 //!
-//! - Subscription replay on socket reconnect, with anti-flood
-//!   backoff at 5 / 10 / 15 / 30 / 60 s.
+//! - The subscription REQ is re-sent on every fresh socket, and the
+//!   per-socket reconnect backoff (2 → 60 s, jittered) is the single
+//!   anti-flood pace for a flapping relay.
 //! - Transition-only logging — no per-event spam.
-//! - Per-relay backoff on connection failure, capped at 60 s.
+//! - Directed negotiation (offer / answer / candidate) is tagged with
+//!   its recipient (`["p", device_id]`); once every announced peer in
+//!   the room advertises [`crate::SIG_CAP_PTAG`], the subscription
+//!   narrows to "presence + directed-to-me" and pairwise negotiation
+//!   stops being delivered to the whole room (see `desired_filters`).
 //!
 //! The driver is independent of the engine; the
 //! [`crate::SignalingChannel`] trait is the seam.
@@ -28,10 +33,9 @@ use super::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
 };
 use super::handle::derive_room_handle;
-use super::relay::SubscriptionReplay;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
-use crate::SignalingMessage;
+use crate::{SignalingMessage, SIG_CAP_PTAG};
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -151,6 +155,11 @@ pub fn start(
     // signaling to actually come back after a network change before it
     // renegotiates (see `relay_connected` on `DriverShared`).
     let relay_connected = Arc::new(watch::channel(0u64).0);
+    // Subscription-shape signal. `true` = keep the legacy catch-all
+    // directed filter (some peer in the room predates recipient tags);
+    // `false` = presence + directed-to-me only. Starts conservative
+    // (true) and narrows once every announced peer advertises the cap.
+    let compat_directed = Arc::new(watch::channel(true).0);
     let shared = Arc::new(DriverShared {
         identity,
         room_handle,
@@ -164,6 +173,8 @@ pub fn start(
             SEEN_EVENT_CAPACITY,
         )),
         outbound_replay: Mutex::new(std::collections::VecDeque::new()),
+        room_caps: Mutex::new(std::collections::HashMap::new()),
+        compat_directed,
     });
     {
         let mut relays = shared.relays.lock();
@@ -328,6 +339,111 @@ struct DriverShared {
     /// and TTL'd ([`OUTBOUND_REPLAY_TTL_MS`]) so a long outage can't grow it
     /// unboundedly or replay an offer the negotiation has moved past.
     outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>>,
+    /// Signaling capabilities of every peer that has announced in this
+    /// room, keyed by device id: `true` = the peer tags its directed
+    /// events with the recipient (`SIG_CAP_PTAG`). Entries leave on
+    /// `Leave`. Drives [`DriverShared::compat_directed`].
+    room_caps: Mutex<std::collections::HashMap<String, bool>>,
+    /// `true` while at least one announced peer predates recipient tags,
+    /// so the subscription must keep the legacy catch-all directed
+    /// filter. Relay sessions watch this and re-issue their REQ (same
+    /// sub id — NIP-01 replaces the filters) when it flips. Narrowing is
+    /// what stops every pairwise offer/answer/candidate in the room from
+    /// being delivered to every member.
+    compat_directed: Arc<watch::Sender<bool>>,
+}
+
+/// Re-evaluate [`DriverShared::compat_directed`] from the current
+/// `room_caps` map and signal sessions if it changed. Conservative: an
+/// empty room keeps compat on (no evidence everyone tags), and any
+/// announced peer without the cap keeps it on.
+fn recompute_compat(shared: &DriverShared) {
+    let caps = shared.room_caps.lock();
+    let need_compat = caps.is_empty() || caps.values().any(|ptag| !*ptag);
+    drop(caps);
+    shared.compat_directed.send_if_modified(|current| {
+        if *current != need_compat {
+            debug!(
+                room = %&shared.room_handle[..16.min(shared.room_handle.len())],
+                need_compat,
+                "directed-subscription shape changed"
+            );
+            *current = need_compat;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// The NIP-01 filter set for our room subscription, as the current
+/// room composition wants it:
+///
+///   1. presence (stored kind, replayed over the `since` window),
+///   2. directed-to-me negotiation (ephemeral kind, `#p` = us),
+///   3. legacy catch-all negotiation — only while `compat` (some peer
+///      in the room doesn't tag its directed events yet).
+///
+/// One REQ, multiple filters (OR semantics), so narrowing is a
+/// same-sub-id REQ replacement rather than sub churn.
+fn desired_filters(shared: &DriverShared, compat: bool) -> Vec<Value> {
+    let since = now_secs().saturating_sub(PRESENCE_REPLAY_WINDOW_SECS);
+    let mut filters = vec![
+        serde_json::json!({
+            "kinds": [SIGNALING_EVENT_KIND],
+            "#r": [shared.room_handle.clone()],
+            "since": since,
+        }),
+        // Directed-to-me, plus room-addressed broadcasts: a tagging
+        // build stamps broadcast ephemerals (`leave`) with the room
+        // handle as their recipient, so the narrowed shape still hears
+        // departures. `#p` is an OR-list per NIP-01.
+        serde_json::json!({
+            "kinds": [SIGNALING_EPHEMERAL_KIND],
+            "#r": [shared.room_handle.clone()],
+            "#p": [shared.device_id.clone(), shared.room_handle.clone()],
+        }),
+    ];
+    if compat {
+        filters.push(serde_json::json!({
+            "kinds": [SIGNALING_EPHEMERAL_KIND],
+            "#r": [shared.room_handle.clone()],
+        }));
+    }
+    filters
+}
+
+/// Serialize the room REQ for `desired_filters`.
+fn build_req(shared: &DriverShared, sub_id: &str, compat: bool) -> String {
+    let mut arr = vec![
+        Value::String("REQ".to_string()),
+        Value::String(sub_id.to_string()),
+    ];
+    arr.extend(desired_filters(shared, compat));
+    Value::Array(arr).to_string()
+}
+
+/// Deterministic ±15% jitter on a timer, seeded from the device id and a
+/// per-use salt, so co-restarted nodes (a site-wide power blip, a relay
+/// outage ending) don't fire their timers in lockstep forever. Pure —
+/// same inputs, same wait — which keeps tests exact.
+fn jittered_ms(base_ms: u64, seed: &str, salt: u64) -> u64 {
+    use sha2::{Digest, Sha256};
+    if base_ms == 0 {
+        return 0;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update(salt.to_le_bytes());
+    let digest = hasher.finalize();
+    let raw = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
+    // Map to [-15%, +15%] of base.
+    let span = base_ms * 30 / 100;
+    if span == 0 {
+        return base_ms;
+    }
+    let offset = raw % (span + 1);
+    base_ms - (base_ms * 15 / 100) + offset
 }
 
 /// Window size of `seen_event_ids` — re-exported from
@@ -351,7 +467,6 @@ async fn run_relay(
     live: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) {
     let mut backoff_attempt = 0u32;
-    let mut replay = SubscriptionReplay::new();
     // Receiver for forced reconnects. `borrow_and_update` marks the
     // current generation as seen so a stale value from before this
     // task started can't fire a spurious immediate reconnect.
@@ -396,16 +511,9 @@ async fn run_relay(
                 if let Some(c) = &live {
                     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                let outcome = run_relay_session(
-                    &url,
-                    stream,
-                    &shared,
-                    &inbound_tx,
-                    &mut replay,
-                    &cancel,
-                    &mut force_rx,
-                )
-                .await;
+                let outcome =
+                    run_relay_session(&url, stream, &shared, &inbound_tx, &cancel, &mut force_rx)
+                        .await;
                 if let Some(c) = &live {
                     c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -437,15 +545,18 @@ async fn run_relay(
             return;
         }
         // Reconnect backoff: 2 / 4 / 8 / 16 / 32 s capped at 60 s — the
-        // increment precedes the shift, so a 1 s wait is unreachable. A
-        // forced-reconnect bump cuts the wait short so resume-from-sleep
+        // increment precedes the shift, so a 1 s wait is unreachable —
+        // then jittered ±15% per node so a shared outage (relay restart,
+        // site-wide blip) doesn't recover as a synchronized redial herd.
+        // A forced-reconnect bump cuts the wait short so resume-from-sleep
         // recovery doesn't sit through a backoff that accrued while the
         // host was suspended.
         backoff_attempt = (backoff_attempt + 1).min(6);
-        let wait = (1u64 << backoff_attempt).min(60);
-        debug!(relay = %short(&url), wait_s = wait, "relay backoff before reconnect");
+        let base_ms = (1u64 << backoff_attempt).min(60) * 1_000;
+        let wait_ms = jittered_ms(base_ms, &shared.device_id, backoff_attempt as u64);
+        debug!(relay = %short(&url), wait_ms, "relay backoff before reconnect");
         tokio::select! {
-            _ = sleep(Duration::from_secs(wait)) => {}
+            _ = sleep(Duration::from_millis(wait_ms)) => {}
             _ = force_rx.changed() => {
                 debug!(relay = %short(&url), "forced reconnect during backoff — redialing now");
                 backoff_attempt = 0;
@@ -586,43 +697,33 @@ async fn run_relay_session(
     >,
     shared: &Arc<DriverShared>,
     inbound_tx: &mpsc::UnboundedSender<NostrInbound>,
-    replay: &mut SubscriptionReplay,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     force_rx: &mut watch::Receiver<u64>,
 ) -> RelaySessionOutcome {
     let (mut write, mut read) = stream.split();
 
-    // Open subscription for the room handle. We subscribe to both
-    // signaling kinds in one REQ:
-    //   - SIGNALING_EVENT_KIND (stored): presence announces. The
-    //     `since` window replays the last few minutes so a late
-    //     joiner discovers everyone already here.
-    //   - SIGNALING_EPHEMERAL_KIND (not stored): live offer/answer/
-    //     candidate. The relay has nothing to replay for these, so
-    //     `since` is a no-op for them — they only ever arrive live.
-    // The window therefore governs presence replay only; connection
-    // negotiation is never replayed, which is the whole point of the
-    // ephemeral kind (see `event::SIGNALING_EPHEMERAL_KIND`).
+    // Open the room subscription — one REQ, several filters (see
+    // `desired_filters`):
+    //   - presence on the stored kind, with a `since` window that
+    //     replays the last few minutes so a late joiner discovers
+    //     everyone already here;
+    //   - directed-to-me negotiation on the ephemeral kind (`#p` us);
+    //   - while any peer in the room predates recipient tags, a
+    //     legacy catch-all for untagged negotiation.
+    // Ephemeral events are never stored, so `since` governs presence
+    // replay only — negotiation always arrives live (see
+    // `event::SIGNALING_EPHEMERAL_KIND`).
     let sub_id = "mom-sig-1";
-    let req = serde_json::json!([
-        "REQ",
-        sub_id,
-        {
-            "kinds": [SIGNALING_EVENT_KIND, SIGNALING_EPHEMERAL_KIND],
-            "#r": [shared.room_handle.clone()],
-            "since": now_secs().saturating_sub(PRESENCE_REPLAY_WINDOW_SECS),
-        }
-    ]);
-    let req_text = req.to_string();
-    let _ = replay.observe_send(&req_text);
+    // Watch the subscription-shape signal; `borrow_and_update` seeds the
+    // shape this session subscribes with and marks it seen, so only a
+    // *later* flip re-issues the REQ.
+    let mut compat_rx = shared.compat_directed.subscribe();
+    let mut compat = *compat_rx.borrow_and_update();
+    let req_text = build_req(shared, sub_id, compat);
 
-    if let Err(e) = write.send(WsMessage::Text(req_text.clone())).await {
+    if let Err(e) = write.send(WsMessage::Text(req_text)).await {
         return RelaySessionOutcome::Error(format!("send REQ: {e}"));
     }
-
-    // Mark the socket as opened so the replay layer knows.
-    let _decision = replay.on_open();
-    replay.record_replay();
 
     // Subscribe to the broadcast so outbound events fan to this socket.
     // Announce ticking lives in `run_announcer` — one shared task
@@ -719,6 +820,23 @@ async fn run_relay_session(
             _ = force_rx.changed() => {
                 return RelaySessionOutcome::ForcedReconnect;
             }
+            // The room's directed-subscription shape changed (a legacy
+            // peer appeared, or the last one left). Re-issue the REQ
+            // under the same sub id — NIP-01 replaces the filters in
+            // place, no unsubscribe round-trip needed.
+            changed = compat_rx.changed() => {
+                if changed.is_ok() {
+                    let now_compat = *compat_rx.borrow_and_update();
+                    if now_compat != compat {
+                        compat = now_compat;
+                        let req_text = build_req(shared, sub_id, compat);
+                        debug!(relay = %short(url), compat, "re-issuing room REQ (subscription shape changed)");
+                        if let Err(e) = write.send(WsMessage::Text(req_text)).await {
+                            return RelaySessionOutcome::Error(format!("send REQ: {e}"));
+                        }
+                    }
+                }
+            }
             // Idle-wake so a stopped/dropped handle is noticed within one
             // poll interval even on a quiet socket. Without this, a
             // `read.next()` parked on an idle connection could hold the
@@ -752,10 +870,21 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         // relays are currently connected.
         let _ = shared.publish_tx.send(Arc::new(event));
 
-        let wait_ms = ANNOUNCE_BACKOFF_MS
+        let base_ms = ANNOUNCE_BACKOFF_MS
             .get(count)
             .copied()
             .unwrap_or(ANNOUNCE_STEADY_MS);
+        // Jitter the steady cadence (±15%) so nodes that came up together
+        // — a site restoring power, a fleet rebooting after an update —
+        // don't publish their presence in the same instant every cycle
+        // forever. The dense early schedule stays exact: it exists to make
+        // a fresh joiner visible fast, and determinism there keeps tests
+        // and traces legible.
+        let wait_ms = if base_ms == ANNOUNCE_STEADY_MS {
+            jittered_ms(base_ms, &shared.device_id, count as u64)
+        } else {
+            base_ms
+        };
         count = count.saturating_add(1);
 
         // Cancellation-aware sleep: chunked at 1s so a stop()
@@ -838,7 +967,7 @@ fn handle_inbound_frame(
             // an ephemeral event) and is dropped rather than applied
             // as a remote description against dead ICE credentials.
             match envelope.msg {
-                SignalingMessage::Announce { peer_id } => {
+                SignalingMessage::Announce { peer_id, caps } => {
                     if event.kind != SIGNALING_EVENT_KIND {
                         trace!(
                             relay = %short(url),
@@ -850,6 +979,14 @@ fn handle_inbound_frame(
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
+                    // Track whether this peer tags its directed events; the
+                    // room-wide verdict decides whether our subscription
+                    // still needs the legacy catch-all filter.
+                    {
+                        let ptag = caps.iter().any(|c| c == SIG_CAP_PTAG);
+                        shared.room_caps.lock().insert(peer_id.clone(), ptag);
+                    }
+                    recompute_compat(shared);
                     let _ = inbound_tx.send(NostrInbound::PeerAnnounced { device_id: peer_id });
                 }
                 SignalingMessage::Leave { peer_id } => {
@@ -867,6 +1004,11 @@ fn handle_inbound_frame(
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
+                    // The departed peer no longer votes on the room's
+                    // subscription shape — the last legacy peer leaving is
+                    // exactly when the catch-all filter can narrow away.
+                    shared.room_caps.lock().remove(&peer_id);
+                    recompute_compat(shared);
                     let _ = inbound_tx.send(NostrInbound::PeerLeft { device_id: peer_id });
                 }
                 other => {
@@ -909,12 +1051,17 @@ struct SignalingEnvelope {
     msg: SignalingMessage,
 }
 
+/// The one announce builder — the periodic ticker, the per-session
+/// open-announce, and the engine-driven reactive announce all publish
+/// exactly this event, so there is a single place the announce's shape
+/// (and its advertised signaling caps) can ever change.
 fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     let envelope = SignalingEnvelope {
         from: shared.device_id.clone(),
         to: None,
         msg: SignalingMessage::Announce {
             peer_id: shared.device_id.clone(),
+            caps: vec![SIG_CAP_PTAG.to_string()],
         },
     };
     make_event(
@@ -980,47 +1127,65 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
         // Presence rides the stored kind; directed negotiation rides
         // the ephemeral kind so it's never replayed onto a future
         // session. The kind is chosen by message class, not content.
-        let (envelope, kind) = match outbound {
+        let (event, kind) = match outbound {
+            // Same builder as the ticker and the open-announce — one
+            // announce shape, one place to change it.
             NostrOutbound::Announce => (
-                SignalingEnvelope {
-                    from: shared.device_id.clone(),
-                    to: None,
-                    msg: SignalingMessage::Announce {
-                        peer_id: shared.device_id.clone(),
-                    },
-                },
+                Arc::new(build_announce_event(&shared)),
                 SIGNALING_EVENT_KIND,
             ),
             // A departure is a broadcast (no `to`) on the ephemeral kind —
             // same envelope shape an intelligent signaling server synthesises
             // on a socket close (see `server::build_leave_event`), so
             // receivers handle a self-announced leave identically.
-            NostrOutbound::Leave => (
-                SignalingEnvelope {
+            NostrOutbound::Leave => {
+                let envelope = SignalingEnvelope {
                     from: shared.device_id.clone(),
                     to: None,
                     msg: SignalingMessage::Leave {
                         peer_id: shared.device_id.clone(),
                     },
-                },
-                SIGNALING_EPHEMERAL_KIND,
-            ),
-            NostrOutbound::DirectedToPeer { to, msg } => (
-                SignalingEnvelope {
+                };
+                // Broadcast ephemerals are "addressed to the room": the
+                // `["p", room_handle]` tag is what keeps a departure
+                // visible to peers whose subscription has narrowed to
+                // recipient-tagged events only (see `desired_filters`).
+                let event = make_event(
+                    &shared.identity,
+                    SIGNALING_EPHEMERAL_KIND,
+                    vec![
+                        vec!["r".into(), shared.room_handle.clone()],
+                        vec!["p".into(), shared.room_handle.clone()],
+                    ],
+                    serde_json::to_string(&envelope).expect("serialize ok"),
+                    now_secs(),
+                );
+                (Arc::new(event), SIGNALING_EPHEMERAL_KIND)
+            }
+            // Directed negotiation carries its recipient both in the
+            // envelope (`to`, the receive-side check) and as a `["p", …]`
+            // tag — the tag is what lets subscribers narrow their REQ to
+            // "directed to me" so the relay stops fanning every pairwise
+            // negotiation to the whole room. See `SIG_CAP_PTAG`.
+            NostrOutbound::DirectedToPeer { to, msg } => {
+                let envelope = SignalingEnvelope {
                     from: shared.device_id.clone(),
-                    to: Some(to),
+                    to: Some(to.clone()),
                     msg,
-                },
-                SIGNALING_EPHEMERAL_KIND,
-            ),
+                };
+                let event = make_event(
+                    &shared.identity,
+                    SIGNALING_EPHEMERAL_KIND,
+                    vec![
+                        vec!["r".into(), shared.room_handle.clone()],
+                        vec!["p".into(), to],
+                    ],
+                    serde_json::to_string(&envelope).expect("serialize ok"),
+                    now_secs(),
+                );
+                (Arc::new(event), SIGNALING_EPHEMERAL_KIND)
+            }
         };
-        let event = Arc::new(make_event(
-            &shared.identity,
-            kind,
-            vec![vec!["r".into(), shared.room_handle.clone()]],
-            serde_json::to_string(&envelope).expect("serialize ok"),
-            now_secs(),
-        ));
         // Fan out to every connected relay session via the
         // broadcast bus. Sessions that aren't subscribed yet
         // (still connecting / reconnecting) will pick up the
@@ -1108,6 +1273,7 @@ mod tests {
             to: Some("self-device".into()),
             msg: SignalingMessage::Announce {
                 peer_id: format!("p{n}"),
+                caps: Vec::new(),
             },
         };
         Arc::new(crate::nostr::event::make_event(
@@ -1173,6 +1339,8 @@ mod tests {
                 SEEN_EVENT_CAPACITY,
             )),
             outbound_replay: Mutex::new(std::collections::VecDeque::new()),
+            room_caps: Mutex::new(std::collections::HashMap::new()),
+            compat_directed: Arc::new(watch::channel(true).0),
         })
     }
 
@@ -1186,6 +1354,7 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer.into(),
+                caps: Vec::new(),
             },
         };
         let content = serde_json::to_string(&envelope).unwrap();
@@ -1252,6 +1421,7 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
+                caps: Vec::new(),
             },
         };
         let ev2 = crate::nostr::event::make_event(
@@ -1380,6 +1550,7 @@ mod tests {
             to: None,
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
+                caps: Vec::new(),
             },
         };
         let ev = crate::nostr::event::make_event(
@@ -1399,5 +1570,120 @@ mod tests {
             rx.try_recv().is_err(),
             "an announce on the ephemeral kind must be dropped"
         );
+    }
+
+    /// An announce frame from `peer` advertising the given signaling caps.
+    fn announce_frame_with_caps(peer: &str, signer: &NostrIdentity, caps: &[&str]) -> String {
+        let envelope = SignalingEnvelope {
+            from: peer.into(),
+            to: None,
+            msg: SignalingMessage::Announce {
+                peer_id: peer.into(),
+                caps: caps.iter().map(|s| s.to_string()).collect(),
+            },
+        };
+        let event = crate::nostr::event::make_event(
+            signer,
+            SIGNALING_EVENT_KIND,
+            vec![vec!["r".into(), "test-room".into()]],
+            serde_json::to_string(&envelope).unwrap(),
+            1_700_000_000,
+        );
+        serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
+    }
+
+    #[test]
+    fn desired_filters_narrow_when_compat_off() {
+        let shared = fixture_shared();
+        let wide = desired_filters(&shared, true);
+        assert_eq!(wide.len(), 3, "compat keeps the legacy catch-all filter");
+        assert!(
+            wide[2].get("#p").is_none(),
+            "the catch-all filter has no recipient constraint"
+        );
+        let narrow = desired_filters(&shared, false);
+        assert_eq!(narrow.len(), 2, "narrowed shape: presence + directed-to-me");
+        assert_eq!(
+            narrow[1]["#p"][0], "self-device",
+            "the directed filter names us as the recipient"
+        );
+        assert_eq!(
+            narrow[0]["kinds"][0],
+            serde_json::json!(SIGNALING_EVENT_KIND),
+            "presence filter carries the stored kind"
+        );
+    }
+
+    #[test]
+    fn compat_narrows_only_when_every_announced_peer_tags() {
+        let shared = fixture_shared();
+        assert!(
+            *shared.compat_directed.borrow(),
+            "empty room keeps compat on (no evidence)"
+        );
+
+        let a = NostrIdentity::generate();
+        let b = NostrIdentity::generate();
+        let (tx, _rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        // One tagging peer: narrows (they're the whole room).
+        let frame = announce_frame_with_caps(a.pubkey_hex(), &a, &[SIG_CAP_PTAG]);
+        handle_inbound_frame("wss://r", &frame, &shared, &tx).unwrap();
+        assert!(
+            !*shared.compat_directed.borrow(),
+            "all-tagging room narrows"
+        );
+
+        // A legacy peer announces: widen again.
+        let frame = announce_frame_with_caps(b.pubkey_hex(), &b, &[]);
+        handle_inbound_frame("wss://r", &frame, &shared, &tx).unwrap();
+        assert!(
+            *shared.compat_directed.borrow(),
+            "legacy peer forces the catch-all back on"
+        );
+
+        // The legacy peer leaves: narrow once more.
+        shared.room_caps.lock().remove(b.pubkey_hex());
+        recompute_compat(&shared);
+        assert!(
+            !*shared.compat_directed.borrow(),
+            "compat drops when the last legacy peer departs"
+        );
+    }
+
+    #[test]
+    fn build_req_replaces_same_sub_id() {
+        let shared = fixture_shared();
+        let req = build_req(&shared, "mom-sig-1", false);
+        let v: Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(v[0], "REQ");
+        assert_eq!(v[1], "mom-sig-1");
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            2 + 2,
+            "REQ + sub id + two filters when narrowed"
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_15_percent_and_is_deterministic() {
+        for salt in 0..64u64 {
+            let w = jittered_ms(120_000, "some-device", salt);
+            assert!((102_000..=138_000).contains(&w), "±15% bound, got {w}");
+            assert_eq!(
+                w,
+                jittered_ms(120_000, "some-device", salt),
+                "same inputs, same wait"
+            );
+        }
+        // Different nodes land on different offsets (not all identical).
+        let a = jittered_ms(120_000, "device-a", 1);
+        let b = jittered_ms(120_000, "device-b", 1);
+        let c = jittered_ms(120_000, "device-c", 1);
+        assert!(
+            !(a == b && b == c),
+            "three nodes shouldn't share one jitter offset"
+        );
+        assert_eq!(jittered_ms(0, "x", 0), 0, "zero base stays zero");
     }
 }

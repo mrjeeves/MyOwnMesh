@@ -714,13 +714,19 @@ fn presence_of(ev: &NostrEvent) -> Option<(String, String)> {
 
 /// Build a signed `leave` event for a departed device in a room. Mirrors
 /// the envelope shape the driver expects: `{from, kind:"leave", peer_id}`
-/// on the ephemeral kind.
+/// on the ephemeral kind. Tagged `["p", room]` — broadcast ephemerals are
+/// "addressed to the room" — so drivers whose subscription has narrowed
+/// to recipient-tagged events (see the driver's `desired_filters`) still
+/// hear the departure.
 fn build_leave_event(identity: &NostrIdentity, room: &str, device: &str) -> NostrEvent {
     let envelope = json!({ "from": device, "kind": "leave", "peer_id": device });
     make_event(
         identity,
         SIGNALING_EPHEMERAL_KIND,
-        vec![vec!["r".to_string(), room.to_string()]],
+        vec![
+            vec!["r".to_string(), room.to_string()],
+            vec!["p".to_string(), room.to_string()],
+        ],
         envelope.to_string(),
         now_secs(),
     )
@@ -963,5 +969,12 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.len() >= 2 && t[0] == "r" && t[1] == "room-a"));
+        assert!(
+            leave
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == "room-a"),
+            "synthesized leave is room-addressed so narrowed subscriptions match it"
+        );
     }
 }

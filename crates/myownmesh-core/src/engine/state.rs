@@ -59,12 +59,19 @@ pub struct InboundAudioSample {
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectIntent {
     /// Stop retrying after this instant (drop time + `RECONNECTING_GRACE_MS`).
+    /// A sticky intent ignores this — see [`ReconnectIntent::sticky`].
     pub give_up_at: std::time::Instant,
     /// Earliest instant for the next re-offer; advanced by the backoff each
     /// time the tick services this intent.
     pub next_retry_at: std::time::Instant,
     /// Number of re-offers issued so far — indexes `RECONNECT_RETRY_BACKOFF_MS`.
     pub attempt: usize,
+    /// A pinned peer's intent: never expires, and once the active backoff
+    /// schedule is spent it parks (no more tick-driven re-offers) and waits
+    /// for the peer's next announce to dial — the recovery loop a support
+    /// session needs on a Silent network, without endless blind offers to
+    /// a peer that may be off for the weekend.
+    pub sticky: bool,
 }
 
 /// Bump a reconnect intent's backoff after a re-offer: advance the attempt
@@ -123,7 +130,28 @@ pub enum NetworkCmd {
     /// answering an inbound offer. Idempotent — a no-op if a live session
     /// already exists; upgrades a discovery-only `Sighted` placeholder to a
     /// real session otherwise.
-    ConnectPeer { device_id: String },
+    ConnectPeer {
+        device_id: String,
+        /// Record a standing dial for this peer (see
+        /// [`NetworkState::sticky_peers`]) so the engine keeps
+        /// re-establishing the link across drops and announces.
+        sticky: bool,
+        /// When present, resolved once the peer reaches ACTIVE (or
+        /// with the reason on a terminal failure). `None` preserves
+        /// the fire-and-forget contract.
+        reply: Option<oneshot::Sender<Result<()>>>,
+    },
+    /// Queue a channel frame for acknowledged delivery (see
+    /// [`super::reliable`]): parked until the peer's link is up,
+    /// retransmitted across session rebuilds, resolved on the peer's
+    /// cumulative ack (or with an error at TTL / terminal failure).
+    SendChannelReliable {
+        peer: String,
+        channel: String,
+        payload: serde_json::Value,
+        ttl_ms: Option<u64>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
     /// one peer.
     SendChannelFrame {
@@ -342,6 +370,38 @@ pub struct NetworkState {
     /// on a backoff for the cases no event covers.
     pub reconnect_intents: Mutex<std::collections::HashMap<String, ReconnectIntent>>,
 
+    /// Peers this node maintains a standing dial for (config
+    /// `pinned_peers` plus runtime `connect_peer(…, sticky)`). On a
+    /// Silent network a pinned peer is dialed whenever it announces —
+    /// the one exception to "Silent never auto-dials" — and its
+    /// reconnect intent never expires. See `handle_signaling_inbound`.
+    pub sticky_peers: Mutex<std::collections::HashSet<String>>,
+
+    /// Acked-delivery outboxes, one per peer with frames pending (see
+    /// [`super::reliable`]). Driver-serial like all engine state; the
+    /// mutex guards snapshot readers only.
+    pub(crate) reliable_out: Mutex<std::collections::HashMap<String, super::reliable::Outbox>>,
+
+    /// Receive-side high-water marks for acked delivery, one per peer
+    /// that has sent us `channel_seq` frames.
+    pub(crate) reliable_in: Mutex<std::collections::HashMap<String, super::reliable::InboundMark>>,
+
+    /// Routed-frame dedup ring: `(origin, frame id)` pairs already
+    /// delivered/forwarded, so flood cross-paths and retransmits are
+    /// dropped at the door. Bounded at
+    /// [`super::routing::ROUTING_SEEN_CAPACITY`].
+    pub(crate) routing_seen: Mutex<std::collections::VecDeque<(String, u64)>>,
+
+    /// Per-network traffic accounting (see [`super::traffic`]) —
+    /// written from the frame chokepoints, read by the status surface.
+    pub traffic: super::traffic::TrafficCounters,
+
+    /// Callers waiting for a specific peer to reach ACTIVE (the
+    /// `connect_peer_wait` contract). Resolved on the mutual-approve
+    /// transition; failed on terminal drops and shutdown.
+    pub(crate) connect_waiters:
+        Mutex<std::collections::HashMap<String, Vec<oneshot::Sender<Result<()>>>>>,
+
     /// Last time we reflected a peer's announce with one of our
     /// own. Rate-limited so a room with N peers all reacting to
     /// each other's announces doesn't degenerate into a publish
@@ -425,6 +485,11 @@ impl NetworkState {
         mpsc::UnboundedReceiver<NetworkCmd>,
     )> {
         let topology_impl = crate::topology::from_mode(&config.topology);
+        // Standing dials survive restarts by riding the network config —
+        // the daemon re-joins with the same `pinned_peers`, and this seed
+        // re-arms them without any runtime re-pinning.
+        let pinned: std::collections::HashSet<String> =
+            config.pinned_peers.iter().cloned().collect();
         let roster = crate::roster::load(&config.network_id)?;
         // Load (or initialise) the per-network signed state log. If
         // the config requests Closed kind but the on-disk log says
@@ -478,6 +543,12 @@ impl NetworkState {
             cmd_tx,
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
+            sticky_peers: Mutex::new(pinned),
+            reliable_out: Mutex::new(std::collections::HashMap::new()),
+            reliable_in: Mutex::new(std::collections::HashMap::new()),
+            routing_seen: Mutex::new(std::collections::VecDeque::new()),
+            traffic: super::traffic::TrafficCounters::default(),
+            connect_waiters: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
             relay_reconnect: Mutex::new(None),
@@ -508,16 +579,18 @@ impl NetworkState {
     /// forever. A genuine reconnect clears the intent
     /// ([`clear_reconnect_intent`](Self::clear_reconnect_intent) on
     /// `DataChannelOpen`), so the next loss opens a fresh window.
-    pub fn record_reconnect_intent(&self, device_id: &str) {
+    pub fn record_reconnect_intent(&self, device_id: &str, sticky: bool) {
         let now = std::time::Instant::now();
-        self.reconnect_intents
-            .lock()
-            .entry(device_id.to_string())
-            .or_insert(ReconnectIntent {
-                give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
-                next_retry_at: now,
-                attempt: 0,
-            });
+        let mut map = self.reconnect_intents.lock();
+        let intent = map.entry(device_id.to_string()).or_insert(ReconnectIntent {
+            give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
+            next_retry_at: now,
+            attempt: 0,
+            sticky,
+        });
+        // A pin arriving while a plain intent is mid-backoff upgrades it —
+        // stickiness must not be lost to entry order.
+        intent.sticky = intent.sticky || sticky;
     }
 
     /// Forget a reconnect intent — the link is back (or the peer was
@@ -537,13 +610,20 @@ impl NetworkState {
     pub fn due_reconnect_intents(&self) -> Vec<String> {
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
-        map.retain(|_, i| now < i.give_up_at);
+        map.retain(|_, i| i.sticky || now < i.give_up_at);
         let mut due = Vec::new();
         for (id, intent) in map.iter_mut() {
-            if now >= intent.next_retry_at {
-                due.push(id.clone());
-                advance_backoff(intent, now);
+            if now < intent.next_retry_at {
+                continue;
             }
+            // A sticky intent past its active schedule parks: the entry
+            // stays (so the peer's next announce dials immediately) but
+            // the tick stops issuing blind offers into the void.
+            if intent.sticky && intent.attempt >= RECONNECT_RETRY_BACKOFF_MS.len() + 2 {
+                continue;
+            }
+            due.push(id.clone());
+            advance_backoff(intent, now);
         }
         due
     }
@@ -555,7 +635,7 @@ impl NetworkState {
     pub fn flush_reconnect_intents(&self) -> Vec<String> {
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
-        map.retain(|_, i| now < i.give_up_at);
+        map.retain(|_, i| i.sticky || now < i.give_up_at);
         for intent in map.values_mut() {
             advance_backoff(intent, now);
         }
@@ -1028,6 +1108,16 @@ impl NetworkState {
             let _ = s.close().await;
         }
         self.peers.clear();
+        // Nothing outlives the engine: parked connect waits and queued
+        // reliable sends resolve with the truth instead of hanging.
+        let waiting: Vec<String> = self.connect_waiters.lock().keys().cloned().collect();
+        for peer in waiting {
+            self.resolve_connect_waiters(&peer, Some("network shut down"));
+        }
+        let queued: Vec<String> = self.reliable_out.lock().keys().cloned().collect();
+        for peer in queued {
+            super::reliable::fail_peer(self, &peer, "network shut down");
+        }
     }
 
     /// Broadcast a graceful departure so peers drop our session immediately
@@ -1062,7 +1152,114 @@ impl NetworkState {
     pub fn connect_peer(&self, device_id: &str) {
         let _ = self.cmd_tx.send(NetworkCmd::ConnectPeer {
             device_id: device_id.to_string(),
+            sticky: false,
+            reply: None,
         });
+    }
+
+    /// Deliberately dial one peer and resolve when the link reaches
+    /// ACTIVE (or fail with the terminal reason). `sticky` records a
+    /// standing dial: the engine re-dials on every announce and holds a
+    /// never-expiring reconnect intent — the "support session" contract
+    /// on a Silent network. The returned future is bounded only by the
+    /// caller's own timeout.
+    pub async fn connect_peer_wait(&self, device_id: &str, sticky: bool) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(NetworkCmd::ConnectPeer {
+                device_id: device_id.to_string(),
+                sticky,
+                reply: Some(reply),
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped the connect wait".into()))?
+    }
+
+    /// Queue a frame for acknowledged delivery to `peer` — see
+    /// [`NetworkCmd::SendChannelReliable`] for the contract. Resolves on
+    /// the peer's ack; errs on TTL expiry, outbox backpressure, or
+    /// terminal peer failure.
+    pub async fn send_channel_reliable(
+        &self,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+        ttl_ms: Option<u64>,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(NetworkCmd::SendChannelReliable {
+                peer: peer.to_string(),
+                channel: channel.to_string(),
+                payload,
+                ttl_ms,
+                reply,
+            })
+            .map_err(|_| Error::Network("engine command queue closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Network("engine dropped the reliable send".into()))?
+    }
+
+    /// Point-in-time traffic accounting for this network, with the
+    /// acked-delivery backlog folded in — the number an operator (or a
+    /// topology experiment) compares across configurations.
+    pub fn traffic_snapshot(&self) -> super::traffic::TrafficSnapshot {
+        let mut snap = self.traffic.snapshot();
+        snap.reliable_pending = super::reliable::pending_total(self) as u64;
+        snap
+    }
+
+    /// Whether `device_id` has a standing dial (config pin or runtime
+    /// `connect_peer(…, sticky)`).
+    pub fn is_sticky(&self, device_id: &str) -> bool {
+        self.sticky_peers.lock().contains(device_id)
+    }
+
+    /// Record a standing dial for `device_id`, mirrored into the live
+    /// config's `pinned_peers` so a config read-back (and the daemon's
+    /// persistence of it) carries the pin across restarts.
+    pub fn add_sticky(&self, device_id: &str) {
+        self.sticky_peers.lock().insert(device_id.to_string());
+        let mut cfg = self.config.write();
+        if !cfg.pinned_peers.iter().any(|p| p == device_id) {
+            cfg.pinned_peers.push(device_id.to_string());
+        }
+    }
+
+    /// Drop a standing dial (and its never-expiring intent), e.g. when
+    /// the app "forgets" the peer.
+    pub fn remove_sticky(&self, device_id: &str) {
+        self.sticky_peers.lock().remove(device_id);
+        self.config.write().pinned_peers.retain(|p| p != device_id);
+        self.reconnect_intents.lock().remove(device_id);
+    }
+
+    /// Park a waiter to be resolved when `device_id` reaches ACTIVE.
+    pub(crate) fn register_connect_waiter(
+        &self,
+        device_id: &str,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        self.connect_waiters
+            .lock()
+            .entry(device_id.to_string())
+            .or_default()
+            .push(reply);
+    }
+
+    /// Resolve every waiter parked on `device_id`. `error == None`
+    /// resolves Ok; otherwise each waiter gets the reason.
+    pub(crate) fn resolve_connect_waiters(&self, device_id: &str, error: Option<&str>) {
+        let waiters = self.connect_waiters.lock().remove(device_id);
+        let Some(waiters) = waiters else { return };
+        for w in waiters {
+            let result = match error {
+                None => Ok(()),
+                Some(e) => Err(Error::Network(format!("connect {device_id}: {e}"))),
+            };
+            let _ = w.send(result);
+        }
     }
 
     /// True when this network's governance kind is `Silent`. The load-bearing

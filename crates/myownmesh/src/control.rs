@@ -149,6 +149,18 @@ pub enum Request {
     NetworkConnectPeer {
         network: String,
         peer: String,
+        /// Record a standing dial: the engine redials this peer on
+        /// every announce (even on a Silent network) and holds a
+        /// never-expiring reconnect intent, persisted with the network
+        /// config. The shape a support session needs to survive the
+        /// far end sleeping or rebooting.
+        #[serde(default)]
+        pin: bool,
+        /// When > 0, wait up to this long for the peer to reach
+        /// ACTIVE and report the real outcome, instead of returning
+        /// as soon as the dial is queued.
+        #[serde(default)]
+        wait_ms: u64,
     },
     /// Snapshot which infrastructure services this device hosts
     /// (relay / signaling / STUN / TURN): live runtime status plus the
@@ -370,6 +382,21 @@ pub enum Request {
         channel: String,
         peer: String,
         payload: serde_json::Value,
+    },
+    /// Send a frame on a typed channel under the acknowledged-delivery
+    /// contract: queued until the peer's link is up, retransmitted
+    /// across session rebuilds, resolved when the peer's engine has
+    /// delivered it (or with an error at TTL / terminal failure). The
+    /// primitive that replaces application-level retransmit loops.
+    ChannelSendReliable {
+        network: String,
+        channel: String,
+        peer: String,
+        payload: serde_json::Value,
+        /// Milliseconds before an undelivered frame expires (0 = the
+        /// engine default).
+        #[serde(default)]
+        ttl_ms: u64,
     },
     /// Broadcast a frame on a typed channel to every active
     /// peer. Returns the number of peers the send was
@@ -944,9 +971,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             info!(%network, ?peer, "control: network_reconnect");
             network_reconnect(state, &network, peer)
         }
-        Request::NetworkConnectPeer { network, peer } => {
-            info!(%network, %peer, "control: network_connect_peer");
-            network_connect_peer(state, &network, &peer).await
+        Request::NetworkConnectPeer {
+            network,
+            peer,
+            pin,
+            wait_ms,
+        } => {
+            info!(%network, %peer, pin, wait_ms, "control: network_connect_peer");
+            network_connect_peer(state, &network, &peer, pin, wait_ms).await
         }
 
         // ---- self-update ----
@@ -1355,6 +1387,27 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             }
         }
 
+        Request::ChannelSendReliable {
+            network,
+            channel,
+            peer,
+            payload,
+            ttl_ms,
+        } => {
+            let Some(net) = state.registry.get(&network) else {
+                return Response::err(format!("unknown network: {network}"));
+            };
+            let ttl = if ttl_ms == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ttl_ms))
+            };
+            match net.send_reliable(&peer, &channel, payload, ttl).await {
+                Ok(()) => Response::ok(serde_json::json!({ "delivered": true })),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
         Request::ChannelSendAll {
             network,
             channel,
@@ -1652,13 +1705,47 @@ fn network_reconnect(state: &Arc<ControlState>, key: &str, peer: Option<String>)
 /// the offerer-side dial on the engine and returns at once (the outcome rides
 /// the event stream), so a daemon client on a `Silent` network can open exactly
 /// one connection after matching a peer's Support ID.
-async fn network_connect_peer(state: &Arc<ControlState>, key: &str, peer: &str) -> Response {
-    match state.registry.get(key) {
-        Some(joined) => match joined.connect_peer(peer).await {
-            Ok(()) => Response::ok(serde_json::json!({ "connecting": peer, "network": key })),
-            Err(e) => Response::err(e.to_string()),
-        },
-        None => Response::err(format!("unknown network: {key}")),
+async fn network_connect_peer(
+    state: &Arc<ControlState>,
+    key: &str,
+    peer: &str,
+    pin: bool,
+    wait_ms: u64,
+) -> Response {
+    let Some(joined) = state.registry.get(key) else {
+        return Response::err(format!("unknown network: {key}"));
+    };
+    let result = if pin || wait_ms > 0 {
+        // Waited/pinned dial: resolves on ACTIVE (or the deadline). A
+        // pin with no wait still uses the waiting path with a minimal
+        // deadline so the sticky flag is recorded engine-side; the
+        // dial itself keeps going either way.
+        let deadline = std::time::Duration::from_millis(wait_ms.max(1));
+        match joined.connect_peer_wait(peer, pin, deadline).await {
+            Ok(()) => Ok(true),
+            Err(e) if wait_ms == 0 => {
+                // Caller didn't ask to wait — a deadline miss is not
+                // an error, just "still connecting".
+                let msg = e.to_string();
+                if msg.contains("still pending") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        joined.connect_peer(peer).await.map(|_| false)
+    };
+    match result {
+        Ok(active) => Response::ok(serde_json::json!({
+            "connecting": peer,
+            "network": key,
+            "pinned": pin,
+            "active": active,
+        })),
+        Err(e) => Response::err(e.to_string()),
     }
 }
 
@@ -1887,8 +1974,35 @@ fn parse_topology(name: &str, hub: Option<&str>) -> std::result::Result<Topology
             })
         }
         "full_mesh" | "fullmesh" => Ok(TopologyMode::FullMesh),
+        "hubs" => {
+            let list = hub.ok_or_else(|| {
+                "hubs topology requires --hub <id[,id…][:redundancy]>".to_string()
+            })?;
+            let (ids, redundancy) = match list.rsplit_once(':') {
+                Some((ids, r)) => (
+                    ids,
+                    Some(r.parse::<u32>().map_err(|_| {
+                        format!("invalid spoke redundancy '{r}' — expected a number")
+                    })?),
+                ),
+                None => (list, None),
+            };
+            let hubs: Vec<String> = ids
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if hubs.is_empty() {
+                return Err("hubs topology requires at least one hub id".into());
+            }
+            Ok(TopologyMode::Hubs {
+                hubs,
+                spoke_redundancy: redundancy,
+            })
+        }
         other => Err(format!(
-            "unknown topology '{other}' — expected ring | star | full_mesh"
+            "unknown topology '{other}' — expected ring | star | hubs | full_mesh"
         )),
     }
 }
@@ -2157,9 +2271,18 @@ mod media_frame_tests {
         let json = r#"{"op":"network_connect_peer","network":"cec-support","peer":"peerpubkey"}"#;
         let req: Request = serde_json::from_str(json).expect("decode network_connect_peer");
         match &req {
-            Request::NetworkConnectPeer { network, peer } => {
+            Request::NetworkConnectPeer {
+                network,
+                peer,
+                pin,
+                wait_ms,
+            } => {
                 assert_eq!(network, "cec-support");
                 assert_eq!(peer, "peerpubkey");
+                // Wire-additive: an old client's op decodes with the
+                // defaults — no pin, no wait.
+                assert!(!pin);
+                assert_eq!(*wait_ms, 0);
             }
             other => panic!("wrong variant: {other:?}"),
         }

@@ -99,6 +99,29 @@ where
             })
     }
 
+    /// Send under the acknowledged-delivery contract: parked until the
+    /// peer's link is up, retransmitted across session rebuilds, and
+    /// resolved when the peer's engine has handed the frame to its
+    /// application layer (or with an error at TTL / terminal failure).
+    /// Unlike [`Self::send_to`], a peer that isn't connected *yet* is a
+    /// reason to queue, not an error — this is the primitive that
+    /// replaces application-level retransmit loops.
+    pub async fn send_to_acked(
+        &self,
+        peer: &str,
+        body: &T,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), ChannelError> {
+        let payload = serde_json::to_value(body)?;
+        self.network
+            .send_channel_reliable(peer, &self.name, payload, ttl.map(|d| d.as_millis() as u64))
+            .await
+            .map_err(|e| match e {
+                crate::error::Error::Transport(msg) => ChannelError::Transport(msg),
+                other => ChannelError::Transport(other.to_string()),
+            })
+    }
+
     /// Broadcast to every active peer. Returns the count of peers
     /// the send was dispatched to (a send-success count, not a
     /// delivery-success count — the underlying data channel is

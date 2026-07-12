@@ -14,6 +14,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use super::Topology;
+use crate::signing;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RingSelector {
@@ -30,6 +31,68 @@ impl Topology for RingSelector {
     fn select_preferred(&self, self_id: &str, peer_ids: &[String]) -> HashSet<String> {
         select_ring_neighbors(self_id, peer_ids, self.n_preferred)
     }
+
+    fn edge(&self, a: &str, b: &str, all: &[String]) -> bool {
+        // An edge exists when either side would prefer the other —
+        // the union keeps one-way shortcuts connected (shelving stays
+        // per-direction, exactly as before). Each side's preferred set
+        // is computed over the full known membership minus itself, so
+        // both nodes evaluate the same function on the same inputs.
+        let others = |me: &str| -> Vec<String> {
+            let mut v: Vec<String> = all.iter().filter(|x| x.as_str() != me).cloned().collect();
+            for extra in [a, b] {
+                if extra != me && !v.iter().any(|x| x == extra) {
+                    v.push(extra.to_string());
+                }
+            }
+            v
+        };
+        select_ring_neighbors(a, &others(a), self.n_preferred).contains(b)
+            || select_ring_neighbors(b, &others(b), self.n_preferred).contains(a)
+    }
+
+    fn prunes(&self) -> bool {
+        true
+    }
+
+    fn forwards(&self, _self_id: &str, _all: &[String]) -> bool {
+        // Everyone forwards on a ring — that's what closes it.
+        true
+    }
+
+    fn next_hops(&self, self_id: &str, dest: &str, connected: &[String]) -> Vec<String> {
+        // Greedy ring routing: hand the frame to the connected peer
+        // lexicographically closest to the destination (the ring is
+        // the sorted id space). The per-node dedup ring and the TTL
+        // make transient disagreement safe.
+        let mut best: Option<(usize, &String)> = None;
+        for c in connected {
+            if signing::pubkey_part(c) == signing::pubkey_part(self_id) {
+                continue;
+            }
+            let d = ring_distance(signing::pubkey_part(c), signing::pubkey_part(dest));
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, c));
+            }
+        }
+        best.map(|(_, c)| vec![c.clone()]).unwrap_or_default()
+    }
+
+    fn flood_ttl(&self) -> u8 {
+        // Half a large ring; dedup terminates the flood well before
+        // this on any realistic membership.
+        32
+    }
+}
+
+/// A cheap, total order-distance between two ids in the sorted id
+/// space: byte-wise common-prefix inversion. Not a metric — just a
+/// deterministic "closer in the ring order" comparator for greedy
+/// forwarding.
+fn ring_distance(a: &str, b: &str) -> usize {
+    let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let max_len = a.len().max(b.len()).max(1);
+    max_len - common.min(max_len)
 }
 
 /// The pure algorithm, exposed for direct testing and reuse.
@@ -194,6 +257,49 @@ mod tests {
             !carol.contains("alice"),
             "carol should NOT pick alice; got {carol:?}"
         );
+    }
+
+    #[test]
+    fn edge_is_symmetric_and_covers_ring_neighbors() {
+        let sel = RingSelector { n_preferred: 3 };
+        let all: Vec<String> = ["alice", "bob", "carol", "dave", "eve", "frank"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        for a in &all {
+            for b in &all {
+                if a == b {
+                    continue;
+                }
+                assert_eq!(
+                    sel.edge(a, b, &all),
+                    sel.edge(b, a, &all),
+                    "edge({a},{b}) must be symmetric"
+                );
+            }
+        }
+        // Immediate sorted-ring neighbors always hold an edge.
+        let mut sorted = all.clone();
+        sorted.sort();
+        for i in 0..sorted.len() {
+            let next = &sorted[(i + 1) % sorted.len()];
+            assert!(
+                sel.edge(&sorted[i], next, &all),
+                "ring neighbors {} and {next} must share an edge",
+                sorted[i]
+            );
+        }
+        assert!(sel.prunes());
+        assert!(sel.forwards("alice", &all));
+    }
+
+    #[test]
+    fn next_hops_picks_the_connected_peer_nearest_the_destination() {
+        let sel = RingSelector { n_preferred: 3 };
+        let connected: Vec<String> = ["bbbb", "cccc"].iter().map(|x| x.to_string()).collect();
+        let hops = sel.next_hops("aaaa", "cccd", &connected);
+        assert_eq!(hops, vec!["cccc".to_string()]);
+        assert!(sel.next_hops("aaaa", "zzzz", &[]).is_empty());
     }
 
     #[test]

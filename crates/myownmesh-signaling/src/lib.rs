@@ -26,6 +26,16 @@ pub mod upstream;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Signaling-layer capability id: the sender stamps a recipient tag on
+/// every ephemeral event it publishes — `["p", <device id>]` on directed
+/// offer / answer / candidate, `["p", <room handle>]` on room-addressed
+/// broadcasts (`leave`) — so subscribers can ask the relay for "directed
+/// to me (or the room)" instead of receiving every pairwise negotiation
+/// in the room. Advertised in the announce's `caps` so receivers know
+/// when the whole room tags — see `nostr::driver` for the adaptive
+/// subscription that drops the legacy catch-all filter once it does.
+pub const SIG_CAP_PTAG: &str = "ptag";
+
 /// One signaling message — either an offer/answer SDP exchange, an
 /// ICE candidate, or the periodic presence-announce. Each carries
 /// the sender's peer-id (Device ID) so receivers route correctly.
@@ -37,6 +47,11 @@ use serde::{Deserialize, Serialize};
 pub enum SignalingMessage {
     Announce {
         peer_id: String,
+        /// Signaling-layer capabilities of the announcing build (e.g.
+        /// [`SIG_CAP_PTAG`]). `default` so pre-caps announces decode as
+        /// an empty list — receivers treat empty as "legacy build".
+        #[serde(default)]
+        caps: Vec<String>,
     },
     Offer {
         peer_id: String,
@@ -73,9 +88,7 @@ pub enum SignalingMessage {
     /// Public relays never synthesise it; on those, a deliberate exit still
     /// self-announces, and an ungraceful one falls back to timeout-based
     /// detection.
-    Leave {
-        peer_id: String,
-    },
+    Leave { peer_id: String },
 }
 
 /// Per-relay health snapshot. Diagnostic-only — surfaced via the

@@ -33,6 +33,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
+        pinned_peers: Vec::new(),
         // `auto_approve = true` makes the wire-level approve frame
         // fire automatically so both peers reach ACTIVE without a
         // user-clicked approve. Reaching ACTIVE now also persists each

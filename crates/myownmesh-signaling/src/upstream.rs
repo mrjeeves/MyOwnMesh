@@ -19,13 +19,16 @@
 //! inbound EVENTs arrive. Natural re-handshake stalls for ~90s until
 //! `forceRediscovery` fires a full room rebuild.
 //!
-//! **Our fix:** Track outgoing `["REQ", subId, …]` / `["CLOSE", subId]`
-//! per relay socket. On every `onopen` *after the first*, replay the
-//! active REQs. Anti-flood schedule: 5s / 10s / 15s / 30s / 60s (sticky
-//! at 60s), reset after 60s of quiet so a long-stable connection that
-//! finally blips doesn't pay the cap.
-//!
-//! Implementation: [`super::nostr::relay::SubscriptionReplay`].
+//! **Our fix:** Every fresh socket session sends its room REQ as the
+//! first thing it does (`run_relay_session`) — subscription state can
+//! never outlive the socket it was opened on, so there is nothing to
+//! "replay" and nothing to forget. Flood control lives at the one
+//! layer that owns reconnection: the per-socket dial backoff in
+//! `run_relay` (2 → 60 s, jittered ±15%). An earlier design carried a
+//! separate REQ-level anti-flood schedule (`SubscriptionReplay`); it
+//! was redundant with the socket backoff — a REQ is only ever sent
+//! when a socket was just established, which the backoff already
+//! paces — and was removed so reconnect pacing has exactly one owner.
 //!
 //! # 2. Treat `ICE-disconnected` as transient
 //!
@@ -111,9 +114,9 @@
 //!
 //! # 7. Adaptive announce cadence
 //!
-//! **Problem:** Trystero's flat 5.333s announce interval
-//! ([`ANNOUNCE_INTERVAL_MS`]) makes new-peer discovery snappy at
-//! startup, but two devices that never grow their mesh keep
+//! **Problem:** Trystero's flat 5.333s announce interval makes
+//! new-peer discovery snappy at startup, but two devices that
+//! never grow their mesh keep
 //! pinging at the same rate forever — one line per peer per ~5s
 //! in the Activity log, indefinitely. Discovery latency drops at
 //! the cost of long-term log + relay traffic, and the trade-off
@@ -126,19 +129,16 @@
 //! room saw 5× the intended publish rate.
 //!
 //! **Our fix:** A single global announcer task per driver instance
-//! runs the schedule in [`ANNOUNCE_BACKOFF_MS`]: dense at startup
-//! (5s × 5, then 10s × 3, then 15s × 4, then 30s × 2 — total
-//! ~3 min of fast cadence), then steady-state at
-//! [`ANNOUNCE_STEADY_MS`] (60s). Per-relay timers go away;
-//! each tick publishes once via the shared broadcast channel and
-//! every connected relay writes the same event from its existing
-//! publish-pump.
-//!
-//! Net effect: a freshly-joined peer is still discovered within
-//! ~5s, but once both ends have settled the announce rate drops
-//! 12× (5s → 60s steady) — and that 12× compounds with the relay
-//! deduplication of item 6, giving a roughly 60× reduction in
-//! observed Activity-log spam vs. the pre-fix behavior.
+//! runs the schedule in [`ANNOUNCE_BACKOFF_MS`]: an immediate
+//! announce at startup, one 30s safety-net re-announce (catching a
+//! silently-failed first publish), then steady-state at
+//! [`ANNOUNCE_STEADY_MS`] (120s, jittered ±15% per node). Per-relay
+//! timers go away; each tick publishes once via the shared broadcast
+//! channel and every connected relay writes the same event from its
+//! existing publish-pump. Discovery latency doesn't ride this
+//! schedule at all anymore: stored-kind replay (item 8) hands a late
+//! joiner every existing peer instantly, and the engine's reactive
+//! announce reflection answers a joiner within ~1s.
 //!
 //! # 8. Presence is stored; connection negotiation is ephemeral
 //!
@@ -173,25 +173,39 @@
 //! handshake. Presence persists; the connection is always live.
 //!
 //! Constant: [`PRESENCE_REPLAY_WINDOW_SECS`].
+//!
+//! # 9. Recipient-tagged negotiation (room-wide O(N²) → O(N))
+//!
+//! **Problem:** The room subscription had no recipient constraint, so
+//! every directed offer / answer / candidate was delivered to *every*
+//! subscriber in the room and filtered client-side against the
+//! envelope's `to`. Per pairwise negotiation that is N−2 wasted
+//! deliveries; during a join wave where many pairs negotiate at once,
+//! relay fan-out grows with the square of the room size — the "the
+//! bigger the network, the worse it runs" cost lived here.
+//!
+//! **Our fix:** Directed ephemeral events carry a `["p", device_id]`
+//! tag naming their recipient, and each peer's REQ carries three
+//! filters: presence, `#p`-is-me negotiation, and — only while some
+//! announced peer predates the tag — a legacy catch-all. Announces
+//! advertise [`crate::SIG_CAP_PTAG`]; once every peer in the room does,
+//! the catch-all filter is dropped (same-sub-id REQ replacement) and
+//! the relay stops fanning pairwise negotiation to bystanders. Mixed
+//! rooms behave exactly as before; the envelope's `to` check remains
+//! as the receive-side backstop either way.
+//!
+//! Implementation: `desired_filters` / `recompute_compat` in
+//! [`super::nostr::driver`].
 
 /// Inbound-message staleness threshold for zombie clearing — see
-/// item 3. Picked at ~5× Trystero's 5.333s announce cadence, well
-/// above any single-relay blip after the subscription-replay fix.
+/// item 3. Picked at ~5× the legacy 5.333s announce cadence, well
+/// above any single-relay blip (every fresh socket re-REQs first
+/// thing, see item 1).
 pub const STALE_INBOUND_MS: u64 = 25_000;
 
 /// Minimum time between offer-pool flushes — see item 4. A wave
 /// of peer drops within this window collapses to one flush.
 pub const OFFER_POOL_FLUSH_THROTTLE_MS: u64 = 10_000;
-
-/// Anti-flood schedule for subscription replays after socket
-/// reconnect — see item 1. Indices saturate at the last value;
-/// reset after [`BACKOFF_RESET_AFTER_MS`] of quiet.
-pub const RESUBSCRIBE_BACKOFF_MS: &[u64] = &[5_000, 10_000, 15_000, 30_000, 60_000];
-
-/// Quiet period after which the resubscribe backoff index resets
-/// to 0. Picked at the max backoff so a long-stable socket doesn't
-/// pay the cap on the next blip.
-pub const BACKOFF_RESET_AFTER_MS: u64 = 60_000;
 
 /// Inbound event-ID dedup ring size — see item 6. Bounded so the
 /// driver never grows unbounded on a long-lived mesh; sized to
@@ -201,11 +215,6 @@ pub const SEEN_EVENT_CAPACITY: usize = 2048;
 /// Disconnected-peer grace window before the engine tears down the
 /// connection. Matches Trystero's `disconnectedPeerGraceMs`.
 pub const DISCONNECTED_PEER_GRACE_MS: u64 = 7_500;
-
-/// Legacy flat-cadence announce interval, retained as a reference
-/// value for tests that still want the upstream-Trystero behavior.
-/// Production paths use the adaptive schedule below.
-pub const ANNOUNCE_INTERVAL_MS: u64 = 5_333;
 
 /// Adaptive announce schedule — see `upstream.rs` item 7.
 ///

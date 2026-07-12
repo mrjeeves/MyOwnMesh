@@ -26,6 +26,7 @@
 //!     stun_servers: Default::default(),
 //!     turn_servers: Default::default(),
 //!     roster_path: None,
+//!     pinned_peers: Vec::new(),
 //!     auto_approve: false,
 //! }).await?;
 //!

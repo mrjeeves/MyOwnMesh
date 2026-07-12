@@ -82,6 +82,12 @@ pub enum DropReason {
     AuthFailed,
     /// User-requested disconnect (network leave, app shutdown).
     UserLeft,
+    /// The topology selector closed a both-sides-shelved connection
+    /// its shape doesn't want (a non-edge under star / hubs / ring
+    /// connection-shaping). Not a failure: the member stays Sighted
+    /// and reachable through the shape's forwarders, and a later
+    /// shape change redials it.
+    TopologyPruned,
     /// Peer went silent past the heartbeat grace; transport
     /// considered dead.
     HeartbeatTimeout,

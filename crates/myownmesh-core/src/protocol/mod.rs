@@ -114,6 +114,31 @@ pub enum MeshMessage {
         /// efficiency can base64-encode into a string field.
         payload: serde_json::Value,
     },
+
+    // -- reliable channel delivery (gated by `reliable_channels_v1`) --
+    /// A channel frame under the acknowledged-delivery contract: one
+    /// entry of the sender's per-peer outbox stream. `stream` is minted
+    /// once per outbox lifetime (a fresh daemon run = a fresh stream) so
+    /// the receiver can tell a retransmit from a reset; `seq` is
+    /// strictly increasing within a stream. Receivers deliver exactly
+    /// once (dropping seqs at or below their high-water mark), then
+    /// acknowledge cumulatively with [`Self::ChannelAck`]. Senders keep
+    /// each entry queued — across session rebuilds — until acked or its
+    /// TTL lapses. See `engine::reliable`.
+    ChannelSeq {
+        stream: u64,
+        seq: u64,
+        channel: String,
+        payload: serde_json::Value,
+    },
+    /// Cumulative acknowledgement for [`Self::ChannelSeq`]: every entry
+    /// of `stream` with `seq <= up_to` has been delivered to the
+    /// receiver's channel router.
+    ChannelAck {
+        stream: u64,
+        up_to: u64,
+    },
+
     /// Unknown frame from a future protocol revision. Captured here
     /// so the receiver's deserializer doesn't fail the whole stream
     /// — the engine forwards Unknown frames as `Diag` events but

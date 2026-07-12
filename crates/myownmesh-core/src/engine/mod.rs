@@ -28,10 +28,13 @@ pub mod ladder;
 pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
+pub mod reliable;
+pub mod routing;
 pub mod scheduler;
 pub mod signaling_bridge;
 pub mod state;
 pub mod tick;
+pub mod traffic;
 pub mod wake;
 
 pub use signaling_bridge::{
@@ -158,7 +161,9 @@ pub async fn run_driver(
     let mut tick_registry = tick::TickRegistry::new()
         .register(tick::IceWatchdogTicker)
         .register(tick::NetworkWatchTicker::new().await)
-        .register(tick::ReconnectSupervisor);
+        .register(tick::ReconnectSupervisor)
+        .register(tick::ReliableSendTicker)
+        .register(tick::TopologyShapeTicker);
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "engine",
@@ -267,7 +272,20 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             Some(device_id) => network_watch::reconnect_peer_in_place(state, &device_id).await,
             None => network_watch::reconnect_all_in_place(state).await,
         },
-        NetworkCmd::ConnectPeer { device_id } => connect_peer(state, &device_id).await,
+        NetworkCmd::ConnectPeer {
+            device_id,
+            sticky,
+            reply,
+        } => connect_peer(state, &device_id, sticky, reply).await,
+        NetworkCmd::SendChannelReliable {
+            peer,
+            channel,
+            payload,
+            ttl_ms,
+            reply,
+        } => {
+            reliable::enqueue(state, &peer, &channel, payload, ttl_ms, reply).await;
+        }
         NetworkCmd::SendChannelFrame {
             peer,
             channel,
@@ -363,6 +381,9 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
     // debug capture the last of these lines names the message being handled
     // when the driver stopped.
     trace!(network = %state.network_id, kind = sig.kind_name(), "driver: signaling inbound");
+    state
+        .traffic
+        .record_signaling_rx(matches!(sig, SignalingInbound::PeerAnnounced { .. }));
     match sig {
         SignalingInbound::PeerAnnounced { device_id } => {
             // Whoever holds the lex-lower id initiates so we don't
@@ -509,9 +530,45 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // inbound Offer is still honoured (that path is not gated), so a
             // peer someone deliberately dials still gets answered.
             if state.is_silent() {
-                note_sighted_without_dialing(state, &device_id);
+                if state.is_sticky(&device_id) {
+                    // The one exception to "Silent never auto-dials": a
+                    // pinned peer (a standing support session) redials on
+                    // its announce, always as the offerer — the far side
+                    // has no pin and would wait forever on lex-order.
+                    ensure_peer_session(state, device_id, Role::Offerer).await;
+                } else {
+                    note_sighted_without_dialing(state, &device_id, "silent network");
+                }
             } else {
-                ensure_peer_session(state, device_id, role).await;
+                // Under a shaped topology, dial only where the selector
+                // says an edge exists — this is where ring/star/hubs stop
+                // paying full-mesh connection costs. Non-edges are
+                // recorded as Sighted so the member stays visible and a
+                // later shape change (hub failover, ring re-sort) can
+                // dial from the placeholder. Inbound offers are never
+                // gated: if the other side computed an edge we didn't
+                // (membership transient), answering keeps us connected
+                // and the next reevaluation reconciles.
+                let dial = {
+                    let topo = state.topology_impl.read();
+                    if topo.prunes() {
+                        let me = state.identity.public_id().to_string();
+                        let mut known: Vec<String> =
+                            state.peers.iter().map(|e| e.key().clone()).collect();
+                        if !known.iter().any(|k| k == &device_id) {
+                            known.push(device_id.clone());
+                        }
+                        known.push(me.clone());
+                        topo.edge(&me, &device_id, &known)
+                    } else {
+                        true
+                    }
+                };
+                if dial {
+                    ensure_peer_session(state, device_id, role).await;
+                } else {
+                    note_sighted_without_dialing(state, &device_id, "no topology edge");
+                }
             }
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -774,8 +831,11 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
         return;
     }
     // Only the deterministic offerer (lex-lower id) re-offers; the answerer
-    // waits for that offer rather than sending a competing one.
-    if state.identity.public_id() >= device_id {
+    // waits for that offer rather than sending a competing one. A sticky
+    // (pinned) peer bypasses the gate: the pin lives on exactly one side —
+    // the dialing side — and on a Silent network the other end will never
+    // initiate, lex order or not.
+    if state.identity.public_id() >= device_id && !state.is_sticky(device_id) {
         return;
     }
     maybe_reactive_announce(state);
@@ -1027,7 +1087,7 @@ pub(crate) async fn renegotiate_ice(
 /// which replaces the placeholder). Idempotent: a re-announce for an
 /// already-tracked (or already-connected) peer is a no-op, so `Sighted` fires
 /// once per discovery, not once per announce.
-fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
+fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str, why: &str) {
     if state.peers.contains_key(device_id) {
         return;
     }
@@ -1043,10 +1103,10 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
         crate::events::DiagLevel::Info,
         "peer",
         format!(
-            "{} sighted on signaling (silent network — not dialing)",
+            "{} sighted on signaling ({why} — not dialing)",
             short_peer(device_id)
         ),
-        serde_json::json!({ "peer": device_id, "silent": true }),
+        serde_json::json!({ "peer": device_id, "reason": why }),
     );
     // Recompute the rollup so a network that has only discovered (but not
     // connected) peers reads as `Discovering`, not `Alone`.
@@ -1061,7 +1121,29 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
 /// and answers via its (ungated) inbound-offer path. Idempotent: a no-op when a
 /// live session already exists; otherwise `ensure_peer_session` builds the
 /// session, upgrading any discovery-only `Sighted` placeholder in place.
-async fn connect_peer(state: &Arc<NetworkState>, device_id: &str) {
+async fn connect_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    sticky: bool,
+    reply: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+) {
+    if sticky {
+        state.add_sticky(device_id);
+    }
+    if let Some(reply) = reply {
+        // Already carrying app traffic? Resolve now — the waiter contract
+        // is "the link is ACTIVE", not "a fresh dial happened".
+        let already_active = state
+            .peers
+            .get(device_id)
+            .map(|p| matches!(p.state.read().status, PeerStatus::Active))
+            .unwrap_or(false);
+        if already_active {
+            let _ = reply.send(Ok(()));
+        } else {
+            state.register_connect_waiter(device_id, reply);
+        }
+    }
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
     // Nudge presence so the relays are warm and the remote sees us promptly;
     // globally rate-limited, so this can't add signaling load.
@@ -1954,6 +2036,9 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
             return;
         }
     };
+    state
+        .traffic
+        .record_rx(traffic::class_of(&msg), bytes.len());
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
         data.last_recv_at = Some(Instant::now());
@@ -1993,6 +2078,15 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
         MeshMessage::RpcStreamEnd(e) => on_rpc_stream_end(state, device_id, e).await,
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(state, device_id, channel, payload).await
+        }
+        MeshMessage::ChannelSeq {
+            stream,
+            seq,
+            channel,
+            payload,
+        } => reliable::on_channel_seq(state, device_id, stream, seq, channel, payload).await,
+        MeshMessage::ChannelAck { stream, up_to } => {
+            reliable::on_channel_ack(state, device_id, stream, up_to)
         }
         MeshMessage::NetworkState(b) => governance::on_state_broadcast(state, device_id, b).await,
         MeshMessage::NetworkStatePropose(m) => governance::on_propose(state, device_id, m).await,
@@ -2226,6 +2320,15 @@ async fn on_channel_frame(
     channel: String,
     payload: serde_json::Value,
 ) {
+    // Routed envelopes ride the reserved relay channel; the router
+    // consumes the wrapper-shaped ones (delivering / forwarding across
+    // the topology) and leaves legacy RelayService envelopes to the
+    // ordinary subscriber path below.
+    if channel == crate::services::relay::RELAY_CHANNEL
+        && Box::pin(routing::on_relay_frame(state, device_id, &payload)).await
+    {
+        return;
+    }
     state.dispatch_channel_frame(&channel, device_id, payload);
 }
 
@@ -2253,12 +2356,14 @@ pub(crate) async fn send_to_peer(
     // whole driver. Best-effort by contract, so a timed-out control frame is
     // just dropped and re-sent next cycle (see `scheduler::PEER_SEND_TIMEOUT_MS`;
     // the reliable channels take `send_channel_frame`, not this path).
+    let class = traffic::class_of(msg);
     let n = tokio::time::timeout(
         Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
         session.send(Bytes::from(serialized)),
     )
     .await
     .map_err(|_| Error::Transport("peer send timed out".into()))??;
+    state.traffic.record_tx(class, n);
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
         data.diag.bytes_out += n as u64;
@@ -2273,15 +2378,31 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    send_to_peer(
+    let direct = send_to_peer(
         state,
         peer,
         &MeshMessage::Channel {
             channel: channel.to_string(),
-            payload,
+            payload: payload.clone(),
         },
     )
-    .await
+    .await;
+    match direct {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Under a shaped topology "no direct link" is the normal
+            // state for most pairs — hand the frame to the shape's
+            // forwarders instead of surfacing an error the caller
+            // can't act on. Anything else (a live link that failed)
+            // stays an error.
+            let shaped = state.topology_impl.read().prunes();
+            if shaped {
+                routing::send_routed(state, peer, channel, &payload).await
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 async fn broadcast_channel_frame(
@@ -2289,6 +2410,13 @@ async fn broadcast_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> usize {
+    // A shaped topology reaches members we hold no connection to —
+    // flood one wrapped envelope per connected edge and let the
+    // forwarders re-fan it (per-node dedup keeps delivery exactly
+    // once). Full mesh keeps the plain per-peer send.
+    if state.topology_impl.read().prunes() {
+        return routing::broadcast_flood(state, channel, &payload).await;
+    }
     let peers: Vec<String> = state
         .peers
         .iter()
@@ -2613,17 +2741,29 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
         // that genuinely went away ages out instead of spinning. Intentional
         // teardown (UserLeft / Denied / AuthFailed) must never be retried.
         let we_offer = state.identity.public_id() < device_id;
+        let sticky = state.is_sticky(device_id);
         let recoverable = matches!(
             reason,
             DropReason::IceFailed
                 | DropReason::HeartbeatTimeout
                 | DropReason::TransportError { .. }
         );
-        if recoverable && we_offer {
-            state.record_reconnect_intent(device_id);
-        } else if !recoverable {
-            // Intentional removal / leave / auth failure — stop retrying.
+        if recoverable && (we_offer || sticky) {
+            state.record_reconnect_intent(device_id, sticky);
+            // Whatever was on the wire for the dead session may or may not
+            // have landed — queue it all for retransmit on the next ACTIVE;
+            // the receiver's high-water mark absorbs any double.
+            reliable::mark_unsent(state, device_id);
+        } else if recoverable {
+            reliable::mark_unsent(state, device_id);
+        } else {
+            // Intentional removal / leave / auth failure — stop retrying,
+            // and tell every parked caller the truth rather than letting
+            // them wait out a TTL on a peer that was deliberately ended.
             state.clear_reconnect_intent(device_id);
+            let why = format!("{reason:?}");
+            reliable::fail_peer(state, device_id, &why);
+            state.resolve_connect_waiters(device_id, Some(&why));
         }
     }
     phase::recompute(state);
@@ -2655,6 +2795,7 @@ pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
+        pinned_peers: Vec::new(),
         auto_approve: true,
     };
     let identity = Arc::new(crate::identity::Identity::ephemeral());
@@ -2751,11 +2892,11 @@ mod tests {
 
         let peer = "peerpubkeyzzz-tech";
         // Discover first (session-less placeholder), as an announce would.
-        note_sighted_without_dialing(&state, peer);
+        note_sighted_without_dialing(&state, peer, "silent network");
         assert!(state.peers.get(peer).unwrap().session.lock().is_none());
 
         // Deliberate dial opens a real session on the same entry.
-        connect_peer(&state, peer).await;
+        connect_peer(&state, peer, false, None).await;
         assert!(
             state.peers.get(peer).unwrap().session.lock().is_some(),
             "connect_peer must open a session, upgrading the Sighted placeholder"
@@ -2955,7 +3096,7 @@ mod tests {
         // re-offers it), then the backoff pushes it out — it must NOT come due
         // on every tick (that would publish an offer per tick).
         let state = build_test_state("reconnect-intent-due");
-        state.record_reconnect_intent("peer-x");
+        state.record_reconnect_intent("peer-x", false);
         assert_eq!(
             state.due_reconnect_intents(),
             vec!["peer-x".to_string()],
@@ -2974,7 +3115,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_intent_cleared_on_success() {
         let state = build_test_state("reconnect-intent-clear");
-        state.record_reconnect_intent("peer-y");
+        state.record_reconnect_intent("peer-y", false);
         assert!(state.has_reconnect_intent("peer-y"));
         state.clear_reconnect_intent("peer-y");
         assert!(!state.has_reconnect_intent("peer-y"));
@@ -2986,7 +3127,7 @@ mod tests {
         // Past the reconnecting grace, an intent is given up — dropped, never
         // retried — so a peer that genuinely went away can't spin forever.
         let state = build_test_state("reconnect-intent-expire");
-        state.record_reconnect_intent("peer-z");
+        state.record_reconnect_intent("peer-z", false);
         {
             let mut map = state.reconnect_intents.lock();
             let intent = map.get_mut("peer-z").expect("intent present");
@@ -3004,8 +3145,8 @@ mod tests {
         // The relay-reconnect event flushes every owed intent at once; flushing
         // advances each backoff so the tick doesn't immediately re-offer them.
         let state = build_test_state("reconnect-intent-flush");
-        state.record_reconnect_intent("a");
-        state.record_reconnect_intent("b");
+        state.record_reconnect_intent("a", false);
+        state.record_reconnect_intent("b", false);
         let mut flushed = state.flush_reconnect_intents();
         flushed.sort();
         assert_eq!(flushed, vec!["a".to_string(), "b".to_string()]);

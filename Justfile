@@ -1,11 +1,17 @@
 # MyOwnMesh — one-command operations.
 # Install `just` (https://just.systems) then run `just setup` to get going.
-
+#
+# Mirrors the AllMyStuff Justfile (the shared porcelain: dev / kill / pull /
+# checkout / go / check) so every repo in the family drives the same way. The
+# differences here are the daemon-first extras: foreground `serve` with tuned
+# logging, connection tracing, and the static-musl appliance cross-builds
+# (NanoKVM riscv64, NanoKVM-Pro aarch64).
+#
 # `set shell` is used on Linux/macOS. On Windows the global
-# `windows-shell` override routes recipes through PowerShell. Recipes
-# with bash-specific syntax need a `[windows]` variant; recipes that
-# just call cross-platform tools (cargo, git) work in both shells
-# unmodified.
+# `windows-shell` override routes recipes through PowerShell so they find
+# `pnpm.cmd` / `node.exe` via the Windows PATH. Recipes with bash-specific
+# syntax need a `[windows]` variant; recipes that just call cross-platform
+# tools (cargo, pnpm, git) work in both shells unmodified.
 set shell := ["bash", "-cu"]
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
 
@@ -32,6 +38,17 @@ build:
 
 build-release:
     @cargo build --workspace --release
+
+# Build the desktop bundle (.deb / .AppImage / .dmg / .msi).
+[unix]
+[doc("Build the desktop bundle.")]
+gui-build:
+    @cd gui && pnpm install --silent && pnpm tauri build
+
+[windows]
+[doc("Build the desktop bundle.")]
+gui-build:
+    @cd gui; pnpm install --silent; pnpm tauri build
 
 # One-time: add the riscv64 musl Rust target + the Zig-based cross toolchain.
 # We build with cargo-zigbuild (Zig = C compiler + linker), NOT the device's
@@ -157,8 +174,58 @@ trace NETWORK:
 run *ARGS:
     @cargo run --release --bin myownmesh -- {{ARGS}}
 
+# Stop this machine's mesh daemon — a `just dev` session's auto-spawned child,
+# a standalone `just serve`, or an *orphaned* one. Use it for a clean slate
+# between `just dev` runs: on macOS a hard Ctrl-C out of `just dev` can leave
+# the daemon running (no kernel parent-death signal there), and the next run
+# silently reuses it. Restart with `just dev` or `just serve`.
+[unix]
+[doc("Kill this machine's mesh daemon (whatever spawned it).")]
+kill:
+    @pkill -f '[m]yownmesh.* serve' 2>/dev/null; echo 'stopped the mesh daemon (whatever was running)'
+
+[windows]
+[doc("Kill this machine's mesh daemon (whatever spawned it).")]
+kill:
+    @Get-Process myownmesh,myownmesh-* -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Output "mesh daemon stopped"; exit 0
+
+# Clean restart: kill the daemon, then start the app fresh.
+[doc("Kill the daemon, then `just dev`.")]
+restart *ARGS: kill
+    @just dev {{ARGS}}
+
+# Discard local changes, pull the latest, and fetch every remote branch — a
+# pristine tree so `just dev` starts clean each time (clears stray lockfile /
+# build-artifact edits a dev run leaves behind), with all of origin's branches
+# fetched and ready to check out. git commands are identical on bash and
+# PowerShell, so no [windows] variant is needed.
+[doc("Discard local changes + git pull + fetch all branches — a clean slate.")]
+pull:
+    @git reset --hard HEAD
+    @git pull
+    @git fetch --all --prune
+
+# `git checkout` with a clean slate first: `pull` runs ahead of it (discard
+# local changes, pull, and fetch every remote branch), so the tree is pristine
+# and whatever branch you name is already fetched and ready. Args still pass
+# straight through — `just checkout main`, `just checkout -b feature`,
+# `just checkout -- file` all behave like the git command, minus typing `git`.
+[doc("just pull (clean + fetch all), then git checkout (e.g. `just checkout main`).")]
+checkout *args: pull
+    @git checkout {{args}}
+
+# The one-liner clean start: stop the daemon, pull a pristine tree, then run
+# the app. `kill` and `pull` run first (in order), then `just dev` (the OS
+# variant resolves itself). `just go -- <args>` forwards to `dev`.
+[doc("just kill + just pull + just dev.")]
+go *ARGS: kill pull
+    @just dev {{ARGS}}
+
 fmt:
     @cargo fmt --all
+
+fmt-check:
+    @cargo fmt --all --check
 
 lint:
     @cargo clippy --workspace --all-targets -- -D warnings
@@ -166,10 +233,25 @@ lint:
 test:
     @cargo test --workspace --no-fail-fast
 
-check:
-    @cargo fmt --all --check
-    @cargo clippy --workspace --all-targets -- -D warnings
-    @cargo test --workspace --no-fail-fast
+# Typecheck + build the Svelte front-end (no webview needed). Not in CI yet
+# (ci.yml is Rust-only + the appliance cross-builds), so this is the local
+# gate that keeps GUI changes honest before a push.
+[unix]
+[doc("Typecheck + build the front-end.")]
+gui-check:
+    @cd gui && pnpm install --frozen-lockfile && pnpm check && pnpm build
+
+[windows]
+[doc("Typecheck + build the front-end.")]
+gui-check:
+    @cd gui; pnpm install --frozen-lockfile; pnpm check; pnpm build
+
+# Everything CI runs — Rust fmt + clippy + test — plus the GUI typecheck/build
+# CI doesn't cover yet. (CI's appliance cross-builds aren't here: they need
+# zig; run `just build-risc` / `just build-aarch64-musl` when touching the
+# daemon's native surface.)
+[doc("Everything CI runs (fmt + clippy + test), plus the GUI typecheck/build.")]
+check: fmt-check lint test gui-check
 
 # Cut a release: bump every crate's version, commit, push, then push
 # the `v{{VERSION}}` tag to trigger the workflow. Mirrors MyOwnLLM's

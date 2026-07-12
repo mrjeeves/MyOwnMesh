@@ -62,6 +62,11 @@ pub struct NetworkSummary {
     /// Current topology mode. Serialised with serde-internal tagging so
     /// `Star { hub }` keeps its hub field on the wire.
     pub topology: myownmesh_core::TopologyMode,
+    /// Per-network traffic accounting since join — frames/bytes by
+    /// class, signaling publish/receive split into presence vs
+    /// negotiation, forwarding duty, acked-delivery backlog. The
+    /// numbers a topology experiment compares.
+    pub traffic: myownmesh_core::engine::traffic::TrafficSnapshot,
 }
 
 /// One row of the registry: the `JoinedNetwork` handle plus the
@@ -138,6 +143,7 @@ impl NetworkRegistry {
                 label: j.label().to_string(),
                 phase: j.current_phase(),
                 topology: j.current_topology(),
+                traffic: j.traffic(),
             });
         }
         // Stable order across calls: alphabetical by config id.
