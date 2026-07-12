@@ -134,7 +134,10 @@ pub enum MeshMessage {
     /// Cumulative acknowledgement for [`Self::ChannelSeq`]: every entry
     /// of `stream` with `seq <= up_to` has been delivered to the
     /// receiver's channel router.
-    ChannelAck { stream: u64, up_to: u64 },
+    ChannelAck {
+        stream: u64,
+        up_to: u64,
+    },
 
     /// Unknown frame from a future protocol revision. Captured here
     /// so the receiver's deserializer doesn't fail the whole stream

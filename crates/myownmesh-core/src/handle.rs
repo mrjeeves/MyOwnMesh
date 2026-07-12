@@ -503,8 +503,7 @@ impl JoinedNetwork {
         sticky: bool,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await
-        {
+        match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await {
             Ok(result) => result,
             Err(_) => Err(Error::Network(format!(
                 "connect to {device_id} still pending after {timeout:?} (the dial keeps going{})",

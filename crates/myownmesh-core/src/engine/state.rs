@@ -380,13 +380,17 @@ pub struct NetworkState {
     /// Acked-delivery outboxes, one per peer with frames pending (see
     /// [`super::reliable`]). Driver-serial like all engine state; the
     /// mutex guards snapshot readers only.
-    pub(crate) reliable_out:
-        Mutex<std::collections::HashMap<String, super::reliable::Outbox>>,
+    pub(crate) reliable_out: Mutex<std::collections::HashMap<String, super::reliable::Outbox>>,
 
     /// Receive-side high-water marks for acked delivery, one per peer
     /// that has sent us `channel_seq` frames.
-    pub(crate) reliable_in:
-        Mutex<std::collections::HashMap<String, super::reliable::InboundMark>>,
+    pub(crate) reliable_in: Mutex<std::collections::HashMap<String, super::reliable::InboundMark>>,
+
+    /// Routed-frame dedup ring: `(origin, frame id)` pairs already
+    /// delivered/forwarded, so flood cross-paths and retransmits are
+    /// dropped at the door. Bounded at
+    /// [`super::routing::ROUTING_SEEN_CAPACITY`].
+    pub(crate) routing_seen: Mutex<std::collections::VecDeque<(String, u64)>>,
 
     /// Callers waiting for a specific peer to reach ACTIVE (the
     /// `connect_peer_wait` contract). Resolved on the mutual-approve
@@ -538,6 +542,7 @@ impl NetworkState {
             sticky_peers: Mutex::new(pinned),
             reliable_out: Mutex::new(std::collections::HashMap::new()),
             reliable_in: Mutex::new(std::collections::HashMap::new()),
+            routing_seen: Mutex::new(std::collections::VecDeque::new()),
             connect_waiters: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
@@ -572,14 +577,12 @@ impl NetworkState {
     pub fn record_reconnect_intent(&self, device_id: &str, sticky: bool) {
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
-        let intent = map
-            .entry(device_id.to_string())
-            .or_insert(ReconnectIntent {
-                give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
-                next_retry_at: now,
-                attempt: 0,
-                sticky,
-            });
+        let intent = map.entry(device_id.to_string()).or_insert(ReconnectIntent {
+            give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
+            next_retry_at: now,
+            attempt: 0,
+            sticky,
+        });
         // A pin arriving while a plain intent is mid-backoff upgrades it —
         // stickiness must not be lost to entry order.
         intent.sticky = intent.sticky || sticky;

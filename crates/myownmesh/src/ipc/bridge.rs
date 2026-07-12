@@ -391,7 +391,7 @@ mod tests {
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             roster_path: None,
-        pinned_peers: Vec::new(),
+            pinned_peers: Vec::new(),
             auto_approve: true,
         }
     }

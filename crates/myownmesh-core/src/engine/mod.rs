@@ -29,6 +29,7 @@ pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
+pub mod routing;
 pub mod scheduler;
 pub mod signaling_bridge;
 pub mod state;
@@ -160,7 +161,8 @@ pub async fn run_driver(
         .register(tick::IceWatchdogTicker)
         .register(tick::NetworkWatchTicker::new().await)
         .register(tick::ReconnectSupervisor)
-        .register(tick::ReliableSendTicker);
+        .register(tick::ReliableSendTicker)
+        .register(tick::TopologyShapeTicker);
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "engine",
@@ -531,10 +533,38 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                     // has no pin and would wait forever on lex-order.
                     ensure_peer_session(state, device_id, Role::Offerer).await;
                 } else {
-                    note_sighted_without_dialing(state, &device_id);
+                    note_sighted_without_dialing(state, &device_id, "silent network");
                 }
             } else {
-                ensure_peer_session(state, device_id, role).await;
+                // Under a shaped topology, dial only where the selector
+                // says an edge exists — this is where ring/star/hubs stop
+                // paying full-mesh connection costs. Non-edges are
+                // recorded as Sighted so the member stays visible and a
+                // later shape change (hub failover, ring re-sort) can
+                // dial from the placeholder. Inbound offers are never
+                // gated: if the other side computed an edge we didn't
+                // (membership transient), answering keeps us connected
+                // and the next reevaluation reconciles.
+                let dial = {
+                    let topo = state.topology_impl.read();
+                    if topo.prunes() {
+                        let me = state.identity.public_id().to_string();
+                        let mut known: Vec<String> =
+                            state.peers.iter().map(|e| e.key().clone()).collect();
+                        if !known.iter().any(|k| k == &device_id) {
+                            known.push(device_id.clone());
+                        }
+                        known.push(me.clone());
+                        topo.edge(&me, &device_id, &known)
+                    } else {
+                        true
+                    }
+                };
+                if dial {
+                    ensure_peer_session(state, device_id, role).await;
+                } else {
+                    note_sighted_without_dialing(state, &device_id, "no topology edge");
+                }
             }
         }
         SignalingInbound::Offer { device_id, sdp } => {
@@ -1053,7 +1083,7 @@ pub(crate) async fn renegotiate_ice(
 /// which replaces the placeholder). Idempotent: a re-announce for an
 /// already-tracked (or already-connected) peer is a no-op, so `Sighted` fires
 /// once per discovery, not once per announce.
-fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
+fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str, why: &str) {
     if state.peers.contains_key(device_id) {
         return;
     }
@@ -1069,10 +1099,10 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str) {
         crate::events::DiagLevel::Info,
         "peer",
         format!(
-            "{} sighted on signaling (silent network — not dialing)",
+            "{} sighted on signaling ({why} — not dialing)",
             short_peer(device_id)
         ),
-        serde_json::json!({ "peer": device_id, "silent": true }),
+        serde_json::json!({ "peer": device_id, "reason": why }),
     );
     // Recompute the rollup so a network that has only discovered (but not
     // connected) peers reads as `Discovering`, not `Alone`.
@@ -2283,6 +2313,15 @@ async fn on_channel_frame(
     channel: String,
     payload: serde_json::Value,
 ) {
+    // Routed envelopes ride the reserved relay channel; the router
+    // consumes the wrapper-shaped ones (delivering / forwarding across
+    // the topology) and leaves legacy RelayService envelopes to the
+    // ordinary subscriber path below.
+    if channel == crate::services::relay::RELAY_CHANNEL
+        && Box::pin(routing::on_relay_frame(state, device_id, &payload)).await
+    {
+        return;
+    }
     state.dispatch_channel_frame(&channel, device_id, payload);
 }
 
@@ -2330,15 +2369,31 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    send_to_peer(
+    let direct = send_to_peer(
         state,
         peer,
         &MeshMessage::Channel {
             channel: channel.to_string(),
-            payload,
+            payload: payload.clone(),
         },
     )
-    .await
+    .await;
+    match direct {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Under a shaped topology "no direct link" is the normal
+            // state for most pairs — hand the frame to the shape's
+            // forwarders instead of surfacing an error the caller
+            // can't act on. Anything else (a live link that failed)
+            // stays an error.
+            let shaped = state.topology_impl.read().prunes();
+            if shaped {
+                routing::send_routed(state, peer, channel, &payload).await
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 async fn broadcast_channel_frame(
@@ -2346,6 +2401,13 @@ async fn broadcast_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> usize {
+    // A shaped topology reaches members we hold no connection to —
+    // flood one wrapped envelope per connected edge and let the
+    // forwarders re-fan it (per-node dedup keeps delivery exactly
+    // once). Full mesh keeps the plain per-peer send.
+    if state.topology_impl.read().prunes() {
+        return routing::broadcast_flood(state, channel, &payload).await;
+    }
     let peers: Vec<String> = state
         .peers
         .iter()
@@ -2821,7 +2883,7 @@ mod tests {
 
         let peer = "peerpubkeyzzz-tech";
         // Discover first (session-less placeholder), as an announce would.
-        note_sighted_without_dialing(&state, peer);
+        note_sighted_without_dialing(&state, peer, "silent network");
         assert!(state.peers.get(peer).unwrap().session.lock().is_none());
 
         // Deliberate dial opens a real session on the same entry.

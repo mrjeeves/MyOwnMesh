@@ -42,6 +42,40 @@ impl Topology for StarSelector {
             .cloned()
             .collect()
     }
+
+    fn edge(&self, a: &str, b: &str, _all: &[String]) -> bool {
+        let hub = signing::pubkey_part(&self.hub);
+        signing::pubkey_part(a) == hub || signing::pubkey_part(b) == hub
+    }
+
+    fn prunes(&self) -> bool {
+        true
+    }
+
+    fn forwards(&self, self_id: &str, _all: &[String]) -> bool {
+        signing::pubkey_part(self_id) == signing::pubkey_part(&self.hub)
+    }
+
+    fn next_hops(&self, self_id: &str, _dest: &str, connected: &[String]) -> Vec<String> {
+        // A spoke's only road is the hub. The hub itself has no next
+        // hop: it is directly connected to every reachable member by
+        // construction, so an unreachable destination is genuinely
+        // unreachable.
+        if signing::pubkey_part(self_id) == signing::pubkey_part(&self.hub) {
+            return Vec::new();
+        }
+        let hub = signing::pubkey_part(&self.hub);
+        connected
+            .iter()
+            .filter(|c| signing::pubkey_part(c) == hub)
+            .cloned()
+            .collect()
+    }
+
+    fn flood_ttl(&self) -> u8 {
+        // spoke → hub → spoke, plus one spare.
+        3
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +111,25 @@ mod tests {
         let peers = s(&["spoke1", "spoke2"]);
         let got = sel.select_preferred("spoke3", &peers);
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn edges_exist_only_through_the_hub() {
+        let sel = StarSelector { hub: "hub".into() };
+        assert!(sel.edge("hub", "spoke1", &[]));
+        assert!(sel.edge("spoke1", "hub", &[]));
+        assert!(!sel.edge("spoke1", "spoke2", &[]));
+        assert!(sel.prunes());
+        assert!(sel.forwards("hub", &[]));
+        assert!(!sel.forwards("spoke1", &[]));
+    }
+
+    #[test]
+    fn spoke_routes_everything_via_hub() {
+        let sel = StarSelector { hub: "hub".into() };
+        let connected = s(&["hub"]);
+        assert_eq!(sel.next_hops("spoke1", "spoke2", &connected), s(&["hub"]));
+        assert!(sel.next_hops("hub", "spoke2", &connected).is_empty());
     }
 
     #[test]

@@ -28,14 +28,34 @@ pub const CONFIG_VERSION: u32 = 1;
 pub enum TopologyMode {
     /// Default. Auto-healing ring with `n_preferred` neighbors (2
     /// immediate + (n-2) shortcuts). Missing/null `n_preferred`
-    /// defaults to 3.
+    /// defaults to 3. Under connection-shaping (see
+    /// [`crate::topology::Topology::edge`]) each node dials only the
+    /// union of the two sides' preferred sets, and broadcasts flood
+    /// hop-by-hop around the ring.
     Ring {
         #[serde(default)]
         n_preferred: Option<u32>,
     },
-    /// All spokes route through a single, config-named hub. Hub holds
-    /// all peers active; spokes shelve everyone but the hub.
+    /// All spokes connect to a single, config-named hub — and only the
+    /// hub. Spoke↔spoke frames route through it.
     Star { hub: DeviceId },
+    /// A hub *tier*: the named hubs hold a full mesh among themselves,
+    /// and every other member (spoke) connects to `spoke_redundancy`
+    /// of them, assigned by rendezvous hashing so the mapping is
+    /// deterministic on every node and stable as hubs come and go.
+    /// Spoke↔spoke frames route spoke → hub (→ hub) → spoke. This is
+    /// the hierarchical hub-and-spoke shape: per-spoke connection
+    /// count is O(redundancy), per-hub O(spokes/hubs + hubs), and
+    /// nobody pays N².
+    Hubs {
+        hubs: Vec<DeviceId>,
+        /// How many hubs each spoke maintains a connection to
+        /// (default [`TopologyMode::DEFAULT_SPOKE_REDUNDANCY`],
+        /// clamped to the hub count). 1 is minimal; 2 keeps every
+        /// spoke reachable through a single hub restart.
+        #[serde(default)]
+        spoke_redundancy: Option<u32>,
+    },
     /// Full mesh — every peer keeps every other peer active. N² cost;
     /// only useful for small fixed-size deployments.
     FullMesh,
@@ -51,6 +71,11 @@ impl TopologyMode {
     /// The default `n_preferred` for ring topology (2 immediate +
     /// 1 shortcut). Used when a Ring config omits the field.
     pub const DEFAULT_RING_N_PREFERRED: u32 = 3;
+
+    /// Default hub count each spoke connects to under
+    /// [`TopologyMode::Hubs`] — two, so one hub restarting doesn't
+    /// strand its spokes.
+    pub const DEFAULT_SPOKE_REDUNDANCY: u32 = 2;
 
     /// Resolve the effective `n_preferred` for a Ring topology,
     /// substituting the default when the field is None. Other

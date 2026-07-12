@@ -146,8 +146,8 @@ pub(crate) async fn enqueue(
 fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
     let entry = state.peers.get(peer)?;
     let data = entry.state.read();
-    let up = matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
-        && data.data_channel_open;
+    let up =
+        matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.data_channel_open;
     if !up {
         return None;
     }
@@ -204,7 +204,9 @@ pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
         match super::send_to_peer(state, peer, &msg).await {
             Ok(()) => {
                 let mut out = state.reliable_out.lock();
-                let Some(outbox) = out.get_mut(peer) else { return };
+                let Some(outbox) = out.get_mut(peer) else {
+                    return;
+                };
                 if acked_peer {
                     if let Some(p) = outbox.entries.iter_mut().find(|p| p.seq == seq) {
                         p.sent = true;

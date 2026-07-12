@@ -145,6 +145,24 @@ impl Ticker for ReconnectSupervisor {
     }
 }
 
+/// Connection-shaping pass for pruning topologies — closes
+/// both-sides-shelved non-edges and dials missing edges (see
+/// `ladder::shape_connections`). Keys on the shelve handshake, which
+/// completes asynchronously — a tick is the natural place to observe
+/// "both sides have now agreed". No-op for non-pruning modes.
+pub(crate) struct TopologyShapeTicker;
+
+#[async_trait]
+impl Ticker for TopologyShapeTicker {
+    fn name(&self) -> &'static str {
+        "topology-shape"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        super::ladder::shape_connections(state).await;
+    }
+}
+
 /// Acked-delivery maintenance — expires lapsed outbox entries (their
 /// callers get an error instead of silence) and re-attempts flushes for
 /// peers holding unsent frames after a transient send failure. The event
