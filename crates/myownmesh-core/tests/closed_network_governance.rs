@@ -753,6 +753,149 @@ async fn re_admitting_an_evicted_member_supersedes_the_tombstone() {
 }
 
 #[tokio::test]
+async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
+    // The "offline and lost devices just keep showing back up" loop, killed
+    // end to end. Carol is admitted to the closed network and then evicted
+    // while OFFLINE — she never hears the evict. When she comes back she
+    // redials with a stale credential; before this fix, the handshake
+    // treated her as a fresh face and (on an auto-approve network — every
+    // fleet mesh) re-approved her, put her back in rosters on mutual
+    // ACTIVE, and gossiped the resurrection. Now: the members' handshake
+    // gate denies her WITH the signed log attached, she verifies her own
+    // eviction through the standard strict-extension adoption (the owner's
+    // signatures are the authority, not the denier), flips to stood-down,
+    // and nobody's roster ever re-admits her.
+    shared_home();
+
+    let broker = LocalBroker::new();
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral()); // owner
+    let bob_id = Arc::new(Identity::ephemeral()); // co-member, online
+    let carol_id = Arc::new(Identity::ephemeral()); // evicted while offline
+
+    let network_id = "evict-deny-proof-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+    let (bob_state, _bd) = spawn_network(
+        fresh_network("bob", network_id),
+        bob_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("bob engine");
+    // Carol's engine is SPAWNED now (so she holds a clean, empty in-memory
+    // governance state — the test home's shared on-disk state must not
+    // leak her own eviction to her) but only ATTACHED to signaling after
+    // the eviction: spawned-but-unattached is this harness's "offline".
+    let (carol_state, _cd) = spawn_network(
+        fresh_network("carol", network_id),
+        carol_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("carol engine");
+
+    let mut alice_events = alice_state.events_tx.subscribe();
+    let mut bob_events = bob_state.events_tx.subscribe();
+    attach_local(&alice_state, &broker);
+    attach_local(&bob_state, &broker);
+
+    wait_for_approval(&mut alice_events, bob_id.public_id()).await;
+    wait_for_approval(&mut bob_events, alice_id.public_id()).await;
+    cross_approve(&alice_state, &bob_state, &alice_id, &bob_id).await;
+
+    use myownmesh_core::engine::governance::propose;
+    propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found");
+    wait_for(Duration::from_secs(10), || {
+        alice_state.governance_state.read().kind == NetworkKind::Closed
+            && bob_state.governance_state.read().kind == NetworkKind::Closed
+    })
+    .await;
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_id.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("admit carol");
+    wait_for(Duration::from_secs(10), || {
+        rostered(&bob_state, carol_id.public_id())
+    })
+    .await;
+    propose(
+        &alice_state,
+        TransitionVariant::Evict {
+            target: carol_id.public_id().to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("evict carol while she is offline");
+    wait_for(Duration::from_secs(10), || {
+        !rostered(&alice_state, carol_id.public_id()) && !rostered(&bob_state, carol_id.public_id())
+    })
+    .await;
+
+    // Carol comes back online, clueless, and redials the mesh.
+    attach_local(&carol_state, &broker);
+
+    // She learns: some member's handshake denies her with the signed log,
+    // she adopts it (strict extension over her empty log), and the
+    // verified verdict stands her down.
+    wait_for(Duration::from_secs(20), || {
+        carol_state
+            .self_evicted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    })
+    .await;
+    assert!(
+        carol_state
+            .self_evicted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the denied device must adopt the eviction proof and stand down"
+    );
+
+    // And the resurrection is dead: give the mesh a few more announce/
+    // gossip beats — nobody re-admits her, on either member.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !rostered(&alice_state, carol_id.public_id()),
+        "an evicted device redialing must not re-enter the owner's roster"
+    );
+    assert!(
+        !rostered(&bob_state, carol_id.public_id()),
+        "an evicted device redialing must not re-enter a member's roster"
+    );
+    // Her own roster view keeps whatever she had; the flag is what stands
+    // her down — and the signed logs she adopted agree she is out.
+    let verdict = {
+        let gov = carol_state.governance_state.read();
+        myownmesh_core::network_state::member_log_removed(&gov, &gov.member_log, network_id)
+            .contains(carol_id.public_id())
+    };
+    assert!(
+        verdict,
+        "carol's own adopted (verified) state must carry her eviction"
+    );
+}
+
+#[tokio::test]
 async fn two_owners_converge_their_rosters() {
     // The reported symptom, inverted into a guarantee: a fleet with two owners
     // where the rosters never converge and only one behaves like the "real"

@@ -670,8 +670,32 @@ fn spawn_fanout(
     mut outbound_rx: mpsc::UnboundedReceiver<SignalingOutbound>,
     driver_txs: Vec<mpsc::UnboundedSender<SignalingOutbound>>,
 ) -> tokio::task::JoinHandle<()> {
+    // While stood-down (signed-evicted), announces are suppressed — but
+    // not forever silenced: one probe per this interval still goes out, so
+    // a device that gets RE-ADMITTED in place (a fresh signed grant, no
+    // re-claim flow) isn't deaf to its own pardon. The probe costs one
+    // handshake+deny per interval while still evicted; the moment the
+    // members' verdict clears, that same probe is what revives the links.
+    const EVICTED_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+    let mut last_evicted_probe: Option<std::time::Instant> = None;
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
+            // A stood-down engine stops advertising itself: an announce is
+            // an invitation to dial us, and every member would answer it
+            // with a denial. Directed signaling (offers/answers already in
+            // flight) still passes — only the broadcast self-advertisement
+            // is throttled, to the slow re-admit probe above.
+            if matches!(msg, SignalingOutbound::Announce)
+                && state.self_evicted.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let due = last_evicted_probe
+                    .map(|at| at.elapsed() >= EVICTED_PROBE_INTERVAL)
+                    .unwrap_or(true);
+                if !due {
+                    continue;
+                }
+                last_evicted_probe = Some(std::time::Instant::now());
+            }
             state
                 .traffic
                 .record_signaling_tx(matches!(msg, SignalingOutbound::Announce));

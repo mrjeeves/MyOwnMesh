@@ -44,7 +44,9 @@ pub use governance::{
     NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
     RosterSummaryMessage,
 };
-pub use handshake::{ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage};
+pub use handshake::{
+    ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage, DENY_REASON_EVICTED,
+};
 pub use keepalive::{PingMessage, PongMessage};
 pub use rpc::{
     CapabilitiesUpdateMessage, CapabilityAdvert, RpcRequestMessage, RpcResponseMessage,
