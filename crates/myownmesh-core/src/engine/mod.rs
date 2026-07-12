@@ -34,6 +34,7 @@ pub mod scheduler;
 pub mod signaling_bridge;
 pub mod state;
 pub mod tick;
+pub mod traffic;
 pub mod wake;
 
 pub use signaling_bridge::{
@@ -380,6 +381,9 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
     // debug capture the last of these lines names the message being handled
     // when the driver stopped.
     trace!(network = %state.network_id, kind = sig.kind_name(), "driver: signaling inbound");
+    state
+        .traffic
+        .record_signaling_rx(matches!(sig, SignalingInbound::PeerAnnounced { .. }));
     match sig {
         SignalingInbound::PeerAnnounced { device_id } => {
             // Whoever holds the lex-lower id initiates so we don't
@@ -2032,6 +2036,9 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
             return;
         }
     };
+    state
+        .traffic
+        .record_rx(traffic::class_of(&msg), bytes.len());
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
         data.last_recv_at = Some(Instant::now());
@@ -2349,12 +2356,14 @@ pub(crate) async fn send_to_peer(
     // whole driver. Best-effort by contract, so a timed-out control frame is
     // just dropped and re-sent next cycle (see `scheduler::PEER_SEND_TIMEOUT_MS`;
     // the reliable channels take `send_channel_frame`, not this path).
+    let class = traffic::class_of(msg);
     let n = tokio::time::timeout(
         Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
         session.send(Bytes::from(serialized)),
     )
     .await
     .map_err(|_| Error::Transport("peer send timed out".into()))??;
+    state.traffic.record_tx(class, n);
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
         data.diag.bytes_out += n as u64;

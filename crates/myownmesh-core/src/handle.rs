@@ -512,6 +512,16 @@ impl JoinedNetwork {
         }
     }
 
+    /// Point-in-time traffic accounting for this network: frames and
+    /// bytes by class (keepalive / control / gossip / app), signaling
+    /// publish and receive counts split into presence vs pairwise
+    /// negotiation, forwarding duty, and the acked-delivery backlog.
+    /// Two snapshots around an experiment are the honest comparison of
+    /// two topologies.
+    pub fn traffic(&self) -> crate::engine::traffic::TrafficSnapshot {
+        self.state.traffic_snapshot()
+    }
+
     /// Remove a standing dial recorded by `connect_peer_wait(…, sticky
     /// = true)` (or a config `pinned_peers` entry) — the peer stops
     /// being redialed on announce and its never-expiring intent is

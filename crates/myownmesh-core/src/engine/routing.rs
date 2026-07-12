@@ -184,6 +184,7 @@ pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payloa
         }
         return true;
     }
+    state.traffic.record_forwarded();
     let onward = RelayEnvelope {
         dst: env.dst.clone(),
         src: origin.clone(),

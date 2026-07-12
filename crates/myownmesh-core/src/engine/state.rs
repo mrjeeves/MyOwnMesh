@@ -392,6 +392,10 @@ pub struct NetworkState {
     /// [`super::routing::ROUTING_SEEN_CAPACITY`].
     pub(crate) routing_seen: Mutex<std::collections::VecDeque<(String, u64)>>,
 
+    /// Per-network traffic accounting (see [`super::traffic`]) —
+    /// written from the frame chokepoints, read by the status surface.
+    pub traffic: super::traffic::TrafficCounters,
+
     /// Callers waiting for a specific peer to reach ACTIVE (the
     /// `connect_peer_wait` contract). Resolved on the mutual-approve
     /// transition; failed on terminal drops and shutdown.
@@ -543,6 +547,7 @@ impl NetworkState {
             reliable_out: Mutex::new(std::collections::HashMap::new()),
             reliable_in: Mutex::new(std::collections::HashMap::new()),
             routing_seen: Mutex::new(std::collections::VecDeque::new()),
+            traffic: super::traffic::TrafficCounters::default(),
             connect_waiters: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
@@ -1194,6 +1199,15 @@ impl NetworkState {
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         rx.await
             .map_err(|_| Error::Network("engine dropped the reliable send".into()))?
+    }
+
+    /// Point-in-time traffic accounting for this network, with the
+    /// acked-delivery backlog folded in — the number an operator (or a
+    /// topology experiment) compares across configurations.
+    pub fn traffic_snapshot(&self) -> super::traffic::TrafficSnapshot {
+        let mut snap = self.traffic.snapshot();
+        snap.reliable_pending = super::reliable::pending_total(self) as u64;
+        snap
     }
 
     /// Whether `device_id` has a standing dial (config pin or runtime

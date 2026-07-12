@@ -612,7 +612,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
         (true, true) => {
             let (nostr_tx, nostr_rx) = mpsc::unbounded_channel::<SignalingOutbound>();
             let (mdns_tx, mdns_rx) = mpsc::unbounded_channel::<SignalingOutbound>();
-            let fanout = spawn_fanout(outbound_rx, vec![nostr_tx, mdns_tx]);
+            let fanout = spawn_fanout(state.clone(), outbound_rx, vec![nostr_tx, mdns_tx]);
             let nostr = attach_nostr_with(state, nostr_rx, gate.clone());
             let mdns = attach_mdns_with(state, mdns_rx, gate);
             SignalingDrivers {
@@ -652,7 +652,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
             SignalingDrivers {
                 nostr: None,
                 mdns: None,
-                fanout: Some(spawn_fanout(outbound_rx, Vec::new())),
+                fanout: Some(spawn_fanout(state.clone(), outbound_rx, Vec::new())),
             }
         }
     };
@@ -661,13 +661,20 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
 
 /// Clone every engine emission to each driver's queue. A closed
 /// driver queue is skipped silently (its driver failed or detached);
-/// the task exits when the engine side closes.
+/// the task exits when the engine side closes. This is also the one
+/// place every outbound signaling event passes exactly once, so the
+/// per-network traffic accounting counts publishes here — per logical
+/// event, not per driver copy.
 fn spawn_fanout(
+    state: Arc<NetworkState>,
     mut outbound_rx: mpsc::UnboundedReceiver<SignalingOutbound>,
     driver_txs: Vec<mpsc::UnboundedSender<SignalingOutbound>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
+            state
+                .traffic
+                .record_signaling_tx(matches!(msg, SignalingOutbound::Announce));
             for tx in &driver_txs {
                 let _ = tx.send(msg.clone());
             }
