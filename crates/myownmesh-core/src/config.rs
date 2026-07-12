@@ -67,6 +67,10 @@ pub enum TopologyMode {
     FullMesh,
 }
 
+// `FullMesh` carries no data, so Default is derivable — but keeping it
+// explicit documents that the default is a *decision* (the truthful
+// name for pre-0.2.34 behavior), not an accident of variant order.
+#[allow(clippy::derivable_impls)]
 impl Default for TopologyMode {
     fn default() -> Self {
         TopologyMode::FullMesh
@@ -716,8 +720,10 @@ mod tests {
 
     #[test]
     fn v1_config_ring_migrates_to_full_mesh() {
-        let mut cfg = MeshConfig::default();
-        cfg.version = 1;
+        let mut cfg = MeshConfig {
+            version: 1,
+            ..Default::default()
+        };
         let mut net = NetworkConfig::from_network_id("n1", "net-one");
         net.topology = TopologyMode::Ring { n_preferred: None };
         cfg.networks.push(net);
