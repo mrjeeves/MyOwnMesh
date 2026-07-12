@@ -157,7 +157,7 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
                 if !edge && both_shelved && settled && !state.is_sticky(id) {
                     to_prune.push(id.clone());
                 }
-            } else if edge && me < *id {
+            } else if (edge || state.is_sticky(id)) && me < *id {
                 to_dial.push(id.clone());
             }
         }

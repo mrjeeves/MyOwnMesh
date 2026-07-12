@@ -550,7 +550,22 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                         )
                     })
                     .unwrap_or(false);
-                if unhealthy {
+                // A session silent past the stale-inbound window is a
+                // wake/rebuild candidate, not a restart candidate: an ICE
+                // restart at a peer that rebuilt its PeerConnection during
+                // sleep can never converge, and its IceRestart tier
+                // suppresses the fast confirm-rebuild below — turning an
+                // instant wake reconnect into a 10-90s stall. Restart only
+                // recently-alive sessions; leave corpses to the confirm
+                // probe (~1.5s teardown + fresh dial).
+                let recently_alive = state
+                    .peers
+                    .get(&device_id)
+                    .and_then(|p| p.state.read().last_recv_at)
+                    .is_some_and(|at| {
+                        at.elapsed().as_millis() < scheduler::STALE_INBOUND_MS as u128
+                    });
+                if unhealthy && recently_alive {
                     renegotiate_ice(state, &device_id, false, "announce-unhealthy").await;
                 }
             }
@@ -588,6 +603,17 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 // gated: if the other side computed an edge we didn't
                 // (membership transient), answering keeps us connected
                 // and the next reevaluation reconciles.
+                // A pinned peer (a standing support session) outranks the
+                // shape: under hubs a spoke↔spoke pin is a non-edge, and
+                // gating its announce-dial parked wake reconnects forever
+                // (the sticky reconnect intent parks after ~1 min and waits
+                // for exactly this announce-dial). Pins dial as the offerer
+                // — the far side has no pin and would wait on lex-order —
+                // same rule as the Silent branch and the prune exemption.
+                if state.is_sticky(&device_id) {
+                    ensure_peer_session(state, device_id, Role::Offerer).await;
+                    return;
+                }
                 let dial = {
                     let topo = state.topology_impl.read();
                     if topo.prunes() {
