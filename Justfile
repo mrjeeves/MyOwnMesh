@@ -197,13 +197,31 @@ restart *ARGS: kill
 # Discard local changes, pull the latest, and fetch every remote branch — a
 # pristine tree so `just dev` starts clean each time (clears stray lockfile /
 # build-artifact edits a dev run leaves behind), with all of origin's branches
-# fetched and ready to check out. git commands are identical on bash and
-# PowerShell, so no [windows] variant is needed.
-[doc("Discard local changes + git pull + fetch all branches — a clean slate.")]
+# fetched and ready to check out. If the current branch no longer exists on
+# origin (a feature branch merged & deleted out from under the clone), the
+# old `git pull` died with "no such ref was fetched" — now the gone upstream
+# is detected and the recipe drops back to the default branch before pulling.
+# Bash logic, so this one carries a [windows] PowerShell twin.
+[unix]
+[doc("Discard local changes + pull + fetch all; falls back to the default branch when yours is gone on origin.")]
 pull:
-    @git reset --hard HEAD
-    @git pull
-    @git fetch --all --prune
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git reset --hard HEAD
+    git fetch --all --prune
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if ! git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's|^origin/||' || true)
+        default=${default:-main}
+        echo "→ origin no longer has '$branch' (merged & deleted?) — switching to '$default'"
+        git checkout "$default"
+    fi
+    git pull
+
+[windows]
+[doc("Discard local changes + pull + fetch all; falls back to the default branch when yours is gone on origin.")]
+pull:
+    @$branch = git rev-parse --abbrev-ref HEAD; git reset --hard HEAD; git fetch --all --prune; git show-ref --verify --quiet "refs/remotes/origin/$branch"; if ($LASTEXITCODE -ne 0) { $default = git symbolic-ref --quiet --short refs/remotes/origin/HEAD; if ($default) { $default = $default -replace '^origin/','' } else { $default = 'main' }; Write-Host "origin no longer has '$branch' (merged & deleted?) - switching to '$default'"; git checkout $default }; git pull
 
 # `git checkout` with a clean slate first: `pull` runs ahead of it (discard
 # local changes, pull, and fetch every remote branch), so the tree is pristine

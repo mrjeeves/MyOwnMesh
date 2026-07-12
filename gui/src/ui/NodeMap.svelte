@@ -5,6 +5,7 @@
     networkDisplayName,
     topologyName,
     topologyHub,
+    topologyHubSet,
   } from "../types";
   import { meshClient } from "../mesh-client.svelte";
 
@@ -477,6 +478,11 @@
       }
     }
 
+    // Hubs tier: members of the governed/configured hub set render
+    // with the hub styling wherever they land on the rings, so the
+    // shape reads at a glance without re-anchoring the whole layout.
+    const hubSet = new Set(topologyHubSet(network.topology));
+
     // Lay out LAN peers around the centre. Small radius so they
     // visually cluster — "near" you in network terms.
     const lanRadius = Math.max(60, Math.min(width, height) / 5);
@@ -488,7 +494,7 @@
       Math.PI * 0.25,
       Math.PI * 0.75,
       (node, peer) => {
-        node.role = "peer";
+        node.role = hubSet.has(peer.device_id) ? "hub" : "peer";
         node.link = linkKindOf(peer);
         nodes.push(node);
         edges.push({
@@ -510,7 +516,7 @@
       -Math.PI * 0.85,
       -Math.PI * 0.15,
       (node, peer) => {
-        node.role = "peer";
+        node.role = hubSet.has(peer.device_id) ? "hub" : "peer";
         node.link = linkKindOf(peer);
         nodes.push(node);
         edges.push({

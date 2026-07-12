@@ -500,7 +500,6 @@ impl NetworkState {
         mpsc::UnboundedReceiver<SignalingInbound>,
         mpsc::UnboundedReceiver<NetworkCmd>,
     )> {
-        let topology_impl = crate::topology::from_mode(&config.topology);
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
         // re-arms them without any runtime re-pinning.
@@ -523,6 +522,15 @@ impl NetworkState {
             }
             s
         };
+        // Topology has the same precedence as kind: a ratified
+        // `TopologyChange` in the signed log outranks whatever the
+        // local config says; the config value only shapes networks
+        // governance hasn't spoken for.
+        let effective_topology = governance_state
+            .topology
+            .clone()
+            .unwrap_or_else(|| config.topology.clone());
+        let topology_impl = crate::topology::from_mode(&effective_topology);
         let (events_tx, _) = broadcast::channel(256);
         // Shallow: at 30 fps a depth of 16 is half a second of slack —
         // beyond that a slow consumer should lose frames, not delay them.
@@ -543,7 +551,7 @@ impl NetworkState {
             identity,
             transport,
             config: RwLock::new(config.clone()),
-            topology: RwLock::new(config.topology.clone()),
+            topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
             peers: DashMap::new(),
             roster: RwLock::new(roster),

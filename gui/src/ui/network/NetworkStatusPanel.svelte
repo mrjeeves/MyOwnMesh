@@ -74,9 +74,13 @@
 
       <dt>Topology</dt>
       <dd>
-        {topologyName(network.topology)}
-        {#if topologyName(network.topology) === "star"}
+        {topologyName(network.topology).replace("_", " ")}
+        {#if network.topology.kind === "star"}
           · hub <span class="mono">{topologyHub(network.topology)}</span>
+        {:else if network.topology.kind === "hubs"}
+          · {network.topology.hubs.length}
+          hub{network.topology.hubs.length === 1 ? "" : "s"}
+          · {network.topology.spoke_redundancy ?? 2} links/spoke
         {/if}
       </dd>
 

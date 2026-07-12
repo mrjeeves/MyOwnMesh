@@ -256,6 +256,24 @@ pub enum Request {
         #[serde(default)]
         mfa_code: Option<String>,
     },
+    /// Float a topology-change proposal: the owner-signed, network-wide
+    /// shape (mode, hub set, spoke redundancy) in one transition. Once
+    /// ratified it outranks every device's local config topology and
+    /// converges through the signed log exactly like roles do — this is
+    /// how a node is made an infra hub for the whole network. Closed
+    /// networks only; open/silent ones keep the per-device `TopologySet`.
+    GovernanceProposeTopology {
+        network: String,
+        /// Same encoding `TopologySet` takes: `ring`, `star`, `hubs`,
+        /// or `full_mesh`.
+        topology: String,
+        /// Hub spec for `star` (`<device_id>`) / `hubs`
+        /// (`id1,id2[,…][:spoke_redundancy]`).
+        #[serde(default)]
+        hub: Option<String>,
+        #[serde(default)]
+        mfa_code: Option<String>,
+    },
     /// Sign a pending proposal.
     GovernanceSign {
         network: String,
@@ -952,10 +970,26 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
                 Err(msg) => return Response::err(msg),
             };
             match state.registry.get(&network) {
-                Some(net) => match net.set_topology(mode).await {
-                    Ok(_) => Response::ok(serde_json::json!({ "topology": topology })),
-                    Err(e) => Response::err(e.to_string()),
-                },
+                Some(net) => {
+                    // A ratified TopologyChange owns the shape network-wide;
+                    // a local set would silently fork this device off it
+                    // (the engine ignores the command as a backstop — the
+                    // refusal belongs here where the caller can see it).
+                    if let Ok(gov) = net.governance_state().await {
+                        if gov.topology.is_some() {
+                            return Response::err(
+                                "this network's topology is governed by a signed \
+                                 owner transition — propose a change instead \
+                                 (`networks topology-propose` / GovernanceProposeTopology)"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    match net.set_topology(mode).await {
+                        Ok(_) => Response::ok(serde_json::json!({ "topology": topology })),
+                        Err(e) => Response::err(e.to_string()),
+                    }
+                }
                 None => Response::err(format!("unknown network: {network}")),
             }
         }
@@ -1154,6 +1188,30 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             },
             None => Response::err(format!("unknown network: {network}")),
         },
+        Request::GovernanceProposeTopology {
+            network,
+            topology,
+            hub,
+            mfa_code,
+        } => {
+            let mode = match parse_topology(&topology, hub.as_deref()) {
+                Ok(m) => m,
+                Err(msg) => return Response::err(msg),
+            };
+            match state.registry.get(&network) {
+                Some(net) => match net
+                    .propose_transition(
+                        myownmesh_core::TransitionVariant::TopologyChange { to: mode },
+                        mfa_code,
+                    )
+                    .await
+                {
+                    Ok(id) => Response::ok(serde_json::json!({ "proposal_id": id })),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                None => Response::err(format!("unknown network: {network}")),
+            }
+        }
         Request::GovernanceSign {
             network,
             proposal_id,

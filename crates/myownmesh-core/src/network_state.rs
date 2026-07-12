@@ -166,6 +166,23 @@ pub enum TransitionVariant {
         new_network_id: String,
         members: Vec<String>,
     },
+    /// Set the network's connection topology — the whole shape in one
+    /// signed entry (mode, hub set, spoke redundancy), so "make this
+    /// node an infra hub" is an owner action that every member's
+    /// daemon converges on via the ordinary log adoption path, exactly
+    /// like `kind`. `None` on [`NetworkState::topology`] (no such
+    /// transition ratified yet) means the network's shape is whatever
+    /// each device's local config says — the pre-governance behaviour.
+    TopologyChange { to: crate::config::TopologyMode },
+    /// A transition kind a newer build introduced. Parsing it as
+    /// `Unknown` (instead of failing the enclosing message) keeps
+    /// roster anti-entropy alive across mixed-version fleets: an older
+    /// daemon can still ingest entries and membership, while
+    /// [`verify_log`] refuses to adopt a governance log containing a
+    /// variant it can't verify — it stays behind on governance until
+    /// it updates, rather than breaking the whole sync channel.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Canonical signed-payload bytes for a transition. The signer
@@ -224,6 +241,38 @@ pub fn transition_payload(network_id: &str, variant: &TransitionVariant) -> Vec<
             let members_csv = sorted.join(",");
             format!("split|new_id={new_network_id}|members={members_csv}")
         }
+        TransitionVariant::TopologyChange { to } => {
+            use crate::config::TopologyMode;
+            match to {
+                TopologyMode::FullMesh => "topology|full_mesh".to_string(),
+                TopologyMode::Ring { n_preferred } => format!(
+                    "topology|ring|n={}",
+                    n_preferred.map_or("none".to_string(), |n| n.to_string())
+                ),
+                TopologyMode::Star { hub } => format!("topology|star|hub={hub}"),
+                TopologyMode::Hubs {
+                    hubs,
+                    spoke_redundancy,
+                } => {
+                    // Hub order is meaningless to the selector
+                    // (rendezvous hashing), so order-normalise like
+                    // `Split` does — the same designation signed by two
+                    // UIs that listed hubs differently must verify as
+                    // the same payload.
+                    let mut sorted = hubs.clone();
+                    sorted.sort();
+                    format!(
+                        "topology|hubs|hubs={}|r={}",
+                        sorted.join(","),
+                        spoke_redundancy.map_or("none".to_string(), |r| r.to_string())
+                    )
+                }
+            }
+        }
+        // Never signed by this build — and a foreign signature over a
+        // variant we can't render byte-identically can never verify,
+        // which is exactly the "stay behind until updated" contract.
+        TransitionVariant::Unknown => "unknown".to_string(),
     };
     format!("{SIGN_DOMAIN_TAG_STATE}{network_id}|{variant_str}").into_bytes()
 }
@@ -303,6 +352,14 @@ pub struct NetworkState {
     /// Splits this network has spawned. Each entry was derived from
     /// a stuck close proposal here.
     pub splits: Vec<SplitRecord>,
+    /// Governed connection topology, set by a ratified
+    /// [`TransitionVariant::TopologyChange`]. `Some` is authoritative
+    /// over the device-local config topology (the same precedence
+    /// `kind` has); `None` means no topology transition has ever been
+    /// ratified and the local config rules. `#[serde(default)]` so
+    /// pre-topology state files keep loading.
+    #[serde(default)]
+    pub topology: Option<crate::config::TopologyMode>,
 }
 
 impl Default for NetworkState {
@@ -322,6 +379,7 @@ impl NetworkState {
             member_log: Vec::new(),
             pending: Vec::new(),
             splits: Vec::new(),
+            topology: None,
         }
     }
 
@@ -621,6 +679,45 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
                 ));
             }
         }
+
+        (TransitionVariant::TopologyChange { to }, NetworkKind::Closed) => {
+            // Same-shape transitions don't make sense (mirrors the
+            // KindChange no-op rule) — without this, a re-assert would
+            // append an identical entry to the log forever.
+            if state_before.topology.as_ref() == Some(to) {
+                return Err(Error::Protocol(
+                    "TopologyChange to the current topology is a no-op".into(),
+                ));
+            }
+            // Shaping the fabric is an owner act — the same tier as
+            // reopening the network. Controllers govern members; the
+            // owner governs the infrastructure.
+            if !signers.iter().any(|s| owners.contains(s)) {
+                return Err(Error::Protocol(
+                    "topology change needs ≥ 1 owner signature".into(),
+                ));
+            }
+        }
+        (TransitionVariant::TopologyChange { .. }, NetworkKind::Open | NetworkKind::Silent) => {
+            // Open/Silent networks have no enforced owner, so a signed
+            // network-wide topology would be anyone's to hijack. Their
+            // shape stays a per-device config choice (`TopologySet`).
+            return Err(Error::Protocol(
+                "topology is governed on closed networks only — open/silent \
+                 networks set it per-device in local config"
+                    .into(),
+            ));
+        }
+
+        (TransitionVariant::Unknown, _) => {
+            // A variant from a newer build. We can't reconstruct its
+            // canonical payload, so we can't verify authority over it —
+            // refuse, which makes `verify_log` hold this node at its
+            // current governance state until it updates.
+            return Err(Error::Protocol(
+                "transition kind from a newer build — update to verify it".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -673,6 +770,13 @@ pub fn apply_transition(mut state: NetworkState, t: &Transition) -> NetworkState
                 members: members.clone(),
             });
         }
+        TransitionVariant::TopologyChange { to } => {
+            state.topology = Some(to.clone());
+        }
+        // Unreachable through verified paths (the quorum table refuses
+        // Unknown), but apply stays total: record the entry, mutate
+        // nothing.
+        TransitionVariant::Unknown => {}
     }
     state.transitions.push(t.clone());
     state
@@ -915,7 +1019,11 @@ pub fn split_member_tier(state: &mut NetworkState) {
                     }
                 }
             }
-            TransitionVariant::Split { .. } => {}
+            // Neither touches roles, and both are governance-tier —
+            // they fall through to the governance vec below.
+            TransitionVariant::Split { .. }
+            | TransitionVariant::TopologyChange { .. }
+            | TransitionVariant::Unknown => {}
         }
         if member_tier {
             members.push(t);
@@ -1688,6 +1796,155 @@ mod tests {
         assert_eq!(state.role_of(&owner), Role::Owner);
         assert_eq!(state.role_of(&member), Role::Controller);
         assert_eq!(state.transitions.len(), 2);
+    }
+
+    // ---- topology governance -------------------------------------------
+
+    fn hubs_mode(hubs: &[&str], r: Option<u32>) -> crate::config::TopologyMode {
+        crate::config::TopologyMode::Hubs {
+            hubs: hubs.iter().map(|s| s.to_string()).collect(),
+            spoke_redundancy: r,
+        }
+    }
+
+    #[test]
+    fn topology_payload_normalises_hub_order_and_signs_all_fields() {
+        let pay =
+            |mode| transition_payload("net-1", &TransitionVariant::TopologyChange { to: mode });
+        // Hub order is selector-irrelevant (rendezvous hashing), so two
+        // UIs listing the same hubs differently must sign identically.
+        let a = pay(hubs_mode(&["hub-b", "hub-a"], Some(2)));
+        let b = pay(hubs_mode(&["hub-a", "hub-b"], Some(2)));
+        assert_eq!(a, b);
+        // …while membership and redundancy are signed content.
+        assert_ne!(a, pay(hubs_mode(&["hub-a", "hub-b"], Some(1))));
+        assert_ne!(a, pay(hubs_mode(&["hub-a"], Some(2))));
+        assert_ne!(a, pay(hubs_mode(&["hub-a", "hub-b"], None)));
+        // Distinct prefix from every earlier variant family.
+        let s = String::from_utf8(a).unwrap();
+        assert!(s.contains("|topology|hubs|"));
+    }
+
+    #[test]
+    fn topology_change_needs_an_owner_on_closed() {
+        let (_, owner) = fixture_key(1);
+        let (_, controller) = fixture_key(2);
+        let gov = closed_gov(
+            "net-1",
+            &[(&owner, Role::Owner), (&controller, Role::Controller)],
+        );
+        let v = TransitionVariant::TopologyChange {
+            to: hubs_mode(&[&owner], Some(2)),
+        };
+        // Quorum only — signature validity is a separate check.
+        let by = |signer: &str| Transition {
+            at: 5,
+            variant: v.clone(),
+            signers: vec![signer.to_string()],
+            signatures: vec!["sig".into()],
+        };
+        verify_quorum(&gov, &by(&owner)).expect("owner shapes the fabric");
+        assert!(
+            verify_quorum(&gov, &by(&controller)).is_err(),
+            "controllers govern members, not infrastructure"
+        );
+    }
+
+    #[test]
+    fn topology_change_is_refused_on_open_and_silent() {
+        let (_, anyone) = fixture_key(3);
+        let v = TransitionVariant::TopologyChange {
+            to: crate::config::TopologyMode::FullMesh,
+        };
+        let t = Transition {
+            at: 1,
+            variant: v,
+            signers: vec![anyone],
+            signatures: vec!["sig".into()],
+        };
+        let open = NetworkState::empty_for("net-open");
+        assert!(verify_quorum(&open, &t).is_err());
+        let mut silent = NetworkState::empty_for("net-silent");
+        silent.kind = NetworkKind::Silent;
+        assert!(verify_quorum(&silent, &t).is_err());
+    }
+
+    #[test]
+    fn verify_log_carries_topology_to_every_replayer() {
+        let (owner_sk, owner) = fixture_key(1);
+        let (_, hub_a) = fixture_key(7);
+        let net = "fleet-1";
+        let v0 = TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        };
+        let t0 = Transition {
+            at: 1,
+            variant: v0.clone(),
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v0, &owner_sk)],
+        };
+        let mode = hubs_mode(&[&hub_a, &owner], Some(2));
+        let v1 = TransitionVariant::TopologyChange { to: mode.clone() };
+        let t1 = Transition {
+            at: 2,
+            variant: v1.clone(),
+            signers: vec![owner.clone()],
+            signatures: vec![sign_transition(net, &v1, &owner_sk)],
+        };
+        let state = verify_log(net, &[t0, t1]).expect("owner-signed topology verifies");
+        assert_eq!(state.topology, Some(mode));
+        // And a non-owner's attempt fails the replay outright.
+        let (mallory_sk, mallory) = fixture_key(9);
+        let v2 = TransitionVariant::TopologyChange {
+            to: crate::config::TopologyMode::FullMesh,
+        };
+        let t2 = Transition {
+            at: 3,
+            variant: v2.clone(),
+            signers: vec![mallory.clone()],
+            signatures: vec![sign_transition(net, &v2, &mallory_sk)],
+        };
+        let log = [
+            state.transitions[0].clone(),
+            state.transitions[1].clone(),
+            t2,
+        ];
+        assert!(verify_log(net, &log).is_err());
+    }
+
+    #[test]
+    fn unknown_variant_parses_but_never_verifies() {
+        // A transition kind from a newer build must not break parsing —
+        // roster anti-entropy carries whole logs, and 0.2.35↔0.2.36-style
+        // mixed fleets have to keep converging membership — but it can't
+        // be verified, so log adoption holds this node at its current
+        // governance until it updates.
+        let json = r#"{
+            "at": 9,
+            "variant": { "kind": "from_the_future", "field": true },
+            "signers": ["p1"],
+            "signatures": ["s1"]
+        }"#;
+        let t: Transition = serde_json::from_str(json).unwrap();
+        assert_eq!(t.variant, TransitionVariant::Unknown);
+        let gov = NetworkState::empty_for("net-x");
+        assert!(verify_quorum(&gov, &t).is_err());
+    }
+
+    #[test]
+    fn pre_topology_state_file_loads_with_none() {
+        // State written by a build that predates governed topology.
+        let json = r#"{
+            "version": 2,
+            "network_id": "net-a",
+            "kind": "closed",
+            "roles": {},
+            "transitions": [],
+            "pending": [],
+            "splits": []
+        }"#;
+        let s: NetworkState = serde_json::from_str(json).unwrap();
+        assert_eq!(s.topology, None);
     }
 
     // ---- member tier (multi-writer leaf) ------------------------------

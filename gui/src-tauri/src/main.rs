@@ -401,6 +401,27 @@ async fn mesh_governance_propose_role_revoke(
 }
 
 #[tauri::command]
+async fn mesh_governance_propose_topology(
+    state: State<'_, AppState>,
+    network: String,
+    topology: String,
+    hub: Option<String>,
+    mfa_code: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceProposeTopology {
+            network,
+            topology,
+            hub,
+            mfa_code,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
 async fn mesh_governance_sign(
     state: State<'_, AppState>,
     network: String,
@@ -679,6 +700,7 @@ fn main() {
             mesh_governance_propose_kind_change,
             mesh_governance_propose_role_grant,
             mesh_governance_propose_role_revoke,
+            mesh_governance_propose_topology,
             mesh_governance_sign,
             mesh_governance_deny,
             mesh_governance_withdraw,

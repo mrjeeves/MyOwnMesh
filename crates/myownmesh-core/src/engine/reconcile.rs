@@ -59,13 +59,23 @@ pub fn apply_hot(state: &Arc<NetworkState>, next: NetworkConfig) -> Result<()> {
         cfg.stun_servers = next.stun_servers;
         cfg.turn_servers = next.turn_servers;
     }
+    // The config's topology only drives the runtime while governance
+    // hasn't spoken: a ratified TopologyChange in the signed log owns
+    // the shape (the same precedence `kind` has), and a config edit —
+    // which any device can make locally — must not clobber it.
+    let effective = state
+        .governance_state
+        .read()
+        .topology
+        .clone()
+        .unwrap_or(next.topology);
     {
         let mut topo = state.topology.write();
-        *topo = next.topology.clone();
+        *topo = effective.clone();
     }
     {
         let mut sel = state.topology_impl.write();
-        *sel = crate::topology::from_mode(&next.topology);
+        *sel = crate::topology::from_mode(&effective);
     }
     Ok(())
 }

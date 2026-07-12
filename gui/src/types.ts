@@ -25,9 +25,12 @@ export type MeshPhase =
 export type TopologyMode =
   | { kind: "ring"; n_preferred: number | null }
   | { kind: "star"; hub: string }
+  | { kind: "hubs"; hubs: string[]; spoke_redundancy: number | null }
   | { kind: "full_mesh" };
 
-export function topologyName(t: TopologyMode): "ring" | "star" | "full_mesh" {
+export type TopologyKind = TopologyMode["kind"];
+
+export function topologyName(t: TopologyMode): TopologyKind {
   return t.kind;
 }
 
@@ -35,16 +38,57 @@ export function topologyHub(t: TopologyMode): string | null {
   return t.kind === "star" ? t.hub : null;
 }
 
+/** Every device acting as a hub under this mode — the star's single
+ *  hub or the hubs tier's whole set; empty for shapes with no hub
+ *  concept. */
+export function topologyHubSet(t: TopologyMode): string[] {
+  if (t.kind === "star") return [t.hub];
+  if (t.kind === "hubs") return t.hubs;
+  return [];
+}
+
 /** Build a TopologyMode value from the picker primitives the UI
- *  collects (a discriminant + optional hub). Centralised so add /
- *  set-topology paths share the same construction. */
+ *  collects (a discriminant + optional hub / hub set). Centralised so
+ *  add / set-topology / propose-topology paths share the same
+ *  construction. */
 export function buildTopology(
-  name: "ring" | "star" | "full_mesh",
+  name: TopologyKind,
   hub?: string | null,
+  hubs?: string[],
+  spokeRedundancy?: number | null,
 ): TopologyMode {
   if (name === "ring") return { kind: "ring", n_preferred: null };
   if (name === "full_mesh") return { kind: "full_mesh" };
+  if (name === "hubs")
+    return {
+      kind: "hubs",
+      hubs: hubs ?? [],
+      spoke_redundancy: spokeRedundancy ?? null,
+    };
   return { kind: "star", hub: hub ?? "" };
+}
+
+/** Encode a TopologyMode into the (`topology`, `hub`) string pair the
+ *  daemon's `TopologySet` / `GovernanceProposeTopology` ops take —
+ *  `hubs` rides the `id1,id2[,…][:redundancy]` spec. */
+export function topologyToOpArgs(t: TopologyMode): {
+  topology: string;
+  hub: string | null;
+} {
+  switch (t.kind) {
+    case "ring":
+      return { topology: "ring", hub: null };
+    case "full_mesh":
+      return { topology: "full_mesh", hub: null };
+    case "star":
+      return { topology: "star", hub: t.hub };
+    case "hubs": {
+      const list = t.hubs.join(",");
+      const spec =
+        t.spoke_redundancy != null ? `${list}:${t.spoke_redundancy}` : list;
+      return { topology: "hubs", hub: spec };
+    }
+  }
 }
 
 // ---- network config (write shape — sent into NetworkAdd) -------------
@@ -494,6 +538,11 @@ export interface NetworkStateView {
    *  a new closed network with the listed members). Used to render
    *  the "also runs *N'*" chip on the Connections tab. */
   splits: SplitRecord[];
+  /** Governed topology, when a ratified owner-signed TopologyChange
+   *  owns the network's shape. `null`/absent = not governed — each
+   *  device's local config topology applies (and the local picker in
+   *  network settings stays writable). */
+  topology?: TopologyMode | null;
 }
 
 export interface NetworkTransition {
