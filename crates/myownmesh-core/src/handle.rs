@@ -481,9 +481,63 @@ impl JoinedNetwork {
             .cmd_tx
             .send(NetworkCmd::ConnectPeer {
                 device_id: device_id.to_string(),
+                sticky: false,
+                reply: None,
             })
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         Ok(())
+    }
+
+    /// Dial one peer and resolve when the link is genuinely ACTIVE (or
+    /// fail with the terminal reason) — the observable twin of
+    /// [`Self::connect_peer`], which only queues the dial. Bounded by
+    /// `timeout`. `sticky` records a standing dial: the engine keeps a
+    /// never-expiring reconnect intent for the peer and — the one
+    /// exception to Silent's no-auto-dial rule — redials it whenever it
+    /// announces, which is what lets a remote-support session survive
+    /// the far end sleeping, moving networks, or rebooting without the
+    /// application re-driving the dial.
+    pub async fn connect_peer_wait(
+        &self,
+        device_id: &str,
+        sticky: bool,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::Network(format!(
+                "connect to {device_id} still pending after {timeout:?} (the dial keeps going{})",
+                if sticky { "; the pin stays armed" } else { "" }
+            ))),
+        }
+    }
+
+    /// Remove a standing dial recorded by `connect_peer_wait(…, sticky
+    /// = true)` (or a config `pinned_peers` entry) — the peer stops
+    /// being redialed on announce and its never-expiring intent is
+    /// dropped. Does not tear down a live session.
+    pub fn unpin_peer(&self, device_id: &str) {
+        self.state.remove_sticky(device_id);
+    }
+
+    /// Send an application frame with the acknowledged-delivery
+    /// contract: parked until the peer's link is up, retransmitted
+    /// across session rebuilds, resolved when the peer's engine has
+    /// delivered it to the application layer (or with an error at TTL /
+    /// terminal failure / outbox backpressure). The everyday cure for
+    /// "my first frame raced the data channel and vanished" — no
+    /// application retry loop required.
+    pub async fn send_reliable(
+        &self,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<()> {
+        self.state
+            .send_channel_reliable(peer, channel, payload, ttl.map(|d| d.as_millis() as u64))
+            .await
     }
 
     /// Stop the network. Tears down all peer sessions, signals

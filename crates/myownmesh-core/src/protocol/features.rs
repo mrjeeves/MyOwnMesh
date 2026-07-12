@@ -38,6 +38,14 @@ impl Feature {
     /// the `Unknown` catch-all. See
     /// [`docs/NETWORK-TYPES.md`](../../../../docs/NETWORK-TYPES.md).
     pub const NETWORK_STATE_V1: &'static str = "network_state_v1";
+
+    /// Peer honours the acknowledged-delivery channel contract —
+    /// accepts `channel_seq` frames, delivers them exactly once, and
+    /// answers with cumulative `channel_ack`s. Senders fall back to
+    /// plain `channel` frames (queued locally until the link is up,
+    /// but unacknowledged) against peers that don't advertise this.
+    /// See the engine's `reliable` module.
+    pub const RELIABLE_CHANNELS: &'static str = "reliable_channels_v1";
 }
 
 /// The set of features this build advertises to peers. Embedders
@@ -49,6 +57,7 @@ pub const ADVERTISED_FEATURES: &[&str] = &[
     Feature::TYPED_CHANNELS,
     Feature::CAPABILITIES_UPDATE,
     Feature::NETWORK_STATE_V1,
+    Feature::RELIABLE_CHANNELS,
 ];
 
 /// Test whether a peer's advertised feature list contains `feature`.

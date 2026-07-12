@@ -40,6 +40,7 @@ fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> Net
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
+        pinned_peers: Vec::new(),
         auto_approve: true,
     }
 }

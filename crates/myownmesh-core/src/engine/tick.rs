@@ -144,3 +144,22 @@ impl Ticker for ReconnectSupervisor {
         super::service_reconnect_intents(state).await;
     }
 }
+
+/// Acked-delivery maintenance — expires lapsed outbox entries (their
+/// callers get an error instead of silence) and re-attempts flushes for
+/// peers holding unsent frames after a transient send failure. The event
+/// paths (enqueue, the ACTIVE transition, inbound acks) drive the common
+/// case; this is the no-event backstop, a cheap no-op when every outbox
+/// is drained.
+pub(crate) struct ReliableSendTicker;
+
+#[async_trait]
+impl Ticker for ReliableSendTicker {
+    fn name(&self) -> &'static str {
+        "reliable-send"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        super::reliable::tick(state).await;
+    }
+}

@@ -201,6 +201,10 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
         data.nonce_received = Some(hello.nonce.clone());
         data.verification_code_received = Some(hello.verification_code.clone());
         data.label = hello.label.clone();
+        // The advertised feature set is the sender-side gate for every
+        // optional frame kind (acked channel delivery, governance wire,
+        // …) — record it, or `peer_supports` has nothing to consult.
+        data.features = hello.features.clone();
         if let Some(caps) = &hello.capabilities {
             data.capabilities = Some(caps.clone());
         }
@@ -405,6 +409,13 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         }));
         phase::recompute(state);
         super::ladder::reevaluate_topology(state).await;
+        // The link is up for app traffic — settle everything that was
+        // waiting on exactly this moment: parked `connect_peer_wait`
+        // callers, the peer's queued reliable sends, and any standing
+        // reconnect intent (the link is back; stop retrying it).
+        state.resolve_connect_waiters(device_id, None);
+        state.clear_reconnect_intent(device_id);
+        super::reliable::flush_peer(state, device_id).await;
         // Advertise both anti-entropy channels to the freshly-active link.
         // The roster summary carries only the *membership* root, which is blind
         // to role changes by design — so a peer that missed a promote/demote or

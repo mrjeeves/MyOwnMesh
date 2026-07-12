@@ -46,6 +46,11 @@ pub struct PeerStateData {
     pub status: PeerStatus,
     pub tier: ConnectionTier,
     pub authenticated: bool,
+    /// Features the peer advertised in its `hello` (see
+    /// `protocol::features`). Empty until the hello lands — and empty
+    /// forever for a pre-features build, which is exactly the "assume
+    /// nothing optional" senders must gate on.
+    pub features: Vec<String>,
     pub local_approve_sent: bool,
     pub remote_approve_seen: bool,
     pub local_shelved: bool,
@@ -148,6 +153,7 @@ impl Default for PeerStateData {
             status: PeerStatus::Sighted,
             tier: ConnectionTier::Steady,
             authenticated: false,
+            features: Vec::new(),
             local_approve_sent: false,
             remote_approve_seen: false,
             local_shelved: false,

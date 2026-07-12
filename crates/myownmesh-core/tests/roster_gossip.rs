@@ -49,6 +49,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
+        pinned_peers: Vec::new(),
         // Auto-approve fires the wire-level approve automatically so both
         // peers reach ACTIVE without a human Approve click — which is the
         // exact path we want to prove now persists the roster on its own.

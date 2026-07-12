@@ -238,6 +238,15 @@ pub struct NetworkConfig {
     /// (`~/.myownmesh/mesh/rosters/{network_id}.json`).
     #[serde(default)]
     pub roster_path: Option<PathBuf>,
+    /// Peers this node maintains a standing dial for. On a `Silent`
+    /// network these are the one exception to "nothing connects until a
+    /// deliberate dial": a pinned peer is (re)dialed whenever it
+    /// announces, and its reconnect intent never expires — the shape a
+    /// standing remote-support session needs. Populated by
+    /// `connect_peer(…, sticky)` at runtime and persisted with the
+    /// config so pins survive daemon restarts.
+    #[serde(default)]
+    pub pinned_peers: Vec<String>,
     /// When true, every authenticating peer is added to the roster
     /// automatically without user approval. Useful for headless
     /// fleet members; off by default.
@@ -263,6 +272,7 @@ impl NetworkConfig {
             stun_servers: default_stun_servers(),
             turn_servers: default_turn_servers(),
             roster_path: None,
+            pinned_peers: Vec::new(),
             auto_approve: false,
         }
     }
