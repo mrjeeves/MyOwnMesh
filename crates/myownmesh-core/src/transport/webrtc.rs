@@ -185,11 +185,31 @@ pub const PRE_PROVISIONED_LANES: usize = 1;
 /// grace revives the same negotiated track, so samples flow again on
 /// the first write. That is exactly the smoothness the pre-lifecycle
 /// transport had (every lane always open); the grace buys it back
-/// without re-paying the always-on SDP tax. Five seconds comfortably
-/// covers an app-level release→reconfigure→restart round-trip (sub-
-/// second in practice) while keeping a genuinely-abandoned m-line's
-/// afterlife short.
-pub const LANE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// without re-paying the always-on SDP tax.
+///
+/// The window has to cover a *human* stop→start, not just an app-level
+/// reconfigure: a technician closing a console and re-opening it seconds
+/// later must land on the free-revive path, because the alternative —
+/// reaping the track and negotiating a fresh recycled m-line — does not
+/// reliably re-`ontrack` on the viewer (screen re-opens sat at "connecting"
+/// with no frames arriving, fixed only by a full peer restart). 5s missed
+/// that by a mile (a real re-open is 8–15s), so widen to 90s.
+///
+/// This costs nothing on the wire: a draining lane is *silent* — the app
+/// writes no samples, so no RTP flows; the grace only keeps the (already
+/// negotiated) m-line alive a little longer before the reaper removes it.
+/// A genuinely-abandoned lane is still reaped, just after a session-sized
+/// window instead of a machine-sized one — quiet network intact, and one
+/// fewer reap↔re-add renegotiation churn per stop→start cycle. Override
+/// with `MYOWNMESH_LANE_DRAIN_SECS` (clamped 1..=600) for tuning.
+pub static LANE_DRAIN_GRACE: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    let secs = std::env::var("MYOWNMESH_LANE_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90)
+        .clamp(1, 600);
+    Duration::from_secs(secs)
+});
 
 /// Per-device media-lane ceiling, resolved once at transport
 /// construction. `MYOWNMESH_MEDIA_LANES` overrides the [`MEDIA_LANES`]

@@ -963,7 +963,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         };
         // Anything draining past the grace? (Cheap read; the actual
         // removal happens in the spawned task.)
-        if !pending && !session.has_reapable_lanes(crate::transport::webrtc::LANE_DRAIN_GRACE) {
+        if !pending && !session.has_reapable_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE) {
             continue;
         }
         {
@@ -987,7 +987,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 // the removals too — one renegotiation for the whole
                 // delta.
                 let reaped = session
-                    .reap_drained_lanes(crate::transport::webrtc::LANE_DRAIN_GRACE)
+                    .reap_drained_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE)
                     .await;
                 match session.create_offer().await {
                     Ok(desc) => {
