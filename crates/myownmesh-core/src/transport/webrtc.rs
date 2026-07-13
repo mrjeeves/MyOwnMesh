@@ -174,6 +174,17 @@ pub const MEDIA_LANES: usize = 8;
 
 /// Lanes created at connection setup, before any media flows: lane 0
 /// only. Everything else is lifecycle-managed (see [`MEDIA_LANES`]).
+///
+/// These pre-provisioned lanes are also **pinned**: once negotiated they
+/// are never reaped for the connection's life. A close still drains them
+/// (silent — no RTP), but the track stays attached indefinitely, so a
+/// re-open always takes the zero-SDP free-revive path instead of the
+/// recycled-m-line renegotiation that does not reliably re-`ontrack` on
+/// the viewer. [`LANE_DRAIN_GRACE`] governs only the transient lanes
+/// (1+); the pinned lane needs no timer. This costs one always-present
+/// m-line per connection — the one that was pre-provisioned anyway — and
+/// removes the per-stop→start reap↔re-add churn on the common
+/// single-stream path (screen share, CEC console).
 pub const PRE_PROVISIONED_LANES: usize = 1;
 
 /// How long a closed lane keeps its track attached before the reaper
@@ -1305,13 +1316,16 @@ impl PeerSession {
     /// it to decide whether this peer needs a renegotiation pass at
     /// all.
     pub fn has_reapable_lanes(&self, grace: Duration) -> bool {
+        let pinned = PRE_PROVISIONED_LANES.min(self.max_lanes);
         [LaneKind::Video, LaneKind::Audio].iter().any(|kind| {
             self.pool(*kind)
                 .lock()
                 .expect("lane pool")
                 .iter()
-                .any(|slot| {
-                    matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace)
+                .enumerate()
+                .any(|(idx, slot)| {
+                    idx >= pinned
+                        && matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace)
                 })
         })
     }
@@ -1323,10 +1337,20 @@ impl PeerSession {
     /// `remove_track` calls run outside it — a concurrent revive can't
     /// resurrect a slot the reaper already committed to tearing down.
     pub async fn reap_drained_lanes(&self, grace: Duration) -> usize {
+        let pinned = PRE_PROVISIONED_LANES.min(self.max_lanes);
         let mut victims: Vec<Arc<TrackLocalStaticSample>> = Vec::new();
         for kind in [LaneKind::Video, LaneKind::Audio] {
             let mut pool = self.pool(kind).lock().expect("lane pool");
-            for slot in pool.iter_mut() {
+            for (idx, slot) in pool.iter_mut().enumerate() {
+                // The pre-provisioned lane is pinned: it drains silent but
+                // never loses its track, so a re-open always hits the
+                // zero-SDP free-revive path instead of a recycled-m-line
+                // renegotiation (which doesn't reliably re-`ontrack` on the
+                // viewer — the CEC console re-open hang). Only transient
+                // lanes (1+) are reaped once past the grace.
+                if idx < pinned {
+                    continue;
+                }
                 let due = matches!(slot, Some(LaneSlot::Draining { since, .. }) if since.elapsed() >= grace);
                 if due {
                     if let Some(LaneSlot::Draining { track, .. }) = slot.take() {
@@ -2315,6 +2339,85 @@ mod tests {
             .await
             .expect_err("past-ceiling lane must error");
         assert!(err.to_string().contains("no video lane"));
+
+        session.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn pinned_lane_drains_but_is_never_reaped() {
+        let transport = Transport::new().expect("transport");
+        let (session, mut events) = transport
+            .open_peer(Role::Offerer, &[], &[])
+            .await
+            .expect("open");
+
+        // Lane 0 is pre-provisioned. Closing it drains the lane (keeps its
+        // track) but — being pinned — it is never eligible for reaping, no
+        // matter how far past the grace. A re-open therefore always revives
+        // the same negotiated track (zero SDP) instead of recycling an
+        // m-line, which is the reliable path. This is the CEC console
+        // stop→start fast path made durable rather than time-boxed.
+        session
+            .close_media_lane(LaneKind::Video, 0)
+            .await
+            .expect("close lane 0");
+        assert!(
+            events.try_recv().is_err(),
+            "a drain is silent — no renegotiation on close"
+        );
+
+        // Even at zero grace (maximally eager reaping) the pinned lane is
+        // neither counted nor reaped, and it keeps its m-line.
+        assert!(
+            !session.has_reapable_lanes(Duration::ZERO),
+            "the pinned lane never counts as reapable"
+        );
+        assert_eq!(
+            session.reap_drained_lanes(Duration::ZERO).await,
+            0,
+            "the pinned lane is never reaped"
+        );
+        assert_eq!(
+            session.open_lane_count(LaneKind::Video),
+            PRE_PROVISIONED_LANES,
+            "the pinned lane keeps its m-line through the drain"
+        );
+
+        // Re-open revives the same lane in place, free.
+        let lane = session
+            .open_media_lane(LaneKind::Video)
+            .await
+            .expect("reopen pinned lane");
+        assert_eq!(lane, 0, "reopen revives the pinned lane in place");
+        assert!(
+            events.try_recv().is_err(),
+            "reviving the pinned lane is free — no renegotiation"
+        );
+
+        // Contrast: a transient lane (1+) still reaps past its grace, so the
+        // pin is narrowly scoped to the pre-provisioned lane.
+        session
+            .send_video(
+                1,
+                Bytes::from_static(b"x"),
+                std::time::Duration::from_millis(33),
+            )
+            .await
+            .expect("auto-open transient lane 1");
+        while events.try_recv().is_ok() {}
+        session
+            .close_media_lane(LaneKind::Video, 1)
+            .await
+            .expect("close lane 1");
+        assert!(
+            session.has_reapable_lanes(Duration::ZERO),
+            "a transient lane past grace is reapable"
+        );
+        assert_eq!(
+            session.reap_drained_lanes(Duration::ZERO).await,
+            1,
+            "the transient lane is reaped"
+        );
 
         session.close().await.expect("close");
     }
