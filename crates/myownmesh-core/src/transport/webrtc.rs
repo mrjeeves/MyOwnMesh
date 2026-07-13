@@ -353,6 +353,19 @@ impl Transport {
                 "media-lane pool overridden via MYOWNMESH_MEDIA_LANES"
             );
         }
+        // Surface the resolved drain grace once at startup. It governs how
+        // long a closed media lane stays re-openable onto its already-
+        // negotiated track (the free-revive path) before the reaper removes
+        // it — the difference between a console re-open that resumes silently
+        // and one forced into a fresh renegotiation. Logging it means field
+        // logs self-verify which grace a daemon is actually running, instead
+        // of guessing whether the new binary is live. Traffic-neutral: a
+        // draining lane sends no RTP; this only sets the reap deadline.
+        info!(
+            secs = LANE_DRAIN_GRACE.as_secs(),
+            overridden = std::env::var("MYOWNMESH_LANE_DRAIN_SECS").is_ok(),
+            "media-lane drain grace active"
+        );
         Ok(Self {
             api: Arc::new(api),
             media_lanes,
