@@ -1810,6 +1810,16 @@ async fn handle_transport_event(
             handshake::initiate(state, &device_id).await;
         }
         TransportEvent::DataChannelClosed => {
+            // A channel that closes right after we hand an evicted peer its
+            // deny-with-proof is that device standing down, not an ICE failure.
+            // Label it `Denied` so the diag reads truthfully (an evicted peer
+            // dropping as "IceFailed" is exactly what made this loop hard to
+            // read) and so it lands in the non-recoverable bucket — no redial.
+            let reason = if governance::log_evicted(state, &device_id) {
+                DropReason::Denied
+            } else {
+                DropReason::IceFailed
+            };
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
                 "transport",
@@ -1817,9 +1827,9 @@ async fn handle_transport_event(
                     "data channel closed with {} — dropping peer",
                     short_peer(&device_id)
                 ),
-                serde_json::json!({ "peer": device_id }),
+                serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
             );
-            drop_peer(state, &device_id, DropReason::IceFailed).await;
+            drop_peer(state, &device_id, reason).await;
         }
         TransportEvent::Message(bytes) => {
             handle_inbound_frame(state, &device_id, bytes).await;
@@ -2950,12 +2960,25 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
         // teardown (UserLeft / Denied / AuthFailed) must never be retried.
         let we_offer = state.identity.public_id() < device_id;
         let sticky = state.is_sticky(device_id);
-        let recoverable = matches!(
-            reason,
-            DropReason::IceFailed
-                | DropReason::HeartbeatTimeout
-                | DropReason::TransportError { .. }
-        );
+        // A peer our own signed state has evicted is never reconnected back,
+        // whatever the drop reason: the deny-with-proof exchange is a one-shot
+        // handoff, not a session to keep alive. Its post-deny channel close
+        // arrives as a "recoverable" IceFailed, and because we hold the
+        // lex-lower id (so `we_offer`) that would re-arm a reconnect intent —
+        // the 2 s connect/deny/drop/redial hot loop that never converges. Fold
+        // eviction into the intentional-teardown bucket so we stop self-driving
+        // the dial; the evicted device's own periodic announce is still
+        // answered and re-denied with proof, so convergence keeps its channel
+        // without the spin. Mirror of the `self_evicted` announce gate, which
+        // already stands a stood-down engine down from dialing.
+        let evicted = governance::log_evicted(state, device_id);
+        let recoverable = !evicted
+            && matches!(
+                reason,
+                DropReason::IceFailed
+                    | DropReason::HeartbeatTimeout
+                    | DropReason::TransportError { .. }
+            );
         if recoverable && (we_offer || sticky) {
             state.record_reconnect_intent(device_id, sticky);
             // Whatever was on the wire for the dead session may or may not
@@ -3346,6 +3369,96 @@ mod tests {
             "an intent past its grace is given up, not retried"
         );
         assert!(!state.has_reconnect_intent("peer-z"));
+    }
+
+    #[tokio::test]
+    async fn evicted_peer_drop_never_rearms_reconnect() {
+        // The evicted-peer loop guard. A device our own signed state has
+        // evicted must not be self-dialed back: its post-deny channel close
+        // arrives as a "recoverable" IceFailed, and since we hold the lex-lower
+        // id we're its offerer — so without the guard `drop_peer` re-arms a
+        // reconnect intent, the 2 s tick reconnects, the handshake re-denies,
+        // the channel closes, and it drops again, forever. Dropping an evicted
+        // peer is intentional teardown, so no intent is left behind; the peer's
+        // own announce (answered + re-denied with proof) is the only thing that
+        // re-opens a session, so convergence keeps its channel without the spin.
+        use crate::network_state::{
+            transition_payload, NetworkState as GovState, Transition, TransitionVariant,
+        };
+        use crate::{NetworkKind, Role};
+
+        let state = build_test_state("evicted-no-reconnect");
+        let net = state.network_id.clone();
+
+        // Lex-greater than any base32 identity, so `we_offer` holds; dash-free,
+        // so `pubkey_part` leaves the id whole and the evict target matches.
+        let evicted = "z".repeat(60);
+        let live = "y".repeat(60);
+        assert!(
+            state.identity.public_id() < evicted.as_str()
+                && state.identity.public_id() < live.as_str(),
+            "test ids must sort above our identity so we're their offerer"
+        );
+
+        // Seed a Closed governance whose signed member log evicts `evicted`.
+        let owner = crate::identity::Identity::ephemeral();
+        let owner_pk = owner.public_id().to_string();
+        {
+            let mut gov = state.governance_state.write();
+            *gov = GovState::empty_for(&net);
+            gov.kind = NetworkKind::Closed;
+            gov.roles.insert(owner_pk.clone(), Role::Owner);
+            let signed = |variant: TransitionVariant, at: u64| {
+                let payload = transition_payload(&net, &variant);
+                Transition {
+                    at,
+                    signatures: vec![crate::signing::sign_with(owner.signing_key(), &payload)],
+                    signers: vec![owner_pk.clone()],
+                    variant,
+                }
+            };
+            gov.member_log = vec![
+                signed(
+                    TransitionVariant::RoleGrant {
+                        target: evicted.clone(),
+                        role: Role::Member,
+                    },
+                    1,
+                ),
+                signed(
+                    TransitionVariant::Evict {
+                        target: evicted.clone(),
+                    },
+                    2,
+                ),
+            ];
+        }
+        assert!(
+            governance::log_evicted(&state, &evicted),
+            "seed must make the target read as evicted"
+        );
+        assert!(
+            !governance::log_evicted(&state, &live),
+            "the control peer must not read as evicted"
+        );
+
+        // The evicted peer: its IceFailed drop must leave no reconnect intent.
+        insert_session_less_peer(&state, &evicted, None);
+        drop_peer(&state, &evicted, DropReason::IceFailed).await;
+        assert!(
+            !state.has_reconnect_intent(&evicted),
+            "an evicted peer's drop must not arm a reconnect intent"
+        );
+
+        // Control: a non-evicted offerer-role peer with the identical drop DOES
+        // self-reconnect — proving the guard, not the plumbing, suppresses the
+        // evicted one.
+        insert_session_less_peer(&state, &live, None);
+        drop_peer(&state, &live, DropReason::IceFailed).await;
+        assert!(
+            state.has_reconnect_intent(&live),
+            "a non-evicted offerer-role peer still self-reconnects on IceFailed"
+        );
     }
 
     #[tokio::test]
