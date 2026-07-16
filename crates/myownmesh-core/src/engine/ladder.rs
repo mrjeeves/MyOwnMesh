@@ -100,7 +100,16 @@ pub async fn reevaluate_topology(state: &Arc<NetworkState>) {
     };
 
     for peer_id in &active_peers {
-        let should_be_shelved = !preferred.contains(peer_id);
+        // A sticky (pinned) peer outranks the shape here exactly as it does
+        // in the announce-dial and prune passes. The pin lives on one side
+        // only, and pruning a non-edge needs BOTH sides shelved — so the
+        // pin-holder must never send its half of that agreement. Without
+        // this, a technician's pinned support session was shelved by its
+        // own daemon, the customer's pinless daemon saw both-sides-shelved
+        // and pruned the link, the pin redialed it, and the session dropped
+        // on a loop every few seconds. Marking a pinned peer preferred also
+        // heals one shelved before the pin existed (it unshelves below).
+        let should_be_shelved = !preferred.contains(peer_id) && !state.is_sticky(peer_id);
         let needs_shelve = {
             let Some(peer) = state.peers.get(peer_id) else {
                 continue;
@@ -294,6 +303,64 @@ mod tests {
             entry.session.lock().is_none(),
             "both-sides-shelved non-edge closes, member stays Sighted"
         );
+    }
+
+    #[tokio::test]
+    async fn reevaluate_never_shelves_a_pinned_peer() {
+        let state = build_test_state("shelve-sticky");
+        let mode = TopologyMode::Star { hub: "~hub".into() };
+        *state.topology.write() = mode.clone();
+        *state.topology_impl.write() = from_mode(&mode);
+        // A live spoke↔spoke session (no edge under Star) held by a pin —
+        // a technician's standing support dial.
+        crate::engine::ensure_peer_session(
+            &state,
+            "spoke-b".into(),
+            crate::transport::Role::Offerer,
+        )
+        .await;
+        state.add_sticky("spoke-b");
+        {
+            let peer = state.peers.get("spoke-b").unwrap();
+            peer.state.write().status = PeerStatus::Active;
+        }
+        reevaluate_topology(&state).await;
+        let entry = state.peers.get("spoke-b").unwrap();
+        let data = entry.state.read();
+        assert!(
+            !data.local_shelved,
+            "the pin-holder must not shelve its pinned peer — its Shelve is \
+             the far (pinless) side's missing half of the prune agreement"
+        );
+        assert_eq!(data.status, PeerStatus::Active, "the link stays Active");
+    }
+
+    #[tokio::test]
+    async fn reevaluate_unshelves_a_peer_that_became_pinned() {
+        let state = build_test_state("unshelve-sticky");
+        let mode = TopologyMode::Star { hub: "~hub".into() };
+        *state.topology.write() = mode.clone();
+        *state.topology_impl.write() = from_mode(&mode);
+        crate::engine::ensure_peer_session(
+            &state,
+            "spoke-b".into(),
+            crate::transport::Role::Offerer,
+        )
+        .await;
+        // Shelved before the pin existed (the dial raced the shelve pass) —
+        // the next reevaluation must heal it back to Active.
+        {
+            let peer = state.peers.get("spoke-b").unwrap();
+            let mut data = peer.state.write();
+            data.status = PeerStatus::Shelved;
+            data.local_shelved = true;
+        }
+        state.add_sticky("spoke-b");
+        reevaluate_topology(&state).await;
+        let entry = state.peers.get("spoke-b").unwrap();
+        let data = entry.state.read();
+        assert!(!data.local_shelved, "the pin un-shelves the link");
+        assert_eq!(data.status, PeerStatus::Active);
     }
 
     #[tokio::test]
