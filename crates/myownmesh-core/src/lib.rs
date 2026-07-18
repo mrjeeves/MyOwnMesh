@@ -68,9 +68,13 @@
 //! Each device owns a long-lived ed25519 keypair. The `hello`
 //! handshake commits both sides to a shared nonce; the
 //! `auth_response` is an ed25519 signature over
-//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id`.
-//! Domain separation prevents a signature obtained for one
-//! protocol step from being replayed in another.
+//! `SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id ||
+//! channel_binding`. Domain separation prevents a signature obtained
+//! for one protocol step from being replayed in another, and the
+//! `channel_binding` — the DTLS certificate fingerprint of the channel
+//! the handshake runs over — ties the proven identity to *this*
+//! transport, so a man-in-the-middle on the (unauthenticated) signaling
+//! path can't relay the handshake across two DTLS legs it terminates.
 //!
 //! A user-visible 6-char verification code lets a human
 //! eyeball-confirm the handshake over voice/video at first-meeting

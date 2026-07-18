@@ -226,11 +226,34 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
         }),
     );
 
+    // Bind the signed handshake to this DTLS channel: fold in the fingerprint
+    // of the certificate we present here. The initiator verifies it against
+    // the fingerprint it observes on its end of the channel, so a
+    // signaling-path MITM that terminates DTLS on each leg (presenting its own
+    // cert) makes the two disagree and the signature fails. Fail closed if the
+    // transport can't surface it — dropping is safer than sending an unbound
+    // signature an interceptor could relay unmodified.
+    let Some(session) = state
+        .peers
+        .get(device_id)
+        .and_then(|p| p.session.lock().clone())
+    else {
+        warn!(peer = %device_id, "no transport session at hello — cannot channel-bind, dropping");
+        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        return;
+    };
+    let Some(channel_binding) = session.local_fingerprint().await else {
+        warn!(peer = %device_id, "no local DTLS fingerprint — refusing to send an unbound auth response");
+        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        return;
+    };
+
     // Build the signed payload and reply.
     let payload = signing::handshake_payload(
         &hello.nonce,
         state.identity.public_id(),
         signing::pubkey_part(device_id),
+        &channel_binding,
     );
     let signature = signing::sign_with(state.identity.signing_key(), &payload);
     if let Err(e) = send_to_peer(
@@ -279,10 +302,31 @@ pub async fn on_auth_response(
         warn!(peer = %device_id, "received auth_response without having sent hello");
         return;
     };
+    // Reconstruct the peer's channel binding: the DTLS fingerprint we observe
+    // on our end of the channel. The peer signed the fingerprint of the cert
+    // it presented; WebRTC guarantees that equals what we observe here unless
+    // DTLS was re-terminated in the middle — in which case the fingerprints
+    // differ and the signature won't verify below. Fail closed if the
+    // transport can't surface it.
+    let Some(session) = state
+        .peers
+        .get(device_id)
+        .and_then(|p| p.session.lock().clone())
+    else {
+        warn!(peer = %device_id, "no transport session at auth_response — cannot verify channel binding, dropping");
+        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        return;
+    };
+    let Some(channel_binding) = session.remote_fingerprint().await else {
+        warn!(peer = %device_id, "no remote DTLS fingerprint — cannot verify channel binding, dropping");
+        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        return;
+    };
     let payload = signing::handshake_payload(
         &my_nonce,
         signing::pubkey_part(device_id),
         state.identity.public_id(),
+        &channel_binding,
     );
     let ok = match signing::verify(device_id, &payload, &resp.signature) {
         Ok(v) => v,

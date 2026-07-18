@@ -1104,6 +1104,21 @@ impl PeerSession {
         sdp_fingerprint(&self.pc.remote_description().await?.sdp)
     }
 
+    /// DTLS fingerprint of our *local* description — the fingerprint of the
+    /// certificate THIS side presents on the DTLS channel. WebRTC verifies a
+    /// peer's presented certificate against the `a=fingerprint:` in the SDP it
+    /// received, so on an un-intercepted channel a peer's
+    /// [`Self::remote_fingerprint`] equals its counterpart's
+    /// `local_fingerprint`. The auth handshake folds this value into the signed
+    /// ed25519 payload (see [`crate::signing::handshake_payload`]) so a
+    /// signaling-path man-in-the-middle — which must present its own
+    /// certificate on each leg it terminates — is detected: the victim's
+    /// observed remote fingerprint no longer matches the one the real peer
+    /// signed. `None` before the local description is set.
+    pub async fn local_fingerprint(&self) -> Option<String> {
+        sdp_fingerprint(&self.pc.local_description().await?.sdp)
+    }
+
     /// True when the peer connection is awaiting a remote Answer — i.e. we
     /// have a local offer outstanding (`have-local-offer`). An Answer that
     /// arrives in any other state is stale (a duplicate from relay redundancy,
