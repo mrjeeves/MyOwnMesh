@@ -77,6 +77,13 @@ pub enum Request {
     NetworkRemove {
         network: String,
     },
+    /// Forget every joined network at once (purges each network's signed state +
+    /// roster; keeps the device identity). The daemon exits afterward so it
+    /// reloads clean — the GUI restarts the stack.
+    ForgetAllNetworks,
+    /// Wipe this device's entire state directory (identity, config, all
+    /// networks) and exit for a fresh start — a factory reset.
+    FactoryReset,
     /// Atomic in-place edit of an already-joined network. Hot-applies
     /// label / topology / auto-approve without dropping peers; restarts
     /// transport only for signaling/STUN/TURN edits. Preserves the roster
