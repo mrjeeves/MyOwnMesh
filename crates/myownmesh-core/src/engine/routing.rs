@@ -128,6 +128,10 @@ pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payloa
     let Some(w) = parse_wrapper(&env.payload) else {
         return false;
     };
+    // The carrier is guaranteed admitted here: `on_relay_frame` is only reached
+    // via `on_channel_frame` for an inbound `Channel` frame, which the
+    // admission gate in `handle_inbound_frame` already drops from an unadmitted
+    // peer — so no separate carrier check is needed (or wanted per-frame).
     let me = state.identity.public_id().to_string();
     let origin = if env.src.is_empty() {
         from.to_string()

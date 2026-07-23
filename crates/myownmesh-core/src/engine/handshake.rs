@@ -419,7 +419,15 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         // we're already ACTIVE shouldn't re-fire the on-active side
         // effects (roster persist, gossip, Approved event).
         let was_active = matches!(data.status, PeerStatus::Active);
-        let active = data.local_approve_sent && data.remote_approve_seen;
+        // A peer reaches ACTIVE only once it has proven its ed25519 identity.
+        // `remote_approve_seen` can be latched by an `Approve` that arrives
+        // before authentication (protocol frames pass the admission gate), and
+        // the external `roster_approve` path sets `local_approve_sent` without
+        // an auth check — so without this `authenticated` conjunct an
+        // unauthenticated peer could be promoted to ACTIVE and gain the run of
+        // every application and control plane. The early latch is harmless: the
+        // transition simply completes the moment authentication lands.
+        let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;
         if active && !was_active {
             data.status = PeerStatus::Active;
             data.tier = ConnectionTier::Steady;

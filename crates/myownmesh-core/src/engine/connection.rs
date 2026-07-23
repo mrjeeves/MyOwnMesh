@@ -154,7 +154,29 @@ pub struct PeerStateData {
     /// peer's SDP. Drained and applied after the first successful
     /// `set_remote_description`; see [`remote_description_set`].
     pub pending_remote_candidates: Vec<LocalIceCandidate>,
+    /// Count of inbound frames the admission gate dropped because the peer
+    /// hadn't reached the phase they require (an application/RPC/reliable/
+    /// governance/media frame arriving before the ed25519 handshake + approval
+    /// finished). Drives a power-of-two-throttled warn so a pre-admission
+    /// flood can't be turned into a log-amplification primitive.
+    pub admission_rejected: u64,
     pub diag: PeerDiag,
+}
+
+impl PeerStateData {
+    /// The admission boundary: `true` once this peer has proven its ed25519
+    /// identity (`authenticated`) **and** both sides have approved (`Active`,
+    /// or `Shelved` — an admitted `Active` peer parked by the topology
+    /// selector). This is the single predicate every inbound application/RPC/
+    /// reliable/governance/routing/media path — and the application-level
+    /// outbound senders — gate on. A merely-connected peer (`Sighted`/
+    /// `Handshaking`/`PendingApproval`) is **not** admitted: a live DTLS data
+    /// channel is not authorization. The `authenticated` conjunct is defence in
+    /// depth — even if some path reached `Active` without authenticating, no
+    /// traffic flows.
+    pub fn is_admitted(&self) -> bool {
+        self.authenticated && matches!(self.status, PeerStatus::Active | PeerStatus::Shelved)
+    }
 }
 
 impl Default for PeerStateData {
@@ -194,6 +216,7 @@ impl Default for PeerStateData {
             selected_pair: None,
             remote_description_set: false,
             pending_remote_candidates: Vec::new(),
+            admission_rejected: 0,
             diag: PeerDiag::default(),
         }
     }
