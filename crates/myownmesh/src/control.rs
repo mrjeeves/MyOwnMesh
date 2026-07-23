@@ -109,6 +109,21 @@ pub enum Request {
         #[serde(default)]
         purge: bool,
     },
+    /// Forget **every** joined network at once — a `NetworkRemove{purge:true}`
+    /// for all of them: tear each out of the registry, `leave()` its driver, and
+    /// delete its signed governance state + roster from disk. Keeps this device's
+    /// identity. The daemon then exits (see [`schedule_daemon_exit`]) so every
+    /// layer reloads from the now-clean disk instead of a stale in-memory cache
+    /// that would re-persist ("resurrect") what was just removed; the GUI/service
+    /// brings a fresh daemon back up.
+    ForgetAllNetworks,
+    /// Factory reset — wipe this device's **entire** state directory
+    /// (`~/.myownmesh`, honouring `MYOWNMESH_HOME`): identity, config, and every
+    /// network's roster + governance state. The device becomes a brand-new
+    /// identity to every peer. Quiesces each network first (so nothing
+    /// re-persists mid-wipe), then removes the tree and exits so a fresh daemon
+    /// mints a new identity on empty state.
+    FactoryReset,
     /// Update an already-joined network's config in place. Hot-
     /// reloadable changes (topology / label / auto_approve / roster
     /// path) are applied without dropping any peer; transport-level
@@ -1014,6 +1029,14 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
             info!(%network, purge, "control: network_remove");
             network_remove(state, &network, purge).await
         }
+        Request::ForgetAllNetworks => {
+            info!("control: forget_all_networks");
+            forget_all_networks(state).await
+        }
+        Request::FactoryReset => {
+            info!("control: factory_reset");
+            factory_reset(state).await
+        }
         Request::NetworkUpdate { config } => {
             info!(network = %config.network_id, config_id = %config.id, "control: network_update");
             network_update(state, config).await
@@ -1812,6 +1835,72 @@ async fn network_remove(state: &Arc<ControlState>, key: &str, purge: bool) -> Re
         }
         RemoveResult::NotFound => Response::err(format!("unknown network: {key_owned}")),
     }
+}
+
+/// Forget every joined network at once — the bulk `NetworkRemove{purge:true}`.
+/// Each network is torn down live and its signed state + roster deleted from
+/// disk; the device identity is kept. Snapshots the set first so removing as we
+/// go can't skip an entry. Schedules a daemon exit ([`schedule_daemon_exit`]) so
+/// every layer reloads clean around the wipe.
+async fn forget_all_networks(state: &Arc<ControlState>) -> Response {
+    let mut forgotten = Vec::new();
+    for n in state.registry.summaries() {
+        // `network_remove` resolves either alias; the config id is stable.
+        let _ = network_remove(state, &n.config_id, true).await;
+        forgotten.push(n.config_id);
+    }
+    schedule_daemon_exit();
+    Response::ok(serde_json::json!({ "forgotten": forgotten, "restarting": true }))
+}
+
+/// Factory reset — return this device to a brand-new state. First quiesce every
+/// network (tear it down + purge its files) so nothing re-persists mid-wipe,
+/// then remove the whole state directory (identity, config, and any leftovers),
+/// and finally exit so a fresh daemon mints a new identity on empty state. The
+/// live control socket + log file descriptors stay valid until exit; the
+/// supervising service, or the GUI's `ensure_daemon_running` on relaunch, brings
+/// the daemon back. Best-effort per step — we always schedule the exit so a
+/// partial failure still ends in a clean restart rather than a half-wiped daemon
+/// re-persisting stale caches.
+async fn factory_reset(state: &Arc<ControlState>) -> Response {
+    // Quiesce writers first: tearing each network down stops its engine driver
+    // from writing a roster/state file back out while we're deleting the tree.
+    for n in state.registry.summaries() {
+        let _ = network_remove(state, &n.config_id, true).await;
+    }
+    let dir = match myownmesh_core::dirs::data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            // Can't find the dir to wipe — still restart so we don't leave the
+            // caller hanging on a half-done reset.
+            schedule_daemon_exit();
+            return Response::err(format!("factory reset: resolve state dir: {e}"));
+        }
+    };
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        // A missing dir already reads as reset; anything else is worth logging,
+        // but we still exit so caches can't resurrect what did get deleted.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(dir = %dir.display(), "factory reset: remove_dir_all: {e:#}");
+        }
+    }
+    schedule_daemon_exit();
+    Response::ok(serde_json::json!({ "reset": true, "restarting": true }))
+}
+
+/// Exit the daemon shortly after the current response flushes, so a fresh
+/// instance reloads from the now-clean disk. The reset commands use this: the
+/// only reliable way to drop every in-memory cache — which would otherwise
+/// re-persist and "resurrect" the state we just deleted — is a clean process
+/// restart. The short delay lets the JSON response reach the client first; the
+/// supervising service (Restart=always) or the GUI's `ensure_daemon_running` on
+/// relaunch starts a fresh daemon.
+fn schedule_daemon_exit() {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        info!("reset complete — exiting so a fresh daemon reloads clean state");
+        std::process::exit(0);
+    });
 }
 
 /// Reconnect a joined network in place — the non-destructive twin of

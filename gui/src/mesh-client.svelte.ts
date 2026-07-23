@@ -222,6 +222,24 @@ function createMeshClient() {
     await refreshNetworks();
   }
 
+  /** Danger Zone: forget every joined network at once, then reboot the whole
+   *  stack. Purges each network's signed state + roster while keeping this
+   *  device's identity. The daemon exits after the reset so it reloads clean,
+   *  and `restart_app` relaunches the app on top of it so no layer keeps a
+   *  stale cache that would resurrect what was wiped. `restart_app` never
+   *  resolves (the app is replaced), so this call ends by relaunching. */
+  async function forgetAllNetworksAndRestart() {
+    await invoke("mesh_forget_all_networks");
+    await invoke("restart_app");
+  }
+
+  /** Danger Zone: factory reset — wipe this device's entire state (identity,
+   *  config, every network) and reboot into a brand-new identity. */
+  async function factoryResetAndRestart() {
+    await invoke("mesh_factory_reset");
+    await invoke("restart_app");
+  }
+
   /** Atomic in-place edit of an already-joined network. The daemon
    *  hot-applies label / topology / auto-approve and only restarts
    *  transport for signaling/STUN/TURN edits — the roster is preserved
@@ -717,6 +735,8 @@ function createMeshClient() {
     configShow,
     networkAdd,
     networkRemove,
+    forgetAllNetworksAndRestart,
+    factoryResetAndRestart,
     networkUpdate,
     exportNetworkFile,
 

@@ -22,6 +22,33 @@
   let urlDraft = $state("");
   let intervalDraft = $state(6);
 
+  // ---- Danger Zone ----
+  // Two-click arming so a reset can't fire on a stray click. When an action
+  // fires it reboots the whole stack (the mesh daemon and the app): the daemon
+  // is the real datastore, so every layer has to reload from the now-clean disk
+  // or an in-memory cache would just re-persist ("resurrect") what we deleted.
+  let armed = $state<null | "forget" | "factory">(null);
+  let resetting = $state<null | "forget" | "factory">(null);
+  let resetError = $state<string | null>(null);
+
+  async function runReset(kind: "forget" | "factory") {
+    if (armed !== kind) {
+      armed = kind; // first click arms; a second confirms
+      return;
+    }
+    armed = null;
+    resetting = kind;
+    resetError = null;
+    try {
+      if (kind === "forget") await meshClient.forgetAllNetworksAndRestart();
+      else await meshClient.factoryResetAndRestart();
+      // The app relaunches on success, so control doesn't normally return here.
+    } catch (e) {
+      resetError = String(e);
+      resetting = null;
+    }
+  }
+
   async function load() {
     try {
       status = await meshClient.updateStatus();
@@ -282,6 +309,70 @@
       </div>
     </div>
   {/if}
+
+  <!-- Danger Zone — always shown (even if update status failed to load), since
+       resets are how you recover a wedged node. Each action reboots the daemon
+       + app so state genuinely flushes. -->
+  <section class="danger">
+    <div class="danger-head">⚠ Danger Zone</div>
+    <p class="danger-lead">
+      Each of these clears state and then <b>restarts the app and the mesh
+      daemon</b>, so every layer reloads from disk. Without the reboot, cached
+      state can quietly reappear.
+    </p>
+
+    <div class="danger-row">
+      <div class="danger-copy">
+        <div class="danger-title">Forget all meshes</div>
+        <div class="danger-desc">
+          Leave and delete every network — rosters and signed governance state —
+          while keeping this device's identity. Use when memberships are stuck
+          or you want a clean networking slate.
+        </div>
+      </div>
+      <button
+        class="danger-btn"
+        class:armed={armed === "forget"}
+        disabled={resetting !== null}
+        onclick={() => runReset("forget")}
+      >
+        {resetting === "forget"
+          ? "Restarting…"
+          : armed === "forget"
+            ? "Confirm — reboots"
+            : "Forget all"}
+      </button>
+    </div>
+
+    <div class="danger-row">
+      <div class="danger-copy">
+        <div class="danger-title">Factory reset</div>
+        <div class="danger-desc">
+          Erase <b>everything</b> — identity, config, and every network. This
+          device becomes brand-new to all peers. There is no undo.
+        </div>
+      </div>
+      <button
+        class="danger-btn nuke"
+        class:armed={armed === "factory"}
+        disabled={resetting !== null}
+        onclick={() => runReset("factory")}
+      >
+        {resetting === "factory"
+          ? "Resetting…"
+          : armed === "factory"
+            ? "Confirm wipe — reboots"
+            : "Factory reset"}
+      </button>
+    </div>
+
+    {#if armed}
+      <button class="danger-cancel" onclick={() => (armed = null)}>Cancel</button>
+    {/if}
+    {#if resetError}
+      <p class="danger-err">Reset failed: {resetError}</p>
+    {/if}
+  </section>
 </div>
 
 <style>
@@ -498,5 +589,97 @@
     border-radius: 5px;
     padding: 0.45rem 0.6rem;
     font-size: 0.8rem;
+  }
+
+  /* ---- Danger Zone ---- */
+  .danger {
+    margin-top: 1.4rem;
+    padding: 0.9rem;
+    border: 1px solid #5a2424;
+    border-radius: 8px;
+    background: #1a1012;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .danger-head {
+    color: #ff9b9b;
+    font-weight: 700;
+    font-size: 0.9rem;
+    letter-spacing: 0.02em;
+  }
+  .danger-lead {
+    color: #c9a3a3;
+    font-size: 0.78rem;
+    margin: 0;
+    line-height: 1.4;
+  }
+  .danger-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid #3a2020;
+  }
+  .danger-copy {
+    min-width: 0;
+  }
+  .danger-title {
+    color: #eaeaea;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .danger-desc {
+    color: #9a8a8a;
+    font-size: 0.76rem;
+    line-height: 1.4;
+    margin-top: 0.15rem;
+  }
+  .danger-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    background: #2a1618;
+    color: #ffb4b4;
+    border: 1px solid #6a2c2c;
+    border-radius: 6px;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .danger-btn:hover:not(:disabled) {
+    background: #3a1c1e;
+  }
+  .danger-btn.armed {
+    background: #7a1f1f;
+    color: #fff;
+    border-color: #a33;
+    font-weight: 600;
+  }
+  .danger-btn.nuke.armed {
+    background: #9a1010;
+  }
+  .danger-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .danger-cancel {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 0.76rem;
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .danger-err {
+    color: #ffb4b4;
+    background: #3a1717;
+    border: 1px solid #5a2424;
+    border-radius: 5px;
+    padding: 0.45rem 0.6rem;
+    font-size: 0.8rem;
+    margin: 0;
   }
 </style>

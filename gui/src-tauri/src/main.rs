@@ -258,6 +258,46 @@ async fn mesh_network_remove(
     unwrap_response(resp)
 }
 
+/// Danger Zone: forget every joined network at once (purges each network's
+/// signed state + roster; keeps the device identity). The daemon exits after
+/// responding so it reloads clean; the caller follows with `restart_app`.
+#[tauri::command]
+async fn mesh_forget_all_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::ForgetAllNetworks)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+/// Danger Zone: factory reset — wipe the entire state directory (identity,
+/// config, all networks). The daemon exits so a fresh one mints a new identity;
+/// the caller follows with `restart_app`.
+#[tauri::command]
+async fn mesh_factory_reset(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let resp = state
+        .client
+        .request(&Request::FactoryReset)
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+/// Relaunch the whole app. The Danger Zone calls this right after a reset so
+/// every layer restarts on the now-clean state — the daemon (which the reset
+/// told to exit), the Tauri backend, and the webview — instead of any of them
+/// serving a stale in-memory cache that would resurrect what was just wiped.
+/// The short wait lets the daemon finish exiting so the relaunched app spawns a
+/// fresh one via `ensure_daemon_running` rather than reconnecting to the old.
+#[tauri::command]
+async fn restart_app(app: AppHandle) -> Result<(), String> {
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    app.restart();
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
 /// Atomic in-place network edit. The daemon hot-applies label / topology
 /// / auto-approve and only restarts transport for signaling/STUN/TURN
 /// changes — the roster survives either way. Replaces the GUI's previous
@@ -712,6 +752,9 @@ fn main() {
             update_check,
             update_apply,
             update_set_prefs,
+            mesh_forget_all_networks,
+            mesh_factory_reset,
+            restart_app,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
