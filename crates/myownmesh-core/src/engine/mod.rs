@@ -1835,13 +1835,15 @@ async fn handle_transport_event(
             handle_inbound_frame(state, &device_id, bytes).await;
         }
         TransportEvent::VideoSample(sample) => {
-            // Same gate as channel frames: the connection's existence
-            // (DTLS identity + roster approval) is the authorization;
-            // app layers add their own policy on top.
+            // No per-sample admission check on this hot path: an unadmitted peer
+            // can't establish a media route to begin with — its `RouteControl`
+            // rides the data channel, which `handle_inbound_frame` drops
+            // pre-admission — and the embedder matches an inbound sample to an
+            // authorized route. Admission is enforced at the route layer (the
+            // outer layer), not per frame here.
             state.dispatch_video(&device_id, sample);
         }
         TransportEvent::AudioSample(sample) => {
-            // Identical gate to video.
             state.dispatch_audio(&device_id, sample);
         }
     }
@@ -2230,6 +2232,34 @@ fn frame_within_cap(len: usize) -> bool {
     len <= MAX_INBOUND_FRAME_BYTES
 }
 
+/// Which admission phase an inbound frame requires before it may move peer
+/// state or reach a handler. Enforced by the gate in [`handle_inbound_frame`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Handshake + approval protocol frames (`Hello`, `AuthResponse`,
+    /// `Approve`, `Deny`). Always processed: they only advance or tear down the
+    /// handshake and grant no application access. Reaching `Active` still
+    /// requires `authenticated` (see [`handshake::on_approve`]), so an early
+    /// `Approve` cannot promote an unauthenticated peer.
+    Protocol,
+    /// Application, RPC, reliable, governance/roster, capabilities, shelve, and
+    /// keepalive traffic — processed only once the peer is admitted.
+    Application,
+}
+
+/// Classify an inbound frame's admission phase. Only the four handshake/
+/// approval frames are `Protocol`; everything else — including any future
+/// variant — is `Application` and requires an admitted peer (fail closed).
+fn inbound_admission(msg: &MeshMessage) -> Admission {
+    match msg {
+        MeshMessage::Hello(_)
+        | MeshMessage::AuthResponse(_)
+        | MeshMessage::Approve(_)
+        | MeshMessage::Deny(_) => Admission::Protocol,
+        _ => Admission::Application,
+    }
+}
+
 async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes: Bytes) {
     // Reject an oversize frame before the deserializer allocates for it.
     if !frame_within_cap(bytes.len()) {
@@ -2247,11 +2277,40 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
             return;
         }
     };
-    state
-        .traffic
-        .record_rx(traffic::class_of(&msg), bytes.len());
+    // Admission gate, folded into the per-frame liveness touch below so it
+    // costs no extra lookup or lock. Admission is a per-connection property
+    // that flips only at the handshake/approval (and topology-shelve)
+    // transitions — each frame just reads it. An endpoint with a live data
+    // channel but an unfinished handshake + approval may drive only the
+    // handshake protocol itself (`Hello`/`AuthResponse`/`Approve`/`Deny`);
+    // application, RPC, reliable, governance/roster, capabilities, shelve, and
+    // keepalive frames are dropped here — before liveness, recovery-tier, or
+    // traffic state moves — so a pre-admission frame is a true no-op it can't
+    // use to fake liveness, clear a recovery, or reach a handler. Reaching
+    // `Active` itself additionally requires `authenticated` (see
+    // `handshake::on_approve`). This check is synchronous, not swept: a
+    // never-admitted peer must get *zero* application processing, so there is
+    // no grace window a periodic revalidation could open.
+    let application = matches!(inbound_admission(&msg), Admission::Application);
     if let Some(peer) = state.peers.get(device_id) {
         let mut data = peer.state.write();
+        if application && !data.is_admitted() {
+            data.admission_rejected = data.admission_rejected.saturating_add(1);
+            let count = data.admission_rejected;
+            drop(data);
+            // Power-of-two throttle so a pre-admission flood can't be turned
+            // into a log-amplification primitive; the running total stays
+            // visible for diagnostics.
+            if count.is_power_of_two() {
+                warn!(
+                    peer = %device_id,
+                    class = ?traffic::class_of(&msg),
+                    count,
+                    "dropping pre-admission frame from a peer that has not finished authenticating and approving"
+                );
+            }
+            return;
+        }
         data.last_recv_at = Some(Instant::now());
         data.diag.bytes_in += bytes.len() as u64;
         data.diag.frames_in += 1;
@@ -2270,7 +2329,15 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
             data.tier = ConnectionTier::Steady;
             data.ice_disconnected_since = None;
         }
+    } else if application {
+        // No peer entry means nothing can admit an application frame — drop it.
+        // Protocol frames fall through; their handlers look the peer up and
+        // handle its absence themselves.
+        return;
     }
+    state
+        .traffic
+        .record_rx(traffic::class_of(&msg), bytes.len());
     match msg {
         MeshMessage::Hello(hello) => handshake::on_hello(state, device_id, hello).await,
         MeshMessage::AuthResponse(resp) => {
@@ -3174,6 +3241,200 @@ mod tests {
             peer.state.read().diag.frames_in,
             0,
             "an oversize frame must be dropped before it counts as received"
+        );
+    }
+
+    // ---- admission gate: pre-authentication application dispatch ----
+    //
+    // The bug these guard: an endpoint with a live DTLS data channel but an
+    // unfinished ed25519 handshake + approval could drive application, RPC,
+    // reliable, governance, and media handlers. The gate admits only handshake
+    // protocol frames until the peer is authenticated + Active/Shelved.
+
+    fn frame_bytes(msg: &MeshMessage) -> Bytes {
+        Bytes::from(serde_json::to_vec(msg).expect("serialize test frame"))
+    }
+
+    fn set_admission(state: &NetworkState, peer: &str, authenticated: bool, status: PeerStatus) {
+        let p = state.peers.get(peer).expect("peer present");
+        let mut d = p.state.write();
+        d.authenticated = authenticated;
+        d.status = status;
+    }
+
+    #[test]
+    fn is_admitted_only_authenticated_active_or_shelved() {
+        use PeerStatus::*;
+        for status in [
+            Sighted,
+            Handshaking,
+            PendingApproval,
+            Reconnecting,
+            Offline,
+            Error,
+        ] {
+            let d = connection::PeerStateData {
+                authenticated: true,
+                status,
+                ..Default::default()
+            };
+            assert!(!d.is_admitted(), "{status:?} is not an admitted status");
+        }
+        for status in [Active, Shelved] {
+            let ok = connection::PeerStateData {
+                authenticated: true,
+                status,
+                ..Default::default()
+            };
+            assert!(
+                ok.is_admitted(),
+                "authenticated {status:?} must be admitted"
+            );
+            let no_auth = connection::PeerStateData {
+                authenticated: false,
+                status,
+                ..Default::default()
+            };
+            assert!(
+                !no_auth.is_admitted(),
+                "{status:?} without authentication is never admitted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_gate_drops_application_traffic_before_authentication() {
+        // Report cases 1,2,5,6: a Handshaking peer's application / reliable /
+        // RPC / governance frame is dropped before it counts as received,
+        // refreshes liveness, or reaches a handler.
+        use crate::protocol::RosterRequestMessage;
+        let cases: Vec<(&str, MeshMessage)> = vec![
+            (
+                "channel",
+                MeshMessage::Channel {
+                    channel: "secret".into(),
+                    payload: serde_json::json!({ "steal": true }),
+                },
+            ),
+            (
+                "reliable",
+                MeshMessage::ChannelSeq {
+                    stream: 1,
+                    seq: 1,
+                    channel: "secret".into(),
+                    payload: serde_json::json!(1),
+                },
+            ),
+            (
+                "rpc",
+                MeshMessage::RpcRequest(RpcRequestMessage {
+                    request_id: "r1".into(),
+                    method: "drain".into(),
+                    payload: serde_json::json!(1),
+                    streaming: false,
+                }),
+            ),
+            (
+                "governance",
+                MeshMessage::RosterRequest(RosterRequestMessage::default()),
+            ),
+        ];
+        for (name, msg) in cases {
+            let state = build_test_state(&format!("admit-drop-{name}"));
+            insert_session_less_peer(&state, "attacker", None);
+            set_admission(&state, "attacker", false, PeerStatus::Handshaking);
+
+            handle_inbound_frame(&state, "attacker", frame_bytes(&msg)).await;
+
+            let p = state.peers.get("attacker").expect("peer present");
+            let d = p.state.read();
+            assert_eq!(
+                d.diag.frames_in, 0,
+                "{name}: a pre-admission frame must not count as received"
+            );
+            assert!(
+                d.last_recv_at.is_none(),
+                "{name}: a pre-admission frame must not refresh liveness"
+            );
+            assert_eq!(
+                d.admission_rejected, 1,
+                "{name}: the pre-admission drop must be recorded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_gate_admits_application_traffic_from_active_peer() {
+        // Report case 9: an admitted peer's application frame flows normally —
+        // the gate must not break legitimate traffic.
+        let state = build_test_state("admit-active-ok");
+        insert_session_less_peer(&state, "member", None);
+        set_admission(&state, "member", true, PeerStatus::Active);
+
+        handle_inbound_frame(
+            &state,
+            "member",
+            frame_bytes(&MeshMessage::Channel {
+                channel: "chat".into(),
+                payload: serde_json::json!("hi"),
+            }),
+        )
+        .await;
+
+        let p = state.peers.get("member").expect("peer present");
+        let d = p.state.read();
+        assert_eq!(d.diag.frames_in, 1, "an admitted peer's frame is processed");
+        assert_eq!(d.admission_rejected, 0);
+        assert!(d.last_recv_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn admission_gate_lets_protocol_frames_through_while_handshaking() {
+        // Report case 4: handshake/approval frames pass even while the peer is
+        // unauthenticated, so the handshake can actually complete.
+        use crate::protocol::ApproveMessage;
+        let state = build_test_state("admit-protocol-pass");
+        insert_session_less_peer(&state, "peer", None);
+        set_admission(&state, "peer", false, PeerStatus::Handshaking);
+
+        handle_inbound_frame(
+            &state,
+            "peer",
+            frame_bytes(&MeshMessage::Approve(ApproveMessage {})),
+        )
+        .await;
+
+        let p = state.peers.get("peer").expect("peer present");
+        assert_eq!(
+            p.state.read().admission_rejected,
+            0,
+            "a handshake/approval frame must not be gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_approve_cannot_activate_unauthenticated_peer() {
+        // Report case 7: an `Approve` that arrives before authentication (and a
+        // `roster_approve` that latched `local_approve_sent`) must NOT promote
+        // the peer to Active. The latch is harmless; the transition now requires
+        // `authenticated` (the full handshake→Active path is covered by the
+        // two_peer_handshake / governance integration tests).
+        let state = build_test_state("admit-early-approve");
+        insert_session_less_peer(&state, "peer", None);
+        set_admission(&state, "peer", false, PeerStatus::Handshaking);
+        {
+            let p = state.peers.get("peer").expect("peer present");
+            p.state.write().local_approve_sent = true;
+        }
+
+        handshake::on_approve(&state, "peer").await;
+
+        let p = state.peers.get("peer").expect("peer present");
+        let d = p.state.read();
+        assert!(d.remote_approve_seen, "the approve is recorded");
+        assert!(
+            !matches!(d.status, PeerStatus::Active),
+            "an unauthenticated peer must never reach Active"
         );
     }
 
