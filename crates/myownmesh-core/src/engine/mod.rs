@@ -3390,10 +3390,15 @@ mod tests {
         let state = build_test_state("evicted-no-reconnect");
         let net = state.network_id.clone();
 
-        // Lex-greater than any base32 identity, so `we_offer` holds; dash-free,
-        // so `pubkey_part` leaves the id whole and the evict target matches.
+        // Both must sort lex-greater than any base32 identity so `we_offer`
+        // holds (we're the offerer) and dash-free so `pubkey_part` leaves the id
+        // whole and the evict target matches. base32-lowercase tops out at 'z' in
+        // a 52-char id, so any all-'z' string longer than 52 chars clears every
+        // identity deterministically — a plain "y"*60 did not (a ~3 % of ephemeral
+        // identities that happen to start with 'z' sort above it, flaking the
+        // precondition assert). Distinct lengths keep the two ids distinct.
         let evicted = "z".repeat(60);
-        let live = "y".repeat(60);
+        let live = "z".repeat(61);
         assert!(
             state.identity.public_id() < evicted.as_str()
                 && state.identity.public_id() < live.as_str(),
