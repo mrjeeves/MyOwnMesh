@@ -1114,7 +1114,25 @@ async fn dispatch(state: &Arc<ControlState>, req: Request) -> Response {
         // ---- governance ----
         Request::GovernanceState { network } => match state.registry.get(&network) {
             Some(net) => match net.governance_state().await {
-                Ok(s) => Response::ok(serde_json::json!({ "state": s })),
+                Ok(s) => {
+                    // The devices the signed logs have **removed** (evicted, or a
+                    // member-tier revoke) — the authoritative "no longer in the
+                    // fleet" set, projected from the same member log membership
+                    // rides. Surfaced alongside the state so a client can prune
+                    // its own local bookkeeping for a device *another* owner
+                    // evicted: that eviction converges the signed roster but never
+                    // touches the evicting-from-afar owner's local claimed-list,
+                    // which would otherwise re-admit the device on the next
+                    // re-assertion.
+                    let evicted: Vec<String> = myownmesh_core::network_state::member_log_removed(
+                        &s,
+                        &s.member_log,
+                        &network,
+                    )
+                    .into_iter()
+                    .collect();
+                    Response::ok(serde_json::json!({ "state": s, "evicted": evicted }))
+                }
                 Err(e) => Response::err(e.to_string()),
             },
             None => Response::err(format!("unknown network: {network}")),
