@@ -1336,11 +1336,19 @@ fn member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) 
             target,
             role: Role::Member,
         } => target.as_str(),
-        TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target }
-            if gov.role_of(target) == Role::Member =>
-        {
+        // A revoke rides the member log (and needs the monotonic stamp) only when
+        // it targets a plain member; a revoke of an owner/manager stays governance
+        // tier and just demotes, so it takes the wall clock below.
+        TransitionVariant::RoleRevoke { target } if gov.role_of(target) == Role::Member => {
             target.as_str()
         }
+        // An evict is tombstoned in the member log at *either* tier (see
+        // `try_ratify`) — to suppress the target's member-tier admit — so it must
+        // ALWAYS be stamped strictly past the target's newest member-log entry.
+        // Otherwise a same-second admit wins the last-writer-wins tie and the
+        // evicted device survives: a promoted owner/manager keeps the plain-member
+        // admit it was given before promotion, and re-appears fleet-wide.
+        TransitionVariant::Evict { target } => target.as_str(),
         _ => return now,
     };
     let newest = gov
@@ -1437,6 +1445,21 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             // Apply to the governance log (also advances `gov.roles`).
             let after = network_state::apply_transition(gov.clone(), &transition);
             *gov = after;
+            // Evicting a device promoted past plain member (an owner or manager)
+            // still leaves its *original* member-tier admit in the member log.
+            // On its own the governance-log evict removes the role but not that
+            // admit, so any peer that re-derives membership from the signed logs
+            // — the gossip-adoption path a co-owner runs after being offline for
+            // the kick — folds the stale admit back in and resurrects the evicted
+            // device as a plain member: it lingers in the roster, still
+            // authorised, and nobody but the evicting owner sees it gone. Record
+            // the evict in the union-merged member log too, so it tombstones that
+            // admit; the removal then converges network-wide and survives
+            // concurrent authors, exactly like a plain-member evict.
+            if matches!(&transition.variant, TransitionVariant::Evict { .. }) {
+                gov.member_log.push(transition.clone());
+                gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
+            }
         }
         gov.pending.retain(|p| p.id != proposal_id);
         network_state::save(&gov)?;
@@ -1457,6 +1480,20 @@ async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
             }
             crate::roster::set_role_in(&mut roster, target, *role);
             crate::roster::save(&roster)?;
+        }
+        if let TransitionVariant::RoleRevoke { target } = &transition.variant {
+            // Withdrawal back to a plain member: unlike an evict the device stays
+            // in the roster, but its cached authority tag has to drop to `member`
+            // so this node's peer rows — and everything that reads the roster role,
+            // including the fleet UI's grant/withdraw controls — reflect the
+            // demotion at once. The gossip-adoption path already reprojects the
+            // whole role map onto the roster; the local ratify path open-codes
+            // per-variant mirrors and previously skipped revoke entirely, so on the
+            // very device that authored the withdrawal the role never "took".
+            let mut roster = state.roster.write();
+            if crate::roster::set_role_in(&mut roster, target, Role::Member) {
+                crate::roster::save(&roster)?;
+            }
         }
         if let TransitionVariant::KindChange {
             to: NetworkKind::Closed,

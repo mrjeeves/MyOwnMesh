@@ -753,6 +753,201 @@ async fn re_admitting_an_evicted_member_supersedes_the_tombstone() {
 }
 
 #[tokio::test]
+async fn evicting_a_promoted_member_tombstones_its_member_admit() {
+    // Regression for "I removed an owner/manager, but it stays controllable and
+    // the other owners still see it in the fleet."
+    //
+    // A device promoted past plain member (admitted as Member, then granted
+    // Controller/Owner) still carries its original member-tier admit in the
+    // member log. Evicting it extends the owner (governance) log — but any peer
+    // that re-derives membership straight from the signed logs, which is exactly
+    // what a co-owner does when it adopts the log via gossip (e.g. it was offline
+    // during the kick), folds that stale admit back in and resurrects the evicted
+    // device as a plain member: it lingers in the roster, still authorised to
+    // control the fleet, and every such owner keeps seeing it. The evict must
+    // tombstone the admit so the projected membership drops the device and the
+    // roster mirror prunes it — the same convergence a plain-member evict gets.
+    //
+    // This drives the projection functions the gossip-adoption path
+    // (`project_roles` / the roster mirror in `adopt_transition_log`) is built
+    // on, so it fails deterministically without the fix — unlike an online peer,
+    // which ratifies the evict incrementally and never hits the resurrecting
+    // re-projection.
+    shared_home();
+
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral());
+    let carol_id = Arc::new(Identity::ephemeral());
+    let carol_pk = carol_id.public_id().to_string();
+
+    let network_id = "evict-promoted-projection-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+
+    use myownmesh_core::engine::governance::propose;
+    propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found");
+    // Admit Carol as a plain member (member log), then promote her to manager
+    // (governance log) — so her stale member-tier admit outlives the promotion.
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_pk.clone(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("admit carol");
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: carol_pk.clone(),
+            role: Role::Controller,
+        },
+        None,
+    )
+    .await
+    .expect("promote carol");
+    assert_eq!(
+        alice_state.governance_state.read().role_of(&carol_pk),
+        Role::Controller,
+        "carol should be a manager after promotion"
+    );
+
+    // Evict the manager.
+    propose(
+        &alice_state,
+        TransitionVariant::Evict {
+            target: carol_pk.clone(),
+        },
+        None,
+    )
+    .await
+    .expect("evict carol");
+
+    // Re-derive membership from the signed logs exactly as a co-owner adopting
+    // via gossip does. Carol must be gone from the projected membership and — via
+    // the removed set the roster mirror prunes by — not resurrected by her stale
+    // member-tier admit.
+    let g = alice_state.governance_state.read();
+    let verified = myownmesh_core::network_state::verify_log(network_id, &g.transitions)
+        .expect("owner log verifies");
+    let members =
+        myownmesh_core::network_state::verify_member_log(&verified, &g.member_log, network_id);
+    assert!(
+        !members.contains(&carol_pk),
+        "an evicted manager must not project back as a member from its stale admit"
+    );
+    let removed =
+        myownmesh_core::network_state::member_log_removed(&verified, &g.member_log, network_id);
+    assert!(
+        removed.contains(&carol_pk),
+        "an evicted manager must land in the member-log removed set so the roster \
+         mirror prunes it on every peer, not just the owner that authored the evict"
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_role_updates_the_local_roster_tag() {
+    // Regression: withdrawing a peer's role (owner/manager → plain member) must
+    // update the *authoring* device's cached roster tag, not just the projected
+    // `roles` map. The gossip-adoption path reprojects the whole role map onto
+    // the roster, but the local ratify path open-coded per-variant mirrors and
+    // skipped RoleRevoke entirely — so on the device that authored the
+    // withdrawal, the peer's row kept rendering the old authority and the
+    // downgrade "didn't take". Single engine: the owner authors the whole chain
+    // and we read the on-disk roster tag it mirrors for its own peer rows.
+    shared_home();
+
+    let transport = Transport::new().expect("transport");
+    let alice_id = Arc::new(Identity::ephemeral());
+    let bob_id = Arc::new(Identity::ephemeral());
+    let bob_pk = bob_id.public_id().to_string();
+
+    let network_id = "withdraw-role-net";
+    let (alice_state, _ad) = spawn_network(
+        fresh_network("alice", network_id),
+        alice_id.clone(),
+        transport.clone(),
+    )
+    .await
+    .expect("alice engine");
+
+    use myownmesh_core::engine::governance::propose;
+    propose(
+        &alice_state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found");
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: bob_pk.clone(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("admit bob");
+    propose(
+        &alice_state,
+        TransitionVariant::RoleGrant {
+            target: bob_pk.clone(),
+            role: Role::Controller,
+        },
+        None,
+    )
+    .await
+    .expect("promote bob");
+    // The mirrored roster tag should read controller on the authoring device.
+    wait_for(Duration::from_secs(5), || {
+        roster_role(&alice_state, &bob_pk) == Some(Role::Controller)
+    })
+    .await;
+
+    // Withdraw Bob's role back to a plain member.
+    propose(
+        &alice_state,
+        TransitionVariant::RoleRevoke {
+            target: bob_pk.clone(),
+        },
+        None,
+    )
+    .await
+    .expect("withdraw bob");
+
+    // The cached roster tag must drop to member on the authoring device — the
+    // withdrawal has to "take" right where the owner performed it.
+    assert_eq!(
+        roster_role(&alice_state, &bob_pk),
+        Some(Role::Member),
+        "withdrawing a role must reset the authoring device's roster tag to member"
+    );
+    // ...and Bob stays in the roster — a withdraw demotes, it doesn't remove.
+    assert!(
+        rostered(&alice_state, &bob_pk),
+        "a withdrawn member stays in the fleet — only its authority drops"
+    );
+}
+
+#[tokio::test]
 async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     // The "offline and lost devices just keep showing back up" loop, killed
     // end to end. Carol is admitted to the closed network and then evicted
@@ -1157,6 +1352,21 @@ async fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) {
 /// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
 fn rostered(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
+}
+
+/// The cached authority tag for `id` in `state`'s on-disk roster, if the peer
+/// is present. This is the projection the fleet UI renders each member's
+/// grant/withdraw controls from, so a role change that doesn't reach here
+/// "doesn't take" on the device that authored it.
+fn roster_role(state: &Arc<myownmesh_core::engine::state::NetworkState>, id: &str) -> Option<Role> {
+    let pk = myownmesh_core::signing::pubkey_part(id);
+    state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .find(|p| p.device_id == pk)
+        .map(|p| p.role)
 }
 
 /// All tests in this file share ONE `MYOWNMESH_HOME` for the process lifetime.
