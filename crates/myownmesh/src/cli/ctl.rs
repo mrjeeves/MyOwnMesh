@@ -572,7 +572,12 @@ pub(crate) async fn bind_signaling_loopback() -> Result<bool> {
     Ok(response.ok)
 }
 
-async fn roundtrip(request: &Request) -> Result<Response> {
+/// One request, one response, over the daemon's control socket.
+///
+/// `pub(crate)` because `myownmesh ashlar` speaks the same socket on an Ashlar
+/// program's behalf: one client, one wire format, one place where "is the
+/// daemon running" is answered.
+pub(crate) async fn roundtrip(request: &Request) -> Result<Response> {
     let stream = connect_socket().await?;
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);

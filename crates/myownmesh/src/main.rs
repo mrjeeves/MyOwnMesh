@@ -38,6 +38,11 @@ enum Command {
         #[command(subcommand)]
         action: cli::ctl::CtlCmd,
     },
+    /// Answer an Ashlar program's `mesh` space over JSON Lines on
+    /// stdin/stdout. Ashlar's `mesh` derives to this command, so a site gets
+    /// a live roster of everyone running it with no binding file and no
+    /// shim. Not meant to be typed: the Ashlar runtime spawns it.
+    Ashlar,
     /// Update MyOwnMesh. A bare `myownmesh update` fetches the latest
     /// release and updates the daemon and the desktop GUI together (like
     /// `myownllm update`); the subcommands drive the pieces by hand.
@@ -208,6 +213,7 @@ fn main() -> ExitCode {
             Command::Serve => cli::serve::run().await,
             Command::Identity { action } => cli::identity::run(action).await,
             Command::Ctl { action } => cli::ctl::run(action).await,
+            Command::Ashlar => cli::ashlar::run().await,
             Command::Update { action } => cli::update::run(action).await,
             Command::Service { system, action } => cli::service::run(system, action).await,
             Command::Config { action } => cli::config::run(action).await,

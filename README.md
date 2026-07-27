@@ -233,6 +233,7 @@ myownmesh update check     # check the feed now and stage if permitted
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
 myownmesh install caddy <domain>    # TLS reverse proxy (Caddy) in front of the signaling relay
 myownmesh caddy path       # print the Caddyfile location to edit
+myownmesh ashlar           # answer an Ashlar program's `mesh` space (spawned, not typed)
 ```
 
 A bare `myownmesh update` fetches the latest release and updates the
@@ -252,6 +253,26 @@ LAN discovery on by default), and listens for
 `myownmesh ctl …` clients on a local socket
 (`~/.myownmesh/daemon.sock` on Unix, named pipe on Windows). Full
 reference in [`crates/myownmesh/README.md`](crates/myownmesh/README.md).
+
+### Ashlar sites
+
+[Ashlar](https://github.com/mrjeeves/ashlar) programs reach a mesh across
+their one foreign boundary, and the space named `mesh` derives to
+`myownmesh ashlar` — a co-process speaking JSON Lines on stdin/stdout that
+answers five calls: `here`, `peers`, `enter`, `revision`, `reread`. The point
+of deriving to a command rather than a library is that this daemon is already
+installed: a site gets a live roster of everyone else running it with no
+binding file, no shim, and nothing vendored.
+
+It is not meant to be typed — the Ashlar runtime spawns it — but it is an
+ordinary subcommand, so `printf '{"call":"here","args":[]}' | myownmesh ashlar`
+is a fair way to see what a site would see. The mesh it joins is whatever the
+program named, defaulting to the shared `ashlar` area; that area is open and
+auto-approving, which makes the mesh id itself the secret, so anything private
+wants an unguessable one (`myownmesh ctl networks id`). Publishing a site's
+port to peers is the other half and lives in
+[AllMyStuff](https://github.com/mrjeeves/AllMyStuff), which has the proxy;
+this command answers the roster and says plainly that it cannot do the rest.
 
 ## Desktop GUI
 
