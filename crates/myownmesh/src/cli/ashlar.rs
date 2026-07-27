@@ -219,7 +219,10 @@ impl Session {
         let mut seen: BTreeMap<String, bool> = BTreeMap::new();
         for p in &peers {
             seen.insert(
-                p.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                p.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 p.get("here").and_then(Value::as_bool).unwrap_or(false),
             );
         }
@@ -239,7 +242,11 @@ impl Session {
 /// A peer's display name, falling back to its id: a roster row with an empty
 /// name is a row nobody can act on.
 fn peer_label(peer: &Value) -> String {
-    let label = peer.get("label").and_then(Value::as_str).unwrap_or("").trim();
+    let label = peer
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if !label.is_empty() {
         return label.to_string();
     }
@@ -281,9 +288,9 @@ fn text_arg(call: &Call, index: usize) -> Result<String> {
 async fn roundtrip(request: &Request) -> Result<Value> {
     let response: Response = crate::cli::ctl::roundtrip(request).await?;
     if !response.ok {
-        return Err(anyhow!(response
-            .error
-            .unwrap_or_else(|| "the daemon refused without saying why".to_string())));
+        return Err(anyhow!(response.error.unwrap_or_else(|| {
+            "the daemon refused without saying why".to_string()
+        })));
     }
     Ok(response.data.unwrap_or(Value::Null))
 }
@@ -312,11 +319,26 @@ mod tests {
     #[test]
     fn a_peer_is_here_only_when_traffic_can_flow() {
         let rows = [
-            (json!({"device_id": "a", "label": "ada", "status": "active"}), true),
-            (json!({"device_id": "b", "label": "bo", "status": "shelved"}), true),
-            (json!({"device_id": "c", "label": "cy", "status": "sighted"}), false),
-            (json!({"device_id": "d", "label": "di", "status": "reconnecting"}), false),
-            (json!({"device_id": "e", "label": "ed", "status": "pending_approval"}), false),
+            (
+                json!({"device_id": "a", "label": "ada", "status": "active"}),
+                true,
+            ),
+            (
+                json!({"device_id": "b", "label": "bo", "status": "shelved"}),
+                true,
+            ),
+            (
+                json!({"device_id": "c", "label": "cy", "status": "sighted"}),
+                false,
+            ),
+            (
+                json!({"device_id": "d", "label": "di", "status": "reconnecting"}),
+                false,
+            ),
+            (
+                json!({"device_id": "e", "label": "ed", "status": "pending_approval"}),
+                false,
+            ),
         ];
         for (peer, expected) in rows {
             let status = peer.get("status").and_then(Value::as_str).unwrap();
@@ -328,7 +350,10 @@ mod tests {
     #[test]
     fn an_unlabelled_peer_falls_back_to_its_id() {
         assert_eq!(peer_label(&json!({"device_id": "abc", "label": ""})), "abc");
-        assert_eq!(peer_label(&json!({"device_id": "abc", "label": " ada "})), "ada");
+        assert_eq!(
+            peer_label(&json!({"device_id": "abc", "label": " ada "})),
+            "ada"
+        );
         assert_eq!(peer_label(&json!({"label": "ada"})), "ada");
         assert_eq!(peer_label(&json!({})), "unknown");
     }
@@ -348,7 +373,11 @@ mod tests {
         // that reaches for it here is told which names exist rather than
         // getting an empty answer that looks like "no sites".
         let mut s = Session::default();
-        let e = s.dispatch(&call("nearby", vec![])).await.unwrap_err().to_string();
+        let e = s
+            .dispatch(&call("nearby", vec![]))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("no such call"), "{e}");
         assert!(e.contains("here, peers, enter, revision, reread"), "{e}");
     }
