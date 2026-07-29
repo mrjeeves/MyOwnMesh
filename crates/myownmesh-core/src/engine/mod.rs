@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
@@ -1357,7 +1357,10 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     {
         return;
     }
-    info!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
+    // Per-peer negotiation stage, same reasoning as the webrtc.rs stage logs:
+    // one line per peer per attempt is fine when connects are rare and a flood
+    // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
+    debug!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
     let (session, mut rx) = match state
         .transport
@@ -1406,7 +1409,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // the daemon sat with one worker spinning and the driver parked here
     // forever while the control socket timed out op after op. A stuck offer
     // now costs this one attempt (the watchdog rebuilds it), not the engine.
-    info!(peer = %short_peer(&device_id), "ensure_peer_session: building offer");
+    debug!(peer = %short_peer(&device_id), "ensure_peer_session: building offer");
     if role == Role::Offerer {
         let built = tokio::time::timeout(
             Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),

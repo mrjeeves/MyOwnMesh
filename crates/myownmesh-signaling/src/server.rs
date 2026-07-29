@@ -47,7 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::nostr::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
@@ -404,7 +404,11 @@ impl HubInner {
             },
         );
         self.connections_total += 1;
-        info!(%ip, active = self.conns.len(), "signaling: client connected");
+        // Per-connection churn, not a daemon event: on a relay holding 20+
+        // clients this fires constantly, and every reconnect writes a pair of
+        // lines forever. The running total is what a healthy log wants, and
+        // that's on the periodic summary — this stays available at debug.
+        debug!(%ip, active = self.conns.len(), "signaling: client connected");
         Some(id)
     }
 
@@ -418,7 +422,7 @@ impl HubInner {
                 self.ip_counts.remove(&entry.ip);
             }
         }
-        info!(ip = %entry.ip, active = self.conns.len(), "signaling: client disconnected");
+        debug!(ip = %entry.ip, active = self.conns.len(), "signaling: client disconnected");
         // Emit a departure for each device this connection was the live
         // owner of (skip any that a newer connection has since taken
         // over — presence holds only the latest owner per device).

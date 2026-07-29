@@ -8,6 +8,7 @@
 //! `ctl …`-style and addresses the running daemon via the control
 //! socket.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -156,16 +157,26 @@ fn main() -> ExitCode {
     let json_logs = std::env::var("MYOWNMESH_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
+    // Colour only when a human is actually looking at a terminal.
+    // `tracing_subscriber` turns ANSI on unconditionally, which is fine in a
+    // shell and actively harmful under systemd: journald/rsyslog capture the
+    // escape sequences verbatim, so every line reaches /var/log/syslog as
+    // `#033[2m2026-…#033[0m #033[32m INFO#033[0m …`. That is ~40-60 wasted
+    // bytes per line, and it breaks grep on a daemon log — the two things you
+    // least want on a box that logs continuously.
+    let ansi = std::io::stdout().is_terminal();
     if json_logs {
         tracing_subscriber::fmt()
             .json()
             .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
             .with_target(false)
+            .with_ansi(ansi)
             .init();
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
             .with_target(false)
+            .with_ansi(ansi)
             .init();
     }
 
