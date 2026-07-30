@@ -113,6 +113,19 @@ Tag the file with the hostname so the merge tool can label rows.
 > `MYOWNMESH_LOG` only when you deliberately want raw webrtc detail, e.g.
 > `MYOWNMESH_LOG="info,webrtc_ice=debug"`.)
 
+> **Where the negotiation stage lines went.** `create_offer` /
+> `create_answer` / `set_remote_description` / `ensure_peer_session`, and the
+> signaling relay's per-client `connected` / `disconnected` pair, are **debug**
+> level. They used to be INFO on the reasoning that they fire once per connect
+> attempt — fine when connects are rare, but a mesh that is renegotiating is
+> exactly the one that floods, so the daemon logged hardest precisely when it
+> was sickest (a field box reached a multi-gigabyte syslog this way, and a full
+> disk takes the diagnosis with it). The default log is now boring on purpose.
+>
+> The debugging workflow is unchanged — the `MYOWNMESH_LOG_EXTRA` line below,
+> and `just serve-trace`, already set `myownmesh_core=debug` and
+> `myownmesh_signaling=debug`, which restore every one of those lines verbatim.
+
 **macOS / Linux**
 
 ```sh

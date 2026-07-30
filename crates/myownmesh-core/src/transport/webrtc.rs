@@ -1050,19 +1050,30 @@ impl PeerSession {
     }
 
     /// Build an offer SDP. Offerer-only (answerer never calls this).
-    /// The stage logs are plain INFO on purpose: this pair is the engine's
-    /// inline-on-the-driver excursion into webrtc-rs, it wedges on the
-    /// NanoKVM with nothing inside logging, and a stage line that only shows
-    /// under a special log filter has already cost deploy cycles. They fire
-    /// once per connect attempt — negligible in a healthy log.
+    ///
+    /// The stage logs exist because this pair is the engine's
+    /// inline-on-the-driver excursion into webrtc-rs: it wedges on the NanoKVM
+    /// with nothing inside logging, so knowing *which* stage stopped is what
+    /// turns an invisible freeze into a diagnosis.
+    ///
+    /// They were INFO on the premise that they "fire once per connect attempt —
+    /// negligible in a healthy log". That premise is what broke: an unhealthy
+    /// mesh renegotiates constantly, and at ~12 lines per peer per attempt
+    /// across 20+ peers this became the single largest contributor to a
+    /// multi-gigabyte syslog. Precisely when the daemon is sickest, its logs
+    /// grow fastest — and the disk that fills takes the diagnosis with it.
+    ///
+    /// So they are DEBUG now, and the field workflow is unchanged in substance:
+    /// `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug` (what `just serve-trace`
+    /// already sets) brings every one of them back verbatim.
     pub async fn create_offer(&self) -> Result<RTCSessionDescription> {
-        info!("create_offer: building SDP (pc.create_offer)");
+        debug!("create_offer: building SDP (pc.create_offer)");
         let offer = self
             .pc
             .create_offer(None)
             .await
             .map_err(|e| Error::Transport(format!("create_offer: {e}")))?;
-        info!(
+        debug!(
             sdp_bytes = offer.sdp.len(),
             "create_offer: applying local description (starts ICE gathering)"
         );
@@ -1070,7 +1081,7 @@ impl PeerSession {
             .set_local_description(offer.clone())
             .await
             .map_err(|e| Error::Transport(format!("set_local_description (offer): {e}")))?;
-        info!("create_offer: local description applied");
+        debug!("create_offer: local description applied");
         Ok(offer)
     }
 
@@ -1081,7 +1092,7 @@ impl PeerSession {
     /// REMOTE side's media sections regardless of our own lane count), so it
     /// is equally capable of freezing the engine invisibly.
     pub async fn set_remote_description(&self, desc: RTCSessionDescription) -> Result<()> {
-        info!(
+        debug!(
             sdp_type = %desc.sdp_type,
             sdp_bytes = desc.sdp.len(),
             "set_remote_description: applying remote SDP"
@@ -1133,13 +1144,13 @@ impl PeerSession {
     /// [`Self::set_remote_description`]. Stage-logged like create_offer —
     /// same inline-on-the-driver machinery, same invisible-freeze potential.
     pub async fn create_answer(&self) -> Result<RTCSessionDescription> {
-        info!("create_answer: building SDP (pc.create_answer)");
+        debug!("create_answer: building SDP (pc.create_answer)");
         let answer = self
             .pc
             .create_answer(None)
             .await
             .map_err(|e| Error::Transport(format!("create_answer: {e}")))?;
-        info!(
+        debug!(
             sdp_bytes = answer.sdp.len(),
             "create_answer: applying local description (starts ICE gathering)"
         );
@@ -1147,7 +1158,7 @@ impl PeerSession {
             .set_local_description(answer.clone())
             .await
             .map_err(|e| Error::Transport(format!("set_local_description (answer): {e}")))?;
-        info!("create_answer: local description applied");
+        debug!("create_answer: local description applied");
         Ok(answer)
     }
 
