@@ -535,26 +535,43 @@ fn normalise_url_override(v: String) -> Option<String> {
     }
 }
 
-/// Background ticker. Runs forever; checks the feed at the configured
-/// interval (re-read each loop so a config edit takes effect without a
-/// restart). The first check fires shortly after launch.
+/// Background ticker. Runs forever: a **launch check** fires shortly after the
+/// daemon starts and ignores the interval cooldown, then the timer takes over
+/// at the configured interval (re-read each loop so a config edit takes effect
+/// without a restart).
+///
+/// The launch check is forced for the same reason `allmystuff-updater`'s is:
+/// it used to run at `force = false`, which meant it was gated on
+/// `check_interval_hours` like any other tick, so a daemon restarted inside
+/// the interval checked *nothing* on the way up and waited out the remainder.
+/// Restarting is the one moment a user has actually asked to be current, and
+/// it was the moment least likely to check — a daemon that bounces every hour
+/// on a 6h interval would go a whole day between real checks.
 pub async fn tick_forever() {
     // Let a fresh daemon finish binding its sockets before we hit the
     // network.
     tokio::time::sleep(Duration::from_secs(30)).await;
+    run_check(true).await;
     loop {
-        match check_now(false).await {
-            Ok(CheckOutcome::Staged { version }) => {
-                tracing::info!("self-update staged {version}; applies on next daemon start");
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("self-update check failed: {e}"),
-        }
         let hours = load_auto_update()
             .map(|a| a.check_interval_hours)
             .unwrap_or(6)
             .max(1);
         tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+        run_check(false).await;
+    }
+}
+
+/// One ticker check. `force` skips only the interval cooldown — the enabled
+/// flag and package-manager gating inside [`check_now`] still apply, so the
+/// launch check no-ops cleanly on an install that doesn't self-update.
+async fn run_check(force: bool) {
+    match check_now(force).await {
+        Ok(CheckOutcome::Staged { version }) => {
+            tracing::info!("self-update staged {version}; applies on next daemon start");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("self-update check failed: {e}"),
     }
 }
 
