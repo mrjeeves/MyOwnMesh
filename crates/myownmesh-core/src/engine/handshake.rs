@@ -408,13 +408,39 @@ pub async fn on_auth_response(
     }
 }
 
+/// The peer's `Approve` landed: latch it, then settle the transition.
+///
+/// The latch lives HERE and nowhere else. Setting `remote_approve_seen` is an
+/// assertion about the *peer* — "they told us we're in" — and only an inbound
+/// Approve is evidence of that. [`send_local_approve`] used to reach this
+/// function directly after emitting our own approve, which meant approving a
+/// peer also recorded that they had approved us: a node went ACTIVE on the
+/// strength of its own half of a handshake that is meant to be bilateral.
+///
+/// That turned a one-way failure into a silent one. A device the peer hasn't
+/// rostered (fleet meshes are closed, `auto_approve` false) never approves
+/// back, so it sits at PendingApproval dropping every application frame at the
+/// admission gate — while we report the link ACTIVE, gossip to it, and accept
+/// `channel_send_to` for it all day. The operator sees a healthy peer and a
+/// tunnel that answers nothing, with no error on either end. Latching only on
+/// the real frame makes the two ends agree, and leaves the stuck side visible
+/// as what it is: awaiting approval.
 pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
+    if let Some(peer) = state.peers.get(device_id) {
+        peer.state.write().remote_approve_seen = true;
+    }
+    settle_activation(state, device_id).await;
+}
+
+/// Re-evaluate whether the link is now ACTIVE, asserting nothing new about
+/// either side — both approvals must already be recorded. Safe to call from
+/// any edge that changes one of the three conjuncts.
+pub(super) async fn settle_activation(state: &Arc<NetworkState>, device_id: &str) {
     let (became_active, label) = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
         };
         let mut data = peer.state.write();
-        data.remote_approve_seen = true;
         // Guard the transition edge: a peer that re-sends Approve after
         // we're already ACTIVE shouldn't re-fire the on-active side
         // effects (roster persist, gossip, Approved event).
@@ -548,7 +574,10 @@ pub async fn send_local_approve(state: &Arc<NetworkState>, device_id: &str) {
         }
         return;
     }
-    // If the peer already sent us their approve, transitioning
-    // happens via `on_approve`; otherwise we just wait.
-    on_approve(state, device_id).await;
+    // If the peer already sent us their approve, that latch is set and this
+    // completes the transition; otherwise we just wait for their frame. NOT
+    // `on_approve` — that would record their approval on the strength of ours
+    // (see its doc comment) and take us ACTIVE against a peer still refusing
+    // our traffic.
+    settle_activation(state, device_id).await;
 }
