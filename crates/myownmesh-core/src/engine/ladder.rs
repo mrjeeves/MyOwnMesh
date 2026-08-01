@@ -5,7 +5,7 @@
 //! reliable signals are: in-place ICE restart in [`super::ice_watchdog`]
 //! and [`super::network_watch`], traffic-confirmed promotion back to
 //! `Steady` in the engine's inbound path, and rebuild-on-silence in
-//! [`super::heartbeat`]. See `CONNECTION-ENGINE.md` for the model. This
+//! [`super::heartbeat`]. See `CONNECTION-ENGINE-FIELD-NOTES.md` for the model. This
 //! module also owns the topology selector pass ([`reevaluate_topology`]).
 
 use std::sync::Arc;

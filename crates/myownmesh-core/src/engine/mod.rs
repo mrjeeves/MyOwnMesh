@@ -15,7 +15,7 @@
 //!   queue.
 //!
 //! Constants are mirrored from MyOwnLLM's `mesh-client.svelte.ts`
-//! and are documented in `CONNECTION-ENGINE.md`. Do not relax them
+//! and are documented in `CONNECTION-ENGINE-FIELD-NOTES.md`. Do not relax them
 //! without understanding the corresponding field-discovered bug.
 
 pub mod conn_trace;
