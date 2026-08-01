@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Own one bounded connection attempt from admitted speculative work through candidate output. Arc 02 adds the authority types without changing the current runtime.
+Own one bounded connection attempt from admitted speculative work through candidate output. Arc 02 defines the authority and reservation boundary without redirecting the current connector runtime.
 
 ## Owned state
 
@@ -12,12 +12,12 @@ The target owner holds one attempt's candidate set, race state, cancellation sta
 
 - local connection intent;
 - bounded transport hints;
-- a pre-authentication resource admission represented by `PreAuthAttemptPermit`;
+- one aggregate pre-authentication resource reservation represented by `PreAuthAttemptPermit`;
 - typed connector-control input and cancellation.
 
 ## Outputs
 
-- `CandidateCapability` for one admitted candidate;
+- `CandidateCapability` with one child reservation and exact attempt ownership;
 - bounded observations, candidate updates, cancellation, or failure.
 
 ## Dependencies
@@ -26,7 +26,11 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 ## Resources
 
-`PreAuthAttemptPermit` is the typed seam for resource admission. Arc 02 does not invent or enforce an unmeasured value. The resource owner supplies accounting before the production attempt path is migrated.
+`PreAuthAttemptPermit` is not consumed by its first candidate. It owns one aggregate reservation and may issue several child reservations. Each candidate carries its child reservation and an unforgeable witness for the exact attempt that issued it.
+
+The child is acquired before the candidate allocation closure runs. A refused child claim does not run that closure. Dropping a candidate returns its active claim to the aggregate.
+
+Arc 02 does not invent a production capacity. The resource owner must supply measured, owner-approved capacity before the production attempt path is migrated. Anonymous-ingress and process-global admission must remain possible before a Device identity or Closed authorization is known.
 
 ## Restart behavior
 

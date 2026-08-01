@@ -3109,25 +3109,14 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
 /// Install the current peer owner and retire any replaced compatibility queue.
 /// Explicit retirement is required because other tasks may still hold an
 /// `Arc` to the replaced peer object.
-fn install_peer(
-    peers: &dashmap::DashMap<String, Arc<PeerConnection>>,
-    device_id: String,
-    peer: Arc<PeerConnection>,
-) {
-    if let Some(replaced) = peers.insert(device_id, peer) {
-        replaced.discard_pending_remote_candidates();
-    }
+fn install_peer(peers: &state::PeerRegistry, device_id: String, peer: Arc<PeerConnection>) {
+    peers.install(device_id, peer);
 }
 
 /// Remove the current peer owner and retire its compatibility queue before the
 /// returned `Arc` can outlive its place in the peer map.
-fn remove_peer(
-    peers: &dashmap::DashMap<String, Arc<PeerConnection>>,
-    device_id: &str,
-) -> Option<Arc<PeerConnection>> {
-    let (_, peer) = peers.remove(device_id)?;
-    peer.discard_pending_remote_candidates();
-    Some(peer)
+fn remove_peer(peers: &state::PeerRegistry, device_id: &str) -> Option<Arc<PeerConnection>> {
+    peers.remove(device_id)
 }
 
 /// Build a minimal `NetworkState` for unit tests. One process-wide
@@ -3187,7 +3176,7 @@ pub(crate) fn insert_session_less_peer(
 mod tests {
     use super::*;
     use crate::resource::{
-        MeshContextResourceScope, PreAuthResourceFamily, ProcessResourceRoot, ResourceUse,
+        NetworkInstanceResourceScope, PreAuthResourceFamily, ProcessResourceRoot, ResourceUse,
     };
     use std::time::{Duration, Instant};
 
@@ -3201,7 +3190,7 @@ mod tests {
     }
 
     fn arc02_peer_with_pending_candidate(
-        context: &MeshContextResourceScope,
+        context: &NetworkInstanceResourceScope,
         device_id: &str,
     ) -> Arc<PeerConnection> {
         let peer = Arc::new(PeerConnection::new(
@@ -3216,7 +3205,7 @@ mod tests {
         peer
     }
 
-    fn arc02_candidate_use(context: &MeshContextResourceScope) -> ResourceUse {
+    fn arc02_candidate_use(context: &NetworkInstanceResourceScope) -> ResourceUse {
         context
             .report()
             .pre_authentication
@@ -3230,8 +3219,8 @@ mod tests {
     fn v4_arc02_peer_replacement_releases_queue_while_retired_arc_survives() {
         let process = ProcessResourceRoot::isolated();
         let mesh = process.mesh_runtime_scope();
-        let context = mesh.mesh_context_scope();
-        let peers = dashmap::DashMap::new();
+        let context = mesh.network_instance_scope();
+        let peers = state::PeerRegistry::default();
         let device_id = "arc02-replaced-peer";
         let retired = arc02_peer_with_pending_candidate(&context, device_id);
         install_peer(&peers, device_id.to_string(), Arc::clone(&retired));
@@ -3252,8 +3241,8 @@ mod tests {
     fn v4_arc02_peer_removal_releases_queue_while_removed_arc_survives() {
         let process = ProcessResourceRoot::isolated();
         let mesh = process.mesh_runtime_scope();
-        let context = mesh.mesh_context_scope();
-        let peers = dashmap::DashMap::new();
+        let context = mesh.network_instance_scope();
+        let peers = state::PeerRegistry::default();
         let device_id = "arc02-removed-peer";
         let retained = arc02_peer_with_pending_candidate(&context, device_id);
         install_peer(&peers, device_id.to_string(), Arc::clone(&retained));
@@ -3263,6 +3252,43 @@ mod tests {
 
         assert!(Arc::ptr_eq(&retained, &removed));
         assert_eq!(arc02_candidate_use(&context), ResourceUse::ZERO);
+    }
+
+    #[tokio::test]
+    async fn v4_arc02_shutdown_retires_queue_while_external_peer_arc_survives() {
+        let state = build_test_state("arc02-shutdown-external-peer");
+        let device_id = "arc02-shutdown-peer";
+        let retained = Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            None,
+            state.peer_connection_resource_scope(),
+        ));
+        {
+            let mut peer_state = retained.state.write();
+            retained.queue_remote_candidate(&mut peer_state, arc02_candidate_fixture());
+        }
+        install_peer(&state.peers, device_id.to_string(), Arc::clone(&retained));
+        let before = state
+            .resource_report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+            .active;
+        assert_ne!(before, ResourceUse::ZERO);
+
+        state.shutdown().await;
+
+        let after = state
+            .resource_report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+            .active;
+        assert_eq!(after, ResourceUse::ZERO);
+        assert_eq!(retained.device_id, device_id);
+        assert!(state.peers.is_empty());
     }
 
     fn stale_instant() -> Instant {

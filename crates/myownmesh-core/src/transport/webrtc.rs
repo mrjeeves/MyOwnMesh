@@ -1164,6 +1164,11 @@ impl PeerSession {
 
     /// Add an ICE candidate the peer sent us. The peer's nominal
     /// `null` (gathering complete) is also acceptable.
+    ///
+    /// V4 transition note: this public raw-candidate port is a temporary Arc
+    /// 02 compatibility bypass. Arc 03 makes candidate application private to
+    /// the Connector Worker and requires the exact candidate capability. The
+    /// current signature is not evidence of resource admission.
     pub async fn add_ice_candidate(&self, cand: LocalIceCandidate) -> Result<()> {
         self.pc
             .add_ice_candidate(cand.into_init())

@@ -1,13 +1,13 @@
 # Arc 02 authority and resource spine red team
 
-Status: executable controls for Arc 02A and the Arc 02B remote-candidate observation pilot.
+Status: executable controls for Arc 02A, Arc 02B, and the corrective Arc 02C revision.
 
-This catalog tests a bounded source and runtime claim. It does not claim complete production resource coverage, selected budgets, production session promotion, or WebRTC and ICE agent accounting.
+This catalog proves bounded source, type, ownership, runtime-cleanup, and measurement claims. It does not claim complete production resource coverage, selected production budgets, a production session mint, or WebRTC internal accounting.
 
-## Run
+## Run the focused gate
 
 ```powershell
-$arc02Target = "C:\Users\Admin\.allmystuff-sandbox-stage\myownmesh-v4-arc02b-target"
+$arc02Target = "C:\Users\Admin\.allmystuff-sandbox-stage\myownmesh-v4-arc02c-target"
 $env:CARGO_TARGET_DIR = $arc02Target
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
@@ -20,8 +20,8 @@ function Invoke-Checked([scriptblock]$Command) {
 
 Invoke-Checked { cargo fmt --all -- --check }
 Invoke-Checked { cargo check --workspace --all-targets -j 16 }
-Invoke-Checked { cargo clippy -p myownmesh-core --all-targets -j 16 -- -D warnings }
-Invoke-Checked { cargo test -p myownmesh-core --lib v4_arc02 -j 16 }
+Invoke-Checked { cargo clippy --workspace --all-targets -j 16 -- -D warnings }
+Invoke-Checked { cargo test -p myownmesh-core --lib v4_arc02 -j 16 -- --nocapture }
 Invoke-Checked { cargo test -p myownmesh-core --doc -j 16 }
 Invoke-Checked { python scripts/check-v4-arc02-compiler-boundaries.py }
 Invoke-Checked { python scripts/check-v4-arc02-spine.py }
@@ -30,143 +30,208 @@ Invoke-Checked { python scripts/check-v4-arc01-inventory.py }
 Invoke-Checked { python scripts/check-v4-arc01-inventory.py --negative-controls }
 ```
 
-The compiler check creates a temporary Cargo project and runs `cargo check --offline`. The focused Rust tests are in-process. These commands do not start a MyOwnMesh runtime, signaling service, listener, or integration binary.
+The compiler harness creates a temporary offline Cargo project. The source and mutation checks start no listener.
 
-Recorded result on 2026-08-01: every command passed. The focused suite passed 28 tests, the doctest suite passed 10 tests, the compiler harness passed 1 positive control and 10 cause-matched rejection controls, and all defined Arc 02 and Arc 01 mutations were rejected.
+## 1. Peer owner attacks
 
-## 1. Candidate ownership attacks
+### RT-02C-01: bypass the registry
 
-### RT-02B-01: restore copied peer state
+Attack: restore a public `DashMap<String, Arc<PeerConnection>>` on `NetworkState`, or mutate the inner map outside `PeerRegistry`.
 
-Attack: add `Clone` to the `PeerStateData` derive or add a manual `Clone` implementation.
+Expected result: the source gate rejects the raw owner or escaped mutation.
 
-Expected result: the source gate rejects the change. A caller must not copy the private candidate queue or its observation owners through a copied state snapshot.
+Reason: no caller may replace, remove, or clear a peer without retiring its compatibility queue.
 
-Runtime control: `v4_arc02_candidate_queue_observes_items_strings_and_container_separately` moves the candidate into the queue and then into a drain.
+### RT-02C-02: replace without retirement
 
-### RT-02B-02: expose the queue
+Attack: replace a peer and retain an external `Arc` to the old peer while skipping `discard_pending_remote_candidates`.
 
-Attack: make `pending_remote_candidates` public or change it from `PendingRemoteCandidateQueue`.
+Expected result: the mutation gate rejects the missing retirement. The runtime replacement test requires active candidate use to return to zero while the old `Arc` remains alive.
 
-Expected result: the source gate rejects the field shape. Every queue mutation must remain behind the observation owner.
+### RT-02C-03: remove without retirement
 
-### RT-02B-03: clone the inbound candidate
+Attack: remove a peer, retain the returned and external `Arc` values, and skip queue retirement.
 
-Attack: replace the moved queue insertion with `candidate.clone()`.
+Expected result: the mutation gate and removal runtime test fail the attack.
 
-Expected result: the source gate rejects the clone. The queued value and its lease must have one move path.
+### RT-02C-04: clear or shut down without retirement
 
-### RT-02B-04: bypass one application path
+Attack: clear the registry without visiting every current peer first.
 
-Attack: remove `apply_pending_remote_candidate` from either the immediate path or the post-SDP drain path.
+Expected result: the mutation gate rejects the clear. `v4_arc02_shutdown_retires_queue_while_external_peer_arc_survives` holds an external peer `Arc`, calls `NetworkState::shutdown`, and requires the network-instance candidate report to return to zero.
 
-Expected result: the source gate rejects any count other than the two reviewed production call sites.
+### RT-02C-05: copy live peer ownership
 
-### RT-02B-05: end observation before the await
+Attack: restore `PeerStateData: Clone`, expose the pending queue, or add the queue to `PeerStateSnapshot`.
 
-Attack: drop the candidate observation before `apply(candidate).await` or remove the post-await drop sequence.
+Expected result: the source and mutation gates reject each change. The public snapshot may copy diagnostic values, but not mutable queue ownership or observation leases.
 
-Expected result: the source gate rejects the lifetime shape.
+## 2. Observer attacks
 
-Runtime controls:
+### RT-02C-06: grow metadata per active lease
 
-- `v4_arc02_cancelling_candidate_application_releases_its_observation` polls a pending application, confirms the lease is active, cancels the future, and confirms cleanup.
-- `v4_arc02_candidate_application_releases_on_success_and_failure` proves both completed outcomes return active use to zero.
+Attack: restore a `BTreeMap<Instant, ...>`, `Vec`, or another active-lease collection in `FamilyState`.
 
-### RT-02B-06: drop queued work
+Expected result: the source gate requires fixed arrays for closed families and constant-space family metadata. The mutation gate inserts an active timestamp map and must reject it.
 
-Attack: remove a peer or replace its session while candidates remain queued.
+### RT-02C-07: restore the hierarchy hot-path mutex
 
-Expected result: ownership drop releases both candidate and queue-container leases.
+Attack: add a transaction mutex to `ResourceAccountant` or a shared `Hierarchy` lock around rollup updates.
 
-Runtime controls:
+Expected result: the source gate rejects the observer shape. Diagnostic cross-scope snapshots do not require global linearizability.
 
-- `v4_arc02_peer_replacement_releases_queue_while_retired_arc_survives` replaces the map owner while retaining another `Arc` to the retired peer.
-- `v4_arc02_peer_removal_releases_queue_while_removed_arc_survives` removes the map owner while retaining both the original and returned `Arc` values.
-- `v4_arc02_dropping_peer_releases_queued_candidate_observations` proves ordinary owner drop cleanup.
+### RT-02C-08: claim an unknown oldest lifetime
 
-## 2. Measurement attacks
+Attack: report the start of a remaining lease after the previously oldest lease ends without storing enough information to know it.
 
-### RT-02B-07: conflate logical and retained bytes
+Expected result: `v4_arc02_bounded_oldest_tracking_stops_claiming_exactness` requires `oldest_active_lifetime` to become `None` and `oldest_active_lifetime_inexact` to become true while another lease remains.
 
-Attack: restore one generic byte field or derive both values from `String::len()`.
+### RT-02C-09: panic on measurement overflow
 
-Expected result: the resource shape gate requires `logical_bytes` and `retained_bytes`. The source gate also requires candidate string capacity reads.
+Attack: add `expect`, `unwrap`, or `panic!` to production resource measurement.
 
-Runtime controls:
+Expected result: the source and mutation gates reject the panic path. Runtime controls require saturation and an inexact report for overflow or unsupported measurement.
 
-- `v4_arc02_logical_and_retained_bytes_are_independent_axes` uses different live fixture values for each axis.
-- `v4_arc02_candidate_queue_observes_items_strings_and_container_separately` creates strings with live spare capacity and checks both dimensions.
+### RT-02C-10: conflate logical and retained bytes
 
-### RT-02B-08: hide spare queue capacity
+Attack: derive both axes from string length, omit string capacity, or omit queue-container capacity.
 
-Attack: remove the queue container lease or omit `Vec::capacity() * size_of::<PendingRemoteCandidate>()`.
+Expected result: the candidate measurement controls fail. Candidate values and container storage remain separate observations.
 
-Expected result: the source gate rejects the queue shape or retained-byte calculation. The reported value is Rust `Vec` capacity in bytes, not allocator metadata or process RSS.
+### RT-02C-11: skip an aggregation owner
 
-Runtime control: the queue test confirms that dropping the candidate while retaining the drain leaves only the container's retained bytes active. Dropping the drain then returns active use to zero.
+Attack: skip the process root or another ancestor during a leaf update.
 
-Interpretation control: candidate count comes from `ResourceUse.items`. Lease count includes the separate queue-container owner and is not a candidate count.
+Expected result: the hierarchy mutation and four-scope runtime test fail. Sibling network instances must remain isolated at their own reports.
 
-### RT-02B-09: double count inline slots
+### RT-02C-12: misstate network-instance attribution
 
-Attack: add wrapper or candidate inline size to each candidate lease while retaining the separate queue-capacity observation.
+Attack: rename the live network-instance scope to an exact Mesh Context without binding an immutable context identity, or infer carrier, ingress, attempt, or known-origin identity from that rollup path.
 
-Expected result: this is a review failure. The approved measurement contract assigns inline slots to the queue container and string allocations to each candidate. The source gate checks the reviewed calculation inputs, but this semantic review remains necessary if the formula changes.
+Expected result: architecture review fails. The source gate requires `NetworkInstanceResourceScope`; orthogonal attribution needs its own typed owner.
 
-## 3. Scope attacks
+## 3. Attempt reservation attacks
 
-### RT-02B-10: skip an ancestor
+### RT-02C-13: consume the attempt into the first candidate
 
-Attack: change an ancestor update loop to `self.path.iter().skip(1)`.
+Attack: store `PreAuthAttemptPermit` directly inside `CandidateCapability`.
 
-Expected result: the mutation gate rejects it.
+Expected result: the protected authority field shape changes and the source gate rejects it. The runtime control requires two simultaneous candidate children from one attempt aggregate.
 
-Runtime control: `v4_arc02_leaf_observation_updates_all_four_scopes` checks process root, Mesh runtime, exact context, and peer connection before and after lease drop.
+### RT-02C-14: allocate before reservation
 
-### RT-02B-11: leak across sibling contexts
+Attack: invoke the allocation closure and ask the aggregate for a child afterward.
 
-Attack: reuse one context scope for unrelated joined contexts.
+Expected result: the source gate rejects the ordering. `v4_arc02_candidate_allocation_runs_only_after_child_reservation` observes an active child from inside the allocation closure and proves that a refused claim never calls the closure.
 
-Expected result: `v4_arc02_sibling_contexts_do_not_observe_each_other` fails. The Mesh and process reports may aggregate both contexts, but one exact context report must not include its sibling.
+### RT-02C-15: lose exact attempt ownership
 
-### RT-02B-12: detach a Mesh runtime
+Attack: replace the candidate's local `Arc<AttemptOwnership>` with a peer string, runtime value alone, or another public label.
 
-Attack: create a standalone accountant in `Mesh::open_with_identity` instead of descending from the process root.
+Expected result: the protected field shape and public-ID conversion controls reject it. Runtime tests use `Arc::ptr_eq` to verify the issuing attempt and aggregate.
 
-Expected result: the source mutation gate rejects the detached wiring.
+### RT-02C-16: exceed the aggregate
 
-### RT-02B-13: add a second process-global observer
+Attack: issue a child whose componentwise claim would exceed the attempt capacity.
 
-Attack: add another static accountant, `OnceLock`, lazy static, or thread-local resource root.
+Expected result: child creation returns `None`, the allocation closure does not run, and active reservation state does not exceed capacity.
 
-Expected result: the source gate requires exactly one typed process observation root and rejects the additional state.
+### RT-02C-17: reopen capacity after an inconsistent release
 
-## 4. Existing Arc 02A authority attacks
+Attack: keep two child reservations live, corrupt aggregate active use below one child's claim, and drop that child. Then drop the remaining child or request another admission.
 
-The same mutation suite continues to reject:
+Expected result: the first inconsistent release preserves the last active value and poisons the aggregate. The second release cannot reduce that value, and every later admission is refused.
 
-- public authority fields or constructors;
-- wrapped, aliased, parenthesized, raw-identifier, macro-generated, or second-implementation mints;
-- forbidden `Clone`, `Copy`, serialization, `Default`, and conversion traits;
+## 4. Candidate observation attacks
+
+### RT-02C-18: clone the inbound candidate
+
+Attack: clone the candidate into the pending queue.
+
+Expected result: the source mutation rejects the clone. Queueing and draining move the candidate and its lease.
+
+### RT-02C-19: end observation before asynchronous application
+
+Attack: drop the candidate observation before `add_ice_candidate(...).await` completes.
+
+Expected result: source order and runtime success, failure, and cancellation controls fail the attack.
+
+### RT-02C-20: mistake the raw API for a guarded port
+
+Attack: claim complete candidate admission because the two current engine call sites use the observation helper, while `PeerSession::add_ice_candidate(LocalIceCandidate)` remains public.
+
+Expected result: review fails. Arc 02C records this as a temporary bypass. Arc 03 must make the port connector-private and capability-consuming. The checker is not expanded to hide this API fact.
+
+## 5. Authority attacks retained from Arc 02A
+
+The same compiler and mutation suites continue to reject:
+
+- public capability fields or constructors;
+- public-ID conversions;
+- `Clone`, `Copy`, serialization, deserialization, or `Default` for authority types;
+- wrapped, aliased, raw-identifier, parenthesized, macro-generated, attribute-generated, descendant-module, or second-implementation mints;
 - alternate runtime witness constructors;
-- legacy wrapper extraction and trait bypasses;
-- crate-root, module-path, conditional-module, and Cargo library-target redirection;
-- missing compile-fail controls or boundary documents;
-- policy, permit, capability, filesystem, process, or network behavior in the observer.
+- raw legacy adapter extraction;
+- crate-root, module-path, conditional-module, or Cargo library-target redirection;
+- a working connected channel used as a promoted session.
 
-The compiler harness accepts one public type-path control and requires ten forbidden expressions to fail with the expected Rust error code, type-specific fragments, and primary probe line.
+## 6. Full repository and platform gate
 
-## 5. Pass meaning
+The corrective commit also requires:
 
-A complete pass proves only the checked code and source properties for Arc 02A and Arc 02B. It does not prove:
+```powershell
+Invoke-Checked { cargo test --workspace --no-fail-fast -j 16 }
+Invoke-Checked { cargo test -p myownmesh-core --test two_peer_handshake -j 16 -- --nocapture }
+Invoke-Checked { cargo test -p myownmesh-signaling --tests -j 16 }
+Invoke-Checked { cargo test -p myownmesh-core transport::webrtc::tests -j 16 }
+$env:MYOWNMESH_ARC02_BENCH_ITERATIONS = "100000"
+Invoke-Checked { cargo test --release -p myownmesh-core --lib v4_arc02_observer_overhead_measurement -j 16 -- --ignored --nocapture }
+Invoke-Checked { cargo test --release -p myownmesh-core --lib v4_arc02_candidate_observer_metadata_measurement -j 16 -- --ignored --nocapture }
+Remove-Item Env:\MYOWNMESH_ARC02_BENCH_ITERATIONS
+```
 
-- a numeric resource budget;
-- resource admission or enforcement;
-- a production `PreAuthAttemptPermit` issuer;
-- all production allocations are observed;
-- WebRTC or ICE agent retention is observed;
-- arbitrary memory corruption safety;
-- Arc 02 completion.
+The benchmark iteration count is a recorded measurement workload, not a production budget or pass threshold. Supported-platform CI remains the authority for Linux x86-64, macOS arm64, Windows x86-64, riscv64 musl, and aarch64 musl.
 
-The handoff boundary is explicit: the candidate lease ends when `add_ice_candidate(...).await` returns. Retention inside webrtc-rs needs a later Connector Worker observation.
+### Recorded corrective run
+
+The local corrective gate ran on 2026-08-01 from base commit `b0134d446ae94bc3b5e6e730c8019b924765d416`.
+
+| Environment | Checked result |
+|---|---|
+| Windows 11 Pro 10.0.26200, x86-64, Rust 1.88.0 | Format, workspace all-target check, workspace all-target Clippy with warnings denied, focused Arc 02 runtime tests, doctests, compiler boundaries, source gates, mutation controls, and release observer measurements passed. |
+| Ubuntu 24.04 under WSL2, x86-64, Rust 1.88.0 | Complete workspace tests, the two-peer handshake and channel exchange, signaling tests, mDNS discovery, self-hosted relay tests, and WebRTC data, Opus, and H.264 tests passed. |
+| Supported-platform CI | Must run against the pushed corrective revision. Local results do not substitute for the GitHub platform matrix. |
+
+The Windows release observer measurement used an Intel Core i9-10850K with 10 cores and 20 logical processors. Three 100,000-operation samples measured one four-scope begin plus drop at 244 ns, 234 ns, and 241 ns per operation. These are raw samples, not a performance requirement.
+
+The exact source after the fail-closed aggregate correction produced one additional 100,000-operation sample at 322 ns per operation. It is kept separate because it is one sample, not an extension of the earlier three-sample run.
+
+The same optimized binary reported these fixed in-memory sizes in bytes:
+
+| Type or fixed state | Bytes |
+|---|---:|
+| Family observation state | 168 |
+| One scope state for all closed families | 5,384 |
+| One locked scope inner value | 5,392 |
+| Resource accountant handle | 24 |
+| Observation lease | 88 |
+| Local ICE candidate header | 80 |
+| Candidate observation lease wrapper | 88 |
+| Pending candidate plus observation | 168 |
+| Pending candidate queue header | 112 |
+| Pending candidate drain header | 120 |
+| Empty vector header used by the queue | 24 |
+
+String allocations and spare vector capacity remain separate retained-byte observations. The header sizes do not claim total heap retention. No measured number in this section selects a capacity or pass threshold.
+
+## 7. Pass meaning
+
+A complete pass proves only the checked revision and named runtime paths. It does not prove:
+
+- a selected numeric resource budget;
+- full production resource admission;
+- every frame, parser, socket, ICE, STUN, TURN, DNS, callback, task, timer, relay, or WebRTC allocation is guarded;
+- WebRTC internal retained memory is measured;
+- the raw candidate API is connector-private;
+- a production `ConnectedChannelCapability` exists;
+- Arc 03 is complete.

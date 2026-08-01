@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
-    ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ResourceUse,
+    ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ResourceMeasurement,
+    ResourceUse,
 };
 use crate::transport::{LocalIceCandidate, PeerDiag, PeerSession, SelectedCandidatePair};
 
@@ -58,9 +59,9 @@ pub(super) struct PendingRemoteCandidate {
 impl PendingRemoteCandidate {
     fn observe(candidate: LocalIceCandidate, resource_scope: &PeerConnectionResourceScope) -> Self {
         let observation = CandidateObservationLease {
-            _observation: resource_scope.observe_pre_authentication(
+            _observation: resource_scope.observe_pre_authentication_measurement(
                 PreAuthResourceFamily::CandidateObject,
-                candidate_resource_use(&candidate),
+                candidate_resource_measurement(&candidate),
             ),
         };
         Self {
@@ -105,14 +106,14 @@ impl PendingRemoteCandidateQueue {
     fn push(&mut self, candidate: LocalIceCandidate, resource_scope: &PeerConnectionResourceScope) {
         self.entries
             .push(PendingRemoteCandidate::observe(candidate, resource_scope));
-        let observed = queue_container_resource_use(&self.entries);
+        let measurement = queue_container_resource_measurement(&self.entries);
         match self.container_observation.as_mut() {
-            Some(observation) => observation.replace_observed(observed),
+            Some(observation) => observation.replace_measurement(measurement),
             None => {
                 self.container_observation =
-                    Some(resource_scope.observe_pre_authentication(
+                    Some(resource_scope.observe_pre_authentication_measurement(
                         PreAuthResourceFamily::CandidateObject,
-                        observed,
+                        measurement,
                     ));
             }
         }
@@ -166,13 +167,13 @@ impl Iterator for PendingRemoteCandidateDrain {
 
 impl ExactSizeIterator for PendingRemoteCandidateDrain {}
 
-fn candidate_resource_use(candidate: &LocalIceCandidate) -> ResourceUse {
-    let logical_bytes = measured_sum([
+fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
+    let (logical_bytes, logical_inexact) = measured_sum([
         candidate.candidate.len(),
         candidate.sdp_mid.as_ref().map_or(0, String::len),
         candidate.username_fragment.as_ref().map_or(0, String::len),
     ]);
-    let retained_bytes = measured_sum([
+    let (retained_bytes, retained_inexact) = measured_sum([
         candidate.candidate.capacity(),
         candidate.sdp_mid.as_ref().map_or(0, String::capacity),
         candidate
@@ -180,25 +181,51 @@ fn candidate_resource_use(candidate: &LocalIceCandidate) -> ResourceUse {
             .as_ref()
             .map_or(0, String::capacity),
     ]);
-    ResourceUse::observed(1, logical_bytes, retained_bytes, 0)
+    let observed = ResourceUse::observed(1, logical_bytes, retained_bytes, 0);
+    if logical_inexact || retained_inexact {
+        ResourceMeasurement::inexact(observed)
+    } else {
+        ResourceMeasurement::exact(observed)
+    }
 }
 
-fn queue_container_resource_use(entries: &Vec<PendingRemoteCandidate>) -> ResourceUse {
-    let retained_bytes = entries
+fn queue_container_resource_measurement(
+    entries: &Vec<PendingRemoteCandidate>,
+) -> ResourceMeasurement {
+    let bytes = entries
         .capacity()
-        .checked_mul(size_of::<PendingRemoteCandidate>())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .expect("a live Vec allocation fits in the observation counter");
-    ResourceUse::observed(0, 0, retained_bytes, 0)
+        .checked_mul(size_of::<PendingRemoteCandidate>());
+    let (retained_bytes, inexact) = measured_usize(bytes);
+    let observed = ResourceUse::observed(0, 0, retained_bytes, 0);
+    if inexact {
+        ResourceMeasurement::inexact(observed)
+    } else {
+        ResourceMeasurement::exact(observed)
+    }
 }
 
-fn measured_sum<const N: usize>(values: [usize; N]) -> u64 {
-    values.into_iter().fold(0_u64, |sum, value| {
-        sum.checked_add(
-            u64::try_from(value).expect("a live allocation fits in the observation counter"),
-        )
-        .expect("co-resident live allocations fit in the observation counter")
-    })
+fn measured_usize(value: Option<usize>) -> (u64, bool) {
+    match value.and_then(|value| u64::try_from(value).ok()) {
+        Some(value) => (value, false),
+        None => (u64::MAX, true),
+    }
+}
+
+fn measured_sum<const N: usize>(values: [usize; N]) -> (u64, bool) {
+    let mut sum = 0_u64;
+    let mut inexact = false;
+    for value in values {
+        let (value, conversion_inexact) = measured_usize(Some(value));
+        inexact |= conversion_inexact;
+        match sum.checked_add(value) {
+            Some(next) => sum = next,
+            None => {
+                sum = u64::MAX;
+                inexact = true;
+            }
+        }
+    }
+    (sum, inexact)
 }
 
 #[derive(Debug)]
@@ -323,6 +350,31 @@ pub struct PeerStateData {
     pub diag: PeerDiag,
 }
 
+/// Clonable point-in-time view for diagnostics and compatibility callers.
+///
+/// This deliberately omits mutable ownership such as the pending candidate
+/// queue. Mutating a snapshot cannot alter the live peer or duplicate an
+/// observation lease.
+#[derive(Debug, Clone)]
+pub struct PeerStateSnapshot {
+    pub status: PeerStatus,
+    pub tier: ConnectionTier,
+    pub rtt_ms: Option<u32>,
+    pub clock_skew_ms: Option<i64>,
+    pub label: String,
+    pub capabilities: Option<CapabilityAdvert>,
+    pub local_shelved: bool,
+    pub remote_shelved: bool,
+    pub authenticated: bool,
+    pub verification_code_received: Option<String>,
+    pub verification_code_sent: Option<String>,
+    pub local_approve_sent: bool,
+    pub remote_approve_seen: bool,
+    pub needs_turn: bool,
+    pub diag: PeerDiag,
+    pub selected_pair: Option<SelectedCandidatePair>,
+}
+
 impl PeerStateData {
     /// The admission boundary: `true` once this peer has proven its ed25519
     /// identity (`authenticated`) **and** both sides have approved (`Active`,
@@ -340,6 +392,27 @@ impl PeerStateData {
 
     pub(super) fn take_pending_remote_candidates(&mut self) -> PendingRemoteCandidateDrain {
         self.pending_remote_candidates.take()
+    }
+
+    pub fn snapshot(&self) -> PeerStateSnapshot {
+        PeerStateSnapshot {
+            status: self.status,
+            tier: self.tier,
+            rtt_ms: self.rtt_ms,
+            clock_skew_ms: self.clock_skew_ms,
+            label: self.label.clone(),
+            capabilities: self.capabilities.clone(),
+            local_shelved: self.local_shelved,
+            remote_shelved: self.remote_shelved,
+            authenticated: self.authenticated,
+            verification_code_received: self.verification_code_received.clone(),
+            verification_code_sent: self.verification_code_sent.clone(),
+            local_approve_sent: self.local_approve_sent,
+            remote_approve_seen: self.remote_approve_seen,
+            needs_turn: self.no_turn_diag_emitted,
+            diag: self.diag.clone(),
+            selected_pair: self.selected_pair,
+        }
     }
 }
 
@@ -427,6 +500,11 @@ impl PeerConnection {
         PendingRemoteCandidate::observe(candidate, &self.resource_scope)
     }
 
+    /// Return a clonable diagnostic view without copying mutable ownership.
+    pub fn snapshot(&self) -> PeerStateSnapshot {
+        self.state.read().snapshot()
+    }
+
     pub(super) fn queue_remote_candidate(
         &self,
         state: &mut PeerStateData,
@@ -494,7 +572,7 @@ mod tests {
     fn observed_peer() -> PeerConnection {
         let process = ProcessResourceRoot::isolated();
         let mesh = process.mesh_runtime_scope();
-        let context = mesh.mesh_context_scope();
+        let context = mesh.network_instance_scope();
         PeerConnection::new(
             "candidate-test-peer".to_string(),
             None,
@@ -506,12 +584,13 @@ mod tests {
     fn v4_arc02_candidate_queue_observes_items_strings_and_container_separately() {
         let peer = observed_peer();
         let candidate = observed_candidate();
-        let candidate_use = candidate_resource_use(&candidate);
+        let candidate_use = candidate_resource_measurement(&candidate).observed();
 
         let container_use = {
             let mut state = peer.state.write();
             peer.queue_remote_candidate(&mut state, candidate);
-            queue_container_resource_use(&state.pending_remote_candidates.entries)
+            queue_container_resource_measurement(&state.pending_remote_candidates.entries)
+                .observed()
         };
 
         let active = candidate_report(&peer.resource_report().pre_authentication);
@@ -559,7 +638,7 @@ mod tests {
     fn v4_arc02_dropping_peer_releases_queued_candidate_observations() {
         let process = ProcessResourceRoot::isolated();
         let mesh = process.mesh_runtime_scope();
-        let context = mesh.mesh_context_scope();
+        let context = mesh.network_instance_scope();
         let peer = PeerConnection::new(
             "replacement-session-peer".to_string(),
             None,
@@ -624,5 +703,24 @@ mod tests {
             assert_eq!(completed.active_lease_count, 0);
             assert_eq!(completed.completed_lease_count, 1);
         }
+    }
+
+    #[test]
+    fn v4_arc02_unsupported_candidate_measurement_saturates_without_panicking() {
+        assert_eq!(measured_usize(None), (u64::MAX, true));
+    }
+
+    #[test]
+    #[ignore = "manual candidate-observer metadata measurement"]
+    fn v4_arc02_candidate_observer_metadata_measurement() {
+        println!(
+            "arc02_candidate_metadata_bytes local_candidate={} observation_lease={} pending_candidate={} queue={} drain={} vec_header={}",
+            size_of::<LocalIceCandidate>(),
+            size_of::<CandidateObservationLease>(),
+            size_of::<PendingRemoteCandidate>(),
+            size_of::<PendingRemoteCandidateQueue>(),
+            size_of::<PendingRemoteCandidateDrain>(),
+            size_of::<Vec<PendingRemoteCandidate>>()
+        );
     }
 }

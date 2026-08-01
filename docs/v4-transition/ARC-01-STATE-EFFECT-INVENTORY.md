@@ -19,9 +19,9 @@ The baseline commit remains fixed. The current fingerprints cover that baseline 
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d` |
-| Production Rust declaration members | 1,562 | `f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,681 | `57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a` |
+| Production Rust source units | 106 | `2678fb41e9f2e796d44ef02cf858b80796be6a7e7e0a5c8ede4afc140fb6732e` |
+| Production Rust declaration members | 1,599 | `c45d588bc71c6d4294617953790c7b1e3c5535ceffdf10443fd8b96ea8fcd2fa` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,708 | `f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af` |
 | Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |
 | Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
@@ -36,7 +36,7 @@ The assignment counts are records, not architectural sizing targets.
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
 | Application Gateway | 348 | 156 |
-| Attempt Node | 42 | 19 |
+| Attempt Node | 55 | 22 |
 | Connector Worker | 48 | 76 |
 | Endpoint Auth Task | 30 | 13 |
 | Peer Session Node | 73 | 50 |
@@ -49,9 +49,9 @@ The assignment counts are records, not architectural sizing targets.
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
-| Resource instrumentation domain | 100 | 39 |
+| Resource instrumentation domain | 104 | 48 |
 | Delete | 23 | 25 |
-| Split | 64 | 365 |
+| Split | 87 | 380 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
 | Decision: OD-DEVICE-KEY-CUSTODY | 13 | 33 |
 | Decision: OD-LEGACY-SILENT-MIGRATION | 1 | 0 |
@@ -106,9 +106,9 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. The Arc 02B pilot now observes remote candidates and their private pre-SDP queue, but it does not enforce a limit. The transport event queue and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 02C keeps remote candidates and their private pre-SDP queue observable, moves peer mutation behind a retiring registry, and adds an aggregate attempt-reservation primitive. No production capacity has been selected and the current connector does not consume that primitive. The transport event queue and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
 
-This does not add Closed-mesh authorization to Open meshes. It requires resource permits for untrusted speculative work. The exact numeric limits remain owner-selected values backed by measurements, so Arc 02 instruments resource families without inventing enforcement values.
+This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 02C defines reservation ordering and observes the current candidate path without inventing production enforcement values.
 
 ### 5. Nostr inbound events are trusted beyond their proven carrier facts
 
@@ -219,4 +219,4 @@ The `runtime/mod.rs` namespace owns the memory-only runtime-incarnation witness 
 - No product code was deleted or changed.
 - The exact baseline and input fingerprints are recorded.
 
-The linked Arc 02 modules are now covered by this gate. Arc 02 remains limited to private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, and observation-only resource accounting. It must not change transport behavior or choose unmeasured resource limits.
+The linked Arc 02 modules are now covered by this gate. Arc 02 remains limited to private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, a retiring peer registry, bounded observation, and the aggregate attempt-reservation foundation. It must not change transport behavior or choose unmeasured resource limits.

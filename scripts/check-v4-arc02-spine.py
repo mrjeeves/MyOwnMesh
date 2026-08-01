@@ -31,8 +31,14 @@ TYPE_OWNERS = {
 }
 
 EXPECTED_FIELDS = {
-    "PreAuthAttemptPermit": {"runtime": "RuntimeIncarnation"},
-    "CandidateCapability": {"permit": "PreAuthAttemptPermit"},
+    "PreAuthAttemptPermit": {
+        "attempt": "Arc<AttemptOwnership>",
+        "aggregate": "Arc<AggregateReservation>",
+    },
+    "CandidateCapability": {
+        "attempt": "Arc<AttemptOwnership>",
+        "reservation": "CandidateReservation",
+    },
     "ConnectedChannelCapability": {"candidate": "CandidateCapability"},
     "EndpointAuthPermit": {"runtime": "RuntimeIncarnation"},
     "AuthenticatedChannelCapability": {
@@ -102,7 +108,7 @@ PROTECTED_PRODUCTION_FINGERPRINTS = {
     "application_gateway/mod.rs": "fdeb6156d7a02f96992e2eff4200c4058b213892f2109c28d619330e3d82d3c2",
     "connector/mod.rs": "3a3a23a98208be249a874ed3217c303ffada45a8fcbb64bca0e10c14f381c85b",
     "endpoint_auth/mod.rs": "d7de05bbb7d4b95c8db451474c99ea723e74a6a38783356dc732ae40749d34a5",
-    "runtime/attempt/mod.rs": "b50c5c633a0713b25b541a47d4b0eefa49bf5e6010de48f3da7f81924b469664",
+    "runtime/attempt/mod.rs": "3b95ace7c758f722ecb7214dc9640e028524d683be99b7463d3c34b6000e33f1",
     "runtime/mod.rs": "aeb6a2bf2fd12df877eb4e02c7c924ce164b07e7db31db457b16f6a4303988d1",
     "runtime/relay/mod.rs": "4652f8fb1a327152c32532f2ef86e26d05b2056321c053684779dbfa438475e6",
     "runtime/session_broker/mod.rs": "31d52ee33c76214123316783e33c3f0003e16f66ab3f2a3200aa81d19ddc9686",
@@ -817,6 +823,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
                 "active_lease_count",
                 "peak_active_lease_count",
                 "oldest_active_lifetime",
+                "oldest_active_lifetime_inexact",
                 "completed_lease_count",
                 "completed_total_use",
                 "completed_total_lifetime",
@@ -851,7 +858,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
     for scope_name in (
         "ProcessResourceRoot",
         "MeshRuntimeResourceScope",
-        "MeshContextResourceScope",
+        "NetworkInstanceResourceScope",
         "PeerConnectionResourceScope",
     ):
         try:
@@ -866,9 +873,13 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
 
     hierarchy_links = (
         ("ProcessResourceRoot", "mesh_runtime_scope", "MeshRuntimeResourceScope"),
-        ("MeshRuntimeResourceScope", "mesh_context_scope", "MeshContextResourceScope"),
         (
-            "MeshContextResourceScope",
+            "MeshRuntimeResourceScope",
+            "network_instance_scope",
+            "NetworkInstanceResourceScope",
+        ),
+        (
+            "NetworkInstanceResourceScope",
             "peer_connection_scope",
             "PeerConnectionResourceScope",
         ),
@@ -881,17 +892,51 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             errors.append(
                 f"resource/mod.rs: missing fixed hierarchy link {owner}::{method} -> {child}"
             )
-    if len(
-        re.findall(
-            r"for\s+scope\s+in\s+self\s*\.\s*path\s*\.\s*iter\s*\(\s*\)\s*\{",
-            resource_masked,
-        )
+    ancestor_walk = re.compile(
+        r"fn\s+for_each_scope\s*\([^{}]*\)\s*\{\s*"
+        r"for\s+scope\s+in\s+self\s*\.\s*ancestors\s*\.\s*iter\s*\(\s*\)\s*\{\s*"
+        r"update\s*\(\s*scope\s*\)\s*;\s*\}\s*"
+        r"update\s*\(\s*&\s*self\s*\.\s*leaf\s*\)\s*;\s*\}"
+    )
+    if not ancestor_walk.search(resource_masked) or len(
+        re.findall(r"self\s*\.\s*for_each_scope\s*\(", resource_masked)
     ) != 3:
         errors.append("resource/mod.rs: leaf observations do not update their ancestor path")
+
+    if re.search(r"\b(?:BTreeMap|Hierarchy|active_starts|lock_transaction)\b", resource_masked):
+        errors.append("resource/mod.rs: observer metadata or hierarchy lock is not bounded")
+    try:
+        _, accountant_body = struct_scope(resource_source, "ResourceAccountant", resource_masked)
+        _, state_body = struct_scope(resource_source, "State", resource_masked)
+        _, family_body = struct_scope(resource_source, "FamilyState", resource_masked)
+    except ValueError as error:
+        errors.append(f"resource/mod.rs: {error}")
+    else:
+        if struct_fields(accountant_body) != {
+            "ancestors": ("", "Arc<[Arc<Inner>]>"),
+            "leaf": ("", "Arc<Inner>"),
+        }:
+            errors.append("resource/mod.rs: observer path metadata must remain fixed and lock-free")
+        state_fields = struct_fields(state_body)
+        if state_fields.get("pre_authentication") != (
+            "",
+            "[FamilyState;PRE_AUTH_RESOURCE_FAMILY_COUNT]",
+        ) or state_fields.get("post_authentication") != (
+            "",
+            "[FamilyState;POST_AUTH_RESOURCE_FAMILY_COUNT]",
+        ):
+            errors.append("resource/mod.rs: observer families must use fixed-size storage")
+        if re.search(r"\b(?:Vec|HashMap|BTreeMap|DashMap|LinkedList|VecDeque)\b", family_body):
+            errors.append("resource/mod.rs: active-lease metadata must remain constant-space")
+
+    for owner in ("resource/mod.rs", "engine/connection.rs"):
+        if re.search(r"\b(?:expect|unwrap)\s*\(|\bpanic\s*!", production_masked[owner]):
+            errors.append(f"{owner}: production resource measurement contains a panic path")
 
     connection_source = production["engine/connection.rs"]
     connection_masked = production_masked["engine/connection.rs"]
     engine_masked = production_masked["engine/mod.rs"]
+    state_masked = production_masked["engine/state.rs"]
     try:
         peer_heading, peer_body = struct_scope(
             connection_source, "PeerStateData", connection_masked
@@ -917,6 +962,32 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
     )
     if any(peer_clone_impl.search(text) for text in workspace_masked.values()):
         errors.append("engine/connection.rs: PeerStateData must not implement Clone")
+
+    try:
+        snapshot_heading, snapshot_body = struct_scope(
+            connection_source, "PeerStateSnapshot", connection_masked
+        )
+    except ValueError as error:
+        errors.append(f"engine/connection.rs: {error}")
+    else:
+        snapshot_derives = {
+            part.strip().split("::")[-1]
+            for derive in re.findall(r"derive\s*\(([^)]*)\)", snapshot_heading)
+            for part in derive.split(",")
+        }
+        if "Clone" not in snapshot_derives:
+            errors.append("engine/connection.rs: read-only peer snapshot must be clonable")
+        if not re.search(r"\bpub\s+struct\s+PeerStateSnapshot\b", mask_rust(snapshot_heading)):
+            errors.append("engine/connection.rs: read-only peer snapshot must be public")
+        snapshot_fields = struct_fields(snapshot_body)
+        if any(visibility != "pub" for visibility, _ in snapshot_fields.values()):
+            errors.append("engine/connection.rs: read-only peer snapshot fields must be readable")
+        if "pending_remote_candidates" in snapshot_fields:
+            errors.append("engine/connection.rs: read-only peer snapshot copied mutable ownership")
+    if not re.search(
+        r"e\s*\.\s*value\s*\(\s*\)\s*\.\s*snapshot\s*\(\s*\)", state_masked
+    ) or not re.search(r"peer\s*\.\s*snapshot\s*\(\s*\)", state_masked):
+        errors.append("engine/state.rs: compatibility reads must use the read-only peer snapshot")
 
     for struct_name, expected in (
         (
@@ -956,32 +1027,82 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
         errors.append(
             "engine/mod.rs: queued and immediate candidate application must both be observed"
         )
+    state_source = production["engine/state.rs"]
+    state_masked = production_masked["engine/state.rs"]
+    try:
+        registry_heading, registry_body = struct_scope(
+            state_source, "PeerRegistry", state_masked
+        )
+    except ValueError as error:
+        errors.append(f"engine/state.rs: {error}")
+    else:
+        if not re.search(r"pub\s*\(\s*super\s*\)\s+struct", mask_rust(registry_heading)):
+            errors.append("engine/state.rs: PeerRegistry must remain private to the engine")
+        registry_fields = struct_fields(registry_body)
+        registry_body_masked = mask_rust(registry_body)
+        if set(registry_fields) != {"peers", "mutation"} or not re.search(
+            r"peers\s*:\s*DashMap\s*<\s*String\s*,\s*Arc\s*<\s*PeerConnection\s*>\s*>",
+            registry_body_masked,
+        ) or registry_fields.get("mutation") != ("", "Mutex<()>"):
+            errors.append("engine/state.rs: PeerRegistry must narrowly own the peer map")
+
     replacement_cleanup = re.compile(
         r"if\s+let\s+Some\s*\(\s*replaced\s*\)\s*=\s*"
-        r"peers\s*\.\s*insert\s*\([^)]*\)\s*\{\s*"
+        r"self\s*\.\s*peers\s*\.\s*insert\s*\([^)]*\)\s*\{\s*"
         r"replaced\s*\.\s*discard_pending_remote_candidates\s*\(\s*\)\s*;"
     )
     removal_cleanup = re.compile(
         r"let\s*\(\s*_\s*,\s*peer\s*\)\s*=\s*"
-        r"peers\s*\.\s*remove\s*\([^;]+;\s*"
+        r"self\s*\.\s*peers\s*\.\s*remove\s*\([^;]+;\s*"
         r"peer\s*\.\s*discard_pending_remote_candidates\s*\(\s*\)\s*;"
     )
-    if not replacement_cleanup.search(engine_masked):
+    retirement_cleanup = re.compile(
+        r"for\s+peer\s+in\s+&\s*retired\s*\{\s*"
+        r"peer\s*\.\s*discard_pending_remote_candidates\s*\(\s*\)\s*;\s*\}\s*"
+        r"self\s*\.\s*peers\s*\.\s*clear\s*\(\s*\)\s*;"
+    )
+    if not replacement_cleanup.search(state_masked):
         errors.append(
-            "engine/mod.rs: peer replacement must explicitly retire queued candidate observations"
+            "engine/state.rs: peer replacement must explicitly retire queued candidate observations"
         )
-    if not removal_cleanup.search(engine_masked):
+    if not removal_cleanup.search(state_masked):
         errors.append(
-            "engine/mod.rs: peer removal must explicitly retire queued candidate observations"
+            "engine/state.rs: peer removal must explicitly retire queued candidate observations"
+        )
+    if not retirement_cleanup.search(state_masked):
+        errors.append(
+            "engine/state.rs: peer clear and shutdown must retire every queued candidate observation"
         )
     peer_map_mutations = sum(
-        len(re.findall(r"\bpeers\s*\.\s*(?:insert|remove)\s*\(", text))
-        for text in workspace_masked.values()
+        len(re.findall(r"\.\s*peers\s*\.\s*(?:insert|remove|clear)\s*\(", text))
+        for path, text in protected_workspace_masked.items()
+        if path != "crates/myownmesh-core/src/engine/state.rs"
     )
-    if peer_map_mutations != 2:
+    if peer_map_mutations != 0:
         errors.append(
-            "engine/mod.rs: peer map replacement and removal must remain confined to reviewed helpers"
+            "engine/state.rs: raw peer-map mutation escaped the private registry"
         )
+    try:
+        _, network_state_body = struct_scope(state_source, "NetworkState", state_masked)
+    except ValueError as error:
+        errors.append(f"engine/state.rs: {error}")
+    else:
+        if network_state_body and struct_fields(network_state_body).get("peers") != (
+            "pub(super)",
+            "PeerRegistry",
+        ):
+            errors.append("engine/state.rs: NetworkState must expose only the narrow peer registry")
+    if not re.search(
+        r"pub\s+async\s+fn\s+shutdown\s*\([^)]*\)\s*\{\s*"
+        r"let\s+retired\s*=\s*self\s*\.\s*peers\s*\.\s*retire_all\s*\(",
+        state_masked,
+    ):
+        errors.append("engine/state.rs: shutdown must retire registry ownership first")
+    if not re.search(
+        r"fn\s+v4_arc02_shutdown_retires_queue_while_external_peer_arc_survives\s*\(",
+        mask_rust(sources["engine/mod.rs"]),
+    ):
+        errors.append("engine/mod.rs: missing external-Arc shutdown cleanup control")
     if not re.search(
         r"let\s+result\s*=\s*apply\s*\(\s*candidate\s*\)\s*\.\s*await\s*;"
         r"\s*drop\s*\(\s*observation\s*\)\s*;",
@@ -1013,7 +1134,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             "engine/state.rs",
             "NetworkState",
             "resource_scope",
-            "MeshContextResourceScope",
+            "NetworkInstanceResourceScope",
         ),
         (
             "engine/connection.rs",
@@ -1048,17 +1169,61 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             "engine/mod.rs: direct spawn_network construction must descend from the process resource root"
         )
     if not re.search(r"spawn_network_in_mesh_scope\s*\(", handle_masked):
-        errors.append("handle.rs: joined mesh contexts must reuse their Mesh runtime scope")
+        errors.append("handle.rs: joined network instances must reuse their Mesh runtime scope")
 
     owner_private_transitions = {
-        "runtime/attempt/mod.rs": {"admitted", "from_permit"},
+        "runtime/attempt/mod.rs": {"admitted", "allocate_candidate"},
         "connector/mod.rs": {"mark_connected"},
     }
     for owner, functions in owner_private_transitions.items():
         source = production_masked[owner]
         for function in functions:
-            if not re.search(rf"(?m)^\s*fn\s+{function}\s*\(", source):
+            if not re.search(
+                rf"(?m)^\s*fn\s+{function}(?:\s*<[^>]+>)?\s*\(", source
+            ):
                 errors.append(f"{owner}: owner transition {function} is not private")
+
+    attempt_masked = production_masked["runtime/attempt/mod.rs"]
+    for struct_name, expected in (
+        (
+            "AttemptOwnership",
+            {"runtime": ("", "RuntimeIncarnation")},
+        ),
+        (
+            "AggregateReservation",
+            {
+                "capacity": ("", "ResourceUse"),
+                "state": ("", "Mutex<AggregateReservationState>"),
+            },
+        ),
+        (
+            "CandidateReservation",
+            {
+                "aggregate": ("", "Arc<AggregateReservation>"),
+                "claim": ("", "ResourceUse"),
+            },
+        ),
+    ):
+        try:
+            heading, body = struct_scope(
+                production["runtime/attempt/mod.rs"], struct_name, attempt_masked
+            )
+        except ValueError as error:
+            errors.append(f"runtime/attempt/mod.rs: {error}")
+            continue
+        if re.search(r"\bpub\b", mask_rust(heading)) or struct_fields(body) != expected:
+            errors.append(
+                f"runtime/attempt/mod.rs: {struct_name} must remain the private reviewed reservation owner"
+            )
+    allocation_order = re.compile(
+        r"let\s+reservation\s*=\s*self\s*\.\s*aggregate\s*\.\s*reserve\s*\(\s*claim\s*\)\s*\?\s*;"
+        r"[\s\S]*?let\s+capability\s*=\s*CandidateCapability\s*\{"
+        r"[\s\S]*?let\s+candidate\s*=\s*allocate\s*\(\s*\)\s*;"
+    )
+    if not allocation_order.search(attempt_masked):
+        errors.append("runtime/attempt/mod.rs: candidate allocation must follow its child reservation")
+    if re.search(r"CandidateCapability\s*\{\s*permit\s*:", attempt_masked):
+        errors.append("runtime/attempt/mod.rs: a candidate must not consume the attempt permit")
 
     for wrapper, (owner, capability_type) in LEGACY_WRAPPERS.items():
         source = production[owner]
@@ -1716,8 +1881,8 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
     )
 
     retained_replaced_queue = copy.deepcopy(sources)
-    retained_replaced_queue["engine/mod.rs"] = retained_replaced_queue[
-        "engine/mod.rs"
+    retained_replaced_queue["engine/state.rs"] = retained_replaced_queue[
+        "engine/state.rs"
     ].replace(
         "        replaced.discard_pending_remote_candidates();",
         "        drop(replaced);",
@@ -1733,11 +1898,11 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
     )
 
     retained_removed_queue = copy.deepcopy(sources)
-    retained_removed_queue["engine/mod.rs"] = retained_removed_queue[
-        "engine/mod.rs"
+    retained_removed_queue["engine/state.rs"] = retained_removed_queue[
+        "engine/state.rs"
     ].replace(
-        "    peer.discard_pending_remote_candidates();",
-        "    let _retired_peer = &peer;",
+        "        peer.discard_pending_remote_candidates();",
+        "        let _retired_peer = &peer;",
         1,
     )
     cases.append(
@@ -1753,8 +1918,8 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
     broken_resource_hierarchy["resource/mod.rs"] = broken_resource_hierarchy[
         "resource/mod.rs"
     ].replace(
-        "for scope in self.path.iter() {",
-        "for scope in self.path.iter().skip(1) {",
+        "for scope in self.ancestors.iter() {",
+        "for scope in self.ancestors.iter().skip(1) {",
         1,
     )
     cases.append(
@@ -1763,6 +1928,100 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
             broken_resource_hierarchy,
             boundaries,
             "leaf observations do not update their ancestor path",
+        )
+    )
+
+    unbounded_active_metadata = copy.deepcopy(sources)
+    unbounded_active_metadata["resource/mod.rs"] = unbounded_active_metadata[
+        "resource/mod.rs"
+    ].replace(
+        "    oldest_active_started_at: Option<Instant>,",
+        "    active_starts: std::collections::BTreeMap<Instant, u64>,",
+        1,
+    )
+    cases.append(
+        (
+            "unbounded active-lease metadata",
+            unbounded_active_metadata,
+            boundaries,
+            "observer metadata or hierarchy lock is not bounded",
+        )
+    )
+
+    hierarchy_hot_path_lock = copy.deepcopy(sources)
+    hierarchy_hot_path_lock["resource/mod.rs"] = hierarchy_hot_path_lock[
+        "resource/mod.rs"
+    ].replace(
+        "    leaf: Arc<Inner>,",
+        "    leaf: Arc<Inner>,\n    transaction: Mutex<()>,",
+        1,
+    )
+    cases.append(
+        (
+            "hierarchy hot-path mutex",
+            hierarchy_hot_path_lock,
+            boundaries,
+            "observer path metadata must remain fixed and lock-free",
+        )
+    )
+
+    panicking_measurement = copy.deepcopy(sources)
+    panicking_measurement["engine/connection.rs"] += (
+        "\nfn redteam_measurement_panic() { panic!(\"measurement overflow\"); }\n"
+    )
+    cases.append(
+        (
+            "panicking resource measurement",
+            panicking_measurement,
+            boundaries,
+            "production resource measurement contains a panic path",
+        )
+    )
+
+    unretired_clear = copy.deepcopy(sources)
+    unretired_clear["engine/state.rs"] = unretired_clear["engine/state.rs"].replace(
+        "        for peer in &retired {\n            peer.discard_pending_remote_candidates();\n        }",
+        "        let _ = &retired;",
+        1,
+    )
+    cases.append(
+        (
+            "peer clear without queue retirement",
+            unretired_clear,
+            boundaries,
+            "peer clear and shutdown must retire every queued candidate observation",
+        )
+    )
+
+    public_raw_peer_map = copy.deepcopy(sources)
+    public_raw_peer_map["engine/state.rs"] = public_raw_peer_map["engine/state.rs"].replace(
+        "    pub(super) peers: PeerRegistry,",
+        "    pub peers: DashMap<String, Arc<PeerConnection>>,",
+        1,
+    )
+    cases.append(
+        (
+            "public raw peer map",
+            public_raw_peer_map,
+            boundaries,
+            "NetworkState must expose only the narrow peer registry",
+        )
+    )
+
+    snapshot_copies_queue = copy.deepcopy(sources)
+    snapshot_copies_queue["engine/connection.rs"] = snapshot_copies_queue[
+        "engine/connection.rs"
+    ].replace(
+        "pub struct PeerStateSnapshot {",
+        "pub struct PeerStateSnapshot {\n    pub pending_remote_candidates: PendingRemoteCandidateQueue,",
+        1,
+    )
+    cases.append(
+        (
+            "read-only snapshot copies mutable queue ownership",
+            snapshot_copies_queue,
+            boundaries,
+            "read-only peer snapshot copied mutable ownership",
         )
     )
 
@@ -1822,6 +2081,9 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
 
     failures: list[str] = []
     for name, candidate_sources, candidate_boundaries, expected in cases:
+        if candidate_sources == sources and candidate_boundaries == boundaries:
+            failures.append(f"negative control did not mutate its input: {name}")
+            continue
         errors = validate(candidate_sources, candidate_boundaries)
         if not any(expected in error for error in errors):
             failures.append(f"negative control was not rejected: {name}")
@@ -1831,6 +2093,8 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
         'path = "src/redteam_lib.rs"',
         1,
     )
+    if redirected_manifest == CORE_MANIFEST.read_text(encoding="utf-8"):
+        failures.append("negative control did not mutate its input: redirected library target")
     if not any(
         "library target must remain exactly" in error
         for error in validate_core_manifest(redirected_manifest)
@@ -1874,16 +2138,18 @@ def main() -> int:
             "legacy-bypass, alias-bypass, "
             "raw-identifier bypass, parenthesized bypass, where-clause bypass, "
             "wrapper-trait, runtime-binding, "
-            "compile-control, boundary, candidate-ownership, hierarchy, "
+            "compile-control, boundary, candidate-ownership, registry-retirement, "
+            "bounded-metadata, lock-free-rollup, measurement-panic, hierarchy, "
             "global-accountant, and resource-policy faults "
             "were rejected."
         )
     else:
         print(
-            "V4 Arc 02A and 02B source gate passed: 10 target-owned authority types, "
+            "V4 Arc 02A through 02C source gate passed: 10 target-owned authority types, "
             "reviewed production fingerprints, private fields, runtime binding, "
             "owner-private transitions, no production SessionCapability mint, "
-            "confined legacy adapters, fixed observation scopes, and observed remote candidates."
+            "confined legacy adapters, a retiring peer registry, bounded observation metadata, "
+            "panic-free measurement, aggregate attempt reservations, and observed remote candidates."
         )
     return 0
 

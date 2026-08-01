@@ -76,11 +76,11 @@
   ],
   "source_snapshot": {
     "count": 106,
-    "sha256": "20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d"
+    "sha256": "1a9edae5d0476e4ac26bf3e3ae5f9ced7f43b1b2e80c5a482811d688388d0994"
   },
   "declaration_snapshot": {
-    "count": 1562,
-    "sha256": "f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7"
+    "count": 1602,
+    "sha256": "4955e17b6e7b9bd0b2c66afb86d7c436123e9e980c84271d78342f29db582e00"
   },
   "declaration_rules": [
     {
@@ -1093,9 +1093,19 @@
       "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "resource_scope"}
     },
     {
+      "id": "decl-arc02-diagnostic-snapshot-compat",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateSnapshot"}
+    },
+    {
       "id": "decl-arc02-context-resource-scope",
       "domain": "Resource instrumentation",
       "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc02-peer-registry-compat",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": ["PeerRegistry", "PeerRegistryEntry"]}
     },
     {
       "id": "decl-arc02-mesh-resource-scope",
@@ -1134,8 +1144,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1681,
-    "sha256": "57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a"
+    "count": 1708,
+    "sha256": "f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af"
   },
   "surface_rules": [
     {
@@ -2077,13 +2087,13 @@
   "expected_aggregates": {
     "declaration_assignments": {
       "DISPOSITION:Delete": 23,
-      "DISPOSITION:Split": 64,
+      "DISPOSITION:Split": 87,
       "DOMAIN:Application client": 52,
       "DOMAIN:Connector infrastructure": 15,
       "DOMAIN:Operational infrastructure (U0)": 106,
-      "DOMAIN:Resource instrumentation": 100,
+      "DOMAIN:Resource instrumentation": 104,
       "NODE:Application Gateway": 348,
-      "NODE:Attempt Node": 42,
+      "NODE:Attempt Node": 55,
       "NODE:Connector Worker": 48,
       "NODE:Endpoint Auth Task": 30,
       "NODE:Peer Session Node": 73,
@@ -2102,13 +2112,13 @@
     },
     "surface_assignments": {
       "DISPOSITION:Delete": 25,
-      "DISPOSITION:Split": 365,
+      "DISPOSITION:Split": 380,
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "DOMAIN:Resource instrumentation": 39,
+      "DOMAIN:Resource instrumentation": 48,
       "NODE:Application Gateway": 156,
-      "NODE:Attempt Node": 19,
+      "NODE:Attempt Node": 22,
       "NODE:Connector Worker": 76,
       "NODE:Endpoint Auth Task": 13,
       "NODE:Peer Session Node": 50,
@@ -2124,7 +2134,7 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1101,
+      "callable": 1128,
       "callback_registration": 9,
       "constructor_entry": 87,
       "external_carrier": 29,
@@ -2158,9 +2168,9 @@
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 106 | `20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d` |",
-    "| Production Rust declaration members | 1,562 | `f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,681 | `57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a` |",
+    "| Production Rust source units | 106 | `2678fb41e9f2e796d44ef02cf858b80796be6a7e7e0a5c8ede4afc140fb6732e` |",
+    "| Production Rust declaration members | 1,599 | `c45d588bc71c6d4294617953790c7b1e3c5535ceffdf10443fd8b96ea8fcd2fa` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,708 | `f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af` |",
     "| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |",
     "| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 19 unbounded channel constructions"

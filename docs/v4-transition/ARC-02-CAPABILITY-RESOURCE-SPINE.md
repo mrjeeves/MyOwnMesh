@@ -2,88 +2,123 @@
 
 Status:
 
-- Arc 02A is the approved compile-time capability and resource-accounting foundation at commit `b2c09872a400d07f6f626d5a1c887ac90b6c2f9c`.
-- Arc 02B implements the remote-candidate observation pilot described here.
-- Arc 02 is not complete.
-- Resource enforcement is not implemented.
+- Arc 02A is the approved compile-time foundation at commit `b2c09872a400d07f6f626d5a1c887ac90b6c2f9c`.
+- Arc 02B is the remote-candidate observation pilot at commit `b0134d446ae94bc3b5e6e730c8019b924765d416`.
+- Arc 02C is the corrective owner, accounting, and API revision carried by this document.
+- Arc 02 stops after Arc 02C. Arc 03 wraps the existing WebRTC path as the first Connector Worker.
+- Production resource budgets and complete allocation coverage are not implemented.
 
 Branch: `arc/02-capability-resource-spine`
 
-Arc 02B parent: `b2c09872a400d07f6f626d5a1c887ac90b6c2f9c`
+Arc 02C parent: `b0134d446ae94bc3b5e6e730c8019b924765d416`
 
-No signaling protocol, candidate content, ICE configuration, transport selection, endpoint authentication, application delivery, listener, or firewall behavior changed in Arc 02B.
+Arc 02C changes no signaling protocol, candidate content, ICE configuration, transport selection, endpoint authentication, application delivery, listener, or firewall policy.
 
-## 1. Arc 02A boundary
+## 1. Required change record
 
-Arc 02A added ten target-owned authority and permit types, closed pre-authentication and post-authentication resource families, RAII observation leases, compiler rejection controls, and source mutation controls.
-
-It did not redirect production authority transitions or production resource owners. In particular, no production `SessionCapability` mint exists.
-
-Capability possession is the authority fact. `RuntimeIncarnation` does not grant, revoke, or refresh authority. It only prevents an already-held capability from being used against a replacement runtime object. A future authority-consuming operation must compare the capability's witness with the current runtime object.
-
-## 2. Arc 02B change contract
-
-| Required field | Arc 02B result |
+| Field | Arc 02C result |
 |---|---|
-| State class moved | Remote ICE candidate observation follows the existing candidate owner. The queue remains a temporary compatibility owner. |
-| Old owner | Public `PeerStateData.pending_remote_candidates: Vec<LocalIceCandidate>`. |
-| New temporary owner | Private `PendingRemoteCandidateQueue`, containing move-only `PendingRemoteCandidate` values. |
-| Final owner | Attempt Node or Connector Worker in a later migration arc. |
-| Production path redirected | Pre-SDP queue insertion, post-SDP immediate application, and post-SDP queue drain. |
-| Authority change | None. Observation grants no authority. |
-| Enforcement change | None. No numeric limit or rejection path was added. |
-| Resource scopes | Process root, live Mesh runtime, exact mesh context, and peer connection. |
-| Byte measurements | Logical content bytes and retained Rust capacity bytes are separate. |
-| Container measurement | Queue allocation capacity is observed separately from candidate-owned strings. |
-| Compatibility deletion gate | Move the queue into Attempt Node or Connector Worker after a real `PreAuthAttemptPermit` is required before insertion. |
+| Owned state changed | Current peer ownership moves behind private `PeerRegistry`. Candidate observation metadata changes from per-active-lease storage to fixed-size state. |
+| Ports changed | `NetworkState.peers` is no longer public. `PeerConnection::new` remains engine-only. `PeerStateData` remains non-clonable. `PeerStateSnapshot` and `PeerConnection::snapshot` provide an owned diagnostic view. |
+| Capability transition changed | One `PreAuthAttemptPermit` owns one aggregate reservation and may create several candidate capabilities. Each candidate carries a child reservation and exact attempt ownership. |
+| Legacy path retained | The existing candidate queue and public raw `PeerSession::add_ice_candidate(LocalIceCandidate)` call remain temporary compatibility paths. |
+| Architecture invariants exercised | One mutable owner, move-only authority, guard before protected allocation, bounded accounting metadata, honest inexact reporting, and no identity prerequisite for future anonymous-ingress admission. |
+| Red-team cases exercised | Registry bypass, replacement, removal, clear, shutdown, copied state, unbounded metadata, global mutex, measurement panic, reservation order, and public-ID authority reconstruction. |
+| Performance and resource measurements | The observer benchmark records elapsed time and fixed metadata sizes. It has no pass threshold and selects no production budget. |
+| Upstream classification | Not applicable. This is an owner-directed V4 transition correction. |
+| Owner decision required | Every production resource capacity and performance tolerance remains owner-selected after measurement. |
 
-## 3. Fixed observation hierarchy
+## 2. Peer ownership
 
-Production observations use this exact path:
+The old owner was a public `DashMap<String, Arc<PeerConnection>>` on `NetworkState`. Any caller with field access could insert, replace, remove, or clear a peer without retiring the private pending-candidate queue.
+
+The new owner is `PeerRegistry`. Its internal `DashMap` and mutation lock are private. Engine code can request owned read snapshots. Only the registry can:
+
+- install a peer;
+- replace a peer;
+- remove a peer;
+- retire every peer during clear or shutdown.
+
+Every exit path calls `discard_pending_remote_candidates` before map ownership ends. Registry drop repeats the retirement rule as a fallback. The shutdown control keeps an external `Arc<PeerConnection>` alive and proves that the candidate report returns to zero before that external reference is dropped.
+
+## 3. Bounded observer
+
+Production observations roll up through this runtime ownership path:
 
 ```text
 process root
   -> live Mesh runtime
-    -> exact joined mesh context
+    -> live joined network instance
       -> attempt or peer connection
 ```
 
-A peer observation updates all four reports. A sibling mesh context does not see another context's leaf observations. A sibling peer does not see another peer's observations. The process root is global only for aggregation and has no policy or authority operation.
+The joined network instance is not called an exact Mesh Context. The current object is not bound to an immutable context identity. Carrier, ingress source, attempt, and known-origin accounting remain orthogonal dimensions.
 
-`Mesh::open_with_identity` creates one Mesh runtime scope. Every context joined through that handle descends from it. A direct `NetworkState::new` caller gets a new Mesh runtime scope below the same process root. Each `PeerConnection` gets a child of its exact context.
+The observer now has:
 
-The resource primitive uses one transaction lock per hierarchy. Begin, replacement, and completion update every scope in the leaf path before another report or observation transaction can enter. Child scopes are not stored in a global registry.
+- fixed arrays for the closed pre-authentication and post-authentication families;
+- constant metadata for each family;
+- no per-active-lease map;
+- no hierarchy-wide transaction mutex;
+- one lock per sampled scope.
 
-## 4. Separate byte meanings
+Begin, replacement, and completion update each scope independently. Cross-scope diagnostic snapshots are not globally linearizable. A report may briefly observe an ancestor and descendant at different points in one update. Authority and enforcement never depend on those diagnostic snapshots.
 
-`ResourceUse` records:
+Exact oldest-lease reporting is possible while the oldest known lease remains active. If that lease ends while another remains, constant-space state cannot recover the next-oldest timestamp. The report then returns no exact oldest lifetime and sets `oldest_active_lifetime_inexact`. Other exact counters remain exact. The flag resets when the family becomes empty.
+
+## 4. Measurement behavior
+
+`ResourceUse` retains four independent axes:
 
 - items;
 - logical bytes;
 - retained bytes;
 - tasks.
 
-For one `LocalIceCandidate`, logical bytes are the current byte lengths of:
+Remote-candidate logical bytes are current string lengths. Retained bytes are current string capacities. Queue-container retained bytes are `Vec` capacity multiplied by the wrapper size. These values do not include allocator metadata, stack use, WebRTC internal retention, or process RSS.
 
-- `candidate`;
-- `sdp_mid`, when present;
-- `username_fragment`, when present.
+Every platform-size conversion and sum is checked. An overflow or unsupported conversion saturates the affected counter and marks the report inexact. Production resource-measurement code contains no `expect`, `unwrap`, or panic path.
 
-Retained candidate bytes are the capacities of those same owned strings. The inline `LocalIceCandidate` and wrapper storage is not counted again per item.
+## 5. Attempt and candidate reservation
 
-The queue container is a separate observation:
+The corrected authority shape is:
 
 ```text
-Vec capacity * size_of::<PendingRemoteCandidate>()
+PreAuthAttemptPermit
+  owns exact AttemptOwnership
+  owns one AggregateReservation
+      -> CandidateCapability A
+           owns exact AttemptOwnership
+           owns CandidateReservation A
+      -> CandidateCapability B
+           owns exact AttemptOwnership
+           owns CandidateReservation B
 ```
 
-That measurement includes occupied slots and spare `Vec` capacity. It has zero logical bytes and zero items, so it does not duplicate candidate count or candidate content. These are Rust capacity bytes derived from the live `String` and `Vec` owners. They are not allocator usable-size measurements and do not include allocator metadata, stack use, or process RSS. No allocator growth factor or plausible capacity is invented.
+The attempt permit is not cloned and is not consumed into the first candidate. `allocate_candidate` acquires a child claim before it invokes the allocation closure. If the aggregate cannot admit the child, the closure does not run. Dropping the candidate returns its active claim.
 
-The active item count is the candidate count. The active lease count is the count of observation owners, so a nonempty queue has one container lease in addition to its candidate leases. Completed lease count must not be interpreted as completed candidate count.
+Aggregate release is fail closed. If a child claim cannot be subtracted consistently, the aggregate keeps its last active value, enters an explicit poisoned state, and rejects later admissions. A poisoned mutex has the same result. Neither condition resets active use or restores capacity.
 
-## 5. Candidate ownership and lifetime
+This is an enforceable local reservation primitive when a resource owner supplies a finite capacity. Arc 02C supplies no production capacity and does not route the current connector through it. No numeric value is inferred from a plausible default.
 
-The production wrapper is:
+## 6. Guard placement and unknown input
+
+A resource guard belongs before the allocation it protects. Queue insertion is not an acceptable substitute. The target boundary order remains:
+
+1. anonymous-ingress and global guard before accepting protected frame storage;
+2. parser guard before decoding;
+3. attempt aggregate before attempt-owned work;
+4. child candidate guard before candidate allocation;
+5. connector-work guard before socket, ICE, STUN, TURN, DNS, task, timer, or callback allocation;
+6. separate post-authentication guards before session and application resources.
+
+Unknown input must be eligible for bounded pre-authentication admission without a Device identity and without Closed authorization. Identity and mesh policy may refine attribution later. They cannot be prerequisites for the global or anonymous-ingress component.
+
+The current repository does not satisfy every item in this list. Arc 02C proves the candidate allocation ordering in the new attempt primitive and keeps the production observer labeled as observation only. Frame, parser, candidate, and connector production ports move under their real guards when their owning arcs migrate and the owner approves measured capacities.
+
+## 7. Candidate compatibility boundary
+
+The private production wrapper remains:
 
 ```rust
 struct PendingRemoteCandidate {
@@ -92,91 +127,66 @@ struct PendingRemoteCandidate {
 }
 ```
 
-The inbound candidate is moved into this wrapper. It is not cloned into the queue. `PeerStateData` no longer implements `Clone`, and its queue field is private.
+The inbound candidate moves into the wrapper. The observation follows queueing, draining, immediate application, success, failure, cancellation, replacement, removal, shutdown, and ordinary drop.
 
-Before remote SDP is set, the wrapper moves into the private queue. Draining moves the queue allocation, candidate values, candidate leases, and container lease out of `PeerStateData` without holding the peer lock across an await.
+`PeerSession::add_ice_candidate(LocalIceCandidate)` remains a public raw compatibility bypass. Arc 03 must make it connector-private and capability-consuming. The Arc 02 source checker checks the two reviewed observed call sites, but it does not pretend that source counting compensates for a public raw API.
 
-After remote SDP is set, the candidate is wrapped and applied immediately. Both paths call the same asynchronous observation helper. The helper keeps the lease alive until `add_ice_candidate(...).await` returns.
+## 8. Public API changes
 
-RAII cleanup covers:
+The public changes introduced across Arc 02B and Arc 02C are intentional:
 
-- successful application;
-- failed application;
-- cancellation while application is pending;
-- explicit queue retirement during peer removal or session replacement, even while another `Arc` keeps the retired peer alive;
-- dropping an ordinary queue, drain, candidate, peer, or runtime owner.
+- `PeerStateData` no longer implements `Clone` because cloning live queue ownership would duplicate the wrong state boundary.
+- `PeerConnection::new` is engine-only because construction assigns runtime resource ownership.
+- `NetworkState.peers` is engine-private because registry mutation must retire compatibility state.
+- `PeerStateSnapshot` is a clonable owned view with no pending queue or observation lease.
+- `PeerConnection::snapshot`, `NetworkState::peer_snapshot`, and `NetworkState::peer_info` provide read-only compatibility surfaces.
 
-When `add_ice_candidate(...).await` returns, the queue-owned or caller-owned observation ends. Any memory or work retained internally by the WebRTC ICE agent is outside this pilot and needs a separate Connector Worker observation.
+The snapshot is diagnostic state, not authority. Mutating an owned snapshot cannot alter the live peer.
 
-## 6. What the pilot proves
+## 9. Proof boundary
 
-The implementation and focused tests prove these bounded claims:
+Arc 02C proves the following checked properties:
 
-- logical and retained bytes are independent axes;
-- one leaf observation updates all four required scopes;
-- sibling contexts remain isolated;
-- candidate values and queue container capacity are measured separately;
-- queue drain preserves both leases;
-- success, failure, cancellation, peer replacement, peer removal, peer drop, and ordinary drop end observations;
-- the immediate and queued application paths both use the observed helper;
-- a source mutation that restores cloning, exposes the queue, clones the inbound candidate, bypasses an observed application path, skips the process root, or adds another global observer is rejected.
+- all peer install, replacement, removal, clear, shutdown, and registry-drop paths retire pending candidates;
+- shutdown cleanup is independent of external peer `Arc` lifetime;
+- observer metadata is structurally bounded by closed arrays and constant family state;
+- no hierarchy-wide observer mutex exists;
+- unsupported measurement saturates and remains visible as inexact;
+- a single attempt can own multiple candidate capabilities under one aggregate;
+- candidate allocation happens after child reservation;
+- a refused claim cannot execute the allocation closure;
+- a candidate is bound to the exact attempt and aggregate that issued it;
+- an inconsistent child release poisons its aggregate, preserves conservative active use, and refuses later admissions while another child remains live;
+- copied live peer state and public queue ownership remain rejected;
+- public labels cannot construct authority types.
 
-These are code and test properties. They are not a measured production budget and do not establish complete allocation coverage.
+These properties do not prove complete production resource coverage, a selected budget, or a production `ConnectedChannelCapability` path.
 
-## 7. Production coverage boundary
+## 10. Verification gate
 
-Arc 02B covers one canonical slice:
+The executable catalog is [`red-teams/ARC-02-AUTHORITY-AND-RESOURCE-SPINE.md`](../../red-teams/ARC-02-AUTHORITY-AND-RESOURCE-SPINE.md). The complete gate includes formatting, workspace Clippy, workspace tests, the focused compiler and mutation controls, two-peer integration, signaling, connector and media tests, the release observer measurements, and supported-platform CI.
 
-| Owner | Observed quantity | Covered lifetime |
-|---|---|---|
-| Remote candidate value | Item, logical string bytes, retained string capacity | Wrapper creation through application completion, cancellation, or drop |
-| Pre-SDP queue container | Retained `Vec` capacity | First insertion through drain completion or drop |
-| Scope rollup | Candidate family totals | Peer, exact context, Mesh runtime, and process root |
+Build artifacts use an isolated Cargo target under `C:\Users\Admin\.allmystuff-sandbox-stage`. The focused source and compiler checks start no listener. Integration tests that bind loopback are identified separately in the recorded evidence.
 
-It does not cover:
+### Corrective verification record
 
-- the signaling inbound or outbound channel containers;
-- candidate parsing or signature work before the engine receives `LocalIceCandidate`;
-- WebRTC, ICE, STUN, TURN, DNS, socket, timer, callback, or task internals;
-- post-authentication resources;
-- any other Arc 01 resource record;
-- queue enforcement or admission.
+The local run on 2026-08-01 used the held base commit `b0134d446ae94bc3b5e6e730c8019b924765d416`. Windows 11 Pro with Rust 1.88.0 passed format, all-target workspace check, all-target workspace Clippy with warnings denied, focused Arc 02 tests, doctests, compiler boundaries, both source gates, and both mutation suites. Ubuntu 24.04 under WSL2 with Rust 1.88.0 passed the complete workspace suite and the named two-peer, signaling, mDNS, relay, data-channel, Opus, and H.264 paths. The socket-heavy tests ran in WSL2 so they could use an isolated network namespace without creating Windows firewall rules.
 
-A zero report outside the pilot still means that no instrumented caller reported activity. It does not prove zero process use.
+On an Intel Core i9-10850K, three Windows release samples of 100,000 four-scope observation begin and drop operations measured 244 ns, 234 ns, and 241 ns per operation. Fixed state measured 168 bytes per family, 5,384 bytes per scope state, 5,392 bytes per locked scope inner value, 24 bytes per accountant handle, and 88 bytes per observation lease. The private candidate path measured 168 bytes for a pending candidate plus observation and 112 bytes for the queue header. The executable red-team record contains the complete type-size table and the limits on interpreting it.
 
-## 8. Verification
+After the fail-closed aggregate correction, one additional exact-source release sample measured 322 ns per four-scope begin and drop operation. The fixed type-size results were unchanged. This additional sample is recorded separately rather than merged into the earlier three-sample set.
 
-Build and test artifacts use an isolated Cargo target under `C:\Users\Admin\.allmystuff-sandbox-stage`. The compiler-boundary harness uses a temporary offline Cargo project. No listener or integration binary is started.
+These values are observations from one machine and one build profile. They are not product budgets, service limits, or acceptance thresholds. Supported-platform CI remains required on the pushed revision.
 
-The executable attack catalog is [`red-teams/ARC-02-AUTHORITY-AND-RESOURCE-SPINE.md`](../../red-teams/ARC-02-AUTHORITY-AND-RESOURCE-SPINE.md).
+## 11. Arc 03 handoff
 
-The final Arc 02B run on 2026-08-01 produced these results:
+Arc 03 has one product goal: preserve the existing WebRTC connection path while making its successful output a `ConnectedChannelCapability`.
 
-| Check | Recorded result |
-|---|---|
-| `cargo fmt --all -- --check` | Passed. |
-| `cargo check --workspace --all-targets -j 16` | Passed. |
-| `cargo clippy -p myownmesh-core --all-targets -j 16 -- -D warnings` | Passed. |
-| `cargo test -p myownmesh-core --lib v4_arc02 -j 16` | 28 passed, 0 failed. |
-| `cargo test -p myownmesh-core --doc -j 16` | 10 passed, 0 failed. |
-| Compiler-boundary harness | 1 positive type-path control and 10 cause-matched rejection controls passed. |
-| Arc 02 source gate | Passed. |
-| Arc 02 mutation gate | Every defined mutation was rejected. |
-| Arc 01 inventory gate | Passed with 106 source units, 1,562 declaration members, 1,681 source surfaces, 75 semantic markers, and 111 resource records. |
-| Arc 01 mutation gate | Every defined mutation was rejected. |
+Arc 03 must:
 
-Every command in the recorded run passed. The executable red-team sequence checks each native exit code before starting the next command.
-
-## 9. Nonclaims and next gate
-
-This slice does not claim that:
-
-- Arc 02 is complete;
-- resource accounting is implemented across production;
-- a numeric budget has been selected;
-- a `PreAuthAttemptPermit` is acquired before work begins;
-- WebRTC or ICE agent retention is measured;
-- a production `SessionCapability` mint exists;
-- runtime replacement invalidates capability possession by itself.
-
-The next gate is to make a real `PreAuthAttemptPermit` mandatory before candidate queue insertion and to move final ownership out of `PeerStateData`. That later change must use measured values approved by the owner. Arc 02B supplies observations only.
+- make the raw candidate application port connector-private and capability-consuming;
+- move final candidate and connector-work ownership out of the `PeerStateData` compatibility queue;
+- preserve current direct and TURN behavior;
+- preserve media and signaling behavior through compatibility adapters;
+- produce no application authority from a working channel;
+- avoid expanding Arc 02 into a general resource-accounting framework.

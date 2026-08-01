@@ -226,7 +226,9 @@ impl JoinedNetwork {
         &self.label
     }
 
-    /// Read observations for this exact joined mesh context.
+    /// Read observations for this live joined network instance.
+    ///
+    /// This runtime rollup is not bound to an immutable context identity.
     pub fn resource_report(&self) -> ResourceReport {
         self.state.resource_report()
     }

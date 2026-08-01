@@ -13,13 +13,15 @@ Production observations use one fixed hierarchy:
 ```text
 process root
   -> one live Mesh runtime
-    -> one exact joined mesh context
+    -> one live joined network instance
       -> one attempt or peer connection
 ```
 
-A leaf observation updates the leaf and all three ancestors. Sibling contexts and sibling peers do not observe each other. The process root is the only process-global accountant. It aggregates measurements and grants no authority.
+A leaf observation updates the leaf and all three ancestors. Sibling network instances and sibling peers do not observe each other. The process root is the only process-global accountant. It aggregates measurements and grants no authority.
 
-Each scope keeps its own report state. The hierarchy holds no registry of child scopes, so dropping a child does not leave a permanent per-child record at the process root. A shared transaction lock makes one begin, replacement, or completion visible to all scopes as one accounting operation.
+The network-instance scope describes a live runtime owner. It is not called an exact Mesh Context because it is not bound to an immutable context identity. Carrier, ingress source, attempt, and known-origin attribution are orthogonal dimensions. They must not be inferred from the runtime aggregation path.
+
+Each scope keeps fixed-size report state for the closed resource families. The hierarchy has no child registry, per-active-lease collection, or hierarchy-wide mutex. Begin, replacement, and completion update each scope independently. A diagnostic snapshot can therefore observe a transient difference between an ancestor and a descendant. It does not claim global linearizability.
 
 ## Measurements
 
@@ -32,7 +34,9 @@ Each scope keeps its own report state. The hierarchy holds no registry of child 
 
 Logical bytes describe live content. Retained bytes use the producer's documented measurement contract and include unused capacity only when that producer reports it. The two byte values are not substituted for each other. The remote-candidate pilot reports Rust `String` and `Vec` capacity bytes. It does not claim allocator metadata, allocator usable size, stack use, or process RSS.
 
-Each family report includes current and peak use, current and peak lease counts, the oldest active lifetime, completed lease count, final completed quantities, total completed lifetime, and a sticky `measurement_inexact` flag.
+Each family report includes current and peak use, current and peak lease counts, the oldest active lifetime when it is known, completed lease count, final completed quantities, total completed lifetime, and a sticky `measurement_inexact` flag.
+
+Oldest-lease tracking uses constant metadata. If the oldest of several leases ends, the next-oldest start cannot be recovered without retaining one timestamp per active lease. The report sets `oldest_active_lifetime_inexact` and stops reporting an exact oldest lifetime until the family becomes empty. Other exact counters remain exact.
 
 ## Ownership and cleanup
 
@@ -40,7 +44,7 @@ Callers provide a family and a measured `ResourceUse`. The accountant returns an
 
 A caller that owns a growing or shrinking collection may replace the lease's measured quantity with a fresh measurement from that same object. This changes measurement only.
 
-Arithmetic is checked before saturation. Overflow, inconsistent subtraction, a poisoned scope lock, or a poisoned hierarchy transaction marks the affected report inexact. Counters do not wrap or underflow.
+Arithmetic is checked before saturation. Overflow, an unsupported platform-sized measurement, inconsistent subtraction, or a poisoned scope lock marks the affected report inexact. Counters do not wrap or underflow. Production measurement code has no `expect`, `unwrap`, or panic path.
 
 Measurements are memory-only. Process restart destroys them. They are not reconstructed from durable state.
 
@@ -63,8 +67,10 @@ This module must not:
 
 An `ObservationLease` proves only that a caller-reported quantity is being measured. It is never evidence that the work was allowed, reserved, authenticated, or safe.
 
-## Arc 02B integration status
+## Arc 02C integration status
 
 The remote ICE candidate pilot is the first production caller. Candidate values and the pre-SDP queue container are observed. The pilot does not cover signaling queues, WebRTC or ICE agent internals, other pre-authentication allocations, post-authentication allocations, or a complete resource family.
 
-No enforcement occurs. A later arc must acquire a real `PreAuthAttemptPermit` before queue insertion. The current queue is a compatibility owner until Attempt Node or Connector Worker owns this state.
+The attempt foundation now acquires a child reservation before invoking a candidate allocation closure. One attempt may issue several candidate capabilities under one aggregate reservation. No production numeric budget has been selected, so the existing candidate queue remains observation-only and must not be described as an enforcement guard.
+
+Frame, parser, attempt, candidate, and connector-work reservations belong at their respective allocation boundaries. Unknown input must be admissible through anonymous-ingress and global budgets before a Device identity or Closed authorization exists. Arc 03 installs the connector-owned candidate boundary. Later owner migrations install the remaining guards after their measured values receive owner approval.

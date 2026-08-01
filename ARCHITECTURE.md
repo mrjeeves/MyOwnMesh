@@ -1,6 +1,6 @@
 # MyOwnMesh fundamental hybrid networking architecture
 
-Status: proposed architecture, pending owner adoption.
+Status: owner-adopted V4 architecture, source revision `2a04e29e0a4c09b95a4914972018850ddb2cbacb`.
 
 This document defines the smallest common architecture for MyOwnMesh discovery, durable mesh semantics, signaling, transport path construction, endpoint authentication, session recovery, and application data delivery.
 
@@ -442,7 +442,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 15. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
 16. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
 
-## 14. Decisions required before adoption
+## 14. Owner decisions that remain explicit
 
 Owner review must select and test:
 
