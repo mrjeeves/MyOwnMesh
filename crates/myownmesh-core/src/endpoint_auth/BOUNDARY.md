@@ -1,0 +1,41 @@
+# Endpoint Auth Task boundary
+
+## Purpose
+
+Own fresh mutual Device authentication for one exact connected channel. Arc 02 installs the capability seam. Arc 04 adds the verified transcript and production transition.
+
+## Owned state
+
+The target task owns the fresh transcript, ordered endpoint roles, exact mesh-context binding, exact channel binding, and authentication result. No mutable production state moves here in Arc 02.
+
+## Inputs
+
+- one `ConnectedChannelCapability`;
+- one `EndpointAuthPermit` issued after pre-authentication resource admission;
+- fresh contributions from both endpoints;
+- exact local and remote Device IDs, mesh context, and channel exporter evidence.
+
+## Outputs
+
+- `AuthenticatedChannelCapability` on complete verification;
+- bounded authentication observations or a typed failure.
+
+## Dependencies
+
+This task depends on the connected-channel capability and the selected cryptographic profile. It does not depend on application payload, Open or Closed policy decisions, or durable projection.
+
+## Resources
+
+Endpoint-authentication work remains pre-authentication work. Arc 02 defines the permit type but does not create a production issuer or infer a limit.
+
+## Restart behavior
+
+The transcript, permit, and authenticated-channel capability are memory-only and tied to one runtime witness. A process restart destroys them. After a same-process runtime replacement, a future consumer must compare that witness with the current Runtime Supervisor witness before use. Stored IDs or an old transcript cannot reconstruct them.
+
+## Forbidden responsibilities
+
+This task does not decide mesh policy, mint `SessionCapability`, authorize an application, choose a route, mutate durable facts, or treat a working channel as authenticated without the complete fresh proof.
+
+## Compatibility adapter
+
+`LegacyAuthenticatedChannel<T>` can hold a legacy object only beside an already-issued capability. It cannot create authentication or expose the raw object outside this owner. Arc 05 deletes it when Session Broker consumes the typed channel directly.

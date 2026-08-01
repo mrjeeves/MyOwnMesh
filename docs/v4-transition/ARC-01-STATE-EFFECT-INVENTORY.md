@@ -1,6 +1,6 @@
 # V4 Arc 01 state and effect inventory
 
-Status: complete as a record of the source at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`.
+Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with additive coverage for the linked Arc 02 production modules.
 
 This arc changes no product behavior and deletes no code. It establishes the ownership record that later implementation arcs must reduce. No listener, peer connection, firewall rule, or live MyOwnMesh instance was started while producing this record.
 
@@ -15,13 +15,13 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The passing baseline contains:
+The baseline commit remains fixed. The current fingerprints cover that baseline plus the linked Arc 02 capability and resource-observation modules:
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 98 | `cc7038543291f2bd96019b6a100b0820a7d20bd46e530618e6ea4683753e32fa` |
-| Production Rust declaration members | 1,415 | `29a37b0ba3f2f27dadfbdef841af3c833d37d6c18d64acba784a1f8e47f42479` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,582 | `a61b4df1b5462e101b0807be95fd0868cebd9076f698428a92de8362ea5bd84a` |
+| Production Rust source units | 106 | `346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a` |
+| Production Rust declaration members | 1,535 | `02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,637 | `420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2` |
 | Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |
 | Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
@@ -35,20 +35,21 @@ The assignment counts are records, not architectural sizing targets.
 
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
-| Application Gateway | 341 | 149 |
-| Attempt Node | 29 | 11 |
-| Connector Worker | 43 | 70 |
-| Endpoint Auth Task | 22 | 8 |
+| Application Gateway | 348 | 154 |
+| Attempt Node | 36 | 19 |
+| Connector Worker | 48 | 76 |
+| Endpoint Auth Task | 30 | 13 |
 | Peer Session Node | 73 | 50 |
 | Reachability Node | 173 | 52 |
-| Relay Node | 36 | 40 |
-| Runtime Supervisor | 54 | 17 |
+| Relay Node | 38 | 40 |
+| Runtime Supervisor | 57 | 20 |
 | Semantic Node | 117 | 106 |
-| Session Broker | 12 | 7 |
+| Session Broker | 21 | 12 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
+| Resource instrumentation domain | 79 | 23 |
 | Delete | 23 | 25 |
 | Split | 64 | 341 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
@@ -198,7 +199,17 @@ These are explicit decision records, so the Arc 01 rule against guessed assignme
 
 ## Boundary documents
 
-Arc 01 creates no target implementation module. The inventory therefore records an empty `target_modules` list and requires no new `BOUNDARY.md` yet. Starting in Arc 02, every target module added to that list must contain a boundary document or the checker fails.
+Arc 01 created no target implementation module. Arc 02 now links seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
+
+- `application_gateway`;
+- `connector`;
+- `endpoint_auth`;
+- `resource` as observation-only instrumentation, not a target node;
+- `runtime/attempt`;
+- `runtime/relay`;
+- `runtime/session_broker`.
+
+The `runtime/mod.rs` namespace owns the memory-only runtime-incarnation witness and is assigned to Runtime Supervisor. It is not a separate target node or a separate boundary document.
 
 ## Arc 01 gate result
 
@@ -208,4 +219,4 @@ Arc 01 creates no target implementation module. The inventory therefore records 
 - No product code was deleted or changed.
 - The exact baseline and input fingerprints are recorded.
 
-Arc 02 may begin. Its scope is private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, and observation-only resource accounting. It must not change transport behavior or choose unmeasured resource limits.
+The linked Arc 02 modules are now covered by this gate. Arc 02 remains limited to private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, and observation-only resource accounting. It must not change transport behavior or choose unmeasured resource limits.

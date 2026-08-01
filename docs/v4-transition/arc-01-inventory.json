@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "baseline_commit": "2a04e29e0a4c09b95a4914972018850ddb2cbacb",
-  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client on the Arc 01 baseline. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
+  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client at the Arc 01 baseline, additively extended with the linked Arc 02 capability and resource-observation modules. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
   "node_targets": [
     "Semantic Node",
     "Signaling Node",
@@ -21,6 +21,7 @@
     "Application/media profile",
     "WebRTC Real-time Flow Provider",
     "Operational infrastructure (U0)",
+    "Resource instrumentation",
     "Application client"
   ],
   "dispositions": [
@@ -74,12 +75,12 @@
     }
   ],
   "source_snapshot": {
-    "count": 98,
-    "sha256": "cc7038543291f2bd96019b6a100b0820a7d20bd46e530618e6ea4683753e32fa"
+    "count": 106,
+    "sha256": "346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a"
   },
   "declaration_snapshot": {
-    "count": 1415,
-    "sha256": "29a37b0ba3f2f27dadfbdef841af3c833d37d6c18d64acba784a1f8e47f42479"
+    "count": 1535,
+    "sha256": "02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001"
   },
   "declaration_rules": [
     {
@@ -1041,6 +1042,46 @@
       "match": {"path": "crates/myownmesh-signaling/src/server.rs", "name": "RelayStatsSnapshot"}
     },
     {
+      "id": "decl-arc02-application-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/application_gateway/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/connector/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-endpoint-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/endpoint_auth/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-runtime-incarnation",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/runtime/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/attempt/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-relay",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/relay/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-session-broker",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/runtime/session_broker/mod.rs"}
+    },
+    {
       "id": "decl-updater-operational",
       "domain": "Operational infrastructure (U0)",
       "match": {"path": "crates/myownmesh-updater/src/*"}
@@ -1052,8 +1093,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1582,
-    "sha256": "a61b4df1b5462e101b0807be95fd0868cebd9076f698428a92de8362ea5bd84a"
+    "count": 1637,
+    "sha256": "420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2"
   },
   "surface_rules": [
     {
@@ -1561,6 +1602,41 @@
       "flags": ["unbounded_queue"]
     },
     {
+      "id": "surface-arc02-application-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/application_gateway/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/connector/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-endpoint-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/endpoint_auth/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-runtime-incarnation",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/runtime/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/attempt/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-session-broker",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/runtime/session_broker/mod.rs"}
+    },
+    {
       "id": "surface-updater-operational",
       "domain": "Operational infrastructure (U0)",
       "match": {"path": "crates/myownmesh-updater/src/*"}
@@ -1964,16 +2040,17 @@
       "DOMAIN:Application client": 52,
       "DOMAIN:Connector infrastructure": 15,
       "DOMAIN:Operational infrastructure (U0)": 106,
-      "NODE:Application Gateway": 341,
-      "NODE:Attempt Node": 29,
-      "NODE:Connector Worker": 43,
-      "NODE:Endpoint Auth Task": 22,
+      "DOMAIN:Resource instrumentation": 79,
+      "NODE:Application Gateway": 348,
+      "NODE:Attempt Node": 36,
+      "NODE:Connector Worker": 48,
+      "NODE:Endpoint Auth Task": 30,
       "NODE:Peer Session Node": 73,
       "NODE:Reachability Node": 173,
-      "NODE:Relay Node": 36,
-      "NODE:Runtime Supervisor": 54,
+      "NODE:Relay Node": 38,
+      "NODE:Runtime Supervisor": 57,
       "NODE:Semantic Node": 117,
-      "NODE:Session Broker": 12,
+      "NODE:Session Broker": 21,
       "NODE:Signaling Node": 190,
       "OWNER_DECISION_REQUIRED:OD-CODEC-FLOW-BOUNDARY": 38,
       "OWNER_DECISION_REQUIRED:OD-DEVICE-KEY-CUSTODY": 13,
@@ -1988,16 +2065,17 @@
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "NODE:Application Gateway": 149,
-      "NODE:Attempt Node": 11,
-      "NODE:Connector Worker": 70,
-      "NODE:Endpoint Auth Task": 8,
+      "DOMAIN:Resource instrumentation": 23,
+      "NODE:Application Gateway": 154,
+      "NODE:Attempt Node": 19,
+      "NODE:Connector Worker": 76,
+      "NODE:Endpoint Auth Task": 13,
       "NODE:Peer Session Node": 50,
       "NODE:Reachability Node": 52,
       "NODE:Relay Node": 40,
-      "NODE:Runtime Supervisor": 17,
+      "NODE:Runtime Supervisor": 20,
       "NODE:Semantic Node": 106,
-      "NODE:Session Broker": 7,
+      "NODE:Session Broker": 12,
       "NODE:Signaling Node": 271,
       "OWNER_DECISION_REQUIRED:OD-CODEC-FLOW-BOUNDARY": 53,
       "OWNER_DECISION_REQUIRED:OD-DEVICE-KEY-CUSTODY": 33,
@@ -2005,9 +2083,9 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1014,
+      "callable": 1062,
       "callback_registration": 9,
-      "constructor_entry": 77,
+      "constructor_entry": 84,
       "external_carrier": 29,
       "external_http": 1,
       "external_http_body": 4,
@@ -2039,12 +2117,20 @@
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 98 | `cc7038543291f2bd96019b6a100b0820a7d20bd46e530618e6ea4683753e32fa` |",
-    "| Production Rust declaration members | 1,415 | `29a37b0ba3f2f27dadfbdef841af3c833d37d6c18d64acba784a1f8e47f42479` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,582 | `a61b4df1b5462e101b0807be95fd0868cebd9076f698428a92de8362ea5bd84a` |",
+    "| Production Rust source units | 106 | `346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a` |",
+    "| Production Rust declaration members | 1,535 | `02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,637 | `420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2` |",
     "| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |",
     "| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 19 unbounded channel constructions"
   ],
-  "target_modules": []
+  "target_modules": [
+    "crates/myownmesh-core/src/application_gateway",
+    "crates/myownmesh-core/src/connector",
+    "crates/myownmesh-core/src/endpoint_auth",
+    "crates/myownmesh-core/src/resource",
+    "crates/myownmesh-core/src/runtime/attempt",
+    "crates/myownmesh-core/src/runtime/relay",
+    "crates/myownmesh-core/src/runtime/session_broker"
+  ]
 }

@@ -92,10 +92,13 @@
 //! - `tests/two_peer_handshake.rs` — the end-to-end integration
 //!   test doubles as an executable spec.
 
+pub mod application_gateway;
 pub mod channels;
 pub mod config;
+pub mod connector;
 pub mod custody;
 pub mod dirs;
+pub mod endpoint_auth;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -104,8 +107,10 @@ pub mod identity;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
+pub mod resource;
 pub mod roster;
 pub mod rpc;
+pub mod runtime;
 pub mod services;
 pub mod signing;
 pub mod topology;
