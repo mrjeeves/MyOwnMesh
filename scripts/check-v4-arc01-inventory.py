@@ -37,6 +37,13 @@ ALLOWED_FLAGS = {
     "unbounded_resource",
 }
 REQUIRED_RESOURCE_METRICS = {"items", "bytes", "tasks", "lifetime"}
+OBSERVED_CANDIDATE_RESOURCE_METRICS = {
+    "items",
+    "logical_bytes",
+    "retained_bytes",
+    "tasks",
+    "lifetime",
+}
 
 
 @dataclass(frozen=True)
@@ -993,10 +1000,20 @@ def validate_inventory(inventory: dict) -> list[str]:
         )
         errors.extend(assignment_errors)
         metrics = resource_group.get("required_metrics", [])
-        if set(metrics) != REQUIRED_RESOURCE_METRICS or len(metrics) != len(REQUIRED_RESOURCE_METRICS):
+        expected_metrics = (
+            OBSERVED_CANDIDATE_RESOURCE_METRICS
+            if resource_group.get("id") == "resource-attempt-candidates"
+            else REQUIRED_RESOURCE_METRICS
+        )
+        if set(metrics) != expected_metrics or len(metrics) != len(expected_metrics):
+            required = (
+                "items, logical_bytes, retained_bytes, tasks, and lifetime"
+                if expected_metrics == OBSERVED_CANDIDATE_RESOURCE_METRICS
+                else "items, bytes, tasks, and lifetime"
+            )
             errors.append(
                 f"resource record group {resource_group.get('id', '<unnamed>')} must require "
-                "exactly items, bytes, tasks, and lifetime"
+                f"exactly {required}"
             )
         for record in resource_group["items"]:
             if "surface_key" in record:
@@ -1136,6 +1153,11 @@ def run_negative_controls(inventory: dict) -> list[str]:
     bad["resource_records"][0]["items"] = bad["resource_records"][0]["items"][1:]
     bad["resource_records"][0]["required_metrics"] = ["items", "bytes", "tasks"]
     next(
+        group
+        for group in bad["resource_records"]
+        if group["id"] == "resource-attempt-candidates"
+    )["required_metrics"] = ["items", "logical_bytes", "tasks", "lifetime"]
+    next(
         rule for rule in bad["surface_rules"] if rule["id"] == "surface-gui-client"
     )["flags"] = ["unbounded_queue"]
     bad["expected_aggregates"]["resource_record_items"] += 1
@@ -1151,6 +1173,9 @@ def run_negative_controls(inventory: dict) -> list[str]:
         "workflow fingerprint": "semantic marker file changed",
         "resource coverage": "unbounded queue surface needs exactly one structured resource record",
         "resource metrics": "must require exactly items, bytes, tasks, and lifetime",
+        "candidate byte metrics": (
+            "must require exactly items, logical_bytes, retained_bytes, tasks, and lifetime"
+        ),
         "precise queue flag": "unbounded_queue flag covers a non-queue surface",
         "aggregate drift": "expected aggregate summary changed",
     }

@@ -31,7 +31,7 @@ Session capacity is a post-authentication class distinct from all attempt and en
 
 ## Restart behavior
 
-Session capabilities and permits are tied to one memory-only runtime witness and disappear at process restart. After a same-process runtime replacement, every future authority-consuming operation must compare that witness with the current Runtime Supervisor witness. Opening durable state, replaying an old transcript, or presenting an old label does not reconstruct them.
+Possession of a session capability or permit grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Session capabilities and permits are memory-only and disappear on process restart. Opening durable state, replaying an old transcript, or presenting an old label does not reconstruct them.
 
 ## Forbidden responsibilities
 

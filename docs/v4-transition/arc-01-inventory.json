@@ -76,11 +76,11 @@
   ],
   "source_snapshot": {
     "count": 106,
-    "sha256": "346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a"
+    "sha256": "20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d"
   },
   "declaration_snapshot": {
-    "count": 1535,
-    "sha256": "02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001"
+    "count": 1562,
+    "sha256": "f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7"
   },
   "declaration_rules": [
     {
@@ -1062,6 +1062,47 @@
       "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
     },
     {
+      "id": "decl-arc02-candidate-pilot-attempt-values",
+      "target": "Attempt Node",
+      "match": {
+        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
+        "member": ["$type", "candidate", "entries"]
+      }
+    },
+    {
+      "id": "decl-arc02-candidate-pilot-observation-lease",
+      "domain": "Resource instrumentation",
+      "match": {
+        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "name": "CandidateObservationLease"
+      }
+    },
+    {
+      "id": "decl-arc02-candidate-pilot-observation-fields",
+      "domain": "Resource instrumentation",
+      "match": {
+        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
+        "member": ["observation", "container_observation", "_container_observation"]
+      }
+    },
+    {
+      "id": "decl-arc02-peer-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc02-context-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc02-mesh-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "resource_scope"}
+    },
+    {
       "id": "decl-arc02-runtime-incarnation",
       "target": "Runtime Supervisor",
       "match": {"path": "crates/myownmesh-core/src/runtime/mod.rs"}
@@ -1093,8 +1134,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1637,
-    "sha256": "420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2"
+    "count": 1681,
+    "sha256": "57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a"
   },
   "surface_rules": [
     {
@@ -1245,13 +1286,13 @@
     {
       "id": "surface-engine-runtime",
       "target": "Runtime Supervisor",
-      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "spawn_network@1"}
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["spawn_network@1", "spawn_network_in_mesh_scope@1"]}
     },
     {
       "id": "surface-engine-callables-split",
       "disposition": "Split",
       "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "category": "callable"},
-      "exclude": [{"symbol": ["confirm_active_session_on_announce@1", "drop_peer@1", "ensure_peer_session@1", "handle_inbound_frame@1", "on_rpc_request@1", "send_to_peer@1", "service_media_renegotiations@1", "spawn_network@1"]}]
+      "exclude": [{"symbol": ["confirm_active_session_on_announce@1", "drop_peer@1", "ensure_peer_session@1", "handle_inbound_frame@1", "on_rpc_request@1", "send_to_peer@1", "service_media_renegotiations@1", "spawn_network@1", "spawn_network_in_mesh_scope@1"]}]
     },
     {
       "id": "surface-network-reachability",
@@ -1324,17 +1365,17 @@
     {
       "id": "surface-state-gateway-events",
       "target": "Application Gateway",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "category": "queue_broadcast", "ordinal": 1}
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": 1}
     },
     {
       "id": "surface-state-media-queues",
       "decision": "OD-CODEC-FLOW-BOUNDARY",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "category": "queue_broadcast", "ordinal": [2, 3]}
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": [2, 3]}
     },
     {
       "id": "surface-state-reachability-queue",
       "target": "Reachability Node",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "category": "queue_broadcast", "ordinal": 4}
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": 4}
     },
     {
       "id": "surface-state-remaining-callables-split",
@@ -1345,13 +1386,13 @@
     {
       "id": "surface-state-signaling-queues",
       "target": "Signaling Node",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "category": "queue_unbounded", "ordinal": [1, 3]},
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_unbounded", "ordinal": [1, 3]},
       "flags": ["unbounded_queue"]
     },
     {
       "id": "surface-state-global-command-delete",
       "disposition": "Delete",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "category": "queue_unbounded", "ordinal": 2},
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_unbounded", "ordinal": 2},
       "flags": ["unbounded_queue", "authority_mutation"]
     },
     {
@@ -1810,7 +1851,7 @@
       "target": "Attempt Node",
       "flags": ["unbounded_resource"],
       "items": [
-        {"path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "data.pending_remote_candidates.push(candidate.clone());", "count": 1}
+        {"path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "peer.queue_remote_candidate(&mut data, candidate);", "count": 1}
       ]
     },
     {
@@ -1834,9 +1875,9 @@
         {"name": "mDNS bridge inbound queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_mdns_with@1", "anchor": "mpsc::unbounded_channel::<MdnsInbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_mdns_with@1|mpsc::unbounded_channel|2"},
         {"name": "Nostr carrier fanout queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_signaling@1", "anchor": "mpsc::unbounded_channel::<SignalingOutbound>()", "count": 2, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_signaling@1|mpsc::unbounded_channel|1"},
         {"name": "mDNS carrier fanout queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_signaling@1", "anchor": "mpsc::unbounded_channel::<SignalingOutbound>()", "count": 2, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_signaling@1|mpsc::unbounded_channel|2"},
-        {"name": "engine signaling outbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new@1|mpsc::unbounded_channel|1"},
-        {"name": "engine global command queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new@1|mpsc::unbounded_channel|2"},
-        {"name": "engine signaling inbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new@1|mpsc::unbounded_channel|3"},
+        {"name": "engine signaling outbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|1"},
+        {"name": "engine global command queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|2"},
+        {"name": "engine signaling inbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|3"},
         {"name": "RPC streaming response queue", "path": "crates/myownmesh-core/src/rpc.rs", "symbol": "call_stream@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/rpc.rs|call_stream@1|mpsc::unbounded_channel|1"},
         {"name": "WebRTC transport event queue", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/transport/webrtc.rs|open_peer_with_config@1|mpsc::unbounded_channel|1"},
         {"name": "local signaling outbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "mpsc::unbounded_channel::<LocalOutbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/local.rs|join@1|mpsc::unbounded_channel|1"},
@@ -1852,10 +1893,10 @@
     {
       "id": "resource-attempt-candidates",
       "decision": "OD-RESOURCE-LIMITS",
-      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "required_metrics": ["items", "logical_bytes", "retained_bytes", "tasks", "lifetime"],
       "items": [
-        {"name": "pending remote ICE candidate vector", "path": "crates/myownmesh-core/src/engine/connection.rs", "anchor": "pub pending_remote_candidates: Vec<LocalIceCandidate>,", "count": 1},
-        {"name": "pending remote ICE candidate append", "path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "data.pending_remote_candidates.push(candidate.clone());", "count": 1}
+        {"name": "pending remote ICE candidate backlog", "path": "crates/myownmesh-core/src/engine/connection.rs", "anchor": "entries: Vec<PendingRemoteCandidate>,", "count": 1},
+        {"name": "pending remote ICE candidate append", "path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "peer.queue_remote_candidate(&mut data, candidate);", "count": 1}
       ]
     },
     {
@@ -2040,9 +2081,9 @@
       "DOMAIN:Application client": 52,
       "DOMAIN:Connector infrastructure": 15,
       "DOMAIN:Operational infrastructure (U0)": 106,
-      "DOMAIN:Resource instrumentation": 79,
+      "DOMAIN:Resource instrumentation": 100,
       "NODE:Application Gateway": 348,
-      "NODE:Attempt Node": 36,
+      "NODE:Attempt Node": 42,
       "NODE:Connector Worker": 48,
       "NODE:Endpoint Auth Task": 30,
       "NODE:Peer Session Node": 73,
@@ -2061,19 +2102,19 @@
     },
     "surface_assignments": {
       "DISPOSITION:Delete": 25,
-      "DISPOSITION:Split": 341,
+      "DISPOSITION:Split": 365,
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "DOMAIN:Resource instrumentation": 23,
-      "NODE:Application Gateway": 154,
+      "DOMAIN:Resource instrumentation": 39,
+      "NODE:Application Gateway": 156,
       "NODE:Attempt Node": 19,
       "NODE:Connector Worker": 76,
       "NODE:Endpoint Auth Task": 13,
       "NODE:Peer Session Node": 50,
       "NODE:Reachability Node": 52,
       "NODE:Relay Node": 40,
-      "NODE:Runtime Supervisor": 20,
+      "NODE:Runtime Supervisor": 22,
       "NODE:Semantic Node": 106,
       "NODE:Session Broker": 12,
       "NODE:Signaling Node": 271,
@@ -2083,9 +2124,9 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1062,
+      "callable": 1101,
       "callback_registration": 9,
-      "constructor_entry": 84,
+      "constructor_entry": 87,
       "external_carrier": 29,
       "external_http": 1,
       "external_http_body": 4,
@@ -2106,10 +2147,10 @@
       "queue_oneshot": 18,
       "queue_unbounded": 19,
       "queue_watch": 3,
-      "static_state": 3,
+      "static_state": 4,
       "stream_receive": 10,
       "task": 56,
-      "trait_callable": 18,
+      "trait_callable": 19,
       "write": 92
     },
     "semantic_marker_items": 75,
@@ -2117,9 +2158,9 @@
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 106 | `346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a` |",
-    "| Production Rust declaration members | 1,535 | `02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,637 | `420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2` |",
+    "| Production Rust source units | 106 | `20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d` |",
+    "| Production Rust declaration members | 1,562 | `f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,681 | `57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a` |",
     "| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |",
     "| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 19 unbounded channel constructions"

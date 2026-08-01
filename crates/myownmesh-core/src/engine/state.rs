@@ -16,6 +16,9 @@ use crate::error::{Error, Result};
 use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
+use crate::resource::{
+    MeshContextResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport,
+};
 use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
@@ -335,6 +338,7 @@ pub struct NetworkState {
     pub network_id: String,
     pub identity: Arc<Identity>,
     pub transport: Transport,
+    resource_scope: MeshContextResourceScope,
 
     pub config: RwLock<NetworkConfig>,
     pub topology: RwLock<TopologyMode>,
@@ -510,6 +514,36 @@ impl NetworkState {
         mpsc::UnboundedReceiver<SignalingInbound>,
         mpsc::UnboundedReceiver<NetworkCmd>,
     )> {
+        let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope)
+    }
+
+    /// Construct state below an existing Mesh runtime observation scope.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn new_in_mesh_scope(
+        config: NetworkConfig,
+        identity: Arc<Identity>,
+        transport: Transport,
+        mesh_scope: &MeshRuntimeResourceScope,
+    ) -> Result<(
+        Arc<Self>,
+        mpsc::UnboundedReceiver<SignalingInbound>,
+        mpsc::UnboundedReceiver<NetworkCmd>,
+    )> {
+        Self::new_in_resource_scope(config, identity, transport, mesh_scope.mesh_context_scope())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn new_in_resource_scope(
+        config: NetworkConfig,
+        identity: Arc<Identity>,
+        transport: Transport,
+        resource_scope: MeshContextResourceScope,
+    ) -> Result<(
+        Arc<Self>,
+        mpsc::UnboundedReceiver<SignalingInbound>,
+        mpsc::UnboundedReceiver<NetworkCmd>,
+    )> {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
         // re-arms them without any runtime re-pinning.
@@ -560,6 +594,7 @@ impl NetworkState {
             network_id: config.network_id.clone(),
             identity,
             transport,
+            resource_scope,
             config: RwLock::new(config.clone()),
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
@@ -594,6 +629,17 @@ impl NetworkState {
             conn_trace_force_on,
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
+    }
+
+    pub(crate) fn peer_connection_resource_scope(
+        &self,
+    ) -> crate::resource::PeerConnectionResourceScope {
+        self.resource_scope.peer_connection_scope()
+    }
+
+    /// Read observations for this exact joined mesh context.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.resource_scope.report()
     }
 
     /// Take the outbound signaling receiver so the signaling task

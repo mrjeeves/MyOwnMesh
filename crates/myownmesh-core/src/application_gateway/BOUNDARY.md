@@ -30,7 +30,7 @@ Local handles, subscriptions, callbacks, and application queues use the post-aut
 
 ## Restart behavior
 
-Principals, queue permits, handles, and subscriptions are tied to one runtime and disappear on process restart. After a same-process runtime replacement, a future consumer must compare their witness with the current Runtime Supervisor witness before use. A stored client, request, session, route, or peer label cannot recreate them.
+Possession of a principal capability or queue permit grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Principals, permits, handles, and subscriptions disappear on process restart. A stored client, request, session, route, or peer label cannot recreate them.
 
 ## Forbidden responsibilities
 

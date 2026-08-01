@@ -19,9 +19,9 @@ The baseline commit remains fixed. The current fingerprints cover that baseline 
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `346f86381f5bebf0d02001a6ff775b17b03a3afc7b27043312b9603c0bf3cb7a` |
-| Production Rust declaration members | 1,535 | `02cda49cd33c274a0777d6676e72184f4abe2296f2c45c0fac23a67807312001` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,637 | `420d085f009c0dcaa6bdbb813d3d091360dfb8c49f5c8535e13ab788e8d86ff2` |
+| Production Rust source units | 106 | `20d2bfbea6eb4918bb1fb40b6063d12dfe501071e16065656b650a5f83dedb1d` |
+| Production Rust declaration members | 1,562 | `f91557eb3f5182dc159c8b00a5b9b797f61d78aa83b86c6c37e5cd17155792b7` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,681 | `57055ddeb6504ccdca63193bfa74f7514f54bfde1f359ab22f4a071a4464987a` |
 | Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |
 | Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
@@ -35,23 +35,23 @@ The assignment counts are records, not architectural sizing targets.
 
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
-| Application Gateway | 348 | 154 |
-| Attempt Node | 36 | 19 |
+| Application Gateway | 348 | 156 |
+| Attempt Node | 42 | 19 |
 | Connector Worker | 48 | 76 |
 | Endpoint Auth Task | 30 | 13 |
 | Peer Session Node | 73 | 50 |
 | Reachability Node | 173 | 52 |
 | Relay Node | 38 | 40 |
-| Runtime Supervisor | 57 | 20 |
+| Runtime Supervisor | 57 | 22 |
 | Semantic Node | 117 | 106 |
 | Session Broker | 21 | 12 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
-| Resource instrumentation domain | 79 | 23 |
+| Resource instrumentation domain | 100 | 39 |
 | Delete | 23 | 25 |
-| Split | 64 | 341 |
+| Split | 64 | 365 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
 | Decision: OD-DEVICE-KEY-CUSTODY | 13 | 33 |
 | Decision: OD-LEGACY-SILENT-MIGRATION | 1 | 0 |
@@ -106,7 +106,7 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Candidates received before remote description are appended to `pending_remote_candidates` at [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L802). The transport event queue and several signaling queues are unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. The Arc 02B pilot now observes remote candidates and their private pre-SDP queue, but it does not enforce a limit. The transport event queue and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
 
 This does not add Closed-mesh authorization to Open meshes. It requires resource permits for untrusted speculative work. The exact numeric limits remain owner-selected values backed by measurements, so Arc 02 instruments resource families without inventing enforcement values.
 

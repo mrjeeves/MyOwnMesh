@@ -29,7 +29,7 @@ Connector work remains covered by the pre-authentication permit owned by the con
 
 ## Restart behavior
 
-Connected channel capabilities and native channel objects are memory-only. A process restart destroys them. After a same-process runtime replacement, a future consumer must compare their witness with the current Runtime Supervisor witness before use. Public labels and stored diagnostics cannot recreate them.
+Possession of a connected-channel capability grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Connected-channel capabilities and native channel objects are memory-only and disappear on process restart. Public labels and stored diagnostics cannot recreate them.
 
 ## Forbidden responsibilities
 

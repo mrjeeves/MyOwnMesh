@@ -30,7 +30,7 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 ## Restart behavior
 
-Attempt permits and candidate capabilities are memory-only. A process restart destroys them. After a same-process runtime replacement, a future consumer must compare their witness with the current Runtime Supervisor witness before use. Durable records and public identifiers cannot recreate them.
+Possession of an attempt permit or candidate capability grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Attempt permits and candidate capabilities are memory-only and disappear on process restart. Durable records and public identifiers cannot recreate them.
 
 ## Forbidden responsibilities
 

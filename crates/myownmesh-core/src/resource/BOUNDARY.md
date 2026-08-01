@@ -6,41 +6,53 @@ This module measures resource use by the closed pre-authentication and post-auth
 
 It is observation infrastructure. It is not resource policy.
 
-## Owned state
+## Observation hierarchy
 
-Each explicitly created `ResourceAccountant` owns one isolated in-memory measurement state. That state contains:
+Production observations use one fixed hierarchy:
 
-- active item, byte, and task totals by family;
-- peak active item, byte, task, and lease totals by family;
-- active observation counts and start times;
-- completed observation counts, final measured quantities, and total lifetimes;
-- a sticky indication that overflow or inconsistent subtraction made a measurement inexact.
+```text
+process root
+  -> one live Mesh runtime
+    -> one exact joined mesh context
+      -> one attempt or peer connection
+```
 
-There is no process-global accountant.
+A leaf observation updates the leaf and all three ancestors. Sibling contexts and sibling peers do not observe each other. The process root is the only process-global accountant. It aggregates measurements and grants no authority.
 
-## Inputs and outputs
+Each scope keeps its own report state. The hierarchy holds no registry of child scopes, so dropping a child does not leave a permanent per-child record at the process root. A shared transaction lock makes one begin, replacement, or completion visible to all scopes as one accounting operation.
 
-Callers provide a family and a measured `ResourceUse`. The accountant returns an `ObservationLease`. Dropping that lease removes the active measurement and records its lifetime.
+## Measurements
 
-A caller that owns a growing or shrinking collection may replace the lease's measured quantity with a new value derived from that live object. This changes the measurement only.
+`ResourceUse` has four independent axes:
 
-Reports include every closed family, including families with zero activity. They preserve active, peak, completed, and lifetime measurements. They are snapshots of measurements only.
+- items;
+- logical bytes;
+- retained bytes;
+- tasks.
+
+Logical bytes describe live content. Retained bytes use the producer's documented measurement contract and include unused capacity only when that producer reports it. The two byte values are not substituted for each other. The remote-candidate pilot reports Rust `String` and `Vec` capacity bytes. It does not claim allocator metadata, allocator usable size, stack use, or process RSS.
+
+Each family report includes current and peak use, current and peak lease counts, the oldest active lifetime, completed lease count, final completed quantities, total completed lifetime, and a sticky `measurement_inexact` flag.
+
+## Ownership and cleanup
+
+Callers provide a family and a measured `ResourceUse`. The accountant returns an `ObservationLease`. Dropping that lease removes the active measurement and records its lifetime at every scope in its path.
+
+A caller that owns a growing or shrinking collection may replace the lease's measured quantity with a fresh measurement from that same object. This changes measurement only.
+
+Arithmetic is checked before saturation. Overflow, inconsistent subtraction, a poisoned scope lock, or a poisoned hierarchy transaction marks the affected report inexact. Counters do not wrap or underflow.
+
+Measurements are memory-only. Process restart destroys them. They are not reconstructed from durable state.
 
 ## Dependencies
 
-The module uses only standard-library synchronization, collections, and monotonic time. It performs no filesystem, process, socket, signaling, connector, relay, or application operation.
-
-## Resource and restart behavior
-
-An accountant retains one small record for each family it has observed and one start-time entry for each distinct active observation start. All arithmetic is checked first and saturates instead of wrapping. Lease completion uses checked subtraction with a zero floor, so dropping a lease cannot underflow counters.
-
-Measurements are in memory and disappear with the owning process. They are not reconstructed from durable state after restart.
+The module uses standard-library synchronization, collections, and monotonic time. It performs no filesystem, process, socket, signaling, connector, relay, or application operation.
 
 ## Forbidden responsibilities
 
 This module must not:
 
-- define or infer a limit;
+- define or infer a numeric limit;
 - accept or refuse work;
 - reserve capacity;
 - create a permit or capability;
@@ -49,8 +61,10 @@ This module must not:
 - provide backpressure, eviction, prioritization, or admission policy;
 - perform networking or mutate production domain state.
 
-An `ObservationLease` proves only that this accountant is currently measuring a caller-reported quantity. It is never evidence that the measured work was allowed, reserved, authenticated, or safe.
+An `ObservationLease` proves only that a caller-reported quantity is being measured. It is never evidence that the work was allowed, reserved, authenticated, or safe.
 
-## Arc 02 integration status
+## Arc 02B integration status
 
-This module has no production allocation caller in the current slice. A report containing zeros therefore does not prove zero use or complete coverage. Current allocation instrumentation remains an open Arc 02 gate.
+The remote ICE candidate pilot is the first production caller. Candidate values and the pre-SDP queue container are observed. The pilot does not cover signaling queues, WebRTC or ICE agent internals, other pre-authentication allocations, post-authentication allocations, or a complete resource family.
+
+No enforcement occurs. A later arc must acquire a real `PreAuthAttemptPermit` before queue insertion. The current queue is a compatibility owner until Attempt Node or Connector Worker owns this state.

@@ -4,7 +4,8 @@
 //! enforce limits, authorize work, or create a permit. See `BOUNDARY.md`.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Number of independently measurable pre-authentication resource families.
@@ -112,18 +113,20 @@ impl PostAuthResourceFamily {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceUse {
     items: u64,
-    bytes: u64,
+    logical_bytes: u64,
+    retained_bytes: u64,
     tasks: u64,
 }
 
 impl ResourceUse {
-    pub const ZERO: Self = Self::observed(0, 0, 0);
+    pub const ZERO: Self = Self::observed(0, 0, 0, 0);
 
     /// Describe an observed quantity without reserving or permitting it.
-    pub const fn observed(items: u64, bytes: u64, tasks: u64) -> Self {
+    pub const fn observed(items: u64, logical_bytes: u64, retained_bytes: u64, tasks: u64) -> Self {
         Self {
             items,
-            bytes,
+            logical_bytes,
+            retained_bytes,
             tasks,
         }
     }
@@ -132,8 +135,15 @@ impl ResourceUse {
         self.items
     }
 
-    pub const fn bytes(self) -> u64 {
-        self.bytes
+    /// Bytes that belong to the observed value's logical content.
+    pub const fn logical_bytes(self) -> u64 {
+        self.logical_bytes
+    }
+
+    /// Bytes retained by the observed owner under that producer's documented
+    /// measurement contract, including unused capacity when it is reported.
+    pub const fn retained_bytes(self) -> u64 {
+        self.retained_bytes
     }
 
     pub const fn tasks(self) -> u64 {
@@ -143,7 +153,8 @@ impl ResourceUse {
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             items: self.items.checked_add(other.items)?,
-            bytes: self.bytes.checked_add(other.bytes)?,
+            logical_bytes: self.logical_bytes.checked_add(other.logical_bytes)?,
+            retained_bytes: self.retained_bytes.checked_add(other.retained_bytes)?,
             tasks: self.tasks.checked_add(other.tasks)?,
         })
     }
@@ -151,7 +162,8 @@ impl ResourceUse {
     fn saturating_add(self, other: Self) -> Self {
         Self {
             items: self.items.saturating_add(other.items),
-            bytes: self.bytes.saturating_add(other.bytes),
+            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
             tasks: self.tasks.saturating_add(other.tasks),
         }
     }
@@ -159,7 +171,8 @@ impl ResourceUse {
     fn checked_sub(self, other: Self) -> Option<Self> {
         Some(Self {
             items: self.items.checked_sub(other.items)?,
-            bytes: self.bytes.checked_sub(other.bytes)?,
+            logical_bytes: self.logical_bytes.checked_sub(other.logical_bytes)?,
+            retained_bytes: self.retained_bytes.checked_sub(other.retained_bytes)?,
             tasks: self.tasks.checked_sub(other.tasks)?,
         })
     }
@@ -167,7 +180,8 @@ impl ResourceUse {
     fn saturating_sub(self, other: Self) -> Self {
         Self {
             items: self.items.saturating_sub(other.items),
-            bytes: self.bytes.saturating_sub(other.bytes),
+            logical_bytes: self.logical_bytes.saturating_sub(other.logical_bytes),
+            retained_bytes: self.retained_bytes.saturating_sub(other.retained_bytes),
             tasks: self.tasks.saturating_sub(other.tasks),
         }
     }
@@ -175,7 +189,8 @@ impl ResourceUse {
     fn componentwise_max(self, other: Self) -> Self {
         Self {
             items: self.items.max(other.items),
-            bytes: self.bytes.max(other.bytes),
+            logical_bytes: self.logical_bytes.max(other.logical_bytes),
+            retained_bytes: self.retained_bytes.max(other.retained_bytes),
             tasks: self.tasks.max(other.tasks),
         }
     }
@@ -208,22 +223,139 @@ pub struct ResourceReport {
         [ResourceFamilyReport<PostAuthResourceFamily>; POST_AUTH_RESOURCE_FAMILY_COUNT],
 }
 
-/// A per-instance, observation-only resource accountant.
+/// The one observation root shared by all MyOwnMesh runtime objects in this
+/// process. It aggregates measurements only and grants no authority.
+static PROCESS_RESOURCE_ROOT: OnceLock<ResourceAccountant> = OnceLock::new();
+
+/// Return a process-wide observation snapshot.
+pub fn process_resource_report() -> ResourceReport {
+    ProcessResourceRoot::global().report()
+}
+
+/// The root of the production observation hierarchy.
 ///
-/// Instances share no global state. Cloning an accountant only creates another
-/// handle to the same explicitly created observation instance.
+/// Child scopes are created in one fixed order: process, Mesh runtime, exact
+/// mesh context, then attempt or peer connection. An observation made at a
+/// leaf is recorded at that leaf and every ancestor.
+#[derive(Clone, Debug)]
+pub struct ProcessResourceRoot {
+    accountant: ResourceAccountant,
+}
+
+impl ProcessResourceRoot {
+    /// Get the observation root for this process.
+    pub fn global() -> Self {
+        Self {
+            accountant: PROCESS_RESOURCE_ROOT
+                .get_or_init(ResourceAccountant::observation_only)
+                .clone(),
+        }
+    }
+
+    /// Read the process aggregate without changing it.
+    pub fn report(&self) -> ResourceReport {
+        self.accountant.report()
+    }
+
+    pub(crate) fn mesh_runtime_scope(&self) -> MeshRuntimeResourceScope {
+        MeshRuntimeResourceScope {
+            accountant: self.accountant.child_scope(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated() -> Self {
+        Self {
+            accountant: ResourceAccountant::observation_only(),
+        }
+    }
+}
+
+/// Observation scope for one live [`crate::Mesh`] runtime.
+#[derive(Clone, Debug)]
+pub(crate) struct MeshRuntimeResourceScope {
+    accountant: ResourceAccountant,
+}
+
+impl MeshRuntimeResourceScope {
+    pub(crate) fn mesh_context_scope(&self) -> MeshContextResourceScope {
+        MeshContextResourceScope {
+            accountant: self.accountant.child_scope(),
+        }
+    }
+
+    pub(crate) fn report(&self) -> ResourceReport {
+        self.accountant.report()
+    }
+}
+
+/// Observation scope for one exact joined mesh context.
+#[derive(Clone, Debug)]
+pub(crate) struct MeshContextResourceScope {
+    accountant: ResourceAccountant,
+}
+
+impl MeshContextResourceScope {
+    pub(crate) fn peer_connection_scope(&self) -> PeerConnectionResourceScope {
+        PeerConnectionResourceScope {
+            accountant: self.accountant.child_scope(),
+        }
+    }
+
+    pub(crate) fn report(&self) -> ResourceReport {
+        self.accountant.report()
+    }
+}
+
+/// Observation scope for one attempt or live peer-connection owner.
+#[derive(Clone, Debug)]
+pub(crate) struct PeerConnectionResourceScope {
+    accountant: ResourceAccountant,
+}
+
+impl PeerConnectionResourceScope {
+    pub(crate) fn observe_pre_authentication(
+        &self,
+        family: PreAuthResourceFamily,
+        observed: ResourceUse,
+    ) -> ObservationLease {
+        self.accountant.observe_pre_authentication(family, observed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report(&self) -> ResourceReport {
+        self.accountant.report()
+    }
+}
+
+/// One node in an observation hierarchy.
+///
+/// `observation_only` creates an isolated root for tests and non-production
+/// consumers of the primitive. Production code enters through
+/// [`ProcessResourceRoot`] and its typed descendants.
 #[derive(Clone, Debug)]
 pub struct ResourceAccountant {
-    inner: Arc<Inner>,
+    hierarchy: Arc<Hierarchy>,
+    path: Arc<[Arc<Inner>]>,
 }
 
 impl ResourceAccountant {
-    /// Create an isolated observation instance.
+    /// Create an isolated observation root.
     ///
     /// This does not establish limits, reserve capacity, or grant authority.
     pub fn observation_only() -> Self {
         Self {
-            inner: Arc::new(Inner::default()),
+            hierarchy: Arc::new(Hierarchy::default()),
+            path: Arc::from([Arc::new(Inner::default())]),
+        }
+    }
+
+    fn child_scope(&self) -> Self {
+        let mut path = self.path.to_vec();
+        path.push(Arc::new(Inner::default()));
+        Self {
+            hierarchy: Arc::clone(&self.hierarchy),
+            path: Arc::from(path),
         }
     }
 
@@ -247,10 +379,14 @@ impl ResourceAccountant {
         self.observe_at(FamilyKey::PostAuth(family), observed, Instant::now())
     }
 
-    /// Read all family measurements without changing them.
+    /// Read all family measurements at this scope without changing them.
     pub fn report(&self) -> ResourceReport {
-        let state = self.inner.lock_state();
-        state.report(Instant::now())
+        let _transaction = self.hierarchy.lock_transaction();
+        let state = self.leaf().lock_state();
+        state.report(
+            Instant::now(),
+            self.hierarchy.measurement_inexact.load(Ordering::Relaxed),
+        )
     }
 
     fn observe_at(
@@ -259,17 +395,19 @@ impl ResourceAccountant {
         observed: ResourceUse,
         started_at: Instant,
     ) -> ObservationLease {
-        let mut state = self.inner.lock_state();
-        state
-            .families
-            .entry(family)
-            .or_default()
-            .begin(observed, started_at);
-        drop(state);
+        let _transaction = self.hierarchy.lock_transaction();
+        for scope in self.path.iter() {
+            scope
+                .lock_state()
+                .families
+                .entry(family)
+                .or_default()
+                .begin(observed, started_at);
+        }
 
         ObservationLease {
             observation: Some(Observation {
-                inner: Arc::clone(&self.inner),
+                accountant: self.clone(),
                 family,
                 observed,
                 started_at,
@@ -277,9 +415,49 @@ impl ResourceAccountant {
         }
     }
 
+    fn replace_observed(&self, family: FamilyKey, previous: ResourceUse, observed: ResourceUse) {
+        let _transaction = self.hierarchy.lock_transaction();
+        for scope in self.path.iter() {
+            scope
+                .lock_state()
+                .families
+                .entry(family)
+                .or_default()
+                .replace(previous, observed);
+        }
+    }
+
+    fn finish_observation(
+        &self,
+        family: FamilyKey,
+        observed: ResourceUse,
+        started_at: Instant,
+        lifetime: Duration,
+    ) {
+        let _transaction = self.hierarchy.lock_transaction();
+        for scope in self.path.iter() {
+            scope
+                .lock_state()
+                .families
+                .entry(family)
+                .or_default()
+                .finish(observed, started_at, lifetime);
+        }
+    }
+
+    fn leaf(&self) -> &Inner {
+        self.path
+            .last()
+            .expect("an observation hierarchy always contains its process root")
+    }
+
     #[cfg(test)]
     fn report_at(&self, now: Instant) -> ResourceReport {
-        self.inner.lock_state().report(now)
+        let _transaction = self.hierarchy.lock_transaction();
+        self.leaf().lock_state().report(
+            now,
+            self.hierarchy.measurement_inexact.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -303,12 +481,9 @@ impl ObservationLease {
         let Some(observation) = self.observation.as_mut() else {
             return;
         };
-        let mut state = observation.inner.lock_state();
-        state
-            .families
-            .entry(observation.family)
-            .or_default()
-            .replace(observation.observed, observed);
+        observation
+            .accountant
+            .replace_observed(observation.family, observation.observed, observed);
         observation.observed = observed;
     }
 
@@ -322,12 +497,12 @@ impl ObservationLease {
             return;
         };
         let lifetime = finished_at.saturating_duration_since(observation.started_at);
-        let mut state = observation.inner.lock_state();
-        state
-            .families
-            .entry(observation.family)
-            .or_default()
-            .finish(observation.observed, observation.started_at, lifetime);
+        observation.accountant.finish_observation(
+            observation.family,
+            observation.observed,
+            observation.started_at,
+            lifetime,
+        );
     }
 }
 
@@ -339,7 +514,7 @@ impl Drop for ObservationLease {
 
 #[derive(Debug)]
 struct Observation {
-    inner: Arc<Inner>,
+    accountant: ResourceAccountant,
     family: FamilyKey,
     observed: ResourceUse,
     started_at: Instant,
@@ -349,6 +524,24 @@ struct Observation {
 enum FamilyKey {
     PreAuth(PreAuthResourceFamily),
     PostAuth(PostAuthResourceFamily),
+}
+
+#[derive(Debug, Default)]
+struct Hierarchy {
+    transaction: Mutex<()>,
+    measurement_inexact: AtomicBool,
+}
+
+impl Hierarchy {
+    fn lock_transaction(&self) -> MutexGuard<'_, ()> {
+        match self.transaction.lock() {
+            Ok(transaction) => transaction,
+            Err(poisoned) => {
+                self.measurement_inexact.store(true, Ordering::Relaxed);
+                poisoned.into_inner()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -376,12 +569,14 @@ struct State {
 }
 
 impl State {
-    fn report(&self, now: Instant) -> ResourceReport {
+    fn report(&self, now: Instant, hierarchy_inexact: bool) -> ResourceReport {
         ResourceReport {
-            pre_authentication: PreAuthResourceFamily::ALL
-                .map(|family| self.snapshot(FamilyKey::PreAuth(family), family, now)),
-            post_authentication: PostAuthResourceFamily::ALL
-                .map(|family| self.snapshot(FamilyKey::PostAuth(family), family, now)),
+            pre_authentication: PreAuthResourceFamily::ALL.map(|family| {
+                self.snapshot(FamilyKey::PreAuth(family), family, now, hierarchy_inexact)
+            }),
+            post_authentication: PostAuthResourceFamily::ALL.map(|family| {
+                self.snapshot(FamilyKey::PostAuth(family), family, now, hierarchy_inexact)
+            }),
         }
     }
 
@@ -390,6 +585,7 @@ impl State {
         key: FamilyKey,
         family: F,
         now: Instant,
+        hierarchy_inexact: bool,
     ) -> ResourceFamilyReport<F> {
         let state = self.families.get(&key);
         ResourceFamilyReport {
@@ -405,7 +601,8 @@ impl State {
             completed_total_use: state.map_or(ResourceUse::ZERO, |state| state.completed_total_use),
             completed_total_lifetime: state
                 .map_or(Duration::ZERO, |state| state.completed_total_lifetime),
-            measurement_inexact: self.measurement_inexact
+            measurement_inexact: hierarchy_inexact
+                || self.measurement_inexact
                 || state.is_some_and(|state| state.measurement_inexact),
         }
     }
@@ -586,11 +783,13 @@ mod tests {
         let first_use = ResourceUse::observed(
             fixture_count(&[first_fixture.as_slice(), second_fixture.as_slice()]),
             fixture_len(first_fixture),
+            fixture_len(second_fixture),
             fixture_count(&[b"candidate-task".as_slice()]),
         );
         let second_use = ResourceUse::observed(
             fixture_count(&[second_fixture.as_slice()]),
             fixture_len(second_fixture),
+            fixture_len(first_fixture),
             ResourceUse::ZERO.tasks(),
         );
         let second_start_offset = Duration::from_millis(fixture_len(b"start-offset"));
@@ -667,11 +866,13 @@ mod tests {
         let initial = ResourceUse::observed(
             fixture_count(&[initial_fixture.as_slice()]),
             fixture_len(initial_fixture),
+            fixture_len(initial_fixture),
             ResourceUse::ZERO.tasks(),
         );
         let expanded = ResourceUse::observed(
             fixture_count(&[initial_fixture.as_slice(), expanded_fixture.as_slice()]),
             fixture_len(expanded_fixture),
+            fixture_len(initial_fixture) + fixture_len(expanded_fixture),
             fixture_count(&[b"queue-task".as_slice()]),
         );
         let mut lease = accountant.observe_at(
@@ -707,6 +908,7 @@ mod tests {
         let use_ = ResourceUse::observed(
             fixture_count(&[fixture.as_slice()]),
             fixture_len(fixture),
+            fixture_len(fixture),
             fixture_count(&[b"session-task".as_slice()]),
         );
         let lease = accountant.observe_at(
@@ -734,6 +936,7 @@ mod tests {
         let observed = ResourceUse::observed(
             fixture_count(&[fixture.as_slice()]),
             fixture_len(fixture),
+            fixture_len(fixture),
             fixture_count(&[b"cleanup-task".as_slice()]),
         );
         let lease = accountant.observe_at(
@@ -743,7 +946,7 @@ mod tests {
         );
 
         {
-            let mut state = accountant.inner.lock_state();
+            let mut state = accountant.leaf().lock_state();
             let family = state
                 .families
                 .get_mut(&FamilyKey::PostAuth(
@@ -772,7 +975,12 @@ mod tests {
     #[test]
     fn v4_arc02_poisoned_state_is_reported_as_inexact() {
         let accountant = ResourceAccountant::observation_only();
-        let inner = Arc::clone(&accountant.inner);
+        let inner = Arc::clone(
+            accountant
+                .path
+                .last()
+                .expect("fixture accountant has a root scope"),
+        );
         let poisoned = std::thread::spawn(move || {
             let _state = inner.state.lock().expect("fixture lock begins healthy");
             panic!("poison the fixture mutex while it is held");
@@ -795,10 +1003,11 @@ mod tests {
     fn v4_arc02_overflow_saturates_and_remains_inexact_after_cleanup() {
         let accountant = ResourceAccountant::observation_only();
         let base = Instant::now();
-        let maximum = ResourceUse::observed(u64::MAX, u64::MAX, u64::MAX);
+        let maximum = ResourceUse::observed(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
         let one = ResourceUse::observed(
             fixture_count(&[b"item".as_slice()]),
             fixture_count(&[b"byte".as_slice()]),
+            fixture_count(&[b"retained".as_slice()]),
             fixture_count(&[b"task".as_slice()]),
         );
         let first = accountant.observe_at(
@@ -833,5 +1042,104 @@ mod tests {
             fixture_count(&[b"first".as_slice(), b"second".as_slice()])
         );
         assert!(completed.measurement_inexact);
+    }
+
+    #[test]
+    fn v4_arc02_logical_and_retained_bytes_are_independent_axes() {
+        let logical_fixture = b"candidate-text";
+        let retained_fixture = b"candidate-allocation-capacity";
+        let observed = ResourceUse::observed(
+            fixture_count(&[logical_fixture.as_slice()]),
+            fixture_len(logical_fixture),
+            fixture_len(retained_fixture),
+            ResourceUse::ZERO.tasks(),
+        );
+
+        assert_eq!(observed.logical_bytes(), fixture_len(logical_fixture));
+        assert_eq!(observed.retained_bytes(), fixture_len(retained_fixture));
+        assert_ne!(observed.logical_bytes(), observed.retained_bytes());
+    }
+
+    #[test]
+    fn v4_arc02_leaf_observation_updates_all_four_scopes() {
+        let process = ProcessResourceRoot::isolated();
+        let mesh = process.mesh_runtime_scope();
+        let context = mesh.mesh_context_scope();
+        let peer = context.peer_connection_scope();
+        let fixture = b"four-scope-candidate";
+        let observed = ResourceUse::observed(
+            fixture_count(&[fixture.as_slice()]),
+            fixture_len(fixture),
+            fixture_len(fixture) + fixture_len(b"retained-slack"),
+            ResourceUse::ZERO.tasks(),
+        );
+
+        let lease =
+            peer.observe_pre_authentication(PreAuthResourceFamily::CandidateObject, observed);
+
+        for report in [
+            process.report(),
+            mesh.report(),
+            context.report(),
+            peer.report(),
+        ] {
+            let candidate = family_report(
+                &report.pre_authentication,
+                PreAuthResourceFamily::CandidateObject,
+            );
+            assert_eq!(candidate.active, observed);
+            assert_eq!(candidate.active_lease_count, 1);
+        }
+
+        drop(lease);
+        for report in [
+            process.report(),
+            mesh.report(),
+            context.report(),
+            peer.report(),
+        ] {
+            let candidate = family_report(
+                &report.pre_authentication,
+                PreAuthResourceFamily::CandidateObject,
+            );
+            assert_eq!(candidate.active, ResourceUse::ZERO);
+            assert_eq!(candidate.completed_total_use, observed);
+            assert_eq!(candidate.completed_lease_count, 1);
+        }
+    }
+
+    #[test]
+    fn v4_arc02_sibling_contexts_do_not_observe_each_other() {
+        let process = ProcessResourceRoot::isolated();
+        let mesh = process.mesh_runtime_scope();
+        let first_context = mesh.mesh_context_scope();
+        let second_context = mesh.mesh_context_scope();
+        let first_peer = first_context.peer_connection_scope();
+        let fixture = b"first-context-only";
+        let observed = ResourceUse::observed(
+            fixture_count(&[fixture.as_slice()]),
+            fixture_len(fixture),
+            fixture_len(fixture),
+            ResourceUse::ZERO.tasks(),
+        );
+
+        let _lease =
+            first_peer.observe_pre_authentication(PreAuthResourceFamily::CandidateObject, observed);
+
+        let mesh_candidate = family_report(
+            &mesh.report().pre_authentication,
+            PreAuthResourceFamily::CandidateObject,
+        );
+        let first_candidate = family_report(
+            &first_context.report().pre_authentication,
+            PreAuthResourceFamily::CandidateObject,
+        );
+        let second_candidate = family_report(
+            &second_context.report().pre_authentication,
+            PreAuthResourceFamily::CandidateObject,
+        );
+        assert_eq!(mesh_candidate.active, observed);
+        assert_eq!(first_candidate.active, observed);
+        assert_eq!(second_candidate.active, ResourceUse::ZERO);
     }
 }

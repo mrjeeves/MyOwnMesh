@@ -30,7 +30,7 @@ Endpoint-authentication work remains pre-authentication work. Arc 02 defines the
 
 ## Restart behavior
 
-The transcript, permit, and authenticated-channel capability are memory-only and tied to one runtime witness. A process restart destroys them. After a same-process runtime replacement, a future consumer must compare that witness with the current Runtime Supervisor witness before use. Stored IDs or an old transcript cannot reconstruct them.
+Possession of the permit or authenticated-channel capability grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. The transcript, permit, and capability are memory-only and disappear on process restart. Stored IDs or an old transcript cannot reconstruct them.
 
 ## Forbidden responsibilities
 

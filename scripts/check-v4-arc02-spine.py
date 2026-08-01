@@ -90,6 +90,12 @@ LEGACY_WRAPPERS = {
 PROTECTED_TYPES = set(TYPE_OWNERS) | set(LEGACY_WRAPPERS) | {"RuntimeIncarnation"}
 AUTHORITY_OWNER_MODULES = set(TYPE_OWNERS.values()) | {"runtime/mod.rs"}
 LEAF_AUTHORITY_OWNER_MODULES = set(TYPE_OWNERS.values())
+PILOT_SOURCES = {
+    "engine/connection.rs",
+    "engine/mod.rs",
+    "engine/state.rs",
+    "handle.rs",
+}
 
 PROTECTED_PRODUCTION_FINGERPRINTS = {
     "lib.rs": "a959b670159fb39b083daa969bc852a36c70e2ed05b9ae6a98a06f8eb0fb4ecc",
@@ -266,8 +272,9 @@ def struct_scope(text: str, name: str, masked: str | None = None) -> tuple[str, 
 
     masked = mask_rust(text) if masked is None else masked
     declaration = re.compile(
-        rf"(?P<attrs>(?:\s*#\s*\[[^\]]*\])*)\s*"
-        rf"(?P<vis>pub(?:\s*\([^)]*\))?\s+)?struct\s+{re.escape(name)}\b[^{{;]*\{{"
+        rf"(?m)^(?P<attrs>(?:[ \t]*#\s*\[[^\]\n]*\][ \t]*\r?\n)*)"
+        rf"[ \t]*(?P<vis>pub(?:\s*\([^)]*\))?\s+)?"
+        rf"struct\s+{re.escape(name)}\b[^{{;]*\{{"
     )
     matches = list(declaration.finditer(masked))
     if len(matches) != 1:
@@ -373,7 +380,11 @@ def trait_impl_headers(masked: str) -> list[str]:
 
 
 def load_sources() -> dict[str, str]:
-    paths = set(TYPE_OWNERS.values()) | {"runtime/mod.rs", "resource/mod.rs", "lib.rs"}
+    paths = (
+        set(TYPE_OWNERS.values())
+        | {"runtime/mod.rs", "resource/mod.rs", "lib.rs"}
+        | PILOT_SOURCES
+    )
     return {
         path: (CORE_SRC / path).read_text(encoding="utf-8")
         for path in sorted(paths)
@@ -433,6 +444,12 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             )
 
     protected_pattern = "|".join(re.escape(name) for name in sorted(PROTECTED_TYPES))
+    protected_reference = re.compile(rf"\b(?:{protected_pattern})\b")
+    protected_workspace_masked = {
+        path: text
+        for path, text in workspace_masked.items()
+        if protected_reference.search(text)
+    }
     type_alias = re.compile(
         r"\btype\s+(?P<alias>[A-Za-z_]\w*)"
         r"(?:\s*<[^;{}]*>)?(?:\s+where\s+[^;{}=]*)?\s*=\s*"
@@ -441,7 +458,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
     renamed_import = re.compile(
         rf"\b(?P<target>{protected_pattern})\s+as\s+(?P<alias>[A-Za-z_]\w*)\b"
     )
-    for path, text in workspace_masked.items():
+    for path, text in protected_workspace_masked.items():
         for declaration in type_alias.finditer(text):
             target = declaration.group("target")
             protected = re.search(rf"\b(?:{protected_pattern})\b", target)
@@ -578,7 +595,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             rf"(?:From|TryFrom)\s*<[^>]+>\s+for\s+"
             rf"(?:[A-Za-z_]\w*\s*::\s*)*{re.escape(type_name)}\b"
         )
-        if any(conversion.search(text) for text in workspace_masked.values()):
+        if any(conversion.search(text) for text in protected_workspace_masked.values()):
             errors.append(f"{type_name} has a production From or TryFrom conversion")
 
         forbidden_impl = re.compile(
@@ -587,12 +604,12 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             rf"(?:\s*<[^>{{}}]*>)?\s+for\s+"
             rf"(?:[A-Za-z_]\w*\s*::\s*)*{re.escape(type_name)}\b"
         )
-        if any(forbidden_impl.search(text) for text in workspace_masked.values()):
+        if any(forbidden_impl.search(text) for text in protected_workspace_masked.values()):
             errors.append(f"{type_name} has a forbidden production trait implementation")
 
         trait_owners = [
             path
-            for path, text in workspace_masked.items()
+            for path, text in protected_workspace_masked.items()
             for header in trait_impl_headers(text)
             if re.search(rf"\b{re.escape(type_name)}\b", header)
         ]
@@ -609,7 +626,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             rf"{re.escape(type_name)}(?:\s*<[^{{}};]*>)?"
             rf"(?:\s*\)\s*)*(?:\s+where\s+[^{{}};]*)?\s*\{{"
         )
-        for path, text in workspace_masked.items():
+        for path, text in protected_workspace_masked.items():
             if inherent_impl.search(text):
                 inherent_impl_owners.append(path)
         expected_owner = f"crates/myownmesh-core/src/{TYPE_OWNERS[type_name]}"
@@ -625,7 +642,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             rf"\b{re.escape(type_name)}\b[^;{{}}]*"
             rf"\b(?:transmute|MaybeUninit|assume_init|zeroed)\b"
         )
-        if any(unsafe_forge.search(text) for text in workspace_masked.values()):
+        if any(unsafe_forge.search(text) for text in protected_workspace_masked.values()):
             errors.append(f"{type_name} appears in an unsafe construction pattern")
 
     session_source = production_masked[TYPE_OWNERS["SessionCapability"]]
@@ -696,7 +713,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
         errors.append("RuntimeMarker must remain private")
     runtime_trait_owners = [
         path
-        for path, text in workspace_masked.items()
+        for path, text in protected_workspace_masked.items()
         for header in trait_impl_headers(text)
         if re.search(r"\bRuntimeIncarnation\b", header)
     ]
@@ -724,7 +741,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
     runtime_constructor_call = re.compile(r"\bRuntimeIncarnation\s*::\s*new\s*\(")
     constructor_callers = [
         path
-        for path, text in workspace_masked.items()
+        for path, text in protected_workspace_masked.items()
         if runtime_constructor_call.search(text)
     ]
     if constructor_callers:
@@ -735,7 +752,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
     runtime_owner = "crates/myownmesh-core/src/runtime/mod.rs"
     literal_callers = [
         path
-        for path, text in workspace_masked.items()
+        for path, text in protected_workspace_masked.items()
         if path != runtime_owner and struct_literal_count(text, "RuntimeIncarnation")
     ]
     if literal_callers:
@@ -763,10 +780,17 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
                 f"{sorted(expected)}, found {sorted(actual)}"
             )
 
-    if re.search(r"(?m)^\s*(?:pub\s+)?static\s+", resource_masked) or re.search(
-        r"\b(?:OnceLock|LazyLock|thread_local)\b", resource_masked
-    ):
-        errors.append("resource/mod.rs: process-global accounting state is forbidden")
+    process_root = re.compile(
+        r"(?m)^\s*static\s+PROCESS_RESOURCE_ROOT\s*:\s*"
+        r"OnceLock\s*<\s*ResourceAccountant\s*>\s*=\s*OnceLock\s*::\s*new\s*\(\s*\)\s*;"
+    )
+    all_statics = list(re.finditer(r"(?m)^\s*(?:pub\s+)?static\s+[^;]+;", resource_masked))
+    if len(process_root.findall(resource_masked)) != 1 or len(all_statics) != 1:
+        errors.append(
+            "resource/mod.rs: exactly one typed process observation root is required"
+        )
+    if re.search(r"\b(?:LazyLock|thread_local)\b", resource_masked):
+        errors.append("resource/mod.rs: unexpected process-global accounting state")
     if re.search(
         r"\b(?:admit|allow|authorize|deny|limit|permit|reject|reserve)\w*\b",
         resource_masked,
@@ -780,7 +804,10 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
         errors.append("resource/mod.rs: observation code performs an external operation")
 
     for struct_name, expected_names in (
-        ("ResourceUse", {"items", "bytes", "tasks"}),
+        (
+            "ResourceUse",
+            {"items", "logical_bytes", "retained_bytes", "tasks"},
+        ),
         (
             "ResourceFamilyReport",
             {
@@ -820,6 +847,208 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             resource_masked,
         ):
             errors.append(f"resource/mod.rs: {method} must return ObservationLease")
+
+    for scope_name in (
+        "ProcessResourceRoot",
+        "MeshRuntimeResourceScope",
+        "MeshContextResourceScope",
+        "PeerConnectionResourceScope",
+    ):
+        try:
+            _, body = struct_scope(resource_source, scope_name, resource_masked)
+        except ValueError as error:
+            errors.append(f"resource/mod.rs: {error}")
+            continue
+        if struct_fields(body) != {"accountant": ("", "ResourceAccountant")}:
+            errors.append(
+                f"resource/mod.rs: {scope_name} must contain only one private accountant"
+            )
+
+    hierarchy_links = (
+        ("ProcessResourceRoot", "mesh_runtime_scope", "MeshRuntimeResourceScope"),
+        ("MeshRuntimeResourceScope", "mesh_context_scope", "MeshContextResourceScope"),
+        (
+            "MeshContextResourceScope",
+            "peer_connection_scope",
+            "PeerConnectionResourceScope",
+        ),
+    )
+    for owner, method, child in hierarchy_links:
+        if not re.search(
+            rf"impl\s+{owner}\s*\{{[\s\S]*?fn\s+{method}\s*\([^)]*\)\s*->\s*{child}\b",
+            resource_masked,
+        ):
+            errors.append(
+                f"resource/mod.rs: missing fixed hierarchy link {owner}::{method} -> {child}"
+            )
+    if len(
+        re.findall(
+            r"for\s+scope\s+in\s+self\s*\.\s*path\s*\.\s*iter\s*\(\s*\)\s*\{",
+            resource_masked,
+        )
+    ) != 3:
+        errors.append("resource/mod.rs: leaf observations do not update their ancestor path")
+
+    connection_source = production["engine/connection.rs"]
+    connection_masked = production_masked["engine/connection.rs"]
+    engine_masked = production_masked["engine/mod.rs"]
+    try:
+        peer_heading, peer_body = struct_scope(
+            connection_source, "PeerStateData", connection_masked
+        )
+    except ValueError as error:
+        errors.append(f"engine/connection.rs: {error}")
+    else:
+        peer_derives = {
+            part.strip().split("::")[-1]
+            for derive in re.findall(r"derive\s*\(([^)]*)\)", peer_heading)
+            for part in derive.split(",")
+        }
+        if "Clone" in peer_derives:
+            errors.append("engine/connection.rs: PeerStateData must not derive Clone")
+        pending_field = struct_fields(peer_body).get("pending_remote_candidates")
+        if pending_field != ("", "PendingRemoteCandidateQueue"):
+            errors.append(
+                "engine/connection.rs: pending_remote_candidates must be a private observed queue"
+            )
+    peer_clone_impl = re.compile(
+        r"\bimpl(?:\s*<[^>{}]*>)?\s+Clone\s+for\s+"
+        r"(?:[A-Za-z_]\w*\s*::\s*)*PeerStateData\b"
+    )
+    if any(peer_clone_impl.search(text) for text in workspace_masked.values()):
+        errors.append("engine/connection.rs: PeerStateData must not implement Clone")
+
+    for struct_name, expected in (
+        (
+            "PendingRemoteCandidate",
+            {
+                "candidate": ("", "LocalIceCandidate"),
+                "observation": ("", "CandidateObservationLease"),
+            },
+        ),
+        (
+            "PendingRemoteCandidateQueue",
+            {
+                "entries": ("", "Vec<PendingRemoteCandidate>"),
+                "container_observation": ("", "Option<ObservationLease>"),
+            },
+        ),
+    ):
+        try:
+            heading, body = struct_scope(connection_source, struct_name, connection_masked)
+        except ValueError as error:
+            errors.append(f"engine/connection.rs: {error}")
+            continue
+        if struct_name == "PendingRemoteCandidateQueue" and re.search(
+            r"\bpub(?:\s*\([^)]*\))?\s+struct\b", heading
+        ):
+            errors.append(
+                "engine/connection.rs: PendingRemoteCandidateQueue must remain private"
+            )
+        if struct_fields(body) != expected:
+            errors.append(
+                f"engine/connection.rs: {struct_name} ownership fields changed"
+            )
+
+    if re.search(r"\bcandidate\s*\.\s*clone\s*\(", engine_masked):
+        errors.append("engine/mod.rs: inbound remote candidate must be moved, not cloned")
+    if len(re.findall(r"connection\s*::\s*apply_pending_remote_candidate\s*\(", engine_masked)) != 2:
+        errors.append(
+            "engine/mod.rs: queued and immediate candidate application must both be observed"
+        )
+    replacement_cleanup = re.compile(
+        r"if\s+let\s+Some\s*\(\s*replaced\s*\)\s*=\s*"
+        r"peers\s*\.\s*insert\s*\([^)]*\)\s*\{\s*"
+        r"replaced\s*\.\s*discard_pending_remote_candidates\s*\(\s*\)\s*;"
+    )
+    removal_cleanup = re.compile(
+        r"let\s*\(\s*_\s*,\s*peer\s*\)\s*=\s*"
+        r"peers\s*\.\s*remove\s*\([^;]+;\s*"
+        r"peer\s*\.\s*discard_pending_remote_candidates\s*\(\s*\)\s*;"
+    )
+    if not replacement_cleanup.search(engine_masked):
+        errors.append(
+            "engine/mod.rs: peer replacement must explicitly retire queued candidate observations"
+        )
+    if not removal_cleanup.search(engine_masked):
+        errors.append(
+            "engine/mod.rs: peer removal must explicitly retire queued candidate observations"
+        )
+    peer_map_mutations = sum(
+        len(re.findall(r"\bpeers\s*\.\s*(?:insert|remove)\s*\(", text))
+        for text in workspace_masked.values()
+    )
+    if peer_map_mutations != 2:
+        errors.append(
+            "engine/mod.rs: peer map replacement and removal must remain confined to reviewed helpers"
+        )
+    if not re.search(
+        r"let\s+result\s*=\s*apply\s*\(\s*candidate\s*\)\s*\.\s*await\s*;"
+        r"\s*drop\s*\(\s*observation\s*\)\s*;",
+        connection_masked,
+    ):
+        errors.append(
+            "engine/connection.rs: candidate observation must outlive asynchronous application"
+        )
+    if not all(
+        token in connection_masked
+        for token in (
+            "candidate.candidate.capacity()",
+            "size_of::<PendingRemoteCandidate>()",
+            "container_observation",
+        )
+    ):
+        errors.append(
+            "engine/connection.rs: candidate strings and queue container need separate retained-byte observations"
+        )
+
+    scoped_owner_fields = (
+        (
+            "handle.rs",
+            "MeshInner",
+            "resource_scope",
+            "MeshRuntimeResourceScope",
+        ),
+        (
+            "engine/state.rs",
+            "NetworkState",
+            "resource_scope",
+            "MeshContextResourceScope",
+        ),
+        (
+            "engine/connection.rs",
+            "PeerConnection",
+            "resource_scope",
+            "PeerConnectionResourceScope",
+        ),
+    )
+    for owner, struct_name, field_name, field_type in scoped_owner_fields:
+        try:
+            _, body = struct_scope(production[owner], struct_name, production_masked[owner])
+        except ValueError as error:
+            errors.append(f"{owner}: {error}")
+            continue
+        if struct_fields(body).get(field_name) != ("", field_type):
+            errors.append(
+                f"{owner}: {struct_name} must privately own {field_type}"
+            )
+    handle_masked = production_masked["handle.rs"]
+    state_masked = production_masked["engine/state.rs"]
+    process_scope_pattern = re.compile(
+        r"ProcessResourceRoot\s*::\s*global\s*\(\s*\)\s*\.\s*mesh_runtime_scope\s*\(\s*\)"
+    )
+    if len(process_scope_pattern.findall(handle_masked)) != 1:
+        errors.append("handle.rs: Mesh runtime must descend from the process resource root")
+    if len(process_scope_pattern.findall(state_masked)) != 1:
+        errors.append(
+            "engine/state.rs: direct NetworkState construction must descend from the process resource root"
+        )
+    if len(process_scope_pattern.findall(engine_masked)) != 1:
+        errors.append(
+            "engine/mod.rs: direct spawn_network construction must descend from the process resource root"
+        )
+    if not re.search(r"spawn_network_in_mesh_scope\s*\(", handle_masked):
+        errors.append("handle.rs: joined mesh contexts must reuse their Mesh runtime scope")
 
     owner_private_transitions = {
         "runtime/attempt/mod.rs": {"admitted", "from_permit"},
@@ -871,7 +1100,7 @@ def validate(sources: dict[str, str], boundaries: set[str]) -> list[str]:
             errors.append(f"{owner}: {wrapper} exposes its raw legacy value")
         wrapper_trait_owners = [
             path
-            for path, text in workspace_masked.items()
+            for path, text in protected_workspace_masked.items()
             for header in trait_impl_headers(text)
             if re.search(rf"\b{re.escape(wrapper)}\b", header)
         ]
@@ -1404,6 +1633,171 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
         )
     )
 
+    clone_peer_state = copy.deepcopy(sources)
+    clone_peer_state["engine/connection.rs"] = clone_peer_state[
+        "engine/connection.rs"
+    ].replace(
+        "#[derive(Debug)]\npub struct PeerStateData",
+        "#[derive(Debug, Clone)]\npub struct PeerStateData",
+        1,
+    )
+    cases.append(
+        (
+            "cloneable peer state",
+            clone_peer_state,
+            boundaries,
+            "PeerStateData must not derive Clone",
+        )
+    )
+
+    manual_peer_clone = copy.deepcopy(sources)
+    manual_peer_clone["engine/connection.rs"] += (
+        "\nimpl Clone for PeerStateData {"
+        " fn clone(&self) -> Self { PeerStateData::default() } }\n"
+    )
+    cases.append(
+        (
+            "manual peer-state clone",
+            manual_peer_clone,
+            boundaries,
+            "PeerStateData must not implement Clone",
+        )
+    )
+
+    public_candidate_queue = copy.deepcopy(sources)
+    public_candidate_queue["engine/connection.rs"] = public_candidate_queue[
+        "engine/connection.rs"
+    ].replace(
+        "    pending_remote_candidates: PendingRemoteCandidateQueue,",
+        "    pub pending_remote_candidates: PendingRemoteCandidateQueue,",
+        1,
+    )
+    cases.append(
+        (
+            "public candidate queue",
+            public_candidate_queue,
+            boundaries,
+            "pending_remote_candidates must be a private observed queue",
+        )
+    )
+
+    cloned_remote_candidate = copy.deepcopy(sources)
+    cloned_remote_candidate["engine/mod.rs"] = cloned_remote_candidate[
+        "engine/mod.rs"
+    ].replace(
+        "peer.queue_remote_candidate(&mut data, candidate);",
+        "peer.queue_remote_candidate(&mut data, candidate.clone());",
+        1,
+    )
+    cases.append(
+        (
+            "cloned remote candidate",
+            cloned_remote_candidate,
+            boundaries,
+            "inbound remote candidate must be moved, not cloned",
+        )
+    )
+
+    unobserved_application = copy.deepcopy(sources)
+    unobserved_application["engine/mod.rs"] = unobserved_application[
+        "engine/mod.rs"
+    ].replace(
+        "connection::apply_pending_remote_candidate(",
+        "connection::apply_remote_candidate_without_observation(",
+        1,
+    )
+    cases.append(
+        (
+            "unobserved candidate application",
+            unobserved_application,
+            boundaries,
+            "queued and immediate candidate application must both be observed",
+        )
+    )
+
+    retained_replaced_queue = copy.deepcopy(sources)
+    retained_replaced_queue["engine/mod.rs"] = retained_replaced_queue[
+        "engine/mod.rs"
+    ].replace(
+        "        replaced.discard_pending_remote_candidates();",
+        "        drop(replaced);",
+        1,
+    )
+    cases.append(
+        (
+            "retained queue after peer replacement",
+            retained_replaced_queue,
+            boundaries,
+            "peer replacement must explicitly retire queued candidate observations",
+        )
+    )
+
+    retained_removed_queue = copy.deepcopy(sources)
+    retained_removed_queue["engine/mod.rs"] = retained_removed_queue[
+        "engine/mod.rs"
+    ].replace(
+        "    peer.discard_pending_remote_candidates();",
+        "    let _retired_peer = &peer;",
+        1,
+    )
+    cases.append(
+        (
+            "retained queue after peer removal",
+            retained_removed_queue,
+            boundaries,
+            "peer removal must explicitly retire queued candidate observations",
+        )
+    )
+
+    broken_resource_hierarchy = copy.deepcopy(sources)
+    broken_resource_hierarchy["resource/mod.rs"] = broken_resource_hierarchy[
+        "resource/mod.rs"
+    ].replace(
+        "for scope in self.path.iter() {",
+        "for scope in self.path.iter().skip(1) {",
+        1,
+    )
+    cases.append(
+        (
+            "resource observation skips process root",
+            broken_resource_hierarchy,
+            boundaries,
+            "leaf observations do not update their ancestor path",
+        )
+    )
+
+    detached_mesh_scope = copy.deepcopy(sources)
+    detached_mesh_scope["handle.rs"] = detached_mesh_scope["handle.rs"].replace(
+        "ProcessResourceRoot::global().mesh_runtime_scope()",
+        "ResourceAccountant::observation_only()",
+        1,
+    )
+    cases.append(
+        (
+            "Mesh runtime detached from process root",
+            detached_mesh_scope,
+            boundaries,
+            "Mesh runtime must descend from the process resource root",
+        )
+    )
+
+    detached_direct_spawn = copy.deepcopy(sources)
+    detached_direct_spawn["engine/mod.rs"] = detached_direct_spawn[
+        "engine/mod.rs"
+    ].replace(
+        "ProcessResourceRoot::global().mesh_runtime_scope()",
+        "ResourceAccountant::observation_only()",
+        1,
+    )
+    cases.append(
+        (
+            "direct spawn detached from process root",
+            detached_direct_spawn,
+            boundaries,
+            "direct spawn_network construction must descend from the process resource root",
+        )
+    )
+
     global_accountant = copy.deepcopy(sources)
     global_accountant["resource/mod.rs"] += "\nstatic GLOBAL_COUNT: u64 = 0;\n"
     cases.append(
@@ -1411,7 +1805,7 @@ def negative_controls(sources: dict[str, str], boundaries: set[str]) -> list[str
             "global accountant",
             global_accountant,
             boundaries,
-            "process-global accounting state",
+            "exactly one typed process observation root",
         )
     )
 
@@ -1480,15 +1874,16 @@ def main() -> int:
             "legacy-bypass, alias-bypass, "
             "raw-identifier bypass, parenthesized bypass, where-clause bypass, "
             "wrapper-trait, runtime-binding, "
-            "compile-control, boundary, global-accountant, and resource-policy faults "
+            "compile-control, boundary, candidate-ownership, hierarchy, "
+            "global-accountant, and resource-policy faults "
             "were rejected."
         )
     else:
         print(
-            "V4 Arc 02 foundation source gate passed: 10 target-owned authority types, "
+            "V4 Arc 02A and 02B source gate passed: 10 target-owned authority types, "
             "reviewed production fingerprints, private fields, runtime binding, "
-            "owner-private transitions, no production SessionCapability mint, and "
-            "confined legacy adapters."
+            "owner-private transitions, no production SessionCapability mint, "
+            "confined legacy adapters, fixed observation scopes, and observed remote candidates."
         )
     return 0
 

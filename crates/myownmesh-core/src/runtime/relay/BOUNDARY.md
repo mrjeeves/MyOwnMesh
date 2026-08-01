@@ -30,7 +30,7 @@ Pre-authentication relay attempts and post-authentication relay data use separat
 
 ## Restart behavior
 
-Allocation permits and live allocations are memory-only and tied to one runtime. A process restart destroys them. After a same-process runtime replacement, a future consumer must compare their witness with the current Runtime Supervisor witness before use. Public destinations, route labels, and stored records cannot recreate them.
+Possession of an allocation permit grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Allocation permits and live allocations are memory-only and disappear on process restart. Public destinations, route labels, and stored records cannot recreate them.
 
 ## Forbidden responsibilities
 
