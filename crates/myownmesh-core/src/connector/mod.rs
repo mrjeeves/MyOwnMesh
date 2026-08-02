@@ -1,7 +1,7 @@
 //! Capability boundary for connector-owned channel establishment.
 //!
 //! This Arc 02 module adds the ownership transition only. Existing WebRTC,
-//! ICE, TURN, and connection behavior remain unchanged until Arc 03.
+//! Arc 03 wraps the existing ICE, TURN, and connection behavior in this owner.
 
 use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;
@@ -42,13 +42,30 @@ pub struct ConnectedChannelCapability {
 pub(crate) fn mark_connected(
     candidate: ConnectorCandidateCapability,
 ) -> Option<ConnectedChannelCapability> {
-    candidate.promote_if_live(|candidate| ConnectedChannelCapability { candidate })
+    try_mark_connected(candidate).ok()
+}
+
+/// Attempt the exact candidate-to-connected resource transition while
+/// returning the still-owned candidate when retirement or admission wins the
+/// race. Cleanup can then retain that child claim through native close.
+#[allow(
+    clippy::result_large_err,
+    reason = "boxing the move-only cleanup claim would add an unaccounted allocation"
+)]
+pub(crate) fn try_mark_connected(
+    candidate: ConnectorCandidateCapability,
+) -> std::result::Result<ConnectedChannelCapability, ConnectorCandidateCapability> {
+    candidate.try_promote_if_live(|candidate| ConnectedChannelCapability { candidate })
 }
 
 #[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
 impl ConnectedChannelCapability {
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
         self.candidate.runtime()
+    }
+
+    pub(crate) fn into_candidate(self) -> ConnectorCandidateCapability {
+        self.candidate
     }
 }
 

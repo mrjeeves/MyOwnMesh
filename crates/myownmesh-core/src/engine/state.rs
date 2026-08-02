@@ -23,7 +23,7 @@ use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
 use crate::transport::webrtc::{AudioSample, VideoSample};
-use crate::transport::{LocalIceCandidate, Transport, WebRtcConnectorEvent};
+use crate::transport::{LocalIceCandidate, Transport};
 
 use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
@@ -90,9 +90,9 @@ fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
     intent.next_retry_at = now + std::time::Duration::from_millis(step);
 }
 
-/// Engine command queue entry. Anything that mutates per-peer
-/// state, sends a frame, or reconfigures the network goes through
-/// here so the driver loop handles it serially.
+/// General engine command queue entry. Application requests and network
+/// reconfiguration use this serialized path. Connector events remain on their
+/// bounded per-worker runtime path and do not enter this enum.
 pub enum NetworkCmd {
     /// Stop the engine and tear down all peer sessions.
     Shutdown,
@@ -113,12 +113,6 @@ pub enum NetworkCmd {
     /// `Dropped` event.
     DropPeer {
         device_id: String,
-        reason: DropReason,
-    },
-    /// Drop only the exact process-local peer owner captured by delayed work.
-    /// A replacement under the same public device id is not affected.
-    DropPeerIfCurrent {
-        owner: PeerOwnerToken,
         reason: DropReason,
     },
     /// Manually triggered in-place reconnect — the non-destructive twin of a
@@ -202,16 +196,6 @@ pub enum NetworkCmd {
         caps: CapabilityAdvert,
         reply: oneshot::Sender<usize>,
     },
-    /// Per-peer transport event — pumped in from the per-peer
-    /// transport task so the driver loop processes everything
-    /// serially.
-    TransportEvent {
-        device_id: String,
-        /// Exact process-local connector ownership stamp. It carries no
-        /// application or admission authority.
-        event: WebRtcConnectorEvent,
-    },
-
     // ---- governance (closed networks) ----
     /// Float a new signed transition. The engine signs with the
     /// local identity, persists the proposal to the governance
@@ -309,7 +293,6 @@ impl SignalingInbound {
 /// replace, remove, or retire peers. Every ownership exit explicitly ends the
 /// connector worker even when another task retains an external
 /// `Arc<PeerConnection>`.
-#[derive(Default)]
 pub(super) struct PeerRegistry {
     peers: DashMap<String, PeerRegistryEntry>,
     mutation: Mutex<()>,
@@ -335,6 +318,15 @@ pub struct PeerOwnerToken {
 impl PeerOwnerToken {
     pub(crate) fn device_id(&self) -> &str {
         &self.peer.device_id
+    }
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        Self {
+            peers: DashMap::new(),
+            mutation: Mutex::new(()),
+        }
     }
 }
 
@@ -1295,6 +1287,16 @@ impl NetworkState {
     /// higher-level [`crate::JoinedNetwork::roster_approve`])
     /// to actually emit the `approve` frame.
     pub async fn approve_roster(&self, device_id: &str, label: &str) -> Result<()> {
+        self.approve_roster_now(device_id, label)
+    }
+
+    /// Synchronous roster commit used by an already-serialized runtime owner.
+    ///
+    /// The public compatibility operation remains async, but the underlying
+    /// roster mutation and file replacement contain no await point. Arc 03
+    /// uses this form while holding the exact peer-installation fence so a
+    /// replacement cannot land between owner validation and persistence.
+    pub(super) fn approve_roster_now(&self, device_id: &str, label: &str) -> Result<()> {
         // Defense in depth behind the handshake's eviction gate: on a
         // closed network a device the signed state evicted can't be
         // rostered by ANY path — not mutual-ACTIVE persistence, not a
@@ -1415,12 +1417,10 @@ impl NetworkState {
     /// driver's shutdown path.
     pub(crate) async fn shutdown(&self) {
         let retired = self.peers.retire_all();
-        let sessions: Vec<_> = retired
-            .iter()
-            .filter_map(|peer| peer.session.lock().clone())
-            .collect();
-        for s in sessions {
-            let _ = s.retire_and_close().await;
+        for peer in &retired {
+            if let Err(error) = peer.retire_and_close().await {
+                tracing::warn!(%error, peer = %peer.device_id, "peer cleanup failed during shutdown");
+            }
         }
         drop(retired);
         // Nothing outlives the engine: parked connect waits and queued
@@ -1456,12 +1456,6 @@ impl NetworkState {
     /// mutation. See [`super::network_watch::reconnect_all_in_place`].
     pub fn reconnect(&self, peer: Option<String>) {
         let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
-    }
-
-    pub(crate) fn request_drop_if_current(&self, owner: PeerOwnerToken, reason: DropReason) {
-        let _ = self
-            .cmd_tx
-            .send(NetworkCmd::DropPeerIfCurrent { owner, reason });
     }
 
     /// Queue a deliberate offerer-side dial of exactly one peer on the engine

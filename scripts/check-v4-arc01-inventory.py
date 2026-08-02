@@ -171,24 +171,73 @@ def blank_range(chars: list[str], start: int, end: int) -> None:
             chars[pos] = " "
 
 
+@functools.lru_cache(maxsize=None)
 def production_text(text: str) -> str:
     """Blank items guarded by cfg(test), including in-file test modules."""
 
     masked = mask_rust(text)
     chars = list(text)
     attr_re = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+    block_item_re = re.compile(
+        r"(?:(?:pub(?:\s*\([^)]*\))?)\s+)?"
+        r"(?:(?:async|unsafe|const)\s+)*"
+        r"(?:extern(?:\s+\"[^\"]*\")?\s+)?"
+        r"(?:fn|mod|impl|trait|struct|enum|union|if|match|while|for|loop)\b"
+    )
     for match in attr_re.finditer(masked):
         cursor = match.end()
         while cursor < len(masked) and masked[cursor].isspace():
             cursor += 1
-        brace = masked.find("{", cursor)
-        semi = masked.find(";", cursor)
-        if semi >= 0 and (brace < 0 or semi < brace):
-            blank_range(chars, match.start(), semi + 1)
-            continue
-        if brace >= 0:
+        while cursor < len(masked) and masked[cursor] == "#":
+            opening = masked.find("[", cursor)
+            if opening < 0:
+                break
+            depth = 0
+            attribute_end = None
+            for pos in range(opening, len(masked)):
+                if masked[pos] == "[":
+                    depth += 1
+                elif masked[pos] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        attribute_end = pos + 1
+                        break
+            if attribute_end is None:
+                raise ValueError(f"unclosed attribute at byte {cursor}")
+            cursor = attribute_end
+            while cursor < len(masked) and masked[cursor].isspace():
+                cursor += 1
+        if block_item_re.match(masked, cursor):
+            brace = masked.find("{", cursor)
+            if brace < 0:
+                raise ValueError(f"cfg(test) block item has no body at byte {cursor}")
             end = matching_brace(masked, brace)
             blank_range(chars, match.start(), end + 1)
+            continue
+
+        # A cfg-gated struct field or enum variant ends at its top-level
+        # comma. A use, type, const, or statement ends at its top-level
+        # semicolon. Do not search for the next brace: for a field, that brace
+        # can be the enclosing struct close or the next production item.
+        depths = {"(": 0, "[": 0, "<": 0, "{": 0}
+        closes = {")": "(", "]": "[", ">": "<", "}": "{"}
+        end = None
+        for pos in range(cursor, len(masked)):
+            char = masked[pos]
+            if char in depths:
+                depths[char] += 1
+            elif char in closes:
+                opener = closes[char]
+                if depths[opener] > 0:
+                    depths[opener] -= 1
+                elif char == "}":
+                    break
+            elif char in ",;" and not any(depths.values()):
+                end = pos + 1
+                break
+        if end is None:
+            raise ValueError(f"cfg(test) member has no terminator at byte {cursor}")
+        blank_range(chars, match.start(), end)
     return "".join(chars)
 
 

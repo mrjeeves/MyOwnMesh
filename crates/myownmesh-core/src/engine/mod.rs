@@ -301,9 +301,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::DropPeer { device_id, reason } => {
             drop_peer(state, &device_id, reason).await;
         }
-        NetworkCmd::DropPeerIfCurrent { owner, reason } => {
-            drop_peer_if_current(state, &owner, reason).await;
-        }
         NetworkCmd::Reconnect { peer } => match peer {
             Some(device_id) => network_watch::reconnect_peer_in_place(state, &device_id).await,
             None => network_watch::reconnect_all_in_place(state).await,
@@ -377,10 +374,6 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
         NetworkCmd::BroadcastCapabilities { caps, reply } => {
             let _ = reply.send(broadcast_capabilities(state, caps).await);
         }
-        NetworkCmd::TransportEvent { device_id, event } => {
-            handle_transport_event(state, device_id, event).await;
-        }
-
         // ---- governance ops ----
         NetworkCmd::ProposeTransition {
             variant,
@@ -1381,18 +1374,19 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
     debug!(peer = %short_peer(&device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
-    let (session, mut rx) = match state
-        .transport
-        .open_connector_peer(
+    let construction = tokio::time::timeout(
+        Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+        state.transport.open_connector_peer(
             role,
             &cfg.stun_servers,
             &cfg.turn_servers,
             state.peer_connection_resource_scope(),
-        )
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
+        ),
+    )
+    .await;
+    let (session, mut rx) = match construction {
+        Ok(Ok(peer)) => peer,
+        Ok(Err(e)) => {
             state.log_diag_with(
                 crate::events::DiagLevel::Error,
                 "transport",
@@ -1400,6 +1394,22 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
                 serde_json::json!({ "peer": device_id, "error": e.to_string() }),
             );
             warn!(peer = %device_id, "open_peer failed: {e}");
+            return;
+        }
+        Err(_) => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Error,
+                "transport",
+                format!(
+                    "open_peer for {} did not complete within the existing {} ms connection-attempt window",
+                    short_peer(&device_id),
+                    scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS
+                ),
+                serde_json::json!({
+                    "peer": device_id,
+                    "timeout_ms": scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS,
+                }),
+            );
             return;
         }
     };
@@ -1481,25 +1491,17 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         }
     }
 
-    // Per-peer transport-event pump. Forwards every event into
-    // the main driver via the command queue so all per-peer state
-    // mutation happens serially. The receiver stamps each value with the
-    // exact connector worker identity that owns its callback source.
-    let driver_tx = state.cmd_tx.clone();
+    // Per-peer transport-event pump. It handles one event at a time from the
+    // worker's bounded mailbox. Connector events never enter the unbounded
+    // general command queue. The receiver stamps each value with the exact
+    // connector worker identity that owns its callback source.
+    let connector_state = Arc::clone(state);
     let peer_id_for_pump = device_id.clone();
     let task_observation = session.observe_owned_task();
     tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(ev) = rx.recv().await {
-            if driver_tx
-                .send(NetworkCmd::TransportEvent {
-                    device_id: peer_id_for_pump.clone(),
-                    event: ev,
-                })
-                .is_err()
-            {
-                break;
-            }
+            handle_transport_event(&connector_state, peer_id_for_pump.clone(), ev).await;
         }
     });
 }
@@ -1819,25 +1821,30 @@ async fn handle_transport_event(
             if state.peers.get_if_current(&owner).is_none() {
                 return;
             }
-            let open = worker.confirm_data_channel_open();
-            match open {
+            let connected = match worker.confirm_data_channel_open() {
                 DataChannelOpenOwnership::Rejected => {
                     trace!(peer = %device_id, "ignoring DataChannelOpen without a live connector owner");
                     return;
                 }
-                DataChannelOpenOwnership::CompatibilityBypass => {
-                    trace!(peer = %device_id, "DataChannelOpen used the explicit Arc 03 compatibility bypass");
+                DataChannelOpenOwnership::AlreadyConnected => {
+                    trace!(peer = %device_id, "ignoring duplicate DataChannelOpen for the exact connector owner");
+                    return;
                 }
-                DataChannelOpenOwnership::ConnectedCapabilityRetained => {}
-            }
+                DataChannelOpenOwnership::Connected(connected) => connected,
+            };
+            let auth_task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(connected));
             // The reliable "transport is up" milestone — record it so the
             // connect-timeout watchdog knows this session made it, and stops
             // counting it as a connecting peer that might need rebuilding.
             let accepted = state.peers.with_current(&owner, |peer| {
+                if !peer.install_endpoint_auth(Arc::clone(&auth_task)) {
+                    return false;
+                }
                 peer.state.write().data_channel_open = true;
                 state.clear_reconnect_intent(&device_id);
+                true
             });
-            if accepted.is_none() {
+            if accepted != Some(true) {
                 return;
             }
             // The link is back — retire any reconnect intent we were driving
@@ -1851,7 +1858,7 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id }),
             );
-            handshake::initiate(state, &owner).await;
+            handshake::initiate(state, &owner, auth_task).await;
         }
         TransportEvent::DataChannelClosed => {
             // A channel that closes right after we hand an evicted peer its
@@ -2302,7 +2309,7 @@ async fn handle_pc_state_change(
 /// above any real handshake / roster / governance / RPC / user-channel frame —
 /// so it only ever bites a pathological one. (Per-peer byte-rate budgets are a
 /// deeper follow-up; this is the hard per-frame ceiling.)
-const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether an inbound frame is small enough to decode. Split out so the
 /// [`MAX_INBOUND_FRAME_BYTES`] boundary is unit-tested.
@@ -3092,7 +3099,7 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
                 ),
                 serde_json::json!({ "peer": device_id }),
             );
-            state.request_drop_if_current(owner, crate::events::DropReason::HeartbeatTimeout);
+            drop_peer_if_current(&state, &owner, crate::events::DropReason::HeartbeatTimeout).await;
             // Re-seed discovery so the rebuilt peer reconnects on the next
             // round-trip rather than waiting for its own announce schedule.
             maybe_reactive_announce(&state);
@@ -3107,14 +3114,12 @@ async fn finish_drop_peer(
     removed: Option<Arc<PeerConnection>>,
 ) {
     if let Some(peer) = removed {
-        let session = peer.session.lock().clone();
-        if let Some(session) = session {
-            // Spawn the close so the driver loop never blocks on
-            // the WebRTC teardown's potentially-slow path.
-            tokio::spawn(async move {
-                let _ = session.retire_and_close().await;
-            });
-        }
+        let cleanup_peer = Arc::clone(&peer);
+        tokio::spawn(async move {
+            if let Err(error) = cleanup_peer.retire_and_close().await {
+                warn!(%error, "peer cleanup did not complete successfully");
+            }
+        });
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
@@ -3208,15 +3213,11 @@ fn install_peer(peers: &state::PeerRegistry, peer: Arc<PeerConnection>) {
     let Some(replaced) = peers.install(peer) else {
         return;
     };
-    let session = replaced.session.lock().clone();
-    if let Some(session) = session {
-        // Replacement is already committed and callback admission is already
-        // retired. Close dependency-owned WebRTC state without parking the
-        // driver on teardown.
-        tokio::spawn(async move {
-            let _ = session.retire_and_close().await;
-        });
-    }
+    tokio::spawn(async move {
+        if let Err(error) = replaced.retire_and_close().await {
+            warn!(%error, "replaced peer cleanup did not complete successfully");
+        }
+    });
 }
 
 /// Remove the current peer owner and retire its compatibility queue before the

@@ -256,6 +256,7 @@ pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
+    endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
     /// attempt, resource, or application authority.
@@ -271,6 +272,7 @@ impl PeerConnection {
             device_id,
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
+            endpoint_auth: Mutex::new(None),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -285,12 +287,56 @@ impl PeerConnection {
     /// External `Arc` holders cannot keep callbacks or queued candidates live.
     pub(super) fn retire_connector(&self) {
         self.registry_retired.store(true, Ordering::Release);
-        if let Some(worker) = self.session.lock().as_ref() {
+        let worker = self.session.lock().clone();
+        if let Some(worker) = worker {
             worker.retire();
         }
     }
 
+    /// Fence the exact connector, await its single native cleanup owner, then
+    /// release Endpoint Auth Task's connected-channel claim.
+    pub(super) async fn retire_and_close(&self) -> crate::Result<()> {
+        self.retire_connector();
+        let worker = self.session.lock().clone();
+        let result = match worker {
+            Some(worker) => worker.retire_and_close().await,
+            None => Ok(()),
+        };
+        drop(self.endpoint_auth.lock().take());
+        result
+    }
+
     pub(super) fn registry_retired(&self) -> bool {
         self.registry_retired.load(Ordering::Acquire)
+    }
+
+    pub(super) fn install_endpoint_auth(
+        &self,
+        task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> bool {
+        let exact_connector = self
+            .session
+            .lock()
+            .as_ref()
+            .is_some_and(|worker| worker.owns_endpoint_auth(&task));
+        if !exact_connector {
+            return false;
+        }
+        let mut current = self.endpoint_auth.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(task);
+        true
+    }
+
+    pub(super) fn endpoint_auth_is_current(
+        &self,
+        task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> bool {
+        self.endpoint_auth
+            .lock()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, task))
     }
 }

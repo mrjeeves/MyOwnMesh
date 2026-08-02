@@ -15,6 +15,18 @@ categories = ["network-programming", "asynchronous"]
 name = "myownmesh_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+transport-lab = []
+
+[[example]]
+name = "spin_min"
+required-features = ["transport-lab"]
+
+[[example]]
+name = "spin_probe"
+required-features = ["transport-lab"]
+
 [dependencies]
 myownmesh-signaling = { workspace = true }
 

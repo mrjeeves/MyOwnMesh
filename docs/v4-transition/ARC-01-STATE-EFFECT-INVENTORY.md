@@ -1,6 +1,6 @@
 # V4 Arc 01 state and effect inventory
 
-Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with current coverage through the first Arc 03 WebRTC Connector Worker, exact-owner registry, approval-convergence, and owner-bound reliable-outbound slice.
+Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with current coverage through the Arc 03 WebRTC Connector Worker implementation.
 
 This inventory refresh changes no product behavior and deletes no code. It records the ownership seams that later implementation arcs must reduce. The checker opens no listener, peer connection, firewall rule, or live MyOwnMesh instance.
 
@@ -15,13 +15,13 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. The current fingerprints cover that baseline, the linked Arc 02 capability and resource-observation modules, and the first Arc 03 ownership, approval-convergence, and owner-bound reliable-outbound slice:
+The baseline commit remains fixed. The current fingerprints cover that baseline, the linked Arc 02 capability and resource-observation modules, and the Arc 03 WebRTC connector-owner implementation:
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `1705568c74a833a8153276edabc9105eec11ab8a38b5552106a48da6e573b83b` |
-| Production Rust declaration members | 1,649 | `48fbd038c0321ff724150bffa33458ae097ef694b3b8d20d5e9771c8ea0ad939` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,771 | `b25c57ba260191eacd12ae6561d99c320c4105400f27999141a973113332cc57` |
+| Production Rust source units | 106 | `7179a4984d83dc6a75327da239ae9720e7df8fae6a10f69424f74cdaebb3f57c` |
+| Production Rust declaration members | 1,717 | `937eda9e821c2ff6cc2b83d2bba7e7084449c2d04df97f94a500e45a4e2061be` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,861 | `25ba2122af69341da58c0e53cfedfc23ead9ce2bbcd066d70ceb4471eb044fde` |
 | Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |
 | Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
@@ -36,22 +36,22 @@ The assignment counts are records, not architectural sizing targets.
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
 | Application Gateway | 348 | 156 |
-| Attempt Node | 59 | 36 |
-| Connector Worker | 89 | 114 |
-| Endpoint Auth Task | 30 | 13 |
+| Attempt Node | 57 | 40 |
+| Connector Worker | 157 | 187 |
+| Endpoint Auth Task | 33 | 15 |
 | Peer Session Node | 73 | 53 |
 | Reachability Node | 173 | 54 |
 | Relay Node | 38 | 40 |
 | Runtime Supervisor | 57 | 22 |
-| Semantic Node | 117 | 106 |
-| Session Broker | 21 | 14 |
+| Semantic Node | 117 | 111 |
+| Session Broker | 21 | 15 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
 | Resource instrumentation domain | 106 | 55 |
 | Delete | 23 | 25 |
-| Split | 87 | 377 |
+| Split | 86 | 382 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
 | Decision: OD-DEVICE-KEY-CUSTODY | 13 | 33 |
 | Decision: OD-LEGACY-SILENT-MIGRATION | 1 | 0 |
@@ -86,11 +86,11 @@ The same rule applies to `PeerStateData`. Endpoint authentication, policy promot
 
 These findings are confirmed from the current input source. Items that depend on operating-system reachability or a hostile network service still require dynamic reproduction before final severity is assigned.
 
-### 1. Pre-authentication media reaches application subscribers
+### 1. Arc 03 now stops pre-authentication media before application delivery
 
-WebRTC sessions provision media before endpoint authentication, and their track pumps emit `VideoSample` and `AudioSample` events. The engine dispatches those events to application subscribers without an admission or session-capability check at [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L1840). Endpoint authentication begins only after the data channel opens at [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L1794).
+WebRTC sessions still provision the existing native media primitives before endpoint authentication. Arc 03 now discards remote audio before event creation and remote video before H.264 access-unit assembly until the exact connector is activated. The engine's existing admission check remains a second boundary before application delivery.
 
-This is a direct Arc 05 and Arc 06 blocker. Transport may perform bounded work before authentication, but application delivery may not occur before Session Broker promotion.
+This closes the original application-delivery finding for the admitted connector path. It does not establish a complete hostile-input budget for dependency-owned RTP work before that gate.
 
 ### 2. Ordinary members forward application payload and may assert an origin
 
@@ -106,9 +106,9 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. The first Arc 03 slice places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through the handshake and approval paths. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Activation requires authentication and both facts. Activation follow-ups recheck the exact owner, and reliable outbox flushing requires an admitted open channel and uses the exact-owner send path. The slice retains the Arc 02 aggregate attempt-reservation primitive. No production capacity has been selected, and production still uses the explicit compatibility state rather than an admitted connector candidate. The transport event queue, global command queue, and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 03 places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through handshake, approval, roster persistence, waiter completion, reconnect cleanup, and reliable-send effects. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Production no longer uses the compatibility state. It constructs the connector through an admitted candidate, promotes the exact data channel, and moves the resulting capability into an exact-incarnation `EndpointAuthTask`. Connector callbacks use a bounded per-worker mailbox and ordered per-worker handler rather than the unbounded general command queue. The global command queue remains unbounded for its existing non-connector commands. The observed pre-SDP candidate queue and several signaling queues also remain unbounded at process scope. RPC streaming uses an unbounded queue and detached request tasks.
 
-This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 moves ownership and adds cancellation guards without inventing production enforcement values. Admitted production construction remains disabled until the recorded cancellation, queue, and capacity gaps are resolved.
+This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 now enforces connector ownership, cancellation, exact promotion, and per-worker backpressure without inventing process-wide admission values. Complete anonymous-ingress and global resource admission remains unresolved.
 
 ### 5. Nostr inbound events are trusted beyond their proven carrier facts
 
@@ -166,7 +166,7 @@ The consistency check belongs with the selected identity foundation. It is indep
 
 ## Resource inventory
 
-The source scanner records 19 unbounded channel constructions, and every one has exactly one structured resource record. The audited collections and work sources also include:
+The source scanner records 18 unbounded channel constructions, and every one has exactly one structured resource record. The audited collections and work sources also include:
 
 - peer, connection, subscription, pending-request, candidate, and presence maps or vectors;
 - one task per control or signaling connection in several paths;
@@ -195,11 +195,11 @@ The full questions are in the JSON. The unresolved decisions are:
 10. Early signaling authentication and its allowed speculative-work vector.
 11. Ownership of network-change recovery policy after observation is separated from restart effects.
 
-These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types, resource instrumentation, or the first Arc 03 ownership wrapper. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
+These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types, resource instrumentation, or the Arc 03 ownership implementation. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
 
 ## Boundary documents
 
-Arc 01 created no target implementation module. Arc 02 and the first Arc 03 slice use seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
+Arc 01 created no target implementation module. Arc 02 and Arc 03 use seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
 
 - `application_gateway`;
 - `connector`;
@@ -219,4 +219,4 @@ The `runtime/mod.rs` namespace owns the memory-only runtime-incarnation witness 
 - This inventory refresh changed no product code.
 - The exact baseline and input fingerprints are recorded.
 
-The linked Arc 02 foundation and the first Arc 03 WebRTC ownership, approval-convergence, and owner-bound reliable-outbound slice are now covered by this gate. Arc 03 wraps the existing WebRTC work, moves remote-candidate and callback ownership into `WebRtcConnectorWorker`, adds exact local retirement and installation identities, carries exact peer ownership through handshake, activation, and the reliable activation follow-up, and keeps production on the explicit compatibility path. It does not enable admitted production construction, choose resource limits, bound the remaining queues or cleanup tasks, or establish full behavior preservation.
+The linked Arc 02 foundation and Arc 03 WebRTC ownership, approval convergence, and owner-bound reliable-outbound implementation are covered by this gate. Arc 03 wraps the existing WebRTC work, moves remote-candidate and callback ownership into `WebRtcConnectorWorker`, adds exact local retirement and installation identities, carries exact peer ownership through handshake and activation, and uses admitted production construction. It does not choose process resource limits, bound the remaining observed and dependency-owned resources, or substitute this inventory for the supported-platform behavior matrix.

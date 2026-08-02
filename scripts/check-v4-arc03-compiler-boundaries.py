@@ -44,12 +44,23 @@ fn main() { let _ = std::mem::size_of::<WebRtcConnectorWorker>(); }
         "E0603",
         ("WebRtcConnectorWorker", "private"),
     ),
+    RejectedProbe(
+        "raw_peer_constructor_is_not_production_api",
+        """use myownmesh_core::transport::{Role, Transport};
+async fn bypass(transport: &Transport) {
+    let _ = transport.open_peer(Role::Offerer, &[], &[]).await; // expected-error
+}
+fn main() {}
+""",
+        "E0599",
+        ("open_peer", "not found"),
+    ),
 )
 
 
 POSITIVE_SOURCE = """use myownmesh_core::transport::{LocalIceCandidate, PeerSession};
-fn public_compatibility_surface(_: &PeerSession, _: LocalIceCandidate) {}
-fn main() { let _ = public_compatibility_surface; }
+fn public_diagnostic_types(_: &PeerSession, _: LocalIceCandidate) {}
+fn main() { let _ = public_diagnostic_types; }
 """
 
 
@@ -187,7 +198,7 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        "control and two cause-matched rejection controls."
+        "control and three cause-matched rejection controls."
     )
     return 0
 

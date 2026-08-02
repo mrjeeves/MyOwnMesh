@@ -1,7 +1,7 @@
 //! Capability boundary for one bounded connection attempt.
 //!
-//! This Arc 02 module adds authority types only. It does not redirect the
-//! current attempt runtime or change transport behavior.
+//! The attempt owner admits connector candidates before allocation, retires
+//! losing work, and transfers an exact child claim when a candidate connects.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,6 +71,22 @@ impl PreAuthResourceClaim {
         })
     }
 
+    fn componentwise_max(self, other: Self) -> Self {
+        let mut maximum = Self::ZERO;
+        for family in PreAuthResourceFamily::ALL {
+            let index = family.index();
+            let left = self.by_family[index];
+            let right = other.by_family[index];
+            maximum.by_family[index] = ResourceUse::observed(
+                left.items().max(right.items()),
+                left.logical_bytes().max(right.logical_bytes()),
+                left.retained_bytes().max(right.retained_bytes()),
+                left.tasks().max(right.tasks()),
+            );
+        }
+        maximum
+    }
+
     #[cfg(test)]
     fn for_family(self, family: PreAuthResourceFamily) -> ResourceUse {
         self.by_family[family.index()]
@@ -83,8 +99,9 @@ impl PreAuthResourceClaim {
 /// policy: one connector candidate owns one transport object. It does not
 /// decide the remaining per-family quantities or any production capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ConnectorCandidateResourceClaim {
-    resources: PreAuthResourceClaim,
+pub(crate) struct ConnectorCandidateResourceClaim {
+    opening: PreAuthResourceClaim,
+    connected: PreAuthResourceClaim,
 }
 
 impl ConnectorCandidateResourceClaim {
@@ -92,9 +109,34 @@ impl ConnectorCandidateResourceClaim {
         dead_code,
         reason = "production construction waits for owner-approved per-family measurements"
     )]
-    fn checked(resources: PreAuthResourceClaim) -> Option<Self> {
-        let transport = resources.by_family[PreAuthResourceFamily::TransportObject.index()];
-        (transport.items() == 1).then_some(Self { resources })
+    fn checked(opening: PreAuthResourceClaim, connected: PreAuthResourceClaim) -> Option<Self> {
+        let opening_transport = opening.by_family[PreAuthResourceFamily::TransportObject.index()];
+        let connected_transport =
+            connected.by_family[PreAuthResourceFamily::TransportObject.index()];
+        (opening_transport.items() == 1 && connected_transport.items() == 1)
+            .then_some(Self { opening, connected })
+    }
+
+    /// The mechanically fixed Arc 03 claim. It describes the one native peer
+    /// connection and one connector-construction operation whose ownership
+    /// this arc can prove. It is not a complete WebRTC allocation budget and
+    /// does not select a process-wide admission limit.
+    pub(crate) fn exact_connector_floor() -> Self {
+        let transport = PreAuthResourceClaim::single(
+            PreAuthResourceFamily::TransportObject,
+            ResourceUse::observed(1, 0, 0, 0),
+        );
+        let mut opening = transport;
+        opening.by_family[PreAuthResourceFamily::ConnectorSpecificWork.index()] =
+            ResourceUse::observed(1, 0, 0, 0);
+        Self {
+            opening,
+            connected: transport,
+        }
+    }
+
+    fn aggregate_capacity(self) -> PreAuthResourceClaim {
+        self.opening.componentwise_max(self.connected)
     }
 }
 
@@ -111,11 +153,15 @@ pub(crate) struct AttemptLifetime {
 
 impl AttemptLifetime {
     pub(crate) fn retire(&self) {
-        let _transition = match self.attempt.transition.lock() {
-            Ok(transition) => transition,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        self.attempt.active.store(false, Ordering::Release);
+        {
+            let _transition = match self.attempt.transition.lock() {
+                Ok(transition) => transition,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.attempt.active.store(false, Ordering::Release);
+        }
+        // Notify after releasing the attempt transition. Connector cleanup may
+        // take its own authority mutex, so this prevents a reverse nested edge.
         self.attempt.retired.send_replace(true);
     }
 
@@ -198,6 +244,35 @@ impl AggregateReservation {
         })
     }
 
+    /// Replace one live child's claim without exposing an unreserved gap.
+    /// Inconsistent subtraction poisons the aggregate and preserves its last
+    /// conservative value. Capacity refusal leaves the old claim live.
+    fn transition(&self, old: PreAuthResourceClaim, new: PreAuthResourceClaim) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.poisoned = true;
+                return false;
+            }
+        };
+        if state.poisoned {
+            return false;
+        }
+        let Some(without_old) = state.active.checked_sub(old) else {
+            state.poisoned = true;
+            return false;
+        };
+        let Some(next) = without_old.checked_add(new) else {
+            return false;
+        };
+        if !next.fits_within(self.capacity) {
+            return false;
+        }
+        state.active = next;
+        true
+    }
+
     #[cfg(test)]
     fn active(&self) -> PreAuthResourceClaim {
         match self.state.lock() {
@@ -232,6 +307,16 @@ impl AggregateReservation {
 struct ConnectorCandidateReservation {
     aggregate: Arc<AggregateReservation>,
     claim: PreAuthResourceClaim,
+}
+
+impl ConnectorCandidateReservation {
+    fn transition(&mut self, next: PreAuthResourceClaim) -> bool {
+        if !self.aggregate.transition(self.claim, next) {
+            return false;
+        }
+        self.claim = next;
+        true
+    }
 }
 
 impl Drop for ConnectorCandidateReservation {
@@ -302,19 +387,42 @@ impl PreAuthAttemptPermit {
         claim: ConnectorCandidateResourceClaim,
         allocate: impl FnOnce() -> T,
     ) -> Option<(ConnectorCandidateCapability, T)> {
-        let transition = self.attempt.transition.lock().ok()?;
+        let capability = self.reserve_connector_candidate(claim)?;
+        let candidate = allocate();
+        Some((capability, candidate))
+    }
+
+    /// Reserve the opening claim before asynchronous connector construction.
+    /// The attempt permit remains available for other racing candidates.
+    pub(crate) fn reserve_connector_candidate(
+        &self,
+        claim: ConnectorCandidateResourceClaim,
+    ) -> Option<ConnectorCandidateCapability> {
+        let _transition = self.attempt.transition.lock().ok()?;
         if !self.attempt.active.load(Ordering::Acquire) {
             return None;
         }
-        let reservation = self.aggregate.reserve(claim.resources)?;
-        let capability = ConnectorCandidateCapability {
+        let reservation = self.aggregate.reserve(claim.opening)?;
+        Some(ConnectorCandidateCapability {
             attempt: Arc::clone(&self.attempt),
             reservation,
-        };
-        let candidate = allocate();
-        drop(transition);
-        Some((capability, candidate))
+            connected_claim: claim.connected,
+        })
     }
+}
+
+/// Admit one single-candidate attempt at the exact Arc 03 connector floor.
+/// This attempt-local capacity is not a process or ingress limit.
+pub(crate) fn admit_single_connector_candidate(
+    runtime: RuntimeIncarnation,
+) -> (
+    PreAuthAttemptPermit,
+    AttemptLifetime,
+    ConnectorCandidateResourceClaim,
+) {
+    let claim = ConnectorCandidateResourceClaim::exact_connector_floor();
+    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, claim.aggregate_capacity());
+    (permit, lifetime, claim)
 }
 
 /// Local authority to attempt one connector candidate.
@@ -337,6 +445,7 @@ impl PreAuthAttemptPermit {
 pub struct ConnectorCandidateCapability {
     attempt: Arc<AttemptOwnership>,
     reservation: ConnectorCandidateReservation,
+    connected_claim: PreAuthResourceClaim,
 }
 
 #[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
@@ -359,53 +468,42 @@ impl ConnectorCandidateCapability {
     }
 
     pub(crate) fn promote_if_live<T>(self, promote: impl FnOnce(Self) -> T) -> Option<T> {
+        self.try_promote_if_live(promote).ok()
+    }
+
+    /// Promote without losing cleanup ownership when retirement or a
+    /// fail-closed aggregate refuses the transition.
+    #[allow(
+        clippy::result_large_err,
+        reason = "boxing the move-only cleanup claim would add an unaccounted allocation"
+    )]
+    pub(crate) fn try_promote_if_live<T>(
+        mut self,
+        promote: impl FnOnce(Self) -> T,
+    ) -> std::result::Result<T, Self> {
         let attempt = Arc::clone(&self.attempt);
-        let transition = attempt.transition.lock().ok()?;
+        let _transition = match attempt.transition.lock() {
+            Ok(transition) => transition,
+            Err(_) => return Err(self),
+        };
         if !attempt.active.load(Ordering::Acquire) {
-            return None;
+            return Err(self);
         }
-        let promoted = promote(self);
-        drop(transition);
-        Some(promoted)
+        if !self.reservation.transition(self.connected_claim) {
+            return Err(self);
+        }
+        Ok(promote(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reservation_is_active_for_test(&self) -> bool {
+        self.reservation.aggregate.active() != PreAuthResourceClaim::ZERO
     }
 
     #[cfg(test)]
     fn belongs_to(&self, permit: &PreAuthAttemptPermit) -> bool {
         Arc::ptr_eq(&self.attempt, &permit.attempt)
             && Arc::ptr_eq(&self.reservation.aggregate, &permit.aggregate)
-    }
-}
-
-/// Temporary adapter for legacy candidate objects.
-///
-/// It carries the old object beside, rather than inside, the authority proof.
-/// Supplying a legacy value cannot mint a capability. Arc 03 deletes this
-/// wrapper after the connector consumes `ConnectorCandidateCapability`
-/// directly.
-#[allow(
-    dead_code,
-    reason = "Arc 03 installs and deletes this migration adapter"
-)]
-pub(crate) struct LegacyConnectorCandidate<T> {
-    capability: ConnectorCandidateCapability,
-    legacy: T,
-}
-
-#[allow(
-    dead_code,
-    reason = "Arc 03 installs and deletes this migration adapter"
-)]
-impl<T> LegacyConnectorCandidate<T> {
-    pub(crate) fn new(capability: ConnectorCandidateCapability, legacy: T) -> Self {
-        Self { capability, legacy }
-    }
-
-    pub(crate) fn capability(&self) -> &ConnectorCandidateCapability {
-        &self.capability
-    }
-
-    fn into_parts(self) -> (ConnectorCandidateCapability, T) {
-        (self.capability, self.legacy)
     }
 }
 
@@ -419,7 +517,7 @@ fn candidate_capacity(items: u64) -> PreAuthResourceClaim {
 
 #[cfg(test)]
 fn candidate_claim() -> ConnectorCandidateResourceClaim {
-    ConnectorCandidateResourceClaim::checked(candidate_capacity(1))
+    ConnectorCandidateResourceClaim::checked(candidate_capacity(1), candidate_capacity(1))
         .expect("one transport object is one connector candidate")
 }
 
@@ -428,7 +526,7 @@ pub(crate) fn connector_candidate_for_test(
     runtime: RuntimeIncarnation,
 ) -> (ConnectorCandidateCapability, AttemptLifetime) {
     let claim = candidate_claim();
-    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, claim.resources);
+    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, claim.aggregate_capacity());
     let capability = permit
         .allocate_connector_candidate(claim, || ())
         .map(|(capability, ())| capability)
@@ -487,7 +585,7 @@ mod tests {
 
         fn accepts_candidate(_: ConnectorCandidateCapability) {}
         accepts_candidate(first);
-        assert_eq!(permit.aggregate.active(), one.resources);
+        assert_eq!(permit.aggregate.active(), one.opening);
         accepts_candidate(second);
         assert_eq!(permit.aggregate.active(), PreAuthResourceClaim::ZERO);
     }
@@ -495,12 +593,14 @@ mod tests {
     #[test]
     fn v4_arc02_candidate_allocation_runs_only_after_child_reservation() {
         let one = candidate_claim();
-        let (permit, _lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), one.resources);
+        let (permit, _lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            one.aggregate_capacity(),
+        );
         let (first, saw_active) = permit
             .allocate_connector_candidate(one, || permit.aggregate.active())
             .expect("fixture child fits");
-        assert_eq!(saw_active, one.resources);
+        assert_eq!(saw_active, one.opening);
 
         let allocation_called = std::cell::Cell::new(false);
         let refused = permit.allocate_connector_candidate(one, || allocation_called.set(true));
@@ -541,17 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc02_legacy_adapter_requires_an_existing_capability() {
-        let (candidate, _lifetime) =
-            connector_candidate_for_test(crate::runtime::runtime_for_test());
-        let wrapper = LegacyConnectorCandidate::new(candidate, "legacy candidate");
-        let _ = wrapper.capability();
-        let (_capability, legacy) = wrapper.into_parts();
-
-        assert_eq!(legacy, "legacy candidate");
-    }
-
-    #[test]
     fn v4_arc03_attempt_retirement_invalidates_every_connector_candidate() {
         let runtime = crate::runtime::runtime_for_test();
         let one = candidate_claim();
@@ -574,8 +663,10 @@ mod tests {
     #[test]
     fn v4_arc03_retired_attempt_refuses_later_candidate_allocation() {
         let one = candidate_claim();
-        let (permit, lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), one.resources);
+        let (permit, lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            one.aggregate_capacity(),
+        );
         lifetime.retire();
         let allocation_called = std::cell::Cell::new(false);
 
@@ -662,10 +753,12 @@ mod tests {
     }
 
     #[test]
-    fn v4_arc03_allocation_and_retirement_have_one_linearized_order() {
+    fn v4_arc03_reservation_precedes_allocation_and_retirement_fences_result() {
         let claim = candidate_claim();
-        let (permit, lifetime) =
-            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), claim.resources);
+        let (permit, lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            claim.aggregate_capacity(),
+        );
         let lifetime = Arc::new(lifetime);
         let (allocation_entered_tx, allocation_entered_rx) = std::sync::mpsc::channel();
         let (release_allocation_tx, release_allocation_rx) = std::sync::mpsc::channel();
@@ -683,36 +776,16 @@ mod tests {
             .recv()
             .expect("allocation acquires the transition first");
 
-        let retire_lifetime = Arc::clone(&lifetime);
-        let (retirement_contended_tx, retirement_contended_rx) = std::sync::mpsc::channel();
-        let retirement = std::thread::spawn(move || {
-            let contended = matches!(
-                retire_lifetime.attempt.transition.try_lock(),
-                Err(std::sync::TryLockError::WouldBlock)
-            );
-            retirement_contended_tx
-                .send(contended)
-                .expect("test reports transition contention");
-            if contended {
-                retire_lifetime.retire();
-            }
-        });
-        let retirement_contended = retirement_contended_rx
-            .recv()
-            .expect("retirement checks the allocation transition");
+        lifetime.retire();
+        assert!(!lifetime.is_active());
         release_allocation_tx
             .send(())
             .expect("release allocation transition");
-        assert!(
-            allocation
-                .join()
-                .expect("allocation thread joins")
-                .is_some(),
-            "allocation linearized before retirement"
-        );
-        retirement.join().expect("retirement thread joins");
-        assert!(retirement_contended);
-        assert!(!lifetime.is_active());
+        let (candidate, ()) = allocation
+            .join()
+            .expect("allocation thread joins")
+            .expect("reservation completed before allocation began");
+        assert!(!candidate.is_live());
     }
 
     #[test]
@@ -723,7 +796,7 @@ mod tests {
             ResourceUse::observed(1, 0, 0, 0),
         );
         let capacity = one_candidate
-            .resources
+            .opening
             .checked_add(one_task)
             .expect("fixture sum");
         let (permit, _lifetime) =
@@ -750,15 +823,55 @@ mod tests {
 
     #[test]
     fn v4_arc03_connector_candidate_claim_rejects_zero_and_mislabeled_resources() {
-        assert!(ConnectorCandidateResourceClaim::checked(PreAuthResourceClaim::ZERO).is_none());
-        assert!(
-            ConnectorCandidateResourceClaim::checked(PreAuthResourceClaim::single(
+        assert!(ConnectorCandidateResourceClaim::checked(
+            PreAuthResourceClaim::ZERO,
+            candidate_capacity(1)
+        )
+        .is_none());
+        assert!(ConnectorCandidateResourceClaim::checked(
+            PreAuthResourceClaim::single(
                 PreAuthResourceFamily::Task,
                 ResourceUse::observed(1, 0, 0, 0),
-            ))
-            .is_none()
+            ),
+            candidate_capacity(1)
+        )
+        .is_none());
+        assert!(ConnectorCandidateResourceClaim::checked(
+            candidate_capacity(2),
+            candidate_capacity(1)
+        )
+        .is_none());
+        assert!(ConnectorCandidateResourceClaim::checked(
+            candidate_capacity(1),
+            candidate_capacity(1)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn v4_arc03_promotion_atomically_releases_candidate_only_claims() {
+        let claim = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let (permit, _lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            claim.aggregate_capacity(),
         );
-        assert!(ConnectorCandidateResourceClaim::checked(candidate_capacity(2)).is_none());
-        assert!(ConnectorCandidateResourceClaim::checked(candidate_capacity(1)).is_some());
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("opening claim fits");
+        assert_eq!(permit.aggregate.active(), claim.opening);
+
+        let connected = candidate
+            .promote_if_live(|candidate| candidate)
+            .expect("live candidate promotes");
+        assert_eq!(permit.aggregate.active(), claim.connected);
+        assert_eq!(
+            permit
+                .aggregate
+                .active()
+                .for_family(PreAuthResourceFamily::ConnectorSpecificWork),
+            ResourceUse::ZERO
+        );
+        drop(connected);
+        assert_eq!(permit.aggregate.active(), PreAuthResourceClaim::ZERO);
     }
 }

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Own one bounded connection attempt from admitted speculative work through candidate output. Arc 02 defines the authority and reservation boundary without redirecting the current connector runtime.
+Own one bounded connection attempt from admitted speculative work through candidate output. Arc 03 connects this authority and reservation boundary to the production WebRTC connector owner.
 
 ## Owned state
 
@@ -28,11 +28,13 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 `PreAuthAttemptPermit` is not consumed by its first connector candidate. It owns one aggregate reservation and may issue several child reservations. Each connector candidate carries its child reservation and an unforgeable witness for the exact attempt that issued it.
 
-The aggregate is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 still supplies no production capacity.
+The aggregate is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the algebraically fixed per-candidate floor needed to prove ownership of one transport object and its construction work. It supplies no process or anonymous-ingress capacity.
 
-The child is acquired before the candidate allocation closure runs. A refused child claim does not run that closure. Dropping a candidate returns its active claim to the aggregate.
+The child is acquired before connector construction starts. A refused child claim performs no allocation. Real asynchronous construction runs in an owned task. Cancellation fences publication, closes any private native result, and returns the child claim only after successful native cleanup.
 
-Arc 02 does not invent a production capacity. The resource owner must supply measured, owner-approved capacity before the production attempt path is migrated. Anonymous-ingress and process-global admission must remain possible before a Device identity or Closed authorization is known.
+Candidate promotion atomically changes the child from its opening claim to its connected claim. Candidate-only construction work is released while the transport claim remains with the connected-channel capability.
+
+Arc 03 does not invent a production process capacity. The resource owner must supply measured, owner-approved attempt and worker capacities before this structural floor can become a complete hostile-ingress guard. Anonymous-ingress and process-global admission must remain possible before a Device identity or Closed authorization is known.
 
 ## Restart behavior
 
@@ -41,7 +43,3 @@ Possession of an attempt permit or connector-candidate capability grants the aut
 ## Forbidden responsibilities
 
 This node does not own durable facts, Open or Closed policy, endpoint identity proof, application payload, session authority, relay fanout, or unbounded speculative work.
-
-## Compatibility adapter
-
-`LegacyConnectorCandidate<T>` carries an existing legacy connector object beside an already-created capability. It cannot create authority from the legacy value. Arc 03 deletes it when all connector callers consume `ConnectorCandidateCapability` directly.

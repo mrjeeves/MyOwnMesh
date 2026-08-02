@@ -1,7 +1,7 @@
 //! WebRTC transport. Wraps `webrtc-rs` so the engine can drive peer
 //! connections without dealing with the crate's callback-driven API
-//! directly — every transport event lands on an mpsc the engine
-//! drains in its main loop.
+//! directly. Every transport event lands on the exact worker's
+//! bounded mailbox and is handled in order by that worker's pump.
 //!
 //! Architecture:
 //!
@@ -10,9 +10,9 @@
 //! - One [`PeerSession`] per remote peer — owns the
 //!   `RTCPeerConnection` and the application data channel. Drops
 //!   close the connection.
-//! - Events ([`TransportEvent`]) flow out of `PeerSession` on an
-//!   mpsc. The engine matches on them serially so there are no
-//!   races on per-peer state.
+//! - Events ([`TransportEvent`]) flow out of `PeerSession` on a
+//!   bounded mpsc. One worker pump handles each peer in order, while
+//!   exact owner checks fence replacement races.
 
 pub mod diag;
 pub mod ice;
@@ -28,6 +28,6 @@ pub use webrtc::{
     TransportEvent, VideoSample, MEDIA_LANES,
 };
 pub(crate) use webrtc::{
-    DataChannelOpenOwnership, RemoteCandidateDisposition, WebRtcConnectorEvent,
-    WebRtcConnectorWorker,
+    DataChannelOpenOwnership, EndpointAuthHandoff, RemoteCandidateDisposition,
+    WebRtcConnectorEvent, WebRtcConnectorIncarnation, WebRtcConnectorWorker,
 };
