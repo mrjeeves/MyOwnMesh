@@ -30,7 +30,7 @@ struct RuntimeMarker;
     reason = "Arc 02 links this witness before production capability migration"
 )]
 impl RuntimeIncarnation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             marker: Arc::new(RuntimeMarker),
         }

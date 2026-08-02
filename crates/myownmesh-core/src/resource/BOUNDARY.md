@@ -67,10 +67,10 @@ This module must not:
 
 An `ObservationLease` proves only that a caller-reported quantity is being measured. It is never evidence that the work was allowed, reserved, authenticated, or safe.
 
-## Arc 02C integration status
+## Arc 03 integration status
 
-The remote ICE candidate pilot is the first production caller. Candidate values and the pre-SDP queue container are observed. The pilot does not cover signaling queues, WebRTC or ICE agent internals, other pre-authentication allocations, post-authentication allocations, or a complete resource family.
+Remote ICE candidate values and the pre-SDP queue container are observed. The WebRTC connector also observes its wrapper, callbacks, worker tasks, parser work, and selected queue sites. These observations do not cover signaling queues, complete WebRTC or ICE agent internals, sockets, DNS, every dependency task, or a complete hostile-ingress resource family.
 
-The attempt foundation now acquires a child reservation before invoking a candidate allocation closure. One attempt may issue several candidate capabilities under one aggregate reservation. No production numeric budget has been selected, so the existing candidate queue remains observation-only and must not be described as an enforcement guard.
+The attempt owner acquires a child reservation before asynchronous native construction. One attempt may issue several candidate capabilities under one aggregate reservation. Candidate promotion explicitly releases candidate-only construction work and retains the connected transport claim. No production numeric budget has been selected, so the existing candidate queue remains observation-only and must not be described as an enforcement guard.
 
-Frame, parser, attempt, candidate, and connector-work reservations belong at their respective allocation boundaries. Unknown input must be admissible through anonymous-ingress and global budgets before a Device identity or Closed authorization exists. Arc 03 installs the connector-owned candidate boundary. Later owner migrations install the remaining guards after their measured values receive owner approval.
+Frame, parser, attempt, candidate, and connector-work reservations belong at their respective allocation boundaries. Unknown input must be admissible through anonymous-ingress and global budgets before a Device identity or Closed authorization exists. Arc 03 installs connector ownership and per-worker callback backpressure, but it does not create owner-approved anonymous-ingress or process capacities. Later resource-policy work installs those guards only after measured values receive owner approval.

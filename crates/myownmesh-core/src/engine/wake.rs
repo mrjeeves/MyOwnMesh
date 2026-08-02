@@ -150,8 +150,12 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 // channel can't work; rebuild and let discovery
                 // re-establish it (same reasoning as the heartbeat path).
                 debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
-                state_clone
-                    .request_drop_if_current(owner, crate::events::DropReason::HeartbeatTimeout);
+                super::drop_peer_if_current(
+                    &state_clone,
+                    &owner,
+                    crate::events::DropReason::HeartbeatTimeout,
+                )
+                .await;
                 any_rebuilt = true;
             }
         }

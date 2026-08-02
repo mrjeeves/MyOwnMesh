@@ -55,7 +55,18 @@ fn fresh_nonce() -> String {
 
 /// Kick off the handshake — called once the data channel opens.
 /// Sends the first hello and schedules the timeout watchdog.
-pub async fn initiate(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+pub(super) async fn initiate(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+) {
+    if state
+        .peers
+        .with_current(owner, |peer| peer.endpoint_auth_is_current(&auth_task))
+        != Some(true)
+    {
+        return;
+    }
     let device_id = owner.device_id();
     let nonce = fresh_nonce();
     let code = verification::generate_code();
@@ -164,7 +175,7 @@ fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
                 format!("handshake watchdog fired for {device_id} — tearing down"),
                 serde_json::json!({ "peer": device_id }),
             );
-            state.request_drop_if_current(owner, DropReason::HeartbeatTimeout);
+            super::drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
         }
     });
 }
@@ -433,8 +444,34 @@ pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
 /// Only [`on_approve`] may latch remote approval. Re-evaluating after a local
 /// send must never manufacture peer consent.
 async fn maybe_activate(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    maybe_activate_after_check(state, owner, || {}).await;
+}
+
+/// Recheck and commit activation under the exact installation fence.
+///
+/// `before_commit` is normally empty. The deterministic replacement test uses
+/// it to replace the peer after the initial eligibility read but before the
+/// roster persistence linearization point.
+async fn maybe_activate_after_check(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    before_commit: impl FnOnce(),
+) {
     let device_id = owner.device_id();
-    let Some((became_active, label)) = state.peers.with_current(owner, |peer| {
+    let eligible = state.peers.get_if_current(owner).is_some_and(|peer| {
+        let data = peer.state.read();
+        !matches!(data.status, PeerStatus::Active)
+            && data.authenticated
+            && data.local_approve_sent
+            && data.remote_approve_seen
+    });
+    if !eligible {
+        return;
+    }
+
+    before_commit();
+
+    let Some(Some(roster_result)) = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
         // Guard the transition edge: a peer that re-sends Approve after
         // we're already ACTIVE shouldn't re-fire the on-active side
@@ -449,82 +486,64 @@ async fn maybe_activate(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
         // every application and control plane. The early latch is harmless: the
         // transition simply completes the moment authentication lands.
         let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;
-        if active && !was_active {
-            data.status = PeerStatus::Active;
-            data.tier = ConnectionTier::Steady;
-            // Successful Active reset: clear the no-TURN diagnostic
-            // guards so a future failure cycle gets a fresh chance
-            // to emit (and so the failure count doesn't carry over
-            // from a previous bad spell).
-            data.ice_failed_count = 0;
-            data.no_turn_diag_emitted = false;
+        if !active || was_active {
+            return None;
         }
-        (active && !was_active, data.label.clone())
+        data.status = PeerStatus::Active;
+        data.tier = ConnectionTier::Steady;
+        data.ice_failed_count = 0;
+        data.no_turn_diag_emitted = false;
+        let label = data.label.clone();
+        drop(data);
+
+        // This file mutation has no await point and runs while registry
+        // replacement is excluded. Replacement therefore linearizes before
+        // this complete commit or after it.
+        let roster_result = state.approve_roster_now(device_id, &label);
+        if let Some(worker) = peer.session.lock().as_ref() {
+            worker.enable_realtime_delivery();
+        }
+        state.log_diag_with(
+            crate::events::DiagLevel::Info,
+            "peer",
+            format!("{} ACTIVE", super::short_peer(device_id)),
+            serde_json::json!({ "peer": device_id }),
+        );
+        state.emit(MeshEvent::Peer(PeerEvent::Approved {
+            network_id: state.network_id.clone(),
+            device_id: device_id.to_string(),
+            label: label.clone(),
+        }));
+        state.resolve_connect_waiters(device_id, None);
+        state.clear_reconnect_intent(device_id);
+        Some(roster_result)
     }) else {
         return;
     };
-    if became_active {
-        // Both sides have now approved — the bilateral double handshake is
-        // complete and the link is ACTIVE. THIS is the moment a peer
-        // becomes a confirmed member, so persist them into the roster
-        // (idempotent: the manual-approve path already added them; the
-        // auto-approve path had not) and gossip the new membership so the
-        // rest of the network converges. Without this an auto-approved
-        // peer would reach ACTIVE but never be remembered, and no member
-        // beyond the two endpoints would ever learn the peer exists —
-        // exactly the "we keep losing our roster" symptom.
-        if let Err(e) = state.approve_roster(device_id, &label).await {
-            state.log_diag(
-                crate::events::DiagLevel::Warn,
-                "roster",
-                format!(
-                    "persist {} after mutual approve failed: {e}",
-                    super::short_peer(device_id)
-                ),
-            );
-        }
-        // These device-id keyed effects are valid only while the exact owner
-        // that completed the transition remains installed. Holding the
-        // registry transition through the synchronous effects prevents a
-        // replacement from receiving an Approved event or waiter success.
-        let followups_current = state
-            .peers
-            .with_current(owner, |peer| {
-                if !peer.state.read().is_admitted() {
-                    return false;
-                }
-                state.log_diag_with(
-                    crate::events::DiagLevel::Info,
-                    "peer",
-                    format!("{} ACTIVE", super::short_peer(device_id)),
-                    serde_json::json!({ "peer": device_id }),
-                );
-                state.emit(MeshEvent::Peer(PeerEvent::Approved {
-                    network_id: state.network_id.clone(),
-                    device_id: device_id.to_string(),
-                    label: label.clone(),
-                }));
-                state.resolve_connect_waiters(device_id, None);
-                state.clear_reconnect_intent(device_id);
-                true
-            })
-            .unwrap_or(false);
-        phase::recompute(state);
-        if followups_current {
-            // The outbox send is bound to the exact admitted owner. A
-            // replacement under the same device id cannot receive the batch.
-            super::reliable::flush_peer_owner(state, owner).await;
-            super::ladder::reevaluate_topology(state).await;
-        }
-        // Advertise both anti-entropy channels to the freshly-active link.
-        // The roster summary carries only the *membership* root, which is blind
-        // to role changes by design — so a peer that missed a promote/demote or
-        // any other governance transition while offline wouldn't detect it from
-        // the summary alone. Also emitting the governance snapshot (transition +
-        // member-log counts) lets `on_state_broadcast` notice the divergence and
-        // pull the log, so roles converge on reconnect, not just membership.
-        super::governance::broadcast_roster_summary(state).await;
-        super::governance::broadcast_state(state).await;
+
+    if let Err(e) = roster_result {
+        state.log_diag(
+            crate::events::DiagLevel::Warn,
+            "roster",
+            format!(
+                "persist {} after mutual approve failed: {e}",
+                super::short_peer(device_id)
+            ),
+        );
+    }
+
+    phase::recompute(state);
+    super::reliable::flush_peer_owner(state, owner).await;
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+    super::ladder::reevaluate_topology(state).await;
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+
+    if super::governance::broadcast_roster_summary_for_owner(state, owner).await {
+        let _ = super::governance::broadcast_state_for_owner(state, owner).await;
     }
 }
 
@@ -678,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03_stale_owner_cannot_activate_replacement() {
+    async fn v4_arc03_replacement_before_roster_persistence_cancels_activation_commit() {
         let state = crate::engine::build_test_state("arc03-approve-stale-owner");
         crate::engine::insert_session_less_peer(&state, "peer", None);
         let stale_owner = state.peers.owner("peer").expect("first peer owner");
@@ -698,8 +717,11 @@ mod tests {
             data.status = PeerStatus::PendingApproval;
         }
 
-        crate::engine::insert_session_less_peer(&state, "peer", None);
-        maybe_activate(&state, &stale_owner).await;
+        let replacement_state = Arc::clone(&state);
+        maybe_activate_after_check(&state, &stale_owner, move || {
+            crate::engine::insert_session_less_peer(&replacement_state, "peer", None);
+        })
+        .await;
 
         {
             let replacement = state.peers.get("peer").expect("replacement peer");
@@ -718,6 +740,10 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert!(state.has_reconnect_intent("peer"));
+        assert!(
+            !state.is_rostered("peer"),
+            "a peer replaced before the persistence fence must not enter the roster"
+        );
         state.shutdown().await;
     }
 }

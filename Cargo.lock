@@ -1422,7 +1422,9 @@ version = "0.3.2"
 dependencies = [
  "async-trait",
  "myownmesh-core",
+ "myownmesh-signaling",
  "stun",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

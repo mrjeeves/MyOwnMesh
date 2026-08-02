@@ -21,4 +21,7 @@ turn = { workspace = true }
 webrtc-util = { workspace = true }
 
 [dev-dependencies]
+myownmesh-core = { workspace = true, features = ["transport-lab"] }
+myownmesh-signaling = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

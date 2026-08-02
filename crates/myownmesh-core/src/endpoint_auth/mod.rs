@@ -6,6 +6,25 @@
 
 use crate::connector::ConnectedChannelCapability;
 use crate::runtime::RuntimeIncarnation;
+use crate::transport::{EndpointAuthHandoff, WebRtcConnectorIncarnation};
+use std::sync::Arc;
+
+/// The one runtime owner that receives a newly working channel before any
+/// authentication frame may be emitted or consumed. Arc 04 replaces the
+/// legacy handshake body, but Arc 03 makes this ownership handoff mandatory.
+pub(crate) struct EndpointAuthTask {
+    connected: EndpointAuthHandoff,
+}
+
+impl EndpointAuthTask {
+    pub(crate) fn begin(connected: EndpointAuthHandoff) -> Self {
+        Self { connected }
+    }
+
+    pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
+        self.connected.belongs_to(incarnation)
+    }
+}
 
 /// Proof that bounded endpoint-authentication work was admitted.
 ///

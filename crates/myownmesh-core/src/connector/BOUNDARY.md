@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Own native connector work and turn one admitted candidate into a live connected channel. Arc 02 installs the type boundary without changing transport behavior.
+Own native connector work and turn one admitted candidate into a live connected channel. Arc 03 places the existing WebRTC runtime behind this owner without changing its transport protocol.
 
 ## Owned state
 
-The target owner holds connector-native attempt state, one live channel, and optional connector-native flow state. The existing implementation keeps that mutable state until Arc 03.
+`WebRtcConnectorWorker` holds connector-native attempt state, one live channel, its callback incarnation, pending remote candidates, cleanup state, and optional connector-native flow state.
 
 ## Inputs
 
@@ -25,11 +25,11 @@ The connector depends on the attempt capability and its connector-specific trans
 
 ## Resources
 
-Connector work remains covered by the pre-authentication permit owned by the consumed candidate. Arc 03 will attach the existing WebRTC, ICE, STUN, and TURN allocations to measured resource accounting.
+Connector work remains covered by the child reservation owned by the consumed candidate. Promotion explicitly transfers the opening claim to a connected claim. The connected claim moves into Endpoint Auth Task, while the connector cleanup owner retains release responsibility through successful native close. A close error retains the claim conservatively. Arc 03 observes known WebRTC ownership sites, but complete dependency resources and owner-approved process capacities remain outside the claim.
 
 ## Restart behavior
 
-Possession of a connected-channel capability grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Connected-channel capabilities and native channel objects are memory-only and disappear on process restart. Public labels and stored diagnostics cannot recreate them.
+Possession of a connected-channel capability grants the authority represented by that type. Its process-local connector incarnation grants no authority. The incarnation only prevents a handoff from being installed against another connector, including a replacement in the same runtime. Connected-channel capabilities and native channel objects are memory-only and disappear on process restart. Public labels and stored diagnostics cannot recreate them.
 
 ## Forbidden responsibilities
 
