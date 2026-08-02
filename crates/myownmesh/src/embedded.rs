@@ -9,13 +9,26 @@
 //! daemon as a child process), but nothing here is mobile-specific — any
 //! embedder that wants the daemon in-process can use it.
 
-use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::control;
 use crate::registry::NetworkRegistry;
 use crate::services::ServiceManager;
+
+/// Typed startup failures for the embedded daemon.
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddedStartError {
+    /// The process owner has not supplied the connector admission policy.
+    #[error("connector resource policy is required before daemon startup")]
+    MissingConnectorResourcePolicy,
+
+    #[error("open mesh: {0}")]
+    OpenMesh(#[from] myownmesh_core::Error),
+
+    #[error("service policy: {0}")]
+    ServicePolicy(#[from] crate::services::ServicePolicyError),
+}
 
 /// A daemon running inside this process. Keep it alive for the daemon's
 /// lifetime; call [`shutdown`](Self::shutdown) for the same graceful teardown
@@ -50,19 +63,35 @@ impl EmbeddedDaemon {
     }
 }
 
-/// Start the daemon on the current tokio runtime and return once it's
-/// serving. Identical to `myownmesh serve` except that shutdown is the
-/// caller's (via [`EmbeddedDaemon::shutdown`]) rather than a signal's.
-pub async fn start(cfg: myownmesh_core::MeshConfig) -> Result<EmbeddedDaemon> {
+/// Refuse ownerless daemon startup with a typed error.
+///
+/// Use [`start_with_connector_resource_policy`] after the process owner has
+/// supplied every required policy value.
+pub async fn start(
+    _cfg: myownmesh_core::MeshConfig,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    Err(EmbeddedStartError::MissingConnectorResourcePolicy)
+}
+
+/// Start the daemon with the connector policy selected by the process owner.
+///
+/// This is the only Arc 03 daemon path that can establish connectors. No
+/// capacity, callback weight, real-time deadline, unit limit, or close timeout
+/// is inferred here.
+pub async fn start_with_connector_resource_policy(
+    cfg: myownmesh_core::MeshConfig,
+    connector_policy: myownmesh_core::ConnectorResourcePolicy,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    ServiceManager::validate_config(&cfg.services)?;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         networks = cfg.networks.len(),
         "embedded daemon starting"
     );
 
-    let mesh = myownmesh_core::Mesh::open(cfg.clone())
-        .await
-        .context("open mesh")?;
+    let mesh =
+        myownmesh_core::Mesh::open_with_connector_resource_policy(cfg.clone(), connector_policy)
+            .await?;
     info!(device_id = %mesh.identity().display_id(), "identity ready");
 
     // The registry holds every JoinedNetwork + its signaling driver handle so
@@ -80,7 +109,7 @@ pub async fn start(cfg: myownmesh_core::MeshConfig) -> Result<EmbeddedDaemon> {
     // Infrastructure services (relay / signaling / STUN / TURN); an all-off
     // config (the default) starts nothing.
     let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
-    let report = service_manager.apply(cfg.services.clone()).await;
+    let report = service_manager.apply(cfg.services.clone()).await?;
     info!(
         relay = report.relay.enabled,
         signaling = report.signaling.running,
@@ -121,4 +150,18 @@ pub async fn start(cfg: myownmesh_core::MeshConfig) -> Result<EmbeddedDaemon> {
         service_manager,
         shutdown_tx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ownerless_start_returns_typed_missing_policy_error() {
+        let result = start(myownmesh_core::MeshConfig::default()).await;
+        assert!(matches!(
+            result,
+            Err(EmbeddedStartError::MissingConnectorResourcePolicy)
+        ));
+    }
 }

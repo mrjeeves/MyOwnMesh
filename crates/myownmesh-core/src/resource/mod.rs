@@ -268,16 +268,17 @@ pub struct ResourceReport {
         [ResourceFamilyReport<PostAuthResourceFamily>; POST_AUTH_RESOURCE_FAMILY_COUNT],
 }
 
-/// The one observation root shared by all MyOwnMesh runtime objects in this
-/// process. It aggregates measurements only and grants no authority.
-static PROCESS_RESOURCE_ROOT: OnceLock<ResourceAccountant> = OnceLock::new();
+/// The one resource root shared by all MyOwnMesh runtime objects in this
+/// process. Its accountant remains observation-only. Its separate connector
+/// owner slot binds the owner-selected admission policy once for the process.
+static PROCESS_RESOURCE_ROOT: OnceLock<ProcessResourceRoot> = OnceLock::new();
 
 /// Return a process-wide observation snapshot.
 pub fn process_resource_report() -> ResourceReport {
     ProcessResourceRoot::global().report()
 }
 
-/// The root of the production observation hierarchy.
+/// The root of the production resource hierarchy.
 ///
 /// Child scopes are created in one fixed ownership order: process, Mesh
 /// runtime, joined network instance, then attempt or peer connection. These
@@ -285,19 +286,70 @@ pub fn process_resource_report() -> ResourceReport {
 /// Carrier, ingress source, attempt, and known-origin attribution remain
 /// independent dimensions. An observation made at a leaf is recorded at that
 /// leaf and every ancestor.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProcessResourceRoot {
     accountant: ResourceAccountant,
+    connector_owner: Arc<OnceLock<crate::runtime::attempt::ConnectorResourceOwnerPort>>,
+}
+
+impl std::fmt::Debug for ProcessResourceRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessResourceRoot")
+            .field("accountant", &self.accountant)
+            .field(
+                "connector_policy_installed",
+                &self.connector_owner.get().is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ProcessResourceRoot {
     /// Get the observation root for this process.
     pub fn global() -> Self {
-        Self {
-            accountant: PROCESS_RESOURCE_ROOT
-                .get_or_init(ResourceAccountant::observation_only)
-                .clone(),
+        PROCESS_RESOURCE_ROOT
+            .get_or_init(|| Self {
+                accountant: ResourceAccountant::observation_only(),
+                connector_owner: Arc::new(OnceLock::new()),
+            })
+            .clone()
+    }
+
+    /// Install or reuse the one connector admission owner for this process
+    /// resource root.
+    ///
+    /// The first owner-selected policy wins. A later Mesh runtime can share
+    /// it only when it requests the exact same policy.
+    pub fn install_connector_policy(
+        &self,
+        policy: crate::runtime::attempt::ConnectorResourcePolicy,
+    ) -> std::result::Result<
+        crate::runtime::attempt::ConnectorResourceOwnerPort,
+        Box<crate::runtime::attempt::ConnectorResourcePolicyConflict>,
+    > {
+        let installed = self
+            .connector_owner
+            .get_or_init(|| crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy));
+        let installed_policy = installed.policy();
+        if installed_policy == policy {
+            Ok(installed.clone())
+        } else {
+            Err(Box::new(
+                crate::runtime::attempt::ConnectorResourcePolicyConflict {
+                    installed: installed_policy,
+                    requested: policy,
+                },
+            ))
         }
+    }
+
+    /// Return the installed process connector owner, if the process owner has
+    /// selected a policy.
+    pub fn connector_resource_owner(
+        &self,
+    ) -> Option<crate::runtime::attempt::ConnectorResourceOwnerPort> {
+        self.connector_owner.get().cloned()
     }
 
     /// Read the process aggregate without changing it.
@@ -315,6 +367,7 @@ impl ProcessResourceRoot {
     pub(crate) fn isolated() -> Self {
         Self {
             accountant: ResourceAccountant::observation_only(),
+            connector_owner: Arc::new(OnceLock::new()),
         }
     }
 }

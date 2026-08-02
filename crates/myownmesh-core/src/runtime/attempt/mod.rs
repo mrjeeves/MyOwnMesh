@@ -138,29 +138,28 @@ impl ConnectorCandidateResourceClaim {
     }
 }
 
-/// Owner-selected bounds for the four independent connector callback
-/// mailboxes. Keeping these values separate prevents video or audio pressure
-/// from occupying the only control or endpoint-data slot.
+/// Owner-selected bounds for the connector's closed callback-class set.
+///
+/// Codec and media names belong to the WebRTC compatibility adapter. The
+/// connector resource owner accounts only for control, endpoint data, and
+/// codec-neutral real-time flow callbacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackMailboxCapacities {
     control: NonZeroUsize,
-    data: NonZeroUsize,
-    audio: NonZeroUsize,
-    video: NonZeroUsize,
+    endpoint_data: NonZeroUsize,
+    realtime: NonZeroUsize,
 }
 
 impl ConnectorCallbackMailboxCapacities {
     pub const fn new(
         control: NonZeroUsize,
-        data: NonZeroUsize,
-        audio: NonZeroUsize,
-        video: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+        realtime: NonZeroUsize,
     ) -> Self {
         Self {
             control,
-            data,
-            audio,
-            video,
+            endpoint_data,
+            realtime,
         }
     }
 
@@ -168,16 +167,147 @@ impl ConnectorCallbackMailboxCapacities {
         self.control
     }
 
-    pub const fn data(self) -> NonZeroUsize {
-        self.data
+    pub const fn endpoint_data(self) -> NonZeroUsize {
+        self.endpoint_data
     }
 
-    pub const fn audio(self) -> NonZeroUsize {
-        self.audio
+    pub const fn realtime(self) -> NonZeroUsize {
+        self.realtime
+    }
+}
+
+/// Owner-selected scheduler weights for the closed callback-class set.
+///
+/// No default exists. A weight is a maximum consecutive service quantum when
+/// the selected class remains ready. Empty classes are skipped, so a stalled
+/// class cannot block the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorCallbackServiceWeights {
+    control: NonZeroUsize,
+    endpoint_data: NonZeroUsize,
+    realtime: NonZeroUsize,
+}
+
+impl ConnectorCallbackServiceWeights {
+    pub const fn new(
+        control: NonZeroUsize,
+        endpoint_data: NonZeroUsize,
+        realtime: NonZeroUsize,
+    ) -> Self {
+        Self {
+            control,
+            endpoint_data,
+            realtime,
+        }
     }
 
-    pub const fn video(self) -> NonZeroUsize {
-        self.video
+    pub const fn control(self) -> NonZeroUsize {
+        self.control
+    }
+
+    pub const fn endpoint_data(self) -> NonZeroUsize {
+        self.endpoint_data
+    }
+
+    pub const fn realtime(self) -> NonZeroUsize {
+        self.realtime
+    }
+}
+
+/// Owner-selected callback behavior for one connector.
+///
+/// Endpoint frames retain the protocol's independent frame limit. The
+/// real-time unit limit and enqueue deadline are separate operational inputs
+/// because an encoded access unit is not an endpoint message frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorCallbackPolicy {
+    mailboxes: ConnectorCallbackMailboxCapacities,
+    service_weights: ConnectorCallbackServiceWeights,
+    max_realtime_unit_bytes: NonZeroUsize,
+    realtime_enqueue_deadline: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectorCallbackPolicyError {
+    #[error("real-time callback enqueue deadline must be nonzero")]
+    ZeroRealtimeEnqueueDeadline,
+    #[error(
+        "{class} callback mailbox capacity {requested} exceeds Tokio's supported maximum {maximum}"
+    )]
+    MailboxCapacityExceedsRuntimeLimit {
+        class: &'static str,
+        requested: usize,
+        maximum: usize,
+    },
+}
+
+impl ConnectorCallbackPolicy {
+    pub fn new(
+        mailboxes: ConnectorCallbackMailboxCapacities,
+        service_weights: ConnectorCallbackServiceWeights,
+        max_realtime_unit_bytes: NonZeroUsize,
+        realtime_enqueue_deadline: Duration,
+    ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
+        if realtime_enqueue_deadline.is_zero() {
+            return Err(ConnectorCallbackPolicyError::ZeroRealtimeEnqueueDeadline);
+        }
+        for (class, requested) in [
+            ("control", mailboxes.control().get()),
+            ("endpoint-data", mailboxes.endpoint_data().get()),
+            ("real-time", mailboxes.realtime().get()),
+        ] {
+            if requested > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(
+                    ConnectorCallbackPolicyError::MailboxCapacityExceedsRuntimeLimit {
+                        class,
+                        requested,
+                        maximum: tokio::sync::Semaphore::MAX_PERMITS,
+                    },
+                );
+            }
+        }
+        Ok(Self {
+            mailboxes,
+            service_weights,
+            max_realtime_unit_bytes,
+            realtime_enqueue_deadline,
+        })
+    }
+
+    pub const fn mailboxes(self) -> ConnectorCallbackMailboxCapacities {
+        self.mailboxes
+    }
+
+    pub const fn service_weights(self) -> ConnectorCallbackServiceWeights {
+        self.service_weights
+    }
+
+    pub const fn max_realtime_unit_bytes(self) -> NonZeroUsize {
+        self.max_realtime_unit_bytes
+    }
+
+    pub const fn realtime_enqueue_deadline(self) -> Duration {
+        self.realtime_enqueue_deadline
+    }
+
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(crate) fn unrestricted_lab(mailbox_capacity: NonZeroUsize) -> Self {
+        Self {
+            mailboxes: ConnectorCallbackMailboxCapacities::new(
+                mailbox_capacity,
+                mailbox_capacity,
+                mailbox_capacity,
+            ),
+            service_weights: ConnectorCallbackServiceWeights::new(
+                mailbox_capacity,
+                mailbox_capacity,
+                mailbox_capacity,
+            ),
+            max_realtime_unit_bytes: NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            // Raw transport labs are the compatibility bypass. Production
+            // policy construction rejects a zero enqueue deadline.
+            realtime_enqueue_deadline: Duration::ZERO,
+        }
     }
 }
 
@@ -189,19 +319,19 @@ impl ConnectorCallbackMailboxCapacities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorResourcePolicy {
     max_active_candidates: NonZeroUsize,
-    callback_mailboxes: ConnectorCallbackMailboxCapacities,
+    callbacks: ConnectorCallbackPolicy,
     native_close_timeout: Duration,
 }
 
 impl ConnectorResourcePolicy {
     pub fn new(
         max_active_candidates: NonZeroUsize,
-        callback_mailboxes: ConnectorCallbackMailboxCapacities,
+        callbacks: ConnectorCallbackPolicy,
         native_close_timeout: Duration,
     ) -> Option<Self> {
         (!native_close_timeout.is_zero()).then_some(Self {
             max_active_candidates,
-            callback_mailboxes,
+            callbacks,
             native_close_timeout,
         })
     }
@@ -210,8 +340,8 @@ impl ConnectorResourcePolicy {
         self.max_active_candidates
     }
 
-    pub const fn callback_mailboxes(self) -> ConnectorCallbackMailboxCapacities {
-        self.callback_mailboxes
+    pub const fn callbacks(self) -> ConnectorCallbackPolicy {
+        self.callbacks
     }
 
     pub const fn native_close_timeout(self) -> Duration {
@@ -219,13 +349,29 @@ impl ConnectorResourcePolicy {
     }
 }
 
+/// A process resource root already owns a different connector policy.
+///
+/// Reusing the installed policy is safe. Replacing it while live claims may
+/// exist would split the process limit, so the root refuses the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the process connector resource policy is already installed with different values")]
+pub struct ConnectorResourcePolicyConflict {
+    pub installed: ConnectorResourcePolicy,
+    pub requested: ConnectorResourcePolicy,
+}
+
 /// Point-in-time report from the connector resource owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorResourceOwnerReport {
     pub max_active_candidates: NonZeroUsize,
     pub active_candidates: usize,
-    pub poisoned: bool,
-    pub callback_mailboxes: ConnectorCallbackMailboxCapacities,
+    /// Exact candidate claims retained after a native cleanup failure. These
+    /// slots remain consumed until process exit and cannot be reused.
+    pub failed_cleanup_candidates: usize,
+    /// Aggregate accounting is no longer exact, so all later admissions are
+    /// refused. A known per-candidate cleanup failure does not set this flag.
+    pub accounting_poisoned: bool,
+    pub callbacks: ConnectorCallbackPolicy,
     pub native_close_timeout: Duration,
 }
 
@@ -293,7 +439,8 @@ impl Drop for AttemptLifetime {
 struct ConnectorResourceOwnerState {
     active: PreAuthResourceClaim,
     active_candidates: usize,
-    poisoned: bool,
+    failed_cleanup_candidates: usize,
+    accounting_poisoned: bool,
 }
 
 struct ConnectorResourceOwnerInner {
@@ -308,7 +455,8 @@ impl ConnectorResourceOwnerInner {
             state: Mutex::new(ConnectorResourceOwnerState {
                 active: PreAuthResourceClaim::ZERO,
                 active_candidates: 0,
-                poisoned: false,
+                failed_cleanup_candidates: 0,
+                accounting_poisoned: false,
             }),
         }
     }
@@ -321,7 +469,7 @@ impl ConnectorResourceOwnerInner {
             Ok(state) => state,
             Err(_) => return None,
         };
-        if state.poisoned {
+        if state.accounting_poisoned {
             return None;
         }
         if state.active_candidates >= self.policy.max_active_candidates.get() {
@@ -333,7 +481,7 @@ impl ConnectorResourceOwnerInner {
         Some(ConnectorCandidateReservation {
             owner: Arc::clone(self),
             claim,
-            poisoned: false,
+            release_on_drop: true,
         })
     }
 
@@ -345,15 +493,15 @@ impl ConnectorResourceOwnerInner {
             Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
-                state.poisoned = true;
+                state.accounting_poisoned = true;
                 return false;
             }
         };
-        if state.poisoned {
+        if state.accounting_poisoned {
             return false;
         }
         let Some(without_old) = state.active.checked_sub(old) else {
-            state.poisoned = true;
+            state.accounting_poisoned = true;
             return false;
         };
         let Some(next) = without_old.checked_add(new) else {
@@ -363,27 +511,37 @@ impl ConnectorResourceOwnerInner {
         true
     }
 
-    fn poison(&self) {
-        match self.state.lock() {
-            Ok(mut state) => state.poisoned = true,
-            Err(poisoned) => poisoned.into_inner().poisoned = true,
-        }
-    }
-
     fn report(&self) -> ConnectorResourceOwnerReport {
-        let (active_candidates, poisoned) = match self.state.lock() {
-            Ok(state) => (state.active_candidates, state.poisoned),
-            Err(poisoned) => {
-                let state = poisoned.into_inner();
-                (state.active_candidates, true)
-            }
-        };
+        let (active_candidates, failed_cleanup_candidates, accounting_poisoned) =
+            match self.state.lock() {
+                Ok(state) => (
+                    state.active_candidates,
+                    state.failed_cleanup_candidates,
+                    state.accounting_poisoned,
+                ),
+                Err(poisoned) => {
+                    let state = poisoned.into_inner();
+                    (
+                        state.active_candidates,
+                        state.failed_cleanup_candidates,
+                        true,
+                    )
+                }
+            };
         ConnectorResourceOwnerReport {
             max_active_candidates: self.policy.max_active_candidates,
             active_candidates,
-            poisoned,
-            callback_mailboxes: self.policy.callback_mailboxes,
+            failed_cleanup_candidates,
+            accounting_poisoned,
+            callbacks: self.policy.callbacks,
             native_close_timeout: self.policy.native_close_timeout,
+        }
+    }
+
+    fn poison_accounting(&self) {
+        match self.state.lock() {
+            Ok(mut state) => state.accounting_poisoned = true,
+            Err(poisoned) => poisoned.into_inner().accounting_poisoned = true,
         }
     }
 
@@ -398,7 +556,7 @@ impl ConnectorResourceOwnerInner {
     #[cfg(test)]
     fn is_poisoned(&self) -> bool {
         match self.state.lock() {
-            Ok(state) => state.poisoned,
+            Ok(state) => state.accounting_poisoned,
             Err(_) => true,
         }
     }
@@ -424,7 +582,7 @@ pub struct ConnectorResourceOwnerPort {
 }
 
 impl ConnectorResourceOwnerPort {
-    pub fn new(policy: ConnectorResourcePolicy) -> Self {
+    pub(crate) fn new(policy: ConnectorResourcePolicy) -> Self {
         Self {
             inner: Arc::new(ConnectorResourceOwnerInner::new(policy)),
         }
@@ -434,16 +592,20 @@ impl ConnectorResourceOwnerPort {
         self.inner.report()
     }
 
-    pub(crate) fn callback_mailboxes(&self) -> ConnectorCallbackMailboxCapacities {
-        self.inner.policy.callback_mailboxes
+    pub(crate) fn policy(&self) -> ConnectorResourcePolicy {
+        self.inner.policy
+    }
+
+    pub(crate) fn callbacks(&self) -> ConnectorCallbackPolicy {
+        self.inner.policy.callbacks
     }
 
     pub(crate) fn native_close_timeout(&self) -> Duration {
         self.inner.policy.native_close_timeout
     }
 
-    pub(crate) fn poison_cleanup(&self) {
-        self.inner.poison();
+    pub(crate) fn poison_accounting(&self) {
+        self.inner.poison_accounting();
     }
 }
 
@@ -457,12 +619,16 @@ impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
         .and_then(NonZeroUsize::new)
         .expect("test owner capacity includes at least one connector");
         let one = NonZeroUsize::new(1).expect("one is nonzero");
-        let policy = ConnectorResourcePolicy::new(
-            candidates,
-            ConnectorCallbackMailboxCapacities::new(one, one, one, one),
+        let callbacks = ConnectorCallbackPolicy::new(
+            ConnectorCallbackMailboxCapacities::new(one, one, one),
+            ConnectorCallbackServiceWeights::new(one, one, one),
+            NonZeroUsize::new(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
+                .expect("endpoint frame fixture limit is nonzero"),
             Duration::from_secs(1),
         )
-        .expect("test close timeout is nonzero");
+        .expect("test realtime enqueue deadline is nonzero");
+        let policy = ConnectorResourcePolicy::new(candidates, callbacks, Duration::from_secs(1))
+            .expect("test close timeout is nonzero");
         Self::new(policy)
     }
 }
@@ -475,7 +641,7 @@ impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
 struct ConnectorCandidateReservation {
     owner: Arc<ConnectorResourceOwnerInner>,
     claim: PreAuthResourceClaim,
-    poisoned: bool,
+    release_on_drop: bool,
 }
 
 impl ConnectorCandidateReservation {
@@ -487,27 +653,44 @@ impl ConnectorCandidateReservation {
         true
     }
 
-    fn poison(&mut self) {
-        self.poisoned = true;
-        self.owner.poison();
+    /// Convert this exact live claim into a process-owned failed-cleanup slot.
+    /// The aggregate already includes the claim, so this records the terminal
+    /// disposition and prevents `Drop` from making the slot reusable.
+    fn retain_after_cleanup_failure(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        let mut state = match self.owner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.accounting_poisoned = true;
+                self.release_on_drop = false;
+                return;
+            }
+        };
+        match state.failed_cleanup_candidates.checked_add(1) {
+            Some(retained) => state.failed_cleanup_candidates = retained,
+            None => state.accounting_poisoned = true,
+        }
+        self.release_on_drop = false;
     }
 }
 
 impl Drop for ConnectorCandidateReservation {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         let mut state = match self.owner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
-                state.poisoned = true;
+                state.accounting_poisoned = true;
                 return;
             }
         };
-        if state.poisoned {
-            return;
-        }
-        if self.poisoned {
-            state.poisoned = true;
+        if state.accounting_poisoned {
             return;
         }
         match state.active.checked_sub(self.claim) {
@@ -515,8 +698,8 @@ impl Drop for ConnectorCandidateReservation {
                 state.active = active;
                 state.active_candidates -= 1;
             }
-            None => state.poisoned = true,
-            Some(_) => state.poisoned = true,
+            None => state.accounting_poisoned = true,
+            Some(_) => state.accounting_poisoned = true,
         }
     }
 }
@@ -655,6 +838,10 @@ impl ConnectorCandidateCapability {
         self.attempt.active.load(Ordering::Acquire)
     }
 
+    pub(crate) fn retain_after_cleanup_failure(&mut self) {
+        self.reservation.retain_after_cleanup_failure();
+    }
+
     pub(crate) fn promote_if_live<T>(self, promote: impl FnOnce(Self) -> T) -> Option<T> {
         self.try_promote_if_live(promote).ok()
     }
@@ -692,10 +879,6 @@ impl ConnectorCandidateCapability {
     fn belongs_to(&self, permit: &PreAuthAttemptPermit) -> bool {
         Arc::ptr_eq(&self.attempt, &permit.attempt)
             && Arc::ptr_eq(&self.reservation.owner, &permit.resource_owner.inner)
-    }
-
-    pub(crate) fn poison_cleanup(&mut self) {
-        self.reservation.poison();
     }
 }
 
@@ -750,6 +933,131 @@ pub(crate) fn two_connector_candidates_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn explicit_test_policy(max_active_candidates: usize) -> ConnectorResourcePolicy {
+        let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
+        let callbacks = ConnectorCallbackPolicy::new(
+            ConnectorCallbackMailboxCapacities::new(one, one, one),
+            ConnectorCallbackServiceWeights::new(one, one, one),
+            NonZeroUsize::new(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
+                .expect("fixture real-time unit limit is nonzero"),
+            Duration::from_secs(1),
+        )
+        .expect("fixture real-time enqueue deadline is nonzero");
+        ConnectorResourcePolicy::new(
+            NonZeroUsize::new(max_active_candidates).expect("fixture connector bound is nonzero"),
+            callbacks,
+            Duration::from_secs(1),
+        )
+        .expect("fixture close timeout is nonzero")
+    }
+
+    #[test]
+    fn v4_arc03d_process_root_shares_one_connector_limit_across_mesh_runtimes() {
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        let policy = explicit_test_policy(1);
+        let first_owner = root
+            .install_connector_policy(policy)
+            .expect("first Mesh runtime installs the policy");
+        let second_owner = root
+            .install_connector_policy(policy)
+            .expect("second Mesh runtime reuses the policy");
+        let claim = candidate_claim();
+        let (first_attempt, _first_lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), first_owner);
+        let first = first_attempt
+            .reserve_connector_candidate(claim)
+            .expect("first Mesh runtime consumes the process slot");
+        let (second_attempt, _second_lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), second_owner);
+        assert!(second_attempt.reserve_connector_candidate(claim).is_none());
+        drop(first);
+        assert!(second_attempt.reserve_connector_candidate(claim).is_some());
+    }
+
+    #[test]
+    fn v4_arc03d_process_root_rejects_a_conflicting_policy() {
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        let installed = explicit_test_policy(1);
+        let requested = explicit_test_policy(2);
+        root.install_connector_policy(installed)
+            .expect("fixture installs its first policy");
+        let error = match root.install_connector_policy(requested) {
+            Ok(_) => panic!("a live process root cannot split its connector limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.installed, installed);
+        assert_eq!(error.requested, requested);
+    }
+
+    #[test]
+    fn v4_arc03d_concurrent_process_policy_installation_has_one_winner() {
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        let first_policy = explicit_test_policy(1);
+        let second_policy = explicit_test_policy(2);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let first_root = root.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_root.install_connector_policy(first_policy)
+        });
+        let second_root = root.clone();
+        let second_barrier = Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_root.install_connector_policy(second_policy)
+        });
+
+        barrier.wait();
+        let first_result = first.join().expect("first installer joins");
+        let second_result = second.join().expect("second installer joins");
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+
+        let installed = root
+            .connector_resource_owner()
+            .expect("one concurrent installer owns the root")
+            .policy();
+        for result in [first_result, second_result] {
+            match result {
+                Ok(owner) => assert_eq!(owner.policy(), installed),
+                Err(conflict) => {
+                    assert_eq!(conflict.installed, installed);
+                    assert_ne!(conflict.requested, installed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v4_arc03d_callback_policy_rejects_runtime_panicking_capacity() {
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let unsupported = NonZeroUsize::new(
+            tokio::sync::Semaphore::MAX_PERMITS
+                .checked_add(1)
+                .expect("Tokio's maximum is below usize::MAX"),
+        )
+        .expect("the unsupported fixture is nonzero");
+
+        let error = ConnectorCallbackPolicy::new(
+            ConnectorCallbackMailboxCapacities::new(unsupported, one, one),
+            ConnectorCallbackServiceWeights::new(one, one, one),
+            one,
+            Duration::from_secs(1),
+        )
+        .expect_err("policy construction rejects a capacity that mpsc::channel would panic on");
+
+        assert!(matches!(
+            error,
+            ConnectorCallbackPolicyError::MailboxCapacityExceedsRuntimeLimit {
+                class: "control",
+                requested,
+                maximum,
+            } if requested == tokio::sync::Semaphore::MAX_PERMITS + 1
+                && maximum == tokio::sync::Semaphore::MAX_PERMITS
+        ));
+    }
 
     #[test]
     fn v4_arc02_attempt_issues_multiple_candidate_children_from_one_aggregate() {

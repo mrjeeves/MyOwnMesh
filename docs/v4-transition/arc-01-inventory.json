@@ -76,11 +76,11 @@
   ],
   "source_snapshot": {
     "count": 106,
-    "sha256": "ee46d0bf9139b40c1d157932efee8b44ffd442f6b5879df0886255ce9153a597"
+    "sha256": "b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba"
   },
   "declaration_snapshot": {
-    "count": 1762,
-    "sha256": "797f31b9296cc6eed59fe0145a9097343c2c0216b04c8802853e536eb9598b10"
+    "count": 1792,
+    "sha256": "f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a"
   },
   "declaration_rules": [
     {
@@ -142,6 +142,11 @@
       "id": "decl-embedded-container",
       "disposition": "Split",
       "match": {"path": "crates/myownmesh/src/embedded.rs", "name": "EmbeddedDaemon", "member": "$type"}
+    },
+    {
+      "id": "decl-embedded-start-error",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/embedded.rs", "name": "EmbeddedStartError"}
     },
     {
       "id": "decl-registry-gateway",
@@ -1157,8 +1162,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1910,
-    "sha256": "dbed310b91abbe861f2375cdd5b1c8c9370fee65a129c220418ecc405f6f4abb"
+    "count": 1952,
+    "sha256": "4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb"
   },
   "surface_rules": [
     {
@@ -1735,7 +1740,7 @@
         {"path": "crates/myownmesh-core/src/engine/routing.rs", "anchor": "pub(crate) async fn send_routed", "count": 1},
         {"path": "crates/myownmesh-core/src/engine/routing.rs", "anchor": "pub(crate) async fn broadcast_flood", "count": 1},
         {"path": "crates/myownmesh-core/src/services/relay.rs", "anchor": "pub const RELAY_CHANNEL: &str = \"__mesh_relay__/v1\";", "count": 1},
-        {"path": "crates/myownmesh/src/services.rs", "anchor": "if desired.relay.enabled {", "count": 1},
+        {"path": "crates/myownmesh/src/services.rs", "anchor": "if desired.relay.enabled {", "count": 2},
         {"path": "crates/myownmesh/src/services.rs", "anchor": "RelayService::start(joined.state(), fanout)", "count": 2},
         {"path": "crates/myownmesh/src/cli/ctl.rs", "anchor": "\"relay\" => services.relay.enabled = enabled,", "count": 1}
       ]
@@ -1966,7 +1971,7 @@
       "items": [
         {"name": "attempt retirement watch", "path": "crates/myownmesh-core/src/runtime/attempt/mod.rs", "symbol": "admitted@1", "anchor": "watch::channel(false)", "count": 1},
         {"name": "WebRTC connector retirement watch", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "new@1", "anchor": "watch::channel(false)", "count": 1},
-        {"name": "WebRTC independently bounded callback mailboxes", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::channel(callback_mailboxes.", "count": 4},
+        {"name": "WebRTC closed generic callback mailboxes", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::channel(mailboxes.", "count": 3},
         {"name": "WebRTC connector transport observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_connector_peer@1", "anchor": "PreAuthResourceFamily::TransportObject", "count": 1},
         {"name": "WebRTC peer-connection callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "register_callbacks@1", "anchor": "PreAuthResourceFamily::Callback", "count": 5},
         {"name": "WebRTC data-channel callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "install_data_channel_handlers@1", "anchor": "PreAuthResourceFamily::Callback", "count": 4},
@@ -2158,15 +2163,15 @@
       "DOMAIN:Application client": 52,
       "DOMAIN:Connector infrastructure": 15,
       "DOMAIN:Operational infrastructure (U0)": 106,
-      "DOMAIN:Resource instrumentation": 106,
-      "NODE:Application Gateway": 348,
-      "NODE:Attempt Node": 76,
-      "NODE:Connector Worker": 183,
+      "DOMAIN:Resource instrumentation": 107,
+      "NODE:Application Gateway": 351,
+      "NODE:Attempt Node": 92,
+      "NODE:Connector Worker": 189,
       "NODE:Endpoint Auth Task": 33,
       "NODE:Peer Session Node": 73,
       "NODE:Reachability Node": 173,
       "NODE:Relay Node": 38,
-      "NODE:Runtime Supervisor": 57,
+      "NODE:Runtime Supervisor": 61,
       "NODE:Semantic Node": 117,
       "NODE:Session Broker": 21,
       "NODE:Signaling Node": 190,
@@ -2183,15 +2188,15 @@
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "DOMAIN:Resource instrumentation": 54,
-      "NODE:Application Gateway": 164,
-      "NODE:Attempt Node": 60,
-      "NODE:Connector Worker": 207,
+      "DOMAIN:Resource instrumentation": 58,
+      "NODE:Application Gateway": 165,
+      "NODE:Attempt Node": 72,
+      "NODE:Connector Worker": 229,
       "NODE:Endpoint Auth Task": 15,
       "NODE:Peer Session Node": 53,
       "NODE:Reachability Node": 54,
       "NODE:Relay Node": 40,
-      "NODE:Runtime Supervisor": 22,
+      "NODE:Runtime Supervisor": 25,
       "NODE:Semantic Node": 111,
       "NODE:Session Broker": 15,
       "NODE:Signaling Node": 271,
@@ -2201,9 +2206,9 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1279,
+      "callable": 1314,
       "callback_registration": 9,
-      "constructor_entry": 108,
+      "constructor_entry": 114,
       "external_carrier": 29,
       "external_http": 1,
       "external_http_body": 4,
@@ -2217,9 +2222,9 @@
       "parser_binary": 1,
       "parser_entry": 24,
       "process": 16,
-      "public_action": 127,
+      "public_action": 129,
       "public_trait_action": 3,
-      "queue_bounded": 6,
+      "queue_bounded": 5,
       "queue_broadcast": 8,
       "queue_oneshot": 19,
       "queue_unbounded": 18,
@@ -2235,9 +2240,9 @@
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 106 | `ee46d0bf9139b40c1d157932efee8b44ffd442f6b5879df0886255ce9153a597` |",
-    "| Production Rust declaration members | 1,762 | `797f31b9296cc6eed59fe0145a9097343c2c0216b04c8802853e536eb9598b10` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,910 | `dbed310b91abbe861f2375cdd5b1c8c9370fee65a129c220418ecc405f6f4abb` |",
+    "| Production Rust source units | 106 | `b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba` |",
+    "| Production Rust declaration members | 1,792 | `f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,952 | `4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb` |",
     "| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |",
     "| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 18 unbounded channel constructions"

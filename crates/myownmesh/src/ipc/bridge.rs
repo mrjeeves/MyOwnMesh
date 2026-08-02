@@ -376,13 +376,51 @@ mod tests {
     use myownmesh_core::identity::Identity;
     use myownmesh_core::transport::Transport;
     use myownmesh_core::{
-        ConnectorCallbackMailboxCapacities, ConnectorResourceOwnerPort, ConnectorResourcePolicy,
+        ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
+        ConnectorCallbackServiceWeights, ConnectorResourcePolicy,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    static BRIDGE_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct BridgeTestDrivers {
+        alice: Arc<myownmesh_core::engine::NetworkState>,
+        bob: Arc<myownmesh_core::engine::NetworkState>,
+        drivers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl BridgeTestDrivers {
+        async fn shutdown(mut self) {
+            let _ = self
+                .alice
+                .cmd_tx
+                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+            let _ = self
+                .bob
+                .cmd_tx
+                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+            while let Some(driver) = self.drivers.pop() {
+                let _ = driver.await;
+            }
+        }
+    }
+
+    impl Drop for BridgeTestDrivers {
+        fn drop(&mut self) {
+            let _ = self
+                .alice
+                .cmd_tx
+                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+            let _ = self
+                .bob
+                .cmd_tx
+                .send(myownmesh_core::engine::NetworkCmd::Shutdown);
+        }
+    }
 
     fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
         NetworkConfig {
@@ -405,20 +443,29 @@ mod tests {
             NonZeroUsize::new(4).expect("test connector count is explicitly nonzero");
         let callback_capacity =
             NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
-        let policy = ConnectorResourcePolicy::new(
-            connector_count,
+        let callbacks = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(
                 callback_capacity,
                 callback_capacity,
                 callback_capacity,
+            ),
+            ConnectorCallbackServiceWeights::new(
+                callback_capacity,
+                callback_capacity,
                 callback_capacity,
             ),
+            NonZeroUsize::new(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
+                .expect("test real-time unit limit is nonzero"),
             Duration::from_secs(10),
         )
-        .expect("test close deadline is explicitly nonzero");
+        .expect("test real-time enqueue deadline is explicitly nonzero");
+        let policy =
+            ConnectorResourcePolicy::new(connector_count, callbacks, Duration::from_secs(10))
+                .expect("test close deadline is explicitly nonzero");
         Transport::new()
             .expect("transport")
-            .with_connector_resource_owner(ConnectorResourceOwnerPort::new(policy))
+            .with_connector_resource_policy(policy)
+            .expect("test process connector policy is consistent")
     }
 
     async fn wait_for_approval(
@@ -442,10 +489,9 @@ mod tests {
         }
     }
 
-    /// Build two engines + a Rpc dispatcher pair sharing one
-    /// LocalBroker. Returns `(alice_state, bob_state, alice_rpc,
-    /// bob_rpc, alice_id, bob_id)`. Driver join handles are
-    /// leaked — the tests don't depend on clean shutdown.
+    /// Build two engines and an RPC dispatcher pair sharing one LocalBroker.
+    /// The returned driver owner performs a real shutdown so one process-global
+    /// connector budget is reusable by the next test.
     #[allow(clippy::type_complexity)]
     async fn two_peer_rpc(
         wire_id: &str,
@@ -456,6 +502,7 @@ mod tests {
         Arc<myownmesh_core::rpc::Rpc>,
         Arc<Identity>,
         Arc<Identity>,
+        BridgeTestDrivers,
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("MYOWNMESH_HOME", tmp.path());
@@ -477,11 +524,6 @@ mod tests {
         let (bob_state, bob_driver) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
-        // Leak the driver handles — keeps them running for the
-        // life of the test process.
-        std::mem::forget(alice_driver);
-        std::mem::forget(bob_driver);
-
         let alice_rpc = Arc::new(myownmesh_core::rpc::Rpc::attach(&alice_state));
         let bob_rpc = Arc::new(myownmesh_core::rpc::Rpc::attach(&bob_state));
 
@@ -493,7 +535,20 @@ mod tests {
         wait_for_approval(&mut alice_events, bob_id.public_id()).await;
         wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
-        (alice_state, bob_state, alice_rpc, bob_rpc, alice_id, bob_id)
+        let drivers = BridgeTestDrivers {
+            alice: Arc::clone(&alice_state),
+            bob: Arc::clone(&bob_state),
+            drivers: vec![alice_driver, bob_driver],
+        };
+        (
+            alice_state,
+            bob_state,
+            alice_rpc,
+            bob_rpc,
+            alice_id,
+            bob_id,
+            drivers,
+        )
     }
 
     /// Single-shot RPC routed via the IPC bridge. Alice's
@@ -504,7 +559,8 @@ mod tests {
     /// returned payload.
     #[tokio::test]
     async fn single_shot_rpc_round_trip_through_bridge() {
-        let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id) =
+        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             two_peer_rpc("ipc-bridge-single").await;
 
         // Simulate an IPC client on Alice's side.
@@ -593,6 +649,7 @@ mod tests {
             .expect("join")
             .expect("rpc ok");
         assert_eq!(bob_response.body, serde_json::json!({"n_squared": 49}));
+        drivers.shutdown().await;
     }
 
     /// Streaming RPC: Alice's "client" pushes three chunks
@@ -601,7 +658,8 @@ mod tests {
     /// receiver and sees all three plus the end-of-stream.
     #[tokio::test]
     async fn streaming_rpc_round_trip_through_bridge() {
-        let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id) =
+        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let (alice_state, _bob_state, _alice_rpc, bob_rpc, alice_id, _bob_id, drivers) =
             two_peer_rpc("ipc-bridge-stream").await;
 
         let registry = ClientRegistry::new();
@@ -690,6 +748,7 @@ mod tests {
             .await
             .expect("end timeout");
         assert!(end.is_none(), "expected stream end, got {end:?}");
+        drivers.shutdown().await;
     }
 
     /// Channel pub/sub: subscribe Alice's "IPC client" to a
@@ -698,7 +757,8 @@ mod tests {
     /// correct payload and sender.
     #[tokio::test]
     async fn channel_inbound_round_trip_through_bridge() {
-        let (alice_state, bob_state, _alice_rpc, _bob_rpc, _alice_id, bob_id) =
+        let _serial = BRIDGE_TEST_SERIAL.lock().await;
+        let (alice_state, bob_state, _alice_rpc, _bob_rpc, _alice_id, bob_id, drivers) =
             two_peer_rpc("ipc-bridge-channel").await;
 
         let registry = ClientRegistry::new();
@@ -778,6 +838,7 @@ mod tests {
             }
             other => panic!("expected ChannelInbound, got {other:?}"),
         }
+        drivers.shutdown().await;
     }
 
     fn _alice_id_arg(state: &Arc<myownmesh_core::engine::NetworkState>) -> &str {

@@ -38,6 +38,12 @@ pub struct ServiceManager {
     state: Mutex<ManagerState>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ServicePolicyError {
+    #[error("ordinary-member application payload relay is forbidden by the V4 endpoint path")]
+    LegacyPayloadRelayForbidden,
+}
+
 struct ManagerState {
     config: ServicesConfig,
     stun: Option<StunServerHandle>,
@@ -88,6 +94,13 @@ pub struct RelayReport {
 }
 
 impl ServiceManager {
+    pub fn validate_config(desired: &ServicesConfig) -> Result<(), ServicePolicyError> {
+        if desired.relay.enabled {
+            return Err(ServicePolicyError::LegacyPayloadRelayForbidden);
+        }
+        Ok(())
+    }
+
     pub fn new(mesh: MeshHandle, registry: Arc<NetworkRegistry>) -> Arc<Self> {
         Arc::new(Self {
             mesh,
@@ -107,7 +120,11 @@ impl ServiceManager {
     /// set from the current network registry, and refreshes capability
     /// adverts. Returns the resulting status. Per-service start failures
     /// are logged, not propagated.
-    pub async fn apply(&self, desired: ServicesConfig) -> ServicesReport {
+    pub async fn apply(
+        &self,
+        desired: ServicesConfig,
+    ) -> Result<ServicesReport, ServicePolicyError> {
+        Self::validate_config(&desired)?;
         let mut g = self.state.lock().await;
 
         // ---- Node participation ----
@@ -215,7 +232,7 @@ impl ServiceManager {
             relays = g.relays.len(),
             "services reconciled"
         );
-        g.report(joined)
+        Ok(g.report(joined))
     }
 
     /// Snapshot the current service status without changing anything.
@@ -481,5 +498,16 @@ mod tests {
         assert!(advert.tags.contains(&"service:signaling".to_string()));
         // ...but no URL since we don't know a reachable host.
         assert_eq!(ServiceAdvert::from_extra(&advert.extra), None);
+    }
+
+    #[test]
+    fn v4_daemon_policy_rejects_ordinary_member_payload_relay() {
+        let mut cfg = ServicesConfig::default();
+        cfg.relay.enabled = true;
+
+        assert!(matches!(
+            ServiceManager::validate_config(&cfg),
+            Err(ServicePolicyError::LegacyPayloadRelayForbidden)
+        ));
     }
 }
