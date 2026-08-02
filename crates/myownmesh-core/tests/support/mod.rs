@@ -12,7 +12,29 @@ use myownmesh_core::{
 /// These values cover the known in-process multi-device test fixtures. They
 /// are test inputs only and make no production sizing claim.
 pub fn test_transport() -> Transport {
-    let connector_count = NonZeroUsize::new(16).expect("fixture connector bound is nonzero");
+    // Every integration-test binary has one real process resource root, while
+    // libtest runs up to one test case per worker concurrently. Keep the
+    // established per-Mesh fixture ceiling separate from the process ceiling
+    // so parallel tests cannot consume one another's connector allowance.
+    let mesh_connector_count =
+        NonZeroUsize::new(16).expect("fixture per-Mesh connector bound is nonzero");
+    let test_workers = std::env::var("RUST_TEST_THREADS")
+        .ok()
+        .map(|raw| {
+            raw.parse::<NonZeroUsize>()
+                .expect("RUST_TEST_THREADS must be a nonzero integer")
+        })
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .expect("integration-test worker concurrency must be observable")
+        });
+    let process_connector_count = NonZeroUsize::new(
+        mesh_connector_count
+            .get()
+            .checked_mul(test_workers.get())
+            .expect("integration-test process connector bound must fit usize"),
+    )
+    .expect("derived integration-test process connector bound is nonzero");
     let callback_capacity = NonZeroUsize::new(16).expect("fixture callback capacity is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
         ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
@@ -26,11 +48,12 @@ pub fn test_transport() -> Transport {
         Duration::from_secs(10),
     )
     .expect("fixture real-time useful lifetime is nonzero");
-    let policy = ConnectorResourcePolicy::new(connector_count, callbacks, Duration::from_secs(10))
-        .expect("fixture close deadline is nonzero");
+    let policy =
+        ConnectorResourcePolicy::new(process_connector_count, callbacks, Duration::from_secs(10))
+            .expect("fixture close deadline is nonzero");
     let policy = ConnectorCapableResourcePolicy::new(
         policy,
-        MeshConnectorResourcePolicy::new(connector_count),
+        MeshConnectorResourcePolicy::new(mesh_connector_count),
     );
     Transport::new()
         .expect("transport")
