@@ -12,7 +12,7 @@ The target owner holds one attempt's connector-candidate set, race state, `Attem
 
 - local connection intent;
 - bounded transport hints;
-- one aggregate pre-authentication resource reservation represented by `PreAuthAttemptPermit`;
+- one explicit `ConnectorResourceOwnerPort` supplied by the process owner;
 - typed connector-control input and cancellation.
 
 ## Outputs
@@ -26,15 +26,15 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 ## Resources
 
-`PreAuthAttemptPermit` is not consumed by its first connector candidate. It owns one aggregate reservation and may issue several child reservations. Each connector candidate carries its child reservation and an unforgeable witness for the exact attempt that issued it.
+`PreAuthAttemptPermit` is not consumed by its first connector candidate. It may request several child reservations, but it cannot create capacity. Every request goes to the injected process resource owner. Each connector candidate carries its admitted child reservation and an unforgeable witness for the exact attempt that issued it.
 
-The aggregate is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the algebraically fixed per-candidate floor needed to prove ownership of one transport object and its construction work. It supplies no process or anonymous-ingress capacity.
+The active claim is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the fixed per-candidate structure needed to prove ownership of one transport object, construction work, and an owned task slot. The external owner supplies the process candidate count, four callback mailbox capacities, and native-close deadline. There is no production default.
 
 The child is acquired before connector construction starts. A refused child claim performs no allocation. Real asynchronous construction runs in an owned task. Cancellation fences publication, closes any private native result, and returns the child claim only after successful native cleanup.
 
 Candidate promotion atomically changes the child from its opening claim to its connected claim. Candidate-only construction work is released while the transport claim remains with the connected-channel capability.
 
-Arc 03 does not invent a production process capacity. The resource owner must supply measured, owner-approved attempt and worker capacities before this structural floor can become a complete hostile-ingress guard. Anonymous-ingress and process-global admission must remain possible before a Device identity or Closed authorization is known.
+Arc 03 does not invent production values. The resource owner must supply measured, owner-approved values. Anonymous-ingress and process-global admission remain possible before a Device identity or Closed authorization is known. The current port bounds active connector candidates, but it is not a complete hostile-ingress model for every dependency-owned allocation.
 
 ## Restart behavior
 

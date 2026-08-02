@@ -11,7 +11,6 @@ use std::sync::Arc;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{governance, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{NetworkKind, TransitionVariant};
 
 fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
@@ -34,7 +33,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
 async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let net_id = "custody-gate";
     let alice = Arc::new(Identity::ephemeral());
@@ -84,3 +83,4 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
         "with no enrollment the gate must be a no-op"
     );
 }
+mod support;

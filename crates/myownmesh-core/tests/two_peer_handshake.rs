@@ -8,7 +8,6 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{Channel, MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -43,7 +42,7 @@ async fn two_peers_handshake_and_exchange_channel_message() {
     // Same wire-level network id, same broker — but two distinct
     // identities and two engines.
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
@@ -134,3 +133,4 @@ async fn wait_for_approval(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
         }
     }
 }
+mod support;

@@ -202,13 +202,6 @@ impl ResourceUse {
             tasks: self.tasks.max(other.tasks),
         }
     }
-
-    pub(crate) const fn fits_within(self, capacity: Self) -> bool {
-        self.items <= capacity.items
-            && self.logical_bytes <= capacity.logical_bytes
-            && self.retained_bytes <= capacity.retained_bytes
-            && self.tasks <= capacity.tasks
-    }
 }
 
 /// One caller-supplied measurement and whether all of its components were

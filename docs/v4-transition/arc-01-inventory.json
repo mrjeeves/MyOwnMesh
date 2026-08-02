@@ -76,11 +76,11 @@
   ],
   "source_snapshot": {
     "count": 106,
-    "sha256": "7d5ba5380dcd3e815eeb841589422291ea346284b523f0dfa3189a80482beecf"
+    "sha256": "ee46d0bf9139b40c1d157932efee8b44ffd442f6b5879df0886255ce9153a597"
   },
   "declaration_snapshot": {
-    "count": 1717,
-    "sha256": "937eda9e821c2ff6cc2b83d2bba7e7084449c2d04df97f94a500e45a4e2061be"
+    "count": 1762,
+    "sha256": "797f31b9296cc6eed59fe0145a9097343c2c0216b04c8802853e536eb9598b10"
   },
   "declaration_rules": [
     {
@@ -437,6 +437,11 @@
       "id": "decl-peer-connection-endpoint-auth",
       "target": "Endpoint Auth Task",
       "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "endpoint_auth"}
+    },
+    {
+      "id": "decl-peer-connection-realtime-flow",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "realtime_flow"}
     },
     {
       "id": "decl-peer-connection-split",
@@ -891,7 +896,7 @@
       "decision": "OD-CODEC-FLOW-BOUNDARY",
       "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": ["LaneKind", "LaneSlot", "VideoSample", "AudioSample", "H264AuAssembler", "Transport", "PeerSession"]},
       "exclude": [
-        {"name": "Transport", "member": ["$type", "api", "runtime", "ice_transport_policy"]},
+        {"name": "Transport", "member": ["$type", "api", "runtime", "ice_transport_policy", "connector_resource_owner"]},
         {"name": "PeerSession", "member": ["$type", "events_tx", "data_channel", "pc", "role", "resource_scope", "callback_gate"]}
       ]
     },
@@ -1152,8 +1157,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1861,
-    "sha256": "25ba2122af69341da58c0e53cfedfc23ead9ce2bbcd066d70ceb4471eb044fde"
+    "count": 1910,
+    "sha256": "dbed310b91abbe861f2375cdd5b1c8c9370fee65a129c220418ecc405f6f4abb"
   },
   "surface_rules": [
     {
@@ -1961,7 +1966,7 @@
       "items": [
         {"name": "attempt retirement watch", "path": "crates/myownmesh-core/src/runtime/attempt/mod.rs", "symbol": "admitted@1", "anchor": "watch::channel(false)", "count": 1},
         {"name": "WebRTC connector retirement watch", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "new@1", "anchor": "watch::channel(false)", "count": 1},
-        {"name": "WebRTC bounded callback mailbox", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR)", "count": 1},
+        {"name": "WebRTC independently bounded callback mailboxes", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::channel(callback_mailboxes.", "count": 4},
         {"name": "WebRTC connector transport observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_connector_peer@1", "anchor": "PreAuthResourceFamily::TransportObject", "count": 1},
         {"name": "WebRTC peer-connection callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "register_callbacks@1", "anchor": "PreAuthResourceFamily::Callback", "count": 5},
         {"name": "WebRTC data-channel callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "install_data_channel_handlers@1", "anchor": "PreAuthResourceFamily::Callback", "count": 4},
@@ -2155,8 +2160,8 @@
       "DOMAIN:Operational infrastructure (U0)": 106,
       "DOMAIN:Resource instrumentation": 106,
       "NODE:Application Gateway": 348,
-      "NODE:Attempt Node": 57,
-      "NODE:Connector Worker": 157,
+      "NODE:Attempt Node": 76,
+      "NODE:Connector Worker": 183,
       "NODE:Endpoint Auth Task": 33,
       "NODE:Peer Session Node": 73,
       "NODE:Reachability Node": 173,
@@ -2174,14 +2179,14 @@
     },
     "surface_assignments": {
       "DISPOSITION:Delete": 25,
-      "DISPOSITION:Split": 382,
+      "DISPOSITION:Split": 384,
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "DOMAIN:Resource instrumentation": 55,
-      "NODE:Application Gateway": 156,
-      "NODE:Attempt Node": 40,
-      "NODE:Connector Worker": 187,
+      "DOMAIN:Resource instrumentation": 54,
+      "NODE:Application Gateway": 164,
+      "NODE:Attempt Node": 60,
+      "NODE:Connector Worker": 207,
       "NODE:Endpoint Auth Task": 15,
       "NODE:Peer Session Node": 53,
       "NODE:Reachability Node": 54,
@@ -2196,9 +2201,9 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1247,
+      "callable": 1279,
       "callback_registration": 9,
-      "constructor_entry": 98,
+      "constructor_entry": 108,
       "external_carrier": 29,
       "external_http": 1,
       "external_http_body": 4,
@@ -2212,17 +2217,17 @@
       "parser_binary": 1,
       "parser_entry": 24,
       "process": 16,
-      "public_action": 123,
-      "public_trait_action": 2,
-      "queue_bounded": 3,
+      "public_action": 127,
+      "public_trait_action": 3,
+      "queue_bounded": 6,
       "queue_broadcast": 8,
       "queue_oneshot": 19,
       "queue_unbounded": 18,
       "queue_watch": 6,
       "static_state": 4,
       "stream_receive": 10,
-      "task": 63,
-      "trait_callable": 19,
+      "task": 61,
+      "trait_callable": 20,
       "write": 92
     },
     "semantic_marker_items": 88,
@@ -2230,9 +2235,9 @@
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 106 | `7179a4984d83dc6a75327da239ae9720e7df8fae6a10f69424f74cdaebb3f57c` |",
-    "| Production Rust declaration members | 1,717 | `937eda9e821c2ff6cc2b83d2bba7e7084449c2d04df97f94a500e45a4e2061be` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,861 | `25ba2122af69341da58c0e53cfedfc23ead9ce2bbcd066d70ceb4471eb044fde` |",
+    "| Production Rust source units | 106 | `ee46d0bf9139b40c1d157932efee8b44ffd442f6b5879df0886255ce9153a597` |",
+    "| Production Rust declaration members | 1,762 | `797f31b9296cc6eed59fe0145a9097343c2c0216b04c8802853e536eb9598b10` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,910 | `dbed310b91abbe861f2375cdd5b1c8c9370fee65a129c220418ecc405f6f4abb` |",
     "| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |",
     "| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 18 unbounded channel constructions"

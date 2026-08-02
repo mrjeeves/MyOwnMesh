@@ -5,6 +5,8 @@
 
 use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;
+use crate::transport::WebRtcConnectorIncarnation;
+use std::sync::Arc;
 
 /// Local proof that a connector candidate produced a working channel.
 ///
@@ -66,6 +68,34 @@ impl ConnectedChannelCapability {
 
     pub(crate) fn into_candidate(self) -> ConnectorCandidateCapability {
         self.candidate
+    }
+
+    pub(crate) fn poison_cleanup(&mut self) {
+        self.candidate.poison_cleanup();
+    }
+}
+
+/// Exact, process-local authority for one connector-native real-time flow.
+///
+/// This type deliberately says nothing about codecs, media kinds, lanes, or
+/// application semantics. It only proves that the legacy admission path
+/// authorized real-time work on one exact live connector incarnation. Arc 04
+/// will replace that compatibility issuance point with authenticated-session
+/// ownership.
+///
+/// It has no public constructor and is neither cloneable by value nor
+/// serializable. Runtime owners may share the exact instance through `Arc`.
+pub(crate) struct ConnectorRealtimeFlowCapability {
+    incarnation: Arc<WebRtcConnectorIncarnation>,
+}
+
+impl ConnectorRealtimeFlowCapability {
+    pub(super) fn new(incarnation: Arc<WebRtcConnectorIncarnation>) -> Self {
+        Self { incarnation }
+    }
+
+    pub(crate) fn belongs_to(&self, incarnation: &Arc<WebRtcConnectorIncarnation>) -> bool {
+        Arc::ptr_eq(&self.incarnation, incarnation) && incarnation.is_active()
     }
 }
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,14 @@ fn main() {}
 """,
         "E0599",
         ("open_peer", "not found"),
+    ),
+    RejectedProbe(
+        "realtime_flow_capability_is_not_public",
+        """use myownmesh_core::connector::ConnectorRealtimeFlowCapability; // expected-error
+fn main() { let _ = std::mem::size_of::<ConnectorRealtimeFlowCapability>(); }
+""",
+        "E0603",
+        ("ConnectorRealtimeFlowCapability", "private"),
     ),
 )
 
@@ -150,6 +159,31 @@ def matches(probe: RejectedProbe, diagnostics: list[dict]) -> bool:
 
 def main() -> int:
     failures: list[str] = []
+    webrtc_source = (CORE / "src" / "transport" / "webrtc.rs").read_text(
+        encoding="utf-8"
+    )
+    for consumer in (
+        "open_media_lane",
+        "close_media_lane",
+        "send_video",
+        "send_audio",
+        "has_reapable_lanes",
+        "reap_drained_lanes",
+    ):
+        signature = re.search(
+            rf"pub\(crate\)\s+(?:async\s+)?fn\s+{consumer}\s*\((?P<args>.{{0,700}}?)\)\s*(?:->|\{{)",
+            webrtc_source,
+            flags=re.DOTALL,
+        )
+        if signature is None or "ConnectorRealtimeFlowCapability" not in signature.group(
+            "args"
+        ):
+            failures.append(
+                f"{consumer} does not consume ConnectorRealtimeFlowCapability"
+            )
+    if "enable_realtime_delivery" in webrtc_source:
+        failures.append("legacy worker-only real-time enablement still exists")
+
     with tempfile.TemporaryDirectory(prefix="myownmesh-v4-arc03-compiler-") as temporary:
         project = Path(temporary)
         source_dir = project / "src"
@@ -198,7 +232,8 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        "control and three cause-matched rejection controls."
+        "control, four cause-matched rejection controls, and six exact "
+        "real-time-flow consumers."
     )
     return 0
 

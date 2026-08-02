@@ -11,7 +11,6 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, NetworkKind, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -40,7 +39,7 @@ async fn silent_peers_are_sighted_but_do_not_connect_until_dialed() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
@@ -149,3 +148,4 @@ async fn expect_sighted_but_not_authenticated(
         "expected to discover {peer} via Sighted on a silent network"
     );
 }
+mod support;

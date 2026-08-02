@@ -136,6 +136,10 @@ pub use network_state::{
 pub use protocol::CapabilityAdvert;
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
+pub use runtime::attempt::{
+    ConnectorCallbackMailboxCapacities, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
+    ConnectorResourcePolicy,
+};
 pub use services::{
     relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,
 };

@@ -10,14 +10,18 @@ use myownmesh_core::config::{
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
 use myownmesh_core::identity::Identity;
+use myownmesh_core::transport::webrtc::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
-use myownmesh_core::{Channel, MeshEvent, PeerEvent};
+use myownmesh_core::{
+    Channel, ConnectorCallbackMailboxCapacities, ConnectorResourceOwnerPort,
+    ConnectorResourcePolicy, MeshEvent, PeerEvent,
+};
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn network_config(label: &str, turn_url: String) -> NetworkConfig {
+fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkConfig {
     NetworkConfig {
         id: label.to_string(),
         network_id: "turn-endpoint-auth".to_string(),
@@ -33,8 +37,26 @@ fn network_config(label: &str, turn_url: String) -> NetworkConfig {
         }],
         roster_path: None,
         pinned_peers: Vec::new(),
-        auto_approve: true,
+        auto_approve,
     }
+}
+
+fn test_connector_resource_owner() -> ConnectorResourceOwnerPort {
+    let one = std::num::NonZeroUsize::new(1).expect("fixture candidate bound is nonzero");
+    let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
+    let policy = ConnectorResourcePolicy::new(
+        one,
+        ConnectorCallbackMailboxCapacities::new(callback, callback, callback, callback),
+        Duration::from_secs(10),
+    )
+    .expect("fixture native-close deadline is nonzero");
+    ConnectorResourceOwnerPort::new(policy)
+}
+
+fn relay_only_test_transport() -> Transport {
+    Transport::new_relay_only_for_lab()
+        .expect("relay-only test transport")
+        .with_connector_resource_owner(test_connector_resource_owner())
 }
 
 async fn wait_for_authenticated_then_approved(
@@ -79,6 +101,43 @@ async fn receive_string(
     .expect("endpoint data did not cross the selected TURN path")
 }
 
+async fn wait_for_authenticated(
+    events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
+    peer_id: &str,
+) {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if matches!(
+                events.recv().await.expect("mesh event stream remains open"),
+                MeshEvent::Peer(PeerEvent::Authenticated { device_id, .. }) if device_id == peer_id
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("endpoint authentication timed out");
+}
+
+async fn wait_for_relay_pair(state: &myownmesh_core::engine::state::NetworkState, peer_id: &str) {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if state
+                .peer_info(peer_id)
+                .and_then(|peer| peer.selected_pair)
+                .is_some_and(|pair| {
+                    pair.local == IceCandidateKind::Relay && pair.remote == IceCandidateKind::Relay
+                })
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("relay-selected candidate pair timed out");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
@@ -105,16 +164,16 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
     let (alice, alice_driver) = spawn_network(
-        network_config("alice", turn_url.clone()),
+        network_config("alice", turn_url.clone(), true),
         Arc::clone(&alice_id),
-        Transport::new_relay_only_for_lab().expect("relay-only Alice transport"),
+        relay_only_test_transport(),
     )
     .await
     .expect("Alice engine starts");
     let (bob, bob_driver) = spawn_network(
-        network_config("bob", turn_url),
+        network_config("bob", turn_url.clone(), true),
         Arc::clone(&bob_id),
-        Transport::new_relay_only_for_lab().expect("relay-only Bob transport"),
+        relay_only_test_transport(),
     )
     .await
     .expect("Bob engine starts");
@@ -179,6 +238,90 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     alice_driver.await.expect("Alice driver shuts down cleanly");
     bob_driver.await.expect("Bob driver shuts down cleanly");
     drop((alice, bob));
+    tokio::task::yield_now().await;
+
+    // Negative control on the same real TURN service. A relay-selected and
+    // endpoint-authenticated channel that has not received mutual application
+    // admission cannot send endpoint data, open a real-time lane, or send a
+    // real-time sample.
+    let carol_id = Arc::new(Identity::ephemeral());
+    let dave_id = Arc::new(Identity::ephemeral());
+    let (carol, carol_driver) = spawn_network(
+        network_config("carol", turn_url.clone(), false),
+        Arc::clone(&carol_id),
+        relay_only_test_transport(),
+    )
+    .await
+    .expect("Carol engine starts");
+    let (dave, dave_driver) = spawn_network(
+        network_config("dave", turn_url, false),
+        Arc::clone(&dave_id),
+        relay_only_test_transport(),
+    )
+    .await
+    .expect("Dave engine starts");
+    let mut carol_events = carol.events_tx.subscribe();
+    let mut dave_events = dave.events_tx.subscribe();
+    let negative_broker = LocalBroker::new();
+    attach_local(&carol, &negative_broker);
+    attach_local(&dave, &negative_broker);
+
+    tokio::join!(
+        wait_for_authenticated(&mut carol_events, dave_id.public_id()),
+        wait_for_authenticated(&mut dave_events, carol_id.public_id())
+    );
+    tokio::join!(
+        wait_for_relay_pair(&carol, dave_id.public_id()),
+        wait_for_relay_pair(&dave, carol_id.public_id())
+    );
+    for (state, peer_id) in [(&carol, dave_id.public_id()), (&dave, carol_id.public_id())] {
+        let peer = state
+            .peer_info(peer_id)
+            .expect("pending peer remains current");
+        assert_eq!(peer.status, PeerStatus::PendingApproval);
+        assert!(peer.authenticated);
+        assert!(!peer.local_approve_sent);
+        assert!(!peer.remote_approve_seen);
+    }
+
+    let carol_channel = Channel::<String>::new("arc03-negative".to_string(), Arc::clone(&carol));
+    carol_channel
+        .send_to(dave_id.public_id(), &"must-not-send".to_string())
+        .await
+        .expect_err("relay selection cannot bypass session admission");
+    carol
+        .send_video_sample(
+            dave_id.public_id(),
+            0,
+            b"must-not-send".to_vec().into(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("relay selection cannot bypass real-time-flow admission");
+    let (lane_reply, lane_result) = tokio::sync::oneshot::channel();
+    carol
+        .cmd_tx
+        .send(NetworkCmd::MediaLaneOpen {
+            peer: dave_id.public_id().to_string(),
+            kind: LaneKind::Video,
+            reply: lane_reply,
+        })
+        .expect("negative lane request reaches the engine");
+    lane_result
+        .await
+        .expect("engine returns the negative lane result")
+        .expect_err("worker possession cannot bypass real-time-flow admission");
+
+    carol
+        .cmd_tx
+        .send(NetworkCmd::Shutdown)
+        .expect("Carol shutdown reaches its driver");
+    dave.cmd_tx
+        .send(NetworkCmd::Shutdown)
+        .expect("Dave shutdown reaches its driver");
+    carol_driver.await.expect("Carol driver shuts down cleanly");
+    dave_driver.await.expect("Dave driver shuts down cleanly");
+    drop((carol, dave));
     tokio::task::yield_now().await;
     turn.stop().await.expect("TURN server stops cleanly");
 }

@@ -311,13 +311,12 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             reply,
         } => connect_peer(state, &device_id, sticky, reply).await,
         NetworkCmd::MediaLaneOpen { peer, kind, reply } => {
-            let session = state
-                .peers
-                .get(&peer)
-                .and_then(|p| p.session.lock().clone());
-            let result = match session {
-                Some(s) => s.open_media_lane(kind).await,
-                None => Err(Error::Network(format!("peer not connected: {peer}"))),
+            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let result = match flow {
+                Some((worker, capability)) => worker.open_media_lane(&capability, kind).await,
+                None => Err(Error::Network(format!(
+                    "peer real-time flow not admitted: {peer}"
+                ))),
             };
             let _ = reply.send(result);
         }
@@ -327,12 +326,11 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) -> bool {
             lane,
             reply,
         } => {
-            let session = state
-                .peers
-                .get(&peer)
-                .and_then(|p| p.session.lock().clone());
-            let result = match session {
-                Some(s) => s.close_media_lane(kind, lane).await,
+            let flow = state.peers.get(&peer).and_then(|p| p.realtime_flow_ports());
+            let result = match flow {
+                Some((worker, capability)) => {
+                    worker.close_media_lane(&capability, kind, lane).await
+                }
                 None => Ok(()), // no session, nothing open — close is idempotent
             };
             let _ = reply.send(result);
@@ -929,7 +927,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(entry) = state.peers.get(&device_id) else {
             continue;
         };
-        let Some(session) = entry.session.lock().clone() else {
+        let Some((session, realtime_flow)) = entry.realtime_flow_ports() else {
             continue;
         };
         let pending = {
@@ -938,7 +936,10 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         };
         // Anything draining past the grace? (Cheap read; the actual
         // removal happens in the spawned task.)
-        if !pending && !session.has_reapable_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE) {
+        if !pending
+            && !session
+                .has_reapable_lanes(&realtime_flow, *crate::transport::webrtc::LANE_DRAIN_GRACE)
+        {
             continue;
         }
         {
@@ -965,7 +966,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 // the removals too — one renegotiation for the whole
                 // delta.
                 let reaped = session
-                    .reap_drained_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE)
+                    .reap_drained_lanes(&realtime_flow, *crate::transport::webrtc::LANE_DRAIN_GRACE)
                     .await;
                 match session.create_offer().await {
                     Ok(desc) => {
@@ -2335,7 +2336,7 @@ enum Admission {
 /// Classify an inbound frame's admission phase. Only the four handshake/
 /// approval frames are `Protocol`; everything else — including any future
 /// variant — is `Application` and requires an admitted peer (fail closed).
-fn inbound_admission(msg: &MeshMessage) -> Admission {
+fn message_admission(msg: &MeshMessage) -> Admission {
     match msg {
         MeshMessage::Hello(_)
         | MeshMessage::AuthResponse(_)
@@ -2389,7 +2390,7 @@ async fn handle_inbound_frame_from(
     // `handshake::on_approve`). This check is synchronous, not swept: a
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
-    let application = matches!(inbound_admission(&msg), Admission::Application);
+    let application = matches!(message_admission(&msg), Admission::Application);
     let Some(peer) = state.peers.get_if_current(owner) else {
         return;
     };
@@ -2722,6 +2723,13 @@ pub(crate) async fn send_to_peer(
         let Some(peer) = state.peers.get(device_id) else {
             return Err(Error::Network(format!("peer not found: {device_id}")));
         };
+        if matches!(message_admission(msg), Admission::Application)
+            && !peer.state.read().is_admitted()
+        {
+            return Err(Error::Network(format!(
+                "peer is not admitted for application traffic: {device_id}"
+            )));
+        }
         let session = peer.session.lock().clone();
         session
     };
@@ -2758,6 +2766,13 @@ pub(crate) async fn send_to_peer_owner(
         .peers
         .get_if_current(owner)
         .ok_or_else(|| Error::Network(format!("peer owner is stale: {}", owner.device_id())))?;
+    if matches!(message_admission(msg), Admission::Application) && !peer.state.read().is_admitted()
+    {
+        return Err(Error::Network(format!(
+            "peer owner is not admitted for application traffic: {}",
+            owner.device_id()
+        )));
+    }
     let session = peer
         .session
         .lock()
@@ -2784,6 +2799,15 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
+    let admitted = state
+        .peers
+        .get(peer)
+        .is_some_and(|connection| connection.state.read().is_admitted());
+    if !admitted {
+        return Err(Error::Network(format!(
+            "peer is not admitted for application traffic: {peer}"
+        )));
+    }
     // Only a shaped topology can ever route around a missing link, so
     // only a shaped topology pays for keeping a copy. On full mesh the
     // payload moves — this is the hot path for MJPEG / PCM / file
@@ -3263,7 +3287,26 @@ fn build_test_state_parts(
         auto_approve: true,
     };
     let identity = Arc::new(crate::identity::Identity::ephemeral());
-    let transport = crate::transport::Transport::new().expect("transport");
+    let max_connectors = std::num::NonZeroUsize::new(2)
+        .expect("engine fixture has two simultaneous connector slots");
+    let callback_capacity =
+        std::num::NonZeroUsize::new(16).expect("engine fixture callback capacity is nonzero");
+    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
+        max_connectors,
+        crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
+            callback_capacity,
+            callback_capacity,
+            callback_capacity,
+            callback_capacity,
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("engine fixture close deadline is nonzero");
+    let transport = crate::transport::Transport::new()
+        .expect("transport")
+        .with_connector_resource_owner(crate::runtime::attempt::ConnectorResourceOwnerPort::new(
+            connector_policy,
+        ));
     let (state, _signaling_in_rx, cmd_rx) =
         NetworkState::new(config, identity, transport).expect("network state");
     (state, cmd_rx)
@@ -3689,6 +3732,52 @@ mod tests {
                 "{status:?} without authentication is never admitted"
             );
         }
+    }
+
+    #[test]
+    fn v4_arc03_relay_selection_is_not_authentication_or_session_admission() {
+        let relay_pair = crate::transport::SelectedCandidatePair {
+            local: crate::transport::IceCandidateKind::Relay,
+            remote: crate::transport::IceCandidateKind::Relay,
+        };
+        let unauthenticated = connection::PeerStateData {
+            authenticated: false,
+            status: PeerStatus::Active,
+            selected_pair: Some(relay_pair),
+            ..Default::default()
+        };
+        assert!(!unauthenticated.is_admitted());
+
+        let pending = connection::PeerStateData {
+            authenticated: true,
+            status: PeerStatus::PendingApproval,
+            selected_pair: Some(relay_pair),
+            ..Default::default()
+        };
+        assert!(!pending.is_admitted());
+
+        let peer = PeerConnection::new("relay-negative".to_string(), None);
+        *peer.state.write() = pending;
+        assert!(peer.realtime_flow_ports().is_none());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_outbound_application_send_requires_current_session_admission() {
+        let state = build_test_state("arc03-outbound-admission");
+        insert_session_less_peer(&state, "pending-peer", None);
+        set_admission(&state, "pending-peer", true, PeerStatus::PendingApproval);
+
+        let error = send_channel_frame(
+            &state,
+            "pending-peer",
+            "negative-control",
+            serde_json::json!("must-not-send"),
+        )
+        .await
+        .expect_err("pending peer cannot receive outbound application data");
+
+        assert!(error.to_string().contains("not admitted"));
+        assert_eq!(state.traffic.snapshot().app_tx.frames, 0);
     }
 
     #[tokio::test]
