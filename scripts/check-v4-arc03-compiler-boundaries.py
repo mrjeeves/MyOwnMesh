@@ -217,7 +217,11 @@ def main() -> int:
     ):
         failures.append("legacy real-time issuer does not verify exact Endpoint Auth provenance")
 
-    if "ProcessResourceRoot::global().install_connector_policy(policy)?" not in webrtc_source:
+    if not (
+        "let root = ProcessResourceRoot::global();" in webrtc_source
+        and "root.install_connector_policy(policy.process())?;" in webrtc_source
+        and "root.issue_mesh_connector_scope(policy.mesh())?;" in webrtc_source
+    ):
         failures.append("public transport policy path does not use the process resource root")
     if "ProcessResourceRoot::global().mesh_runtime_scope()" not in engine_source:
         failures.append("public Mesh runtime path does not use the process resource root")
@@ -233,9 +237,13 @@ def main() -> int:
         body = capacity_shape.group("body")
         if "audio" in body or "video" in body:
             failures.append("generic callback mailbox capacity still names audio or video")
-        for field in ("control", "endpoint_data", "realtime"):
+        for field in ("control", "endpoint_data"):
             if field not in body:
                 failures.append(f"generic callback mailbox capacity is missing {field}")
+        if re.search(r"\brealtime\s*:", body):
+            failures.append("generic callback mailbox still contains one shared realtime queue")
+        if "queue_capacity_per_flow" not in attempt_source:
+            failures.append("codec-neutral per-flow realtime queue bound is missing")
 
     recv_queued = re.search(
         r"async fn recv_queued\s*\(&mut self\).*?\n\s*\}",

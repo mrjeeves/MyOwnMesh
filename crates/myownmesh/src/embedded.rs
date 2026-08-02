@@ -23,6 +23,10 @@ pub enum EmbeddedStartError {
     #[error("connector resource policy is required before daemon startup")]
     MissingConnectorResourcePolicy,
 
+    /// Infrastructure-only startup must not create a network participant.
+    #[error("infrastructure-only startup requires node participation to be disabled")]
+    InfrastructureOnlyRequiresNodeDisabled,
+
     #[error("open mesh: {0}")]
     OpenMesh(#[from] myownmesh_core::Error),
 
@@ -63,14 +67,18 @@ impl EmbeddedDaemon {
     }
 }
 
-/// Refuse ownerless daemon startup with a typed error.
+/// Start the daemon from configuration alone.
 ///
-/// Use [`start_with_connector_resource_policy`] after the process owner has
-/// supplied every required policy value.
+/// An explicitly infrastructure-only configuration can start without native
+/// connector authority. Node participation still requires the process owner to
+/// call [`start_connector_capable`] with every reviewed policy value.
 pub async fn start(
-    _cfg: myownmesh_core::MeshConfig,
+    cfg: myownmesh_core::MeshConfig,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
-    Err(EmbeddedStartError::MissingConnectorResourcePolicy)
+    if cfg.services.node.enabled {
+        return Err(EmbeddedStartError::MissingConnectorResourcePolicy);
+    }
+    start_infrastructure_only(cfg).await
 }
 
 /// Start the daemon with the connector policy selected by the process owner.
@@ -78,20 +86,51 @@ pub async fn start(
 /// This is the only Arc 03 daemon path that can establish connectors. No
 /// capacity, callback weight, real-time deadline, unit limit, or close timeout
 /// is inferred here.
-pub async fn start_with_connector_resource_policy(
+pub async fn start_connector_capable(
     cfg: myownmesh_core::MeshConfig,
-    connector_policy: myownmesh_core::ConnectorResourcePolicy,
+    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     ServiceManager::validate_config(&cfg.services)?;
+    let mesh =
+        myownmesh_core::Mesh::open_with_connector_resource_policy(cfg.clone(), connector_policy)
+            .await?;
+    start_with_mesh(cfg, mesh).await
+}
+
+/// Compatibility name for [`start_connector_capable`].
+pub async fn start_with_connector_resource_policy(
+    cfg: myownmesh_core::MeshConfig,
+    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    start_connector_capable(cfg, connector_policy).await
+}
+
+/// Start a daemon that only hosts signaling, STUN, or TURN infrastructure.
+///
+/// The configuration must explicitly disable node participation. This form
+/// installs no connector policy, joins no network, and cannot later enable
+/// node participation through the live service configuration.
+pub async fn start_infrastructure_only(
+    cfg: myownmesh_core::MeshConfig,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    if cfg.services.node.enabled {
+        return Err(EmbeddedStartError::InfrastructureOnlyRequiresNodeDisabled);
+    }
+    ServiceManager::validate_config(&cfg.services)?;
+    let mesh = myownmesh_core::Mesh::open(cfg.clone()).await?;
+    start_with_mesh(cfg, mesh).await
+}
+
+async fn start_with_mesh(
+    cfg: myownmesh_core::MeshConfig,
+    mesh: myownmesh_core::MeshHandle,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         networks = cfg.networks.len(),
         "embedded daemon starting"
     );
 
-    let mesh =
-        myownmesh_core::Mesh::open_with_connector_resource_policy(cfg.clone(), connector_policy)
-            .await?;
     info!(device_id = %mesh.identity().display_id(), "identity ready");
 
     // The registry holds every JoinedNetwork + its signaling driver handle so
@@ -162,6 +201,15 @@ mod tests {
         assert!(matches!(
             result,
             Err(EmbeddedStartError::MissingConnectorResourcePolicy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn infrastructure_start_requires_node_participation_disabled() {
+        let result = start_infrastructure_only(myownmesh_core::MeshConfig::default()).await;
+        assert!(matches!(
+            result,
+            Err(EmbeddedStartError::InfrastructureOnlyRequiresNodeDisabled)
         ));
     }
 }

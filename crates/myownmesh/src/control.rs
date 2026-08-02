@@ -2124,7 +2124,10 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
 /// same config even if the live reconcile partly fails (a failed service
 /// start is logged inside `apply`, not surfaced as an error here).
 async fn services_set(state: &Arc<ControlState>, services: ServicesConfig) -> Response {
-    if let Err(e) = ServiceManager::validate_config(&services) {
+    // Validate against the live daemon before persistence. In particular, an
+    // infrastructure-only runtime must not save node participation as enabled
+    // when it has no connector resource owner capable of admitting that state.
+    if let Err(e) = state.services.validate_config_for_runtime(&services) {
         return Response::err(format!("services policy rejected: {e}"));
     }
     if let Err(e) = persist_services(&services) {

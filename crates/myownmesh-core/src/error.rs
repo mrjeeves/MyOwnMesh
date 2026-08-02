@@ -49,8 +49,18 @@ pub enum Error {
     #[error("transport: {0}")]
     Transport(String),
 
+    /// A network-capable operation was attempted through a Mesh runtime that
+    /// was deliberately opened without a connector resource owner.
+    #[error("connector resource policy is required for network-capable mesh operations")]
+    ConnectorPolicyRequired,
+
     #[error("connector resource policy: {0}")]
     ConnectorResourcePolicy(#[from] Box<crate::runtime::attempt::ConnectorResourcePolicyConflict>),
+
+    #[error("mesh connector resource scope: {0}")]
+    MeshConnectorResourceScope(
+        #[from] crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
+    ),
 
     #[error("network: {0}")]
     Network(String),

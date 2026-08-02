@@ -352,6 +352,25 @@ impl ProcessResourceRoot {
         self.connector_owner.get().cloned()
     }
 
+    /// Issue one unforgeable connector admission scope for an exact live
+    /// [`crate::Mesh`] runtime.
+    ///
+    /// The process policy must already be installed. The caller supplies the
+    /// per-Mesh hard ceiling explicitly; no value is inferred from the process
+    /// ceiling or from other live Mesh runtimes.
+    pub fn issue_mesh_connector_scope(
+        &self,
+        policy: crate::runtime::attempt::MeshConnectorResourcePolicy,
+    ) -> Result<
+        crate::runtime::attempt::MeshConnectorResourceScope,
+        crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
+    > {
+        let owner = self.connector_owner.get().ok_or(
+            crate::runtime::attempt::MeshConnectorResourceScopeIssueError::ProcessPolicyMissing,
+        )?;
+        owner.issue_mesh_scope(policy)
+    }
+
     /// Read the process aggregate without changing it.
     pub fn report(&self) -> ResourceReport {
         self.accountant.report()

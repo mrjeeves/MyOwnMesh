@@ -18,7 +18,7 @@
 use std::future::Future;
 use std::mem::size_of;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,8 +58,9 @@ use crate::resource::{
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorResourceOwnerPort,
-    ConnectorResourceOwnerReport,
+    ConnectorCallbackServiceWeights, ConnectorCandidateCapability, ConnectorCapableResourcePolicy,
+    ConnectorRealtimeFlowPolicy, ConnectorResourceOwnerReport, MeshConnectorResourceReport,
+    MeshConnectorResourceScope,
 };
 
 use super::ice::build_rtc_configuration;
@@ -235,6 +236,611 @@ impl ConnectorCallbackClass {
     }
 }
 
+/// Opaque process-local identity for one connector real-time flow.
+///
+/// The key is scheduling identity only. It is not serialized and grants no
+/// authority. Codec, lane, and application-purpose names stay in the WebRTC
+/// compatibility adapter that owns the corresponding flow port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RealtimeFlowKey(std::num::NonZeroU64);
+
+static NEXT_REALTIME_FLOW_KEY: AtomicU64 = AtomicU64::new(1);
+
+impl RealtimeFlowKey {
+    fn issue() -> Option<Self> {
+        NEXT_REALTIME_FLOW_KEY
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .map(Self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealtimeFlowDropReason {
+    OwnerPolicyMissing,
+    FlowLimit,
+    FragmentOversize,
+    UnitOversize,
+    InProgressLimit,
+    AggregateBytes,
+    FlowQueueFull,
+    Expired,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RealtimeFlowObservation {
+    Flow {
+        key: RealtimeFlowKey,
+        active_flows: usize,
+    },
+    Assembly {
+        key: RealtimeFlowKey,
+        in_progress_units: usize,
+        retained_bytes: usize,
+    },
+    Queue {
+        key: RealtimeFlowKey,
+        units: usize,
+        retained_bytes: usize,
+    },
+    Service {
+        key: RealtimeFlowKey,
+        queue_age: Duration,
+        payload_bytes: usize,
+    },
+    Drop {
+        key: Option<RealtimeFlowKey>,
+        reason: RealtimeFlowDropReason,
+        queue_age: Duration,
+        payload_bytes: usize,
+    },
+}
+
+/// Observation seam for the owner-run measurement harness.
+///
+/// Production installs no recorder. Test and lab recorders receive raw values
+/// and own their own bounded storage or streaming output.
+trait RealtimeFlowObserver: Send + Sync {
+    fn observe(&self, observation: RealtimeFlowObservation);
+}
+
+struct QueuedRealtimeEvent {
+    event: QueuedTransportEvent,
+    queued_at: Instant,
+    expires_at: Option<Instant>,
+    payload_bytes: usize,
+}
+
+struct RealtimeFlowQueue {
+    events: std::collections::VecDeque<QueuedRealtimeEvent>,
+    scheduled: bool,
+}
+
+struct RealtimeFlowRegistryState {
+    flows: std::collections::BTreeMap<RealtimeFlowKey, RealtimeFlowQueue>,
+    ready: std::collections::VecDeque<RealtimeFlowKey>,
+    retained_bytes: usize,
+    in_progress_units: usize,
+    accounting_poisoned: bool,
+}
+
+struct RealtimeFlowRegistry {
+    policy: Option<ConnectorRealtimeFlowPolicy>,
+    max_unit_bytes: usize,
+    useful_lifetime: Duration,
+    state: SyncMutex<RealtimeFlowRegistryState>,
+    ready: tokio::sync::Notify,
+    observer: Option<Arc<dyn RealtimeFlowObserver>>,
+}
+
+impl RealtimeFlowRegistry {
+    fn new(policy: ConnectorCallbackPolicy) -> Arc<Self> {
+        Self::with_observer(policy, None)
+    }
+
+    fn with_observer(
+        policy: ConnectorCallbackPolicy,
+        observer: Option<Arc<dyn RealtimeFlowObserver>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            policy: policy.realtime_flow_policy(),
+            max_unit_bytes: policy.max_realtime_unit_bytes().get(),
+            useful_lifetime: policy.realtime_useful_lifetime(),
+            state: SyncMutex::new(RealtimeFlowRegistryState {
+                flows: std::collections::BTreeMap::new(),
+                ready: std::collections::VecDeque::new(),
+                retained_bytes: 0,
+                in_progress_units: 0,
+                accounting_poisoned: false,
+            }),
+            ready: tokio::sync::Notify::new(),
+            observer,
+        })
+    }
+
+    fn record(&self, observation: RealtimeFlowObservation) {
+        if let Some(observer) = self.observer.as_ref() {
+            observer.observe(observation);
+        }
+    }
+
+    fn open_flow(self: &Arc<Self>) -> Option<RealtimeFlowPort> {
+        let Some(policy) = self.policy else {
+            self.record(RealtimeFlowObservation::Drop {
+                key: None,
+                reason: RealtimeFlowDropReason::OwnerPolicyMissing,
+                queue_age: Duration::ZERO,
+                payload_bytes: 0,
+            });
+            return None;
+        };
+        let Some(key) = RealtimeFlowKey::issue() else {
+            self.record(RealtimeFlowObservation::Drop {
+                key: None,
+                reason: RealtimeFlowDropReason::FlowLimit,
+                queue_age: Duration::ZERO,
+                payload_bytes: 0,
+            });
+            return None;
+        };
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return None;
+        }
+        if state.flows.len() >= policy.max_active_flows().get() {
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::FlowLimit,
+                queue_age: Duration::ZERO,
+                payload_bytes: 0,
+            });
+            return None;
+        }
+        state.flows.insert(
+            key,
+            RealtimeFlowQueue {
+                events: std::collections::VecDeque::new(),
+                scheduled: false,
+            },
+        );
+        let active_flows = state.flows.len();
+        drop(state);
+        self.record(RealtimeFlowObservation::Flow { key, active_flows });
+        Some(RealtimeFlowPort {
+            lifetime: Arc::new(RealtimeFlowLifetime {
+                key,
+                registry: Arc::clone(self),
+            }),
+        })
+    }
+
+    fn remove_flow(&self, key: RealtimeFlowKey) {
+        let mut state = self.state.lock();
+        if let Some(flow) = state.flows.remove(&key) {
+            state.ready.retain(|candidate| *candidate != key);
+            if state.accounting_poisoned {
+                return;
+            }
+            let Some(released) = flow.events.iter().try_fold(0usize, |total, event| {
+                total.checked_add(event.payload_bytes)
+            }) else {
+                state.accounting_poisoned = true;
+                return;
+            };
+            Self::release_bytes_locked(&mut state, released);
+            let active_flows = state.flows.len();
+            drop(state);
+            self.record(RealtimeFlowObservation::Flow { key, active_flows });
+        }
+    }
+
+    fn release_bytes_locked(state: &mut RealtimeFlowRegistryState, bytes: usize) -> bool {
+        if state.accounting_poisoned {
+            return false;
+        }
+        match state.retained_bytes.checked_sub(bytes) {
+            Some(retained) => {
+                state.retained_bytes = retained;
+                true
+            }
+            None => {
+                state.accounting_poisoned = true;
+                false
+            }
+        }
+    }
+
+    fn release_unit_locked(state: &mut RealtimeFlowRegistryState) -> bool {
+        if state.accounting_poisoned {
+            return false;
+        }
+        match state.in_progress_units.checked_sub(1) {
+            Some(units) => {
+                state.in_progress_units = units;
+                true
+            }
+            None => {
+                state.accounting_poisoned = true;
+                false
+            }
+        }
+    }
+
+    fn begin_unit(self: &Arc<Self>, key: RealtimeFlowKey) -> Option<RealtimeAssemblyReservation> {
+        let policy = self.policy?;
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return None;
+        }
+        if !state.flows.contains_key(&key) {
+            return None;
+        }
+        if state.in_progress_units >= policy.max_in_progress_units().get() {
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::InProgressLimit,
+                queue_age: Duration::ZERO,
+                payload_bytes: 0,
+            });
+            return None;
+        }
+        state.in_progress_units += 1;
+        let in_progress_units = state.in_progress_units;
+        let retained_bytes = state.retained_bytes;
+        drop(state);
+        self.record(RealtimeFlowObservation::Assembly {
+            key,
+            in_progress_units,
+            retained_bytes,
+        });
+        Some(RealtimeAssemblyReservation {
+            registry: Arc::clone(self),
+            key,
+            retained_bytes: 0,
+            active: true,
+        })
+    }
+
+    fn reserve_output(
+        self: &Arc<Self>,
+        key: RealtimeFlowKey,
+        bytes: usize,
+    ) -> Option<RealtimeOutputReservation> {
+        if bytes > self.max_unit_bytes {
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::UnitOversize,
+                queue_age: Duration::ZERO,
+                payload_bytes: bytes,
+            });
+            return None;
+        }
+        let policy = self.policy?;
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return None;
+        }
+        if !state.flows.contains_key(&key) {
+            return None;
+        }
+        let next = state.retained_bytes.checked_add(bytes)?;
+        if next > policy.max_retained_bytes().get() {
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::AggregateBytes,
+                queue_age: Duration::ZERO,
+                payload_bytes: bytes,
+            });
+            return None;
+        }
+        state.retained_bytes = next;
+        drop(state);
+        Some(RealtimeOutputReservation {
+            registry: Arc::clone(self),
+            key,
+            bytes,
+            active: true,
+        })
+    }
+
+    fn purge_expired_locked(
+        &self,
+        state: &mut RealtimeFlowRegistryState,
+        key: RealtimeFlowKey,
+        now: Instant,
+    ) {
+        let mut dropped = Vec::new();
+        if let Some(flow) = state.flows.get_mut(&key) {
+            while flow
+                .events
+                .front()
+                .is_some_and(|event| event.expires_at.is_some_and(|deadline| deadline <= now))
+            {
+                if let Some(event) = flow.events.pop_front() {
+                    dropped.push(event);
+                }
+            }
+            if flow.events.is_empty() {
+                flow.scheduled = false;
+                state.ready.retain(|candidate| *candidate != key);
+            }
+        }
+        for event in dropped {
+            Self::release_bytes_locked(state, event.payload_bytes);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::Expired,
+                queue_age: now.saturating_duration_since(event.queued_at),
+                payload_bytes: event.payload_bytes,
+            });
+        }
+    }
+
+    fn enqueue(
+        &self,
+        key: RealtimeFlowKey,
+        event: QueuedTransportEvent,
+        mut reservation: RealtimeOutputReservation,
+    ) -> bool {
+        if !std::ptr::eq(self, Arc::as_ref(&reservation.registry))
+            || reservation.key != key
+            || !reservation.active
+        {
+            return false;
+        }
+        let Some(policy) = self.policy else {
+            return false;
+        };
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        if state.accounting_poisoned {
+            return false;
+        }
+        self.purge_expired_locked(&mut state, key, now);
+        let Some(flow) = state.flows.get_mut(&key) else {
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::Retired,
+                queue_age: Duration::ZERO,
+                payload_bytes: reservation.bytes,
+            });
+            return false;
+        };
+        if flow.events.len() >= policy.queue_capacity_per_flow().get() {
+            drop(state);
+            self.record(RealtimeFlowObservation::Drop {
+                key: Some(key),
+                reason: RealtimeFlowDropReason::FlowQueueFull,
+                queue_age: Duration::ZERO,
+                payload_bytes: reservation.bytes,
+            });
+            return true;
+        }
+        let was_empty = flow.events.is_empty();
+        flow.events.push_back(QueuedRealtimeEvent {
+            event,
+            queued_at: now,
+            // A zero lifetime exists only in the raw transport laboratory and
+            // means observation without expiry. Production policy rejects it.
+            expires_at: (!self.useful_lifetime.is_zero())
+                .then(|| now.checked_add(self.useful_lifetime).unwrap_or(now)),
+            payload_bytes: reservation.bytes,
+        });
+        let units = flow.events.len();
+        if was_empty && !flow.scheduled {
+            flow.scheduled = true;
+            state.ready.push_back(key);
+        }
+        reservation.active = false;
+        let retained_bytes = state.retained_bytes;
+        drop(state);
+        self.record(RealtimeFlowObservation::Queue {
+            key,
+            units,
+            retained_bytes,
+        });
+        self.ready.notify_one();
+        true
+    }
+
+    fn try_recv(&self) -> Option<QueuedTransportEvent> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        while let Some(key) = state.ready.pop_front() {
+            self.purge_expired_locked(&mut state, key, now);
+            let Some(flow) = state.flows.get_mut(&key) else {
+                continue;
+            };
+            let Some(event) = flow.events.pop_front() else {
+                flow.scheduled = false;
+                continue;
+            };
+            if flow.events.is_empty() {
+                flow.scheduled = false;
+            } else {
+                state.ready.push_back(key);
+            }
+            Self::release_bytes_locked(&mut state, event.payload_bytes);
+            drop(state);
+            self.record(RealtimeFlowObservation::Service {
+                key,
+                queue_age: now.saturating_duration_since(event.queued_at),
+                payload_bytes: event.payload_bytes,
+            });
+            return Some(event.event);
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .flows
+            .values()
+            .all(|flow| flow.events.is_empty())
+    }
+}
+
+struct RealtimeFlowLifetime {
+    key: RealtimeFlowKey,
+    registry: Arc<RealtimeFlowRegistry>,
+}
+
+impl Drop for RealtimeFlowLifetime {
+    fn drop(&mut self) {
+        self.registry.remove_flow(self.key);
+    }
+}
+
+#[derive(Clone)]
+struct RealtimeFlowPort {
+    lifetime: Arc<RealtimeFlowLifetime>,
+}
+
+impl RealtimeFlowPort {
+    fn key(&self) -> RealtimeFlowKey {
+        self.lifetime.key
+    }
+
+    fn begin_unit(&self) -> Option<RealtimeAssemblyReservation> {
+        self.lifetime.registry.begin_unit(self.key())
+    }
+
+    fn reserve_output(&self, bytes: usize) -> Option<RealtimeOutputReservation> {
+        self.lifetime.registry.reserve_output(self.key(), bytes)
+    }
+
+    fn enqueue(&self, event: QueuedTransportEvent, reservation: RealtimeOutputReservation) -> bool {
+        self.lifetime
+            .registry
+            .enqueue(self.key(), event, reservation)
+    }
+}
+
+struct RealtimeAssemblyReservation {
+    registry: Arc<RealtimeFlowRegistry>,
+    key: RealtimeFlowKey,
+    retained_bytes: usize,
+    active: bool,
+}
+
+impl RealtimeAssemblyReservation {
+    fn retain_fragment(&mut self, bytes: usize) -> bool {
+        let Some(policy) = self.registry.policy else {
+            return false;
+        };
+        if bytes > policy.max_inbound_fragment_bytes().get() {
+            self.registry.record(RealtimeFlowObservation::Drop {
+                key: Some(self.key),
+                reason: RealtimeFlowDropReason::FragmentOversize,
+                queue_age: Duration::ZERO,
+                payload_bytes: bytes,
+            });
+            return false;
+        }
+        let Some(unit_bytes) = self.retained_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if unit_bytes > self.registry.max_unit_bytes {
+            self.registry.record(RealtimeFlowObservation::Drop {
+                key: Some(self.key),
+                reason: RealtimeFlowDropReason::UnitOversize,
+                queue_age: Duration::ZERO,
+                payload_bytes: unit_bytes,
+            });
+            return false;
+        }
+        let mut state = self.registry.state.lock();
+        if state.accounting_poisoned {
+            return false;
+        }
+        let Some(total) = state.retained_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > policy.max_retained_bytes().get() {
+            drop(state);
+            self.registry.record(RealtimeFlowObservation::Drop {
+                key: Some(self.key),
+                reason: RealtimeFlowDropReason::AggregateBytes,
+                queue_age: Duration::ZERO,
+                payload_bytes: bytes,
+            });
+            return false;
+        }
+        state.retained_bytes = total;
+        self.retained_bytes = unit_bytes;
+        let in_progress_units = state.in_progress_units;
+        let retained_bytes = state.retained_bytes;
+        drop(state);
+        self.registry.record(RealtimeFlowObservation::Assembly {
+            key: self.key,
+            in_progress_units,
+            retained_bytes,
+        });
+        true
+    }
+}
+
+impl Drop for RealtimeAssemblyReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.registry.state.lock();
+        RealtimeFlowRegistry::release_bytes_locked(&mut state, self.retained_bytes);
+        RealtimeFlowRegistry::release_unit_locked(&mut state);
+        let in_progress_units = state.in_progress_units;
+        let retained_bytes = state.retained_bytes;
+        drop(state);
+        self.registry.record(RealtimeFlowObservation::Assembly {
+            key: self.key,
+            in_progress_units,
+            retained_bytes,
+        });
+    }
+}
+
+struct RealtimeOutputReservation {
+    registry: Arc<RealtimeFlowRegistry>,
+    key: RealtimeFlowKey,
+    bytes: usize,
+    active: bool,
+}
+
+impl RealtimeOutputReservation {
+    fn shrink_to(&mut self, bytes: usize) -> bool {
+        if bytes > self.bytes {
+            return false;
+        }
+        let released = self.bytes - bytes;
+        if released != 0 {
+            let mut state = self.registry.state.lock();
+            if !RealtimeFlowRegistry::release_bytes_locked(&mut state, released) {
+                return false;
+            }
+            self.bytes = bytes;
+        }
+        true
+    }
+}
+
+impl Drop for RealtimeOutputReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.registry.state.lock();
+            RealtimeFlowRegistry::release_bytes_locked(&mut state, self.bytes);
+        }
+    }
+}
+
 fn callback_payload_limit(
     policy: ConnectorCallbackPolicy,
     class: ConnectorCallbackClass,
@@ -250,15 +856,14 @@ fn callback_payload_limit(
 struct ConnectorEventMailboxes {
     control: mpsc::Sender<QueuedTransportEvent>,
     endpoint_data: mpsc::Sender<QueuedTransportEvent>,
-    realtime: mpsc::Sender<QueuedTransportEvent>,
 }
 
 impl ConnectorEventMailboxes {
-    fn sender(&self, class: ConnectorCallbackClass) -> &mpsc::Sender<QueuedTransportEvent> {
+    fn sender(&self, class: ConnectorCallbackClass) -> Option<&mpsc::Sender<QueuedTransportEvent>> {
         match class {
-            ConnectorCallbackClass::Control => &self.control,
-            ConnectorCallbackClass::EndpointData => &self.endpoint_data,
-            ConnectorCallbackClass::Realtime => &self.realtime,
+            ConnectorCallbackClass::Control => Some(&self.control),
+            ConnectorCallbackClass::EndpointData => Some(&self.endpoint_data),
+            ConnectorCallbackClass::Realtime => None,
         }
     }
 }
@@ -266,6 +871,7 @@ impl ConnectorEventMailboxes {
 #[derive(Clone)]
 struct ConnectorEventSink {
     events: ConnectorEventMailboxes,
+    realtime_flows: Arc<RealtimeFlowRegistry>,
     resource_scope: Option<PeerConnectionResourceScope>,
     realtime_delivery: Arc<AtomicBool>,
     attempt_liveness: Option<AttemptLiveness>,
@@ -275,6 +881,42 @@ struct ConnectorEventSink {
 }
 
 impl ConnectorEventSink {
+    fn open_realtime_flow(&self) -> Option<RealtimeFlowPort> {
+        self.realtime_flows.open_flow()
+    }
+
+    fn observe_realtime_payload(&self, payload_bytes: usize) -> Option<ObservationLease> {
+        self.resource_scope.as_ref().map(|scope| {
+            scope.observe_pre_authentication_measurement(
+                PreAuthResourceFamily::MediaQuarantine,
+                ResourceMeasurement::inexact(ResourceUse::observed(
+                    1,
+                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+                    u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+                    0,
+                )),
+            )
+        })
+    }
+
+    fn emit_realtime(
+        &self,
+        flow: &RealtimeFlowPort,
+        event: TransportEvent,
+        reservation: RealtimeOutputReservation,
+    ) -> bool {
+        if !self.realtime_delivery.load(Ordering::Acquire) || !self.callback_gate.is_active() {
+            return true;
+        }
+        let payload_bytes = match &event {
+            TransportEvent::VideoSample(sample) => sample.data.len(),
+            TransportEvent::AudioSample(sample) => sample.data.len(),
+            _ => return false,
+        };
+        let observation = self.observe_realtime_payload(payload_bytes);
+        flow.enqueue(QueuedTransportEvent { event, observation }, reservation)
+    }
+
     async fn emit(&self, event: TransportEvent) -> bool {
         let callback_class = ConnectorCallbackClass::for_event(&event);
         let payload_bytes = match &event {
@@ -319,7 +961,12 @@ impl ConnectorEventSink {
             )
         });
         let mut queued = Some(QueuedTransportEvent { event, observation });
-        let mailbox = self.events.sender(callback_class);
+        let Some(mailbox) = self.events.sender(callback_class) else {
+            // Real-time units must enter through an exact RealtimeFlowPort.
+            // A connector-wide compatibility mailbox would let one flow
+            // consume or reorder another flow's admitted queue.
+            return false;
+        };
         let send = async {
             loop {
                 let mut connector_retirement = self.callback_gate.subscribe_retirement();
@@ -381,21 +1028,7 @@ impl ConnectorEventSink {
             }
         };
 
-        if callback_class != ConnectorCallbackClass::Realtime
-            || self.callback_policy.realtime_enqueue_deadline().is_zero()
-        {
-            return send.await;
-        }
-        match tokio::time::timeout(self.callback_policy.realtime_enqueue_deadline(), send).await {
-            Ok(delivered) => delivered,
-            Err(_) => {
-                trace!(
-                    deadline = ?self.callback_policy.realtime_enqueue_deadline(),
-                    "dropping real-time callback after its enqueue deadline"
-                );
-                true
-            }
-        }
+        send.await
     }
 }
 
@@ -451,6 +1084,7 @@ pub(crate) struct WebRtcConnectorEventReceiver {
     attempt_lifetime: Option<AttemptLifetime>,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
+    data_channel_open_committed: bool,
 }
 
 /// Lab/test receiver for raw WebRTC behavior. Production wraps it in the
@@ -458,31 +1092,36 @@ pub(crate) struct WebRtcConnectorEventReceiver {
 pub struct TransportEventReceiver {
     control: mpsc::Receiver<QueuedTransportEvent>,
     endpoint_data: mpsc::Receiver<QueuedTransportEvent>,
-    realtime: mpsc::Receiver<QueuedTransportEvent>,
+    realtime_flows: Arc<RealtimeFlowRegistry>,
     scheduler: ConnectorCallbackScheduler,
 }
 
 impl TransportEventReceiver {
-    fn receiver(
+    fn try_scheduled_filtered(
         &mut self,
-        class: ConnectorCallbackClass,
-    ) -> &mut mpsc::Receiver<QueuedTransportEvent> {
-        match class {
-            ConnectorCallbackClass::Control => &mut self.control,
-            ConnectorCallbackClass::EndpointData => &mut self.endpoint_data,
-            ConnectorCallbackClass::Realtime => &mut self.realtime,
-        }
-    }
-
-    fn try_scheduled(&mut self) -> Option<QueuedTransportEvent> {
+        allow_endpoint_data: bool,
+    ) -> Option<QueuedTransportEvent> {
         for _ in 0..3 {
             let class = self.scheduler.current();
-            match self.receiver(class).try_recv() {
-                Ok(event) => {
+            if class == ConnectorCallbackClass::EndpointData && !allow_endpoint_data {
+                self.scheduler.skip_current();
+                continue;
+            }
+            let event = if class == ConnectorCallbackClass::Realtime {
+                self.realtime_flows.try_recv()
+            } else {
+                match class {
+                    ConnectorCallbackClass::Control => self.control.try_recv().ok(),
+                    ConnectorCallbackClass::EndpointData => self.endpoint_data.try_recv().ok(),
+                    ConnectorCallbackClass::Realtime => unreachable!(),
+                }
+            };
+            match event {
+                Some(event) => {
                     self.scheduler.delivered(class);
                     return Some(event);
                 }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                None => {
                     self.scheduler.skip_current();
                 }
             }
@@ -490,17 +1129,23 @@ impl TransportEventReceiver {
         None
     }
 
-    async fn recv_queued(&mut self) -> Option<QueuedTransportEvent> {
+    fn try_scheduled(&mut self) -> Option<QueuedTransportEvent> {
+        self.try_scheduled_filtered(true)
+    }
+
+    async fn recv_queued_filtered(
+        &mut self,
+        allow_endpoint_data: bool,
+    ) -> Option<QueuedTransportEvent> {
         loop {
-            if let Some(event) = self.try_scheduled() {
+            if let Some(event) = self.try_scheduled_filtered(allow_endpoint_data) {
                 return Some(event);
             }
             if self.control.is_closed()
                 && self.control.is_empty()
-                && self.endpoint_data.is_closed()
-                && self.endpoint_data.is_empty()
-                && self.realtime.is_closed()
-                && self.realtime.is_empty()
+                && (!allow_endpoint_data
+                    || (self.endpoint_data.is_closed() && self.endpoint_data.is_empty()))
+                && self.realtime_flows.is_empty()
             {
                 return None;
             }
@@ -511,20 +1156,21 @@ impl TransportEventReceiver {
                         return Some(event);
                     }
                 }
-                event = self.endpoint_data.recv(), if !self.endpoint_data.is_closed() || !self.endpoint_data.is_empty() => {
+                event = self.endpoint_data.recv(), if allow_endpoint_data && (!self.endpoint_data.is_closed() || !self.endpoint_data.is_empty()) => {
                     if let Some(event) = event {
                         self.scheduler.delivered(ConnectorCallbackClass::EndpointData);
                         return Some(event);
                     }
                 }
-                event = self.realtime.recv(), if !self.realtime.is_closed() || !self.realtime.is_empty() => {
-                    if let Some(event) = event {
-                        self.scheduler.delivered(ConnectorCallbackClass::Realtime);
-                        return Some(event);
-                    }
+                _ = self.realtime_flows.ready.notified() => {
+                    continue;
                 }
             }
         }
+    }
+
+    async fn recv_queued(&mut self) -> Option<QueuedTransportEvent> {
+        self.recv_queued_filtered(true).await
     }
 
     pub async fn recv(&mut self) -> Option<TransportEvent> {
@@ -535,7 +1181,10 @@ impl TransportEventReceiver {
         if let Some(queued) = self.try_scheduled() {
             return Ok(queued.event);
         }
-        if self.control.is_closed() && self.endpoint_data.is_closed() && self.realtime.is_closed() {
+        if self.control.is_closed()
+            && self.endpoint_data.is_closed()
+            && self.realtime_flows.is_empty()
+        {
             Err(mpsc::error::TryRecvError::Disconnected)
         } else {
             Err(mpsc::error::TryRecvError::Empty)
@@ -566,7 +1215,7 @@ impl WebRtcConnectorEventReceiver {
                     }
                     continue;
                 }
-                queued = self.raw.recv_queued() => queued,
+                queued = self.raw.recv_queued_filtered(self.data_channel_open_committed) => queued,
             };
             if let Some(queued) = queued {
                 if self.ownership.incarnation.is_active() {
@@ -579,6 +1228,14 @@ impl WebRtcConnectorEventReceiver {
             }
             return None;
         }
+    }
+
+    /// Release bounded endpoint-protocol callbacks only after the engine has
+    /// committed the exact connector's working-channel ownership transition.
+    /// Delivering the control event is insufficient because its owner may be
+    /// stale or may reject the transition.
+    pub(crate) fn commit_data_channel_open(&mut self) {
+        self.data_channel_open_committed = true;
     }
 
     fn reclaim_retired_attempt_candidate(&mut self) -> bool {
@@ -1212,7 +1869,7 @@ impl NativeConnectorClosePort for WebRtcNativeCloseErrorPort {
 /// Single cleanup owner for one native peer connection.
 struct ConnectorCloseOwner {
     ownership: ConnectorOwnership,
-    resource_owner: ConnectorResourceOwnerPort,
+    resource_owner: MeshConnectorResourceScope,
     native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
     remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
     native_close_timeout: Duration,
@@ -1226,7 +1883,7 @@ struct ConnectorCloseOwner {
 }
 
 impl ConnectorCloseOwner {
-    fn new(ownership: ConnectorOwnership, resource_owner: ConnectorResourceOwnerPort) -> Arc<Self> {
+    fn new(ownership: ConnectorOwnership, resource_owner: MeshConnectorResourceScope) -> Arc<Self> {
         let (status, _receiver) = watch::channel(ConnectorCloseStatus::Open);
         Arc::new(Self {
             ownership,
@@ -1517,6 +2174,7 @@ impl WebRtcConnectorWorker {
             attempt_lifetime: Some(attempt_lifetime),
             remote_candidates: Arc::clone(&remote_candidates),
             close_owner: Some(Arc::clone(&close_owner)),
+            data_channel_open_committed: false,
         };
         Ok((
             Self {
@@ -2044,7 +2702,7 @@ pub struct Transport {
     ice_transport_policy: RTCIceTransportPolicy,
     /// Media lanes provisioned per peer connection (see [`resolve_media_lanes`]).
     media_lanes: usize,
-    connector_resource_owner: Option<ConnectorResourceOwnerPort>,
+    connector_resource_scope: Option<MeshConnectorResourceScope>,
     #[cfg(test)]
     construction_hook: Option<Arc<ConstructionTestHook>>,
 }
@@ -2314,7 +2972,7 @@ impl Transport {
             runtime: crate::runtime::RuntimeIncarnation::new(),
             ice_transport_policy: RTCIceTransportPolicy::All,
             media_lanes,
-            connector_resource_owner: None,
+            connector_resource_scope: None,
             #[cfg(test)]
             construction_hook: None,
         })
@@ -2322,11 +2980,11 @@ impl Transport {
 
     /// Bind this transport to an explicitly configured process resource owner.
     /// Connector construction is refused until this port is present.
-    pub(crate) fn with_connector_resource_owner(
+    pub(crate) fn with_connector_resource_scope(
         mut self,
-        owner: ConnectorResourceOwnerPort,
+        scope: MeshConnectorResourceScope,
     ) -> Self {
-        self.connector_resource_owner = Some(owner);
+        self.connector_resource_scope = Some(scope);
         self
     }
 
@@ -2335,16 +2993,24 @@ impl Transport {
     /// cannot multiply the process limit.
     pub fn with_connector_resource_policy(
         self,
-        policy: crate::runtime::attempt::ConnectorResourcePolicy,
+        policy: ConnectorCapableResourcePolicy,
     ) -> Result<Self> {
-        let owner = ProcessResourceRoot::global().install_connector_policy(policy)?;
-        Ok(self.with_connector_resource_owner(owner))
+        let root = ProcessResourceRoot::global();
+        root.install_connector_policy(policy.process())?;
+        let scope = root.issue_mesh_connector_scope(policy.mesh())?;
+        Ok(self.with_connector_resource_scope(scope))
     }
 
     pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
-        self.connector_resource_owner
+        self.connector_resource_scope
             .as_ref()
-            .map(|owner| owner.report())
+            .map(|scope| scope.process_report())
+    }
+
+    pub fn mesh_connector_resource_report(&self) -> Option<MeshConnectorResourceReport> {
+        self.connector_resource_scope
+            .as_ref()
+            .map(MeshConnectorResourceScope::report)
     }
 
     /// Build a lab transport that rejects host and server-reflexive candidate
@@ -2382,12 +3048,10 @@ impl Transport {
         turn: &[crate::config::TurnServer],
         resource_scope: PeerConnectionResourceScope,
     ) -> Result<(WebRtcConnectorWorker, WebRtcConnectorEventReceiver)> {
-        let resource_owner = self.connector_resource_owner.clone().ok_or_else(|| {
-            Error::Transport(
-                "connector resource owner is not configured; refusing native allocation"
-                    .to_string(),
-            )
-        })?;
+        let resource_owner = self
+            .connector_resource_scope
+            .clone()
+            .ok_or(Error::ConnectorPolicyRequired)?;
         let transport_observation = observe_inexact_item(
             &resource_scope,
             PreAuthResourceFamily::TransportObject,
@@ -2591,13 +3255,13 @@ impl Transport {
             let (control_tx, control_rx) = mpsc::channel(mailboxes.control().get());
             let (endpoint_data_tx, endpoint_data_rx) =
                 mpsc::channel(mailboxes.endpoint_data().get());
-            let (realtime_tx, realtime_rx) = mpsc::channel(mailboxes.realtime().get());
+            let realtime_flows = RealtimeFlowRegistry::new(callback_policy);
             let event_sink = ConnectorEventSink {
                 events: ConnectorEventMailboxes {
                     control: control_tx,
                     endpoint_data: endpoint_data_tx,
-                    realtime: realtime_tx,
                 },
+                realtime_flows: Arc::clone(&realtime_flows),
                 resource_scope: resource_scope.clone(),
                 realtime_delivery,
                 attempt_liveness,
@@ -2657,6 +3321,7 @@ impl Transport {
                 audio_tracks: std::sync::Mutex::new(audio_tracks),
                 max_lanes: self.media_lanes,
                 events_tx: event_sink,
+                outbound_realtime_flows: SyncMutex::new(std::collections::BTreeMap::new()),
                 callback_gate,
                 role,
                 resource_scope,
@@ -2666,7 +3331,7 @@ impl Transport {
                 TransportEventReceiver {
                     control: control_rx,
                     endpoint_data: endpoint_data_rx,
-                    realtime: realtime_rx,
+                    realtime_flows,
                     scheduler: ConnectorCallbackScheduler::new(callback_policy.service_weights()),
                 },
             ))
@@ -2954,9 +3619,14 @@ fn register_callbacks(
             let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             let remote_tracks = Arc::clone(&remote_tracks);
+            let flow = tx.open_realtime_flow();
             let task_observation =
                 observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
+                let Some(flow) = flow else {
+                    let _ = transceiver.stop().await;
+                    return;
+                };
                 let lane = lane_of_track_id(&track.id());
                 let key = match track.kind() {
                     RTPCodecType::Video => Some((true, lane)),
@@ -2979,6 +3649,7 @@ fn register_callbacks(
                             task_observation,
                             remote_tracks,
                             key,
+                            flow,
                         ));
                     }
                     RTPCodecType::Audio => {
@@ -2988,6 +3659,7 @@ fn register_callbacks(
                             task_observation,
                             remote_tracks,
                             key,
+                            flow,
                         ));
                     }
                     _ => unreachable!("track kind was classified above"),
@@ -3007,6 +3679,7 @@ async fn pump_audio_track(
     _task_observation: Option<ObservationLease>,
     remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
     track_key: (bool, u8),
+    flow: RealtimeFlowPort,
 ) {
     let lane = lane_of_track_id(&track.id());
     loop {
@@ -3020,12 +3693,22 @@ async fn pump_audio_track(
         if !tx.realtime_delivery.load(Ordering::Acquire) {
             continue;
         }
+        let Some(mut fragment) = flow.begin_unit() else {
+            continue;
+        };
+        if !fragment.retain_fragment(pkt.payload.len()) {
+            continue;
+        }
+        let Some(output) = flow.reserve_output(pkt.payload.len()) else {
+            continue;
+        };
         let sample = AudioSample {
             rtp_timestamp: pkt.header.timestamp,
             lane,
             data: pkt.payload.clone(),
         };
-        if !tx.emit(TransportEvent::AudioSample(sample)).await {
+        drop(fragment);
+        if !tx.emit_realtime(&flow, TransportEvent::AudioSample(sample), output) {
             break;
         }
     }
@@ -3041,9 +3724,10 @@ async fn pump_video_track(
     _task_observation: Option<ObservationLease>,
     remote_tracks: Arc<SyncMutex<std::collections::HashSet<(bool, u8)>>>,
     track_key: (bool, u8),
+    flow: RealtimeFlowPort,
 ) {
     let lane = lane_of_track_id(&track.id());
-    let mut assembler = H264AuAssembler::default();
+    let mut assembler = H264AuAssembler::guarded(flow.clone());
     loop {
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
@@ -3052,10 +3736,13 @@ async fn pump_video_track(
         if !tx.realtime_delivery.load(Ordering::Acquire) {
             continue;
         }
-        match assembler.push(&pkt) {
+        match assembler.push_guarded(&pkt) {
             Ok(Some(mut sample)) => {
-                sample.lane = lane;
-                if !tx.emit(TransportEvent::VideoSample(sample)).await {
+                sample.sample.lane = lane;
+                let Some(output) = sample.output.take() else {
+                    break;
+                };
+                if !tx.emit_realtime(&flow, TransportEvent::VideoSample(sample.sample), output) {
                     break;
                 }
             }
@@ -3098,6 +3785,13 @@ struct H264AuAssembler {
     prev_end: Option<i64>,
     /// Sequence unwrapper state: (last raw seq, its unwrapped value).
     last_seq: Option<(u16, i64)>,
+    flow: Option<RealtimeFlowPort>,
+    assembly: Option<RealtimeAssemblyReservation>,
+}
+
+struct GuardedVideoSample {
+    sample: VideoSample,
+    output: Option<RealtimeOutputReservation>,
 }
 
 /// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
@@ -3105,7 +3799,23 @@ struct H264AuAssembler {
 const MAX_AU_PARTS: usize = 2048;
 
 impl H264AuAssembler {
+    fn guarded(flow: RealtimeFlowPort) -> Self {
+        Self {
+            flow: Some(flow),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     fn push(&mut self, pkt: &webrtc::rtp::packet::Packet) -> Result<Option<VideoSample>> {
+        self.push_guarded(pkt)
+            .map(|sample| sample.map(|sample| sample.sample))
+    }
+
+    fn push_guarded(
+        &mut self,
+        pkt: &webrtc::rtp::packet::Packet,
+    ) -> Result<Option<GuardedVideoSample>> {
         if pkt.payload.is_empty() {
             return Ok(None); // padding / probe
         }
@@ -3119,7 +3829,7 @@ impl H264AuAssembler {
                 if !self.parts.is_empty() {
                     self.prev_end = None;
                 }
-                self.parts.clear();
+                self.clear_current();
                 self.marker_seq = None;
                 self.timestamp = ts;
             } else {
@@ -3129,20 +3839,46 @@ impl H264AuAssembler {
             }
         }
         if self.parts.len() >= MAX_AU_PARTS {
-            self.parts.clear();
+            self.clear_current();
             self.marker_seq = None;
             self.prev_end = None;
             return Err(Error::Transport("video unit overflowed reassembly".into()));
+        }
+        if self.parts.contains_key(&seq) {
+            if pkt.header.marker {
+                self.marker_seq = Some(seq);
+            }
+            return self.try_emit_guarded();
+        }
+        if let Some(flow) = self.flow.as_ref() {
+            if self.assembly.is_none() {
+                self.assembly = flow.begin_unit();
+            }
+            let Some(assembly) = self.assembly.as_mut() else {
+                self.clear_current();
+                return Ok(None);
+            };
+            if !assembly.retain_fragment(pkt.payload.len()) {
+                self.clear_current();
+                self.prev_end = None;
+                return Err(Error::Transport(
+                    "video unit exceeded its owner-selected byte envelope".into(),
+                ));
+            }
         }
         self.parts.insert(seq, pkt.payload.clone());
         if pkt.header.marker {
             self.marker_seq = Some(seq);
         }
-        self.try_emit()
+        self.try_emit_guarded()
     }
 
-    /// Emit the collected unit if its packet chain is complete.
-    fn try_emit(&mut self) -> Result<Option<VideoSample>> {
+    fn clear_current(&mut self) {
+        self.parts.clear();
+        self.assembly = None;
+    }
+
+    fn try_emit_guarded(&mut self) -> Result<Option<GuardedVideoSample>> {
         let Some(end) = self.marker_seq else {
             return Ok(None);
         };
@@ -3169,14 +3905,44 @@ impl H264AuAssembler {
         if self.parts.range(start..=end).count() < need {
             return Ok(None); // a hole — wait for the retransmit
         }
+        // Reserve the full owner-selected output ceiling before the
+        // depacketizer allocates. The reservation shrinks to the exact output
+        // length before it enters the flow queue.
+        let mut output = match self.flow.as_ref() {
+            Some(flow) => match flow.reserve_output(flow.lifetime.registry.max_unit_bytes) {
+                Some(output) => Some(output),
+                None => {
+                    self.clear_current();
+                    self.marker_seq = None;
+                    self.prev_end = None;
+                    return Ok(None);
+                }
+            },
+            None => None,
+        };
         // Complete: depacketize in sequence order with fresh FU state.
         use webrtc::rtp::packetizer::Depacketizer;
         let mut depacketizer = webrtc::rtp::codecs::h264::H264Packet::default();
         let mut data = Vec::new();
         let mut failed = None;
+        let output_limit = self
+            .flow
+            .as_ref()
+            .map_or(usize::MAX, |flow| flow.lifetime.registry.max_unit_bytes);
         for (_, payload) in self.parts.range(start..=end) {
             match depacketizer.depacketize(payload) {
-                Ok(part) => data.extend_from_slice(&part),
+                Ok(part) => {
+                    let Some(next_len) = data.len().checked_add(part.len()) else {
+                        failed = Some("video unit output length overflowed".to_string());
+                        break;
+                    };
+                    if next_len > output_limit {
+                        failed =
+                            Some("video unit exceeded its owner-selected output limit".to_string());
+                        break;
+                    }
+                    data.extend_from_slice(&part);
+                }
                 Err(e) => {
                     failed = Some(format!("h264 depacketize: {e}"));
                     break;
@@ -3186,7 +3952,7 @@ impl H264AuAssembler {
         // Either way this unit is consumed and the next one anchors
         // right after it.
         self.prev_end = Some(end);
-        self.parts.clear();
+        self.clear_current();
         self.marker_seq = None;
         if let Some(e) = failed {
             return Err(Error::Transport(e));
@@ -3194,14 +3960,24 @@ impl H264AuAssembler {
         if data.is_empty() {
             return Ok(None);
         }
+        if let Some(output) = output.as_mut() {
+            if !output.shrink_to(data.len()) {
+                return Err(Error::Transport(
+                    "video output reservation could not represent the assembled unit".into(),
+                ));
+            }
+        }
         let data = Bytes::from(data);
-        Ok(Some(VideoSample {
-            rtp_timestamp: self.timestamp,
-            key: au_has_idr(&data),
-            // The pump that owns the track stamps the real lane; the
-            // assembler is lane-agnostic.
-            lane: 0,
-            data,
+        Ok(Some(GuardedVideoSample {
+            sample: VideoSample {
+                rtp_timestamp: self.timestamp,
+                key: au_has_idr(&data),
+                // The pump that owns the track stamps the real lane; the
+                // assembler is lane-agnostic.
+                lane: 0,
+                data,
+            },
+            output,
         }))
     }
 
@@ -3446,6 +4222,9 @@ pub struct PeerSession {
     /// Device lane ceiling (see [`resolve_media_lanes`]).
     max_lanes: usize,
     events_tx: ConnectorEventSink,
+    /// Codec-neutral flow owners used by the WebRTC compatibility adapter.
+    /// The `(is_video_adapter, lane)` key never leaves this adapter.
+    outbound_realtime_flows: SyncMutex<std::collections::BTreeMap<(bool, u8), RealtimeFlowPort>>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     role: Role,
     resource_scope: Option<PeerConnectionResourceScope>,
@@ -3614,6 +4393,13 @@ impl PeerSession {
         duration: std::time::Duration,
     ) -> Result<()> {
         let track = self.ensure_lane(LaneKind::Video, lane).await?;
+        let flow = self.outbound_realtime_flow(LaneKind::Video, lane)?;
+        let _reservation = flow.reserve_output(data.len()).ok_or_else(|| {
+            Error::Transport(
+                "outbound real-time unit was refused by its owner-selected byte envelope"
+                    .to_string(),
+            )
+        })?;
         track
             .write_sample(&Sample {
                 data,
@@ -3635,6 +4421,13 @@ impl PeerSession {
         duration: std::time::Duration,
     ) -> Result<()> {
         let track = self.ensure_lane(LaneKind::Audio, lane).await?;
+        let flow = self.outbound_realtime_flow(LaneKind::Audio, lane)?;
+        let _reservation = flow.reserve_output(data.len()).ok_or_else(|| {
+            Error::Transport(
+                "outbound real-time unit was refused by its owner-selected byte envelope"
+                    .to_string(),
+            )
+        })?;
         track
             .write_sample(&Sample {
                 data,
@@ -3643,6 +4436,22 @@ impl PeerSession {
             })
             .await
             .map_err(|e| Error::Transport(format!("audio write_sample (lane {lane}): {e}")))
+    }
+
+    fn outbound_realtime_flow(&self, kind: LaneKind, lane: u8) -> Result<RealtimeFlowPort> {
+        let key = (kind == LaneKind::Video, lane);
+        let mut flows = self.outbound_realtime_flows.lock();
+        if let Some(flow) = flows.get(&key) {
+            return Ok(flow.clone());
+        }
+        let flow = self.events_tx.open_realtime_flow().ok_or_else(|| {
+            Error::Transport(
+                "outbound real-time flow was refused by its owner-selected flow envelope"
+                    .to_string(),
+            )
+        })?;
+        flows.insert(key, flow.clone());
+        Ok(flow)
     }
 
     fn pool(&self, kind: LaneKind) -> &std::sync::Mutex<Vec<Option<LaneSlot>>> {
@@ -4062,14 +4871,13 @@ mod tests {
         max_active_candidates: usize,
         callback_capacity: usize,
         native_close_timeout: Duration,
-    ) -> ConnectorResourceOwnerPort {
+    ) -> MeshConnectorResourceScope {
         let max_active_candidates = std::num::NonZeroUsize::new(max_active_candidates)
             .expect("fixture has a nonzero candidate bound");
         let callback_capacity = std::num::NonZeroUsize::new(callback_capacity)
             .expect("fixture has nonzero callback bounds");
         let callbacks = ConnectorCallbackPolicy::new(
             crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                callback_capacity,
                 callback_capacity,
                 callback_capacity,
             ),
@@ -4082,18 +4890,22 @@ mod tests {
                 .expect("fixture real-time unit limit is nonzero"),
             native_close_timeout,
         )
-        .expect("fixture has a nonzero real-time enqueue deadline");
+        .expect("fixture has a nonzero real-time useful lifetime");
         let policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
             max_active_candidates,
             callbacks,
             native_close_timeout,
         )
         .expect("fixture has a nonzero close timeout");
-        ConnectorResourceOwnerPort::new(policy)
+        crate::runtime::attempt::ConnectorResourceOwnerPort::new(policy)
+            .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
+                max_active_candidates,
+            ))
+            .expect("fixture process owner issues one explicit Mesh scope")
     }
 
     fn close_owner_fixture(
-        owner: &ConnectorResourceOwnerPort,
+        owner: &MeshConnectorResourceScope,
     ) -> (Arc<ConnectorCloseOwner>, AttemptLifetime) {
         let (permit, lifetime, claim) =
             admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
@@ -4105,7 +4917,7 @@ mod tests {
     }
 
     fn connected_claim_fixture(
-        owner: &ConnectorResourceOwnerPort,
+        owner: &MeshConnectorResourceScope,
     ) -> (
         crate::connector::ConnectedChannelCapability,
         AttemptLifetime,
@@ -4200,20 +5012,47 @@ mod tests {
         let capacities = policy.mailboxes();
         let (control, control_rx) = mpsc::channel(capacities.control().get());
         let (endpoint_data, endpoint_data_rx) = mpsc::channel(capacities.endpoint_data().get());
-        let (realtime, realtime_rx) = mpsc::channel(capacities.realtime().get());
+        let realtime_flows = RealtimeFlowRegistry::new(policy);
         (
             ConnectorEventMailboxes {
                 control,
                 endpoint_data,
-                realtime,
             },
             TransportEventReceiver {
                 control: control_rx,
                 endpoint_data: endpoint_data_rx,
-                realtime: realtime_rx,
+                realtime_flows,
                 scheduler: ConnectorCallbackScheduler::new(policy.service_weights()),
             },
         )
+    }
+
+    fn test_event_sink(
+        events: ConnectorEventMailboxes,
+        policy: ConnectorCallbackPolicy,
+        resource_scope: Option<PeerConnectionResourceScope>,
+    ) -> ConnectorEventSink {
+        ConnectorEventSink {
+            events,
+            realtime_flows: RealtimeFlowRegistry::new(policy),
+            resource_scope,
+            realtime_delivery: Arc::new(AtomicBool::new(true)),
+            attempt_liveness: None,
+            candidate_promoted: Arc::new(AtomicBool::new(true)),
+            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+            callback_policy: policy,
+        }
+    }
+
+    fn test_event_sink_for_receiver(
+        events: ConnectorEventMailboxes,
+        policy: ConnectorCallbackPolicy,
+        resource_scope: Option<PeerConnectionResourceScope>,
+        receiver: &TransportEventReceiver,
+    ) -> ConnectorEventSink {
+        let mut sink = test_event_sink(events, policy, resource_scope);
+        sink.realtime_flows = Arc::clone(&receiver.realtime_flows);
+        sink
     }
 
     fn explicit_callback_policy(
@@ -4222,14 +5061,12 @@ mod tests {
         endpoint_data_weight: usize,
         realtime_weight: usize,
         max_realtime_unit_bytes: usize,
-        realtime_enqueue_deadline: Duration,
+        realtime_useful_lifetime: Duration,
     ) -> ConnectorCallbackPolicy {
         let capacity =
             std::num::NonZeroUsize::new(capacity).expect("fixture callback capacity is nonzero");
         ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                capacity, capacity, capacity,
-            ),
+            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(capacity, capacity),
             ConnectorCallbackServiceWeights::new(
                 std::num::NonZeroUsize::new(control_weight)
                     .expect("fixture control weight is nonzero"),
@@ -4240,9 +5077,43 @@ mod tests {
             ),
             std::num::NonZeroUsize::new(max_realtime_unit_bytes)
                 .expect("fixture real-time unit limit is nonzero"),
-            realtime_enqueue_deadline,
+            realtime_useful_lifetime,
         )
-        .expect("fixture real-time enqueue deadline is nonzero")
+        .expect("fixture real-time useful lifetime is nonzero")
+    }
+
+    fn explicit_realtime_callback_policy(
+        max_unit_bytes: usize,
+        useful_lifetime: Duration,
+        max_active_flows: usize,
+        queue_capacity_per_flow: usize,
+        max_inbound_fragment_bytes: usize,
+        max_in_progress_units: usize,
+        max_retained_bytes: usize,
+    ) -> ConnectorCallbackPolicy {
+        let nonzero = |value, name| {
+            std::num::NonZeroUsize::new(value)
+                .unwrap_or_else(|| panic!("fixture {name} must be nonzero"))
+        };
+        explicit_callback_policy(1, 1, 1, 1, max_unit_bytes, useful_lifetime)
+            .with_realtime_flow_policy(ConnectorRealtimeFlowPolicy::new(
+                nonzero(max_active_flows, "flow count"),
+                nonzero(queue_capacity_per_flow, "per-flow queue capacity"),
+                nonzero(max_inbound_fragment_bytes, "fragment limit"),
+                nonzero(max_in_progress_units, "in-progress unit limit"),
+                nonzero(max_retained_bytes, "retained-byte limit"),
+            ))
+    }
+
+    #[derive(Default)]
+    struct TestRealtimeObserver {
+        observations: SyncMutex<Vec<RealtimeFlowObservation>>,
+    }
+
+    impl RealtimeFlowObserver for TestRealtimeObserver {
+        fn observe(&self, observation: RealtimeFlowObservation) {
+            self.observations.lock().push(observation);
+        }
     }
 
     fn stamped_event(
@@ -4261,21 +5132,33 @@ mod tests {
         second: TransportEvent,
     ) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: None,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-            callback_policy: ConnectorCallbackPolicy::unrestricted_lab(
-                std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
-            ),
-        };
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         assert!(sink.emit(first).await);
-        assert!(sink.emit(second).await);
+        let mut retained_flow = None;
+        match second {
+            event @ (TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_)) => {
+                let payload_bytes = match &event {
+                    TransportEvent::AudioSample(sample) => sample.data.len(),
+                    TransportEvent::VideoSample(sample) => sample.data.len(),
+                    _ => unreachable!(),
+                };
+                let flow = sink
+                    .open_realtime_flow()
+                    .expect("fixture admits one exact real-time flow");
+                let reservation = flow
+                    .reserve_output(payload_bytes)
+                    .expect("fixture reserves the exact complete unit");
+                assert!(sink.emit_realtime(&flow, event, reservation));
+                retained_flow = Some(flow);
+            }
+            event => assert!(sink.emit(event).await),
+        }
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_ok());
+        drop(retained_flow);
     }
 
     #[tokio::test]
@@ -4317,40 +5200,41 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_endpoint_data_and_realtime_callback_capacity_are_independent() {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: None,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-            callback_policy: ConnectorCallbackPolicy::unrestricted_lab(
-                std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
-            ),
-        };
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        );
+        let sink = test_event_sink_for_receiver(events, policy, None, &receiver);
         assert!(
             sink.emit(TransportEvent::Message(Bytes::from_static(b"data")))
                 .await
         );
-        assert!(
-            sink.emit(TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 0,
-                lane: 0,
-                data: Bytes::from_static(b"audio"),
-            }))
-            .await
-        );
+        let audio_flow = sink
+            .open_realtime_flow()
+            .expect("fixture admits the audio compatibility flow");
+        let audio = TransportEvent::AudioSample(AudioSample {
+            rtp_timestamp: 0,
+            lane: 0,
+            data: Bytes::from_static(b"audio"),
+        });
+        let audio_reservation = audio_flow
+            .reserve_output(5)
+            .expect("fixture reserves the audio unit");
+        assert!(sink.emit_realtime(&audio_flow, audio, audio_reservation));
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_ok());
-        assert!(
-            sink.emit(TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 0,
-                key: true,
-                lane: 0,
-                data: Bytes::from_static(b"video"),
-            }))
-            .await
-        );
+        let video_flow = sink
+            .open_realtime_flow()
+            .expect("fixture admits the video compatibility flow");
+        let video = TransportEvent::VideoSample(VideoSample {
+            rtp_timestamp: 0,
+            key: true,
+            lane: 0,
+            data: Bytes::from_static(b"video"),
+        });
+        let video_reservation = video_flow
+            .reserve_output(5)
+            .expect("fixture reserves the video unit");
+        assert!(sink.emit_realtime(&video_flow, video, video_reservation));
         assert!(receiver.try_recv().is_ok());
     }
 
@@ -4383,9 +5267,15 @@ mod tests {
                 observation: None,
             })
             .expect("fixture endpoint-data mailbox has capacity");
-        events
-            .realtime
-            .try_send(QueuedTransportEvent {
+        let realtime_flow = receiver
+            .realtime_flows
+            .open_flow()
+            .expect("fixture admits one exact real-time flow");
+        let reservation = realtime_flow
+            .reserve_output(0)
+            .expect("zero-byte fixture unit is admitted");
+        assert!(realtime_flow.enqueue(
+            QueuedTransportEvent {
                 event: TransportEvent::VideoSample(VideoSample {
                     rtp_timestamp: 0,
                     key: true,
@@ -4393,8 +5283,9 @@ mod tests {
                     data: Bytes::new(),
                 }),
                 observation: None,
-            })
-            .expect("fixture real-time mailbox has capacity");
+            },
+            reservation,
+        ));
 
         assert!(matches!(
             receiver.try_recv(),
@@ -4419,54 +5310,398 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_arc03_realtime_backpressure_drops_after_owner_deadline() {
-        let (events, mut receiver) = test_event_mailboxes(1);
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: None,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-            callback_policy: explicit_callback_policy(
-                1,
-                1,
-                1,
-                1,
-                crate::engine::MAX_ENDPOINT_FRAME_BYTES,
-                Duration::from_millis(20),
-            ),
-        };
-        assert!(
-            sink.emit(TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 0,
-                key: true,
-                lane: 0,
-                data: Bytes::new(),
-            }))
-            .await
+    async fn v4_arc03_endpoint_protocol_waits_for_committed_open_despite_scheduler_cursor() {
+        let (events, mut receiver) = test_event_mailboxes(3);
+        receiver.scheduler.cursor = ConnectorCallbackClass::EndpointData.index();
+        receiver.scheduler.remaining = 1;
+        let first_handshake = Bytes::from(
+            serde_json::to_vec(&crate::protocol::MeshMessage::Hello(
+                crate::protocol::HelloMessage {
+                    protocol: crate::PROTOCOL_VERSION,
+                    device_id: "lifecycle-peer".to_string(),
+                    label: "Lifecycle fixture".to_string(),
+                    nonce: "nonce".to_string(),
+                    verification_code: "code".to_string(),
+                    capabilities: None,
+                    max_connections: None,
+                    features: Vec::new(),
+                    app_version: None,
+                },
+            ))
+            .expect("fixture Hello serializes"),
         );
-        let started = Instant::now();
-        assert!(
-            sink.emit(TransportEvent::AudioSample(AudioSample {
-                rtp_timestamp: 1,
-                lane: 0,
-                data: Bytes::new(),
-            }))
+        events
+            .endpoint_data
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::Message(first_handshake.clone()),
+                observation: None,
+            })
+            .expect("fixture endpoint mailbox has capacity");
+        events
+            .control
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::DataChannelOpen,
+                observation: None,
+            })
+            .expect("fixture control mailbox has capacity");
+
+        let before_commit = receiver
+            .recv_queued_filtered(false)
             .await
-        );
-        assert!(started.elapsed() >= Duration::from_millis(20));
+            .expect("open control event is deliverable");
         assert!(matches!(
-            receiver.try_recv(),
-            Ok(TransportEvent::VideoSample(_))
+            before_commit.event,
+            TransportEvent::DataChannelOpen
         ));
-        assert!(receiver.try_recv().is_err());
+
+        let after_commit = receiver
+            .recv_queued_filtered(true)
+            .await
+            .expect("retained handshake is released after commitment");
+        assert!(matches!(
+            after_commit.event,
+            TransportEvent::Message(bytes) if bytes == first_handshake
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_close_can_retire_before_uncommitted_endpoint_protocol() {
+        let (events, mut receiver) = test_event_mailboxes(2);
+        receiver.scheduler.cursor = ConnectorCallbackClass::EndpointData.index();
+        receiver.scheduler.remaining = 1;
+        events
+            .endpoint_data
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
+                observation: None,
+            })
+            .expect("fixture endpoint mailbox has capacity");
+        events
+            .control
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::DataChannelClosed,
+                observation: None,
+            })
+            .expect("fixture control mailbox has capacity");
+
+        let event = receiver
+            .recv_queued_filtered(false)
+            .await
+            .expect("close remains deliverable before open commitment");
+        assert!(matches!(event.event, TransportEvent::DataChannelClosed));
+        assert!(matches!(
+            receiver.endpoint_data.try_recv(),
+            Ok(QueuedTransportEvent {
+                event: TransportEvent::Message(bytes),
+                ..
+            }) if bytes == Bytes::from_static(b"stale-handshake")
+        ));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_retirement_drops_uncommitted_endpoint_protocol_and_its_observation() {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let resource_scope = context.peer_connection_scope();
+        let observation = resource_scope.observe_pre_authentication(
+            PreAuthResourceFamily::FrameBytes,
+            ResourceUse::observed(1, 15, 15, 0),
+        );
+        let active_frame_bytes = || {
+            context
+                .report()
+                .pre_authentication
+                .iter()
+                .find(|report| report.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame-byte family is present")
+                .active
+        };
+        assert_ne!(active_frame_bytes(), ResourceUse::ZERO);
+
+        let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let ownership = admitted_ownership(candidate);
+        let (events, raw) = test_event_mailboxes(2);
+        let mut receiver = WebRtcConnectorEventReceiver {
+            ownership: ownership.clone(),
+            retirement: ownership.incarnation.subscribe_retirement(),
+            attempt_retirement: None,
+            raw,
+            attempt_lifetime: Some(lifetime),
+            remote_candidates: Arc::new(SyncMutex::new(RemoteCandidateState::default())),
+            close_owner: None,
+            data_channel_open_committed: false,
+        };
+        events
+            .endpoint_data
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::Message(Bytes::from_static(b"stale-handshake")),
+                observation: Some(observation),
+            })
+            .expect("fixture endpoint mailbox has capacity");
+        events
+            .control
+            .try_send(QueuedTransportEvent {
+                event: TransportEvent::DataChannelClosed,
+                observation: None,
+            })
+            .expect("fixture control mailbox has capacity");
+
+        let close = receiver
+            .recv()
+            .await
+            .expect("close control event remains deliverable before open");
+        assert!(matches!(close.event, TransportEvent::DataChannelClosed));
+        drop(close);
+
+        ownership.retire();
+        assert!(receiver.recv().await.is_none());
+        drop(receiver);
+        assert_eq!(active_frame_bytes(), ResourceUse::ZERO);
+    }
+
+    #[test]
+    fn v4_arc03_realtime_flows_have_independent_bounded_queues() {
+        let policy = explicit_realtime_callback_policy(16, Duration::from_secs(1), 2, 1, 16, 2, 32);
+        let observer = Arc::new(TestRealtimeObserver::default());
+        let registry = RealtimeFlowRegistry::with_observer(
+            policy,
+            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+        );
+        let video = registry.open_flow().expect("first flow is admitted");
+        let audio = registry.open_flow().expect("second flow is admitted");
+
+        let video_unit = |timestamp| {
+            TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: timestamp,
+                key: false,
+                lane: 0,
+                data: Bytes::from_static(b"video"),
+            })
+        };
+        let audio_unit = TransportEvent::AudioSample(AudioSample {
+            rtp_timestamp: 1,
+            lane: 0,
+            data: Bytes::from_static(b"audio"),
+        });
+
+        assert!(video.enqueue(
+            QueuedTransportEvent {
+                event: video_unit(1),
+                observation: None,
+            },
+            video.reserve_output(5).expect("video unit is reserved"),
+        ));
+        assert!(video.enqueue(
+            QueuedTransportEvent {
+                event: video_unit(2),
+                observation: None,
+            },
+            video
+                .reserve_output(5)
+                .expect("full-queue unit is still measured before refusal"),
+        ));
+        assert!(audio.enqueue(
+            QueuedTransportEvent {
+                event: audio_unit,
+                observation: None,
+            },
+            audio.reserve_output(5).expect("audio unit is reserved"),
+        ));
+
+        assert!(matches!(
+            registry.try_recv().map(|queued| queued.event),
+            Some(TransportEvent::VideoSample(sample)) if sample.rtp_timestamp == 1
+        ));
+        assert!(matches!(
+            registry.try_recv().map(|queued| queued.event),
+            Some(TransportEvent::AudioSample(sample)) if sample.rtp_timestamp == 1
+        ));
+        assert!(registry.try_recv().is_none());
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert!(!state.accounting_poisoned);
+        drop(state);
+        assert!(observer.observations.lock().iter().any(|observation| {
+            matches!(
+                observation,
+                RealtimeFlowObservation::Drop {
+                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_expired_realtime_unit_is_dropped_whole_without_enqueue_wait() {
+        let policy =
+            explicit_realtime_callback_policy(16, Duration::from_millis(5), 1, 2, 16, 1, 32);
+        let observer = Arc::new(TestRealtimeObserver::default());
+        let registry = RealtimeFlowRegistry::with_observer(
+            policy,
+            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+        );
+        let flow = registry.open_flow().expect("flow is admitted");
+        assert!(flow.enqueue(
+            QueuedTransportEvent {
+                event: TransportEvent::AudioSample(AudioSample {
+                    rtp_timestamp: 7,
+                    lane: 0,
+                    data: Bytes::from_static(b"stale"),
+                }),
+                observation: None,
+            },
+            flow.reserve_output(5).expect("unit is reserved"),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(registry.try_recv().is_none());
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert!(!state.accounting_poisoned);
+        drop(state);
+        assert!(observer.observations.lock().iter().any(|observation| {
+            matches!(
+                observation,
+                RealtimeFlowObservation::Drop {
+                    reason: RealtimeFlowDropReason::Expired,
+                    payload_bytes: 5,
+                    queue_age,
+                    ..
+                } if *queue_age >= Duration::from_millis(5)
+            )
+        }));
+    }
+
+    #[test]
+    fn v4_arc03_realtime_byte_claims_precede_fragment_and_output_retention() {
+        let policy = explicit_realtime_callback_policy(6, Duration::from_secs(1), 1, 1, 4, 1, 8);
+        let registry = RealtimeFlowRegistry::new(policy);
+        let flow = registry.open_flow().expect("flow is admitted");
+        let mut assembly = flow.begin_unit().expect("first unit is admitted");
+        assert!(flow.begin_unit().is_none(), "in-progress limit is exact");
+        assert!(assembly.retain_fragment(4));
+        assert!(
+            !assembly.retain_fragment(3),
+            "unit ceiling is checked first"
+        );
+        assert!(
+            flow.reserve_output(5).is_none(),
+            "assembly and output share the connector byte ceiling"
+        );
+        drop(assembly);
+
+        let output = flow
+            .reserve_output(6)
+            .expect("exact output ceiling is admitted");
+        assert!(flow.reserve_output(3).is_none());
+        drop(output);
+        assert!(
+            flow.reserve_output(7).is_none(),
+            "oversized output is refused"
+        );
+
+        let mut oversized_fragment = flow.begin_unit().expect("unit slot was released");
+        assert!(!oversized_fragment.retain_fragment(5));
+        drop(oversized_fragment);
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert_eq!(state.in_progress_units, 0);
+        assert!(!state.accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_realtime_accounting_corruption_fails_closed() {
+        let policy = explicit_realtime_callback_policy(8, Duration::from_secs(1), 1, 1, 8, 1, 8);
+        let registry = RealtimeFlowRegistry::new(policy);
+        let flow = registry.open_flow().expect("flow is admitted");
+        let reservation = flow.reserve_output(4).expect("output is admitted");
+        registry.state.lock().retained_bytes = 0;
+        drop(reservation);
+
+        let state = registry.state.lock();
+        assert!(state.accounting_poisoned);
+        drop(state);
+        assert!(registry.open_flow().is_none());
+        assert!(flow.reserve_output(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_cancelled_realtime_output_work_releases_its_claim() {
+        let registry = RealtimeFlowRegistry::new(explicit_realtime_callback_policy(
+            8,
+            Duration::from_secs(1),
+            1,
+            1,
+            8,
+            1,
+            8,
+        ));
+        let flow = registry.open_flow().expect("flow is admitted");
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _reservation = flow.reserve_output(8).expect("output is admitted");
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.expect("fixture reserved output");
+        assert_eq!(registry.state.lock().retained_bytes, 8);
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("fixture task is cancelled")
+            .is_cancelled());
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert!(!state.accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_realtime_flow_retirement_drains_its_owned_queue() {
+        let registry = RealtimeFlowRegistry::new(explicit_realtime_callback_policy(
+            8,
+            Duration::from_secs(1),
+            1,
+            2,
+            8,
+            1,
+            16,
+        ));
+        let flow = registry.open_flow().expect("flow is admitted");
+        assert!(flow.enqueue(
+            QueuedTransportEvent {
+                event: TransportEvent::AudioSample(AudioSample {
+                    rtp_timestamp: 1,
+                    lane: 0,
+                    data: Bytes::from_static(b"owned"),
+                }),
+                observation: None,
+            },
+            flow.reserve_output(5).expect("unit is admitted"),
+        ));
+        assert_eq!(registry.state.lock().retained_bytes, 5);
+        drop(flow);
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert!(state.flows.is_empty());
+        assert!(state.ready.is_empty());
+        assert!(!state.accounting_poisoned);
     }
 
     #[tokio::test]
     async fn v4_arc03_endpoint_and_realtime_units_have_independent_limits() {
         let realtime_limit = 4;
-        let policy = explicit_callback_policy(2, 2, 2, 1, realtime_limit, Duration::from_secs(1));
+        let policy = explicit_realtime_callback_policy(
+            realtime_limit,
+            Duration::from_secs(1),
+            1,
+            2,
+            realtime_limit,
+            1,
+            16,
+        );
         assert_eq!(
             callback_payload_limit(policy, ConnectorCallbackClass::EndpointData),
             Some(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
@@ -4481,41 +5716,29 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let (events, mut receiver) = test_event_mailboxes(2);
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: Some(scope.clone()),
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-            callback_policy: policy,
-        };
+        let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
+        let sink = test_event_sink_for_receiver(events, policy, Some(scope.clone()), &receiver);
 
-        assert!(
-            sink.emit(TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 0,
-                key: false,
-                lane: 0,
-                data: Bytes::from_static(b"12345"),
-            }))
-            .await
-        );
+        let flow = sink
+            .open_realtime_flow()
+            .expect("fixture admits one exact real-time flow");
+        assert!(flow.reserve_output(5).is_none());
         assert!(receiver.try_recv().is_err());
 
         assert!(
             sink.emit(TransportEvent::Message(Bytes::from_static(b"12345")))
                 .await
         );
-        assert!(
-            sink.emit(TransportEvent::VideoSample(VideoSample {
-                rtp_timestamp: 1,
-                key: true,
-                lane: 0,
-                data: Bytes::from_static(b"1234"),
-            }))
-            .await
-        );
+        let video = TransportEvent::VideoSample(VideoSample {
+            rtp_timestamp: 1,
+            key: true,
+            lane: 0,
+            data: Bytes::from_static(b"1234"),
+        });
+        let reservation = flow
+            .reserve_output(4)
+            .expect("fixture reserves the complete real-time unit");
+        assert!(sink.emit_realtime(&flow, video, reservation));
 
         let report = scope.report();
         let frame = report
@@ -5043,6 +6266,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
+            data_channel_open_committed: false,
         };
 
         ownership.retire();
@@ -5059,17 +6283,10 @@ mod tests {
 
     fn assert_callback_class_backpressure(first: TransportEvent, second: TransportEvent) {
         let (events, mut receiver) = test_event_mailboxes(1);
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: None,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-            callback_policy: ConnectorCallbackPolicy::unrestricted_lab(
-                std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
-            ),
-        };
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        );
+        let sink = test_event_sink(events, policy, None);
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
 
@@ -5091,6 +6308,57 @@ mod tests {
         );
     }
 
+    fn assert_realtime_flow_backpressure(first: TransportEvent, second: TransportEvent) {
+        let policy = explicit_realtime_callback_policy(16, Duration::from_secs(1), 1, 1, 16, 1, 32);
+        let observer = Arc::new(TestRealtimeObserver::default());
+        let registry = RealtimeFlowRegistry::with_observer(
+            policy,
+            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+        );
+        let flow = registry
+            .open_flow()
+            .expect("fixture admits one exact real-time flow");
+        let payload_bytes = |event: &TransportEvent| match event {
+            TransportEvent::AudioSample(sample) => sample.data.len(),
+            TransportEvent::VideoSample(sample) => sample.data.len(),
+            _ => panic!("fixture event must be a real-time compatibility unit"),
+        };
+        let first_reservation = flow
+            .reserve_output(payload_bytes(&first))
+            .expect("fixture reserves the first complete unit");
+        assert!(flow.enqueue(
+            QueuedTransportEvent {
+                event: first,
+                observation: None,
+            },
+            first_reservation,
+        ));
+        let second_reservation = flow
+            .reserve_output(payload_bytes(&second))
+            .expect("aggregate bytes admit the competing unit before queue pressure");
+        assert!(flow.enqueue(
+            QueuedTransportEvent {
+                event: second,
+                observation: None,
+            },
+            second_reservation,
+        ));
+        assert!(observer.observations.lock().iter().any(|observation| {
+            matches!(
+                observation,
+                RealtimeFlowObservation::Drop {
+                    reason: RealtimeFlowDropReason::FlowQueueFull,
+                    ..
+                }
+            )
+        }));
+        assert!(matches!(
+            registry.try_recv().map(|queued| queued.event),
+            Some(TransportEvent::AudioSample(_) | TransportEvent::VideoSample(_))
+        ));
+        assert!(registry.try_recv().is_none());
+    }
+
     #[test]
     fn v4_arc03_control_callback_contention_honors_configured_bound() {
         assert_callback_class_backpressure(
@@ -5109,7 +6377,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_audio_callback_contention_honors_configured_bound() {
-        assert_callback_class_backpressure(
+        assert_realtime_flow_backpressure(
             TransportEvent::AudioSample(AudioSample {
                 rtp_timestamp: 0,
                 lane: 0,
@@ -5125,7 +6393,7 @@ mod tests {
 
     #[test]
     fn v4_arc03_video_callback_contention_honors_configured_bound() {
-        assert_callback_class_backpressure(
+        assert_realtime_flow_backpressure(
             TransportEvent::VideoSample(VideoSample {
                 rtp_timestamp: 0,
                 key: true,
@@ -5142,120 +6410,116 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "owner-run measurement; requires explicit callback policy environment inputs"]
+    #[ignore = "owner-run observation; requires only workload-shape inputs"]
     async fn v4_arc03_measure_callback_classes_without_selecting_a_budget() {
-        fn owner_nonzero(name: &str) -> std::num::NonZeroUsize {
+        fn workload_nonzero(name: &str) -> std::num::NonZeroUsize {
             std::env::var(name)
-                .unwrap_or_else(|_| panic!("owner supplies {name}"))
+                .unwrap_or_else(|_| panic!("observation scenario supplies {name}"))
                 .parse::<usize>()
                 .ok()
                 .and_then(std::num::NonZeroUsize::new)
                 .unwrap_or_else(|| panic!("{name} must be a nonzero integer"))
         }
-        let control_capacity = owner_nonzero("MYOWNMESH_ARC03_CONTROL_CAPACITY");
-        let endpoint_data_capacity = owner_nonzero("MYOWNMESH_ARC03_ENDPOINT_DATA_CAPACITY");
-        let realtime_capacity = owner_nonzero("MYOWNMESH_ARC03_REALTIME_CAPACITY");
-        let control_weight = owner_nonzero("MYOWNMESH_ARC03_CONTROL_WEIGHT");
-        let endpoint_data_weight = owner_nonzero("MYOWNMESH_ARC03_ENDPOINT_DATA_WEIGHT");
-        let realtime_weight = owner_nonzero("MYOWNMESH_ARC03_REALTIME_WEIGHT");
-        let max_realtime_unit_bytes = owner_nonzero("MYOWNMESH_ARC03_MAX_REALTIME_UNIT_BYTES");
-        let realtime_enqueue_deadline_ms =
-            std::env::var("MYOWNMESH_ARC03_REALTIME_ENQUEUE_DEADLINE_MS")
-                .expect("owner supplies MYOWNMESH_ARC03_REALTIME_ENQUEUE_DEADLINE_MS")
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value != 0)
-                .expect("MYOWNMESH_ARC03_REALTIME_ENQUEUE_DEADLINE_MS must be nonzero");
-        let policy = ConnectorCallbackPolicy::new(
-            crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
-                control_capacity,
-                endpoint_data_capacity,
-                realtime_capacity,
-            ),
-            ConnectorCallbackServiceWeights::new(
-                control_weight,
-                endpoint_data_weight,
-                realtime_weight,
-            ),
-            max_realtime_unit_bytes,
-            Duration::from_millis(realtime_enqueue_deadline_ms),
-        )
-        .expect("owner callback policy is valid");
-        let samples = std::env::var("MYOWNMESH_ARC03_CALLBACK_SAMPLES")
-            .expect("owner supplies sample count")
-            .parse::<usize>()
-            .ok()
-            .and_then(std::num::NonZeroUsize::new)
-            .expect("owner sample count must be a nonzero integer");
+        let samples = workload_nonzero("MYOWNMESH_ARC03_OBSERVE_SAMPLES");
+        let flows = workload_nonzero("MYOWNMESH_ARC03_OBSERVE_FLOWS");
+        let payload_bytes = workload_nonzero("MYOWNMESH_ARC03_OBSERVE_PAYLOAD_BYTES");
+        let total_realtime_units = samples
+            .get()
+            .checked_mul(flows.get())
+            .expect("observation workload unit count fits usize");
+        let callback_capacity =
+            std::num::NonZeroUsize::new(samples.get().max(total_realtime_units))
+                .expect("derived observation queue is nonzero");
+        // This raw laboratory envelope is derived only to hold the requested
+        // finite observation workload. It is not a production policy or a
+        // proposed default.
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(callback_capacity);
 
         for class in [
             ConnectorCallbackClass::Control,
             ConnectorCallbackClass::EndpointData,
-            ConnectorCallbackClass::Realtime,
         ] {
             let (events, mut receiver) = test_event_mailboxes_with_policy(policy);
-            let sink = ConnectorEventSink {
-                events,
-                resource_scope: None,
-                realtime_delivery: Arc::new(AtomicBool::new(true)),
-                attempt_liveness: None,
-                candidate_promoted: Arc::new(AtomicBool::new(true)),
-                callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
-                callback_policy: policy,
-            };
-            let started = Instant::now();
-            let producer = async {
-                for index in 0..samples.get() {
-                    let event = match class {
-                        ConnectorCallbackClass::Control => TransportEvent::DataChannelClosed,
-                        ConnectorCallbackClass::EndpointData => {
-                            TransportEvent::Message(Bytes::from(index.to_le_bytes().to_vec()))
-                        }
-                        ConnectorCallbackClass::Realtime => {
-                            TransportEvent::VideoSample(VideoSample {
-                                rtp_timestamp: index as u32,
-                                key: false,
-                                lane: 0,
-                                data: Bytes::new(),
-                            })
-                        }
-                    };
-                    assert!(sink.emit(event).await);
-                }
-            };
-            let consumer = async {
-                for _ in 0..samples.get() {
-                    receiver.recv().await.expect("measurement callback arrives");
-                }
-            };
-            tokio::join!(producer, consumer);
-            println!(
-                "arc03_callback_measurement class={class:?} capacities={:?} weights={:?} realtime_deadline_ms={} max_realtime_unit_bytes={} samples={} elapsed_ns={}",
-                policy.mailboxes(),
-                policy.service_weights(),
-                realtime_enqueue_deadline_ms,
-                max_realtime_unit_bytes,
-                samples,
-                started.elapsed().as_nanos()
+            let sink = test_event_sink(events, policy, None);
+            let mut queued_at = std::collections::VecDeque::new();
+            for index in 0..samples.get() {
+                let event = match class {
+                    ConnectorCallbackClass::Control => TransportEvent::DataChannelClosed,
+                    ConnectorCallbackClass::EndpointData => {
+                        TransportEvent::Message(Bytes::from(index.to_le_bytes().to_vec()))
+                    }
+                    ConnectorCallbackClass::Realtime => unreachable!(),
+                };
+                let observed_at = Instant::now();
+                assert!(sink.emit(event).await);
+                queued_at.push_back(observed_at);
+            }
+            for index in 0..samples.get() {
+                receiver.recv().await.expect("observed callback arrives");
+                let queue_age = queued_at
+                    .pop_front()
+                    .expect("one timestamp exists per observed callback")
+                    .elapsed();
+                println!(
+                    "arc03_callback_raw class={class:?} index={index} queue_age_ns={}",
+                    queue_age.as_nanos()
+                );
+            }
+        }
+
+        let observer = Arc::new(TestRealtimeObserver::default());
+        let registry = RealtimeFlowRegistry::with_observer(
+            policy,
+            Some(observer.clone() as Arc<dyn RealtimeFlowObserver>),
+        );
+        let mut admitted_flows = Vec::with_capacity(flows.get());
+        for _ in 0..flows.get() {
+            admitted_flows.push(
+                registry
+                    .open_flow()
+                    .expect("raw observation envelope admits the requested flow"),
             );
         }
+        for (flow_index, flow) in admitted_flows.iter().enumerate() {
+            for unit_index in 0..samples.get() {
+                let payload = Bytes::from(vec![0u8; payload_bytes.get()]);
+                let reservation = flow
+                    .reserve_output(payload.len())
+                    .expect("raw observation envelope retains the requested unit");
+                assert!(flow.enqueue(
+                    QueuedTransportEvent {
+                        event: TransportEvent::VideoSample(VideoSample {
+                            rtp_timestamp: unit_index as u32,
+                            key: false,
+                            lane: u8::try_from(flow_index).unwrap_or(u8::MAX),
+                            data: payload,
+                        }),
+                        observation: None,
+                    },
+                    reservation,
+                ));
+            }
+        }
+        for _ in 0..total_realtime_units {
+            registry
+                .try_recv()
+                .expect("raw real-time observation unit remains serviceable");
+        }
+        for observation in observer.observations.lock().iter() {
+            println!("arc03_realtime_raw observation={observation:?}");
+        }
+        drop(admitted_flows);
     }
 
     #[tokio::test]
     async fn v4_arc03_retirement_wakes_producer_blocked_by_full_callback_queue() {
         let (events, mut receiver) = test_event_mailboxes(1);
         let callback_gate = Arc::new(WebRtcConnectorIncarnation::new());
-        let sink = ConnectorEventSink {
-            events,
-            resource_scope: None,
-            realtime_delivery: Arc::new(AtomicBool::new(true)),
-            attempt_liveness: None,
-            candidate_promoted: Arc::new(AtomicBool::new(true)),
-            callback_gate: Arc::clone(&callback_gate),
-            callback_policy: ConnectorCallbackPolicy::unrestricted_lab(
-                std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
-            ),
-        };
+        let policy = ConnectorCallbackPolicy::unrestricted_lab(
+            std::num::NonZeroUsize::new(1).expect("fixture capacity is nonzero"),
+        );
+        let mut sink = test_event_sink(events, policy, None);
+        sink.callback_gate = Arc::clone(&callback_gate);
 
         assert!(sink.emit(TransportEvent::DataChannelOpen).await);
         let blocked =
@@ -5296,6 +6560,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(RemoteCandidateState::default())),
             close_owner: None,
+            data_channel_open_committed: false,
         };
         events_tx
             .control
@@ -5349,6 +6614,7 @@ mod tests {
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
+            data_channel_open_committed: false,
         };
         assert_eq!(
             candidate_report(&context.report().pre_authentication).active_lease_count,
@@ -5371,7 +6637,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_owner(test_resource_owner(1, 4, Duration::from_secs(10)));
+            .with_connector_resource_scope(test_resource_owner(1, 4, Duration::from_secs(10)));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -5437,7 +6703,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_owner(owner.clone());
+            .with_connector_resource_scope(owner.clone());
         let hook =
             ConstructionTestHook::new(ConstructionPause::AfterNativeAllocationWithCloseError);
         transport.construction_hook = Some(Arc::clone(&hook));
@@ -5496,7 +6762,7 @@ mod tests {
         let context = process.mesh_runtime_scope().network_instance_scope();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_owner(test_resource_owner(1, 4, Duration::from_secs(10)));
+            .with_connector_resource_scope(test_resource_owner(1, 4, Duration::from_secs(10)));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterResultDelivery);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -5559,7 +6825,7 @@ mod tests {
         let owner = test_resource_owner(1, 4, Duration::from_secs(2));
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_owner(owner.clone());
+            .with_connector_resource_scope(owner.clone());
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let process = ProcessResourceRoot::isolated();
@@ -5638,7 +6904,7 @@ mod tests {
         let owner = test_resource_owner(1, 4, Duration::from_secs(10));
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_owner(owner.clone());
+            .with_connector_resource_scope(owner.clone());
         let hook = ConstructionTestHook::new(ConstructionPause::FailAfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let process = ProcessResourceRoot::isolated();
@@ -5974,6 +7240,105 @@ mod tests {
     const FU_S: &[u8] = &[0x7C, 0x85, 0x11];
     const FU_M: &[u8] = &[0x7C, 0x05, 0x22];
     const FU_E: &[u8] = &[0x7C, 0x45, 0x33];
+
+    #[test]
+    fn v4_arc03_guarded_video_refuses_fragment_before_retention() {
+        let registry = RealtimeFlowRegistry::new(explicit_realtime_callback_policy(
+            8,
+            Duration::from_secs(1),
+            1,
+            1,
+            2,
+            1,
+            16,
+        ));
+        let flow = registry.open_flow().expect("flow is admitted");
+        let mut assembler = H264AuAssembler::guarded(flow);
+        assert!(assembler
+            .push_guarded(&rtp_pkt(1, 100, true, IDR_NAL))
+            .is_err());
+        assert!(assembler.parts.is_empty());
+        let state = registry.state.lock();
+        assert_eq!(state.retained_bytes, 0);
+        assert_eq!(state.in_progress_units, 0);
+        assert!(!state.accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim() {
+        let registry = RealtimeFlowRegistry::new(explicit_realtime_callback_policy(
+            32,
+            Duration::from_secs(1),
+            1,
+            1,
+            8,
+            1,
+            64,
+        ));
+        let flow = registry.open_flow().expect("flow is admitted");
+        let mut assembler = H264AuAssembler::guarded(flow);
+        let anchor = assembler
+            .push_guarded(&rtp_pkt(9, 100, true, IDR_NAL))
+            .expect("anchor is valid")
+            .expect("anchor emits");
+        drop(anchor);
+        assert!(assembler
+            .push_guarded(&rtp_pkt(10, 200, false, FU_S))
+            .unwrap()
+            .is_none());
+        assert!(assembler
+            .push_guarded(&rtp_pkt(12, 200, true, FU_E))
+            .unwrap()
+            .is_none());
+        let sample = assembler
+            .push_guarded(&rtp_pkt(11, 200, false, FU_M))
+            .expect("late middle is valid")
+            .expect("whole reordered unit emits");
+        assert_eq!(
+            sample.sample.data.as_ref(),
+            &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]
+        );
+        assert_eq!(
+            registry.state.lock().retained_bytes,
+            sample.sample.data.len()
+        );
+        drop(sample);
+        assert_eq!(registry.state.lock().retained_bytes, 0);
+    }
+
+    #[test]
+    fn v4_arc03_guarded_video_in_progress_limit_is_connector_wide_across_tracks() {
+        let registry = RealtimeFlowRegistry::new(explicit_realtime_callback_policy(
+            32,
+            Duration::from_secs(1),
+            2,
+            1,
+            8,
+            1,
+            64,
+        ));
+        let first_flow = registry.open_flow().expect("first flow is admitted");
+        let second_flow = registry.open_flow().expect("second flow is admitted");
+        let mut first = H264AuAssembler::guarded(first_flow);
+        let mut second = H264AuAssembler::guarded(second_flow);
+        assert!(first
+            .push_guarded(&rtp_pkt(1, 100, false, FU_S))
+            .unwrap()
+            .is_none());
+        assert!(second
+            .push_guarded(&rtp_pkt(2, 200, false, FU_S))
+            .unwrap()
+            .is_none());
+        assert!(second.parts.is_empty());
+        assert_eq!(registry.state.lock().in_progress_units, 1);
+        drop(first);
+        assert_eq!(registry.state.lock().in_progress_units, 0);
+        assert!(second
+            .push_guarded(&rtp_pkt(3, 300, false, FU_S))
+            .unwrap()
+            .is_none());
+        assert_eq!(registry.state.lock().in_progress_units, 1);
+    }
 
     #[test]
     fn single_packet_units_emit_in_order() {

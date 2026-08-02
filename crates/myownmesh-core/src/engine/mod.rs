@@ -1506,7 +1506,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(ev) = rx.recv().await {
-            handle_transport_event(&connector_state, peer_id_for_pump.clone(), ev).await;
+            if handle_transport_event(&connector_state, peer_id_for_pump.clone(), ev).await {
+                rx.commit_data_channel_open();
+            }
         }
     });
 }
@@ -1702,7 +1704,7 @@ async fn handle_transport_event(
     state: &Arc<NetworkState>,
     device_id: String,
     event: WebRtcConnectorEvent,
-) {
+) -> bool {
     // The callback stamp must match the exact active worker. A delayed event
     // from a replaced worker cannot act on the replacement peer.
     let owner = state.peers.owner(&device_id);
@@ -1712,11 +1714,11 @@ async fn handle_transport_event(
         .and_then(|peer| peer.session.lock().clone());
     let (Some(owner), Some(worker)) = (owner, worker) else {
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
-        return;
+        return false;
     };
     let Some(event) = worker.accept_event(event) else {
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
-        return;
+        return false;
     };
     match event {
         TransportEvent::RenegotiationNeeded => {
@@ -1745,7 +1747,7 @@ async fn handle_transport_event(
                 })
                 .is_some();
             if !accepted {
-                return;
+                return false;
             }
             // Debug-level: candidates are noisy (one per
             // host/srflx/relay), so the per-candidate detail lands
@@ -1777,7 +1779,7 @@ async fn handle_transport_event(
                     data.diag.local_candidates.relay,
                 )
             }) else {
-                return;
+                return false;
             };
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
@@ -1824,16 +1826,16 @@ async fn handle_transport_event(
         }
         TransportEvent::DataChannelOpen => {
             if state.peers.get_if_current(&owner).is_none() {
-                return;
+                return false;
             }
             let connected = match worker.confirm_data_channel_open() {
                 DataChannelOpenOwnership::Rejected => {
                     trace!(peer = %device_id, "ignoring DataChannelOpen without a live connector owner");
-                    return;
+                    return false;
                 }
                 DataChannelOpenOwnership::AlreadyConnected => {
                     trace!(peer = %device_id, "ignoring duplicate DataChannelOpen for the exact connector owner");
-                    return;
+                    return true;
                 }
                 DataChannelOpenOwnership::Connected(connected) => connected,
             };
@@ -1850,7 +1852,13 @@ async fn handle_transport_event(
                 true
             });
             if accepted != Some(true) {
-                return;
+                // The connector capability was already promoted, but the
+                // exact registry owner lost its install race. Fence this
+                // connector now so it cannot retain connected ownership or
+                // later release queued endpoint protocol without an installed
+                // Endpoint Auth Task.
+                worker.retire();
+                return false;
             }
             // The link is back — retire any reconnect intent we were driving
             // for this peer so the tick stops re-offering it.
@@ -1864,6 +1872,7 @@ async fn handle_transport_event(
                 serde_json::json!({ "peer": device_id }),
             );
             handshake::initiate(state, &owner, auth_task).await;
+            return true;
         }
         TransportEvent::DataChannelClosed => {
             // A channel that closes right after we hand an evicted peer its
@@ -1907,6 +1916,7 @@ async fn handle_transport_event(
             });
         }
     }
+    false
 }
 
 async fn handle_ice_state_change(
@@ -3265,7 +3275,6 @@ fn build_test_state_parts(
         crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
             callback_capacity,
             callback_capacity,
-            callback_capacity,
         ),
         crate::runtime::attempt::ConnectorCallbackServiceWeights::new(
             callback_capacity,
@@ -3276,18 +3285,22 @@ fn build_test_state_parts(
             .expect("engine fixture real-time unit limit is nonzero"),
         Duration::from_secs(10),
     )
-    .expect("engine fixture real-time enqueue deadline is nonzero");
+    .expect("engine fixture real-time useful lifetime is nonzero");
     let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
         max_connectors,
         callbacks,
         Duration::from_secs(10),
     )
     .expect("engine fixture close deadline is nonzero");
+    let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(connector_policy);
+    let scope = owner
+        .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
+            max_connectors,
+        ))
+        .expect("engine fixture process owner issues one explicit Mesh scope");
     let transport = crate::transport::Transport::new()
         .expect("transport")
-        .with_connector_resource_owner(crate::runtime::attempt::ConnectorResourceOwnerPort::new(
-            connector_policy,
-        ));
+        .with_connector_resource_scope(scope);
     let (state, _signaling_in_rx, cmd_rx) =
         NetworkState::new(config, identity, transport).expect("network state");
     (state, cmd_rx)

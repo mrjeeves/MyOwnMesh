@@ -86,6 +86,11 @@ cargo run -p myownmesh -- serve
 just serve                                    # MYOWNMESH_LOG=debug cargo run -p myownmesh -- serve
 ```
 
+Arc 03 connector-capable daemon startup requires the complete owner-selected
+process, per-Mesh, callback, real-time-flow, and close policy vector. No numeric
+defaults are supplied. See [the quickstart policy input list](docs/QUICKSTART.md#2-open-the-mesh).
+An explicitly non-participating infrastructure host needs no connector policy.
+
 ### 2. Run the desktop GUI
 
 The [one-command install](#install) above already includes the GUI
@@ -125,11 +130,15 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust
-use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
+use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkConfig, TopologyMode};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mesh = Mesh::open(MeshConfig::load().unwrap_or_default()).await?;
+async fn run(
+    connector_policy: ConnectorCapableResourcePolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mesh = Mesh::open_with_connector_resource_policy(
+        MeshConfig::load().unwrap_or_default(),
+        connector_policy,
+    ).await?;
 
     let net = mesh.join(NetworkConfig {
         id: "home".into(),

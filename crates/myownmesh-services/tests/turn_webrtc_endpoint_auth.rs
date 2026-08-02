@@ -14,7 +14,8 @@ use myownmesh_core::transport::webrtc::LaneKind;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-    ConnectorCallbackServiceWeights, ConnectorResourcePolicy, MeshEvent, PeerEvent,
+    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
+    MeshConnectorResourcePolicy, MeshEvent, PeerEvent,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -41,21 +42,21 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
     }
 }
 
-fn test_connector_resource_policy() -> ConnectorResourcePolicy {
+fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
     let two = std::num::NonZeroUsize::new(2)
         .expect("the two-endpoint fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
-        ConnectorCallbackMailboxCapacities::new(callback, callback, callback),
+        ConnectorCallbackMailboxCapacities::new(callback, callback),
         ConnectorCallbackServiceWeights::new(callback, callback, callback),
         std::num::NonZeroUsize::new(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
             .expect("fixture real-time unit limit is nonzero"),
         Duration::from_secs(10),
     )
-    .expect("fixture real-time enqueue deadline is nonzero");
-    let policy = ConnectorResourcePolicy::new(two, callbacks, Duration::from_secs(10))
+    .expect("fixture real-time useful lifetime is nonzero");
+    let process = ConnectorResourcePolicy::new(two, callbacks, Duration::from_secs(10))
         .expect("fixture native-close deadline is nonzero");
-    policy
+    ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two))
 }
 
 fn relay_only_test_transport() -> Transport {

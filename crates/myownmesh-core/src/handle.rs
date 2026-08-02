@@ -26,7 +26,9 @@ use crate::protocol::CapabilityAdvert;
 use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
-use crate::runtime::attempt::{ConnectorResourceOwnerReport, ConnectorResourcePolicy};
+use crate::runtime::attempt::{
+    ConnectorCapableResourcePolicy, ConnectorResourceOwnerReport, MeshConnectorResourceReport,
+};
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// How long [`JoinedNetwork::announce_leave`] waits after queuing the
@@ -61,9 +63,13 @@ struct NetworkEntry {
 }
 
 impl Mesh {
-    /// Build a fresh `Mesh`. Loads (or generates) the on-disk identity
-    /// anchor (`~/.myownmesh/.secrets/identity.json`) and constructs the
-    /// shared WebRTC API.
+    /// Build an identity and infrastructure-only `Mesh` without connector
+    /// authority.
+    ///
+    /// This form can host non-participating infrastructure services, but its
+    /// handle cannot join a network or allocate a native peer connector. A
+    /// network-capable owner must use [`Self::open_with_connector_resource_policy`]
+    /// and provide the reviewed process policy explicitly.
     pub async fn open(config: MeshConfig) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
         Self::open_with_identity(config, identity).await
@@ -74,19 +80,21 @@ impl Mesh {
     /// inferred capacity.
     pub async fn open_with_connector_resource_policy(
         config: MeshConfig,
-        policy: ConnectorResourcePolicy,
+        policy: ConnectorCapableResourcePolicy,
     ) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
         Self::open_with_identity_and_connector_resource_policy(config, identity, policy).await
     }
 
-    /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
+    /// Build an infrastructure-only `Mesh` with a **caller-supplied identity**,
+    /// for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.
     /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
     /// Keystore, or any host that has already loaded a key. Pair with
     /// [`Identity::from_signing_key`](crate::identity::Identity::from_signing_key).
-    /// Otherwise identical to [`Mesh::open`]: same shared WebRTC stack, same
-    /// network join/leave surface.
+    /// Otherwise identical to [`Mesh::open`]. It has no connector authority;
+    /// use [`Self::open_with_identity_and_connector_resource_policy`] for
+    /// network participation.
     pub async fn open_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
@@ -99,7 +107,7 @@ impl Mesh {
     pub async fn open_with_identity_and_connector_resource_policy(
         _config: MeshConfig,
         identity: Arc<Identity>,
-        policy: ConnectorResourcePolicy,
+        policy: ConnectorCapableResourcePolicy,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?.with_connector_resource_policy(policy)?;
         Self::open_with_identity_and_transport(identity, transport)
@@ -159,6 +167,11 @@ impl MeshHandle {
         self.mesh.inner.transport.connector_resource_report()
     }
 
+    /// Current connector accounting for this exact live Mesh runtime.
+    pub fn mesh_connector_resource_report(&self) -> Option<MeshConnectorResourceReport> {
+        self.mesh.inner.transport.mesh_connector_resource_report()
+    }
+
     /// Subscribe to mesh-wide events (every joined network's
     /// PeerEvent / PhaseEvent / Diag stream is fanned into this
     /// single broadcaster).
@@ -176,6 +189,15 @@ impl MeshHandle {
     /// until [`JoinedNetwork::leave`] is called (or the
     /// `JoinedNetwork` is dropped).
     pub async fn join(&self, mut config: NetworkConfig) -> Result<JoinedNetwork> {
+        if self
+            .mesh
+            .inner
+            .transport
+            .connector_resource_report()
+            .is_none()
+        {
+            return Err(Error::ConnectorPolicyRequired);
+        }
         // Normalize the network id so signaling derivation is
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
@@ -759,5 +781,23 @@ mod tests {
 
         // The mesh's wire id derives from the injected key, not a disk anchor.
         assert_eq!(mesh.device_id(), want);
+    }
+
+    #[tokio::test]
+    async fn ownerless_mesh_rejects_network_join_with_typed_policy_error() {
+        let identity = Arc::new(Identity::ephemeral());
+        let mesh = Mesh::open_with_identity(MeshConfig::default(), identity)
+            .await
+            .expect("open infrastructure-only mesh");
+
+        let error = match mesh
+            .join(NetworkConfig::from_network_id("ownerless", "ownerless"))
+            .await
+        {
+            Ok(_) => panic!("ownerless mesh must not join a network"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::ConnectorPolicyRequired));
+        assert!(mesh.joined_network_ids().is_empty());
     }
 }

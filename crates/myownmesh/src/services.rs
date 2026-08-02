@@ -42,6 +42,9 @@ pub struct ServiceManager {
 pub enum ServicePolicyError {
     #[error("ordinary-member application payload relay is forbidden by the V4 endpoint path")]
     LegacyPayloadRelayForbidden,
+
+    #[error("connector resource policy is required before enabling node participation")]
+    ConnectorPolicyRequired,
 }
 
 struct ManagerState {
@@ -101,6 +104,23 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Validate a service configuration against this daemon incarnation.
+    ///
+    /// An infrastructure-only daemon has no connector owner. It cannot be
+    /// changed into a participating node through live configuration because
+    /// doing so would otherwise persist a state whose connector attempts can
+    /// never be admitted.
+    pub fn validate_config_for_runtime(
+        &self,
+        desired: &ServicesConfig,
+    ) -> Result<(), ServicePolicyError> {
+        Self::validate_config(desired)?;
+        if desired.node.enabled && self.mesh.connector_resource_report().is_none() {
+            return Err(ServicePolicyError::ConnectorPolicyRequired);
+        }
+        Ok(())
+    }
+
     pub fn new(mesh: MeshHandle, registry: Arc<NetworkRegistry>) -> Arc<Self> {
         Arc::new(Self {
             mesh,
@@ -124,7 +144,7 @@ impl ServiceManager {
         &self,
         desired: ServicesConfig,
     ) -> Result<ServicesReport, ServicePolicyError> {
-        Self::validate_config(&desired)?;
+        self.validate_config_for_runtime(&desired)?;
         let mut g = self.state.lock().await;
 
         // ---- Node participation ----
@@ -509,5 +529,29 @@ mod tests {
             ServiceManager::validate_config(&cfg),
             Err(ServicePolicyError::LegacyPayloadRelayForbidden)
         ));
+    }
+
+    #[tokio::test]
+    async fn infrastructure_runtime_rejects_later_node_enable_without_mutation() {
+        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+        let mesh = myownmesh_core::Mesh::open_with_identity(MeshConfig::default(), identity)
+            .await
+            .expect("open infrastructure-only mesh");
+        let registry = NetworkRegistry::new();
+        let manager = ServiceManager::new(mesh, registry);
+        let mut infrastructure = ServicesConfig::default();
+        infrastructure.node.enabled = false;
+        manager
+            .apply(infrastructure.clone())
+            .await
+            .expect("disable node participation");
+
+        let mut attempted = infrastructure;
+        attempted.node.enabled = true;
+        assert!(matches!(
+            manager.apply(attempted).await,
+            Err(ServicePolicyError::ConnectorPolicyRequired)
+        ));
+        assert!(!manager.current_config().await.node.enabled);
     }
 }

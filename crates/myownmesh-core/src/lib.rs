@@ -8,11 +8,14 @@
 //! # Quick tour
 //!
 //! ```no_run
-//! # async fn _ex() -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn _ex(connector_policy: myownmesh_core::ConnectorCapableResourcePolicy) -> Result<(), Box<dyn std::error::Error>> {
 //! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
 //!
-//! // Load (or create) the local identity + open the WebRTC stack.
-//! let mesh = Mesh::open(MeshConfig::default()).await?;
+//! // The process owner supplies the reviewed connector policy explicitly.
+//! let mesh = Mesh::open_with_connector_resource_policy(
+//!     MeshConfig::default(),
+//!     connector_policy,
+//! ).await?;
 //! println!("device id: {}", mesh.identity().display_id());
 //!
 //! // Join a named network. Returns a per-network handle.
@@ -139,8 +142,10 @@ pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
-    ConnectorCallbackServiceWeights, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
-    ConnectorResourcePolicy, ConnectorResourcePolicyConflict,
+    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorRealtimeFlowPolicy,
+    ConnectorResourceOwnerPort, ConnectorResourceOwnerReport, ConnectorResourcePolicy,
+    ConnectorResourcePolicyConflict, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError,
 };
 pub use services::{
     relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,

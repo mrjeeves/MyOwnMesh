@@ -12,7 +12,7 @@ The target owner holds one attempt's connector-candidate set, race state, `Attem
 
 - local connection intent;
 - bounded transport hints;
-- one explicit `ConnectorResourceOwnerPort` supplied by the process owner;
+- one unforgeable `MeshConnectorResourceScope` issued by the process owner;
 - typed connector-control input and cancellation.
 
 ## Outputs
@@ -26,9 +26,9 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 ## Resources
 
-`PreAuthAttemptPermit` is not consumed by its first connector candidate. It may request several child reservations, but it cannot create capacity. Every request goes to the injected process resource owner. Each connector candidate carries its admitted child reservation and an unforgeable witness for the exact attempt that issued it.
+`PreAuthAttemptPermit` is not consumed by its first connector candidate. It may request several child reservations, but it cannot create capacity. Every request goes through the exact Mesh child scope. Each connector candidate carries its admitted reservation and an unforgeable witness for the exact attempt that issued it.
 
-The active claim is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the fixed per-candidate structure needed to prove ownership of one transport object, construction work, and an owned task slot. `ProcessResourceRoot` installs one owner shared by all Mesh runtimes in the process. The external owner supplies the process candidate count, three generic callback capacities, three scheduler weights, real-time unit limit, real-time enqueue deadline, and native close timeout. There is no production default.
+The active claim is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the fixed per-candidate structure needed to prove ownership of one transport object, construction work, and an owned task slot. `ProcessResourceRoot` installs one process owner and issues a separate child scope for each live Mesh runtime. Admission updates the process and exact child atomically. The external owner supplies the process and per-Mesh candidate ceilings, two reliable callback mailbox capacities, three scheduler weights, real-time unit and flow bounds, useful lifetime, and native close timeout. There is no production default or inferred child share.
 
 The child is acquired before connector construction starts. A refused child claim performs no allocation. Real asynchronous construction runs in an owned task. Cancellation fences publication, closes any private native result, and returns the child claim only after successful native cleanup.
 

@@ -50,7 +50,7 @@ The TURN control must select Relay-to-Relay pairs. The positive path authenticat
 
 Attack: let an attempt create the capacity that admits its own connector.
 
-Required result: `admit_single_connector_candidate` can define only the structural claim. `ProcessResourceRoot` installs one connector owner for the process. Additional Mesh runtimes reuse that owner and cannot multiply the limit. External code cannot construct an owner port. No production default or inferred capacity exists.
+Required result: `admit_single_connector_candidate` can define only the structural claim. `ProcessResourceRoot` installs one connector owner for the process and issues one unforgeable child scope per live Mesh runtime. Admission updates the process aggregate and exact child together. One Mesh cannot consume every process slot unless the owner explicitly gives that child the same ceiling. External code cannot construct either authority. No production default or inferred share exists.
 
 Controls:
 
@@ -59,6 +59,11 @@ Controls:
 - `v4_arc03d_process_root_shares_one_connector_limit_across_mesh_runtimes`;
 - `v4_arc03d_process_root_rejects_a_conflicting_policy`;
 - `v4_arc03d_concurrent_process_policy_installation_has_one_winner`;
+- `v4_arc03e_mesh_scope_requires_the_single_installed_process_owner`;
+- `v4_arc03e_mesh_ceiling_isolates_children_inside_the_process_cap`;
+- `v4_arc03e_concurrent_children_never_oversubscribe_either_ceiling`;
+- `v4_arc03e_failed_cleanup_retains_the_exact_process_and_mesh_claim`;
+- `v4_arc03e_final_failed_cleanup_scope_drop_keeps_unrelated_capacity_usable`;
 - compiler-boundary checker;
 - cause-matched rejection of external `ConnectorResourceOwnerPort::new`.
 
@@ -123,7 +128,7 @@ Controls:
 
 Attack: fill one callback class, prequeue stale events, block a producer, then retire or replace the connector.
 
-Required result: control, endpoint data, and codec-neutral real-time flow each have an owner-selected bound. Audio and video remain WebRTC adapter names and share the real-time class. The owner supplies scheduler weights. Every continuously ready class receives a bounded service opportunity. Control and endpoint-data sends retain reliable bounded backpressure. Real-time sends drop the newest unit after the owner-supplied enqueue deadline. Exact incarnation stamps reject stale events.
+Required result: control and endpoint data have separate owner-selected mailboxes. Every codec-neutral real-time flow has independent bounded queue state under the connector aggregate. Audio and video remain WebRTC adapter names. The owner supplies scheduler weights. Every continuously ready class receives a bounded service opportunity. Control and endpoint-data sends retain reliable bounded backpressure. Real-time handling removes expired whole units synchronously and refuses a complete arriving unit when its exact flow queue is still full. It does not wait one full deadline per stale unit. Exact incarnation stamps reject stale events.
 
 Controls:
 
@@ -133,26 +138,28 @@ Controls:
 - `v4_arc03_video_callback_contention_honors_configured_bound`;
 - `v4_arc03_endpoint_data_and_realtime_callback_capacity_are_independent`;
 - `v4_arc03_scheduler_gives_each_ready_class_a_bounded_service_turn`;
-- `v4_arc03_realtime_backpressure_drops_after_owner_deadline`;
+- `v4_arc03_realtime_flows_have_independent_bounded_queues`;
+- `v4_arc03_expired_realtime_unit_is_dropped_whole_without_enqueue_wait`;
+- `v4_arc03_realtime_flow_retirement_drains_its_owned_queue`;
 - `v4_arc03_endpoint_and_realtime_units_have_independent_limits`;
+- `v4_arc03_realtime_byte_claims_precede_fragment_and_output_retention`;
+- `v4_arc03_guarded_video_refuses_fragment_before_retention`;
+- `v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim`;
+- `v4_arc03_guarded_video_in_progress_limit_is_connector_wide_across_tracks`;
+- `v4_arc03_cancelled_realtime_output_work_releases_its_claim`;
+- `v4_arc03_realtime_accounting_corruption_fails_closed`;
 - `v4_arc03_retirement_wakes_producer_blocked_by_full_callback_queue`;
 - `v4_arc03_retirement_stops_event_pump_before_stale_callback_queueing`;
 - `v4_arc03_stale_transport_event_cannot_mutate_replacement_worker` in WSL.
 
-These tests prove shape and enforcement, not operational sufficiency. The owner must measure workload-specific capacities, scheduler weights, the real-time unit limit, and the real-time enqueue deadline under mixed sustained load.
+These tests prove shape and enforcement, not operational sufficiency. The owner must measure workload-specific capacities, scheduler weights, real-time unit limits, retained bytes, in-progress units, and useful lifetimes under mixed sustained load.
 
-The ignored measurement requires owner-supplied inputs and reports each class separately:
+The ignored measurement requires workload-shape inputs, not production policy values. It reports raw per-event and per-flow observations. The derived finite laboratory envelope is not a proposed default:
 
 ```powershell
-$env:MYOWNMESH_ARC03_CONTROL_CAPACITY = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_ENDPOINT_DATA_CAPACITY = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_REALTIME_CAPACITY = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_CONTROL_WEIGHT = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_ENDPOINT_DATA_WEIGHT = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_REALTIME_WEIGHT = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_MAX_REALTIME_UNIT_BYTES = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_REALTIME_ENQUEUE_DEADLINE_MS = "<owner-supplied>"
-$env:MYOWNMESH_ARC03_CALLBACK_SAMPLES = "<owner-supplied>"
+$env:MYOWNMESH_ARC03_OBSERVE_SAMPLES = "<scenario sample count>"
+$env:MYOWNMESH_ARC03_OBSERVE_FLOWS = "<scenario flow count>"
+$env:MYOWNMESH_ARC03_OBSERVE_PAYLOAD_BYTES = "<scenario payload size>"
 cargo test -p myownmesh-core --lib v4_arc03_measure_callback_classes_without_selecting_a_budget -- --ignored --nocapture --test-threads=1
 ```
 
@@ -195,6 +202,14 @@ Controls:
 - `v4_arc03_admitted_worker_rejects_protocol_bytes_before_channel_capability`;
 - `v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives` in WSL;
 - compiler-boundary checker.
+
+The scheduler has an additional exact lifecycle barrier. `Message` remains in the bounded endpoint-data mailbox until the exact `DataChannelOpen` transition commits and the current peer installs its Endpoint Auth task. `DataChannelClosed` can still pass before open. Replacement at the commit fence retires the losing connector and drops its retained endpoint queue.
+
+Controls:
+
+- `v4_arc03_endpoint_protocol_waits_for_committed_open_despite_scheduler_cursor`;
+- `v4_arc03_close_can_retire_before_uncommitted_endpoint_protocol`;
+- `v4_arc03_retirement_drops_uncommitted_endpoint_protocol_and_its_observation`;
 
 Arc 03 proves provenance ownership only. It does not claim Endpoint Auth resource admission or transcript verification.
 
@@ -260,6 +275,13 @@ Required result: the V4 engine does not call `routing::send_routed`, `routing::b
 
 The connector-capable V4 daemon also rejects `services.relay.enabled` at startup and through live service reconfiguration. RTM-002 remains open because the legacy `RelayService` construction surface is still present outside that daemon entry path.
 
+Arc 03 remains blocked on an explicit owner choice:
+
+1. Fence the historical routing and relay surface into a typed V1 compatibility package that future V4 session capabilities cannot reach, with deletion retained for Arc 12.
+2. Accept immediate breaking removal and typed no-direct-session plus partial-fanout behavior.
+
+This branch does not silently select immediate removal.
+
 Controls:
 
 - compiler-boundary source checks for all three forbidden V4 calls;
@@ -271,9 +293,9 @@ Controls:
 
 Attack: start the daemon without resource policy, then discover that every connector is refused only after the service is running.
 
-Required result: `embedded::start` returns the typed `EmbeddedStartError::MissingConnectorResourcePolicy`. Only `start_with_connector_resource_policy` can start a connector-capable daemon. No policy value is inferred.
+Required result: configuration-only `embedded::start` starts only an explicitly infrastructure-only daemon or returns the typed `EmbeddedStartError::MissingConnectorResourcePolicy`. Only `start_connector_capable` can start a connector-capable daemon. Infrastructure-only startup requires node participation to be disabled, and later node enablement is rejected before persistence. `myownmesh serve` selects the infrastructure form when node participation is disabled. When it is enabled, the command requires the complete owner-selected `MYOWNMESH_CONNECTOR_*` vector and rejects every missing, zero, or invalid value before startup. No policy value is inferred.
 
-Control: `ownerless_start_returns_typed_missing_policy_error`.
+Controls: `ownerless_start_returns_typed_missing_policy_error`, `infrastructure_start_requires_node_participation_disabled`, `ownerless_mesh_rejects_network_join_with_typed_policy_error`, `infrastructure_runtime_rejects_later_node_enable_without_mutation`, and the three `connector_capable_serve_*` parser tests.
 
 ## 18. Compiler boundary
 

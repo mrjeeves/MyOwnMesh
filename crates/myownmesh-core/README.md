@@ -27,9 +27,10 @@ catalogue and the path to crates.io.
 ## Public API tour
 
 ```rust
-use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
+use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkConfig, TopologyMode};
 
-let mesh = Mesh::open(MeshConfig::default()).await?;
+// `connector_policy` is selected by the process owner. The library has no default.
+let mesh = Mesh::open_with_connector_resource_policy(MeshConfig::default(), connector_policy).await?;
 let net = mesh.join(NetworkConfig { /* ... */ }).await?;
 let chan = net.channel::<MyMessage>("my-channel");
 let rpc  = net.rpc();

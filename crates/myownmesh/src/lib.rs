@@ -4,7 +4,7 @@
 //! modules here. They are exposed as a library for one reason: so a host
 //! application that is **forbidden from spawning processes**, such as an iOS
 //! app where the sandbox allows neither fork nor exec, can run the same daemon
-//! inside its own process via [`embedded::start_with_connector_resource_policy`], instead of
+//! inside its own process via [`embedded::start_connector_capable`], instead of
 //! re-implementing the daemon's behaviour piece by piece.
 //!
 //! Everything else about the daemon is unchanged: it still listens on the

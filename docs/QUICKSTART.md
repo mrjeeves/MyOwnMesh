@@ -29,17 +29,47 @@ catalogue.
 
 ## 2. Open the mesh
 
-`Mesh::open` loads (or generates on first call) this device's
+`Mesh::open_with_connector_resource_policy` loads (or generates on first call) this device's
 long-lived ed25519 identity from
 `~/.myownmesh/.secrets/identity.json` and constructs the shared
-WebRTC API.
+WebRTC API with the process owner's reviewed process and exact-Mesh connector
+policy. MyOwnMesh does not provide default policy values. `Mesh::open` is reserved for an
+infrastructure-only runtime and cannot join a network.
 
 ```rust
-use myownmesh_core::{Mesh, MeshConfig};
+use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig};
 
-let mesh = Mesh::open(MeshConfig::default()).await?;
+let mesh = Mesh::open_with_connector_resource_policy(
+    MeshConfig::default(),
+    connector_policy,
+).await?;
 println!("device id: {}", mesh.identity().display_id());
 ```
+
+For the headless daemon, `myownmesh serve` uses the infrastructure-only form
+when node participation is disabled. A participating node requires every
+owner-selected value below before startup:
+
+```text
+MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES
+MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES
+MYOWNMESH_CONNECTOR_CONTROL_CAPACITY
+MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY
+MYOWNMESH_CONNECTOR_CONTROL_WEIGHT
+MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT
+MYOWNMESH_CONNECTOR_REALTIME_WEIGHT
+MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES
+MYOWNMESH_CONNECTOR_REALTIME_USEFUL_LIFETIME_MS
+MYOWNMESH_CONNECTOR_REALTIME_MAX_ACTIVE_FLOWS
+MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW
+MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES
+MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS
+MYOWNMESH_CONNECTOR_REALTIME_MAX_RETAINED_BYTES
+MYOWNMESH_CONNECTOR_NATIVE_CLOSE_TIMEOUT_MS
+```
+
+MyOwnMesh supplies no numeric fallback. Missing, zero, or invalid values stop
+the connector-capable daemon before it joins a mesh.
 
 The returned `MeshHandle` is cheap to clone — multiple subsystems in
 your app can hold one.

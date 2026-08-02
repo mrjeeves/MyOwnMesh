@@ -377,7 +377,8 @@ mod tests {
     use myownmesh_core::transport::Transport;
     use myownmesh_core::{
         ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
-        ConnectorCallbackServiceWeights, ConnectorResourcePolicy,
+        ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
+        MeshConnectorResourcePolicy,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
@@ -444,11 +445,7 @@ mod tests {
         let callback_capacity =
             NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
-            ConnectorCallbackMailboxCapacities::new(
-                callback_capacity,
-                callback_capacity,
-                callback_capacity,
-            ),
+            ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
             ConnectorCallbackServiceWeights::new(
                 callback_capacity,
                 callback_capacity,
@@ -458,10 +455,14 @@ mod tests {
                 .expect("test real-time unit limit is nonzero"),
             Duration::from_secs(10),
         )
-        .expect("test real-time enqueue deadline is explicitly nonzero");
-        let policy =
+        .expect("test real-time useful lifetime is explicitly nonzero");
+        let process_policy =
             ConnectorResourcePolicy::new(connector_count, callbacks, Duration::from_secs(10))
                 .expect("test close deadline is explicitly nonzero");
+        let policy = ConnectorCapableResourcePolicy::new(
+            process_policy,
+            MeshConnectorResourcePolicy::new(connector_count),
+        );
         Transport::new()
             .expect("transport")
             .with_connector_resource_policy(policy)
