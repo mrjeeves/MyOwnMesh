@@ -9,4 +9,7 @@
 *~
 
 # Local config / state — never check in
+__pycache__/
+*.py[cod]
+
 /.myownmesh/

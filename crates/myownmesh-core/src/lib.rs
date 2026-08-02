@@ -59,7 +59,7 @@
 //! - [`engine`] — connection engine: hello state machine, heartbeat,
 //!   recovery from reliable transport signals (in-place ICE restart
 //!   confirmed by inbound traffic, clean rebuild on failure), topology
-//!   shelving. See `CONNECTION-ENGINE.md`.
+//!   shelving. See `CONNECTION-ENGINE-FIELD-NOTES.md`.
 //! - [`Channel<T>`] — typed publish/subscribe between peers.
 //! - [`Rpc`] — generic request/response with streaming.
 //!
@@ -85,17 +85,20 @@
 //!
 //! - `docs/QUICKSTART.md` — the narrative walkthrough.
 //! - `docs/PROTOCOL.md` — every wire frame.
-//! - `CONNECTION-ENGINE.md` — every tunable, every edge case.
+//! - `CONNECTION-ENGINE-FIELD-NOTES.md`: every retained tunable and edge case.
 //! - `examples/` — runnable demos
 //!   (`cargo run --example two_peer_chat -p myownmesh-core`,
 //!   `echo_rpc`, `roster_demo`).
 //! - `tests/two_peer_handshake.rs` — the end-to-end integration
 //!   test doubles as an executable spec.
 
+pub mod application_gateway;
 pub mod channels;
 pub mod config;
+pub mod connector;
 pub mod custody;
 pub mod dirs;
+pub mod endpoint_auth;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -104,8 +107,10 @@ pub mod identity;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
+pub mod resource;
 pub mod roster;
 pub mod rpc;
+pub mod runtime;
 pub mod services;
 pub mod signing;
 pub mod topology;

@@ -16,6 +16,9 @@ use crate::error::{Error, Result};
 use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
+use crate::resource::{
+    MeshRuntimeResourceScope, NetworkInstanceResourceScope, ProcessResourceRoot, ResourceReport,
+};
 use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
@@ -297,6 +300,109 @@ impl SignalingInbound {
     }
 }
 
+/// Narrow owner of the current peer set.
+///
+/// Callers can take owned read snapshots, but only this registry can install,
+/// replace, remove, or retire peers. Every ownership exit explicitly ends the
+/// temporary candidate queue even when another task retains an external
+/// `Arc<PeerConnection>`.
+#[derive(Default)]
+pub(super) struct PeerRegistry {
+    peers: DashMap<String, Arc<PeerConnection>>,
+    mutation: Mutex<()>,
+}
+
+pub(super) struct PeerRegistryEntry {
+    key: String,
+    value: Arc<PeerConnection>,
+}
+
+impl PeerRegistryEntry {
+    pub(super) fn key(&self) -> &String {
+        &self.key
+    }
+
+    pub(super) fn value(&self) -> &Arc<PeerConnection> {
+        &self.value
+    }
+}
+
+impl std::ops::Deref for PeerRegistryEntry {
+    type Target = PeerConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl PeerRegistry {
+    pub(super) fn get(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
+        self.peers
+            .get(device_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    pub(super) fn contains_key(&self, device_id: &str) -> bool {
+        self.peers.contains_key(device_id)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    pub(super) fn iter(&self) -> std::vec::IntoIter<PeerRegistryEntry> {
+        self.peers
+            .iter()
+            .map(|entry| PeerRegistryEntry {
+                key: entry.key().clone(),
+                value: Arc::clone(entry.value()),
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    pub(super) fn install(&self, device_id: String, peer: Arc<PeerConnection>) {
+        let _mutation = self.mutation.lock();
+        if let Some(replaced) = self.peers.insert(device_id, peer) {
+            replaced.discard_pending_remote_candidates();
+        }
+    }
+
+    pub(super) fn remove(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let (_, peer) = self.peers.remove(device_id)?;
+        peer.discard_pending_remote_candidates();
+        Some(peer)
+    }
+
+    /// Remove every current owner after retiring its compatibility queue.
+    /// Returned peers let shutdown close sessions after map ownership ends.
+    pub(super) fn retire_all(&self) -> Vec<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let retired: Vec<_> = self
+            .peers
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        for peer in &retired {
+            peer.discard_pending_remote_candidates();
+        }
+        self.peers.clear();
+        retired
+    }
+}
+
+impl Drop for PeerRegistry {
+    fn drop(&mut self) {
+        let retired = self.retire_all();
+        drop(retired);
+    }
+}
+
 /// Outbound signaling messages from the engine to the signaling task.
 /// `Clone` so the bridge's fan-out can hand one engine emission to
 /// several concurrently-attached drivers (Nostr + mDNS).
@@ -335,12 +441,13 @@ pub struct NetworkState {
     pub network_id: String,
     pub identity: Arc<Identity>,
     pub transport: Transport,
+    resource_scope: NetworkInstanceResourceScope,
 
     pub config: RwLock<NetworkConfig>,
     pub topology: RwLock<TopologyMode>,
     pub topology_impl: RwLock<Box<dyn Topology>>,
 
-    pub peers: DashMap<String, Arc<PeerConnection>>,
+    pub(super) peers: PeerRegistry,
     pub roster: RwLock<Roster>,
     /// Signed governance state — kind + role assignments + the
     /// append-only signed transition log + pending proposals.
@@ -510,6 +617,41 @@ impl NetworkState {
         mpsc::UnboundedReceiver<SignalingInbound>,
         mpsc::UnboundedReceiver<NetworkCmd>,
     )> {
+        let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+        Self::new_in_mesh_scope(config, identity, transport, &mesh_scope)
+    }
+
+    /// Construct state below an existing Mesh runtime observation scope.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn new_in_mesh_scope(
+        config: NetworkConfig,
+        identity: Arc<Identity>,
+        transport: Transport,
+        mesh_scope: &MeshRuntimeResourceScope,
+    ) -> Result<(
+        Arc<Self>,
+        mpsc::UnboundedReceiver<SignalingInbound>,
+        mpsc::UnboundedReceiver<NetworkCmd>,
+    )> {
+        Self::new_in_resource_scope(
+            config,
+            identity,
+            transport,
+            mesh_scope.network_instance_scope(),
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn new_in_resource_scope(
+        config: NetworkConfig,
+        identity: Arc<Identity>,
+        transport: Transport,
+        resource_scope: NetworkInstanceResourceScope,
+    ) -> Result<(
+        Arc<Self>,
+        mpsc::UnboundedReceiver<SignalingInbound>,
+        mpsc::UnboundedReceiver<NetworkCmd>,
+    )> {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
         // re-arms them without any runtime re-pinning.
@@ -560,10 +702,11 @@ impl NetworkState {
             network_id: config.network_id.clone(),
             identity,
             transport,
+            resource_scope,
             config: RwLock::new(config.clone()),
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
-            peers: DashMap::new(),
+            peers: PeerRegistry::default(),
             roster: RwLock::new(roster),
             governance_state: RwLock::new(governance_state),
             current_phase: RwLock::new(MeshPhase::Joining),
@@ -594,6 +737,17 @@ impl NetworkState {
             conn_trace_force_on,
         });
         Ok((state, signaling_inbound_rx, cmd_rx))
+    }
+
+    pub(crate) fn peer_connection_resource_scope(
+        &self,
+    ) -> crate::resource::PeerConnectionResourceScope {
+        self.resource_scope.peer_connection_scope()
+    }
+
+    /// Read observations for this live joined network instance.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.resource_scope.report()
     }
 
     /// Take the outbound signaling receiver so the signaling task
@@ -1101,7 +1255,7 @@ impl NetworkState {
             .iter()
             .map(|e| {
                 let device_id = e.key().clone();
-                let data = e.value().state.read();
+                let data = e.value().snapshot();
                 let pubkey = crate::signing::pubkey_part(&device_id);
                 let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
                 crate::handle::PeerInfo {
@@ -1110,19 +1264,19 @@ impl NetworkState {
                     tier: data.tier,
                     rtt_ms: data.rtt_ms,
                     clock_skew_ms: data.clock_skew_ms,
-                    label: data.label.clone(),
-                    capabilities: data.capabilities.clone(),
+                    label: data.label,
+                    capabilities: data.capabilities,
                     local_shelved: data.local_shelved,
                     remote_shelved: data.remote_shelved,
                     authenticated: data.authenticated,
                     device_suffix,
-                    verification_code_received: data.verification_code_received.clone(),
-                    verification_code_sent: data.verification_code_sent.clone(),
+                    verification_code_received: data.verification_code_received,
+                    verification_code_sent: data.verification_code_sent,
                     local_approve_sent: data.local_approve_sent,
                     remote_approve_seen: data.remote_approve_seen,
-                    needs_turn: data.no_turn_diag_emitted,
-                    local_candidates: data.diag.local_candidates.clone(),
-                    remote_candidates: data.diag.remote_candidates.clone(),
+                    needs_turn: data.needs_turn,
+                    local_candidates: data.diag.local_candidates,
+                    remote_candidates: data.diag.remote_candidates,
                     selected_pair: data.selected_pair,
                 }
             })
@@ -1133,7 +1287,7 @@ impl NetworkState {
     /// engine's map.
     pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
         let peer = self.peers.get(device_id)?;
-        let data = peer.state.read();
+        let data = peer.snapshot();
         let pubkey = crate::signing::pubkey_part(device_id);
         let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
         Some(crate::handle::PeerInfo {
@@ -1142,19 +1296,19 @@ impl NetworkState {
             tier: data.tier,
             rtt_ms: data.rtt_ms,
             clock_skew_ms: data.clock_skew_ms,
-            label: data.label.clone(),
-            capabilities: data.capabilities.clone(),
+            label: data.label,
+            capabilities: data.capabilities,
             local_shelved: data.local_shelved,
             remote_shelved: data.remote_shelved,
             authenticated: data.authenticated,
             device_suffix,
-            verification_code_received: data.verification_code_received.clone(),
-            verification_code_sent: data.verification_code_sent.clone(),
+            verification_code_received: data.verification_code_received,
+            verification_code_sent: data.verification_code_sent,
             local_approve_sent: data.local_approve_sent,
             remote_approve_seen: data.remote_approve_seen,
-            needs_turn: data.no_turn_diag_emitted,
-            local_candidates: data.diag.local_candidates.clone(),
-            remote_candidates: data.diag.remote_candidates.clone(),
+            needs_turn: data.needs_turn,
+            local_candidates: data.diag.local_candidates,
+            remote_candidates: data.diag.remote_candidates,
             selected_pair: data.selected_pair,
         })
     }
@@ -1162,15 +1316,15 @@ impl NetworkState {
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
     pub async fn shutdown(&self) {
-        let sessions: Vec<_> = self
-            .peers
+        let retired = self.peers.retire_all();
+        let sessions: Vec<_> = retired
             .iter()
-            .filter_map(|e| e.value().session.lock().clone())
+            .filter_map(|peer| peer.session.lock().clone())
             .collect();
         for s in sessions {
             let _ = s.close().await;
         }
-        self.peers.clear();
+        drop(retired);
         // Nothing outlives the engine: parked connect waits and queued
         // reliable sends resolve with the truth instead of hanging.
         let waiting: Vec<String> = self.connect_waiters.lock().keys().cloned().collect();
