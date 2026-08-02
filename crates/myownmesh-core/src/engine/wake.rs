@@ -102,24 +102,23 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
         debug!(network = %state.network_id, "wake — forcing relay reconnect");
     }
 
-    let active: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let active: Vec<_> = state.peers.collect_map(|peer| {
+        matches!(
+            peer.state.read().status,
+            PeerStatus::Active | PeerStatus::Shelved
+        )
+        .then(|| state.peers.owner(&peer.device_id))
+        .flatten()
+    });
     let now = monotonic_ms();
-    for peer_id in &active {
-        if let Some(peer) = state.peers.get(peer_id) {
+    for owner in &active {
+        let peer_id = owner.device_id();
+        if let Some(peer) = state.peers.get_if_current(owner) {
             peer.state.write().last_ping_t = Some(now);
         }
         if let Err(e) =
-            super::send_to_peer(state, peer_id, &MeshMessage::Ping(PingMessage { t: now })).await
+            super::send_to_peer_owner(state, owner, &MeshMessage::Ping(PingMessage { t: now }))
+                .await
         {
             tracing::trace!(peer = %peer_id, "wake-probe ping failed: {e}");
         }
@@ -133,9 +132,10 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
         tokio::time::sleep(Duration::from_millis(WAKE_PROBE_DELAY_MS)).await;
         let now = Instant::now();
         let mut any_rebuilt = false;
-        for peer_id in peers {
+        for owner in peers {
+            let peer_id = owner.device_id().to_string();
             let stale = {
-                let Some(peer) = state_clone.peers.get(&peer_id) else {
+                let Some(peer) = state_clone.peers.get_if_current(&owner) else {
                     continue;
                 };
                 let data = peer.state.read();
@@ -150,9 +150,9 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 // channel can't work; rebuild and let discovery
                 // re-establish it (same reasoning as the heartbeat path).
                 debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
-                super::drop_peer(
+                super::drop_peer_if_current(
                     &state_clone,
-                    &peer_id,
+                    &owner,
                     crate::events::DropReason::HeartbeatTimeout,
                 )
                 .await;

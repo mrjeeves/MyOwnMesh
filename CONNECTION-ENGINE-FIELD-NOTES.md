@@ -1,5 +1,11 @@
 # Connection engine
 
+> Status: retained pre-V4 field-mechanism evidence. This is not an
+> architecture contract. The V4 architecture and transition documents govern
+> ownership, authority, and migration. Where this file conflicts with them,
+> V4 supersedes it. Preserve its reproductions and proven recovery mechanisms
+> through the mappings in `CURRENT-TO-TARGET-MIGRATION-MATRIX.md`.
+
 The mesh's resilience comes from a layered connection engine whose
 recovery is driven by **reliable transport signals** — the data channel
 and inbound traffic — not by webrtc-rs's ICE connection state, which lies
@@ -10,9 +16,10 @@ MyOwnLLM's `src/mesh-client.svelte.ts`, but has since **diverged through
 field testing** on a Mac / Windows / Linux rig: the old re-handshake
 (Tier 4) and room-rejoin (Tier 5) loops are gone — re-handshaking over a
 dead channel can't work — replaced by an in-place ICE restart *confirmed
-by inbound traffic*, with a clean rebuild as the fallback. This file is
-the spec the engine — under `crates/myownmesh-core/src/engine/` — must
-hit. The constants are load-bearing edge-case handling; don't relax one
+by inbound traffic*, with a clean rebuild as the fallback. This file records
+the field evidence behind the current engine under
+`crates/myownmesh-core/src/engine/`. The constants are load-bearing edge-case
+handling; don't relax one
 without understanding why it's there.
 
 > **Debugging connection-state reliability?** See

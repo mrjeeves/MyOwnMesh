@@ -45,7 +45,7 @@ use crate::protocol::{
 };
 
 use super::connection::PeerStatus;
-use super::state::{NetworkCmd, NetworkState as EngineState};
+use super::state::{NetworkCmd, NetworkState as EngineState, PeerOwnerToken};
 
 // ---- helpers --------------------------------------------------------
 
@@ -74,20 +74,14 @@ fn pk(device_id: &str) -> String {
 /// Iterate active peers — those whose data channel is ACTIVE +
 /// authenticated. Used to broadcast governance frames.
 fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
-    state
-        .peers
-        .iter()
-        .filter_map(|entry| {
-            let peer = entry.value();
-            let data = peer.state.read();
-            if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated
-            {
-                Some(entry.key().clone())
-            } else {
-                None
-            }
-        })
-        .collect()
+    state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
@@ -99,6 +93,32 @@ async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
             tracing::debug!(peer = %peer_id, err = %e, "governance broadcast send failed");
         }
     }
+}
+
+/// Broadcast only while the exact peer installation that justified the
+/// broadcast remains current.
+///
+/// Replacement is checked before every send. A send already started before
+/// replacement may finish, but no later send is initiated by the retired
+/// owner. This keeps the activation trigger local without changing ordinary
+/// governance broadcasts that originate from durable governance mutations.
+async fn broadcast_for_owner(
+    state: &Arc<EngineState>,
+    owner: &PeerOwnerToken,
+    msg: MeshMessage,
+) -> bool {
+    if state.peers.get_if_current(owner).is_none() {
+        return false;
+    }
+    for peer_id in active_peer_ids(state) {
+        if state.peers.get_if_current(owner).is_none() {
+            return false;
+        }
+        if let Err(e) = super::send_to_peer(state, &peer_id, &msg).await {
+            tracing::debug!(peer = %peer_id, err = %e, "owner-bound governance broadcast send failed");
+        }
+    }
+    state.peers.get_if_current(owner).is_some()
 }
 
 fn diag(state: &Arc<EngineState>, level: crate::events::DiagLevel, msg: impl Into<String>) {
@@ -723,6 +743,20 @@ pub async fn broadcast_roster_summary(state: &Arc<EngineState>) {
     broadcast(state, MeshMessage::RosterSummary(summary)).await;
 }
 
+/// Activation-triggered roster summary. Unlike an ordinary durable
+/// governance broadcast, this effect is cancelled when its exact activating
+/// peer installation is replaced.
+pub(super) async fn broadcast_roster_summary_for_owner(
+    state: &Arc<EngineState>,
+    owner: &PeerOwnerToken,
+) -> bool {
+    if state.peers.get_if_current(owner).is_none() || !state.gossip_roster_enabled() {
+        return false;
+    }
+    let summary = crate::roster::summary(&state.roster.read());
+    broadcast_for_owner(state, owner, MeshMessage::RosterSummary(summary)).await
+}
+
 /// Inbound roster summary. If the sender's membership root differs from
 /// ours, ask for their full roster so we can merge what we're missing.
 pub async fn on_roster_summary(state: &Arc<EngineState>, peer_id: &str, msg: RosterSummaryMessage) {
@@ -944,7 +978,11 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
 /// auto-approve; those were exactly the resurrection engine). The proof
 /// costs nothing to trust: the denied device verifies it independently
 /// through strict-extension adoption, so a spoofed deny changes nothing.
-pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
+pub(super) async fn deny_if_evicted(
+    state: &Arc<EngineState>,
+    owner: &super::state::PeerOwnerToken,
+) -> bool {
+    let device_id = owner.device_id();
     if !log_evicted(state, device_id) {
         return false;
     }
@@ -966,7 +1004,7 @@ pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -
         transitions,
         member_log,
     });
-    if let Err(e) = super::send_to_peer(state, device_id, &deny).await {
+    if let Err(e) = super::send_to_peer_owner(state, owner, &deny).await {
         tracing::debug!(peer = %device_id, err = %e, "eviction deny send failed");
     }
     // Do NOT tear the session down in the same breath: the data channel's
@@ -977,11 +1015,11 @@ pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -
     // (`on_deny`); this delayed drop is only the janitor for a peer that
     // never processes it. Until then the peer sits unauthenticated-for-
     // app-traffic (never approved), so nothing rides the grace window.
-    let janitor = state.clone();
-    let dev = device_id.to_string();
+    let owner = owner.clone();
+    let state = Arc::clone(state);
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        super::drop_peer(&janitor, &dev, DropReason::Denied).await;
+        super::drop_peer_if_current(&state, &owner, DropReason::Denied).await;
     });
     true
 }
@@ -1587,4 +1625,36 @@ pub async fn broadcast_state(state: &Arc<EngineState>) {
         roster_root,
     });
     broadcast(state, msg).await;
+}
+
+/// Activation-triggered state snapshot. Each outbound send retains the exact
+/// activating-owner fence, while ordinary governance mutations continue to use
+/// [`broadcast_state`].
+pub(super) async fn broadcast_state_for_owner(
+    state: &Arc<EngineState>,
+    owner: &PeerOwnerToken,
+) -> bool {
+    if state.peers.get_if_current(owner).is_none() {
+        return false;
+    }
+    let (kind, transitions_count, member_log_count) = {
+        let gov = state.governance_state.read();
+        (
+            gov.kind,
+            gov.transitions.len() as u32,
+            gov.member_log.len() as u32,
+        )
+    };
+    let roster_root = crate::roster::membership_root(&state.roster.read());
+    broadcast_for_owner(
+        state,
+        owner,
+        MeshMessage::NetworkState(NetworkStateBroadcast {
+            kind,
+            transitions_count,
+            member_log_count,
+            roster_root,
+        }),
+    )
+    .await
 }

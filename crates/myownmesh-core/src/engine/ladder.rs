@@ -5,7 +5,7 @@
 //! reliable signals are: in-place ICE restart in [`super::ice_watchdog`]
 //! and [`super::network_watch`], traffic-confirmed promotion back to
 //! `Steady` in the engine's inbound path, and rebuild-on-silence in
-//! [`super::heartbeat`]. See `CONNECTION-ENGINE.md` for the model. This
+//! [`super::heartbeat`]. See `CONNECTION-ENGINE-FIELD-NOTES.md` for the model. This
 //! module also owns the topology selector pass ([`reevaluate_topology`]).
 
 use std::sync::Arc;
@@ -78,17 +78,13 @@ pub async fn reevaluate_topology(state: &Arc<NetworkState>) {
         return;
     }
     let me = state.identity.public_id().to_string();
-    let active_peers: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let active_peers: Vec<String> = state.peers.collect_map(|peer| {
+        matches!(
+            peer.state.read().status,
+            PeerStatus::Active | PeerStatus::Shelved
+        )
+        .then(|| peer.device_id.clone())
+    });
     if active_peers.is_empty() {
         return;
     }
@@ -153,19 +149,19 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
         return;
     }
     let me = state.identity.public_id().to_string();
-    let mut known: Vec<String> = state.peers.iter().map(|e| e.key().clone()).collect();
+    let mut known = state.peers.device_ids_snapshot();
     known.push(me.clone());
 
     let mut to_prune: Vec<String> = Vec::new();
     let mut to_dial: Vec<String> = Vec::new();
     {
         let topo = state.topology_impl.read();
-        for entry in state.peers.iter() {
-            let id = entry.key();
-            let has_session = entry.value().session.lock().is_some();
+        for peer in state.peers.values_snapshot() {
+            let id = &peer.device_id;
+            let has_session = peer.session.lock().is_some();
             let edge = topo.edge(&me, id, &known);
             if has_session {
-                let data = entry.value().state.read();
+                let data = peer.state.read();
                 let both_shelved = data.local_shelved && data.remote_shelved;
                 let settled = matches!(data.status, PeerStatus::Shelved);
                 if !edge && both_shelved && settled && !state.is_sticky(id) {

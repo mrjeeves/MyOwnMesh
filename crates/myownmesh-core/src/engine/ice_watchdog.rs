@@ -22,7 +22,7 @@ use super::ladder::ConnectionTier;
 use super::scheduler::{
     DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
 };
-use super::state::NetworkState;
+use super::state::{NetworkState, PeerOwnerToken};
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
 /// After this many consecutive ICE failures with zero relay
@@ -38,24 +38,18 @@ const NO_TURN_DIAG_AFTER_FAILURES: u32 = 3;
 /// over the peers map with no per-peer locks held across awaits.
 pub async fn poll_all(state: &Arc<NetworkState>) {
     let now = Instant::now();
-    let candidates: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let data = e.value().state.read();
-            if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
-                return None;
-            }
-            let since = data.ice_disconnected_since?;
-            if now.saturating_duration_since(since).as_millis() as u64
-                >= ICE_DISCONNECTED_RESTART_MS
-            {
-                Some(e.key().clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let candidates: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
+            return None;
+        }
+        let since = data.ice_disconnected_since?;
+        if now.saturating_duration_since(since).as_millis() as u64 >= ICE_DISCONNECTED_RESTART_MS {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    });
 
     for peer_id in candidates {
         // Renegotiate (restart_ice + a fresh offer), not a bare
@@ -82,20 +76,16 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // skips any peer whose pair is already known, only touches
     // the stats API for peers in `Active`/`Shelved` with no
     // pair recorded yet.
-    let need_pair: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let data = e.value().state.read();
-            if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
-                return None;
-            }
-            if data.selected_pair.is_some() {
-                return None;
-            }
-            Some(e.key().clone())
-        })
-        .collect();
+    let need_pair: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
+            return None;
+        }
+        if data.selected_pair.is_some() {
+            return None;
+        }
+        Some(peer.device_id.clone())
+    });
     for peer_id in need_pair {
         super::record_selected_pair(state, &peer_id).await;
     }
@@ -109,18 +99,14 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // data channel, not this — it's purely the "why isn't it connecting"
     // trail. Self-limiting: a peer only sits in Checking briefly before it
     // connects, fails, or hits the connect-timeout.
-    let checking: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let session = e.value().session.lock().clone()?;
-            if session.ice_connection_state() == RTCIceConnectionState::Checking {
-                Some(e.key().clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let checking: Vec<String> = state.peers.collect_map(|peer| {
+        let session = peer.session.lock().clone()?;
+        if session.ice_connection_state() == RTCIceConnectionState::Checking {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    });
     for peer_id in checking {
         super::log_ice_check_snapshot(state, &peer_id, "checking", false).await;
     }
@@ -133,20 +119,15 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // milestone — `data_channel_open` — not ICE state, which has been seen
     // to lie in both directions. A peer whose channel already opened is
     // never a candidate here; its liveness is the heartbeat.
-    let timed_out: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let data = e.value().state.read();
-            if data.data_channel_open {
-                return None;
-            }
-            let started = data.session_started_at?;
-            (now.saturating_duration_since(started).as_millis() as u64
-                >= DATA_CHANNEL_OPEN_TIMEOUT_MS)
-                .then(|| e.key().clone())
-        })
-        .collect();
+    let timed_out: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if data.data_channel_open {
+            return None;
+        }
+        let started = data.session_started_at?;
+        (now.saturating_duration_since(started).as_millis() as u64 >= DATA_CHANNEL_OPEN_TIMEOUT_MS)
+            .then(|| peer.device_id.clone())
+    });
     for peer_id in timed_out {
         on_connect_timeout(state, &peer_id).await;
     }
@@ -160,35 +141,30 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // while it's still re-gathering — the clock is re-stamped to the moment
     // ICE reconnects, so a restart legitimately crossing slow signaling
     // isn't killed early.
-    let restart_unconfirmed: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let started = match e.value().state.read().tier {
-                ConnectionTier::IceRestart { started } => started,
-                _ => return None,
-            };
-            let ice_up = e
-                .value()
-                .session
-                .lock()
-                .as_ref()
-                .map(|s| {
-                    matches!(
-                        s.ice_connection_state(),
-                        RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
-                    )
-                })
-                .unwrap_or(false);
-            let deadline = if ice_up {
-                RESTART_TRAFFIC_GRACE_MS
-            } else {
-                DATA_CHANNEL_OPEN_TIMEOUT_MS
-            };
-            (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
-                .then(|| e.key().clone())
-        })
-        .collect();
+    let restart_unconfirmed: Vec<String> = state.peers.collect_map(|peer| {
+        let started = match peer.state.read().tier {
+            ConnectionTier::IceRestart { started } => started,
+            _ => return None,
+        };
+        let ice_up = peer
+            .session
+            .lock()
+            .as_ref()
+            .map(|s| {
+                matches!(
+                    s.ice_connection_state(),
+                    RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+                )
+            })
+            .unwrap_or(false);
+        let deadline = if ice_up {
+            RESTART_TRAFFIC_GRACE_MS
+        } else {
+            DATA_CHANNEL_OPEN_TIMEOUT_MS
+        };
+        (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
+            .then(|| peer.device_id.clone())
+    });
     for peer_id in restart_unconfirmed {
         on_restart_unconfirmed(state, &peer_id).await;
     }
@@ -258,17 +234,13 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
         .get(device_id)
         .map(|p| p.state.read().diag.remote_candidates.total() == 0)
         .unwrap_or(false);
-    let other_live_peers = state
-        .peers
-        .iter()
-        .filter(|e| {
-            e.key() != device_id
-                && matches!(
-                    e.value().state.read().status,
-                    PeerStatus::Active | PeerStatus::Shelved
-                )
-        })
-        .count();
+    let other_live_peers = state.peers.count_where(|peer| {
+        peer.device_id != device_id
+            && matches!(
+                peer.state.read().status,
+                PeerStatus::Active | PeerStatus::Shelved
+            )
+    });
     if no_remote {
         if other_live_peers > 0 {
             // Suppressed on purpose — DEBUG so the decision is greppable
@@ -341,20 +313,24 @@ async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str) {
 /// Called directly from the ICE state-change handler when ICE
 /// reports `Failed`. Skips the watchdog window — we know the
 /// connection is gone.
-pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
+pub async fn on_failed(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let device_id = owner.device_id();
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
     state.log_diag_with(
         crate::events::DiagLevel::Warn,
         "ice",
         format!("ICE failed for {device_id} — renegotiating"),
         serde_json::json!({ "peer": device_id }),
     );
-    maybe_emit_no_turn_diag(state, device_id);
+    maybe_emit_no_turn_diag(state, owner);
     // The right response to a hard ICE failure is the same as a network
     // change: restart_ice + a fresh offer so both ends re-gather and
     // re-exchange. The old path escalated to a Tier-4 re-handshake, which
     // only re-sends `hello` over the already-dead data channel and can't
     // bring the transport back. Single-flighted in `renegotiate_ice`.
-    super::renegotiate_ice(state, device_id, false, "ice-failed").await;
+    super::renegotiate_ice_for_owner(state, owner, false, "ice-failed").await;
 }
 
 /// Inspect the peer's candidate stats after an ICE failure and, if
@@ -362,9 +338,10 @@ pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
 /// human-readable diagnostic pointing at the missing TURN config.
 /// Throttled: the `no_turn_diag_emitted` flag stops us re-emitting
 /// once per ladder cycle. Reset by the engine's Active transition.
-fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
+fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let device_id = owner.device_id();
     let snapshot = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let mut data = peer.state.write();
@@ -441,14 +418,11 @@ fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
 /// reconnected within seconds instead of half a minute, and the
 /// per-peer single-flight keeps the fan-out from flooding signaling.
 pub async fn force_ice_restart_all(state: &Arc<NetworkState>) {
-    let candidates: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let data = e.value().state.read();
-            matches!(data.status, PeerStatus::Active | PeerStatus::Shelved).then(|| e.key().clone())
-        })
-        .collect();
+    let candidates: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
+            .then(|| peer.device_id.clone())
+    });
 
     for peer_id in candidates {
         // Forced: on a network change ICE often still reads Connected

@@ -2,7 +2,8 @@
 
 A field runbook for the connection-reliability work. The engine is
 heavily layered — a graduated recovery ladder, an ICE watchdog, a wake
-detector, a network watcher (see [`CONNECTION-ENGINE.md`](../CONNECTION-ENGINE.md)).
+detector, a network watcher (see the retained
+[`CONNECTION-ENGINE-FIELD-NOTES.md`](../CONNECTION-ENGINE-FIELD-NOTES.md)).
 When node connection state is nonetheless unreliable, the cause is
 almost never a missing tier. It's one of two structural things:
 

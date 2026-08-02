@@ -42,8 +42,8 @@ use crate::PROTOCOL_VERSION;
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
 use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
-use super::state::NetworkState;
-use super::{phase, send_to_peer};
+use super::state::{NetworkState, PeerOwnerToken};
+use super::{phase, send_to_peer_owner};
 
 /// Generate a fresh nonce: 32 random bytes, base32-lowercase.
 fn fresh_nonce() -> String {
@@ -55,7 +55,19 @@ fn fresh_nonce() -> String {
 
 /// Kick off the handshake — called once the data channel opens.
 /// Sends the first hello and schedules the timeout watchdog.
-pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
+pub(super) async fn initiate(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    auth_task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+) {
+    if state
+        .peers
+        .with_current(owner, |peer| peer.endpoint_auth_is_current(&auth_task))
+        != Some(true)
+    {
+        return;
+    }
+    let device_id = owner.device_id();
     let nonce = fresh_nonce();
     let code = verification::generate_code();
     let caps = state
@@ -75,7 +87,7 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         features: ADVERTISED_FEATURES.iter().map(|s| s.to_string()).collect(),
         app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
-    if let Some(peer) = state.peers.get(device_id) {
+    if let Some(peer) = state.peers.get_if_current(owner) {
         let mut data = peer.state.write();
         data.status = PeerStatus::Handshaking;
         data.nonce_sent = Some(nonce);
@@ -94,7 +106,7 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         serde_json::json!({ "peer": device_id, "code": code }),
     );
     let hello_msg = MeshMessage::Hello(hello);
-    if let Err(e) = send_to_peer(state, device_id, &hello_msg).await {
+    if let Err(e) = send_to_peer_owner(state, owner, &hello_msg).await {
         state.log_diag_with(
             crate::events::DiagLevel::Error,
             "handshake",
@@ -103,8 +115,8 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
         );
         warn!(peer = %device_id, "send hello failed: {e}");
     }
-    schedule_hello_retries(state.clone(), device_id.to_string(), hello_msg);
-    schedule_watchdog(state.clone(), device_id.to_string());
+    schedule_hello_retries(state.clone(), owner.clone(), hello_msg);
+    schedule_watchdog(state.clone(), owner.clone());
 }
 
 /// Re-send the same hello at each tick of
@@ -113,12 +125,13 @@ pub async fn initiate(state: &Arc<NetworkState>, device_id: &str) {
 /// receiver overwrites its `nonce_received` slot unconditionally and
 /// the signature in `auth_response` is deterministic, so a duplicate
 /// just yields a duplicate (idempotent) reply.
-fn schedule_hello_retries(state: Arc<NetworkState>, device_id: String, hello: MeshMessage) {
+fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello: MeshMessage) {
     tokio::spawn(async move {
+        let device_id = owner.device_id().to_string();
         for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let still_handshaking = {
-                let Some(peer) = state.peers.get(&device_id) else {
+                let Some(peer) = state.peers.get_if_current(&owner) else {
                     return;
                 };
                 let data = peer.state.read();
@@ -127,10 +140,10 @@ fn schedule_hello_retries(state: Arc<NetworkState>, device_id: String, hello: Me
             if !still_handshaking {
                 return;
             }
-            if let Err(e) = send_to_peer(&state, &device_id, &hello).await {
+            if let Err(e) = send_to_peer_owner(&state, &owner, &hello).await {
                 debug!(peer = %device_id, "hello retry send failed: {e}");
             }
-            if let Some(peer) = state.peers.get(&device_id) {
+            if let Some(peer) = state.peers.get_if_current(&owner) {
                 let mut data = peer.state.write();
                 data.hello_attempt = data.hello_attempt.saturating_add(1);
                 data.diag.hellos_sent = data.diag.hellos_sent.saturating_add(1);
@@ -139,11 +152,12 @@ fn schedule_hello_retries(state: Arc<NetworkState>, device_id: String, hello: Me
     });
 }
 
-fn schedule_watchdog(state: Arc<NetworkState>, device_id: String) {
+fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
     tokio::spawn(async move {
+        let device_id = owner.device_id().to_string();
         tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)).await;
         let should_fail = {
-            let Some(peer) = state.peers.get(&device_id) else {
+            let Some(peer) = state.peers.get_if_current(&owner) else {
                 return;
             };
             let data = peer.state.read();
@@ -161,12 +175,13 @@ fn schedule_watchdog(state: Arc<NetworkState>, device_id: String) {
                 format!("handshake watchdog fired for {device_id} — tearing down"),
                 serde_json::json!({ "peer": device_id }),
             );
-            super::drop_peer(&state, &device_id, DropReason::HeartbeatTimeout).await;
+            super::drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
         }
     });
 }
 
-pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMessage) {
+pub async fn on_hello(state: &Arc<NetworkState>, owner: &PeerOwnerToken, hello: HelloMessage) {
+    let device_id = owner.device_id();
     // Sanity-check: the device id the peer claimed in the hello
     // must match the connection id we're using to route this
     // frame. If a peer claims to be someone else, refuse — the
@@ -191,12 +206,12 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
             claimed = %hello.device_id,
             "hello claimed a different device id than the connection — dropping"
         );
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     }
 
     // Record the peer's nonce / verification code and capabilities.
-    if let Some(peer) = state.peers.get(device_id) {
+    if let Some(peer) = state.peers.get_if_current(owner) {
         let mut data = peer.state.write();
         data.nonce_received = Some(hello.nonce.clone());
         data.verification_code_received = Some(hello.verification_code.clone());
@@ -235,18 +250,21 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
     // signature an interceptor could relay unmodified.
     let Some(session) = state
         .peers
-        .get(device_id)
+        .get_if_current(owner)
         .and_then(|p| p.session.lock().clone())
     else {
         warn!(peer = %device_id, "no transport session at hello — cannot channel-bind, dropping");
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     };
     let Some(channel_binding) = session.local_fingerprint().await else {
         warn!(peer = %device_id, "no local DTLS fingerprint — refusing to send an unbound auth response");
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     };
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
 
     // Build the signed payload and reply.
     let payload = signing::handshake_payload(
@@ -256,9 +274,9 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
         &channel_binding,
     );
     let signature = signing::sign_with(state.identity.signing_key(), &payload);
-    if let Err(e) = send_to_peer(
+    if let Err(e) = send_to_peer_owner(
         state,
-        device_id,
+        owner,
         &MeshMessage::AuthResponse(AuthResponseMessage { signature }),
     )
     .await
@@ -280,15 +298,16 @@ pub async fn on_hello(state: &Arc<NetworkState>, device_id: &str, hello: HelloMe
 
 pub async fn on_auth_response(
     state: &Arc<NetworkState>,
-    device_id: &str,
+    owner: &PeerOwnerToken,
     resp: AuthResponseMessage,
 ) {
+    let device_id = owner.device_id();
     // Verify the signature against the nonce we sent. The peer's
     // signature covers `SIGN_DOMAIN_TAG || nonce_we_sent ||
     // peer_id || my_id` — peer is the signer, so the order is
     // their-id-first from their perspective. Match that exactly.
     let (my_nonce, peer_label, verification_code) = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let data = peer.state.read();
@@ -310,18 +329,21 @@ pub async fn on_auth_response(
     // transport can't surface it.
     let Some(session) = state
         .peers
-        .get(device_id)
+        .get_if_current(owner)
         .and_then(|p| p.session.lock().clone())
     else {
         warn!(peer = %device_id, "no transport session at auth_response — cannot verify channel binding, dropping");
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     };
     let Some(channel_binding) = session.remote_fingerprint().await else {
         warn!(peer = %device_id, "no remote DTLS fingerprint — cannot verify channel binding, dropping");
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     };
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
     let payload = signing::handshake_payload(
         &my_nonce,
         signing::pubkey_part(device_id),
@@ -337,7 +359,7 @@ pub async fn on_auth_response(
     };
     if !ok {
         warn!(peer = %device_id, "auth_response signature did not verify");
-        super::drop_peer(state, device_id, DropReason::AuthFailed).await;
+        super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
     }
 
@@ -351,11 +373,11 @@ pub async fn on_auth_response(
     // approval nudges at best, and on an auto-approve network (every
     // fleet mesh) auto-approve → mutual ACTIVE → `approve_roster` put it
     // straight back into the roster and gossiped it fleet-wide.
-    if super::governance::deny_if_evicted(state, device_id).await {
+    if super::governance::deny_if_evicted(state, owner).await {
         return;
     }
     let (auto_approve, rostered, caps) = {
-        let Some(peer) = state.peers.get(device_id) else {
+        let Some(peer) = state.peers.get_if_current(owner) else {
             return;
         };
         let mut data = peer.state.write();
@@ -404,17 +426,53 @@ pub async fn on_auth_response(
     }));
 
     if auto_approve {
-        send_local_approve(state, device_id).await;
+        send_local_approve_owner(state, owner).await;
     }
 }
 
-pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
-    let (became_active, label) = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return;
-        };
+pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let recorded = state.peers.with_current(owner, |peer| {
+        peer.state.write().remote_approve_seen = true;
+    });
+    if recorded.is_none() {
+        return;
+    }
+    maybe_activate(state, owner).await;
+}
+
+/// Complete the Active edge from facts already established on the exact peer.
+/// Only [`on_approve`] may latch remote approval. Re-evaluating after a local
+/// send must never manufacture peer consent.
+async fn maybe_activate(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    maybe_activate_after_check(state, owner, || {}).await;
+}
+
+/// Recheck and commit activation under the exact installation fence.
+///
+/// `before_commit` is normally empty. The deterministic replacement test uses
+/// it to replace the peer after the initial eligibility read but before the
+/// roster persistence linearization point.
+async fn maybe_activate_after_check(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    before_commit: impl FnOnce(),
+) {
+    let device_id = owner.device_id();
+    let eligible = state.peers.get_if_current(owner).is_some_and(|peer| {
+        let data = peer.state.read();
+        !matches!(data.status, PeerStatus::Active)
+            && data.authenticated
+            && data.local_approve_sent
+            && data.remote_approve_seen
+    });
+    if !eligible {
+        return;
+    }
+
+    before_commit();
+
+    let Some(Some(roster_result)) = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
-        data.remote_approve_seen = true;
         // Guard the transition edge: a peer that re-sends Approve after
         // we're already ACTIVE shouldn't re-fire the on-active side
         // effects (roster persist, gossip, Approved event).
@@ -422,42 +480,35 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         // A peer reaches ACTIVE only once it has proven its ed25519 identity.
         // `remote_approve_seen` can be latched by an `Approve` that arrives
         // before authentication (protocol frames pass the admission gate), and
-        // the external `roster_approve` path sets `local_approve_sent` without
-        // an auth check — so without this `authenticated` conjunct an
+        // a locally accepted Approve send can be recorded before authentication.
+        // Without this `authenticated` conjunct an
         // unauthenticated peer could be promoted to ACTIVE and gain the run of
         // every application and control plane. The early latch is harmless: the
         // transition simply completes the moment authentication lands.
         let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;
-        if active && !was_active {
-            data.status = PeerStatus::Active;
-            data.tier = ConnectionTier::Steady;
-            // Successful Active reset: clear the no-TURN diagnostic
-            // guards so a future failure cycle gets a fresh chance
-            // to emit (and so the failure count doesn't carry over
-            // from a previous bad spell).
-            data.ice_failed_count = 0;
-            data.no_turn_diag_emitted = false;
+        if !active || was_active {
+            return None;
         }
-        (active && !was_active, data.label.clone())
-    };
-    if became_active {
-        // Both sides have now approved — the bilateral double handshake is
-        // complete and the link is ACTIVE. THIS is the moment a peer
-        // becomes a confirmed member, so persist them into the roster
-        // (idempotent: the manual-approve path already added them; the
-        // auto-approve path had not) and gossip the new membership so the
-        // rest of the network converges. Without this an auto-approved
-        // peer would reach ACTIVE but never be remembered, and no member
-        // beyond the two endpoints would ever learn the peer exists —
-        // exactly the "we keep losing our roster" symptom.
-        if let Err(e) = state.approve_roster(device_id, &label).await {
-            state.log_diag(
-                crate::events::DiagLevel::Warn,
-                "roster",
+        data.status = PeerStatus::Active;
+        data.tier = ConnectionTier::Steady;
+        data.ice_failed_count = 0;
+        data.no_turn_diag_emitted = false;
+        let label = data.label.clone();
+        drop(data);
+
+        // This file mutation has no await point and runs while registry
+        // replacement is excluded. Replacement therefore linearizes before
+        // this complete commit or after it.
+        let roster_result = state.approve_roster_now(device_id, &label);
+        if !peer.install_legacy_realtime_flow() {
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "connector",
                 format!(
-                    "persist {} after mutual approve failed: {e}",
+                    "{} ACTIVE without an admitted connector-native real-time flow",
                     super::short_peer(device_id)
                 ),
+                serde_json::json!({ "peer": device_id }),
             );
         }
         state.log_diag_with(
@@ -469,30 +520,43 @@ pub async fn on_approve(state: &Arc<NetworkState>, device_id: &str) {
         state.emit(MeshEvent::Peer(PeerEvent::Approved {
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
-            label,
+            label: label.clone(),
         }));
-        phase::recompute(state);
-        super::ladder::reevaluate_topology(state).await;
-        // The link is up for app traffic — settle everything that was
-        // waiting on exactly this moment: parked `connect_peer_wait`
-        // callers, the peer's queued reliable sends, and any standing
-        // reconnect intent (the link is back; stop retrying it).
         state.resolve_connect_waiters(device_id, None);
         state.clear_reconnect_intent(device_id);
-        super::reliable::flush_peer(state, device_id).await;
-        // Advertise both anti-entropy channels to the freshly-active link.
-        // The roster summary carries only the *membership* root, which is blind
-        // to role changes by design — so a peer that missed a promote/demote or
-        // any other governance transition while offline wouldn't detect it from
-        // the summary alone. Also emitting the governance snapshot (transition +
-        // member-log counts) lets `on_state_broadcast` notice the divergence and
-        // pull the log, so roles converge on reconnect, not just membership.
-        super::governance::broadcast_roster_summary(state).await;
-        super::governance::broadcast_state(state).await;
+        Some(roster_result)
+    }) else {
+        return;
+    };
+
+    if let Err(e) = roster_result {
+        state.log_diag(
+            crate::events::DiagLevel::Warn,
+            "roster",
+            format!(
+                "persist {} after mutual approve failed: {e}",
+                super::short_peer(device_id)
+            ),
+        );
+    }
+
+    phase::recompute(state);
+    super::reliable::flush_peer_owner(state, owner).await;
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+    super::ladder::reevaluate_topology(state).await;
+    if state.peers.get_if_current(owner).is_none() {
+        return;
+    }
+
+    if super::governance::broadcast_roster_summary_for_owner(state, owner).await {
+        let _ = super::governance::broadcast_state_for_owner(state, owner).await;
     }
 }
 
-pub async fn on_deny(state: &Arc<NetworkState>, device_id: &str, deny: DenyMessage) {
+pub async fn on_deny(state: &Arc<NetworkState>, owner: &PeerOwnerToken, deny: DenyMessage) {
+    let device_id = owner.device_id();
     state.log_diag_with(
         crate::events::DiagLevel::Warn,
         "auth",
@@ -510,45 +574,184 @@ pub async fn on_deny(state: &Arc<NetworkState>, device_id: &str, deny: DenyMessa
         super::governance::adopt_deny_proof(state, device_id, &deny.transitions, &deny.member_log)
             .await;
     }
-    super::drop_peer(state, device_id, DropReason::Denied).await;
+    super::drop_peer_if_current(state, owner, DropReason::Denied).await;
+}
+
+async fn send_local_approve_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let device_id = owner.device_id();
+    let Some(already) = state
+        .peers
+        .with_current(owner, |peer| peer.state.read().local_approve_sent)
+    else {
+        return;
+    };
+    if already {
+        // Authentication or remote approval may have completed since the
+        // successful local send. Fold the established facts again.
+        maybe_activate(state, owner).await;
+        return;
+    }
+    if let Err(e) = send_to_peer_owner(state, owner, &MeshMessage::Approve(ApproveMessage {})).await
+    {
+        warn!(peer = %device_id, "send approve failed: {e}");
+        return;
+    }
+    let recorded = state.peers.with_current(owner, |peer| {
+        peer.state.write().local_approve_sent = true;
+    });
+    if recorded.is_none() {
+        return;
+    }
+    // This flag means the exact current transport accepted the bytes for
+    // transmission. It does not prove remote receipt. Concurrent duplicate
+    // Approves are harmless, while a failed send must never erase another
+    // successful one.
+    // A remote Approve may have arrived before authentication completed.
+    // Re-evaluate after local send acceptance without manufacturing the
+    // remote-approval fact.
+    maybe_activate(state, owner).await;
 }
 
 /// Send the local approve frame for a peer. Called from the
 /// auto-approve path and from the user-facing
 /// [`crate::MeshHandle::approve_peer`] action.
 pub async fn send_local_approve(state: &Arc<NetworkState>, device_id: &str) {
-    let already = {
-        let Some(peer) = state.peers.get(device_id) else {
-            return;
-        };
-        let mut data = peer.state.write();
-        if data.local_approve_sent {
-            true
-        } else {
+    if let Some(owner) = state.peers.owner(device_id) {
+        send_local_approve_owner(state, &owner).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn v4_arc03_remote_approve_before_local_send_acceptance_converges() {
+        let state = crate::engine::build_test_state("arc03-approve-remote-first");
+        crate::engine::insert_session_less_peer(&state, "peer", None);
+        let owner = state.peers.owner("peer").expect("installed peer owner");
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("exact peer remains installed");
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::PendingApproval;
+        }
+
+        on_approve(&state, &owner).await;
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("exact peer remains installed");
+            let data = peer.state.read();
+            assert!(data.remote_approve_seen);
+            assert!(!data.local_approve_sent);
+            assert_eq!(data.status, PeerStatus::PendingApproval);
+        }
+
+        state
+            .peers
+            .get_if_current(&owner)
+            .expect("exact peer remains installed")
+            .state
+            .write()
+            .local_approve_sent = true;
+        send_local_approve_owner(&state, &owner).await;
+
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("exact peer remains installed");
+            let data = peer.state.read();
+            assert!(data.remote_approve_seen);
+            assert!(data.local_approve_sent);
+            assert_eq!(data.status, PeerStatus::Active);
+        }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_local_approve_without_remote_consent_stays_pending() {
+        let state = crate::engine::build_test_state("arc03-approve-local-only");
+        crate::engine::insert_session_less_peer(&state, "peer", None);
+        let owner = state.peers.owner("peer").expect("installed peer owner");
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("exact peer remains installed");
+            let mut data = peer.state.write();
+            data.authenticated = true;
             data.local_approve_sent = true;
-            false
+            data.status = PeerStatus::PendingApproval;
         }
-    };
-    if already {
-        return;
-    }
-    if let Err(e) = send_to_peer(state, device_id, &MeshMessage::Approve(ApproveMessage {})).await {
-        warn!(peer = %device_id, "send approve failed: {e}");
-        // Un-latch: the frame never left. Leaving `local_approve_sent` true
-        // here was a one-way trust wedge — every later call short-circuited
-        // on "already sent", the peer never received our approve and sat in
-        // PendingApproval refusing our app traffic, while *we* went Active
-        // the moment their approve landed (the flag said we'd answered).
-        // Roster-driven approves fire the instant a session exists, which
-        // can be before its data channel opens ("DataChannel is not
-        // opened") — with the flag reset, the handshake that starts when
-        // the channel *does* open re-runs auto-approve and delivers it.
-        if let Some(peer) = state.peers.get(device_id) {
-            peer.state.write().local_approve_sent = false;
+
+        send_local_approve_owner(&state, &owner).await;
+
+        {
+            let peer = state
+                .peers
+                .get_if_current(&owner)
+                .expect("exact peer remains installed");
+            let data = peer.state.read();
+            assert!(!data.remote_approve_seen);
+            assert_eq!(data.status, PeerStatus::PendingApproval);
         }
-        return;
+        state.shutdown().await;
     }
-    // If the peer already sent us their approve, transitioning
-    // happens via `on_approve`; otherwise we just wait.
-    on_approve(state, device_id).await;
+
+    #[tokio::test]
+    async fn v4_arc03_replacement_before_roster_persistence_cancels_activation_commit() {
+        let state = crate::engine::build_test_state("arc03-approve-stale-owner");
+        crate::engine::insert_session_less_peer(&state, "peer", None);
+        let stale_owner = state.peers.owner("peer").expect("first peer owner");
+        let mut events = state.events_tx.subscribe();
+        let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+        state.register_connect_waiter("peer", waiter_tx);
+        state.record_reconnect_intent("peer", false);
+        {
+            let peer = state
+                .peers
+                .get_if_current(&stale_owner)
+                .expect("first peer remains installed");
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.local_approve_sent = true;
+            data.remote_approve_seen = true;
+            data.status = PeerStatus::PendingApproval;
+        }
+
+        let replacement_state = Arc::clone(&state);
+        maybe_activate_after_check(&state, &stale_owner, move || {
+            crate::engine::insert_session_less_peer(&replacement_state, "peer", None);
+        })
+        .await;
+
+        {
+            let replacement = state.peers.get("peer").expect("replacement peer");
+            let data = replacement.state.read();
+            assert!(!data.authenticated);
+            assert!(!data.local_approve_sent);
+            assert!(!data.remote_approve_seen);
+            assert_ne!(data.status, PeerStatus::Active);
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(state.has_reconnect_intent("peer"));
+        assert!(
+            !state.is_rostered("peer"),
+            "a peer replaced before the persistence fence must not enter the roster"
+        );
+        state.shutdown().await;
+    }
 }

@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::conn_trace::ConnTrace;
 use myownmesh_core::engine::{attach_signaling, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use tokio::time::Instant;
 
@@ -84,14 +84,29 @@ async fn multicast_available() -> bool {
 }
 
 async fn wait_for_approval(
+    side: &str,
+    state: &Arc<myownmesh_core::engine::state::NetworkState>,
     rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
+    trace_rx: &mut tokio::sync::broadcast::Receiver<ConnTrace>,
     peer_id: &str,
     deadline: Duration,
 ) {
     let deadline = Instant::now() + deadline;
+    let mut observed_events = std::collections::VecDeque::with_capacity(64);
+    let mut observed_traces = std::collections::VecDeque::with_capacity(64);
     loop {
         if Instant::now() > deadline {
-            panic!("never saw PeerApproved for {peer_id}");
+            while let Ok(trace) = trace_rx.try_recv() {
+                if observed_traces.len() == 64 {
+                    observed_traces.pop_front();
+                }
+                observed_traces.push_back(format!("{trace:?}"));
+            }
+            panic!(
+                "{side} never saw PeerApproved for {peer_id}; phase={:?}; peer={:#?}; events={observed_events:#?}; traces={observed_traces:#?}",
+                *state.current_phase.read(),
+                state.peer_info(peer_id),
+            );
         }
         let next = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
         match next {
@@ -100,7 +115,25 @@ async fn wait_for_approval(
             {
                 return;
             }
-            _ => continue,
+            Ok(Ok(event)) => {
+                if observed_events.len() == 64 {
+                    observed_events.pop_front();
+                }
+                observed_events.push_back(format!("{event:?}"));
+            }
+            Ok(Err(error)) => {
+                if observed_events.len() == 64 {
+                    observed_events.pop_front();
+                }
+                observed_events.push_back(format!("event receiver error: {error:?}"));
+            }
+            Err(_) => {}
+        }
+        while let Ok(trace) = trace_rx.try_recv() {
+            if observed_traces.len() == 64 {
+                observed_traces.pop_front();
+            }
+            observed_traces.push_back(format!("{trace:?}"));
         }
     }
 }
@@ -126,7 +159,7 @@ async fn two_peers_handshake_over_mdns_only() {
     };
     let network_id = format!("mdns-only-handshake-{}", std::process::id());
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
 
@@ -147,6 +180,8 @@ async fn two_peers_handshake_over_mdns_only() {
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
+    let mut alice_traces = alice_state.subscribe_conn_trace();
+    let mut bob_traces = bob_state.subscribe_conn_trace();
 
     let alice_drivers = attach_signaling(&alice_state).expect("alice signaling");
     let bob_drivers = attach_signaling(&bob_state).expect("bob signaling");
@@ -156,13 +191,19 @@ async fn two_peers_handshake_over_mdns_only() {
     // Full engine handshake — discovery, SDP over the TCP exchange,
     // WebRTC, ed25519 mutual auth — with zero remote infrastructure.
     wait_for_approval(
+        "alice",
+        &alice_state,
         &mut alice_events,
+        &mut alice_traces,
         bob_id.public_id(),
         Duration::from_secs(60),
     )
     .await;
     wait_for_approval(
+        "bob",
+        &bob_state,
         &mut bob_events,
+        &mut bob_traces,
         alice_id.public_id(),
         Duration::from_secs(60),
     )
@@ -195,7 +236,7 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     };
     let network_id = format!("fanout-handshake-{}", std::process::id());
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
 
@@ -216,6 +257,8 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
+    let mut alice_traces = alice_state.subscribe_conn_trace();
+    let mut bob_traces = bob_state.subscribe_conn_trace();
 
     let alice_drivers = attach_signaling(&alice_state).expect("alice signaling");
     let bob_drivers = attach_signaling(&bob_state).expect("bob signaling");
@@ -231,15 +274,22 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     let _ = &bob_drivers;
 
     wait_for_approval(
+        "alice",
+        &alice_state,
         &mut alice_events,
+        &mut alice_traces,
         bob_id.public_id(),
         Duration::from_secs(60),
     )
     .await;
     wait_for_approval(
+        "bob",
+        &bob_state,
         &mut bob_events,
+        &mut bob_traces,
         alice_id.public_id(),
         Duration::from_secs(60),
     )
     .await;
 }
+mod support;

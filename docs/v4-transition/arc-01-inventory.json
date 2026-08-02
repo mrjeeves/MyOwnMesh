@@ -1,0 +1,2259 @@
+{
+  "schema": 1,
+  "baseline_commit": "2a04e29e0a4c09b95a4914972018850ddb2cbacb",
+  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client at the Arc 01 baseline, additively extended with the linked Arc 02 capability and resource-observation modules and the Arc 03 WebRTC connector-owner implementation. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
+  "node_targets": [
+    "Semantic Node",
+    "Signaling Node",
+    "Attempt Node",
+    "Connector Worker",
+    "Endpoint Auth Task",
+    "Session Broker",
+    "Peer Session Node",
+    "Reachability Node",
+    "Relay Node",
+    "Application Gateway",
+    "Runtime Supervisor"
+  ],
+  "non_node_domains": [
+    "Identity foundation",
+    "Connector infrastructure",
+    "Application/media profile",
+    "WebRTC Real-time Flow Provider",
+    "Operational infrastructure (U0)",
+    "Resource instrumentation",
+    "Application client"
+  ],
+  "dispositions": [
+    "Delete",
+    "Split"
+  ],
+  "owner_decisions": [
+    {
+      "id": "OD-DEVICE-KEY-CUSTODY",
+      "question": "Which single private boundary owns the durable Device signing key while exposing domain-specific signing to Endpoint Auth and Semantic state?"
+    },
+    {
+      "id": "OD-CODEC-FLOW-BOUNDARY",
+      "question": "Which application/media profile and WebRTC real-time-flow boundary owns H.264, Opus, video, audio, and lane meaning outside the basal kernel?"
+    },
+    {
+      "id": "OD-LEGACY-SILENT-MIGRATION",
+      "question": "Is legacy Silent state rejected, mechanically migrated, or accepted only by a compatibility reader that cannot authorize a V4 session?"
+    },
+    {
+      "id": "OD-LEGACY-TOPOLOGY-MIGRATION",
+      "question": "Is legacy governed topology rejected or ignored during migration, since connection preference cannot remain durable semantic authority?"
+    },
+    {
+      "id": "OD-SERVICE-ADVERT",
+      "question": "How is the current mixed service advertisement split into connector candidates, operational status, and application-owned capability metadata?"
+    },
+    {
+      "id": "OD-RESOURCE-LIMITS",
+      "question": "What measured item, byte, task, socket, rate, lifetime, and global limits are selected for each resource family?"
+    },
+    {
+      "id": "OD-GENERIC-NIP01-SERVICE",
+      "question": "Is generic NIP-01 event service behavior removed from the MyOwnMesh signaling service or hosted as a separately bounded service contract?"
+    },
+    {
+      "id": "OD-RAW-SIGNALING-API",
+      "question": "Which low-level signaling constructors remain crate-private, test-only, or intentionally public after typed lane extraction?"
+    },
+    {
+      "id": "OD-LOCAL-PRINCIPAL-BINDING",
+      "question": "Which operating-system credential and policy mechanism establishes the local principal for daemon control?"
+    },
+    {
+      "id": "OD-EARLY-SIGNALING-TRUST",
+      "question": "Which carriers require early authentication, and what bounded speculative-work vector is allowed before Endpoint Auth?"
+    },
+    {
+      "id": "OD-NETWORK-RECOVERY-OWNER",
+      "question": "Which target owns network-change recovery policy and restart cooldown state after observation is separated from connector and session recovery effects?"
+    }
+  ],
+  "source_snapshot": {
+    "count": 106,
+    "sha256": "b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba"
+  },
+  "declaration_snapshot": {
+    "count": 1792,
+    "sha256": "f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a"
+  },
+  "declaration_rules": [
+    {
+      "id": "decl-operational-cli",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh/src/cli/*"},
+      "exclude": [
+        {"path": "crates/myownmesh/src/cli/ctl.rs"},
+        {"path": "crates/myownmesh/src/cli/identity.rs"}
+      ]
+    },
+    {
+      "id": "decl-gateway-cli",
+      "target": "Application Gateway",
+      "match": {"path": ["crates/myownmesh/src/cli/ctl.rs", "crates/myownmesh/src/cli/identity.rs"]}
+    },
+    {
+      "id": "decl-main-process",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh/src/main.rs"}
+    },
+    {
+      "id": "decl-daemon-gateway",
+      "target": "Application Gateway",
+      "match": {"path": ["crates/myownmesh/src/control.rs", "crates/myownmesh/src/ipc/mod.rs", "crates/myownmesh/src/ipc/wire.rs"]}
+    },
+    {
+      "id": "decl-daemon-client-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/ipc/clients.rs"},
+      "exclude": [
+        {"name": "PendingInbound"},
+        {"name": "RegistryInner", "member": ["$type", "pending_inbound", "installed_handlers"]},
+        {"name": "ClientRegistry"}
+      ]
+    },
+    {
+      "id": "decl-daemon-client-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh/src/ipc/clients.rs", "name": ["PendingInbound", "RegistryInner"], "member": ["$type", "Single", "Stream", "pending_inbound", "installed_handlers"]},
+      "exclude": [{"name": "RegistryInner", "member": "$type"}]
+    },
+    {
+      "id": "decl-daemon-client-containers",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/ipc/clients.rs", "name": ["RegistryInner", "ClientRegistry"], "member": ["$type", "inner"]}
+    },
+    {
+      "id": "decl-embedded-gateway-references",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/embedded.rs", "member": ["mesh", "registry"]}
+    },
+    {
+      "id": "decl-embedded-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/embedded.rs", "member": ["service_manager", "shutdown_tx"]}
+    },
+    {
+      "id": "decl-embedded-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/embedded.rs", "name": "EmbeddedDaemon", "member": "$type"}
+    },
+    {
+      "id": "decl-embedded-start-error",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/embedded.rs", "name": "EmbeddedStartError"}
+    },
+    {
+      "id": "decl-registry-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/registry.rs"},
+      "exclude": [
+        {"name": "Entry", "member": ["$type", "drivers"]},
+        {"name": "NetworkRegistry"}
+      ]
+    },
+    {
+      "id": "decl-registry-signaling-handles",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh/src/registry.rs", "name": "Entry", "member": "drivers"}
+    },
+    {
+      "id": "decl-registry-mixed-containers",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/registry.rs", "name": ["Entry", "NetworkRegistry"], "member": ["$type", "inner"]}
+    },
+    {
+      "id": "decl-service-manager",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": ["ServiceManager", "ManagerState"]},
+      "exclude": [
+        {"name": "ServiceManager", "member": ["$type", "state"]},
+        {"name": "ManagerState", "member": ["$type", "config", "relays"]}
+      ]
+    },
+    {
+      "id": "decl-service-manager-mixed-containers",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": ["ServiceManager", "ManagerState"], "member": ["$type", "state", "config"]}
+    },
+    {
+      "id": "decl-service-manager-legacy-relays",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": "ManagerState", "member": "relays"}
+    },
+    {
+      "id": "decl-service-reports",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/services.rs"},
+      "exclude": [
+        {"name": ["ServiceManager", "ManagerState", "RelayReport"]},
+        {"name": "ServicesReport", "member": ["$type", "relay"]}
+      ]
+    },
+    {
+      "id": "decl-service-report-mixed-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": "ServicesReport", "member": "$type"}
+    },
+    {
+      "id": "decl-service-legacy-relay-reports",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": "RelayReport"}
+    },
+    {
+      "id": "decl-service-legacy-relay-report-field",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh/src/services.rs", "name": "ServicesReport", "member": "relay"}
+    },
+    {
+      "id": "decl-core-channel-facade",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/channels.rs"}
+    },
+    {
+      "id": "decl-config-topology",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "TopologyMode"}
+    },
+    {
+      "id": "decl-config-client-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": ["StunServer", "TurnServer"]}
+    },
+    {
+      "id": "decl-config-signaling",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": ["SignalingConfig", "SignalingServerConfig"]}
+    },
+    {
+      "id": "decl-config-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": ["AutoCleanupConfig", "AutoUpdateConfig"]}
+    },
+    {
+      "id": "decl-config-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": ["DaemonConfig", "NodeServiceConfig"]}
+    },
+    {
+      "id": "decl-config-stun-service",
+      "domain": "Connector infrastructure",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "StunServiceConfig"}
+    },
+    {
+      "id": "decl-config-turn-service",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": ["TurnCredential", "TurnServiceConfig"]}
+    },
+    {
+      "id": "decl-config-legacy-relay",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "RelayServiceConfig"}
+    },
+    {
+      "id": "decl-config-mesh-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "MeshConfig", "member": ["$type", "networks", "services"]}
+    },
+    {
+      "id": "decl-config-mesh-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "MeshConfig", "member": ["auto_cleanup", "auto_update"]}
+    },
+    {
+      "id": "decl-config-mesh-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "MeshConfig", "member": ["daemon", "version"]}
+    },
+    {
+      "id": "decl-config-mesh-identity",
+      "decision": "OD-DEVICE-KEY-CUSTODY",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "MeshConfig", "member": "identity_path"}
+    },
+    {
+      "id": "decl-config-network-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": "$type"}
+    },
+    {
+      "id": "decl-config-network-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": ["id", "label"]}
+    },
+    {
+      "id": "decl-config-network-semantic",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": ["network_id", "kind", "roster_path"]}
+    },
+    {
+      "id": "decl-config-network-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": ["topology", "stun_servers", "turn_servers"]}
+    },
+    {
+      "id": "decl-config-network-signaling",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": "signaling"}
+    },
+    {
+      "id": "decl-config-network-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": "pinned_peers"}
+    },
+    {
+      "id": "decl-config-network-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "NetworkConfig", "member": "auto_approve"}
+    },
+    {
+      "id": "decl-config-services-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "$type"}
+    },
+    {
+      "id": "decl-config-services-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "node"}
+    },
+    {
+      "id": "decl-config-services-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "relay"}
+    },
+    {
+      "id": "decl-config-services-signaling",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "signaling"}
+    },
+    {
+      "id": "decl-config-services-stun",
+      "domain": "Connector infrastructure",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "stun"}
+    },
+    {
+      "id": "decl-config-services-turn",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-core/src/config.rs", "name": "ServicesConfig", "member": "turn"}
+    },
+    {
+      "id": "decl-custody-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/custody.rs"}
+    },
+    {
+      "id": "decl-connection-trace",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/conn_trace.rs"}
+    },
+    {
+      "id": "decl-peer-status-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": ["Sighted", "Reconnecting"]}
+    },
+    {
+      "id": "decl-peer-status-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": "Handshaking"}
+    },
+    {
+      "id": "decl-peer-status-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": ["PendingApproval", "Active"]}
+    },
+    {
+      "id": "decl-peer-status-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": "Shelved"}
+    },
+    {
+      "id": "decl-peer-status-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": ["Offline", "Error"]}
+    },
+    {
+      "id": "decl-peer-status-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStatus", "member": "$type"}
+    },
+    {
+      "id": "decl-peer-state-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": "$type"}
+    },
+    {
+      "id": "decl-peer-state-split-marker",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": "status"}
+    },
+    {
+      "id": "decl-peer-state-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["authenticated", "nonce_sent", "nonce_received", "verification_code_sent", "verification_code_received", "handshake_started_at", "hello_attempt"]}
+    },
+    {
+      "id": "decl-peer-state-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["local_approve_sent", "remote_approve_seen"]}
+    },
+    {
+      "id": "decl-peer-state-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["last_offer_sent_at", "session_started_at", "remote_description_set", "pending_remote_candidates"]}
+    },
+    {
+      "id": "decl-peer-state-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["tier", "local_shelved", "remote_shelved", "features"]}
+    },
+    {
+      "id": "decl-peer-state-connector",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["media_reneg_pending", "media_reneg_inflight"]}
+    },
+    {
+      "id": "decl-peer-state-gateway-metadata",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData", "member": ["label", "capabilities"]}
+    },
+    {
+      "id": "decl-peer-state-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateData"},
+      "exclude": [
+        {"member": ["$type", "status", "authenticated", "nonce_sent", "nonce_received", "verification_code_sent", "verification_code_received", "handshake_started_at", "hello_attempt", "local_approve_sent", "remote_approve_seen", "last_offer_sent_at", "session_started_at", "remote_description_set", "pending_remote_candidates", "tier", "local_shelved", "remote_shelved", "features", "media_reneg_pending", "media_reneg_inflight", "label", "capabilities"]}
+      ]
+    },
+    {
+      "id": "decl-peer-connection-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": ["device_id", "epoch"]}
+    },
+    {
+      "id": "decl-peer-connection-connector",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "session"}
+    },
+    {
+      "id": "decl-peer-connection-endpoint-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "endpoint_auth"}
+    },
+    {
+      "id": "decl-peer-connection-realtime-flow",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "realtime_flow"}
+    },
+    {
+      "id": "decl-peer-connection-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": ["$type", "state", "registry_retired"]}
+    },
+    {
+      "id": "decl-heartbeat-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs"}
+    },
+    {
+      "id": "decl-recovery-ladder",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/ladder.rs"}
+    },
+    {
+      "id": "decl-monolithic-engine-dispatch",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs"}
+    },
+    {
+      "id": "decl-network-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs"},
+      "exclude": [
+        {"name": "NetworkWatch", "member": ["$type", "last_restart_at"]}
+      ]
+    },
+    {
+      "id": "decl-network-watch-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "name": "NetworkWatch", "member": "$type"}
+    },
+    {
+      "id": "decl-network-recovery-policy",
+      "decision": "OD-NETWORK-RECOVERY-OWNER",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "name": "NetworkWatch", "member": "last_restart_at"}
+    },
+    {
+      "id": "decl-reliable-session-state",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/reliable.rs"}
+    },
+    {
+      "id": "decl-ordinary-routing-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/engine/routing.rs"}
+    },
+    {
+      "id": "decl-signaling-bridge",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs"}
+    },
+    {
+      "id": "decl-network-command-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": "Shutdown"}
+    },
+    {
+      "id": "decl-network-command-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": "$type"}
+    },
+    {
+      "id": "decl-network-command-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": "SetTopology"}
+    },
+    {
+      "id": "decl-network-command-semantic",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["ApproveRoster", "RemoveRoster", "ProposeTransition", "SignProposal", "DenyProposal", "WithdrawProposal", "SpawnSplit", "GovernanceSnapshot"]}
+    },
+    {
+      "id": "decl-network-command-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["DropPeer", "Reconnect", "ConnectPeer"]}
+    },
+    {
+      "id": "decl-network-command-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["SendChannelReliable", "SendChannelFrame", "BroadcastChannelFrame", "SendRpcRequest", "BroadcastCapabilities"]}
+    },
+    {
+      "id": "decl-network-command-codec-compat",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["MediaLaneOpen", "MediaLaneClose"]}
+    },
+    {
+      "id": "decl-signaling-inbound-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingInbound", "member": ["Offer", "Answer", "Candidate"]}
+    },
+    {
+      "id": "decl-signaling-inbound-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingInbound", "member": ["PeerAnnounced", "PeerLeft"]}
+    },
+    {
+      "id": "decl-signaling-inbound-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingInbound", "member": "$type"}
+    },
+    {
+      "id": "decl-signaling-outbound-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingOutbound", "member": ["Offer", "Answer", "Candidate"]}
+    },
+    {
+      "id": "decl-signaling-outbound-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingOutbound", "member": ["Announce", "Leave"]}
+    },
+    {
+      "id": "decl-signaling-outbound-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "SignalingOutbound", "member": "$type"}
+    },
+    {
+      "id": "decl-media-sample-compat",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": ["InboundAudioSample", "InboundVideoSample"]}
+    },
+    {
+      "id": "decl-reconnect-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "ReconnectIntent"}
+    },
+    {
+      "id": "decl-network-state-semantic",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["network_id", "roster", "governance_state", "self_evicted"]}
+    },
+    {
+      "id": "decl-network-state-identity",
+      "decision": "OD-DEVICE-KEY-CUSTODY",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "identity"}
+    },
+    {
+      "id": "decl-network-state-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["topology", "topology_impl"]}
+    },
+    {
+      "id": "decl-network-state-transport-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "transport"}
+    },
+    {
+      "id": "decl-network-state-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "conn_trace_force_on"}
+    },
+    {
+      "id": "decl-network-state-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["$type", "config", "peers"]}
+    },
+    {
+      "id": "decl-network-state-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["events_tx", "channel_subscribers", "video_subscribers", "audio_subscribers", "rpc"]}
+    },
+    {
+      "id": "decl-network-state-signaling",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["signaling_tx", "signaling_inbound_tx", "signaling_outbound_rx", "last_reactive_announce_at", "relay_reconnect", "relay_connected", "last_relay_rescue_at"]}
+    },
+    {
+      "id": "decl-network-state-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["reconnect_intents", "sticky_peers", "connect_waiters"]}
+    },
+    {
+      "id": "decl-network-state-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["reliable_out", "reliable_in"]}
+    },
+    {
+      "id": "decl-network-state-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["current_phase", "clock_skew_watch", "traffic", "offline", "conn_trace_tx"]}
+    },
+    {
+      "id": "decl-network-state-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": ["cmd_tx", "routing_seen"]}
+    },
+    {
+      "id": "decl-ticker-registry-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": "TickRegistry"}
+    },
+    {
+      "id": "decl-ticker-network-watch",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": "NetworkWatchTicker"}
+    },
+    {
+      "id": "decl-ticker-connector",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": ["IceWatchdogTicker", "TopologyShapeTicker"]}
+    },
+    {
+      "id": "decl-ticker-media-renegotiation",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": "MediaRenegotiationTicker"}
+    },
+    {
+      "id": "decl-ticker-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": "ReliableSendTicker"}
+    },
+    {
+      "id": "decl-ticker-reconnect-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs", "name": "ReconnectSupervisor"}
+    },
+    {
+      "id": "decl-traffic-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/traffic.rs"}
+    },
+    {
+      "id": "decl-wake-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/wake.rs"}
+    },
+    {
+      "id": "decl-public-errors-events",
+      "target": "Application Gateway",
+      "match": {"path": ["crates/myownmesh-core/src/error.rs", "crates/myownmesh-core/src/events.rs"]}
+    },
+    {
+      "id": "decl-handle-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs"},
+      "exclude": [{"name": ["MeshInner", "NetworkEntry"]}]
+    },
+    {
+      "id": "decl-mesh-inner-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "events_tx"}
+    },
+    {
+      "id": "decl-mesh-inner-identity",
+      "decision": "OD-DEVICE-KEY-CUSTODY",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "identity"}
+    },
+    {
+      "id": "decl-mesh-inner-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "networks"}
+    },
+    {
+      "id": "decl-mesh-inner-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "transport"}
+    },
+    {
+      "id": "decl-mesh-inner-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "$type"}
+    },
+    {
+      "id": "decl-network-entry-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "NetworkEntry", "member": ["config_id", "network_id", "state"]}
+    },
+    {
+      "id": "decl-network-entry-signaling",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "NetworkEntry", "member": ["driver", "fanout"]}
+    },
+    {
+      "id": "decl-network-entry-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "NetworkEntry", "member": "$type"}
+    },
+    {
+      "id": "decl-device-identity",
+      "decision": "OD-DEVICE-KEY-CUSTODY",
+      "match": {"path": "crates/myownmesh-core/src/identity.rs"}
+    },
+    {
+      "id": "decl-semantic-compatibility",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/network_state.rs"},
+      "exclude": [
+        {"name": "NetworkKind", "member": "Silent"},
+        {"name": "TransitionVariant", "member": "TopologyChange"},
+        {"name": "NetworkState", "member": "topology"}
+      ]
+    },
+    {
+      "id": "decl-silent-migration",
+      "decision": "OD-LEGACY-SILENT-MIGRATION",
+      "match": {"path": "crates/myownmesh-core/src/network_state.rs", "name": "NetworkKind", "member": "Silent"}
+    },
+    {
+      "id": "decl-topology-migration",
+      "decision": "OD-LEGACY-TOPOLOGY-MIGRATION",
+      "match": {"path": "crates/myownmesh-core/src/network_state.rs", "name": ["TransitionVariant", "NetworkState"], "member": ["TopologyChange", "topology"]}
+    },
+    {
+      "id": "decl-semantic-roster",
+      "target": "Semantic Node",
+      "match": {"path": ["crates/myownmesh-core/src/roster.rs", "crates/myownmesh-core/src/protocol/governance.rs"]}
+    },
+    {
+      "id": "decl-auth-wire",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/protocol/handshake.rs", "name": ["HelloMessage", "AuthResponseMessage"]}
+    },
+    {
+      "id": "decl-approve-wire",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/protocol/handshake.rs", "name": "ApproveMessage"}
+    },
+    {
+      "id": "decl-deny-wire",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/protocol/handshake.rs", "name": "DenyMessage"}
+    },
+    {
+      "id": "decl-keepalive-wire",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/keepalive.rs"}
+    },
+    {
+      "id": "decl-global-wire-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["Hello", "AuthResponse"]}
+    },
+    {
+      "id": "decl-global-wire-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["Approve", "Deny"]}
+    },
+    {
+      "id": "decl-global-wire-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["Ping", "Pong"]}
+    },
+    {
+      "id": "decl-global-wire-gateway-metadata",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": "CapabilitiesUpdate"}
+    },
+    {
+      "id": "decl-global-wire-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["Shelve", "Unshelve", "RpcRequest", "RpcResponse", "RpcStreamChunk", "RpcStreamEnd", "Channel", "ChannelSeq", "ChannelAck"]}
+    },
+    {
+      "id": "decl-global-wire-semantic",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["NetworkState", "NetworkStatePropose", "NetworkStateAck", "NetworkStateSplit", "RosterSummary", "RosterRequest", "RosterEntries"]}
+    },
+    {
+      "id": "decl-global-wire-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/protocol/mod.rs", "name": "MeshMessage", "member": ["$type", "Unknown"]}
+    },
+    {
+      "id": "decl-feature-wire-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/features.rs"}
+    },
+    {
+      "id": "decl-rpc-wire-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/protocol/rpc.rs", "name": ["CapabilitiesUpdateMessage", "CapabilityAdvert"]}
+    },
+    {
+      "id": "decl-rpc-wire-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/rpc.rs"},
+      "exclude": [{"name": ["CapabilitiesUpdateMessage", "CapabilityAdvert"]}]
+    },
+    {
+      "id": "decl-topology-wire-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/topology.rs"}
+    },
+    {
+      "id": "decl-rpc-facade",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs"},
+      "exclude": [
+        {"name": "PendingEntry"},
+        {"name": "RpcInner", "member": ["$type", "pending"]}
+      ]
+    },
+    {
+      "id": "decl-rpc-session-queues",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "name": ["PendingEntry", "RpcInner"], "member": ["Single", "Stream", "pending"]}
+    },
+    {
+      "id": "decl-rpc-mixed-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "name": "RpcInner", "member": "$type"}
+    },
+    {
+      "id": "decl-rpc-pending-container",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "name": "PendingEntry", "member": "$type"}
+    },
+    {
+      "id": "decl-service-advert-decision",
+      "decision": "OD-SERVICE-ADVERT",
+      "match": {"path": "crates/myownmesh-core/src/services/mod.rs"}
+    },
+    {
+      "id": "decl-legacy-relay-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/services/relay.rs"}
+    },
+    {
+      "id": "decl-topology-local-policy",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/topology/*"}
+    },
+    {
+      "id": "decl-transport-observations",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/transport/diag.rs"}
+    },
+    {
+      "id": "decl-webrtc-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs"},
+      "exclude": [
+        {"name": ["LaneKind", "LaneSlot", "VideoSample", "AudioSample", "H264AuAssembler"]},
+        {"name": "TransportEvent", "member": ["$type", "Message", "RenegotiationNeeded", "VideoSample", "AudioSample"]},
+        {"name": "Transport", "member": ["$type", "media_lanes"]},
+        {"name": "PeerSession", "member": ["$type", "events_tx", "video_tracks", "audio_tracks", "max_lanes", "resource_scope"]},
+        {"name": "CandidateObservationLease"},
+        {"name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"], "member": ["$type", "candidate", "entries", "observation", "container_observation", "_container_observation"]},
+        {"name": "WebRtcConnectorWorker", "member": ["resource_scope", "_transport_observation"]}
+      ]
+    },
+    {
+      "id": "decl-webrtc-event-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": ["TransportEvent", "Transport", "PeerSession"], "member": ["$type", "events_tx"]}
+    },
+    {
+      "id": "decl-webrtc-media-profile",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": ["LaneKind", "LaneSlot", "VideoSample", "AudioSample", "H264AuAssembler", "Transport", "PeerSession"]},
+      "exclude": [
+        {"name": "Transport", "member": ["$type", "api", "runtime", "ice_transport_policy", "connector_resource_owner"]},
+        {"name": "PeerSession", "member": ["$type", "events_tx", "data_channel", "pc", "role", "resource_scope", "callback_gate"]}
+      ]
+    },
+    {
+      "id": "decl-webrtc-media-events",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "TransportEvent", "member": ["RenegotiationNeeded", "VideoSample", "AudioSample"]}
+    },
+    {
+      "id": "decl-webrtc-application-message-event",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "TransportEvent", "member": "Message"}
+    },
+    {
+      "id": "decl-connector-infrastructure-common",
+      "domain": "Connector infrastructure",
+      "match": {"path": ["crates/myownmesh-services/src/lib.rs", "crates/myownmesh-services/src/stun.rs"]}
+    },
+    {
+      "id": "decl-turn-relay",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-services/src/turn.rs"}
+    },
+    {
+      "id": "decl-signaling-errors",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/lib.rs", "name": "Error"}
+    },
+    {
+      "id": "decl-signaling-health",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-signaling/src/lib.rs", "name": "RelayHealth"}
+    },
+    {
+      "id": "decl-signaling-message-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-signaling/src/lib.rs", "name": "SignalingMessage", "member": ["Offer", "Answer", "Candidate"]}
+    },
+    {
+      "id": "decl-signaling-message-reachability",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/lib.rs", "name": "SignalingMessage", "member": ["Announce", "Leave"]}
+    },
+    {
+      "id": "decl-signaling-message-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/lib.rs", "name": "SignalingMessage", "member": "$type"}
+    },
+    {
+      "id": "decl-local-signaling-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/local.rs"},
+      "exclude": [{"name": "LocalInbound"}]
+    },
+    {
+      "id": "decl-local-inbound-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/local.rs", "name": "LocalInbound", "member": "$type"}
+    },
+    {
+      "id": "decl-local-inbound-attempt",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/local.rs", "name": "LocalInbound", "member": "Message"}
+    },
+    {
+      "id": "decl-local-inbound-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-signaling/src/local.rs", "name": "LocalInbound", "member": ["PeerAnnounced", "PeerLeft"]}
+    },
+    {
+      "id": "decl-mdns-discovery",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/discovery/*"}
+    },
+    {
+      "id": "decl-mdns-driver-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/driver.rs"},
+      "exclude": [{"name": ["MdnsDriverConfig", "MdnsDriverHandle", "MdnsInbound"]}]
+    },
+    {
+      "id": "decl-mdns-inbound-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "name": "MdnsInbound", "member": "$type"}
+    },
+    {
+      "id": "decl-mdns-inbound-attempt",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "name": "MdnsInbound", "member": "Message"}
+    },
+    {
+      "id": "decl-mdns-inbound-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "name": "MdnsInbound", "member": ["PeerAnnounced", "PeerLeft"]}
+    },
+    {
+      "id": "decl-mdns-driver-lifecycle",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "name": ["MdnsDriverConfig", "MdnsDriverHandle"]}
+    },
+    {
+      "id": "decl-mdns-wire",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/mdns/wire.rs"}
+    },
+    {
+      "id": "decl-nostr-driver-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/driver.rs"},
+      "exclude": [{"name": ["NostrDriverConfig", "NostrDriverHandle", "NostrInbound"]}]
+    },
+    {
+      "id": "decl-nostr-inbound-container",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "name": "NostrInbound", "member": "$type"}
+    },
+    {
+      "id": "decl-nostr-inbound-attempt",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "name": "NostrInbound", "member": "Message"}
+    },
+    {
+      "id": "decl-nostr-inbound-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "name": "NostrInbound", "member": ["PeerAnnounced", "PeerLeft"]}
+    },
+    {
+      "id": "decl-nostr-driver-lifecycle",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "name": ["NostrDriverConfig", "NostrDriverHandle"]}
+    },
+    {
+      "id": "decl-nostr-event-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/nostr/event.rs"}
+    },
+    {
+      "id": "decl-signaling-server-carrier",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/server.rs"},
+      "exclude": [{"name": ["Limits", "SignalingServerHandle", "RelayStatsSnapshot"]}]
+    },
+    {
+      "id": "decl-signaling-server-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-signaling/src/server.rs", "name": ["Limits", "SignalingServerHandle"]}
+    },
+    {
+      "id": "decl-signaling-server-health",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-signaling/src/server.rs", "name": "RelayStatsSnapshot"}
+    },
+    {
+      "id": "decl-arc02-application-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/application_gateway/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/connector/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-endpoint-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/endpoint_auth/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
+    },
+    {
+      "id": "decl-arc03-candidate-connector-values",
+      "target": "Connector Worker",
+      "match": {
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
+        "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
+        "member": ["$type", "candidate", "entries"]
+      }
+    },
+    {
+      "id": "decl-arc03-candidate-observation-lease",
+      "domain": "Resource instrumentation",
+      "match": {
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
+        "name": "CandidateObservationLease"
+      }
+    },
+    {
+      "id": "decl-arc03-candidate-observation-fields",
+      "domain": "Resource instrumentation",
+      "match": {
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
+        "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
+        "member": ["observation", "container_observation", "_container_observation"]
+      }
+    },
+    {
+      "id": "decl-arc03-peer-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "PeerSession", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc03-worker-resource-observation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "WebRtcConnectorWorker", "member": ["resource_scope", "_transport_observation"]}
+    },
+    {
+      "id": "decl-arc02-diagnostic-snapshot-compat",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerStateSnapshot"}
+    },
+    {
+      "id": "decl-arc02-context-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkState", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc02-peer-registry-compat",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": ["PeerRegistry", "PeerRegistryEntry", "PeerOwnerToken"]}
+    },
+    {
+      "id": "decl-arc02-mesh-resource-scope",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs", "name": "MeshInner", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc02-runtime-incarnation",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/runtime/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/attempt/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-relay",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/relay/mod.rs"}
+    },
+    {
+      "id": "decl-arc02-session-broker",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/runtime/session_broker/mod.rs"}
+    },
+    {
+      "id": "decl-updater-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-updater/src/*"}
+    },
+    {
+      "id": "decl-gui-client",
+      "domain": "Application client",
+      "match": {"path": "gui/src-tauri/src/*"}
+    }
+  ],
+  "surface_snapshot": {
+    "count": 1952,
+    "sha256": "4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb"
+  },
+  "surface_rules": [
+    {
+      "id": "surface-operational-cli",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh/src/cli/*"},
+      "exclude": [{"path": "crates/myownmesh/src/cli/ctl.rs"}]
+    },
+    {
+      "id": "surface-gateway-cli",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/cli/ctl.rs"},
+      "exclude": [{"symbol": "set_service@1"}]
+    },
+    {
+      "id": "surface-cli-service-switch",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/cli/ctl.rs", "symbol": "set_service@1"}
+    },
+    {
+      "id": "surface-control-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/control.rs"},
+      "exclude": [
+        {"symbol": ["schedule_daemon_exit@1", "factory_reset@1"]},
+        {"category": "queue_unbounded"}
+      ]
+    },
+    {
+      "id": "surface-control-unbounded-queues",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/control.rs", "category": "queue_unbounded"},
+      "flags": ["unbounded_queue"]
+    },
+    {
+      "id": "surface-control-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/control.rs", "symbol": ["schedule_daemon_exit@1", "factory_reset@1"]}
+    },
+    {
+      "id": "surface-embedded-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh/src/embedded.rs"}
+    },
+    {
+      "id": "surface-ipc-mixed",
+      "disposition": "Split",
+      "match": {"path": ["crates/myownmesh/src/ipc/bridge.rs", "crates/myownmesh/src/ipc/clients.rs"]}
+    },
+    {
+      "id": "surface-registry-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh/src/registry.rs", "symbol": ["new@1", "get@1", "contains@1", "summaries@1"]}
+    },
+    {
+      "id": "surface-registry-mixed",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/registry.rs", "symbol": ["insert@1", "remove@1", "take_all@1", "announce_all_departures@1"]}
+    },
+    {
+      "id": "surface-channel-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/channels.rs"}
+    },
+    {
+      "id": "surface-config-runtime",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/config.rs"}
+    },
+    {
+      "id": "surface-custody-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/custody.rs"}
+    },
+    {
+      "id": "surface-governance-semantic",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/governance.rs"},
+      "exclude": [{"symbol": "deny_if_evicted@1"}]
+    },
+    {
+      "id": "surface-governance-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/engine/governance.rs", "symbol": "deny_if_evicted@1"}
+    },
+    {
+      "id": "surface-auth-tasks",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["schedule_hello_retries@1", "schedule_watchdog@1"]}
+    },
+    {
+      "id": "surface-auth-promotion",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["send_local_approve@1", "send_local_approve_owner@1"]}
+    },
+    {
+      "id": "surface-auth-callables",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["fresh_nonce@1", "initiate@1", "on_auth_response@1", "on_hello@1"]}
+    },
+    {
+      "id": "surface-promotion-callables",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["maybe_activate@1", "maybe_activate_after_check@1", "on_approve@1", "on_deny@1"]}
+    },
+    {
+      "id": "surface-heartbeat-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs", "symbol": ["median@1", "monotonic_ms@1", "observe@1", "on_pong@1", "send_ping_to_owner@1", "watch_clock_skew@1"]}
+    },
+    {
+      "id": "surface-heartbeat-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs", "symbol": "send_ping@1"}
+    },
+    {
+      "id": "surface-heartbeat-mixed",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs", "symbol": ["tick@1", "on_ping@1"]}
+    },
+    {
+      "id": "surface-engine-parser-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "handle_inbound_frame_from@1"},
+      "flags": ["authority_mutation"]
+    },
+    {
+      "id": "surface-engine-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["send_to_peer@1", "send_to_peer_owner@1", "drop_peer@1", "on_rpc_request@1"]}
+    },
+    {
+      "id": "surface-engine-announce-confirm-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "confirm_active_session_on_announce@1"},
+      "flags": ["authority_mutation"]
+    },
+    {
+      "id": "surface-engine-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "ensure_peer_session@1"}
+    },
+    {
+      "id": "surface-engine-connector",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "service_media_renegotiations@1"}
+    },
+    {
+      "id": "surface-engine-connector-close-tasks",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["finish_drop_peer@1", "install_peer@1"], "category": "task"}
+    },
+    {
+      "id": "surface-engine-runtime",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["spawn_network@1", "spawn_network_in_mesh_scope@1"]}
+    },
+    {
+      "id": "surface-engine-callables-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "category": "callable"},
+      "exclude": [{"symbol": ["confirm_active_session_on_announce@1", "drop_peer@1", "ensure_peer_session@1", "handle_inbound_frame_from@1", "on_rpc_request@1", "send_to_peer@1", "send_to_peer_owner@1", "service_media_renegotiations@1", "spawn_network@1", "spawn_network_in_mesh_scope@1"]}]
+    },
+    {
+      "id": "surface-network-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "symbol": ["sample@1", "offline@1", "primary_v4@1", "primary_v6@1", "probe_source@1", "resolve_probe@1", "local_fingerprint@1", "is_benign_secondary_churn@1"]}
+    },
+    {
+      "id": "surface-network-watch-constructor",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "symbol": "new@1"}
+    },
+    {
+      "id": "surface-network-recovery-policy",
+      "decision": "OD-NETWORK-RECOVERY-OWNER",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "symbol": "cooldown_coalesces@1"}
+    },
+    {
+      "id": "surface-network-recovery-mixed",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/network_watch.rs", "symbol": ["poll@1", "on_network_change@1", "fan_out_restart@1", "redial_then_fan_out@1", "reconnect_all_in_place@1", "reconnect_peer_in_place@1"]}
+    },
+    {
+      "id": "surface-routing-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/engine/routing.rs"},
+      "flags": ["ordinary_forwarding", "payload_bypass"]
+    },
+    {
+      "id": "surface-signaling-bridge",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs"},
+      "exclude": [{"category": "queue_unbounded"}]
+    },
+    {
+      "id": "surface-signaling-bridge-queues",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "category": "queue_unbounded"},
+      "flags": ["unbounded_queue"]
+    },
+    {
+      "id": "surface-state-signaling-action",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "announce_departure@1"}
+    },
+    {
+      "id": "surface-state-semantic-action",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": ["approve_roster@1", "remove_roster@1"]}
+    },
+    {
+      "id": "surface-state-attempt-action",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": ["connect_peer@1", "connect_peer_wait@1", "reconnect@1", "resolve_connect_waiters@1"]}
+    },
+    {
+      "id": "surface-state-session-action",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": ["broadcast_capabilities@1", "broadcast_channel_frame@1", "dispatch_channel_frame@1", "send_channel_frame@1", "send_channel_reliable@1", "send_rpc_request@1", "subscribe_channel@1"]}
+    },
+    {
+      "id": "surface-state-media-action",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": ["dispatch_audio@1", "dispatch_video@1", "send_audio_sample@1", "send_video_sample@1", "subscribe_audio@1", "subscribe_video@1", "media_lane_close@1", "media_lane_open@1"]}
+    },
+    {
+      "id": "surface-state-reachability-action",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "subscribe_conn_trace@1"}
+    },
+    {
+      "id": "surface-state-gateway-events",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": 1}
+    },
+    {
+      "id": "surface-state-media-queues",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": [2, 3]}
+    },
+    {
+      "id": "surface-state-reachability-queue",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_broadcast", "ordinal": 4}
+    },
+    {
+      "id": "surface-state-remaining-callables-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "category": ["callable", "constructor_entry", "public_action"]},
+      "exclude": [{"symbol": ["announce_departure@1", "approve_roster@1", "broadcast_capabilities@1", "broadcast_channel_frame@1", "connect_peer@1", "connect_peer_wait@1", "dispatch_audio@1", "dispatch_channel_frame@1", "dispatch_video@1", "media_lane_close@1", "media_lane_open@1", "reconnect@1", "remove_roster@1", "resolve_connect_waiters@1", "send_audio_sample@1", "send_channel_frame@1", "send_channel_reliable@1", "send_rpc_request@1", "send_video_sample@1", "subscribe_audio@1", "subscribe_channel@1", "subscribe_conn_trace@1", "subscribe_video@1"]}]
+    },
+    {
+      "id": "surface-state-signaling-queues",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_unbounded", "ordinal": [1, 3]},
+      "flags": ["unbounded_queue"]
+    },
+    {
+      "id": "surface-state-global-command-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "category": "queue_unbounded", "ordinal": 2},
+      "flags": ["unbounded_queue", "authority_mutation"]
+    },
+    {
+      "id": "surface-wake-reachability",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/wake.rs", "symbol": ["default@1", "monotonic_ms@1", "new@1", "observe@1", "take_wake_event@1"]}
+    },
+    {
+      "id": "surface-wake-mixed",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/wake.rs", "symbol": "on_wake@1"}
+    },
+    {
+      "id": "surface-handle-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/handle.rs"}
+    },
+    {
+      "id": "surface-identity-foundation",
+      "decision": "OD-DEVICE-KEY-CUSTODY",
+      "match": {"path": "crates/myownmesh-core/src/identity.rs"}
+    },
+    {
+      "id": "surface-semantic-persistence",
+      "target": "Semantic Node",
+      "match": {"path": ["crates/myownmesh-core/src/network_state.rs", "crates/myownmesh-core/src/roster.rs"]}
+    },
+    {
+      "id": "surface-persistence-mechanism",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-core/src/persist.rs"}
+    },
+    {
+      "id": "surface-rpc-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "category": ["public_action", "task"]}
+    },
+    {
+      "id": "surface-rpc-session-bounded-queues",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "category": "queue_oneshot"}
+    },
+    {
+      "id": "surface-rpc-session-unbounded-queues",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "category": "queue_unbounded"},
+      "flags": ["unbounded_queue"]
+    },
+    {
+      "id": "surface-rpc-callables-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/rpc.rs", "category": ["callable", "constructor_entry", "parser_entry"]}
+    },
+    {
+      "id": "surface-service-advert-decision",
+      "decision": "OD-SERVICE-ADVERT",
+      "match": {"path": "crates/myownmesh-core/src/services/mod.rs"}
+    },
+    {
+      "id": "surface-legacy-relay-delete",
+      "disposition": "Delete",
+      "match": {"path": "crates/myownmesh-core/src/services/relay.rs"},
+      "flags": ["ordinary_forwarding", "payload_bypass"]
+    },
+    {
+      "id": "surface-webrtc-media-profile",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["annexb_nal_types@1", "attach_track@1", "au_has_idr@1", "close_media_lane@1", "ensure_lane@1", "has_reapable_lanes@1", "lane_of_track_id@1", "make_media_track@1", "newer_rtp_ts@1", "open_lane_count@1", "open_media_lane@1", "payload_starts_au@1", "pool@1", "pump_audio_track@1", "pump_video_track@1", "push@1", "reap_drained_lanes@1", "resolve_media_lanes@1", "resolved_media_lanes@1", "send_audio@1", "send_video@1", "try_emit@1", "unwrap_seq@1"]}
+    },
+    {
+      "id": "surface-webrtc-media-callback",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "register_callbacks@1", "category": "callback_registration", "token": "on_track"}
+    },
+    {
+      "id": "surface-webrtc-media-static",
+      "decision": "OD-CODEC-FLOW-BOUNDARY",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "LANE_DRAIN_GRACE@1", "category": "static_state"}
+    },
+    {
+      "id": "surface-webrtc-mixed",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["register_callbacks@1", "install_data_channel_handlers@1", "new@2", "open_peer@1", "open_peer_with_config@1", "send@1"]},
+      "exclude": [
+        {"category": "callback_registration"},
+        {"category": "queue_unbounded"}
+      ]
+    },
+    {
+      "id": "surface-webrtc-message-callback",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "install_data_channel_handlers@1", "category": "callback_registration", "token": "on_message"}
+    },
+    {
+      "id": "surface-webrtc-connector-callbacks",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "category": "callback_registration"},
+      "exclude": [{"token": ["on_track", "on_message"]}]
+    },
+    {
+      "id": "surface-arc03-webrtc-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["candidate_resource_measurement@1", "measured_usize@1", "observe@1", "observe_inexact_item@1", "observe_inexact_item_if@1", "observe_owned_task@1", "queue_container_resource_measurement@1"]}
+    },
+    {
+      "id": "surface-webrtc-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs"},
+      "exclude": [
+        {"symbol": ["annexb_nal_types@1", "attach_track@1", "au_has_idr@1", "candidate_resource_measurement@1", "close_media_lane@1", "ensure_lane@1", "has_reapable_lanes@1", "install_data_channel_handlers@1", "lane_of_track_id@1", "make_media_track@1", "measured_usize@1", "new@2", "newer_rtp_ts@1", "observe@1", "observe_inexact_item@1", "observe_inexact_item_if@1", "observe_owned_task@1", "open_lane_count@1", "open_media_lane@1", "open_peer@1", "open_peer_with_config@1", "payload_starts_au@1", "pool@1", "pump_audio_track@1", "pump_video_track@1", "push@1", "queue_container_resource_measurement@1", "reap_drained_lanes@1", "register_callbacks@1", "resolve_media_lanes@1", "resolved_media_lanes@1", "send@1", "send_audio@1", "send_video@1", "try_emit@1", "unwrap_seq@1"]},
+        {"category": "callback_registration"},
+        {"category": "queue_unbounded"},
+        {"symbol": "LANE_DRAIN_GRACE@1"}
+      ]
+    },
+    {
+      "id": "surface-core-dirs-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-core/src/dirs.rs"}
+    },
+    {
+      "id": "surface-connection-trace",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/conn_trace.rs"}
+    },
+    {
+      "id": "surface-connection-state-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs"}
+    },
+    {
+      "id": "surface-ice-recovery-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/ice_watchdog.rs"}
+    },
+    {
+      "id": "surface-recovery-ladder",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/ladder.rs"},
+      "exclude": [{"symbol": ["reevaluate_topology@1", "shape_connections@1"]}]
+    },
+    {
+      "id": "surface-recovery-topology-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/ladder.rs", "symbol": ["reevaluate_topology@1", "shape_connections@1"]}
+    },
+    {
+      "id": "surface-phase-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/phase.rs"}
+    },
+    {
+      "id": "surface-reconcile-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/reconcile.rs"}
+    },
+    {
+      "id": "surface-reliable-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/reliable.rs"}
+    },
+    {
+      "id": "surface-ticker-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/engine/tick.rs"}
+    },
+    {
+      "id": "surface-traffic-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/engine/traffic.rs"}
+    },
+    {
+      "id": "surface-core-error-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/error.rs"}
+    },
+    {
+      "id": "surface-feature-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/features.rs"}
+    },
+    {
+      "id": "surface-protocol-governance",
+      "target": "Semantic Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/governance.rs"}
+    },
+    {
+      "id": "surface-protocol-rpc-session",
+      "target": "Peer Session Node",
+      "match": {"path": "crates/myownmesh-core/src/protocol/rpc.rs"}
+    },
+    {
+      "id": "surface-signing-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/signing.rs"}
+    },
+    {
+      "id": "surface-topology-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/topology/*"}
+    },
+    {
+      "id": "surface-transport-observation",
+      "target": "Reachability Node",
+      "match": {"path": "crates/myownmesh-core/src/transport/diag.rs"}
+    },
+    {
+      "id": "surface-transport-ice",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/transport/ice.rs"}
+    },
+    {
+      "id": "surface-verification-presentation-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh-core/src/verification.rs"}
+    },
+    {
+      "id": "surface-daemon-services-split",
+      "disposition": "Split",
+      "match": {"path": "crates/myownmesh/src/services.rs"}
+    },
+    {
+      "id": "surface-daemon-main-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": ["crates/myownmesh/src/main.rs", "crates/myownmesh/build.rs"]}
+    },
+    {
+      "id": "surface-connector-infrastructure",
+      "domain": "Connector infrastructure",
+      "match": {"path": ["crates/myownmesh-services/src/lib.rs", "crates/myownmesh-services/src/stun.rs"]}
+    },
+    {
+      "id": "surface-turn-relay",
+      "target": "Relay Node",
+      "match": {"path": "crates/myownmesh-services/src/turn.rs"}
+    },
+    {
+      "id": "surface-signaling-carriers",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/*"},
+      "exclude": [{"category": "queue_unbounded"}]
+    },
+    {
+      "id": "surface-signaling-carrier-queues",
+      "target": "Signaling Node",
+      "match": {"path": "crates/myownmesh-signaling/src/*", "category": "queue_unbounded"},
+      "flags": ["unbounded_queue"]
+    },
+    {
+      "id": "surface-arc02-application-gateway",
+      "target": "Application Gateway",
+      "match": {"path": "crates/myownmesh-core/src/application_gateway/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-connector",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/connector/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-endpoint-auth",
+      "target": "Endpoint Auth Task",
+      "match": {"path": "crates/myownmesh-core/src/endpoint_auth/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-runtime-incarnation",
+      "target": "Runtime Supervisor",
+      "match": {"path": "crates/myownmesh-core/src/runtime/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-attempt",
+      "target": "Attempt Node",
+      "match": {"path": "crates/myownmesh-core/src/runtime/attempt/mod.rs"}
+    },
+    {
+      "id": "surface-arc02-session-broker",
+      "target": "Session Broker",
+      "match": {"path": "crates/myownmesh-core/src/runtime/session_broker/mod.rs"}
+    },
+    {
+      "id": "surface-updater-operational",
+      "domain": "Operational infrastructure (U0)",
+      "match": {"path": "crates/myownmesh-updater/src/*"}
+    },
+    {
+      "id": "surface-gui-client",
+      "domain": "Application client",
+      "match": {"path": ["gui/src-tauri/src/*", "gui/src-tauri/build.rs"]}
+    }
+  ],
+  "semantic_markers": [
+    {
+      "id": "marker-preauth-media-delivery",
+      "target": "Session Broker",
+      "flags": ["payload_bypass", "authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "anchor": "tx.emit(TransportEvent::VideoSample(sample))", "count": 1},
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "anchor": "tx.emit(TransportEvent::AudioSample(sample))", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "state.dispatch_video(&device_id, sample);", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "state.dispatch_audio(&device_id, sample);", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-ordinary-member-forwarding",
+      "disposition": "Delete",
+      "flags": ["ordinary_forwarding", "payload_bypass", "authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/routing.rs", "anchor": "pub(crate) async fn send_routed", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/routing.rs", "anchor": "pub(crate) async fn broadcast_flood", "count": 1},
+        {"path": "crates/myownmesh-core/src/services/relay.rs", "anchor": "pub const RELAY_CHANNEL: &str = \"__mesh_relay__/v1\";", "count": 1},
+        {"path": "crates/myownmesh/src/services.rs", "anchor": "if desired.relay.enabled {", "count": 2},
+        {"path": "crates/myownmesh/src/services.rs", "anchor": "RelayService::start(joined.state(), fanout)", "count": 2},
+        {"path": "crates/myownmesh/src/cli/ctl.rs", "anchor": "\"relay\" => services.relay.enabled = enabled,", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-public-authority-bypasses",
+      "target": "Application Gateway",
+      "flags": ["public_authority_bypass"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/handle.rs", "anchor": "pub fn state(&self) -> Arc<NetworkState>", "count": 1},
+        {"path": "crates/myownmesh-core/src/identity.rs", "anchor": "pub fn signing_key(&self) -> &SigningKey", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-nostr-inbound-trust",
+      "decision": "OD-EARLY-SIGNALING-TRUST",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "anchor": "let event: NostrEvent =", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "anchor": "event.verify()", "count": 0},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "anchor": "shared.room_handle", "count": 0},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "anchor": "let sub_id", "count": 0},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "anchor": "from: envelope.from,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "handle_inbound_frame@1", "before": "seen.push_back(event.id.clone());", "after": "let envelope: SignalingEnvelope"}
+      ]
+    },
+    {
+      "id": "marker-mdns-claimed-identity",
+      "disposition": "Split",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "on_peer_frame(&frame.from);", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "PeerLeft { device_id: peer_id }", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-signaling-attempt-correlation",
+      "disposition": "Split",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/lib.rs", "anchor": "offer_id: String,", "count": 2},
+        {"path": "crates/myownmesh-signaling/src/lib.rs", "anchor": "Candidate {\n        peer_id: String,\n        candidate: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/lib.rs", "anchor": "Leave { peer_id: String }", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/state.rs", "anchor": "offer_id", "count": 0},
+        {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "offer_id: new_short_id(),", "count": 3},
+        {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "offer_id: String::new(),", "count": 3},
+        {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "SignalingMessage::Offer { sdp, .. }", "count": 2},
+        {"path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "SignalingMessage::Answer { sdp, .. }", "count": 2}
+      ]
+    },
+    {
+      "id": "marker-raw-signaling-api",
+      "decision": "OD-RAW-SIGNALING-API",
+      "flags": ["public_authority_bypass"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/lib.rs", "anchor": "pub enum SignalingMessage", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/lib.rs", "anchor": "pub trait SignalingChannel", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/local.rs", "anchor": "pub enum LocalInbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/local.rs", "anchor": "pub enum LocalOutbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/local.rs", "anchor": "pub fn join(", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "pub enum NostrInbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "pub enum NostrOutbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "pub fn start(", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "pub enum MdnsInbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "pub enum MdnsOutbound", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "pub fn start(", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub struct NostrEvent", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub id: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub pubkey: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub created_at: u64,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub kind: u16,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub tags: Vec<Vec<String>>,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub content: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub sig: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub struct NostrIdentity", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub fn generate() -> Self", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub fn from_secret(sk: SecretKey) -> Self", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/nostr/event.rs", "anchor": "pub fn make_event(", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub struct Frame", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub v: u8,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub room: String,", "count": 2},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub from: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub to: String,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub msg: SignalingMessage,", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub fn encode_frame(", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/mdns/wire.rs", "anchor": "pub fn decode_frame(", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/state.rs", "anchor": "pub enum SignalingInbound", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/state.rs", "anchor": "pub enum SignalingOutbound", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-self-hosted-signaling-claimed-device",
+      "disposition": "Split",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/server.rs", "symbol": "handle_event@1", "anchor": "if !event.verify()", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/server.rs", "symbol": "handle_event@1", "anchor": "if let Some((room, device)) = presence_of(&event)", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/server.rs", "symbol": "presence_of@1", "anchor": "let from = content.get(\"from\")?.as_str()?.to_string();", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/server.rs", "symbol": "unregister@2", "anchor": "let leave = build_leave_event", "count": 1},
+        {"path": "crates/myownmesh-signaling/src/server.rs", "symbol": "build_leave_event@1", "anchor": "json!({ \"from\": device, \"kind\": \"leave\", \"peer_id\": device })", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-generic-nip01-service",
+      "decision": "OD-GENERIC-NIP01-SERVICE",
+      "flags": ["payload_bypass"],
+      "items": [
+        {"path": "crates/myownmesh-signaling/src/server.rs", "anchor": "let delivered = fanout(&self.conns, ev_val, &event, None);", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-control-principal-seam",
+      "decision": "OD-LOCAL-PRINCIPAL-BINDING",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh/src/control.rs", "anchor": "let request: Request = match serde_json::from_str(&line)", "count": 1},
+        {"path": "crates/myownmesh/src/control.rs", "anchor": "client.set_media_sink(tx);", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-updater-signing-and-paths",
+      "domain": "Operational infrastructure (U0)",
+      "flags": ["external_code_replacement"],
+      "items": [
+        {"path": ".github/workflows/release.yml", "anchor": "MYOWNMESH_RELEASE_PUBKEY:", "count": 0, "file_sha256": "2799b8c143b4e2d7708e5b1fbc083084855e6408dc3a8feece38899eb62ef2f4"},
+        {"path": "crates/myownmesh-updater/src/lib.rs", "anchor": "updates_dir()?.join(version)", "count": 1},
+        {"path": "crates/myownmesh-updater/src/lib.rs", "anchor": "updates_dir.join(&asset_name)", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-identity-anchor-consistency",
+      "domain": "Identity foundation",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/identity.rs", "anchor": "public_id: anchor.public_key,", "count": 2}
+      ]
+    },
+    {
+      "id": "marker-unbounded-connector-input",
+      "target": "Connector Worker",
+      "flags": ["unbounded_resource"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "add_remote_candidate@1", "anchor": "state.pending.push(candidate, &self.resource_scope);", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-arc03-admitted-connector-authority",
+      "target": "Connector Worker",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_connector_peer@1", "anchor": "reserve_connector_candidate(claim)", "count": 1},
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "confirm_data_channel_open@1", "anchor": "EndpointAuthHandoff::new(", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "ensure_peer_session@1", "anchor": ".open_connector_peer(", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-arc03-exact-owner-promotion",
+      "target": "Session Broker",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "on_approve@1", "anchor": "peer.state.write().remote_approve_seen = true;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "send_local_approve_owner@1", "anchor": "remote_approve_seen = true;", "count": 0},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate_after_check@1", "anchor": "let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate_after_check@1", "anchor": ".with_current(owner, |peer| {", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate_after_check@1", "anchor": "super::reliable::flush_peer_owner(state, owner).await;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate_after_check@1", "anchor": "broadcast_roster_summary_for_owner(state, owner).await", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "send_local_approve_owner@1", "before": "send_to_peer_owner(state, owner, &MeshMessage::Approve(ApproveMessage {})).await", "after": "peer.state.write().local_approve_sent = true;"}
+      ]
+    },
+    {
+      "id": "marker-arc03-owner-bound-reliable-outbound",
+      "target": "Peer Session Node",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "link_ready@1", "anchor": "let up = data.is_admitted() && data.data_channel_open;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "flush_peer_owner@1", "anchor": "(data.is_admitted() && data.data_channel_open)", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "flush_peer_inner@1", "anchor": "Some(owner) => super::send_to_peer_owner(state, owner, &msg).await,", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-monolithic-command-bus",
+      "disposition": "Delete",
+      "flags": ["unbounded_resource", "authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/state.rs", "anchor": "pub cmd_tx: mpsc::UnboundedSender<NetworkCmd>", "count": 1}
+      ]
+    }
+  ],
+  "resource_records": [
+    {
+      "id": "resource-unbounded-queues",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "Nostr bridge outbound queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_nostr_with@1", "anchor": "mpsc::unbounded_channel::<NostrOutbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_nostr_with@1|mpsc::unbounded_channel|1"},
+        {"name": "Nostr bridge inbound queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_nostr_with@1", "anchor": "mpsc::unbounded_channel::<NostrInbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_nostr_with@1|mpsc::unbounded_channel|2"},
+        {"name": "mDNS bridge outbound queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_mdns_with@1", "anchor": "mpsc::unbounded_channel::<MdnsOutbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_mdns_with@1|mpsc::unbounded_channel|1"},
+        {"name": "mDNS bridge inbound queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_mdns_with@1", "anchor": "mpsc::unbounded_channel::<MdnsInbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_mdns_with@1|mpsc::unbounded_channel|2"},
+        {"name": "Nostr carrier fanout queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_signaling@1", "anchor": "mpsc::unbounded_channel::<SignalingOutbound>()", "count": 2, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_signaling@1|mpsc::unbounded_channel|1"},
+        {"name": "mDNS carrier fanout queue", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_signaling@1", "anchor": "mpsc::unbounded_channel::<SignalingOutbound>()", "count": 2, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/signaling_bridge.rs|attach_signaling@1|mpsc::unbounded_channel|2"},
+        {"name": "engine signaling outbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|1"},
+        {"name": "engine global command queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|2"},
+        {"name": "engine signaling inbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|3"},
+        {"name": "RPC streaming response queue", "path": "crates/myownmesh-core/src/rpc.rs", "symbol": "call_stream@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/rpc.rs|call_stream@1|mpsc::unbounded_channel|1"},
+        {"name": "local signaling outbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "mpsc::unbounded_channel::<LocalOutbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/local.rs|join@1|mpsc::unbounded_channel|1"},
+        {"name": "local signaling inbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "mpsc::unbounded_channel::<LocalInbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/local.rs|join@1|mpsc::unbounded_channel|2"},
+        {"name": "embedded mDNS discovery event queue", "path": "crates/myownmesh-signaling/src/mdns/discovery/embedded.rs", "symbol": "start@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/mdns/discovery/embedded.rs|start@1|mpsc::unbounded_channel|1"},
+        {"name": "system mDNS discovery event queue", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "symbol": "start@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/mdns/discovery/system.rs|start@1|mpsc::unbounded_channel|1"},
+        {"name": "mDNS per-connection writer queue", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "symbol": "adopt_stream@1", "anchor": "mpsc::unbounded_channel::<String>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/mdns/driver.rs|adopt_stream@1|mpsc::unbounded_channel|1"},
+        {"name": "signaling connection outbound queue", "path": "crates/myownmesh-signaling/src/server.rs", "symbol": "handle_conn@1", "anchor": "mpsc::unbounded_channel::<WsMessage>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/server.rs|handle_conn@1|mpsc::unbounded_channel|1"},
+        {"name": "daemon control event writer queue", "path": "crates/myownmesh/src/control.rs", "symbol": "handle_client@1", "anchor": "tokio::sync::mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh/src/control.rs|handle_client@1|mpsc::unbounded_channel|1"},
+        {"name": "daemon media-source pipe queue", "path": "crates/myownmesh/src/control.rs", "symbol": "handle_client@1", "anchor": "tokio::sync::mpsc::unbounded_channel::<Vec<u8>>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh/src/control.rs|handle_client@1|mpsc::unbounded_channel|2"}
+      ]
+    },
+    {
+      "id": "resource-attempt-candidates",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "logical_bytes", "retained_bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "connector-owned pending remote ICE candidate backlog", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "anchor": "entries: Vec<PendingRemoteCandidate>,", "count": 1},
+        {"name": "connector-owned pending remote ICE candidate append", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "add_remote_candidate@1", "anchor": "state.pending.push(candidate, &self.resource_scope);", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-arc03-lifecycle",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "attempt retirement watch", "path": "crates/myownmesh-core/src/runtime/attempt/mod.rs", "symbol": "admitted@1", "anchor": "watch::channel(false)", "count": 1},
+        {"name": "WebRTC connector retirement watch", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "new@1", "anchor": "watch::channel(false)", "count": 1},
+        {"name": "WebRTC closed generic callback mailboxes", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::channel(mailboxes.", "count": 3},
+        {"name": "WebRTC connector transport observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_connector_peer@1", "anchor": "PreAuthResourceFamily::TransportObject", "count": 1},
+        {"name": "WebRTC peer-connection callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "register_callbacks@1", "anchor": "PreAuthResourceFamily::Callback", "count": 5},
+        {"name": "WebRTC data-channel callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "install_data_channel_handlers@1", "anchor": "PreAuthResourceFamily::Callback", "count": 4},
+        {"name": "WebRTC sender-drain task observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "attach_track@1", "anchor": "PreAuthResourceFamily::Task", "count": 1},
+        {"name": "WebRTC connector event-pump task observation", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "ensure_peer_session@1", "anchor": "let task_observation = session.observe_owned_task();", "count": 1},
+        {"name": "removed-peer native close task", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "finish_drop_peer@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "replaced-peer native close task", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "install_peer@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-nostr-driver",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "Nostr event dedup cache", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "seen_event_ids: Mutex<std::collections::VecDeque<String>>,", "count": 1},
+        {"name": "Nostr disconnected outbound replay cache", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<NostrEvent>)>>,", "count": 1},
+        {"name": "Nostr room capability map", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "room_caps: Mutex<std::collections::HashMap<String, bool>>,", "count": 1},
+        {"name": "Nostr relay handle vector", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "relays: Mutex<Vec<RelayHandle>>", "count": 1},
+        {"name": "Nostr driver outbound receiver", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "outbound: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<NostrOutbound>>>", "count": 1},
+        {"name": "Nostr publish broadcast", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "anchor": "publish_tx: broadcast::Sender<Arc<NostrEvent>>", "count": 1},
+        {"name": "Nostr reconnect and compatibility watch channels", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "start@1", "anchor": "watch::channel(", "count": 3},
+        {"name": "Nostr primary, fallback, outbound, and announcer tasks", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "start@1", "anchor": "tokio::spawn(async move {", "count": 4},
+        {"name": "Nostr fallback relay task per configured URL", "path": "crates/myownmesh-signaling/src/nostr/driver.rs", "symbol": "run_fallback_supervisor@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-signaling-bridge",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "cross-carrier signaling dedup cache", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "seen: Mutex<VecDeque<u64>>", "count": 1},
+        {"name": "cross-carrier signaling dedup capacity", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "anchor": "VecDeque::with_capacity(GATE_SEEN_CAPACITY)", "count": 1},
+        {"name": "local signaling bridge pumps", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_local@1", "anchor": "tokio::spawn(async move {", "count": 2},
+        {"name": "Nostr signaling bridge pumps", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_nostr_with@1", "anchor": "tokio::spawn(async move {", "count": 2},
+        {"name": "mDNS signaling bridge pumps", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "attach_mdns_with@1", "anchor": "tokio::spawn(async move {", "count": 2},
+        {"name": "multi-carrier fanout task", "path": "crates/myownmesh-core/src/engine/signaling_bridge.rs", "symbol": "spawn_fanout@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-signaling-server",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "signaling connection map", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "conns: HashMap<u64, ConnEntry>,", "count": 1},
+        {"name": "signaling stored event queue", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "stored: VecDeque<StoredEvent>,", "count": 1},
+        {"name": "signaling presence map", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "presence: HashMap<String, HashMap<String, Presence>>,", "count": 1},
+        {"name": "signaling per-IP connection map", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "ip_counts: HashMap<IpAddr, u32>,", "count": 1},
+        {"name": "signaling connection outbound queue", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "mpsc::unbounded_channel::<WsMessage>()", "count": 1},
+        {"name": "signaling per-connection subscription map", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "subs: HashMap<String, Vec<Value>>", "count": 1},
+        {"name": "signaling per-connection presence-owner vector", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "present: Vec<(String, String)>", "count": 1},
+        {"name": "signaling listener and shutdown tasks", "path": "crates/myownmesh-signaling/src/server.rs", "symbol": "start@1", "anchor": "tokio::spawn(", "count": 2},
+        {"name": "signaling accepted-connection tasks", "path": "crates/myownmesh-signaling/src/server.rs", "symbol": "accept_loop@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "signaling per-connection writer task", "path": "crates/myownmesh-signaling/src/server.rs", "symbol": "handle_conn@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "zero connection limit disables enforcement", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "if self.limits.max_connections_per_ip > 0", "count": 1},
+        {"name": "zero subscription limit disables enforcement", "path": "crates/myownmesh-signaling/src/server.rs", "anchor": "if self.limits.max_subscriptions > 0", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-mdns-driver",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "mDNS peer map", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "peers: Mutex<HashMap<String, PeerEntry>>,", "count": 1},
+        {"name": "mDNS discovery-key map", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "key_to_peer: Mutex<HashMap<String, String>>,", "count": 1},
+        {"name": "mDNS connection map", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "anchor": "conns: Mutex<HashMap<String, ConnHandle>>,", "count": 1},
+        {"name": "mDNS in-flight resolution set", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "anchor": "resolving: Mutex<HashSet<String>>,", "count": 1},
+        {"name": "mDNS discovery event queue", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "anchor": "let (tx, rx) = mpsc::unbounded_channel();", "count": 1},
+        {"name": "mDNS per-connection bounded line buffer", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "symbol": "run_reader@1", "anchor": "let mut buf: Vec<u8> = Vec::new();", "count": 1},
+        {"name": "mDNS per-connection reader and writer tasks", "path": "crates/myownmesh-signaling/src/mdns/driver.rs", "symbol": "adopt_stream@1", "anchor": "tokio::spawn(async move {", "count": 2},
+        {"name": "mDNS native resolution thread per service name", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "symbol": "browse_cb@1", "anchor": "std::thread::Builder::new()", "count": 1},
+        {"name": "mDNS native browse processing thread", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "symbol": "start@1", "anchor": "std::thread::Builder::new()", "count": 1},
+        {"name": "mDNS native registration processing thread", "path": "crates/myownmesh-signaling/src/mdns/discovery/system.rs", "symbol": "register@1", "anchor": "std::thread::Builder::new()", "count": 1},
+        {"name": "embedded mDNS browse pump task", "path": "crates/myownmesh-signaling/src/mdns/discovery/embedded.rs", "symbol": "start@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-local-signaling",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "local signaling room registry", "path": "crates/myownmesh-signaling/src/local.rs", "anchor": "rooms: HashMap<String, Vec<PeerHandle>>,", "count": 1},
+        {"name": "local signaling outbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "anchor": "mpsc::unbounded_channel::<LocalOutbound>()", "count": 1},
+        {"name": "local signaling inbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "anchor": "mpsc::unbounded_channel::<LocalInbound>()", "count": 1},
+        {"name": "local signaling room pump task", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-daemon-clients",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "daemon client registry", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "clients: DashMap<ClientId, Arc<ClientHandle>>,", "count": 1},
+        {"name": "daemon handler claims", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "handler_claims: DashMap<ClaimKey, ClientId>,", "count": 1},
+        {"name": "daemon pending inbound RPC map", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pending_inbound: DashMap<String, PendingInbound>,", "count": 1},
+        {"name": "daemon per-client writer queue", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub writer_tx: mpsc::UnboundedSender<ServerOut>,", "count": 1},
+        {"name": "daemon per-client method-claim set", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub method_claims: Arc<DashSet<ClaimKey>>", "count": 1},
+        {"name": "daemon aggregate channel subscription map", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "channel_subs: DashMap<ClaimKey, Arc<Mutex<Vec<ClientId>>>>,", "count": 1},
+        {"name": "daemon aggregate video subscription map", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "video_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,", "count": 1},
+        {"name": "daemon aggregate audio subscription map", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "audio_subs: DashMap<String, Arc<Mutex<Vec<ClientId>>>>,", "count": 1},
+        {"name": "daemon installed synthetic-handler map", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "installed_handlers: DashMap<ClaimKey, HandlerMode>,", "count": 1},
+        {"name": "daemon per-client channel subscription set", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub channel_subs: Arc<DashSet<ClaimKey>>", "count": 1},
+        {"name": "daemon per-client video subscription set", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub video_subs: Arc<DashSet<String>>", "count": 1},
+        {"name": "daemon per-client audio subscription set", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub audio_subs: Arc<DashSet<String>>", "count": 1},
+        {"name": "daemon per-client media pipe sender", "path": "crates/myownmesh/src/ipc/clients.rs", "anchor": "pub media_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>", "count": 1},
+        {"name": "daemon accepted control-client tasks", "path": "crates/myownmesh/src/control.rs", "symbol": "serve@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "daemon control line input", "path": "crates/myownmesh/src/control.rs", "symbol": "handle_client@1", "anchor": "let mut lines = reader.lines();", "count": 1},
+        {"name": "daemon media frame length buffer", "path": "crates/myownmesh/src/control.rs", "symbol": "run_media_track_pipe@1", "anchor": "let mut len_buf = [0u8; 4];", "count": 1},
+        {"name": "daemon bounded media frame body", "path": "crates/myownmesh/src/control.rs", "symbol": "run_media_track_pipe@1", "anchor": "let mut body = vec![0u8; len];", "count": 1},
+        {"name": "daemon outbound streaming RPC forwarding task", "path": "crates/myownmesh/src/control.rs", "symbol": "dispatch@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-daemon-bridge",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "daemon single-shot synthetic RPC handler lifetime", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "install_single_handler@1", "anchor": "rpc.serve(&method,", "count": 1},
+        {"name": "daemon streaming synthetic RPC handler lifetime", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "install_stream_handler@1", "anchor": "rpc.serve_stream(&method,", "count": 1},
+        {"name": "daemon bounded inbound stream queue", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "install_stream_handler@1", "anchor": "mpsc::channel::<Value>(32)", "count": 1},
+        {"name": "daemon channel pump task", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "spawn_channel_pump@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "daemon video pump task", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "spawn_video_pump@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "daemon audio pump task", "path": "crates/myownmesh/src/ipc/bridge.rs", "symbol": "spawn_audio_pump@1", "anchor": "tokio::spawn(async move {", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-updater-response-bodies",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "updater release-feed JSON body", "path": "crates/myownmesh-updater/src/lib.rs", "symbol": "fetch_release@1", "anchor": ".json().await?", "count": 1},
+        {"name": "updater artifact body buffer", "path": "crates/myownmesh-updater/src/lib.rs", "symbol": "download_verify_stage@1", "anchor": ".bytes()", "count": 1},
+        {"name": "updater checksum and signature text buffers", "path": "crates/myownmesh-updater/src/lib.rs", "symbol": "download_verify_stage@1", "anchor": ".text()", "count": 2}
+      ]
+    },
+    {
+      "id": "resource-rpc-runtime",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "RPC handler map", "path": "crates/myownmesh-core/src/rpc.rs", "anchor": "pub(crate) handlers: DashMap<String, HandlerEntry>,", "count": 1},
+        {"name": "RPC pending request map", "path": "crates/myownmesh-core/src/rpc.rs", "anchor": "pub(crate) pending: DashMap<String, PendingEntry>,", "count": 1},
+        {"name": "RPC streaming response queue", "path": "crates/myownmesh-core/src/rpc.rs", "anchor": "let (tx, rx) = mpsc::unbounded_channel();", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-turn-relay",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "TURN zero bandwidth cap disables throttling", "path": "crates/myownmesh-services/src/turn.rs", "anchor": "if self.max_bps == 0", "count": 1},
+        {"name": "TURN configured per-allocation bandwidth", "path": "crates/myownmesh-services/src/turn.rs", "anchor": "max_bps: config.max_bps_per_connection,", "count": 1},
+        {"name": "TURN credential key map", "path": "crates/myownmesh-services/src/turn.rs", "anchor": "cred_map: HashMap<String, Vec<u8>>", "count": 1},
+        {"name": "TURN control listener socket", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "start@1", "anchor": "UdpSocket::bind(&bind_addr)", "count": 1},
+        {"name": "TURN allocation relay-port search window", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "allocate_in_range@1", "anchor": "for i in 0..span", "count": 1},
+        {"name": "TURN fixed-window allocation socket", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "allocate_in_range@1", "anchor": "self.inner.allocate_conn", "count": 1},
+        {"name": "TURN allocation socket", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "allocate_conn@1", "anchor": "self.inner.allocate_conn", "count": 1},
+        {"name": "TURN per-allocation throttled connection", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "allocate_conn@1", "anchor": "Arc::new(ThrottledConn::new", "count": 1},
+        {"name": "TURN server allocation state", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "start@1", "anchor": "Server::new(ServerConfig", "count": 1},
+        {"name": "TURN dependency-default channel-bind lifetime", "path": "crates/myownmesh-services/src/turn.rs", "symbol": "start@1", "anchor": "channel_bind_timeout: Duration::from_secs(0)", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-stun-service",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "STUN listener socket", "path": "crates/myownmesh-services/src/stun.rs", "symbol": "start@1", "anchor": "UdpSocket::bind(&addr)", "count": 1},
+        {"name": "STUN retained serving-task handle", "path": "crates/myownmesh-services/src/stun.rs", "anchor": "task: JoinHandle<()>", "count": 1},
+        {"name": "STUN serving task", "path": "crates/myownmesh-services/src/stun.rs", "symbol": "start@1", "anchor": "tokio::spawn(serve(socket))", "count": 1},
+        {"name": "STUN packet buffer", "path": "crates/myownmesh-services/src/stun.rs", "symbol": "serve@1", "anchor": "vec![0u8; 1500]", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-legacy-relay",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "legacy relay zero fanout cap", "path": "crates/myownmesh-core/src/services/relay.rs", "anchor": "if max_fanout > 0 && out.len() > max_fanout as usize", "count": 1},
+        {"name": "legacy relay map per joined network", "path": "crates/myownmesh/src/services.rs", "anchor": "relays: HashMap<String, RelayService>", "count": 1},
+        {"name": "legacy relay retained forwarding-task handle", "path": "crates/myownmesh-core/src/services/relay.rs", "anchor": "task: tokio::task::JoinHandle<()>", "count": 1},
+        {"name": "legacy relay forwarding task per network", "path": "crates/myownmesh-core/src/services/relay.rs", "symbol": "start@1", "anchor": "tokio::spawn(run(state, max_fanout))", "count": 1}
+      ]
+    }
+  ],
+  "expected_aggregates": {
+    "declaration_assignments": {
+      "DISPOSITION:Delete": 23,
+      "DISPOSITION:Split": 86,
+      "DOMAIN:Application client": 52,
+      "DOMAIN:Connector infrastructure": 15,
+      "DOMAIN:Operational infrastructure (U0)": 106,
+      "DOMAIN:Resource instrumentation": 107,
+      "NODE:Application Gateway": 351,
+      "NODE:Attempt Node": 92,
+      "NODE:Connector Worker": 189,
+      "NODE:Endpoint Auth Task": 33,
+      "NODE:Peer Session Node": 73,
+      "NODE:Reachability Node": 173,
+      "NODE:Relay Node": 38,
+      "NODE:Runtime Supervisor": 61,
+      "NODE:Semantic Node": 117,
+      "NODE:Session Broker": 21,
+      "NODE:Signaling Node": 190,
+      "OWNER_DECISION_REQUIRED:OD-CODEC-FLOW-BOUNDARY": 38,
+      "OWNER_DECISION_REQUIRED:OD-DEVICE-KEY-CUSTODY": 13,
+      "OWNER_DECISION_REQUIRED:OD-LEGACY-SILENT-MIGRATION": 1,
+      "OWNER_DECISION_REQUIRED:OD-LEGACY-TOPOLOGY-MIGRATION": 2,
+      "OWNER_DECISION_REQUIRED:OD-NETWORK-RECOVERY-OWNER": 1,
+      "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 10
+    },
+    "surface_assignments": {
+      "DISPOSITION:Delete": 25,
+      "DISPOSITION:Split": 384,
+      "DOMAIN:Application client": 72,
+      "DOMAIN:Connector infrastructure": 14,
+      "DOMAIN:Operational infrastructure (U0)": 251,
+      "DOMAIN:Resource instrumentation": 58,
+      "NODE:Application Gateway": 165,
+      "NODE:Attempt Node": 72,
+      "NODE:Connector Worker": 229,
+      "NODE:Endpoint Auth Task": 15,
+      "NODE:Peer Session Node": 53,
+      "NODE:Reachability Node": 54,
+      "NODE:Relay Node": 40,
+      "NODE:Runtime Supervisor": 25,
+      "NODE:Semantic Node": 111,
+      "NODE:Session Broker": 15,
+      "NODE:Signaling Node": 271,
+      "OWNER_DECISION_REQUIRED:OD-CODEC-FLOW-BOUNDARY": 53,
+      "OWNER_DECISION_REQUIRED:OD-DEVICE-KEY-CUSTODY": 33,
+      "OWNER_DECISION_REQUIRED:OD-NETWORK-RECOVERY-OWNER": 1,
+      "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
+    },
+    "surface_categories": {
+      "callable": 1314,
+      "callback_registration": 9,
+      "constructor_entry": 114,
+      "external_carrier": 29,
+      "external_http": 1,
+      "external_http_body": 4,
+      "external_http_request": 4,
+      "network_accept": 4,
+      "network_bind": 8,
+      "network_connect": 5,
+      "network_receive": 5,
+      "network_send": 11,
+      "parser": 28,
+      "parser_binary": 1,
+      "parser_entry": 24,
+      "process": 16,
+      "public_action": 129,
+      "public_trait_action": 3,
+      "queue_bounded": 5,
+      "queue_broadcast": 8,
+      "queue_oneshot": 19,
+      "queue_unbounded": 18,
+      "queue_watch": 6,
+      "static_state": 4,
+      "stream_receive": 10,
+      "task": 61,
+      "trait_callable": 20,
+      "write": 92
+    },
+    "semantic_marker_items": 88,
+    "resource_record_items": 120
+  },
+  "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
+  "report_anchors": [
+    "| Production Rust source units | 106 | `b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba` |",
+    "| Production Rust declaration members | 1,792 | `f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,952 | `4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb` |",
+    "| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |",
+    "| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
+    "The source scanner records 18 unbounded channel constructions"
+  ],
+  "target_modules": [
+    "crates/myownmesh-core/src/application_gateway",
+    "crates/myownmesh-core/src/connector",
+    "crates/myownmesh-core/src/endpoint_auth",
+    "crates/myownmesh-core/src/resource",
+    "crates/myownmesh-core/src/runtime/attempt",
+    "crates/myownmesh-core/src/runtime/relay",
+    "crates/myownmesh-core/src/runtime/session_broker"
+  ]
+}

@@ -31,7 +31,6 @@ use myownmesh_core::engine::state::NetworkState;
 use myownmesh_core::engine::{governance, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::protocol::governance::{RosterEntriesMessage, RosterEntry};
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{NetworkKind, Role};
 
 fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
@@ -82,7 +81,7 @@ fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
 async fn roster_membership_authority_gate() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     // Identities used across both scenarios.
     let bob = Arc::new(Identity::ephemeral()); // a plain Member
@@ -177,3 +176,4 @@ async fn roster_membership_authority_gate() {
         "open-network roster gossip must remain permissionless (member-vouching)"
     );
 }
+mod support;

@@ -17,14 +17,16 @@ use crate::channels::Channel;
 use crate::config::{MeshConfig, NetworkConfig, TopologyMode};
 use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
-use crate::engine::spawn_network;
+use crate::engine::spawn_network_in_mesh_scope;
 use crate::engine::state::{NetworkCmd, NetworkState};
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
+use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
+use crate::runtime::attempt::{ConnectorResourceOwnerReport, ConnectorResourcePolicy};
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// How long [`JoinedNetwork::announce_leave`] waits after queuing the
@@ -44,6 +46,7 @@ pub struct Mesh {
 struct MeshInner {
     identity: Arc<Identity>,
     transport: Transport,
+    resource_scope: MeshRuntimeResourceScope,
     events_tx: broadcast::Sender<MeshEvent>,
     networks: Mutex<Vec<NetworkEntry>>,
 }
@@ -66,6 +69,17 @@ impl Mesh {
         Self::open_with_identity(config, identity).await
     }
 
+    /// Build a `Mesh` whose native connector allocations are admitted by the
+    /// caller's process resource owner. Arc 03 supplies no fallback policy or
+    /// inferred capacity.
+    pub async fn open_with_connector_resource_policy(
+        config: MeshConfig,
+        policy: ConnectorResourcePolicy,
+    ) -> Result<MeshHandle> {
+        let identity = Arc::new(crate::identity::load_or_create()?);
+        Self::open_with_identity_and_connector_resource_policy(config, identity, policy).await
+    }
+
     /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.
     /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
@@ -78,10 +92,29 @@ impl Mesh {
         identity: Arc<Identity>,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?;
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    /// Identity-injected form of [`Self::open_with_connector_resource_policy`].
+    pub async fn open_with_identity_and_connector_resource_policy(
+        _config: MeshConfig,
+        identity: Arc<Identity>,
+        policy: ConnectorResourcePolicy,
+    ) -> Result<MeshHandle> {
+        let transport = Transport::new()?.with_connector_resource_policy(policy)?;
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    fn open_with_identity_and_transport(
+        identity: Arc<Identity>,
+        transport: Transport,
+    ) -> Result<MeshHandle> {
+        let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
             identity,
             transport,
+            resource_scope,
             events_tx,
             networks: Mutex::new(Vec::new()),
         });
@@ -120,11 +153,22 @@ impl MeshHandle {
         self.mesh.inner.identity.public_id().to_string()
     }
 
+    /// Current connector resource-owner state. `None` means connector
+    /// allocation is disabled for this process instance.
+    pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
+        self.mesh.inner.transport.connector_resource_report()
+    }
+
     /// Subscribe to mesh-wide events (every joined network's
     /// PeerEvent / PhaseEvent / Diag stream is fanned into this
     /// single broadcaster).
     pub fn events(&self) -> broadcast::Receiver<MeshEvent> {
         self.mesh.inner.events_tx.subscribe()
+    }
+
+    /// Read observations aggregated for this live Mesh runtime.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.mesh.inner.resource_scope.report()
     }
 
     /// Join a network. Returns a [`JoinedNetwork`] handle for
@@ -136,10 +180,11 @@ impl MeshHandle {
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
 
-        let (state, driver) = spawn_network(
+        let (state, driver) = spawn_network_in_mesh_scope(
             config.clone(),
             self.mesh.inner.identity.clone(),
             self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
         )
         .await?;
         let rpc = Rpc::new(state.clone());
@@ -214,6 +259,13 @@ impl JoinedNetwork {
     /// at create time — the GUI falls back to `network_id`.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Read observations for this live joined network instance.
+    ///
+    /// This runtime rollup is not bound to an immutable context identity.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.state.resource_report()
     }
 
     /// Snapshot the per-network rollup.
@@ -647,9 +699,10 @@ pub struct PeerInfo {
     /// back: this device's suffix + code, the peer's suffix + code.
     /// `None` until our handshake has fired.
     pub verification_code_sent: Option<String>,
-    /// True once we've sent an `Approve` to this peer — either via
-    /// the user clicking Approve in the GUI, or via auto-approve
-    /// because the peer is already in the roster. Surfaced so the
+    /// True once this peer's exact current data channel has accepted our
+    /// `Approve` bytes for transmission, either via the user clicking Approve
+    /// in the GUI or via roster auto-approval. This does not prove remote
+    /// receipt. Surfaced so the
     /// approval UI can flip the row from "review and approve" to
     /// "waiting for peer to approve their side" — the connection
     /// doesn't transition to Active until both ends have approved.

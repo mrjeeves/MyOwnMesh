@@ -2,6 +2,11 @@
 
 Thanks for the interest. A short orientation:
 
+The owner-adopted V4 contract is defined by `ARCHITECTURE.md`,
+`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`, and the transition documents.
+Current implementation behavior is evidence to preserve or migrate, not a
+competing architecture. Every transition change must use `PR-CHECKLIST.md`.
+
 ## Setup
 
 ```
@@ -36,7 +41,7 @@ breakdown. Short version:
 - **Edge cases are load-bearing.** The connection engine's timing
   constants and the Trystero patch behaviors were each discovered
   by a field bug. If you change one, update
-  `CONNECTION-ENGINE.md` and
+  `CONNECTION-ENGINE-FIELD-NOTES.md` and
   `crates/myownmesh-signaling/src/upstream.rs` to match — and the
   commit message should explain which bug your change addresses.
 

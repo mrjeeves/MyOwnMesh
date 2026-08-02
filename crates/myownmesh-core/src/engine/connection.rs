@@ -2,9 +2,9 @@
 //!
 //! Each entry in the engine's `peers` map is a [`PeerConnection`]:
 //! the shared [`PeerStateData`] (status, tier, watermarks,
-//! capabilities) plus the optional [`PeerSession`] handle to the
-//! WebRTC layer.
+//! capabilities) plus the optional WebRTC connector worker.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::CapabilityAdvert;
-use crate::transport::{LocalIceCandidate, PeerDiag, PeerSession, SelectedCandidatePair};
+use crate::transport::{PeerDiag, SelectedCandidatePair, WebRtcConnectorWorker};
 
 use super::ladder::ConnectionTier;
 
@@ -41,7 +41,7 @@ pub enum PeerStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PeerStateData {
     pub status: PeerStatus,
     pub tier: ConnectionTier,
@@ -51,7 +51,10 @@ pub struct PeerStateData {
     /// forever for a pre-features build, which is exactly the "assume
     /// nothing optional" senders must gate on.
     pub features: Vec<String>,
+    /// True after the exact current data channel accepts our `Approve` bytes
+    /// for transmission. This does not prove remote receipt.
     pub local_approve_sent: bool,
+    /// True only after this exact peer sends us an inbound `Approve`.
     pub remote_approve_seen: bool,
     pub local_shelved: bool,
     pub remote_shelved: bool,
@@ -137,23 +140,6 @@ pub struct PeerStateData {
     /// involved) without relying on heuristics over the gathered-
     /// candidate counts. `None` until ICE reaches Connected.
     pub selected_pair: Option<SelectedCandidatePair>,
-    /// True once we've successfully applied the peer's SDP via
-    /// `set_remote_description`. Until this is true, inbound ICE
-    /// candidates can't be added to the PC (webrtc-rs returns
-    /// "remote description is not set") and would otherwise be
-    /// dropped — including the LAN Host candidate that arrives
-    /// trickle-style fractions of a second before the answer on a
-    /// fast local network, which leaves the agent classifying the
-    /// remote as `PeerReflexive` (discovered via STUN binding) and
-    /// the GUI mis-painting a LAN link as STUN. We instead queue
-    /// pre-SDP candidates in `pending_remote_candidates` and
-    /// drain them inside `apply_remote_sdp` once the description
-    /// is in place.
-    pub remote_description_set: bool,
-    /// Remote ICE candidates that arrived before we'd applied the
-    /// peer's SDP. Drained and applied after the first successful
-    /// `set_remote_description`; see [`remote_description_set`].
-    pub pending_remote_candidates: Vec<LocalIceCandidate>,
     /// Count of inbound frames the admission gate dropped because the peer
     /// hadn't reached the phase they require (an application/RPC/reliable/
     /// governance/media frame arriving before the ed25519 handshake + approval
@@ -161,6 +147,31 @@ pub struct PeerStateData {
     /// flood can't be turned into a log-amplification primitive.
     pub admission_rejected: u64,
     pub diag: PeerDiag,
+}
+
+/// Clonable point-in-time view for diagnostics and compatibility callers.
+///
+/// This deliberately omits mutable ownership such as the pending candidate
+/// queue. Mutating a snapshot cannot alter the live peer or duplicate an
+/// observation lease.
+#[derive(Debug, Clone)]
+pub struct PeerStateSnapshot {
+    pub status: PeerStatus,
+    pub tier: ConnectionTier,
+    pub rtt_ms: Option<u32>,
+    pub clock_skew_ms: Option<i64>,
+    pub label: String,
+    pub capabilities: Option<CapabilityAdvert>,
+    pub local_shelved: bool,
+    pub remote_shelved: bool,
+    pub authenticated: bool,
+    pub verification_code_received: Option<String>,
+    pub verification_code_sent: Option<String>,
+    pub local_approve_sent: bool,
+    pub remote_approve_seen: bool,
+    pub needs_turn: bool,
+    pub diag: PeerDiag,
+    pub selected_pair: Option<SelectedCandidatePair>,
 }
 
 impl PeerStateData {
@@ -176,6 +187,27 @@ impl PeerStateData {
     /// traffic flows.
     pub fn is_admitted(&self) -> bool {
         self.authenticated && matches!(self.status, PeerStatus::Active | PeerStatus::Shelved)
+    }
+
+    pub fn snapshot(&self) -> PeerStateSnapshot {
+        PeerStateSnapshot {
+            status: self.status,
+            tier: self.tier,
+            rtt_ms: self.rtt_ms,
+            clock_skew_ms: self.clock_skew_ms,
+            label: self.label.clone(),
+            capabilities: self.capabilities.clone(),
+            local_shelved: self.local_shelved,
+            remote_shelved: self.remote_shelved,
+            authenticated: self.authenticated,
+            verification_code_received: self.verification_code_received.clone(),
+            verification_code_sent: self.verification_code_sent.clone(),
+            local_approve_sent: self.local_approve_sent,
+            remote_approve_seen: self.remote_approve_seen,
+            needs_turn: self.no_turn_diag_emitted,
+            diag: self.diag.clone(),
+            selected_pair: self.selected_pair,
+        }
     }
 }
 
@@ -214,8 +246,6 @@ impl Default for PeerStateData {
             ice_failed_count: 0,
             no_turn_diag_emitted: false,
             selected_pair: None,
-            remote_description_set: false,
-            pending_remote_candidates: Vec::new(),
             admission_rejected: 0,
             diag: PeerDiag::default(),
         }
@@ -225,28 +255,131 @@ impl Default for PeerStateData {
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
-    pub session: Mutex<Option<Arc<PeerSession>>>,
-    /// Monotonic id for *this* session of the peer. Each rebuild (drop +
-    /// re-open) gets a fresh epoch, so transport events pumped in from a
-    /// torn-down session — a `DataChannelClosed` for the old PC that lands
-    /// a millisecond after the replacement session was created — can be
-    /// recognised as stale and ignored, instead of calling `drop_peer` on
-    /// the live session and triggering yet another needless rebuild.
+    pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
+    endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
+    realtime_flow: Mutex<Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>>>,
+    registry_retired: AtomicBool,
+    /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
+    /// attempt, resource, or application authority.
     pub epoch: u64,
 }
 
-/// Process-wide monotonic source for [`PeerConnection::epoch`]. A plain
-/// counter: uniqueness across a process lifetime is all the staleness
-/// check needs, and wrap-around at u64 is not reachable in practice.
-static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Process-wide diagnostic sequence for [`PeerConnection::epoch`].
+static DIAGNOSTIC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl PeerConnection {
-    pub fn new(device_id: String, session: Option<Arc<PeerSession>>) -> Self {
+    pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
         Self {
             device_id,
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
-            epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            endpoint_auth: Mutex::new(None),
+            realtime_flow: Mutex::new(None),
+            registry_retired: AtomicBool::new(false),
+            epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Return a clonable diagnostic view without copying mutable ownership.
+    pub fn snapshot(&self) -> PeerStateSnapshot {
+        self.state.read().snapshot()
+    }
+
+    /// Retire the exact connector worker owned by this registry entry.
+    /// External `Arc` holders cannot keep callbacks or queued candidates live.
+    pub(super) fn retire_connector(&self) {
+        self.registry_retired.store(true, Ordering::Release);
+        drop(self.realtime_flow.lock().take());
+        let worker = self.session.lock().clone();
+        if let Some(worker) = worker {
+            worker.retire();
+        }
+    }
+
+    /// Fence the exact connector, await its single native cleanup owner, then
+    /// release Endpoint Auth Task's connected-channel claim.
+    pub(super) async fn retire_and_close(&self) -> crate::Result<()> {
+        self.retire_connector();
+        let worker = self.session.lock().clone();
+        let result = match worker {
+            Some(worker) => worker.retire_and_close().await,
+            None => Ok(()),
+        };
+        drop(self.endpoint_auth.lock().take());
+        result
+    }
+
+    pub(super) fn registry_retired(&self) -> bool {
+        self.registry_retired.load(Ordering::Acquire)
+    }
+
+    pub(super) fn install_endpoint_auth(
+        &self,
+        task: Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> bool {
+        let exact_connector = self
+            .session
+            .lock()
+            .as_ref()
+            .is_some_and(|worker| worker.owns_endpoint_auth(&task));
+        if !exact_connector {
+            return false;
+        }
+        let mut current = self.endpoint_auth.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(task);
+        true
+    }
+
+    pub(super) fn endpoint_auth_is_current(
+        &self,
+        task: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+    ) -> bool {
+        self.endpoint_auth
+            .lock()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, task))
+    }
+
+    /// Temporary Arc 03 adapter. Endpoint Auth owns connected-channel
+    /// provenance, while the existing authenticated and mutually-approved
+    /// state machine remains the admission fact until Arc 04 implements the
+    /// channel-bound transcript capability.
+    pub(super) fn install_legacy_realtime_flow(&self) -> bool {
+        if self.registry_retired() || !self.state.read().is_admitted() {
+            return false;
+        }
+        let worker = self.session.lock().clone();
+        let task = self.endpoint_auth.lock().clone();
+        let Some((worker, task)) = worker.zip(task) else {
+            return false;
+        };
+        let Some(capability) = worker.admit_legacy_realtime_flow(&task) else {
+            return false;
+        };
+        let mut current = self.realtime_flow.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(capability);
+        true
+    }
+
+    pub(super) fn realtime_flow_ports(
+        &self,
+    ) -> Option<(
+        Arc<WebRtcConnectorWorker>,
+        Arc<crate::connector::ConnectorRealtimeFlowCapability>,
+    )> {
+        if self.registry_retired() || !self.state.read().is_admitted() {
+            return None;
+        }
+        let worker = self.session.lock().clone()?;
+        let capability = self.realtime_flow.lock().clone()?;
+        worker
+            .owns_realtime_flow(&capability)
+            .then_some((worker, capability))
     }
 }

@@ -108,7 +108,7 @@ fn report(label: &str, mut samples_ms: Vec<f64>) {
 async fn run_area(n_spokes: usize) {
     let started = Instant::now();
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let operator = spawn_node("operator", &transport, &broker).await;
     let mut spokes = Vec::with_capacity(n_spokes);
@@ -301,3 +301,4 @@ async fn silent_area_soak() {
         .unwrap_or(24);
     run_area(n).await;
 }
+mod support;
