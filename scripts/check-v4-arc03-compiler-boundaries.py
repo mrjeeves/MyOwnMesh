@@ -15,6 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 CORE = REPO / "crates" / "myownmesh-core"
+DAEMON = REPO / "crates" / "myownmesh"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,17 @@ fn main() { let _ = std::mem::size_of::<ConnectorRealtimeFlowCapability>(); }
 """,
         "E0603",
         ("ConnectorRealtimeFlowCapability", "private"),
+    ),
+    RejectedProbe(
+        "resource_owner_cannot_be_minted_externally",
+        """use myownmesh_core::{ConnectorResourceOwnerPort, ConnectorResourcePolicy};
+fn bypass(policy: ConnectorResourcePolicy) {
+    let _ = ConnectorResourceOwnerPort::new(policy); // expected-error
+}
+fn main() {}
+""",
+        "E0624",
+        ("new", "private"),
     ),
 )
 
@@ -162,6 +174,14 @@ def main() -> int:
     webrtc_source = (CORE / "src" / "transport" / "webrtc.rs").read_text(
         encoding="utf-8"
     )
+    attempt_source = (CORE / "src" / "runtime" / "attempt" / "mod.rs").read_text(
+        encoding="utf-8"
+    )
+    engine_source = (CORE / "src" / "engine" / "mod.rs").read_text(
+        encoding="utf-8"
+    )
+    services_source = (DAEMON / "src" / "services.rs").read_text(encoding="utf-8")
+    embedded_source = (DAEMON / "src" / "embedded.rs").read_text(encoding="utf-8")
     for consumer in (
         "open_media_lane",
         "close_media_lane",
@@ -181,8 +201,64 @@ def main() -> int:
             failures.append(
                 f"{consumer} does not consume ConnectorRealtimeFlowCapability"
             )
+        body = re.search(
+            rf"pub\(crate\)\s+(?:async\s+)?fn\s+{consumer}\s*\(.{{0,700}}?\)\s*(?:->[^{{]+)?\{{(?P<body>.{{0,1200}}?)\n\s*\}}",
+            webrtc_source,
+            flags=re.DOTALL,
+        )
+        if body is None or "owns_realtime_flow" not in body.group("body"):
+            failures.append(f"{consumer} does not verify exact connector ownership")
     if "enable_realtime_delivery" in webrtc_source:
         failures.append("legacy worker-only real-time enablement still exists")
+    if not re.search(
+        r"fn\s+admit_legacy_realtime_flow\s*\(.{0,500}?\)\s*->.*?\{.{0,500}?owns_endpoint_auth",
+        webrtc_source,
+        flags=re.DOTALL,
+    ):
+        failures.append("legacy real-time issuer does not verify exact Endpoint Auth provenance")
+
+    if "ProcessResourceRoot::global().install_connector_policy(policy)?" not in webrtc_source:
+        failures.append("public transport policy path does not use the process resource root")
+    if "ProcessResourceRoot::global().mesh_runtime_scope()" not in engine_source:
+        failures.append("public Mesh runtime path does not use the process resource root")
+
+    capacity_shape = re.search(
+        r"pub struct ConnectorCallbackMailboxCapacities\s*\{(?P<body>.*?)\}",
+        attempt_source,
+        flags=re.DOTALL,
+    )
+    if capacity_shape is None:
+        failures.append("generic callback mailbox capacity type is missing")
+    else:
+        body = capacity_shape.group("body")
+        if "audio" in body or "video" in body:
+            failures.append("generic callback mailbox capacity still names audio or video")
+        for field in ("control", "endpoint_data", "realtime"):
+            if field not in body:
+                failures.append(f"generic callback mailbox capacity is missing {field}")
+
+    recv_queued = re.search(
+        r"async fn recv_queued\s*\(&mut self\).*?\n\s*\}",
+        webrtc_source,
+        flags=re.DOTALL,
+    )
+    if recv_queued is None or "ConnectorCallbackScheduler" not in webrtc_source:
+        failures.append("bounded callback scheduler is missing")
+    elif "biased;" in recv_queued.group(0):
+        failures.append("callback receiver still uses permanently biased selection")
+
+    for legacy_call in (
+        "routing::send_routed(",
+        "routing::broadcast_flood(",
+        "routing::on_relay_frame(",
+    ):
+        if legacy_call in engine_source:
+            failures.append(f"V4 engine path still invokes legacy forwarding: {legacy_call}")
+
+    if "LegacyPayloadRelayForbidden" not in services_source:
+        failures.append("V4 daemon service policy does not reject the legacy payload relay")
+    if "ServiceManager::validate_config(&cfg.services)?" not in embedded_source:
+        failures.append("V4 daemon startup does not validate the payload-relay service policy")
 
     with tempfile.TemporaryDirectory(prefix="myownmesh-v4-arc03-compiler-") as temporary:
         project = Path(temporary)
@@ -232,7 +308,7 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        "control, four cause-matched rejection controls, and six exact "
+        "control, five cause-matched rejection controls, and six exact "
         "real-time-flow consumers."
     )
     return 0

@@ -2124,10 +2124,16 @@ async fn network_update(state: &Arc<ControlState>, config: NetworkConfig) -> Res
 /// same config even if the live reconcile partly fails (a failed service
 /// start is logged inside `apply`, not surfaced as an error here).
 async fn services_set(state: &Arc<ControlState>, services: ServicesConfig) -> Response {
+    if let Err(e) = ServiceManager::validate_config(&services) {
+        return Response::err(format!("services policy rejected: {e}"));
+    }
     if let Err(e) = persist_services(&services) {
         return Response::err(format!("services config save failed: {e}"));
     }
-    let status = state.services.apply(services).await;
+    let status = match state.services.apply(services).await {
+        Ok(status) => status,
+        Err(e) => return Response::err(format!("services policy rejected: {e}")),
+    };
     Response::ok(serde_json::json!({ "status": status }))
 }
 

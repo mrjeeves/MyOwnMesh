@@ -19,9 +19,9 @@ The baseline commit remains fixed. The current fingerprints cover that baseline,
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `ee46d0bf9139b40c1d157932efee8b44ffd442f6b5879df0886255ce9153a597` |
-| Production Rust declaration members | 1,762 | `797f31b9296cc6eed59fe0145a9097343c2c0216b04c8802853e536eb9598b10` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,910 | `dbed310b91abbe861f2375cdd5b1c8c9370fee65a129c220418ecc405f6f4abb` |
+| Production Rust source units | 106 | `b29d095baa3abb64bbdeb986bdb8b2cb65f442b8dc76aa0397fa6582da7967ba` |
+| Production Rust declaration members | 1,792 | `f1a66aee68859013287d281b8a71db6712efa2a9e4670c39ebfe3fc32e41fe7a` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,952 | `4780aaf7147bdff122a5a644c120c12a2abeceb925eb52fd23ac2f256d555eeb` |
 | Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |
 | Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
@@ -35,21 +35,21 @@ The assignment counts are records, not architectural sizing targets.
 
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
-| Application Gateway | 348 | 164 |
-| Attempt Node | 76 | 60 |
-| Connector Worker | 183 | 207 |
+| Application Gateway | 351 | 165 |
+| Attempt Node | 92 | 72 |
+| Connector Worker | 189 | 229 |
 | Endpoint Auth Task | 33 | 15 |
 | Peer Session Node | 73 | 53 |
 | Reachability Node | 173 | 54 |
 | Relay Node | 38 | 40 |
-| Runtime Supervisor | 57 | 22 |
+| Runtime Supervisor | 61 | 25 |
 | Semantic Node | 117 | 111 |
 | Session Broker | 21 | 15 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
-| Resource instrumentation domain | 106 | 54 |
+| Resource instrumentation domain | 107 | 58 |
 | Delete | 23 | 25 |
 | Split | 86 | 384 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
@@ -92,11 +92,11 @@ WebRTC sessions still provision the existing native media primitives before endp
 
 This closes the original application-delivery finding for the admitted connector path. It does not establish a complete hostile-input budget for dependency-owned RTP work before that gate.
 
-### 2. Ordinary members forward application payload and may assert an origin
+### 2. Legacy ordinary-member payload routing remains an open removal item
 
-The current fallback routing path wraps application data, forwards it through ordinary members, and accepts an asserted source when the topology identifies the carrier as a forwarder. The acceptance and re-forwarding path is in [`engine/routing.rs`](../../crates/myownmesh-core/src/engine/routing.rs#L142). A failed direct send enters this path from [`engine/mod.rs`](../../crates/myownmesh-core/src/engine/mod.rs#L2656).
+The legacy routing module still contains code that wraps application data, forwards it through ordinary members, and accepts an asserted source when the topology identifies the carrier as a forwarder. The acceptance and re-forwarding implementation remains in [`engine/routing.rs`](../../crates/myownmesh-core/src/engine/routing.rs). Arc 03D removes every V4 engine call to `send_routed`, `broadcast_flood`, and `on_relay_frame`. Directed and broadcast channel paths now use exact endpoint-session sends only.
 
-This is not the target Relay Node. It has no exact A-to-C allocation and no authenticated A-to-C channel behind the forwarding member. The migration matrix already assigns this code no target. Its reproductions may be retained, but the production behavior is scheduled for deletion.
+This is not the target Relay Node. It has no exact A-to-C allocation and no authenticated A-to-C channel behind the forwarding member. RTM-001 remains open until the legacy module and compatibility surface are removed or separately dispositioned. Arc 03 does not claim repository-wide removal merely because the V4 path no longer invokes it.
 
 ### 3. Public interfaces expose internal state and Device signing authority
 
@@ -106,9 +106,9 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 03 places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through handshake, approval, roster persistence, waiter completion, reconnect cleanup, and reliable-send effects. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Production no longer uses the compatibility state. It constructs the connector through a candidate admitted by an injected process resource owner, promotes the exact data channel, and moves the resulting capability into an exact-incarnation `EndpointAuthTask`. Connector callbacks use four independently bounded, owner-configured mailboxes and an ordered per-worker handler rather than the unbounded general command queue. The global command queue remains unbounded for its existing non-connector commands. The observed pre-SDP candidate queue and several signaling queues also remain unbounded at process scope. RPC streaming uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 03 places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through handshake, approval, roster persistence, waiter completion, reconnect cleanup, and reliable-send effects. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Production constructs the connector through a candidate admitted by the one owner installed in `ProcessResourceRoot`, promotes the exact data channel, and moves the resulting capability into an exact-incarnation `EndpointAuthTask`. Connector callbacks use three independently bounded generic mailboxes, owner-supplied scheduler weights, reliable control and endpoint-data backpressure, and deadline-aware real-time dropping. The global command queue remains unbounded for its existing non-connector commands. The observed pre-SDP candidate queue and several signaling queues also remain unbounded at process scope. RPC streaming uses an unbounded queue and detached request tasks.
 
-This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 now enforces connector ownership, cancellation, exact promotion, and per-worker backpressure without inventing process-wide admission values. Complete anonymous-ingress and global resource admission remains unresolved.
+This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 now enforces process-global connector count, connector ownership, cancellation, exact promotion, and per-worker backpressure without inventing values. Complete anonymous-ingress admission for every dependency-owned resource remains unresolved.
 
 ### 5. Nostr inbound events are trusted beyond their proven carrier facts
 

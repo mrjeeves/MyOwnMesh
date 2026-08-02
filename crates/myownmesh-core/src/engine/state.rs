@@ -616,6 +616,10 @@ pub struct NetworkState {
     /// delivered/forwarded, so flood cross-paths and retransmits are
     /// dropped at the door. Bounded at
     /// [`super::routing::ROUTING_SEEN_CAPACITY`].
+    #[allow(
+        dead_code,
+        reason = "RTM-001 retains legacy forwarding state until that compatibility surface is dispositioned"
+    )]
     pub(crate) routing_seen: Mutex<std::collections::VecDeque<(String, u64)>>,
 
     /// Per-network traffic accounting (see [`super::traffic`]) —

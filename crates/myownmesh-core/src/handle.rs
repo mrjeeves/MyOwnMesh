@@ -26,7 +26,7 @@ use crate::protocol::CapabilityAdvert;
 use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
-use crate::runtime::attempt::{ConnectorResourceOwnerPort, ConnectorResourceOwnerReport};
+use crate::runtime::attempt::{ConnectorResourceOwnerReport, ConnectorResourcePolicy};
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// How long [`JoinedNetwork::announce_leave`] waits after queuing the
@@ -72,13 +72,12 @@ impl Mesh {
     /// Build a `Mesh` whose native connector allocations are admitted by the
     /// caller's process resource owner. Arc 03 supplies no fallback policy or
     /// inferred capacity.
-    pub async fn open_with_connector_resource_owner(
+    pub async fn open_with_connector_resource_policy(
         config: MeshConfig,
-        resource_owner: ConnectorResourceOwnerPort,
+        policy: ConnectorResourcePolicy,
     ) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
-        Self::open_with_identity_and_connector_resource_owner(config, identity, resource_owner)
-            .await
+        Self::open_with_identity_and_connector_resource_policy(config, identity, policy).await
     }
 
     /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
@@ -96,13 +95,13 @@ impl Mesh {
         Self::open_with_identity_and_transport(identity, transport)
     }
 
-    /// Identity-injected form of [`Self::open_with_connector_resource_owner`].
-    pub async fn open_with_identity_and_connector_resource_owner(
+    /// Identity-injected form of [`Self::open_with_connector_resource_policy`].
+    pub async fn open_with_identity_and_connector_resource_policy(
         _config: MeshConfig,
         identity: Arc<Identity>,
-        resource_owner: ConnectorResourceOwnerPort,
+        policy: ConnectorResourcePolicy,
     ) -> Result<MeshHandle> {
-        let transport = Transport::new()?.with_connector_resource_owner(resource_owner);
+        let transport = Transport::new()?.with_connector_resource_policy(policy)?;
         Self::open_with_identity_and_transport(identity, transport)
     }
 

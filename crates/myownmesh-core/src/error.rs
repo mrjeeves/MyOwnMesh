@@ -49,6 +49,9 @@ pub enum Error {
     #[error("transport: {0}")]
     Transport(String),
 
+    #[error("connector resource policy: {0}")]
+    ConnectorResourcePolicy(#[from] Box<crate::runtime::attempt::ConnectorResourcePolicyConflict>),
+
     #[error("network: {0}")]
     Network(String),
 
@@ -74,6 +77,12 @@ pub enum Error {
     /// call sites should prefer a typed variant where one exists.
     #[error("{0}")]
     Other(String),
+}
+
+impl From<crate::runtime::attempt::ConnectorResourcePolicyConflict> for Error {
+    fn from(conflict: crate::runtime::attempt::ConnectorResourcePolicyConflict) -> Self {
+        Box::new(conflict).into()
+    }
 }
 
 impl Error {

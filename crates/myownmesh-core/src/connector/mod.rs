@@ -70,18 +70,20 @@ impl ConnectedChannelCapability {
         self.candidate
     }
 
-    pub(crate) fn poison_cleanup(&mut self) {
-        self.candidate.poison_cleanup();
+    pub(crate) fn retain_after_cleanup_failure(&mut self) {
+        self.candidate.retain_after_cleanup_failure();
     }
 }
 
-/// Exact, process-local authority for one connector-native real-time flow.
+/// Compatibility-only, process-local authority for connector-native
+/// real-time work.
 ///
 /// This type deliberately says nothing about codecs, media kinds, lanes, or
 /// application semantics. It only proves that the legacy admission path
-/// authorized real-time work on one exact live connector incarnation. Arc 04
-/// will replace that compatibility issuance point with authenticated-session
-/// ownership.
+/// authorized real-time work on one exact live connector incarnation. It is
+/// not the generalized flow contract. That later authority must be bound to
+/// an authenticated session and principal, guarded by application policy, and
+/// backed by its own resource reservation.
 ///
 /// It has no public constructor and is neither cloneable by value nor
 /// serializable. Runtime owners may share the exact instance through `Arc`.

@@ -1,214 +1,163 @@
 # V4 Arc 03 WebRTC connector ownership
 
-Status: corrective implementation candidate on `arc/03-webrtc-connector-worker`. PR #112 remains draft and unmerged. Arc 03 is not merge-approved until the exact pushed head passes the supported-platform matrix and the owner supplies reviewed production resource-policy values.
+Status: corrective Arc 03D implementation candidate on `arc/03-webrtc-connector-worker`. PR #112 remains draft and unmerged. Arc 03 is not merge-approved until the exact pushed head passes the supported-platform matrix and the owner supplies reviewed production policy values.
 
 Frozen Arc 02C parent: `0484f7f0987e5d1c488b30ac21e46f1925ea65cb`
 
 ## 1. Scope
 
-Arc 03 puts the existing WebRTC connection path behind explicit resource, attempt, connector, cleanup, and Endpoint Auth owners. It preserves the existing ICE, STUN, TURN, DTLS, direct path, native RTP, H.264, Opus, mDNS, Nostr, reconnect, and recovery behavior.
+Arc 03 puts the existing WebRTC connection path behind explicit process, attempt, connector, cleanup, and Endpoint Auth owners. It preserves ICE, STUN, TURN, DTLS, direct paths, native RTP, H.264, Opus, mDNS, Nostr, reconnect, and recovery behavior.
 
-This arc adds no route identity, durable connector record, path generation, pair permission, application relay, or authentication-before-pathfinding rule. It adds no Arc 03 responsibilities to `PeerStateData`, `NetworkCmd`, or `NetworkState`.
+This arc does not add route identities, durable connector records, path generations, pair permissions, authentication before pathfinding, Endpoint Auth transcript verification, durable session semantics, or codec policy. It does not add Arc 03 responsibilities to `PeerStateData`, `NetworkCmd`, or `NetworkState`.
 
-## 2. Cardinality and owner chain
+## 2. Cardinality and ownership
 
 ```text
-process resource owner
-    -> admits one structural connector-candidate claim
+one ProcessResourceRoot
+    -> one process connector resource owner
+    -> shared by every Mesh runtime in the process
 
 one connection attempt
-    -> may own multiple connector candidates
+    -> multiple connector candidates
 
-one WebRTC connector candidate
+one connector candidate
     -> one RTCPeerConnection and ICE agent
     -> multiple internal ICE candidates and candidate pairs
 
 DataChannelOpen from the exact live connector
     -> ConnectedChannelCapability
     -> EndpointAuthTask owns connected-channel provenance
-    -> existing endpoint authentication and bilateral admission
-    -> optional codec-neutral ConnectorRealtimeFlowCapability
 ```
 
-`ConnectorCandidateCapability` names one complete connector candidate. It never names a trickled `LocalIceCandidate`.
+`ConnectorCandidateCapability` names one complete connector candidate. It does not name a trickled `LocalIceCandidate`.
 
-`admit_single_connector_candidate` defines the structural claim and creates an attempt. It cannot admit its own capacity. `PreAuthAttemptPermit` receives a `ConnectorResourceOwnerPort`, and only that external port can reserve a candidate. The port is shared by the process transport and reports its live candidate count and poison state.
+`admit_single_connector_candidate` defines the structural claim. It cannot create capacity. Only the owner installed in `ProcessResourceRoot` can reserve that claim. A second Mesh runtime requesting the same policy shares the installed owner. A conflicting policy is rejected with `ConnectorResourcePolicyConflict`. External code cannot construct `ConnectorResourceOwnerPort` directly.
 
-The public owner policy has no `Default`. The owner must provide:
+## 3. Owner-selected policy
 
-- the maximum active connector-candidate count;
-- separate control, endpoint-data, audio, and video callback mailbox capacities;
-- a nonzero native-close deadline.
+The public policy has no `Default`. The process owner must supply all of these values:
 
-The implementation does not infer or manufacture those values.
+- maximum active connector candidates for the process;
+- control callback capacity;
+- endpoint-data callback capacity;
+- codec-neutral real-time callback capacity;
+- control, endpoint-data, and real-time scheduler weights;
+- maximum encoded real-time unit bytes;
+- real-time enqueue deadline;
+- native close timeout.
 
-## 3. Attempt transition and lock order
-
-`AttemptLifetime` is the cancellation owner for one candidate race. Allocation, promotion, and retirement use one synchronous attempt-transition mutex.
-
-Connector promotion uses a non-nested transition:
-
-1. Move the candidate into private `Promoting` state under connector authority.
-2. Release connector authority.
-3. Perform the attempt transition.
-4. Release the attempt-transition mutex.
-5. Reacquire connector authority and publish the result.
-
-Attempt retirement releases its transition mutex before notifying watchers. No production path acquires connector authority while holding attempt transition and then acquires those locks in reverse elsewhere.
-
-A promoted winner is no longer an awaiting race candidate. Retiring the attempt invalidates and cleans losing candidates without revoking the connected winner.
+No daemon or library path infers these values. The values remain owner decisions until measurement and review establish production settings.
 
 ## 4. Reserve before allocation
 
 Production construction follows this order:
 
 ```text
-request reservation from process resource owner
-    -> reserve exact structural child claim
-    -> create the one connector cleanup owner
+request a process reservation
+    -> reserve the opening claim
+    -> create the cleanup owner
     -> start owned asynchronous construction
-    -> allocate RTCPeerConnection privately
-    -> attach it to the same cleanup owner
-    -> install callbacks and existing connector machinery
-    -> recheck exact attempt liveness
-    -> publish worker or start cleanup
+    -> allocate RTCPeerConnection
+    -> attach it to the cleanup owner
+    -> install callbacks and connector machinery
+    -> recheck attempt liveness
+    -> publish the worker or start cleanup
 ```
 
-The resource guard exists before the construction task, native peer, callback mailboxes, parser work, or candidate work that it protects. Unknown input can reach this owner under anonymous-ingress and process policy. It does not require a Device identity or Closed-mesh authorization.
+The reservation exists before native construction. Cancellation after native allocation, result delivery, owner-controlled runtime shutdown, or construction failure starts the same cleanup owner. The runtime owner cancels and joins construction before destroying its executor. The cleanup owner then fences callbacks, drains connector-owned pending candidates, wakes blocked work, and retires the native peer. A confirmed close releases the reservation. A failed or unconfirmed close retains only that connector's exact claim.
 
-The same `ConnectorCloseOwner` follows partial, delivered, cancelled, and installed results. Cancellation after native allocation and cancellation after result delivery both start that owner. Caller-runtime shutdown cannot cancel the cleanup attempt because the close owner uses its own bounded cleanup runtime. The native dependency may still fail to close after its original runtime disappears; that outcome reaches visible poison and conservative retention at the configured deadline.
+Raw `Transport::open_peer*` construction remains available only to tests or the explicit `transport-lab` feature.
 
-Raw `Transport::open_peer*` construction is absent from the default production API. It remains available only to unit tests or the explicit `transport-lab` feature.
+## 5. Lock order and retirement
 
-## 5. Cleanup ownership and close failure
+Attempt allocation, promotion, and retirement share one attempt-transition mutex. Connector promotion does not hold connector authority while acquiring that mutex:
 
-Connector retirement fences callback acceptance, wakes blocked producers and silent workers, cancels local awaits, drains the owned remote-candidate queue, retires losing candidates, and starts the one native close owner.
+1. Move the candidate to private `Promoting` state under connector authority.
+2. Release connector authority.
+3. Perform the attempt transition.
+4. Release the attempt-transition mutex.
+5. Reacquire connector authority and publish the result.
 
-Successful native close is the only path that releases the connector claim and attached connected claims. The cleanup owner applies the owner-supplied close deadline and produces one terminal result for all waiters.
+Attempt retirement releases its transition mutex before notifying connector work. A promoted winner is no longer an awaiting race candidate. Retirement cleans losing candidates without revoking an already transferred connected winner.
 
-Close error, timeout, cleanup-runtime build failure, or cleanup-thread start failure produces an explicit `Poisoned` terminal state. In that state:
+## 6. Accounting failure and cleanup failure
 
-- the resource owner remains conservatively consumed;
-- the report remains visibly poisoned with a nonzero active candidate count;
-- later candidate admission is refused;
-- the failed allocation is never treated as reusable capacity.
+The opening claim contains one transport object, one connector-construction work item, and one owned task slot. The connected claim contains one transport object and one owned cleanup task slot. Promotion atomically replaces the opening claim with the connected claim.
 
-Duplicate connected claims are retained in an explicit poisoned collection. No duplicate path uses `mem::forget`. Adding another claim cannot overwrite a terminal cleanup failure or strand waiters.
+There are two different failure classes:
 
-The failure is bounded in time by the supplied close deadline. Capacity remains unavailable for the process lifetime because native cleanup was not proven. The leak is visible and bounded by the owner policy, not silent or reusable.
+- Aggregate accounting corruption means the total can no longer be proved. Examples include inconsistent subtraction and a poisoned accounting mutex. The process owner sets `accounting_poisoned`, preserves conservative consumption, and refuses later admissions.
+- A known native cleanup failure belongs to one exact connector. Close error, close timeout, cleanup-runtime failure, or cleanup-thread failure retains that connector's exact claims and returns a visible terminal error. It does not poison unrelated process slots. The retained claim continues to consume capacity.
 
-## 6. Resource transition
+Duplicate connected claims are kept in an explicit collection. They are never forgotten or overwritten. If native close succeeds, the exact retained claims release. If close fails, those claims remain held.
 
-The exact structural opening claim contains:
+## 7. Callback classes and backpressure
 
-- one transport object;
-- one connector-construction work item;
-- one owned task slot.
-
-The connected claim contains one transport object and one owned task slot for eventual cleanup. Promotion atomically replaces the opening claim with the connected claim. It releases construction-only work without exposing an unreserved interval.
-
-An inconsistent aggregate transition or release poisons the resource owner, preserves conservative consumption, and refuses later admission. Production resource measurement contains no `expect` or panic path.
-
-These are structural claims, not a complete WebRTC memory model. Dependency-owned sockets, ICE pairs, DNS, STUN, TURN, allocator overhead, and internal ICE-agent queues still need measured policy work where the dependency exposes usable observations.
-
-## 7. Callback mailboxes
-
-Each connector has four independent bounded mailboxes:
+The generic connector has three callback classes:
 
 - control;
 - endpoint data;
-- audio;
-- video.
+- codec-neutral real-time flow.
 
-The process resource owner supplies each capacity separately. Backpressure in one class cannot occupy another class's mailbox. Producers await capacity and race that await against connector retirement, so retirement wakes a producer blocked on a full mailbox.
+Audio and video names exist only in the WebRTC compatibility adapter. They share the generic real-time mailbox and do not appear in `ConnectorCallbackMailboxCapacities`.
 
-The receiver currently prefers control, then endpoint data, then audio, then video when several classes are ready. The deterministic tests prove isolation and backpressure for every class. They do not prove an operationally sufficient capacity or starvation bound. Capacity and workload suitability remain measured owner decisions.
+The receiver uses an owner-weighted rotating scheduler. A ready class can consume only its current service quantum before the scheduler advances. Empty classes are skipped. This gives every continuously ready admitted class a bounded service opportunity. No weight is built into production code.
 
-Connector events do not enter the general `NetworkCmd` queue. Every event carries the exact worker incarnation, and stale queued events cannot mutate a replacement worker.
+Control and endpoint-data callbacks use bounded reliable backpressure and race their waits against connector retirement. Real-time callbacks use the owner-supplied enqueue deadline. A real-time callback that cannot enter its queue before that deadline is dropped as the newest unit. This is a compatibility contract, not the final application flow contract.
 
-The pre-SDP remote-candidate queue remains observation-only. Its items, logical bytes, retained bytes, and `Vec` container capacity are observed separately. Arc 03 does not claim that observation is an admission limit.
+Ordinary endpoint frames use `MAX_ENDPOINT_FRAME_BYTES`. Encoded real-time units use the separate owner-supplied `max_realtime_unit_bytes`. Their accounting paths are also separate: endpoint bytes use `FrameBytes`, while encoded real-time units use `MediaQuarantine`. An H.264, HEVC, AV1, or other access unit is not constrained by the ordinary endpoint-frame limit unless the owner independently selects the same numeric value.
 
-## 8. Exact peer ownership
+## 8. Data channel and Endpoint Auth
 
-Every registry installation has a process-local installation stamp. `PeerOwnerToken` contains that stamp and cannot be recreated from a Device ID, label, or diagnostic epoch.
+`DataChannelOpen` proves that the exact connector has a working channel eligible for Endpoint Auth. It does not prove application reachability, endpoint identity, bilateral admission, or session authority.
 
-Synchronous exact-owner effects use `PeerRegistry::with_current`. Asynchronous work captures the exact token and rechecks it before committing state or sending an owner-derived message.
+The exact candidate is consumed into `ConnectedChannelCapability`, then moved into `EndpointAuthTask`. `EndpointAuthTask` is the mandatory connected-channel provenance owner. Arc 03 does not claim Endpoint Auth resource admission or transcript verification.
 
-The activation commit stays inside the exact-owner fence through roster persistence. A forced replacement at that boundary proves that the stale owner cannot persist membership, broadcast governance, resolve waiters, clear reconnect state, flush application frames, or emit `Approved` for the replacement.
+Before peer admission, the engine accepts only the existing Endpoint Auth protocol. Application messages and real-time delivery remain blocked.
 
-Only inbound `Approve` records remote consent. A successful local send records only local connector acceptance. Authentication, local send acceptance, and inbound approval must all belong to the same current owner before activation.
+## 9. Real-time compatibility capability
 
-## 9. Endpoint Auth and real-time flow
+`ConnectorRealtimeFlowCapability` is a temporary connector compatibility capability. It proves only that the current legacy admission path authorized connector-native real-time work on one exact live connector.
 
-`DataChannelOpen` consumes the exact live connector candidate. A move-only handoff binds the resulting `ConnectedChannelCapability` to the exact connector incarnation and places it in `EndpointAuthTask`.
+It is not the final generalized real-time-flow contract. That later contract must be session-bound, principal-bound, policy-guarded, and independently resource-reserved. Arc 03 does not define or mint that final authority.
 
-`EndpointAuthTask` is the mandatory connected-channel provenance owner. Arc 03 does not claim that it has admitted endpoint-authentication resources or verified the Arc 04 transcript. Those remain Arc 04 work.
+The existing WebRTC adapter requires the compatibility capability for lane open, lane close, encoded send, and lane reaping. Possession of `&WebRtcConnectorWorker` is insufficient. H.264, Opus, audio, video, and lane names remain compatibility details rather than basal capability semantics.
 
-The legacy authenticated and mutually-approved state transition may request a `ConnectorRealtimeFlowCapability` through the installed Endpoint Auth task. Issuance checks all of these facts:
+## 10. Endpoint path and legacy forwarding
 
-- the peer is the current registry owner;
-- the peer is authenticated and Active or Shelved;
-- the Endpoint Auth task belongs to the exact live connector;
-- the connector is not retired.
+The V4 channel path sends endpoint data only to the selected endpoint session. A broadcast performs one direct endpoint-session send per connected peer. The V4 engine no longer invokes `routing::send_routed`, `routing::broadcast_flood`, or `routing::on_relay_frame`.
 
-The capability is codec-neutral. It grants one exact connector-native real-time flow and names no media kind, lane, codec, H.264, Opus, video, or audio semantic. The existing media adapter consumes that capability for lane open, lane close, real-time send, and lane reaping.
+TURN selection does not change this boundary. TURN is an ICE carrier for the exact endpoint session, not a MyOwnMesh application relay. Signaling and endpoint payload do not share a logical service.
 
-Possessing `&WebRtcConnectorWorker` is insufficient for those operations. A capability from another connector, including another connector in the same runtime, is rejected. Outbound application frames also check current session admission before any direct send or shaped-topology fallback.
+RTM-001 remains an outstanding legacy violation until the old shaped-topology routing module and its compatibility surface are removed or separately dispositioned. Arc 03 does not claim that every historical repository path is endpoint-to-endpoint merely because the V4 connector path no longer calls that module.
 
-Before general peer admission, the existing engine admits only endpoint-authentication protocol. Application messages remain blocked. Remote audio is dropped before event creation and remote video is dropped before access-unit assembly.
+RTM-002 separately tracks the optional `RelayService`, which forwards opaque application payload through an ordinary member. The connector-capable V4 daemon rejects an initially enabled relay with a typed service-policy error, and live service reconfiguration rejects it before persistence. The public legacy relay type remains in the repository, so RTM-002 stays open until that direct construction surface is removed or separately fenced.
 
-## 10. Public construction surface
+## 11. Daemon startup
 
-`Mesh::open_with_connector_resource_owner` and `Mesh::open_with_identity_and_connector_resource_owner` install an explicit process resource owner. `MeshHandle::connector_resource_report` exposes its current state.
+`embedded::start` now returns the typed `EmbeddedStartError::MissingConnectorResourcePolicy`. `embedded::start_with_connector_resource_policy` is the explicit connector-capable daemon entry point.
 
-The older `Mesh::open` and `Mesh::open_with_identity` paths select no hidden policy. They can construct the mesh runtime, but native connector allocation is refused until an owner port is installed through the explicit constructor. This preserves source compatibility without manufacturing production capacity.
+This prevents an ownerless daemon from silently creating a Mesh that later refuses every native connector. No startup path invents policy values.
 
-`PeerSession` has no `Deref` implementation. The worker exposes narrow connector methods. The raw peer constructors remain test or lab surfaces.
+## 12. Public construction surface
 
-## 11. TURN-selected endpoint proof
+`Mesh::open_with_connector_resource_policy` and `Mesh::open_with_identity_and_connector_resource_policy` install or reuse the process policy. `Transport::with_connector_resource_policy` uses the same `ProcessResourceRoot`. `MeshHandle::connector_resource_report` exposes active candidates and aggregate accounting poison state.
 
-The Linux integration test starts the repository's real TURN server on an ephemeral loopback port and forces both WebRTC transports to relay-only selection through the lab feature. The test supplies explicit test-only resource policies. Those fixture values are not production recommendations.
+`Mesh::open` and `Mesh::open_with_identity` still support ownerless library use, but their transports cannot allocate native connectors. Daemon startup does not use those paths.
 
-The positive control requires, for both endpoints:
+`PeerSession` has no `Deref` implementation. The worker exposes narrow connector methods. Raw peer constructors remain test or lab surfaces.
 
-- `Authenticated` before `Approved`;
-- the expected endpoint identity;
-- bilateral admission;
-- a selected Relay-to-Relay ICE pair;
-- typed endpoint data delivered in both directions.
+## 13. Proof boundary and merge blockers
 
-The negative control creates a second relay-selected pair with endpoint authentication but no bilateral admission. It proves that relay selection cannot authorize typed endpoint data, real-time sample delivery, or lane creation.
+Deterministic controls cover process-global admission, conflicting policies, reserve-before-allocation, promotion and retirement ordering, successful close, exact-claim retention after close failure, cleanup timeout, cleanup startup failure, weighted callback service, class-specific backpressure, separate endpoint and real-time limits, Endpoint Auth provenance, stale replacement, and V4 rejection of legacy forwarding calls.
 
-A socket-free core negative control also assigns a Relay-to-Relay diagnostic pair to unauthenticated and pending peers. Neither state satisfies session admission or produces a real-time-flow capability.
+Socket-bearing controls in WSL cover native construction cancellation, owner-controlled runtime shutdown, direct WebRTC behavior, and the real TURN-selected positive and negative endpoint paths.
 
-Signaling uses the existing local test broker. Endpoint payload uses the ordinary endpoint session. TURN is the selected ICE carrier, not a MyOwnMesh application relay, and signaling carries no endpoint data.
+Arc 03 remains draft and unmerged until all of these conditions hold:
 
-## 12. Executed proof boundary
+1. The exact pushed head passes formatting, check, Clippy, tests, doctests, compiler-boundary checks, and the red-team record.
+2. The unchanged Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl, and Linux ARM64 musl matrix passes on that exact head.
+3. The owner reviews measured production values for every policy field listed in section 3.
+4. The WSL socket tests pass on the exact source revision.
 
-The local deterministic controls cover:
-
-- external resource-owner admission before allocation;
-- multi-candidate attempt ownership and retirement;
-- non-nested attempt and connector transitions;
-- atomic candidate-to-connected resource transfer;
-- successful close, close error, close timeout, caller-runtime shutdown, and cleanup-start failure;
-- construction cancellation during caller-runtime shutdown and background-task failure;
-- explicit duplicate-claim poison retention;
-- Endpoint Auth handoff release before and after native close;
-- independent control, endpoint-data, audio, and video backpressure;
-- stale peer replacement at roster persistence;
-- codec-neutral real-time-flow gating;
-- relay diagnostics having no authentication or admission authority.
-
-Socket-bearing cancellation, native WebRTC preservation, and the real TURN proof run in the isolated Linux harness. Exact commands and attack statements are in `red-teams/ARC-03-WEBRTC-CONNECTOR-WORKER.md`.
-
-## 13. Merge blockers
-
-Arc 03 must remain draft and unmerged until:
-
-1. The exact pushed head passes the unchanged Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl, and Linux ARM64 musl CI matrix.
-2. The owner reviews measured production values for candidate count, the four callback mailboxes, and native-close deadline.
-3. The isolated Linux socket tests pass on the exact source revision.
-4. The source inventory, compiler-boundary checker, and red-team record match the exact source.
-
-Arc 03 does not claim complete hostile-ingress resource admission, complete retained-memory accounting, a bounded pre-SDP candidate queue, Endpoint Auth transcript verification, or Endpoint Auth resource admission.
+Arc 03 does not claim complete hostile-ingress admission, complete dependency-owned resource accounting, a bounded pre-SDP candidate queue, Endpoint Auth transcript verification, Endpoint Auth resource admission, final real-time session authority, or removal of RTM-001 and RTM-002.

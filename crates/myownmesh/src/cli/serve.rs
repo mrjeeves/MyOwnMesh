@@ -1,10 +1,10 @@
-//! `myownmesh serve` — run the daemon in the foreground.
+//! `myownmesh serve`: run the daemon in the foreground.
 //!
 //! A thin wrapper over [`myownmesh::embedded`]: load the config, start the
 //! daemon on this runtime, and hold it until SIGINT/SIGTERM asks for the
-//! graceful teardown. Everything the daemon *is* — the mesh instance, the
+//! graceful teardown. Everything the daemon owns, including the mesh instance, the
 //! network registry, hosted services, the updater tick, the control-socket
-//! listener — lives in the library, so an embedder (an iOS app, which can't
+//! listener, lives in the library, so an embedder (an iOS app, which can't
 //! spawn processes) runs the identical daemon in-process.
 
 use anyhow::{Context, Result};

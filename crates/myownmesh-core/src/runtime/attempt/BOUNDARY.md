@@ -28,13 +28,13 @@ The capability spine depends only on local ownership and move semantics. Arc 03 
 
 `PreAuthAttemptPermit` is not consumed by its first connector candidate. It may request several child reservations, but it cannot create capacity. Every request goes to the injected process resource owner. Each connector candidate carries its admitted child reservation and an unforgeable witness for the exact attempt that issued it.
 
-The active claim is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the fixed per-candidate structure needed to prove ownership of one transport object, construction work, and an owned task slot. The external owner supplies the process candidate count, four callback mailbox capacities, and native-close deadline. There is no production default.
+The active claim is a fixed vector over the closed pre-authentication resource-family set. Capacity in one family cannot pay for another family. Arc 03 supplies only the fixed per-candidate structure needed to prove ownership of one transport object, construction work, and an owned task slot. `ProcessResourceRoot` installs one owner shared by all Mesh runtimes in the process. The external owner supplies the process candidate count, three generic callback capacities, three scheduler weights, real-time unit limit, real-time enqueue deadline, and native close timeout. There is no production default.
 
 The child is acquired before connector construction starts. A refused child claim performs no allocation. Real asynchronous construction runs in an owned task. Cancellation fences publication, closes any private native result, and returns the child claim only after successful native cleanup.
 
 Candidate promotion atomically changes the child from its opening claim to its connected claim. Candidate-only construction work is released while the transport claim remains with the connected-channel capability.
 
-Arc 03 does not invent production values. The resource owner must supply measured, owner-approved values. Anonymous-ingress and process-global admission remain possible before a Device identity or Closed authorization is known. The current port bounds active connector candidates, but it is not a complete hostile-ingress model for every dependency-owned allocation.
+Arc 03 does not invent production values. The resource owner must supply measured, owner-approved values. Anonymous-ingress and process-global admission remain possible before a Device identity or Closed authorization is known. A known per-candidate cleanup failure retains that exact claim without poisoning unrelated process slots. Only accounting states whose aggregate total cannot be proved refuse all later admission. The current port bounds active connector candidates, but it is not a complete hostile-ingress model for every dependency-owned allocation.
 
 ## Restart behavior
 

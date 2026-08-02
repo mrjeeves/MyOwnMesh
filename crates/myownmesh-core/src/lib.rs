@@ -134,11 +134,13 @@ pub use network_state::{
     SIGN_DOMAIN_TAG_STATE,
 };
 pub use protocol::CapabilityAdvert;
+pub use resource::ProcessResourceRoot;
 pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
-    ConnectorCallbackMailboxCapacities, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
-    ConnectorResourcePolicy,
+    ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
+    ConnectorCallbackServiceWeights, ConnectorResourceOwnerPort, ConnectorResourceOwnerReport,
+    ConnectorResourcePolicy, ConnectorResourcePolicyConflict,
 };
 pub use services::{
     relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,

@@ -29,6 +29,10 @@ pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
+#[allow(
+    dead_code,
+    reason = "RTM-001 retains the unreachable legacy forwarding implementation for later disposition"
+)]
 pub mod routing;
 pub mod scheduler;
 pub mod signaling_bridge;
@@ -2310,12 +2314,12 @@ async fn handle_pc_state_change(
 /// above any real handshake / roster / governance / RPC / user-channel frame —
 /// so it only ever bites a pathological one. (Per-peer byte-rate budgets are a
 /// deeper follow-up; this is the hard per-frame ceiling.)
-pub(crate) const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_ENDPOINT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether an inbound frame is small enough to decode. Split out so the
-/// [`MAX_INBOUND_FRAME_BYTES`] boundary is unit-tested.
+/// [`MAX_ENDPOINT_FRAME_BYTES`] boundary is unit-tested.
 fn frame_within_cap(len: usize) -> bool {
-    len <= MAX_INBOUND_FRAME_BYTES
+    len <= MAX_ENDPOINT_FRAME_BYTES
 }
 
 /// Which admission phase an inbound frame requires before it may move peer
@@ -2365,7 +2369,7 @@ async fn handle_inbound_frame_from(
         warn!(
             peer = %device_id,
             len = bytes.len(),
-            "dropping oversize inbound frame (> {MAX_INBOUND_FRAME_BYTES} bytes)"
+            "dropping oversize inbound endpoint frame (> {MAX_ENDPOINT_FRAME_BYTES} bytes)"
         );
         return;
     }
@@ -2698,15 +2702,9 @@ async fn on_channel_frame(
     channel: String,
     payload: serde_json::Value,
 ) {
-    // Routed envelopes ride the reserved relay channel; the router
-    // consumes the wrapper-shaped ones (delivering / forwarding across
-    // the topology) and leaves legacy RelayService envelopes to the
-    // ordinary subscriber path below.
-    if channel == crate::services::relay::RELAY_CHANNEL
-        && Box::pin(routing::on_relay_frame(state, device_id, &payload)).await
-    {
-        return;
-    }
+    // Arc 03 never interprets an endpoint frame as an ordinary-member routing
+    // envelope. The legacy routing module remains tracked by RTM-001, but the
+    // V4 inbound path does not dispatch into it.
     state.dispatch_channel_frame(&channel, device_id, payload);
 }
 
@@ -2808,38 +2806,15 @@ async fn send_channel_frame(
             "peer is not admitted for application traffic: {peer}"
         )));
     }
-    // Only a shaped topology can ever route around a missing link, so
-    // only a shaped topology pays for keeping a copy. On full mesh the
-    // payload moves — this is the hot path for MJPEG / PCM / file
-    // chunks, and a per-frame clone of a 100 KB frame is real money.
-    let shaped = state.topology_impl.read().prunes();
-    if !shaped {
-        return send_to_peer(
-            state,
-            peer,
-            &MeshMessage::Channel {
-                channel: channel.to_string(),
-                payload,
-            },
-        )
-        .await;
-    }
-    let direct = send_to_peer(
+    send_to_peer(
         state,
         peer,
         &MeshMessage::Channel {
             channel: channel.to_string(),
-            payload: payload.clone(),
+            payload,
         },
     )
-    .await;
-    match direct {
-        Ok(()) => Ok(()),
-        // Under a shaped topology "no direct link" is the normal state
-        // for most pairs — hand the frame to the shape's forwarders
-        // instead of surfacing an error the caller can't act on.
-        Err(_) => routing::send_routed(state, peer, channel, &payload).await,
-    }
+    .await
 }
 
 async fn broadcast_channel_frame(
@@ -2847,13 +2822,8 @@ async fn broadcast_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> usize {
-    // A shaped topology reaches members we hold no connection to —
-    // flood one wrapped envelope per connected edge and let the
-    // forwarders re-fan it (per-node dedup keeps delivery exactly
-    // once). Full mesh keeps the plain per-peer send.
-    if state.topology_impl.read().prunes() {
-        return routing::broadcast_flood(state, channel, &payload).await;
-    }
+    // V4 broadcast is one direct send per connected endpoint. It never asks
+    // an ordinary member to forward application payload.
     let peers: Vec<String> = state.peers.collect_map(|peer| {
         let data = peer.state.read();
         (matches!(data.status, PeerStatus::Active) && !data.local_shelved && !data.remote_shelved)
@@ -3291,14 +3261,25 @@ fn build_test_state_parts(
         .expect("engine fixture has two simultaneous connector slots");
     let callback_capacity =
         std::num::NonZeroUsize::new(16).expect("engine fixture callback capacity is nonzero");
-    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
-        max_connectors,
+    let callbacks = crate::runtime::attempt::ConnectorCallbackPolicy::new(
         crate::runtime::attempt::ConnectorCallbackMailboxCapacities::new(
             callback_capacity,
             callback_capacity,
             callback_capacity,
+        ),
+        crate::runtime::attempt::ConnectorCallbackServiceWeights::new(
+            callback_capacity,
+            callback_capacity,
             callback_capacity,
         ),
+        std::num::NonZeroUsize::new(MAX_ENDPOINT_FRAME_BYTES)
+            .expect("engine fixture real-time unit limit is nonzero"),
+        Duration::from_secs(10),
+    )
+    .expect("engine fixture real-time enqueue deadline is nonzero");
+    let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
+        max_connectors,
+        callbacks,
         Duration::from_secs(10),
     )
     .expect("engine fixture close deadline is nonzero");
@@ -3654,11 +3635,11 @@ mod tests {
     #[test]
     fn frame_cap_rejects_oversize_inbound_frames() {
         assert!(frame_within_cap(0));
-        assert!(frame_within_cap(MAX_INBOUND_FRAME_BYTES));
-        assert!(!frame_within_cap(MAX_INBOUND_FRAME_BYTES + 1));
+        assert!(frame_within_cap(MAX_ENDPOINT_FRAME_BYTES));
+        assert!(!frame_within_cap(MAX_ENDPOINT_FRAME_BYTES + 1));
         // The ceiling is generous (far above any real control frame) but
         // bounded — a regression that zeroed or ballooned it would trip here.
-        assert!((1 << 20..=1 << 26).contains(&MAX_INBOUND_FRAME_BYTES));
+        assert!((1 << 20..=1 << 26).contains(&MAX_ENDPOINT_FRAME_BYTES));
     }
 
     #[tokio::test]
@@ -3667,7 +3648,7 @@ mod tests {
         // parse attempt, no panic, and the peer's frame counter doesn't move.
         let state = build_test_state("oversize-frame");
         insert_session_less_peer(&state, "flooder", None);
-        let huge = Bytes::from(vec![b' '; MAX_INBOUND_FRAME_BYTES + 1]);
+        let huge = Bytes::from(vec![b' '; MAX_ENDPOINT_FRAME_BYTES + 1]);
         handle_inbound_frame(&state, "flooder", huge).await;
         let peer = state.peers.get("flooder").expect("peer present");
         assert_eq!(
