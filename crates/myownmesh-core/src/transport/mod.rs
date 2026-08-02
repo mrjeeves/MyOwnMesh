@@ -27,3 +27,7 @@ pub use webrtc::{
     resolved_media_lanes, AudioSample, LocalIceCandidate, PeerSession, Role, Transport,
     TransportEvent, VideoSample, MEDIA_LANES,
 };
+pub(crate) use webrtc::{
+    DataChannelOpenOwnership, RemoteCandidateDisposition, WebRtcConnectorEvent,
+    WebRtcConnectorWorker,
+};

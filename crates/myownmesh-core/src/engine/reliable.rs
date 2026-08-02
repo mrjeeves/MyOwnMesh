@@ -43,8 +43,7 @@ use tracing::{debug, trace, warn};
 use crate::error::{Error, Result};
 use crate::protocol::{features, MeshMessage};
 
-use super::connection::PeerStatus;
-use super::state::NetworkState;
+use super::state::{NetworkState, PeerOwnerToken};
 
 /// Default time an entry may wait for acknowledged delivery before its
 /// caller is told the truth. Long enough to ride out a reconnect (ICE
@@ -146,8 +145,7 @@ pub(crate) async fn enqueue(
 fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
     let entry = state.peers.get(peer)?;
     let data = entry.state.read();
-    let up =
-        matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.data_channel_open;
+    let up = data.is_admitted() && data.data_channel_open;
     if !up {
         return None;
     }
@@ -162,7 +160,29 @@ fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
 /// transition, after each enqueue, on inbound acks, and from the
 /// state-watch tick.
 pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
-    let Some(acked_peer) = link_ready(state, peer) else {
+    let acked_peer = link_ready(state, peer);
+    flush_peer_inner(state, peer, None, acked_peer).await;
+}
+
+/// Drain only through the exact peer installation that completed admission.
+/// A replacement under the same public device id cannot receive this batch.
+pub(crate) async fn flush_peer_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let peer = owner.device_id();
+    let acked_peer = state.peers.get_if_current(owner).and_then(|entry| {
+        let data = entry.state.read();
+        (data.is_admitted() && data.data_channel_open)
+            .then(|| features::peer_supports(&data.features, features::Feature::RELIABLE_CHANNELS))
+    });
+    flush_peer_inner(state, peer, Some(owner), acked_peer).await;
+}
+
+async fn flush_peer_inner(
+    state: &Arc<NetworkState>,
+    peer: &str,
+    owner: Option<&PeerOwnerToken>,
+    acked_peer: Option<bool>,
+) {
+    let Some(acked_peer) = acked_peer else {
         return;
     };
 
@@ -201,7 +221,11 @@ pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
                 payload: payload.clone(),
             }
         };
-        match super::send_to_peer(state, peer, &msg).await {
+        let send_result = match owner {
+            Some(owner) => super::send_to_peer_owner(state, owner, &msg).await,
+            None => super::send_to_peer(state, peer, &msg).await,
+        };
+        match send_result {
             Ok(()) => {
                 let mut out = state.reliable_out.lock();
                 let Some(outbox) = out.get_mut(peer) else {
@@ -212,8 +236,8 @@ pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
                         p.sent = true;
                     }
                 } else {
-                    // Best-effort degradation: sent == delivered as far
-                    // as we can ever know for this peer.
+                    // Best-effort degradation: successful local send is the
+                    // strongest result this compatibility peer can report.
                     if let Some(pos) = outbox.entries.iter().position(|p| p.seq == seq) {
                         if let Some(reply) = outbox.entries.remove(pos).and_then(|p| p.reply) {
                             let _ = reply.send(Ok(()));
@@ -393,10 +417,34 @@ pub(crate) fn pending_total(state: &NetworkState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::connection::PeerStatus;
     use crate::engine::{build_test_state, insert_session_less_peer};
 
     fn recv_now(rx: &mut oneshot::Receiver<Result<()>>) -> Option<Result<()>> {
         rx.try_recv().ok()
+    }
+
+    #[test]
+    fn v4_arc03_reliable_flush_requires_authenticated_admission() {
+        let state = build_test_state("arc03-reliable-admission");
+        insert_session_less_peer(&state, "peer", None);
+        {
+            let peer = state.peers.get("peer").expect("peer is installed");
+            let mut data = peer.state.write();
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+            data.authenticated = false;
+        }
+        assert_eq!(link_ready(&state, "peer"), None);
+
+        state
+            .peers
+            .get("peer")
+            .expect("peer is installed")
+            .state
+            .write()
+            .authenticated = true;
+        assert_eq!(link_ready(&state, "peer"), Some(false));
     }
 
     #[tokio::test]

@@ -106,15 +106,11 @@ fn first_sighting(state: &NetworkState, origin: &str, id: u64) -> bool {
 /// Shelved — a shelved link is still a live path for routed frames,
 /// exactly as the standalone relay treats it).
 fn connected_ids(state: &NetworkState) -> Vec<String> {
-    state
-        .peers
-        .iter()
-        .filter(|e| {
-            let d = e.value().state.read();
-            matches!(d.status, PeerStatus::Active | PeerStatus::Shelved) && d.data_channel_open
-        })
-        .map(|e| e.key().clone())
-        .collect()
+    state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        (matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.data_channel_open)
+            .then(|| peer.device_id.clone())
+    })
 }
 
 /// Try to consume an inbound `RELAY_CHANNEL` frame as a routed
@@ -304,18 +300,14 @@ pub(crate) async fn broadcast_flood(
     let Ok(env_value) = serde_json::to_value(&env) else {
         return 0;
     };
-    let targets: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            let d = e.value().state.read();
-            matches!(d.status, PeerStatus::Active)
-                && !d.local_shelved
-                && !d.remote_shelved
-                && d.data_channel_open
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let targets: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        (matches!(data.status, PeerStatus::Active)
+            && !data.local_shelved
+            && !data.remote_shelved
+            && data.data_channel_open)
+            .then(|| peer.device_id.clone())
+    });
     let mut delivered = 0usize;
     for peer in targets {
         if send_envelope(state, &peer, &env_value).await.is_ok() {

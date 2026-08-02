@@ -23,7 +23,7 @@ use crate::roster::Roster;
 use crate::rpc::RpcInner;
 use crate::topology::Topology;
 use crate::transport::webrtc::{AudioSample, VideoSample};
-use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
+use crate::transport::{LocalIceCandidate, Transport, WebRtcConnectorEvent};
 
 use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
@@ -115,6 +115,12 @@ pub enum NetworkCmd {
         device_id: String,
         reason: DropReason,
     },
+    /// Drop only the exact process-local peer owner captured by delayed work.
+    /// A replacement under the same public device id is not affected.
+    DropPeerIfCurrent {
+        owner: PeerOwnerToken,
+        reason: DropReason,
+    },
     /// Manually triggered in-place reconnect — the non-destructive twin of a
     /// leave-then-rejoin. `peer == None` reconnects the whole network (redial
     /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
@@ -201,12 +207,9 @@ pub enum NetworkCmd {
     /// serially.
     TransportEvent {
         device_id: String,
-        /// Epoch of the [`PeerConnection`](super::connection::PeerConnection)
-        /// session this event came from. The driver drops the event if it
-        /// no longer matches the peer's current epoch (a stale, torn-down
-        /// session still draining its event queue).
-        epoch: u64,
-        event: TransportEvent,
+        /// Exact process-local connector ownership stamp. It carries no
+        /// application or admission authority.
+        event: WebRtcConnectorEvent,
     },
 
     // ---- governance (closed networks) ----
@@ -304,34 +307,34 @@ impl SignalingInbound {
 ///
 /// Callers can take owned read snapshots, but only this registry can install,
 /// replace, remove, or retire peers. Every ownership exit explicitly ends the
-/// temporary candidate queue even when another task retains an external
+/// connector worker even when another task retains an external
 /// `Arc<PeerConnection>`.
 #[derive(Default)]
 pub(super) struct PeerRegistry {
-    peers: DashMap<String, Arc<PeerConnection>>,
+    peers: DashMap<String, PeerRegistryEntry>,
     mutation: Mutex<()>,
 }
 
-pub(super) struct PeerRegistryEntry {
-    key: String,
-    value: Arc<PeerConnection>,
+struct PeerRegistryEntry {
+    peer: Arc<PeerConnection>,
+    installation: Arc<()>,
 }
 
-impl PeerRegistryEntry {
-    pub(super) fn key(&self) -> &String {
-        &self.key
-    }
-
-    pub(super) fn value(&self) -> &Arc<PeerConnection> {
-        &self.value
-    }
+/// Unforgeable process-local identity for one installed peer owner.
+///
+/// This is carried by delayed engine work so a timer or callback created for
+/// peer A cannot mutate or remove replacement peer B under the same device id.
+/// It is not authentication, application, or durable mesh authority.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PeerOwnerToken {
+    peer: Arc<PeerConnection>,
+    installation: Arc<()>,
 }
 
-impl std::ops::Deref for PeerRegistryEntry {
-    type Target = PeerConnection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
+impl PeerOwnerToken {
+    pub(crate) fn device_id(&self) -> &str {
+        &self.peer.device_id
     }
 }
 
@@ -339,7 +342,38 @@ impl PeerRegistry {
     pub(super) fn get(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
         self.peers
             .get(device_id)
-            .map(|entry| Arc::clone(entry.value()))
+            .map(|entry| Arc::clone(&entry.value().peer))
+    }
+
+    pub(super) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
+        self.peers.get(device_id).map(|entry| PeerOwnerToken {
+            peer: Arc::clone(&entry.value().peer),
+            installation: Arc::clone(&entry.value().installation),
+        })
+    }
+
+    pub(super) fn get_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
+        self.peers.get(owner.device_id()).and_then(|entry| {
+            Arc::ptr_eq(&entry.value().installation, &owner.installation)
+                .then(|| Arc::clone(&entry.value().peer))
+        })
+    }
+
+    /// Run one synchronous effect only while `owner` is still the installed
+    /// peer. Registry replacement and removal take the same mutation lock, so
+    /// the effect cannot cross from an accepted callback for peer A into a
+    /// replacement peer B that reused the same device id.
+    pub(super) fn with_current<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce(&Arc<PeerConnection>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        Some(effect(&current.value().peer))
     }
 
     pub(super) fn contains_key(&self, device_id: &str) -> bool {
@@ -354,42 +388,109 @@ impl PeerRegistry {
         self.peers.is_empty()
     }
 
-    pub(super) fn iter(&self) -> std::vec::IntoIter<PeerRegistryEntry> {
+    /// Snapshot peer owners without duplicating registry keys. The peer already
+    /// owns its device id, so value-oriented scans need one `Arc` clone only.
+    pub(super) fn values_snapshot(&self) -> Vec<Arc<PeerConnection>> {
         self.peers
             .iter()
-            .map(|entry| PeerRegistryEntry {
-                key: entry.key().clone(),
-                value: Arc::clone(entry.value()),
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
+            .map(|entry| Arc::clone(&entry.value().peer))
+            .collect()
     }
 
-    pub(super) fn install(&self, device_id: String, peer: Arc<PeerConnection>) {
-        let _mutation = self.mutation.lock();
-        if let Some(replaced) = self.peers.insert(device_id, peer) {
-            replaced.discard_pending_remote_candidates();
+    /// Build one output vector from an `Arc`-only snapshot. The DashMap guards
+    /// are released before the callback can take a peer-state lock. This avoids
+    /// the old key clones without introducing a registry-to-peer lock order.
+    pub(super) fn collect_map<T>(
+        &self,
+        mut map: impl FnMut(&PeerConnection) -> Option<T>,
+    ) -> Vec<T> {
+        self.values_snapshot()
+            .into_iter()
+            .filter_map(|peer| map(peer.as_ref()))
+            .collect()
+    }
+
+    /// Visit an `Arc`-only snapshot after releasing every DashMap guard.
+    pub(super) fn visit(&self, mut visit: impl FnMut(&PeerConnection)) {
+        for peer in self.values_snapshot() {
+            visit(peer.as_ref());
         }
+    }
+
+    pub(super) fn count_where(&self, mut predicate: impl FnMut(&PeerConnection) -> bool) -> usize {
+        self.values_snapshot()
+            .into_iter()
+            .filter(|peer| predicate(peer.as_ref()))
+            .count()
+    }
+
+    /// Snapshot only registry keys for topology code that does not need peer
+    /// state or connector ownership.
+    pub(super) fn device_ids_snapshot(&self) -> Vec<String> {
+        self.peers.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    pub(super) fn install(&self, peer: Arc<PeerConnection>) -> Option<Arc<PeerConnection>> {
+        let device_id = peer.device_id.clone();
+        let _mutation = self.mutation.lock();
+        if self
+            .peers
+            .get(&device_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.value().peer, &peer))
+        {
+            return None;
+        }
+        if peer.registry_retired() {
+            return None;
+        }
+        let replaced = self
+            .peers
+            .insert(
+                device_id,
+                PeerRegistryEntry {
+                    peer,
+                    installation: Arc::new(()),
+                },
+            )
+            .map(|entry| entry.peer);
+        if let Some(replaced) = replaced.as_ref() {
+            replaced.retire_connector();
+        }
+        replaced
     }
 
     pub(super) fn remove(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
         let _mutation = self.mutation.lock();
-        let (_, peer) = self.peers.remove(device_id)?;
-        peer.discard_pending_remote_candidates();
+        let (_, entry) = self.peers.remove(device_id)?;
+        let peer = entry.peer;
+        peer.retire_connector();
         Some(peer)
     }
 
-    /// Remove every current owner after retiring its compatibility queue.
+    pub(super) fn remove_if_current(&self, owner: &PeerOwnerToken) -> Option<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        Some(peer)
+    }
+
+    /// Remove every current owner after retiring its connector worker.
     /// Returned peers let shutdown close sessions after map ownership ends.
     pub(super) fn retire_all(&self) -> Vec<Arc<PeerConnection>> {
         let _mutation = self.mutation.lock();
         let retired: Vec<_> = self
             .peers
             .iter()
-            .map(|entry| Arc::clone(entry.value()))
+            .map(|entry| Arc::clone(&entry.value().peer))
             .collect();
         for peer in &retired {
-            peer.discard_pending_remote_candidates();
+            peer.retire_connector();
         }
         self.peers.clear();
         retired
@@ -1251,36 +1352,33 @@ impl NetworkState {
     /// should treat the snapshot as instantaneous and re-fetch
     /// for fresh data.
     pub fn peer_snapshot(&self) -> Vec<crate::handle::PeerInfo> {
-        self.peers
-            .iter()
-            .map(|e| {
-                let device_id = e.key().clone();
-                let data = e.value().snapshot();
-                let pubkey = crate::signing::pubkey_part(&device_id);
-                let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
-                crate::handle::PeerInfo {
-                    device_id: device_id.clone(),
-                    status: data.status,
-                    tier: data.tier,
-                    rtt_ms: data.rtt_ms,
-                    clock_skew_ms: data.clock_skew_ms,
-                    label: data.label,
-                    capabilities: data.capabilities,
-                    local_shelved: data.local_shelved,
-                    remote_shelved: data.remote_shelved,
-                    authenticated: data.authenticated,
-                    device_suffix,
-                    verification_code_received: data.verification_code_received,
-                    verification_code_sent: data.verification_code_sent,
-                    local_approve_sent: data.local_approve_sent,
-                    remote_approve_seen: data.remote_approve_seen,
-                    needs_turn: data.needs_turn,
-                    local_candidates: data.diag.local_candidates,
-                    remote_candidates: data.diag.remote_candidates,
-                    selected_pair: data.selected_pair,
-                }
+        self.peers.collect_map(|peer| {
+            let device_id = peer.device_id.clone();
+            let data = peer.snapshot();
+            let pubkey = crate::signing::pubkey_part(&device_id);
+            let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
+            Some(crate::handle::PeerInfo {
+                device_id: device_id.clone(),
+                status: data.status,
+                tier: data.tier,
+                rtt_ms: data.rtt_ms,
+                clock_skew_ms: data.clock_skew_ms,
+                label: data.label,
+                capabilities: data.capabilities,
+                local_shelved: data.local_shelved,
+                remote_shelved: data.remote_shelved,
+                authenticated: data.authenticated,
+                device_suffix,
+                verification_code_received: data.verification_code_received,
+                verification_code_sent: data.verification_code_sent,
+                local_approve_sent: data.local_approve_sent,
+                remote_approve_seen: data.remote_approve_seen,
+                needs_turn: data.needs_turn,
+                local_candidates: data.diag.local_candidates,
+                remote_candidates: data.diag.remote_candidates,
+                selected_pair: data.selected_pair,
             })
-            .collect()
+        })
     }
 
     /// Per-peer detail. Returns `None` if the peer is not in the
@@ -1315,14 +1413,14 @@ impl NetworkState {
 
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
-    pub async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let retired = self.peers.retire_all();
         let sessions: Vec<_> = retired
             .iter()
             .filter_map(|peer| peer.session.lock().clone())
             .collect();
         for s in sessions {
-            let _ = s.close().await;
+            let _ = s.retire_and_close().await;
         }
         drop(retired);
         // Nothing outlives the engine: parked connect waits and queued
@@ -1358,6 +1456,12 @@ impl NetworkState {
     /// mutation. See [`super::network_watch::reconnect_all_in_place`].
     pub fn reconnect(&self, peer: Option<String>) {
         let _ = self.cmd_tx.send(NetworkCmd::Reconnect { peer });
+    }
+
+    pub(crate) fn request_drop_if_current(&self, owner: PeerOwnerToken, reason: DropReason) {
+        let _ = self
+            .cmd_tx
+            .send(NetworkCmd::DropPeerIfCurrent { owner, reason });
     }
 
     /// Queue a deliberate offerer-side dial of exactly one peer on the engine
@@ -1550,4 +1654,242 @@ pub(crate) fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod arc03_peer_registry_tests {
+    use super::*;
+    use crate::engine::connection::PeerStatus;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn v4_arc03_registry_scan_releases_map_guard_before_peer_callback() {
+        let registry = Arc::new(PeerRegistry::default());
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "arc03-lock-order-peer".to_string(),
+                None,
+            )))
+            .is_none());
+        let scan = Arc::clone(&registry);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let _: Vec<()> = scan.collect_map(|_| {
+                assert!(scan
+                    .install(Arc::new(PeerConnection::new(
+                        "arc03-lock-order-peer".to_string(),
+                        None,
+                    )))
+                    .is_some());
+                None
+            });
+            let _ = finished_tx.send(());
+        });
+
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer callback must run after every DashMap guard is released");
+    }
+
+    #[test]
+    fn v4_arc03_stale_owner_cannot_remove_replacement_peer() {
+        let registry = PeerRegistry::default();
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "arc03-owner-peer".to_string(),
+                None,
+            )))
+            .is_none());
+        let stale_owner = registry
+            .owner("arc03-owner-peer")
+            .expect("first owner is installed");
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "arc03-owner-peer".to_string(),
+                None,
+            )))
+            .is_some());
+        let replacement = registry
+            .owner("arc03-owner-peer")
+            .expect("replacement owner is installed");
+
+        assert!(registry.remove_if_current(&stale_owner).is_none());
+        assert!(registry.get_if_current(&stale_owner).is_none());
+        assert!(registry.get_if_current(&replacement).is_some());
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn v4_arc03_current_effect_linearizes_before_replacement() {
+        let registry = Arc::new(PeerRegistry::default());
+        let first = Arc::new(PeerConnection::new("arc03-effect-owner".to_string(), None));
+        assert!(registry.install(Arc::clone(&first)).is_none());
+        let owner = registry
+            .owner("arc03-effect-owner")
+            .expect("first installation has an owner stamp");
+        let (effect_entered_tx, effect_entered_rx) = std::sync::mpsc::channel();
+        let (release_effect_tx, release_effect_rx) = std::sync::mpsc::channel();
+        let effect_registry = Arc::clone(&registry);
+        let effect = std::thread::spawn(move || {
+            effect_registry.with_current(&owner, |peer| {
+                effect_entered_tx
+                    .send(())
+                    .expect("test observes the exact-owner effect");
+                release_effect_rx
+                    .recv()
+                    .expect("test releases the exact-owner effect");
+                peer.state.write().data_channel_open = true;
+            })
+        });
+        effect_entered_rx
+            .recv()
+            .expect("exact-owner effect holds the registry transition");
+
+        let replacement_registry = Arc::clone(&registry);
+        let (replacement_done_tx, replacement_done_rx) = std::sync::mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            let replaced = replacement_registry.install(Arc::new(PeerConnection::new(
+                "arc03-effect-owner".to_string(),
+                None,
+            )));
+            replacement_done_tx
+                .send(replaced.is_some())
+                .expect("replacement reports completion");
+        });
+        assert!(
+            replacement_done_rx.try_recv().is_err(),
+            "replacement cannot pass an in-progress exact-owner effect"
+        );
+
+        release_effect_tx
+            .send(())
+            .expect("release the exact-owner effect");
+        assert!(effect.join().expect("effect thread joins").is_some());
+        assert!(replacement_done_rx
+            .recv()
+            .expect("replacement completes after the effect"));
+        replacement.join().expect("replacement thread joins");
+
+        assert!(first.state.read().data_channel_open);
+        assert!(
+            !registry
+                .get("arc03-effect-owner")
+                .expect("replacement remains installed")
+                .state
+                .read()
+                .data_channel_open
+        );
+    }
+
+    #[test]
+    fn v4_arc03_retired_peer_arc_cannot_be_reinstalled() {
+        let registry = PeerRegistry::default();
+        let peer = Arc::new(PeerConnection::new(
+            "arc03-reinstalled-owner".to_string(),
+            None,
+        ));
+        assert!(registry.install(Arc::clone(&peer)).is_none());
+        let stale_owner = registry
+            .owner("arc03-reinstalled-owner")
+            .expect("first installation has an owner stamp");
+        assert!(registry.remove("arc03-reinstalled-owner").is_some());
+        assert!(registry.install(peer).is_none());
+
+        assert!(registry.get_if_current(&stale_owner).is_none());
+        assert!(registry.remove_if_current(&stale_owner).is_none());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn v4_arc03_installing_current_peer_arc_is_idempotent() {
+        let registry = PeerRegistry::default();
+        let peer = Arc::new(PeerConnection::new(
+            "arc03-idempotent-owner".to_string(),
+            None,
+        ));
+        assert!(registry.install(Arc::clone(&peer)).is_none());
+        let owner = registry
+            .owner("arc03-idempotent-owner")
+            .expect("first installation has an owner stamp");
+
+        assert!(registry.install(peer).is_none());
+        assert!(registry.get_if_current(&owner).is_some());
+        assert_eq!(registry.len(), 1);
+    }
+
+    fn scan_counts() -> Vec<usize> {
+        std::env::var("MYOWNMESH_ARC03_PEER_SCAN_COUNTS")
+            .expect("set MYOWNMESH_ARC03_PEER_SCAN_COUNTS to comma-separated sample counts")
+            .split(',')
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("every peer scan count must be a positive integer")
+            })
+            .inspect(|count| assert!(*count > 0, "peer scan counts must be positive"))
+            .collect()
+    }
+
+    fn scan_rounds() -> usize {
+        let rounds = std::env::var("MYOWNMESH_ARC03_PEER_SCAN_ROUNDS")
+            .expect("set MYOWNMESH_ARC03_PEER_SCAN_ROUNDS")
+            .parse::<usize>()
+            .expect("peer scan rounds must be a positive integer");
+        assert!(rounds > 0, "peer scan rounds must be positive");
+        rounds
+    }
+
+    #[test]
+    #[ignore = "manual release-mode scaling observation; requires explicit sample counts"]
+    fn v4_arc03_peer_registry_scan_scaling() {
+        let rounds = scan_rounds();
+        for count in scan_counts() {
+            let registry = PeerRegistry::default();
+            for index in 0..count {
+                let device_id = format!("arc03-scan-peer-{index:08}");
+                let peer = Arc::new(PeerConnection::new(device_id.clone(), None));
+                peer.state.write().status = PeerStatus::Active;
+                assert!(registry.install(peer).is_none());
+            }
+            assert_eq!(registry.len(), count, "benchmark input cardinality");
+
+            let old_started = Instant::now();
+            for _ in 0..rounds {
+                let snapshot: Vec<(String, Arc<PeerConnection>)> = registry
+                    .peers
+                    .iter()
+                    .map(|entry| (entry.key().clone(), Arc::clone(&entry.value().peer)))
+                    .collect();
+                let active: Vec<String> = snapshot
+                    .into_iter()
+                    .filter(|(_, peer)| peer.state.read().status == PeerStatus::Active)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                assert_eq!(active.len(), count, "legacy scan output cardinality");
+                black_box(active);
+            }
+            let old_elapsed = old_started.elapsed();
+
+            let specialized_started = Instant::now();
+            for _ in 0..rounds {
+                let active = registry.collect_map(|peer| {
+                    (peer.state.read().status == PeerStatus::Active).then(|| peer.device_id.clone())
+                });
+                assert_eq!(active.len(), count, "specialized scan output cardinality");
+                black_box(active);
+            }
+            let specialized_elapsed = specialized_started.elapsed();
+
+            println!(
+                "arc03_peer_scan count={count} rounds={rounds} legacy_total_ns={} specialized_total_ns={} legacy_ns_per_peer={:.3} specialized_ns_per_peer={:.3}",
+                old_elapsed.as_nanos(),
+                specialized_elapsed.as_nanos(),
+                old_elapsed.as_nanos() as f64 / (count * rounds) as f64,
+                specialized_elapsed.as_nanos() as f64 / (count * rounds) as f64,
+            );
+        }
+    }
 }

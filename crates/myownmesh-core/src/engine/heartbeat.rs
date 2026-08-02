@@ -20,17 +20,13 @@ use super::state::NetworkState;
 /// drops + rebuilds any peer silent past `HEARTBEAT_TIMEOUT_MS`.
 pub async fn tick(state: &Arc<NetworkState>) {
     let now = Instant::now();
-    let to_ping: Vec<String> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-        })
-        .map(|e| e.key().clone())
-        .collect();
+    let to_ping: Vec<String> = state.peers.collect_map(|peer| {
+        matches!(
+            peer.state.read().status,
+            PeerStatus::Active | PeerStatus::Shelved
+        )
+        .then(|| peer.device_id.clone())
+    });
     for peer_id in &to_ping {
         send_ping(state, peer_id).await;
     }
@@ -44,23 +40,19 @@ pub async fn tick(state: &Arc<NetworkState>) {
     // the wake-threshold buffer prevents a long-paused tokio runtime
     // from immediately tearing down every peer the moment it resumes.
     let stale_cutoff_ms = HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS;
-    let stale: Vec<String> = state
-        .peers
-        .iter()
-        .filter_map(|e| {
-            let data = e.value().state.read();
-            if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
-                return None;
-            }
-            let elapsed = data
-                .last_recv_at
-                .map(|t| now.duration_since(t).as_millis() as u64);
-            match elapsed {
-                Some(ms) if ms > stale_cutoff_ms => Some(e.key().clone()),
-                _ => None,
-            }
-        })
-        .collect();
+    let stale: Vec<String> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
+            return None;
+        }
+        let elapsed = data
+            .last_recv_at
+            .map(|t| now.duration_since(t).as_millis() as u64);
+        match elapsed {
+            Some(ms) if ms > stale_cutoff_ms => Some(peer.device_id.clone()),
+            _ => None,
+        }
+    });
     // Silence past the ping/pong window means the *transport* is dead, not
     // that app state went stale: a live channel keeps `last_recv_at` fresh
     // via the heartbeat pong every interval, so anything past this
@@ -87,14 +79,28 @@ pub async fn tick(state: &Arc<NetworkState>) {
 }
 
 pub(super) async fn send_ping(state: &Arc<NetworkState>, device_id: &str) {
+    let Some(owner) = state.peers.owner(device_id) else {
+        return;
+    };
+    send_ping_to_owner(state, &owner).await;
+}
+
+pub(super) async fn send_ping_to_owner(
+    state: &Arc<NetworkState>,
+    owner: &super::state::PeerOwnerToken,
+) {
+    let device_id = owner.device_id();
     let t = monotonic_ms();
-    if let Some(peer) = state.peers.get(device_id) {
+    let updated = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
         data.last_ping_sent_at = Some(Instant::now());
         data.last_ping_t = Some(t);
+    });
+    if updated.is_none() {
+        return;
     }
     if let Err(e) =
-        super::send_to_peer(state, device_id, &MeshMessage::Ping(PingMessage { t })).await
+        super::send_to_peer_owner(state, owner, &MeshMessage::Ping(PingMessage { t })).await
     {
         trace!(peer = %device_id, "ping send failed (peer probably gone): {e}");
     }
@@ -247,17 +253,12 @@ impl ClockSkewWatch {
 /// Evaluate this tick's network clock-skew estimate and emit the diag on a
 /// verdict. Called from [`tick`]; split out so the shape stays readable.
 fn watch_clock_skew(state: &Arc<NetworkState>) {
-    let skews: Vec<i64> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-        })
-        .filter_map(|e| e.value().state.read().clock_skew_ms)
-        .collect();
+    let skews: Vec<i64> = state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
+            .then_some(data.clock_skew_ms)
+            .flatten()
+    });
     let estimate = median(&skews);
     let verdict = state.clock_skew_watch.lock().observe(estimate, skews.len());
     match verdict {

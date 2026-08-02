@@ -10,7 +10,7 @@ The target owner holds connector-native attempt state, one live channel, and opt
 
 ## Inputs
 
-- one `CandidateCapability` consumed by the connector;
+- one `ConnectorCandidateCapability` consumed by the connector;
 - typed candidate updates and connector callbacks;
 - bounded cancellation and observation requests.
 

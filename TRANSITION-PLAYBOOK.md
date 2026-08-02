@@ -251,7 +251,7 @@ Each arc ends with a buildable repository and a deletion or ownership reduction.
 **Create private-constructor types**
 
 ```text
-CandidateCapability
+ConnectorCandidateCapability
 ConnectedChannelCapability
 AuthenticatedChannelCapability
 SessionCapability
@@ -293,7 +293,22 @@ start(intent, hints, permits)
 receive_typed_control(...)
 observe(...)
 cancel(...)
-    -> CandidateEvent | ConnectedChannelCapability | Failure
+    -> ConnectorCandidateEvent | ConnectedChannelCapability | Failure
+```
+
+The first WebRTC implementation uses this exact cardinality:
+
+```text
+one connection attempt
+    -> multiple connector candidates
+
+one WebRTC connector candidate
+    -> one RTCPeerConnection and ICE agent
+    -> multiple internal ICE candidates and candidate pairs
+
+DataChannelOpen
+    -> working ConnectedChannelCapability
+    -> not authenticated session authority
 ```
 
 2. Wrap `transport/webrtc.rs` without rewriting ICE, DTLS, TURN, native RTP track machinery, or the recovery ladder.

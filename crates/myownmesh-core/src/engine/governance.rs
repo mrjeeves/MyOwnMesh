@@ -74,20 +74,14 @@ fn pk(device_id: &str) -> String {
 /// Iterate active peers — those whose data channel is ACTIVE +
 /// authenticated. Used to broadcast governance frames.
 fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
-    state
-        .peers
-        .iter()
-        .filter_map(|entry| {
-            let peer = entry.value();
-            let data = peer.state.read();
-            if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated
-            {
-                Some(entry.key().clone())
-            } else {
-                None
-            }
-        })
-        .collect()
+    state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
@@ -944,7 +938,11 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
 /// auto-approve; those were exactly the resurrection engine). The proof
 /// costs nothing to trust: the denied device verifies it independently
 /// through strict-extension adoption, so a spoofed deny changes nothing.
-pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
+pub(super) async fn deny_if_evicted(
+    state: &Arc<EngineState>,
+    owner: &super::state::PeerOwnerToken,
+) -> bool {
+    let device_id = owner.device_id();
     if !log_evicted(state, device_id) {
         return false;
     }
@@ -966,7 +964,7 @@ pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -
         transitions,
         member_log,
     });
-    if let Err(e) = super::send_to_peer(state, device_id, &deny).await {
+    if let Err(e) = super::send_to_peer_owner(state, owner, &deny).await {
         tracing::debug!(peer = %device_id, err = %e, "eviction deny send failed");
     }
     // Do NOT tear the session down in the same breath: the data channel's
@@ -978,10 +976,10 @@ pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -
     // never processes it. Until then the peer sits unauthenticated-for-
     // app-traffic (never approved), so nothing rides the grace window.
     let janitor = state.clone();
-    let dev = device_id.to_string();
+    let owner = owner.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        super::drop_peer(&janitor, &dev, DropReason::Denied).await;
+        janitor.request_drop_if_current(owner, DropReason::Denied);
     });
     true
 }

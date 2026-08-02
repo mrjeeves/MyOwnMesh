@@ -9,19 +9,24 @@
 //!    signaling. Answerer: receive remote SDP, call
 //!    [`PeerSession::set_remote_description`], then `create_answer`,
 //!    then ship the SDP back.
-//! 3. ICE candidates flow both ways via signaling; engine pushes
-//!    inbound candidates into [`PeerSession::add_ice_candidate`].
+//! 3. ICE candidates flow both ways via signaling; the engine moves inbound
+//!    candidates through its connector worker and the worker owns raw apply.
 //! 4. Once the data channel opens, the engine can [`PeerSession::send`]
 //!    and observe [`TransportEvent::Message`] frames.
 //! 5. Drop the [`PeerSession`] to tear down, or call
 //!    [`PeerSession::close`] for explicit shutdown.
 
+use std::future::Future;
+use std::mem::size_of;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -45,6 +50,11 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
 
 use crate::error::{Error, Result};
+use crate::resource::{
+    ObservationLease, PeerConnectionResourceScope, PreAuthResourceFamily, ResourceMeasurement,
+    ResourceUse,
+};
+use crate::runtime::attempt::{AttemptLiveness, ConnectorCandidateCapability};
 
 use super::ice::build_rtc_configuration;
 
@@ -126,10 +136,608 @@ pub enum TransportEvent {
     AudioSample(AudioSample),
 }
 
+/// Exact process-local identity for one WebRTC connector worker.
+///
+/// This is a stale-callback guard, not authority. Only a
+/// `ConnectorCandidateCapability` can authorize an admitted candidate.
+struct WebRtcConnectorIncarnation {
+    active: AtomicBool,
+    retired: watch::Sender<bool>,
+}
+
+impl WebRtcConnectorIncarnation {
+    fn new() -> Self {
+        let (retired, _receiver) = watch::channel(false);
+        Self {
+            active: AtomicBool::new(true),
+            retired,
+        }
+    }
+
+    fn retire(&self) {
+        self.active.store(false, Ordering::Release);
+        self.retired.send_replace(true);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn subscribe_retirement(&self) -> watch::Receiver<bool> {
+        self.retired.subscribe()
+    }
+}
+
+async fn await_until_connector_retirement<T>(
+    mut retirement: watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    if *retirement.borrow() {
+        return None;
+    }
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        _ = retirement.changed() => None,
+        result = &mut work => Some(result),
+    }
+}
+
+/// One callback value stamped with the exact worker that received it.
+pub struct WebRtcConnectorEvent {
+    incarnation: Arc<WebRtcConnectorIncarnation>,
+    event: TransportEvent,
+}
+
+/// Receiver half owned by the connector callback pump.
+pub(crate) struct WebRtcConnectorEventReceiver {
+    incarnation: Arc<WebRtcConnectorIncarnation>,
+    retirement: watch::Receiver<bool>,
+    events: mpsc::UnboundedReceiver<TransportEvent>,
+}
+
+impl WebRtcConnectorEventReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<WebRtcConnectorEvent> {
+        if *self.retirement.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = self.retirement.changed() => None,
+            event = self.events.recv() => {
+                event.and_then(|event| {
+                    self.incarnation.is_active().then(|| WebRtcConnectorEvent {
+                        incarnation: Arc::clone(&self.incarnation),
+                        event,
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// Result of applying an inbound candidate through the connector owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteCandidateDisposition {
+    Applied,
+    QueuedUntilRemoteDescription,
+}
+
+/// Outcome of the data-channel-open ownership transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataChannelOpenOwnership {
+    /// Existing production path. This grants no V4 capability.
+    CompatibilityBypass,
+    /// Exact admitted candidate produced a connected-channel capability.
+    ConnectedCapabilityRetained,
+    /// Worker, attempt, or candidate was no longer live.
+    Rejected,
+}
+
+/// Candidate failures observed while a newly applied remote description drains
+/// the connector-owned pre-SDP queue.
+pub(crate) struct RemoteDescriptionApplyReport {
+    pub(crate) queued_candidate_count: usize,
+    pub(crate) candidate_failures: Vec<Error>,
+}
+
+/// One remote candidate paired with the observation that follows its owner.
+/// Moving this value moves the observation. Dropping it ends the observation.
+#[derive(Debug)]
+struct PendingRemoteCandidate {
+    candidate: LocalIceCandidate,
+    observation: CandidateObservationLease,
+}
+
+impl PendingRemoteCandidate {
+    fn observe(candidate: LocalIceCandidate, resource_scope: &PeerConnectionResourceScope) -> Self {
+        let observation = CandidateObservationLease {
+            _observation: resource_scope.observe_pre_authentication_measurement(
+                PreAuthResourceFamily::CandidateObject,
+                candidate_resource_measurement(&candidate),
+            ),
+        };
+        Self {
+            candidate,
+            observation,
+        }
+    }
+}
+
+/// Apply an observed candidate while retaining its lease across the await.
+/// Cancellation drops both the future and its observation.
+async fn apply_pending_remote_candidate<F, Fut, T>(pending: PendingRemoteCandidate, apply: F) -> T
+where
+    F: FnOnce(LocalIceCandidate) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let PendingRemoteCandidate {
+        candidate,
+        observation,
+    } = pending;
+    let result = apply(candidate).await;
+    drop(observation);
+    result
+}
+
+#[derive(Debug)]
+struct CandidateObservationLease {
+    _observation: ObservationLease,
+}
+
+#[derive(Debug, Default)]
+struct PendingRemoteCandidateQueue {
+    entries: Vec<PendingRemoteCandidate>,
+    container_observation: Option<ObservationLease>,
+}
+
+impl PendingRemoteCandidateQueue {
+    fn push(&mut self, candidate: LocalIceCandidate, resource_scope: &PeerConnectionResourceScope) {
+        self.entries
+            .push(PendingRemoteCandidate::observe(candidate, resource_scope));
+        let measurement = queue_container_resource_measurement(&self.entries);
+        match self.container_observation.as_mut() {
+            Some(observation) => observation.replace_measurement(measurement),
+            None => {
+                self.container_observation =
+                    Some(resource_scope.observe_pre_authentication_measurement(
+                        PreAuthResourceFamily::CandidateObject,
+                        measurement,
+                    ));
+            }
+        }
+    }
+
+    fn take(&mut self) -> PendingRemoteCandidateDrain {
+        let queue = std::mem::take(self);
+        PendingRemoteCandidateDrain {
+            entries: queue.entries.into_iter(),
+            _container_observation: queue.container_observation,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingRemoteCandidateDrain {
+    entries: std::vec::IntoIter<PendingRemoteCandidate>,
+    _container_observation: Option<ObservationLease>,
+}
+
+impl Default for PendingRemoteCandidateDrain {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new().into_iter(),
+            _container_observation: None,
+        }
+    }
+}
+
+impl PendingRemoteCandidateDrain {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Iterator for PendingRemoteCandidateDrain {
+    type Item = PendingRemoteCandidate;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl ExactSizeIterator for PendingRemoteCandidateDrain {}
+
+#[derive(Default)]
+struct RemoteCandidateState {
+    remote_description_set: bool,
+    pending: PendingRemoteCandidateQueue,
+}
+
+#[allow(
+    dead_code,
+    reason = "the admitted variant is activated after owner-approved measurements"
+)]
+enum ConnectorAuthorityState {
+    Compatibility,
+    Awaiting {
+        candidate: ConnectorCandidateCapability,
+        liveness: AttemptLiveness,
+    },
+    Connected {
+        _capability: crate::connector::ConnectedChannelCapability,
+    },
+    Retired,
+}
+
+struct ConnectorOwnership {
+    incarnation: Arc<WebRtcConnectorIncarnation>,
+    authority: SyncMutex<ConnectorAuthorityState>,
+}
+
+impl ConnectorOwnership {
+    fn compatibility() -> Self {
+        Self {
+            incarnation: Arc::new(WebRtcConnectorIncarnation::new()),
+            authority: SyncMutex::new(ConnectorAuthorityState::Compatibility),
+        }
+    }
+
+    #[cfg(test)]
+    fn admitted(candidate: ConnectorCandidateCapability) -> Self {
+        let attempt = candidate.liveness();
+        Self {
+            incarnation: Arc::new(WebRtcConnectorIncarnation::new()),
+            authority: SyncMutex::new(ConnectorAuthorityState::Awaiting {
+                candidate,
+                liveness: attempt,
+            }),
+        }
+    }
+
+    fn accepts(&self, event: &WebRtcConnectorEvent) -> bool {
+        if !Arc::ptr_eq(&self.incarnation, &event.incarnation) || !self.incarnation.is_active() {
+            return false;
+        }
+        match (&*self.authority.lock(), &event.event) {
+            (ConnectorAuthorityState::Retired, _) => false,
+            (ConnectorAuthorityState::Compatibility, _) => true,
+            (
+                ConnectorAuthorityState::Awaiting { liveness, .. },
+                TransportEvent::Message(_)
+                | TransportEvent::VideoSample(_)
+                | TransportEvent::AudioSample(_),
+            ) => {
+                let _ = liveness;
+                false
+            }
+            (ConnectorAuthorityState::Awaiting { liveness, .. }, _) => liveness.is_active(),
+            (
+                ConnectorAuthorityState::Connected { .. },
+                TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_),
+            ) => false,
+            (ConnectorAuthorityState::Connected { .. }, _) => true,
+        }
+    }
+
+    fn mark_data_channel_open(&self) -> DataChannelOpenOwnership {
+        let mut authority = self.authority.lock();
+        if !self.incarnation.is_active() {
+            return DataChannelOpenOwnership::Rejected;
+        }
+        match std::mem::replace(&mut *authority, ConnectorAuthorityState::Retired) {
+            ConnectorAuthorityState::Compatibility => {
+                *authority = ConnectorAuthorityState::Compatibility;
+                DataChannelOpenOwnership::CompatibilityBypass
+            }
+            ConnectorAuthorityState::Awaiting {
+                candidate,
+                liveness: _,
+            } => match crate::connector::mark_connected(candidate) {
+                Some(capability) => {
+                    *authority = ConnectorAuthorityState::Connected {
+                        _capability: capability,
+                    };
+                    DataChannelOpenOwnership::ConnectedCapabilityRetained
+                }
+                None => {
+                    self.incarnation.retire();
+                    DataChannelOpenOwnership::Rejected
+                }
+            },
+            ConnectorAuthorityState::Connected { _capability } => {
+                *authority = ConnectorAuthorityState::Connected { _capability };
+                DataChannelOpenOwnership::ConnectedCapabilityRetained
+            }
+            ConnectorAuthorityState::Retired => {
+                self.incarnation.retire();
+                DataChannelOpenOwnership::Rejected
+            }
+        }
+    }
+
+    fn retire(&self) {
+        let mut authority = self.authority.lock();
+        self.incarnation.retire();
+        *authority = ConnectorAuthorityState::Retired;
+    }
+}
+
+fn candidate_resource_measurement(candidate: &LocalIceCandidate) -> ResourceMeasurement {
+    let (logical_bytes, logical_inexact) = measured_sum([
+        candidate.candidate.len(),
+        candidate.sdp_mid.as_ref().map_or(0, String::len),
+        candidate.username_fragment.as_ref().map_or(0, String::len),
+    ]);
+    let (retained_bytes, retained_inexact) = measured_sum([
+        candidate.candidate.capacity(),
+        candidate.sdp_mid.as_ref().map_or(0, String::capacity),
+        candidate
+            .username_fragment
+            .as_ref()
+            .map_or(0, String::capacity),
+    ]);
+    let observed = ResourceUse::observed(1, logical_bytes, retained_bytes, 0);
+    if logical_inexact || retained_inexact {
+        ResourceMeasurement::inexact(observed)
+    } else {
+        ResourceMeasurement::exact(observed)
+    }
+}
+
+fn queue_container_resource_measurement(
+    entries: &Vec<PendingRemoteCandidate>,
+) -> ResourceMeasurement {
+    let bytes = entries
+        .capacity()
+        .checked_mul(size_of::<PendingRemoteCandidate>());
+    let (retained_bytes, inexact) = measured_usize(bytes);
+    let observed = ResourceUse::observed(0, 0, retained_bytes, 0);
+    if inexact {
+        ResourceMeasurement::inexact(observed)
+    } else {
+        ResourceMeasurement::exact(observed)
+    }
+}
+
+fn measured_usize(value: Option<usize>) -> (u64, bool) {
+    match value.and_then(|value| u64::try_from(value).ok()) {
+        Some(value) => (value, false),
+        None => (u64::MAX, true),
+    }
+}
+
+fn measured_sum<const N: usize>(values: [usize; N]) -> (u64, bool) {
+    let mut sum = 0_u64;
+    let mut inexact = false;
+    for value in values {
+        let (value, conversion_inexact) = measured_usize(Some(value));
+        inexact |= conversion_inexact;
+        match sum.checked_add(value) {
+            Some(next) => sum = next,
+            None => {
+                sum = u64::MAX;
+                inexact = true;
+            }
+        }
+    }
+    (sum, inexact)
+}
+
+/// Observe one explicitly owned connector item. Retained memory remains
+/// inexact until the underlying webrtc-rs owner exposes an allocation report.
+fn observe_inexact_item(
+    scope: &PeerConnectionResourceScope,
+    family: PreAuthResourceFamily,
+    items: u64,
+    tasks: u64,
+) -> ObservationLease {
+    scope.observe_pre_authentication_measurement(
+        family,
+        ResourceMeasurement::inexact(ResourceUse::observed(items, 0, 0, tasks)),
+    )
+}
+
+fn observe_inexact_item_if(
+    scope: Option<&PeerConnectionResourceScope>,
+    family: PreAuthResourceFamily,
+    items: u64,
+    tasks: u64,
+) -> Option<ObservationLease> {
+    scope.map(|scope| observe_inexact_item(scope, family, items, tasks))
+}
+
 /// One H.264 access unit off a peer's video track — Annex-B bytes
 /// ready for a decoder. `rtp_timestamp` ticks at the 90 kHz video
 /// clock; `key` marks an IDR (a safe decode entry point); `lane` is
 /// which of the peer's video lanes it arrived on (see [`MEDIA_LANES`]).
+/// Narrow owner of one RTCPeerConnection, its ICE agent, callback identity,
+/// and pending remote-candidate queue.
+///
+/// Production currently enters through the explicit compatibility constructor.
+/// That path preserves existing behavior but cannot mint a V4 connected-channel
+/// capability. Finite per-family claims must be measured and approved before
+/// production can construct the admitted state.
+pub(crate) struct WebRtcConnectorWorker {
+    session: Arc<PeerSession>,
+    ownership: ConnectorOwnership,
+    remote_candidates: SyncMutex<RemoteCandidateState>,
+    resource_scope: PeerConnectionResourceScope,
+    _transport_observation: ObservationLease,
+}
+
+impl WebRtcConnectorWorker {
+    fn compatibility(
+        session: PeerSession,
+        events: mpsc::UnboundedReceiver<TransportEvent>,
+        resource_scope: PeerConnectionResourceScope,
+        transport_observation: ObservationLease,
+    ) -> (Self, WebRtcConnectorEventReceiver) {
+        let ownership = ConnectorOwnership::compatibility();
+        let receiver = WebRtcConnectorEventReceiver {
+            incarnation: Arc::clone(&ownership.incarnation),
+            retirement: ownership.incarnation.subscribe_retirement(),
+            events,
+        };
+        (
+            Self {
+                session: Arc::new(session),
+                ownership,
+                remote_candidates: SyncMutex::new(RemoteCandidateState::default()),
+                resource_scope,
+                _transport_observation: transport_observation,
+            },
+            receiver,
+        )
+    }
+
+    /// Consume an event only when it came from this still-active worker.
+    pub(crate) fn accept_event(&self, event: WebRtcConnectorEvent) -> Option<TransportEvent> {
+        self.ownership.accepts(&event).then_some(event.event)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stamp_event_for_test(&self, event: TransportEvent) -> WebRtcConnectorEvent {
+        WebRtcConnectorEvent {
+            incarnation: Arc::clone(&self.ownership.incarnation),
+            event,
+        }
+    }
+
+    /// Apply or retain one inbound candidate under this worker's ownership.
+    pub(crate) async fn add_remote_candidate(
+        &self,
+        candidate: LocalIceCandidate,
+    ) -> Result<RemoteCandidateDisposition> {
+        let pending = {
+            let mut state = self.remote_candidates.lock();
+            if !self.ownership.incarnation.is_active() {
+                return Err(Error::Transport("connector worker is retired".to_string()));
+            }
+            if !state.remote_description_set {
+                state.pending.push(candidate, &self.resource_scope);
+                return Ok(RemoteCandidateDisposition::QueuedUntilRemoteDescription);
+            }
+            PendingRemoteCandidate::observe(candidate, &self.resource_scope)
+        };
+        self.apply_remote_candidate(pending).await?;
+        Ok(RemoteCandidateDisposition::Applied)
+    }
+
+    /// Apply remote SDP, transfer queue ownership into the async drain, and
+    /// apply every retained candidate through the connector-private raw API.
+    pub(crate) async fn apply_remote_description(
+        &self,
+        description: RTCSessionDescription,
+    ) -> Result<RemoteDescriptionApplyReport> {
+        if !self.ownership.incarnation.is_active() {
+            return Err(Error::Transport("connector worker is retired".to_string()));
+        }
+        let _work_observation = observe_inexact_item(
+            &self.resource_scope,
+            PreAuthResourceFamily::ConnectorSpecificWork,
+            1,
+            0,
+        );
+        await_until_connector_retirement(
+            self.ownership.incarnation.subscribe_retirement(),
+            self.session.set_remote_description(description),
+        )
+        .await
+        .ok_or_else(|| {
+            Error::Transport("connector worker retired during SDP apply".to_string())
+        })??;
+        let pending = {
+            let mut state = self.remote_candidates.lock();
+            if !self.ownership.incarnation.is_active() {
+                return Err(Error::Transport(
+                    "connector worker retired during SDP apply".to_string(),
+                ));
+            }
+            state.remote_description_set = true;
+            state.pending.take()
+        };
+        let queued_candidate_count = pending.len();
+        let mut candidate_failures = Vec::new();
+        for candidate in pending {
+            if let Err(error) = self.apply_remote_candidate(candidate).await {
+                candidate_failures.push(error);
+            }
+        }
+        Ok(RemoteDescriptionApplyReport {
+            queued_candidate_count,
+            candidate_failures,
+        })
+    }
+
+    async fn apply_remote_candidate(&self, pending: PendingRemoteCandidate) -> Result<()> {
+        if !self.ownership.incarnation.is_active() {
+            return Err(Error::Transport("connector worker is retired".to_string()));
+        }
+        let _ice_observation =
+            observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::IceWork, 1, 0);
+        await_until_connector_retirement(
+            self.ownership.incarnation.subscribe_retirement(),
+            apply_pending_remote_candidate(pending, |candidate| async move {
+                self.session.add_ice_candidate(candidate).await
+            }),
+        )
+        .await
+        .ok_or_else(|| Error::Transport("connector worker retired during ICE apply".to_string()))?
+    }
+
+    pub(crate) fn observe_owned_task(&self) -> ObservationLease {
+        observe_inexact_item(&self.resource_scope, PreAuthResourceFamily::Task, 1, 1)
+    }
+
+    pub(crate) async fn send_owned(&self, data: Bytes) -> Result<usize> {
+        await_until_connector_retirement(
+            self.ownership.incarnation.subscribe_retirement(),
+            self.session.send(data),
+        )
+        .await
+        .ok_or_else(|| Error::Transport("connector worker retired during send".to_string()))?
+    }
+
+    pub(crate) fn confirm_data_channel_open(&self) -> DataChannelOpenOwnership {
+        self.ownership.mark_data_channel_open()
+    }
+
+    /// Revoke callback acceptance and release every connector-owned candidate.
+    pub(crate) fn retire(&self) {
+        self.ownership.retire();
+        let pending = self.remote_candidates.lock().pending.take();
+        drop(pending);
+    }
+
+    /// Retire local ownership first, then close the native peer connection.
+    /// This is the only operation intentionally allowed to continue after
+    /// retirement. The local proof is limited to requesting and awaiting the
+    /// dependency's idempotent peer-connection close operation.
+    pub(crate) async fn retire_and_close(&self) -> Result<()> {
+        self.retire();
+        self.session.close().await
+    }
+}
+
+impl Deref for WebRtcConnectorWorker {
+    type Target = PeerSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl Drop for WebRtcConnectorWorker {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoSample {
     pub rtp_timestamp: u32,
@@ -397,6 +1005,33 @@ impl Transport {
         self.open_peer_with_config(role, config).await
     }
 
+    /// Open the engine-owned connector wrapper around the existing WebRTC
+    /// machinery. Arc 03 keeps the old transport behavior inside this owner.
+    pub(crate) async fn open_connector_peer(
+        &self,
+        role: Role,
+        stun: &[crate::config::StunServer],
+        turn: &[crate::config::TurnServer],
+        resource_scope: PeerConnectionResourceScope,
+    ) -> Result<(WebRtcConnectorWorker, WebRtcConnectorEventReceiver)> {
+        let transport_observation = observe_inexact_item(
+            &resource_scope,
+            PreAuthResourceFamily::TransportObject,
+            1,
+            0,
+        );
+        let config = build_rtc_configuration(stun, turn);
+        let (session, events) = self
+            .open_peer_with_config_observed(role, config, Some(resource_scope.clone()))
+            .await?;
+        Ok(WebRtcConnectorWorker::compatibility(
+            session,
+            events,
+            resource_scope,
+            transport_observation,
+        ))
+    }
+
     /// Lower-level entry point that takes an explicit
     /// `RTCConfiguration`. Tests can use this to short-circuit
     /// the user-config path.
@@ -404,6 +1039,16 @@ impl Transport {
         &self,
         role: Role,
         config: RTCConfiguration,
+    ) -> Result<(PeerSession, mpsc::UnboundedReceiver<TransportEvent>)> {
+        self.open_peer_with_config_observed(role, config, None)
+            .await
+    }
+
+    async fn open_peer_with_config_observed(
+        &self,
+        role: Role,
+        config: RTCConfiguration,
+        resource_scope: Option<PeerConnectionResourceScope>,
     ) -> Result<(PeerSession, mpsc::UnboundedReceiver<TransportEvent>)> {
         let pc = self
             .api
@@ -415,7 +1060,7 @@ impl Transport {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let data_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
 
-        register_callbacks(&pc, &events_tx, &data_channel);
+        register_callbacks(&pc, &events_tx, &data_channel, resource_scope.clone());
 
         // Media lanes are lifecycle-managed: only lane 0 exists at
         // setup (the original single lane, so pre-lifecycle peers
@@ -428,10 +1073,10 @@ impl Transport {
         let mut audio_tracks: Vec<Option<LaneSlot>> = vec![None; self.media_lanes];
         for lane in 0..PRE_PROVISIONED_LANES.min(self.media_lanes) {
             let video_track = make_media_track(LaneKind::Video, lane as u8);
-            attach_track(&pc, &video_track).await?;
+            attach_track(&pc, &video_track, resource_scope.as_ref()).await?;
             video_tracks[lane] = Some(LaneSlot::Open(video_track));
             let audio_track = make_media_track(LaneKind::Audio, lane as u8);
-            attach_track(&pc, &audio_track).await?;
+            attach_track(&pc, &audio_track, resource_scope.as_ref()).await?;
             audio_tracks[lane] = Some(LaneSlot::Open(audio_track));
         }
 
@@ -450,7 +1095,7 @@ impl Transport {
                 )
                 .await
                 .map_err(|e| Error::Transport(format!("create_data_channel: {e}")))?;
-            install_data_channel_handlers(dc.clone(), events_tx.clone());
+            install_data_channel_handlers(dc.clone(), events_tx.clone(), resource_scope.as_ref());
             *data_channel.lock().await = Some(dc);
         }
 
@@ -463,6 +1108,7 @@ impl Transport {
                 max_lanes: self.media_lanes,
                 events_tx,
                 role,
+                resource_scope,
             },
             events_rx,
         ))
@@ -514,12 +1160,16 @@ fn make_media_track(kind: LaneKind, lane: u8) -> Arc<TrackLocalStaticSample> {
 async fn attach_track(
     pc: &Arc<RTCPeerConnection>,
     track: &Arc<TrackLocalStaticSample>,
+    resource_scope: Option<&PeerConnectionResourceScope>,
 ) -> Result<()> {
     let sender = pc
         .add_track(Arc::clone(track) as Arc<dyn TrackLocal + Send + Sync>)
         .await
         .map_err(|e| Error::Transport(format!("add_track ({}): {e}", track.id())))?;
+    let task_observation =
+        observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Task, 1, 1);
     tokio::spawn(async move {
+        let _task_observation = task_observation;
         let mut buf = vec![0u8; 1500];
         while sender.read(&mut buf).await.is_ok() {}
     });
@@ -530,11 +1180,19 @@ fn register_callbacks(
     pc: &Arc<RTCPeerConnection>,
     events_tx: &mpsc::UnboundedSender<TransportEvent>,
     data_channel: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    resource_scope: Option<PeerConnectionResourceScope>,
 ) {
     // Local ICE candidate gathered — ship via signaling.
     {
         let tx = events_tx.clone();
+        let callback_observation = observe_inexact_item_if(
+            resource_scope.as_ref(),
+            PreAuthResourceFamily::Callback,
+            1,
+            0,
+        );
         pc.on_ice_candidate(Box::new(move |cand| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let msg = match cand {
@@ -560,7 +1218,14 @@ fn register_callbacks(
     // ICE connection state changed.
     {
         let tx = events_tx.clone();
+        let callback_observation = observe_inexact_item_if(
+            resource_scope.as_ref(),
+            PreAuthResourceFamily::Callback,
+            1,
+            0,
+        );
         pc.on_ice_connection_state_change(Box::new(move |state| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let _ = tx.send(TransportEvent::IceConnectionStateChanged(state));
@@ -571,7 +1236,14 @@ fn register_callbacks(
     // PeerConnection state changed.
     {
         let tx = events_tx.clone();
+        let callback_observation = observe_inexact_item_if(
+            resource_scope.as_ref(),
+            PreAuthResourceFamily::Callback,
+            1,
+            0,
+        );
         pc.on_peer_connection_state_change(Box::new(move |state| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let _ = tx.send(TransportEvent::PeerConnectionStateChanged(state));
@@ -583,15 +1255,24 @@ fn register_callbacks(
     {
         let tx = events_tx.clone();
         let dc_slot = data_channel.clone();
+        let handler_scope = resource_scope.clone();
+        let callback_observation = observe_inexact_item_if(
+            resource_scope.as_ref(),
+            PreAuthResourceFamily::Callback,
+            1,
+            0,
+        );
         pc.on_data_channel(Box::new(move |dc| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             let dc_slot = dc_slot.clone();
+            let handler_scope = handler_scope.clone();
             Box::pin(async move {
                 if dc.label() != APP_DATA_CHANNEL_LABEL {
                     trace!(label = dc.label(), "ignoring non-app data channel");
                     return;
                 }
-                install_data_channel_handlers(dc.clone(), tx);
+                install_data_channel_handlers(dc.clone(), tx, handler_scope.as_ref());
                 *dc_slot.lock().await = Some(dc);
             })
         }));
@@ -602,15 +1283,25 @@ fn register_callbacks(
     // audio straight through (one Opus frame per packet).
     {
         let tx = events_tx.clone();
+        let task_scope = resource_scope.clone();
+        let callback_observation = observe_inexact_item_if(
+            resource_scope.as_ref(),
+            PreAuthResourceFamily::Callback,
+            1,
+            0,
+        );
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
+            let task_observation =
+                observe_inexact_item_if(task_scope.as_ref(), PreAuthResourceFamily::Task, 1, 1);
             Box::pin(async move {
                 match track.kind() {
                     RTPCodecType::Video => {
-                        tokio::spawn(pump_video_track(track, tx));
+                        tokio::spawn(pump_video_track(track, tx, task_observation));
                     }
                     RTPCodecType::Audio => {
-                        tokio::spawn(pump_audio_track(track, tx));
+                        tokio::spawn(pump_audio_track(track, tx, task_observation));
                     }
                     kind => trace!(?kind, "ignoring unknown track kind"),
                 }
@@ -623,7 +1314,11 @@ fn register_callbacks(
 /// Opus frame (RFC 7587 — no fragmentation, no aggregation), so each
 /// non-empty payload surfaces directly as [`TransportEvent::AudioSample`].
 /// Ends when the track does (peer connection closed).
-async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+async fn pump_audio_track(
+    track: Arc<TrackRemote>,
+    tx: mpsc::UnboundedSender<TransportEvent>,
+    _task_observation: Option<ObservationLease>,
+) {
     let lane = lane_of_track_id(&track.id());
     loop {
         let pkt = match track.read_rtp().await {
@@ -647,7 +1342,11 @@ async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
 /// Drain one remote video track: depacketize H.264 RTP into access
 /// units and surface each as [`TransportEvent::VideoSample`]. Ends
 /// when the track does (peer connection closed).
-async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
+async fn pump_video_track(
+    track: Arc<TrackRemote>,
+    tx: mpsc::UnboundedSender<TransportEvent>,
+    _task_observation: Option<ObservationLease>,
+) {
     let lane = lane_of_track_id(&track.id());
     let mut assembler = H264AuAssembler::default();
     loop {
@@ -891,10 +1590,14 @@ fn annexb_nal_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
 fn install_data_channel_handlers(
     dc: Arc<RTCDataChannel>,
     tx: mpsc::UnboundedSender<TransportEvent>,
+    resource_scope: Option<&PeerConnectionResourceScope>,
 ) {
     {
         let tx = tx.clone();
+        let callback_observation =
+            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_open(Box::new(move || {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let _ = tx.send(TransportEvent::DataChannelOpen);
@@ -903,7 +1606,10 @@ fn install_data_channel_handlers(
     }
     {
         let tx = tx.clone();
+        let callback_observation =
+            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_close(Box::new(move || {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let _ = tx.send(TransportEvent::DataChannelClosed);
@@ -912,7 +1618,10 @@ fn install_data_channel_handlers(
     }
     {
         let tx = tx.clone();
+        let callback_observation =
+            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 let _ = tx.send(TransportEvent::Message(msg.data));
@@ -921,7 +1630,10 @@ fn install_data_channel_handlers(
     }
     {
         let tx = tx.clone();
+        let callback_observation =
+            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
         dc.on_error(Box::new(move |err| {
+            let _keep_callback_observation = &callback_observation;
             let tx = tx.clone();
             Box::pin(async move {
                 warn!("data channel error: {err}");
@@ -1036,6 +1748,7 @@ pub struct PeerSession {
     max_lanes: usize,
     events_tx: mpsc::UnboundedSender<TransportEvent>,
     role: Role,
+    resource_scope: Option<PeerConnectionResourceScope>,
 }
 
 impl PeerSession {
@@ -1165,11 +1878,10 @@ impl PeerSession {
     /// Add an ICE candidate the peer sent us. The peer's nominal
     /// `null` (gathering complete) is also acceptable.
     ///
-    /// V4 transition note: this public raw-candidate port is a temporary Arc
-    /// 02 compatibility bypass. Arc 03 makes candidate application private to
-    /// the Connector Worker and requires the exact candidate capability. The
-    /// current signature is not evidence of resource admission.
-    pub async fn add_ice_candidate(&self, cand: LocalIceCandidate) -> Result<()> {
+    /// The raw port is private to `WebRtcConnectorWorker`. External and engine
+    /// callers must use the worker so queue, lifetime, and observation owners
+    /// cannot be bypassed.
+    async fn add_ice_candidate(&self, cand: LocalIceCandidate) -> Result<()> {
         self.pc
             .add_ice_candidate(cand.into_init())
             .await
@@ -1270,7 +1982,7 @@ impl PeerSession {
             }
         }
         let track = make_media_track(kind, lane);
-        attach_track(&self.pc, &track).await?;
+        attach_track(&self.pc, &track, self.resource_scope.as_ref()).await?;
         // First writer wins if two racers opened the same lane; the
         // loser's track was attached too, but the slot's track is the
         // one everyone writes — the duplicate is harmless and gone on
@@ -1632,6 +2344,296 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::{
+        ProcessResourceRoot, ResourceFamilyReport, PRE_AUTH_RESOURCE_FAMILY_COUNT,
+    };
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    fn candidate_report(
+        reports: &[ResourceFamilyReport<PreAuthResourceFamily>; PRE_AUTH_RESOURCE_FAMILY_COUNT],
+    ) -> ResourceFamilyReport<PreAuthResourceFamily> {
+        *reports
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+    }
+
+    fn observed_candidate() -> LocalIceCandidate {
+        let candidate_fixture = "candidate:foundation 1 udp host";
+        let mut candidate =
+            String::with_capacity(candidate_fixture.len() + "candidate-slack".len());
+        candidate.push_str(candidate_fixture);
+
+        let mid_fixture = "data";
+        let mut sdp_mid = String::with_capacity(mid_fixture.len() + "mid-slack".len());
+        sdp_mid.push_str(mid_fixture);
+
+        let username_fixture = "remote-fragment";
+        let mut username_fragment =
+            String::with_capacity(username_fixture.len() + "fragment-slack".len());
+        username_fragment.push_str(username_fixture);
+
+        LocalIceCandidate {
+            candidate,
+            sdp_mid: Some(sdp_mid),
+            sdp_mline_index: None,
+            username_fragment: Some(username_fragment),
+        }
+    }
+
+    #[test]
+    fn v4_arc03_candidate_queue_is_connector_owned_and_observed() {
+        let process = ProcessResourceRoot::isolated();
+        let mesh = process.mesh_runtime_scope();
+        let context = mesh.network_instance_scope();
+        let scope = context.peer_connection_scope();
+        let candidate = observed_candidate();
+        let candidate_use = candidate_resource_measurement(&candidate).observed();
+        let mut queue = PendingRemoteCandidateQueue::default();
+        queue.push(candidate, &scope);
+        let container_use = queue_container_resource_measurement(&queue.entries).observed();
+
+        let active = candidate_report(&context.report().pre_authentication);
+        assert_eq!(active.active.items(), candidate_use.items());
+        assert_eq!(active.active.logical_bytes(), candidate_use.logical_bytes());
+        assert_eq!(
+            active.active.retained_bytes(),
+            candidate_use.retained_bytes() + container_use.retained_bytes()
+        );
+        assert_eq!(active.active_lease_count, 2);
+
+        let mut drain = queue.take();
+        let candidate = drain.next().expect("queued candidate transfers to drain");
+        drop(candidate);
+        assert_eq!(
+            candidate_report(&context.report().pre_authentication)
+                .active
+                .retained_bytes(),
+            container_use.retained_bytes()
+        );
+        drop(drain);
+        let completed = candidate_report(&context.report().pre_authentication);
+        assert_eq!(completed.active, ResourceUse::ZERO);
+        assert_eq!(completed.completed_lease_count, 2);
+    }
+
+    #[test]
+    fn v4_arc03_candidate_apply_observation_survives_await_and_cancellation() {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let scope = context.peer_connection_scope();
+        let pending = PendingRemoteCandidate::observe(observed_candidate(), &scope);
+        let mut application = Box::pin(apply_pending_remote_candidate(pending, |_| {
+            std::future::pending::<std::result::Result<(), ()>>()
+        }));
+        let waker = Waker::noop();
+        let mut task_context = Context::from_waker(waker);
+
+        assert_eq!(application.as_mut().poll(&mut task_context), Poll::Pending);
+        assert_eq!(
+            candidate_report(&context.report().pre_authentication).active_lease_count,
+            1
+        );
+        drop(application);
+        let completed = candidate_report(&context.report().pre_authentication);
+        assert_eq!(completed.active, ResourceUse::ZERO);
+        assert_eq!(completed.completed_lease_count, 1);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_retirement_cancels_inflight_candidate_observation() {
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let scope = context.peer_connection_scope();
+        let pending = PendingRemoteCandidate::observe(observed_candidate(), &scope);
+        let incarnation = Arc::new(WebRtcConnectorIncarnation::new());
+        let retirement = incarnation.subscribe_retirement();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let application = tokio::spawn(async move {
+            await_until_connector_retirement(
+                retirement,
+                apply_pending_remote_candidate(pending, |_| async move {
+                    let _ = entered_tx.send(());
+                    std::future::pending::<std::result::Result<(), ()>>().await
+                }),
+            )
+            .await
+        });
+
+        entered_rx
+            .await
+            .expect("candidate application was polled before retirement");
+        assert_eq!(
+            candidate_report(&context.report().pre_authentication).active_lease_count,
+            1
+        );
+        incarnation.retire();
+        assert!(application.await.expect("application task joins").is_none());
+        let completed = candidate_report(&context.report().pre_authentication);
+        assert_eq!(completed.active, ResourceUse::ZERO);
+        assert_eq!(completed.completed_lease_count, 1);
+    }
+
+    #[test]
+    fn v4_arc03_callback_stamp_requires_exact_live_worker() {
+        let first = ConnectorOwnership::compatibility();
+        let second = ConnectorOwnership::compatibility();
+        let event = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&first.incarnation),
+            event: TransportEvent::DataChannelClosed,
+        };
+        assert!(first.accepts(&event));
+        assert!(!second.accepts(&event));
+        first.retire();
+        assert!(!first.accepts(&event));
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_retirement_stops_event_pump_before_stale_callback_queueing() {
+        let ownership = ConnectorOwnership::compatibility();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let mut receiver = WebRtcConnectorEventReceiver {
+            incarnation: Arc::clone(&ownership.incarnation),
+            retirement: ownership.incarnation.subscribe_retirement(),
+            events,
+        };
+
+        ownership.retire();
+        events_tx
+            .send(TransportEvent::DataChannelClosed)
+            .expect("retained callback sender still has a raw receiver");
+
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn v4_arc03_data_channel_open_requires_live_exact_candidate() {
+        let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let ownership = ConnectorOwnership::admitted(candidate);
+        assert_eq!(
+            ownership.mark_data_channel_open(),
+            DataChannelOpenOwnership::ConnectedCapabilityRetained
+        );
+        assert_eq!(
+            ownership.mark_data_channel_open(),
+            DataChannelOpenOwnership::ConnectedCapabilityRetained
+        );
+        ownership.retire();
+        assert_eq!(
+            ownership.mark_data_channel_open(),
+            DataChannelOpenOwnership::Rejected
+        );
+        drop(lifetime);
+    }
+
+    #[test]
+    fn v4_arc03_admitted_worker_rejects_protocol_bytes_before_channel_capability() {
+        let (candidate, _lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let ownership = ConnectorOwnership::admitted(candidate);
+        let before_open = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&ownership.incarnation),
+            event: TransportEvent::Message(Bytes::from_static(b"not-connected")),
+        };
+
+        assert!(!ownership.accepts(&before_open));
+        assert_eq!(
+            ownership.mark_data_channel_open(),
+            DataChannelOpenOwnership::ConnectedCapabilityRetained
+        );
+        assert!(ownership.accepts(&before_open));
+        let media = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&ownership.incarnation),
+            event: TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 0,
+                lane: 0,
+                data: Bytes::new(),
+            }),
+        };
+        assert!(
+            !ownership.accepts(&media),
+            "connected-channel authority is not application-media authority"
+        );
+    }
+
+    #[test]
+    fn v4_arc03_rejected_open_retires_callback_admission() {
+        let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let ownership = ConnectorOwnership::admitted(candidate);
+        lifetime.retire();
+
+        assert_eq!(
+            ownership.mark_data_channel_open(),
+            DataChannelOpenOwnership::Rejected
+        );
+        let after_rejection = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&ownership.incarnation),
+            event: TransportEvent::Message(Bytes::from_static(b"retired")),
+        };
+        assert!(!ownership.accepts(&after_rejection));
+    }
+
+    #[test]
+    fn v4_arc03_attempt_retirement_preserves_winner_and_invalidates_awaiting_loser() {
+        let (first, second, lifetime) = crate::runtime::attempt::two_connector_candidates_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let first = ConnectorOwnership::admitted(first);
+        let second = ConnectorOwnership::admitted(second);
+
+        assert_eq!(
+            first.mark_data_channel_open(),
+            DataChannelOpenOwnership::ConnectedCapabilityRetained
+        );
+
+        lifetime.retire();
+
+        let winner_message = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&first.incarnation),
+            event: TransportEvent::Message(Bytes::from_static(b"promoted-winner")),
+        };
+        let awaiting_control = WebRtcConnectorEvent {
+            incarnation: Arc::clone(&second.incarnation),
+            event: TransportEvent::DataChannelClosed,
+        };
+        assert!(first.accepts(&winner_message));
+        assert!(!second.accepts(&awaiting_control));
+        assert_eq!(
+            first.mark_data_channel_open(),
+            DataChannelOpenOwnership::ConnectedCapabilityRetained
+        );
+        assert_eq!(
+            second.mark_data_channel_open(),
+            DataChannelOpenOwnership::Rejected
+        );
+        assert!(first.incarnation.is_active());
+        assert!(!second.incarnation.is_active());
+    }
+
+    #[test]
+    fn v4_arc03_unsupported_candidate_measurement_is_inexact_not_a_panic() {
+        assert_eq!(measured_usize(None), (u64::MAX, true));
+    }
+
+    #[test]
+    #[ignore = "manual candidate-observer metadata measurement"]
+    fn v4_arc03_candidate_observer_metadata_measurement() {
+        println!(
+            "arc03_candidate_metadata_bytes local_candidate={} observation_lease={} pending_candidate={} queue={} drain={} vec_header={}",
+            size_of::<LocalIceCandidate>(),
+            size_of::<CandidateObservationLease>(),
+            size_of::<PendingRemoteCandidate>(),
+            size_of::<PendingRemoteCandidateQueue>(),
+            size_of::<PendingRemoteCandidateDrain>(),
+            size_of::<Vec<PendingRemoteCandidate>>()
+        );
+    }
 
     #[test]
     fn sdp_fingerprint_extracts_and_normalises() {

@@ -3,7 +3,7 @@
 //! This Arc 02 module adds the ownership transition only. Existing WebRTC,
 //! ICE, TURN, and connection behavior remain unchanged until Arc 03.
 
-use crate::runtime::attempt::CandidateCapability;
+use crate::runtime::attempt::ConnectorCandidateCapability;
 use crate::runtime::RuntimeIncarnation;
 
 /// Local proof that a connector candidate produced a working channel.
@@ -29,7 +29,7 @@ use crate::runtime::RuntimeIncarnation;
 /// ```
 #[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
 pub struct ConnectedChannelCapability {
-    candidate: CandidateCapability,
+    candidate: ConnectorCandidateCapability,
 }
 
 /// Consume one candidate after the connector has established a working
@@ -39,8 +39,10 @@ pub struct ConnectedChannelCapability {
 /// Arc 03 moves the call behind the connector worker's successful channel
 /// event.
 #[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
-fn mark_connected(candidate: CandidateCapability) -> ConnectedChannelCapability {
-    ConnectedChannelCapability { candidate }
+pub(crate) fn mark_connected(
+    candidate: ConnectorCandidateCapability,
+) -> Option<ConnectedChannelCapability> {
+    candidate.promote_if_live(|candidate| ConnectedChannelCapability { candidate })
 }
 
 #[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
@@ -84,23 +86,33 @@ impl<T> LegacyConnectedChannel<T> {
 
 #[cfg(test)]
 pub(crate) fn connected_for_test(runtime: RuntimeIncarnation) -> ConnectedChannelCapability {
-    mark_connected(crate::runtime::attempt::candidate_for_test(runtime))
+    let (candidate, _lifetime) = crate::runtime::attempt::connector_candidate_for_test(runtime);
+    mark_connected(candidate).expect("fixture candidate belongs to its live attempt")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::attempt::candidate_for_test;
+    use crate::runtime::attempt::connector_candidate_for_test;
 
     #[test]
     fn v4_arc02_connected_channel_consumes_candidate_authority() {
         let runtime = crate::runtime::runtime_for_test();
-        let connected = mark_connected(candidate_for_test(runtime.clone()));
+        let (candidate, _lifetime) = connector_candidate_for_test(runtime.clone());
+        let connected = mark_connected(candidate).expect("live exact attempt");
 
         assert!(connected.runtime().is_same(&runtime));
 
         fn accepts_connected(_: ConnectedChannelCapability) {}
         accepts_connected(connected);
+    }
+
+    #[test]
+    fn v4_arc03_connected_channel_rejects_retired_attempt() {
+        let (retired_candidate, retired_lifetime) =
+            connector_candidate_for_test(crate::runtime::runtime_for_test());
+        retired_lifetime.retire();
+        assert!(mark_connected(retired_candidate).is_none());
     }
 
     #[test]
