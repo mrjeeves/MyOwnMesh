@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "baseline_commit": "2a04e29e0a4c09b95a4914972018850ddb2cbacb",
-  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client at the Arc 01 baseline, additively extended with the linked Arc 02 capability and resource-observation modules. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
+  "scope": "Production Rust in workspace crates, crate build scripts, and the Tauri Rust client at the Arc 01 baseline, additively extended with the linked Arc 02 capability and resource-observation modules and the first Arc 03 connector-ownership, exact-owner registry, approval-convergence, and owner-bound reliable-outbound slice. Test-only code is excluded. Normalized full source, declaration bodies and members, named callable bodies, registered transport callbacks, static state, and mechanically discoverable effects are fingerprinted.",
   "node_targets": [
     "Semantic Node",
     "Signaling Node",
@@ -76,11 +76,11 @@
   ],
   "source_snapshot": {
     "count": 106,
-    "sha256": "1a9edae5d0476e4ac26bf3e3ae5f9ced7f43b1b2e80c5a482811d688388d0994"
+    "sha256": "1705568c74a833a8153276edabc9105eec11ab8a38b5552106a48da6e573b83b"
   },
   "declaration_snapshot": {
-    "count": 1602,
-    "sha256": "4955e17b6e7b9bd0b2c66afb86d7c436123e9e980c84271d78342f29db582e00"
+    "count": 1649,
+    "sha256": "48fbd038c0321ff724150bffa33458ae097ef694b3b8d20d5e9771c8ea0ad939"
   },
   "declaration_rules": [
     {
@@ -436,7 +436,7 @@
     {
       "id": "decl-peer-connection-split",
       "disposition": "Split",
-      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": ["$type", "state"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": ["$type", "state", "registry_retired"]}
     },
     {
       "id": "decl-heartbeat-reachability",
@@ -514,7 +514,7 @@
     {
       "id": "decl-network-command-attempt",
       "target": "Attempt Node",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["DropPeer", "Reconnect", "ConnectPeer"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": "NetworkCmd", "member": ["DropPeer", "DropPeerIfCurrent", "Reconnect", "ConnectPeer"]}
     },
     {
       "id": "decl-network-command-session",
@@ -875,7 +875,10 @@
         {"name": ["LaneKind", "LaneSlot", "VideoSample", "AudioSample", "H264AuAssembler"]},
         {"name": "TransportEvent", "member": ["$type", "Message", "RenegotiationNeeded", "VideoSample", "AudioSample"]},
         {"name": "Transport", "member": ["$type", "media_lanes"]},
-        {"name": "PeerSession", "member": ["$type", "events_tx", "video_tracks", "audio_tracks", "max_lanes"]}
+        {"name": "PeerSession", "member": ["$type", "events_tx", "video_tracks", "audio_tracks", "max_lanes", "resource_scope"]},
+        {"name": "CandidateObservationLease"},
+        {"name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"], "member": ["$type", "candidate", "entries", "observation", "container_observation", "_container_observation"]},
+        {"name": "WebRtcConnectorWorker", "member": ["resource_scope", "_transport_observation"]}
       ]
     },
     {
@@ -889,7 +892,7 @@
       "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": ["LaneKind", "LaneSlot", "VideoSample", "AudioSample", "H264AuAssembler", "Transport", "PeerSession"]},
       "exclude": [
         {"name": "Transport", "member": ["$type", "api"]},
-        {"name": "PeerSession", "member": ["$type", "events_tx", "data_channel", "pc", "role"]}
+        {"name": "PeerSession", "member": ["$type", "events_tx", "data_channel", "pc", "role", "resource_scope"]}
       ]
     },
     {
@@ -1062,35 +1065,40 @@
       "match": {"path": "crates/myownmesh-core/src/resource/mod.rs"}
     },
     {
-      "id": "decl-arc02-candidate-pilot-attempt-values",
-      "target": "Attempt Node",
+      "id": "decl-arc03-candidate-connector-values",
+      "target": "Connector Worker",
       "match": {
-        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
         "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
         "member": ["$type", "candidate", "entries"]
       }
     },
     {
-      "id": "decl-arc02-candidate-pilot-observation-lease",
+      "id": "decl-arc03-candidate-observation-lease",
       "domain": "Resource instrumentation",
       "match": {
-        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
         "name": "CandidateObservationLease"
       }
     },
     {
-      "id": "decl-arc02-candidate-pilot-observation-fields",
+      "id": "decl-arc03-candidate-observation-fields",
       "domain": "Resource instrumentation",
       "match": {
-        "path": "crates/myownmesh-core/src/engine/connection.rs",
+        "path": "crates/myownmesh-core/src/transport/webrtc.rs",
         "name": ["PendingRemoteCandidate", "PendingRemoteCandidateQueue", "PendingRemoteCandidateDrain"],
         "member": ["observation", "container_observation", "_container_observation"]
       }
     },
     {
-      "id": "decl-arc02-peer-resource-scope",
+      "id": "decl-arc03-peer-resource-scope",
       "domain": "Resource instrumentation",
-      "match": {"path": "crates/myownmesh-core/src/engine/connection.rs", "name": "PeerConnection", "member": "resource_scope"}
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "PeerSession", "member": "resource_scope"}
+    },
+    {
+      "id": "decl-arc03-worker-resource-observation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "name": "WebRtcConnectorWorker", "member": ["resource_scope", "_transport_observation"]}
     },
     {
       "id": "decl-arc02-diagnostic-snapshot-compat",
@@ -1105,7 +1113,7 @@
     {
       "id": "decl-arc02-peer-registry-compat",
       "disposition": "Split",
-      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": ["PeerRegistry", "PeerRegistryEntry"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/state.rs", "name": ["PeerRegistry", "PeerRegistryEntry", "PeerOwnerToken"]}
     },
     {
       "id": "decl-arc02-mesh-resource-scope",
@@ -1144,8 +1152,8 @@
     }
   ],
   "surface_snapshot": {
-    "count": 1708,
-    "sha256": "f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af"
+    "count": 1771,
+    "sha256": "b25c57ba260191eacd12ae6561d99c320c4105400f27999141a973113332cc57"
   },
   "surface_rules": [
     {
@@ -1239,7 +1247,7 @@
     {
       "id": "surface-auth-promotion",
       "target": "Session Broker",
-      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "send_local_approve@1"}
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["send_local_approve@1", "send_local_approve_owner@1"]}
     },
     {
       "id": "surface-auth-callables",
@@ -1249,12 +1257,12 @@
     {
       "id": "surface-promotion-callables",
       "target": "Session Broker",
-      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["on_approve@1", "on_deny@1"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": ["maybe_activate@1", "on_approve@1", "on_deny@1"]}
     },
     {
       "id": "surface-heartbeat-reachability",
       "target": "Reachability Node",
-      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs", "symbol": ["median@1", "monotonic_ms@1", "observe@1", "on_pong@1", "watch_clock_skew@1"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/heartbeat.rs", "symbol": ["median@1", "monotonic_ms@1", "observe@1", "on_pong@1", "send_ping_to_owner@1", "watch_clock_skew@1"]}
     },
     {
       "id": "surface-heartbeat-session",
@@ -1269,13 +1277,13 @@
     {
       "id": "surface-engine-parser-split",
       "disposition": "Split",
-      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "handle_inbound_frame@1"},
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "handle_inbound_frame_from@1"},
       "flags": ["authority_mutation"]
     },
     {
       "id": "surface-engine-session",
       "target": "Peer Session Node",
-      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["send_to_peer@1", "drop_peer@1", "on_rpc_request@1"]}
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["send_to_peer@1", "send_to_peer_owner@1", "drop_peer@1", "on_rpc_request@1"]}
     },
     {
       "id": "surface-engine-announce-confirm-split",
@@ -1294,6 +1302,11 @@
       "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "service_media_renegotiations@1"}
     },
     {
+      "id": "surface-engine-connector-close-tasks",
+      "target": "Connector Worker",
+      "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["finish_drop_peer@1", "install_peer@1"], "category": "task"}
+    },
+    {
       "id": "surface-engine-runtime",
       "target": "Runtime Supervisor",
       "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": ["spawn_network@1", "spawn_network_in_mesh_scope@1"]}
@@ -1302,7 +1315,7 @@
       "id": "surface-engine-callables-split",
       "disposition": "Split",
       "match": {"path": "crates/myownmesh-core/src/engine/mod.rs", "category": "callable"},
-      "exclude": [{"symbol": ["confirm_active_session_on_announce@1", "drop_peer@1", "ensure_peer_session@1", "handle_inbound_frame@1", "on_rpc_request@1", "send_to_peer@1", "service_media_renegotiations@1", "spawn_network@1", "spawn_network_in_mesh_scope@1"]}]
+      "exclude": [{"symbol": ["confirm_active_session_on_announce@1", "drop_peer@1", "ensure_peer_session@1", "handle_inbound_frame_from@1", "on_rpc_request@1", "send_to_peer@1", "send_to_peer_owner@1", "service_media_renegotiations@1", "spawn_network@1", "spawn_network_in_mesh_scope@1"]}]
     },
     {
       "id": "surface-network-reachability",
@@ -1485,7 +1498,7 @@
     {
       "id": "surface-webrtc-mixed",
       "disposition": "Split",
-      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["register_callbacks@1", "install_data_channel_handlers@1", "new@1", "open_peer@1", "open_peer_with_config@1", "send@1"]},
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["register_callbacks@1", "install_data_channel_handlers@1", "new@2", "open_peer@1", "open_peer_with_config@1", "send@1"]},
       "exclude": [
         {"category": "callback_registration"},
         {"category": "queue_unbounded"}
@@ -1509,11 +1522,16 @@
       "exclude": [{"token": ["on_track", "on_message"]}]
     },
     {
+      "id": "surface-arc03-webrtc-resource-instrumentation",
+      "domain": "Resource instrumentation",
+      "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": ["candidate_resource_measurement@1", "measured_usize@1", "observe@1", "observe_inexact_item@1", "observe_inexact_item_if@1", "observe_owned_task@1", "queue_container_resource_measurement@1"]}
+    },
+    {
       "id": "surface-webrtc-connector",
       "target": "Connector Worker",
       "match": {"path": "crates/myownmesh-core/src/transport/webrtc.rs"},
       "exclude": [
-        {"symbol": ["annexb_nal_types@1", "attach_track@1", "au_has_idr@1", "close_media_lane@1", "ensure_lane@1", "has_reapable_lanes@1", "install_data_channel_handlers@1", "lane_of_track_id@1", "make_media_track@1", "new@1", "newer_rtp_ts@1", "open_lane_count@1", "open_media_lane@1", "open_peer@1", "open_peer_with_config@1", "payload_starts_au@1", "pool@1", "pump_audio_track@1", "pump_video_track@1", "push@1", "reap_drained_lanes@1", "register_callbacks@1", "resolve_media_lanes@1", "resolved_media_lanes@1", "send@1", "send_audio@1", "send_video@1", "try_emit@1", "unwrap_seq@1"]},
+        {"symbol": ["annexb_nal_types@1", "attach_track@1", "au_has_idr@1", "candidate_resource_measurement@1", "close_media_lane@1", "ensure_lane@1", "has_reapable_lanes@1", "install_data_channel_handlers@1", "lane_of_track_id@1", "make_media_track@1", "measured_usize@1", "new@2", "newer_rtp_ts@1", "observe@1", "observe_inexact_item@1", "observe_inexact_item_if@1", "observe_owned_task@1", "open_lane_count@1", "open_media_lane@1", "open_peer@1", "open_peer_with_config@1", "payload_starts_au@1", "pool@1", "pump_audio_track@1", "pump_video_track@1", "push@1", "queue_container_resource_measurement@1", "reap_drained_lanes@1", "register_callbacks@1", "resolve_media_lanes@1", "resolved_media_lanes@1", "send@1", "send_audio@1", "send_video@1", "try_emit@1", "unwrap_seq@1"]},
         {"category": "callback_registration"},
         {"category": "queue_unbounded"},
         {"symbol": "LANE_DRAIN_GRACE@1"}
@@ -1857,11 +1875,45 @@
       ]
     },
     {
-      "id": "marker-unbounded-attempt-input",
-      "target": "Attempt Node",
+      "id": "marker-unbounded-connector-input",
+      "target": "Connector Worker",
       "flags": ["unbounded_resource"],
       "items": [
-        {"path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "peer.queue_remote_candidate(&mut data, candidate);", "count": 1}
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "add_remote_candidate@1", "anchor": "state.pending.push(candidate, &self.resource_scope);", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-arc03-compatibility-authority",
+      "disposition": "Split",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "compatibility@2", "anchor": "ConnectorOwnership::compatibility()", "count": 1},
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "accepts@1", "anchor": "(ConnectorAuthorityState::Compatibility, _) => true", "count": 1},
+        {"path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "mark_data_channel_open@1", "anchor": "DataChannelOpenOwnership::CompatibilityBypass", "count": 1}
+      ]
+    },
+    {
+      "id": "marker-arc03-exact-owner-promotion",
+      "target": "Session Broker",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "on_approve@1", "anchor": "peer.state.write().remote_approve_seen = true;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "send_local_approve_owner@1", "anchor": "remote_approve_seen = true;", "count": 0},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate@1", "anchor": "let active = data.authenticated && data.local_approve_sent && data.remote_approve_seen;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate@1", "anchor": ".with_current(owner, |peer| {", "count": 2},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate@1", "anchor": "if !peer.state.read().is_admitted() {", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "maybe_activate@1", "anchor": "super::reliable::flush_peer_owner(state, owner).await;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/handshake.rs", "symbol": "send_local_approve_owner@1", "before": "send_to_peer_owner(state, owner, &MeshMessage::Approve(ApproveMessage {})).await", "after": "peer.state.write().local_approve_sent = true;"}
+      ]
+    },
+    {
+      "id": "marker-arc03-owner-bound-reliable-outbound",
+      "target": "Peer Session Node",
+      "flags": ["authority_mutation"],
+      "items": [
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "link_ready@1", "anchor": "let up = data.is_admitted() && data.data_channel_open;", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "flush_peer_owner@1", "anchor": "(data.is_admitted() && data.data_channel_open)", "count": 1},
+        {"path": "crates/myownmesh-core/src/engine/reliable.rs", "symbol": "flush_peer_inner@1", "anchor": "Some(owner) => super::send_to_peer_owner(state, owner, &msg).await,", "count": 1}
       ]
     },
     {
@@ -1889,7 +1941,7 @@
         {"name": "engine global command queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|2"},
         {"name": "engine signaling inbound queue", "path": "crates/myownmesh-core/src/engine/state.rs", "symbol": "new_in_resource_scope@1", "anchor": "mpsc::unbounded_channel()", "count": 3, "surface_key": "queue_unbounded|crates/myownmesh-core/src/engine/state.rs|new_in_resource_scope@1|mpsc::unbounded_channel|3"},
         {"name": "RPC streaming response queue", "path": "crates/myownmesh-core/src/rpc.rs", "symbol": "call_stream@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/rpc.rs|call_stream@1|mpsc::unbounded_channel|1"},
-        {"name": "WebRTC transport event queue", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/transport/webrtc.rs|open_peer_with_config@1|mpsc::unbounded_channel|1"},
+        {"name": "WebRTC transport event queue", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_peer_with_config_observed@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-core/src/transport/webrtc.rs|open_peer_with_config_observed@1|mpsc::unbounded_channel|1"},
         {"name": "local signaling outbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "mpsc::unbounded_channel::<LocalOutbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/local.rs|join@1|mpsc::unbounded_channel|1"},
         {"name": "local signaling inbound queue", "path": "crates/myownmesh-signaling/src/local.rs", "symbol": "join@1", "anchor": "mpsc::unbounded_channel::<LocalInbound>()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/local.rs|join@1|mpsc::unbounded_channel|2"},
         {"name": "embedded mDNS discovery event queue", "path": "crates/myownmesh-signaling/src/mdns/discovery/embedded.rs", "symbol": "start@1", "anchor": "mpsc::unbounded_channel()", "count": 1, "surface_key": "queue_unbounded|crates/myownmesh-signaling/src/mdns/discovery/embedded.rs|start@1|mpsc::unbounded_channel|1"},
@@ -1905,8 +1957,24 @@
       "decision": "OD-RESOURCE-LIMITS",
       "required_metrics": ["items", "logical_bytes", "retained_bytes", "tasks", "lifetime"],
       "items": [
-        {"name": "pending remote ICE candidate backlog", "path": "crates/myownmesh-core/src/engine/connection.rs", "anchor": "entries: Vec<PendingRemoteCandidate>,", "count": 1},
-        {"name": "pending remote ICE candidate append", "path": "crates/myownmesh-core/src/engine/mod.rs", "anchor": "peer.queue_remote_candidate(&mut data, candidate);", "count": 1}
+        {"name": "connector-owned pending remote ICE candidate backlog", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "anchor": "entries: Vec<PendingRemoteCandidate>,", "count": 1},
+        {"name": "connector-owned pending remote ICE candidate append", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "add_remote_candidate@1", "anchor": "state.pending.push(candidate, &self.resource_scope);", "count": 1}
+      ]
+    },
+    {
+      "id": "resource-arc03-lifecycle",
+      "decision": "OD-RESOURCE-LIMITS",
+      "required_metrics": ["items", "bytes", "tasks", "lifetime"],
+      "items": [
+        {"name": "attempt retirement watch", "path": "crates/myownmesh-core/src/runtime/attempt/mod.rs", "symbol": "admitted@1", "anchor": "watch::channel(false)", "count": 1},
+        {"name": "WebRTC connector retirement watch", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "new@1", "anchor": "watch::channel(false)", "count": 1},
+        {"name": "WebRTC connector transport observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "open_connector_peer@1", "anchor": "PreAuthResourceFamily::TransportObject", "count": 1},
+        {"name": "WebRTC peer-connection callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "register_callbacks@1", "anchor": "PreAuthResourceFamily::Callback", "count": 5},
+        {"name": "WebRTC data-channel callback observations", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "install_data_channel_handlers@1", "anchor": "PreAuthResourceFamily::Callback", "count": 4},
+        {"name": "WebRTC sender-drain task observation", "path": "crates/myownmesh-core/src/transport/webrtc.rs", "symbol": "attach_track@1", "anchor": "PreAuthResourceFamily::Task", "count": 1},
+        {"name": "WebRTC connector event-pump task observation", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "ensure_peer_session@1", "anchor": "let task_observation = session.observe_owned_task();", "count": 1},
+        {"name": "removed-peer native close task", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "finish_drop_peer@1", "anchor": "tokio::spawn(async move {", "count": 1},
+        {"name": "replaced-peer native close task", "path": "crates/myownmesh-core/src/engine/mod.rs", "symbol": "install_peer@1", "anchor": "tokio::spawn(async move {", "count": 1}
       ]
     },
     {
@@ -2091,10 +2159,10 @@
       "DOMAIN:Application client": 52,
       "DOMAIN:Connector infrastructure": 15,
       "DOMAIN:Operational infrastructure (U0)": 106,
-      "DOMAIN:Resource instrumentation": 104,
+      "DOMAIN:Resource instrumentation": 106,
       "NODE:Application Gateway": 348,
-      "NODE:Attempt Node": 55,
-      "NODE:Connector Worker": 48,
+      "NODE:Attempt Node": 59,
+      "NODE:Connector Worker": 89,
       "NODE:Endpoint Auth Task": 30,
       "NODE:Peer Session Node": 73,
       "NODE:Reachability Node": 173,
@@ -2112,21 +2180,21 @@
     },
     "surface_assignments": {
       "DISPOSITION:Delete": 25,
-      "DISPOSITION:Split": 380,
+      "DISPOSITION:Split": 377,
       "DOMAIN:Application client": 72,
       "DOMAIN:Connector infrastructure": 14,
       "DOMAIN:Operational infrastructure (U0)": 251,
-      "DOMAIN:Resource instrumentation": 48,
+      "DOMAIN:Resource instrumentation": 55,
       "NODE:Application Gateway": 156,
-      "NODE:Attempt Node": 22,
-      "NODE:Connector Worker": 76,
+      "NODE:Attempt Node": 36,
+      "NODE:Connector Worker": 114,
       "NODE:Endpoint Auth Task": 13,
-      "NODE:Peer Session Node": 50,
-      "NODE:Reachability Node": 52,
+      "NODE:Peer Session Node": 53,
+      "NODE:Reachability Node": 54,
       "NODE:Relay Node": 40,
       "NODE:Runtime Supervisor": 22,
       "NODE:Semantic Node": 106,
-      "NODE:Session Broker": 12,
+      "NODE:Session Broker": 14,
       "NODE:Signaling Node": 271,
       "OWNER_DECISION_REQUIRED:OD-CODEC-FLOW-BOUNDARY": 53,
       "OWNER_DECISION_REQUIRED:OD-DEVICE-KEY-CUSTODY": 33,
@@ -2134,9 +2202,9 @@
       "OWNER_DECISION_REQUIRED:OD-SERVICE-ADVERT": 11
     },
     "surface_categories": {
-      "callable": 1128,
+      "callable": 1181,
       "callback_registration": 9,
-      "constructor_entry": 87,
+      "constructor_entry": 90,
       "external_carrier": 29,
       "external_http": 1,
       "external_http_body": 4,
@@ -2150,29 +2218,29 @@
       "parser_binary": 1,
       "parser_entry": 24,
       "process": 16,
-      "public_action": 111,
+      "public_action": 115,
       "public_trait_action": 2,
       "queue_bounded": 2,
       "queue_broadcast": 8,
       "queue_oneshot": 18,
       "queue_unbounded": 19,
-      "queue_watch": 3,
+      "queue_watch": 5,
       "static_state": 4,
       "stream_receive": 10,
-      "task": 56,
+      "task": 57,
       "trait_callable": 19,
       "write": 92
     },
-    "semantic_marker_items": 75,
-    "resource_record_items": 111
+    "semantic_marker_items": 88,
+    "resource_record_items": 120
   },
   "report_path": "docs/v4-transition/ARC-01-STATE-EFFECT-INVENTORY.md",
   "report_anchors": [
-    "| Production Rust source units | 106 | `2678fb41e9f2e796d44ef02cf858b80796be6a7e7e0a5c8ede4afc140fb6732e` |",
-    "| Production Rust declaration members | 1,599 | `c45d588bc71c6d4294617953790c7b1e3c5535ceffdf10443fd8b96ea8fcd2fa` |",
-    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,708 | `f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af` |",
-    "| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |",
-    "| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
+    "| Production Rust source units | 106 | `1705568c74a833a8153276edabc9105eec11ab8a38b5552106a48da6e573b83b` |",
+    "| Production Rust declaration members | 1,649 | `48fbd038c0321ff724150bffa33458ae097ef694b3b8d20d5e9771c8ea0ad939` |",
+    "| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,771 | `b25c57ba260191eacd12ae6561d99c320c4105400f27999141a973113332cc57` |",
+    "| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |",
+    "| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |",
     "The source scanner records 19 unbounded channel constructions"
   ],
   "target_modules": [

@@ -220,10 +220,9 @@ impl ConnTracer {
 
         let mut seen: HashSet<String> = HashSet::with_capacity(state.peers.len());
 
-        for entry in state.peers.iter() {
-            let device_id = entry.key().clone();
+        for peer in state.peers.values_snapshot() {
+            let device_id = peer.device_id.clone();
             seen.insert(device_id.clone());
-            let peer = entry.value();
             let epoch = peer.epoch;
 
             // Transport-derived states — sync reads, lock released

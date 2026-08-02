@@ -1,8 +1,8 @@
 # V4 Arc 01 state and effect inventory
 
-Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with additive coverage for the linked Arc 02 production modules.
+Status: complete as the Arc 01 baseline record at commit `2a04e29e0a4c09b95a4914972018850ddb2cbacb`, with current coverage through the first Arc 03 WebRTC Connector Worker, exact-owner registry, approval-convergence, and owner-bound reliable-outbound slice.
 
-This arc changes no product behavior and deletes no code. It establishes the ownership record that later implementation arcs must reduce. No listener, peer connection, firewall rule, or live MyOwnMesh instance was started while producing this record.
+This inventory refresh changes no product behavior and deletes no code. It records the ownership seams that later implementation arcs must reduce. The checker opens no listener, peer connection, firewall rule, or live MyOwnMesh instance.
 
 ## Evidence and completeness rule
 
@@ -15,15 +15,15 @@ python scripts\check-v4-arc01-inventory.py
 python scripts\check-v4-arc01-inventory.py --negative-controls
 ```
 
-The baseline commit remains fixed. The current fingerprints cover that baseline plus the linked Arc 02 capability and resource-observation modules:
+The baseline commit remains fixed. The current fingerprints cover that baseline, the linked Arc 02 capability and resource-observation modules, and the first Arc 03 ownership, approval-convergence, and owner-bound reliable-outbound slice:
 
 | Input class | Recorded count | Snapshot SHA-256 |
 |---|---:|---|
-| Production Rust source units | 106 | `2678fb41e9f2e796d44ef02cf858b80796be6a7e7e0a5c8ede4afc140fb6732e` |
-| Production Rust declaration members | 1,599 | `c45d588bc71c6d4294617953790c7b1e3c5535ceffdf10443fd8b96ea8fcd2fa` |
-| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,708 | `f322bef67494f51b3c89d02618bcc8b73e563b76161873112495e393a8c655af` |
-| Hand-reviewed semantic anchors | 75 | Exact source anchors, scopes, ordering, and expected counts |
-| Structured resource anchors | 111 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
+| Production Rust source units | 106 | `1705568c74a833a8153276edabc9105eec11ab8a38b5552106a48da6e573b83b` |
+| Production Rust declaration members | 1,649 | `48fbd038c0321ff724150bffa33458ae097ef694b3b8d20d5e9771c8ea0ad939` |
+| Callable, callback, parser, queue, task, write, network, external-service, process, and static-state surfaces | 1,771 | `b25c57ba260191eacd12ae6561d99c320c4105400f27999141a973113332cc57` |
+| Hand-reviewed semantic anchors | 88 | Exact source anchors, scopes, ordering, and expected counts |
+| Structured resource anchors | 120 | Exact allocation, collection, task, and body-buffer anchors with required metric classes |
 
 The scanner removes `cfg(test)` items and inventories the remaining Rust in workspace crates, crate build scripts, and the Tauri Rust client. It records declaration bodies and members, named callable bodies, trait callables, registered transport callbacks, mutable statics, constructors, parser entries, queues, tasks, filesystem writes, socket operations, buffered stream reads, external carrier and HTTP calls, child processes, and public action APIs. The full-source fingerprint covers outer attributes, visibility, and source constructs that are not represented as separate declaration members. Each discovered declaration or surface must match exactly one ownership rule.
 
@@ -36,22 +36,22 @@ The assignment counts are records, not architectural sizing targets.
 | Target or disposition | Declaration members | Effect surfaces |
 |---|---:|---:|
 | Application Gateway | 348 | 156 |
-| Attempt Node | 55 | 22 |
-| Connector Worker | 48 | 76 |
+| Attempt Node | 59 | 36 |
+| Connector Worker | 89 | 114 |
 | Endpoint Auth Task | 30 | 13 |
-| Peer Session Node | 73 | 50 |
-| Reachability Node | 173 | 52 |
+| Peer Session Node | 73 | 53 |
+| Reachability Node | 173 | 54 |
 | Relay Node | 38 | 40 |
 | Runtime Supervisor | 57 | 22 |
 | Semantic Node | 117 | 106 |
-| Session Broker | 21 | 12 |
+| Session Broker | 21 | 14 |
 | Signaling Node | 190 | 271 |
 | Application client domain | 52 | 72 |
 | Connector infrastructure domain | 15 | 14 |
 | Operational infrastructure (U0) domain | 106 | 251 |
-| Resource instrumentation domain | 104 | 48 |
+| Resource instrumentation domain | 106 | 55 |
 | Delete | 23 | 25 |
-| Split | 87 | 380 |
+| Split | 87 | 377 |
 | Decision: OD-CODEC-FLOW-BOUNDARY | 38 | 53 |
 | Decision: OD-DEVICE-KEY-CUSTODY | 13 | 33 |
 | Decision: OD-LEGACY-SILENT-MIGRATION | 1 | 0 |
@@ -106,9 +106,9 @@ These surfaces bypass the intended Application Gateway and capability transition
 
 ### 4. Speculative resources are not globally confined
 
-An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. Arc 02C keeps remote candidates and their private pre-SDP queue observable, moves peer mutation behind a retiring registry, and adds an aggregate attempt-reservation primitive. No production capacity has been selected and the current connector does not consume that primitive. The transport event queue and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
+An Open-mesh announcement or inbound offer can create native WebRTC work before endpoint authentication. The first Arc 03 slice places the existing WebRTC session, remote-description state, and private pre-SDP candidate queue behind `WebRtcConnectorWorker`. It adds exact local callback and registry-installation identities and carries that identity through the handshake and approval paths. Only an inbound `Approve` records remote approval. A successful local send records that the exact current transport accepted the bytes for transmission, not that the remote endpoint received them. Activation requires authentication and both facts. Activation follow-ups recheck the exact owner, and reliable outbox flushing requires an admitted open channel and uses the exact-owner send path. The slice retains the Arc 02 aggregate attempt-reservation primitive. No production capacity has been selected, and production still uses the explicit compatibility state rather than an admitted connector candidate. The transport event queue, global command queue, and several signaling queues remain unbounded. RPC streaming also uses an unbounded queue and detached request tasks.
 
-This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 02C defines reservation ordering and observes the current candidate path without inventing production enforcement values.
+This does not add Closed-mesh authorization to Open meshes. The target requires resource permits for untrusted speculative work. Exact numeric limits remain owner-selected values backed by measurements. Arc 03 moves ownership and adds cancellation guards without inventing production enforcement values. Admitted production construction remains disabled until the recorded cancellation, queue, and capacity gaps are resolved.
 
 ### 5. Nostr inbound events are trusted beyond their proven carrier facts
 
@@ -177,7 +177,7 @@ The source scanner records 19 unbounded channel constructions, and every one has
 - configurable signaling limits where zero disables the limit;
 - TURN credential, listener, relay-port, allocation-socket, and lifetime boundaries without an established wrapper-level global resource budget.
 
-The existing fixed capacities are evidence of current behavior, not automatically approved V4 values. `OD-RESOURCE-LIMITS` requires measured owner selection. Arc 02 may count items, bytes, tasks, and lifetimes, but it may not enforce fabricated defaults.
+The existing fixed capacities are evidence of current behavior, not automatically approved V4 values. `OD-RESOURCE-LIMITS` requires measured owner selection. Arc 02 and Arc 03 instrumentation may count items, bytes, tasks, and lifetimes, but it may not enforce fabricated defaults.
 
 ## Owner decisions retained without guessing
 
@@ -195,11 +195,11 @@ The full questions are in the JSON. The unresolved decisions are:
 10. Early signaling authentication and its allowed speculative-work vector.
 11. Ownership of network-change recovery policy after observation is separated from restart effects.
 
-These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types and resource instrumentation. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
+These are explicit decision records, so the Arc 01 rule against guessed assignments is satisfied. None requires inventing a value to install the Arc 02 capability types, resource instrumentation, or the first Arc 03 ownership wrapper. Key custody becomes blocking before Arc 04 can claim a complete Endpoint Auth boundary. Codec ownership becomes blocking before the media compatibility adapter is removed. Numeric resource values become blocking before enforcement is enabled.
 
 ## Boundary documents
 
-Arc 01 created no target implementation module. Arc 02 now links seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
+Arc 01 created no target implementation module. Arc 02 and the first Arc 03 slice use seven bounded module directories. The inventory records each directory, and the checker requires its `BOUNDARY.md`:
 
 - `application_gateway`;
 - `connector`;
@@ -216,7 +216,7 @@ The `runtime/mod.rs` namespace owns the memory-only runtime-incarnation witness 
 - Every mechanically discovered declaration member and effect has exactly one target, deletion/split disposition, or named owner decision.
 - No item has two final owners.
 - Payload bypasses, ordinary forwarding, authority mutations, and unbounded queues are recorded.
-- No product code was deleted or changed.
+- This inventory refresh changed no product code.
 - The exact baseline and input fingerprints are recorded.
 
-The linked Arc 02 modules are now covered by this gate. Arc 02 remains limited to private-constructor capabilities, forbidden-conversion tests, compatibility wrappers, a retiring peer registry, bounded observation, and the aggregate attempt-reservation foundation. It must not change transport behavior or choose unmeasured resource limits.
+The linked Arc 02 foundation and the first Arc 03 WebRTC ownership, approval-convergence, and owner-bound reliable-outbound slice are now covered by this gate. Arc 03 wraps the existing WebRTC work, moves remote-candidate and callback ownership into `WebRtcConnectorWorker`, adds exact local retirement and installation identities, carries exact peer ownership through handshake, activation, and the reliable activation follow-up, and keeps production on the explicit compatibility path. It does not enable admitted production construction, choose resource limits, bound the remaining queues or cleanup tasks, or establish full behavior preservation.

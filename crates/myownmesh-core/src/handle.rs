@@ -664,9 +664,10 @@ pub struct PeerInfo {
     /// back: this device's suffix + code, the peer's suffix + code.
     /// `None` until our handshake has fired.
     pub verification_code_sent: Option<String>,
-    /// True once we've sent an `Approve` to this peer — either via
-    /// the user clicking Approve in the GUI, or via auto-approve
-    /// because the peer is already in the roster. Surfaced so the
+    /// True once this peer's exact current data channel has accepted our
+    /// `Approve` bytes for transmission, either via the user clicking Approve
+    /// in the GUI or via roster auto-approval. This does not prove remote
+    /// receipt. Surfaced so the
     /// approval UI can flip the row from "review and approve" to
     /// "waiting for peer to approve their side" — the connection
     /// doesn't transition to Active until both ends have approved.

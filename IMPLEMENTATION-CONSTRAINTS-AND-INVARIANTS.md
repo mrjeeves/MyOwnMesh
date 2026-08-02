@@ -133,7 +133,7 @@ A profile may authenticate an ephemeral signal. Authentication strengthens attri
 At minimum, the runtime must use non-serializable or otherwise unforgeable local capabilities equivalent to:
 
 ```text
-CandidateCapability
+ConnectorCandidateCapability
 ConnectedChannelCapability
 AuthenticatedChannelCapability
 SessionCapability
@@ -252,14 +252,14 @@ A connector profile must expose equivalent operations to:
 
 ```text
 start_attempt(local_intent, bounded_hints)
-    -> CandidateCapability*
+    -> ConnectorCandidateCapability*
 
-poll_or_receive_candidate(candidate_capability, typed_input)
-    -> CandidateUpdate
+poll_or_receive_connector_candidate(connector_candidate_capability, typed_input)
+    -> ConnectorCandidateUpdate
 
-try_candidate(candidate_capability)
+try_connector_candidate(connector_candidate_capability)
     -> ConnectedChannelCapability
-       | CandidateFailure
+       | ConnectorCandidateFailure
 
 observe_channel(channel_capability)
     -> TransportObservation
@@ -269,6 +269,8 @@ close_candidate_or_channel(capability)
 ```
 
 The exact API may be asynchronous or event driven.
+
+One connection attempt may own multiple connector candidates. One WebRTC connector candidate owns one `RTCPeerConnection` and one ICE agent. The ICE agent may own multiple internal ICE candidates and pairs. An internal ICE candidate is typed control input, not a `ConnectorCandidateCapability`.
 
 ### 6.2 Speculative work is allowed
 

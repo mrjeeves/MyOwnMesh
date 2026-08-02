@@ -189,10 +189,10 @@ The connector owns pathfinding and packet transport. It may start useful work be
 An untrusted hint or partially authenticated signal may create only bounded speculative state, such as:
 
 ```text
-CandidateHandle
+ConnectorCandidateCapability
 TransportHandle
 RelayAllocationToken
-ConnectedChannelHandle
+ConnectedChannelCapability
 TransportObservation
 ```
 
@@ -220,7 +220,26 @@ Before promotion, speculative work may not:
 
 MyOwnMesh does not maintain a parallel global route table. A connector may keep local ephemeral candidate and channel indexes for operation and diagnostics. Those local identifiers are not ledger facts, peer identity, application authority, or cross-runtime route identifiers.
 
-### 5.1 Connector profiles
+### 5.1 Attempt and connector cardinality
+
+One connection attempt is a cancellation, race, and aggregate-resource owner. It may own several connector candidates. One WebRTC connector candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE agent may gather, receive, and check many internal ICE candidates and candidate pairs.
+
+```text
+one connection attempt
+    -> multiple connector candidates
+
+one WebRTC connector candidate
+    -> one RTCPeerConnection and ICE agent
+    -> multiple internal ICE candidates and candidate pairs
+
+DataChannelOpen for that exact live WebRTC connector candidate
+    -> ConnectedChannelCapability
+    -> not endpoint authentication or session authority
+```
+
+An internal `LocalIceCandidate` is typed transport-control input to a WebRTC connector candidate. It is not a connector candidate, an attempt, or an authority capability.
+
+### 5.2 Connector profiles
 
 A connector profile defines the transport-specific work it performs, including:
 

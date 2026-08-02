@@ -34,13 +34,24 @@ Step(P, L, I) -> PlannedLiveState x Q* x E*
 The connector runtime has local opaque capabilities:
 
 ```text
-CandidateCapability
+ConnectorCandidateCapability
 ConnectedChannelCapability
 AuthenticatedChannelCapability
 SessionCapability
 ```
 
 A capability is unforgeable within the selected runtime model, bound to one runtime incarnation, and not reconstructible from a durable fact or serialized identifier alone.
+
+For one live connection attempt `a`, let `C(a)` be its finite set of connector candidates. Every `c` in `C(a)` has exactly one attempt owner. A WebRTC candidate `c_w` owns one peer connection and one ICE agent. Its internal ICE candidate and pair sets are finite live connector state, not members of `C(a)` and not authority capabilities.
+
+```text
+DataChannelOpen(c_w)
+and Owns(a, c_w)
+and Active(a)
+    -> ConnectedChannelCapability(c_w)
+```
+
+If `a` is retired before this transition, no delayed callback for any member of `C(a)` may produce a connected-channel capability or mutate the replacement attempt.
 
 ### 1.1 Durable facts
 
