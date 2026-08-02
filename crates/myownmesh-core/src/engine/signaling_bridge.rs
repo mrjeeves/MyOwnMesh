@@ -52,7 +52,8 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
         &state.network_id,
     );
     let device_id = state.identity.public_id().to_string();
-    let (out_tx, mut in_rx) = broker.join(&room, &device_id);
+    let listen_only = state.config.read().signaling.listen_only;
+    let (out_tx, mut in_rx) = broker.join_with(&room, &device_id, !listen_only);
 
     // Outbound: engine → broker.
     let Some(mut outbound_rx) = state.take_signaling_outbound_rx() else {
@@ -64,10 +65,24 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     tokio::spawn(async move {
         // Announce ourselves on join so peers learn we're here
         // even if the engine doesn't emit anything immediately.
-        let _ = out_tx.send(LocalOutbound::Announce {
-            device_id: device_id_for_out.clone(),
-        });
+        // A listen-only join never advertises — see
+        // `SignalingConfig::listen_only` (the broker still registers us
+        // for *inbound* delivery; register-without-announce is exactly
+        // the lurk shape).
+        if !listen_only {
+            let _ = out_tx.send(LocalOutbound::Announce {
+                device_id: device_id_for_out.clone(),
+            });
+        }
         while let Some(outbound) = outbound_rx.recv().await {
+            if listen_only
+                && matches!(
+                    outbound,
+                    SignalingOutbound::Announce | SignalingOutbound::Leave
+                )
+            {
+                continue;
+            }
             let msg = match outbound {
                 SignalingOutbound::Announce => LocalOutbound::Announce {
                     device_id: device_id_for_out.clone(),
@@ -312,6 +327,11 @@ fn attach_nostr_with(
         denylist: cfg.signaling.denylist.clone(),
         redundancy: cfg.signaling.redundancy as usize,
         public_fallback: cfg.signaling.public_fallback,
+        // A listen-only member subscribes but never advertises — the
+        // driver skips its join announce, periodic announcer, and
+        // per-relay open-announce. (The fan-out drops engine-originated
+        // announces too; this covers the driver's own.)
+        announce: !cfg.signaling.listen_only,
     };
     let redundancy = nostr_cfg.redundancy;
     drop(cfg);
@@ -337,6 +357,7 @@ fn attach_nostr_with(
 
     // Outbound pump: engine SignalingOutbound → NostrOutbound.
     let device_id_for_out = device_id.clone();
+    let listen_only = !nostr_cfg.announce;
     tokio::spawn(async move {
         // No explicit startup announce here — the Nostr driver's
         // `run_announcer` fires immediately at t=0 and then follows
@@ -346,6 +367,20 @@ fn attach_nostr_with(
         // → distinct sha256 id, so receiver-side dedup wouldn't
         // collapse it) — wasted relay bandwidth for no benefit.
         while let Some(outbound) = outbound_rx.recv().await {
+            // Listen-only: the engine's announces (join / reactive / wake)
+            // and its Leave never reach the wire — either would leak the
+            // watcher's device id to a room it is deliberately invisible
+            // in. Directed frames below still pass. Gated here (not just
+            // in the fan-out) because the nostr-only attach path hands
+            // this pump the engine receiver directly.
+            if listen_only
+                && matches!(
+                    outbound,
+                    SignalingOutbound::Announce | SignalingOutbound::Leave
+                )
+            {
+                continue;
+            }
             let translated = match outbound {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
                 SignalingOutbound::Leave => NostrOutbound::Leave,
@@ -587,10 +622,25 @@ impl Drop for SignalingDrivers {
 /// outbound queue so it can't grow unboundedly — the network is
 /// simply unreachable, and warnings say so.
 pub fn attach_signaling(state: &Arc<NetworkState>) -> Option<SignalingDrivers> {
-    let (strategy, mdns_on) = {
+    let (strategy, mut mdns_on, listen_only) = {
         let cfg = state.config.read();
-        (cfg.signaling.strategy.clone(), cfg.signaling.mdns)
+        (
+            cfg.signaling.strategy.clone(),
+            cfg.signaling.mdns,
+            cfg.signaling.listen_only,
+        )
     };
+    // mDNS-SD has no listen-only mode — its browse/advertise handshake is
+    // inherently two-way, so attaching it would advertise the very
+    // presence `listen_only` promises to withhold. Skip it, loudly.
+    if listen_only && mdns_on {
+        state.log_diag(
+            crate::events::DiagLevel::Info,
+            "signaling",
+            "listen-only join — mDNS driver not attached (mDNS cannot lurk)".to_string(),
+        );
+        mdns_on = false;
+    }
     let want_nostr = match strategy.as_str() {
         "" | "nostr" => true,
         "none" => false,
@@ -678,8 +728,24 @@ fn spawn_fanout(
     // members' verdict clears, that same probe is what revives the links.
     const EVICTED_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
     let mut last_evicted_probe: Option<std::time::Instant> = None;
+    // Snapshot, not a live read: flipping `listen_only` is a signaling
+    // change, which `reconcile::requires_restart` already forces through a
+    // full leave + rejoin, so the value can't change under a running
+    // fan-out.
+    let listen_only = state.config.read().signaling.listen_only;
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
+            // A listen-only member never advertises: drop the engine's
+            // announces (join, reactive, wake) AND its Leave — a peer that
+            // was never present has no departure to broadcast, and either
+            // frame would leak the watcher's device id to the room.
+            // Directed signaling (offers/answers/candidates) still passes,
+            // so a listen-only member can deliberately dial a peer it
+            // observed.
+            if listen_only && matches!(msg, SignalingOutbound::Announce | SignalingOutbound::Leave)
+            {
+                continue;
+            }
             // A stood-down engine stops advertising itself: an announce is
             // an invitation to dial us, and every member would answer it
             // with a denial. Directed signaling (offers/answers already in

@@ -151,6 +151,22 @@ The behaviour is exercised end-to-end in
 two co-present silent peers reach `Sighted` but never authenticate on their own,
 then both reach `Approved` after a single `connect_peer`.
 
+### Listen-only (lurk) joins
+
+A network's signaling can additionally be joined **listen-only**
+(`SignalingConfig::listen_only`, wire form `"signaling": { …, "listen_only":
+true }`): the member subscribes to the room and receives every announce /
+offer / leave, but never advertises itself — no join announce, no periodic
+announce, no `Leave` on exit. To the room, a listen-only member simply isn't
+there. This is the *watcher* shape a Silent room enables: a help-desk queue
+room whose ordinary members are the queue, read by watchers who must not
+appear in it themselves. Directed signaling still flows both ways, so a
+listen-only member can deliberately `connect_peer` a peer it observed — the
+dial is what reveals it, to that one peer. While set, the mDNS driver is not
+attached (mDNS-SD's browse/advertise handshake cannot lurk). Exercised
+end-to-end in
+[`tests/listen_only.rs`](../crates/myownmesh-core/tests/listen_only.rs).
+
 ## Closed networks: a two-log cert chain
 
 A closed network's membership is **entirely signed** — it does NOT

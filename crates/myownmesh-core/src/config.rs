@@ -194,6 +194,19 @@ pub struct SignalingConfig {
     /// moment one recovers — so steady state never touches public
     /// infrastructure. Set `false` to stay strictly on your own relays.
     pub public_fallback: bool,
+    /// Join the network's signaling **listen-only**: subscribe to the room
+    /// and receive every announce/offer/leave, but never advertise this
+    /// device — no join announce, no periodic announce, no Leave on exit.
+    /// To the room, a listen-only member simply isn't there. The shape a
+    /// queue or monitor *watcher* wants on a Silent network: it observes
+    /// who is present without becoming a presence itself. Directed
+    /// signaling (offers / answers / candidates) still flows both ways, so
+    /// a listen-only member can deliberately dial a peer it observed — the
+    /// dial is what reveals it, to that one peer. Off by default; configs
+    /// written by older builds decode to `false`. While set, the LAN mDNS
+    /// driver is not attached (mDNS-SD has no listen-only mode — its
+    /// browse/advertise handshake is inherently two-way).
+    pub listen_only: bool,
 }
 
 impl Default for SignalingConfig {
@@ -205,6 +218,7 @@ impl Default for SignalingConfig {
             redundancy: DEFAULT_SIGNALING_REDUNDANCY,
             denylist: default_signaling_denylist(),
             public_fallback: true,
+            listen_only: false,
         }
     }
 }

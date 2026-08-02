@@ -59,6 +59,14 @@ pub struct NostrDriverConfig {
     /// unreachable. On by default; the fallback is reactive (only while
     /// the primary set is down) so steady state stays on your own relays.
     pub public_fallback: bool,
+    /// Publish presence announces (the periodic ticker and the per-relay
+    /// open-announce). `false` is a **listen-only** join: the driver
+    /// subscribes to the room and receives every event, but never
+    /// advertises this device — to the room, it simply isn't there. The
+    /// shape a queue/monitor watcher wants; directed sends (offers /
+    /// answers / candidates) are unaffected, so a listen-only peer can
+    /// still deliberately dial someone it observed.
+    pub announce: bool,
 }
 
 /// Inbound signaling events the driver pushes to the engine.
@@ -175,6 +183,7 @@ pub fn start(
         outbound_replay: Mutex::new(std::collections::VecDeque::new()),
         room_caps: Mutex::new(std::collections::HashMap::new()),
         compat_directed,
+        announce: config.announce,
     });
     {
         let mut relays = shared.relays.lock();
@@ -238,14 +247,17 @@ pub fn start(
     // Spawn the global announce task. Single ticker per driver
     // instance (NOT per relay) — fans out via `publish_tx`. See
     // `upstream.rs` item 7 for the schedule rationale and the
-    // earlier "N-relay = N-publish" bug it fixes.
-    let shared_for_announce = shared.clone();
-    let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancel_token_for_task = cancel_token.clone();
-    cancellers.push(cancel_token);
-    tokio::spawn(async move {
-        run_announcer(shared_for_announce, cancel_token_for_task).await;
-    });
+    // earlier "N-relay = N-publish" bug it fixes. A listen-only
+    // driver never advertises, so the ticker isn't even spawned.
+    if config.announce {
+        let shared_for_announce = shared.clone();
+        let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_token_for_task = cancel_token.clone();
+        cancellers.push(cancel_token);
+        tokio::spawn(async move {
+            run_announcer(shared_for_announce, cancel_token_for_task).await;
+        });
+    }
 
     NostrDriverHandle {
         cancellers,
@@ -351,6 +363,10 @@ struct DriverShared {
     /// what stops every pairwise offer/answer/candidate in the room from
     /// being delivered to every member.
     compat_directed: Arc<watch::Sender<bool>>,
+    /// Whether this driver advertises presence at all — `false` is a
+    /// listen-only join (see [`NostrDriverConfig::announce`]). Gates the
+    /// per-relay open-announce; the periodic announcer isn't even spawned.
+    announce: bool,
 }
 
 /// Re-evaluate [`DriverShared::compat_directed`] from the current
@@ -759,8 +775,9 @@ async fn run_relay_session(
     // (re)connected relay immediately learns we're here, rather
     // than waiting up to ANNOUNCE_STEADY_MS for the next global
     // tick. Cheap — the relay-side dedup (by event id) means a
-    // tick that fires shortly after is harmless.
-    {
+    // tick that fires shortly after is harmless. Skipped on a
+    // listen-only join: a watcher's presence is nobody's business.
+    if shared.announce {
         let event = build_announce_event(shared);
         let frame = serde_json::json!(["EVENT", event]).to_string();
         if let Err(e) = write.send(WsMessage::Text(frame)).await {
@@ -1341,6 +1358,7 @@ mod tests {
             outbound_replay: Mutex::new(std::collections::VecDeque::new()),
             room_caps: Mutex::new(std::collections::HashMap::new()),
             compat_directed: Arc::new(watch::channel(true).0),
+            announce: true,
         })
     }
 

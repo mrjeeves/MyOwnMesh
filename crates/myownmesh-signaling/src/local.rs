@@ -42,6 +42,11 @@ pub enum LocalInbound {
 struct PeerHandle {
     device_id: String,
     inbound_tx: mpsc::UnboundedSender<LocalInbound>,
+    /// Whether this peer's presence is advertised at all. A listen-only
+    /// peer (`false`) is never backfilled to later joiners, mirroring the
+    /// Nostr driver where a lurker publishes no announce events for
+    /// relays to replay.
+    announce: bool,
 }
 
 #[derive(Default)]
@@ -75,6 +80,25 @@ impl LocalBroker {
         mpsc::UnboundedSender<LocalOutbound>,
         mpsc::UnboundedReceiver<LocalInbound>,
     ) {
+        self.join_with(room, device_id, true)
+    }
+
+    /// [`Self::join`] with an explicit announce policy. `announce: false`
+    /// is a **listen-only** join: the peer registers for inbound delivery
+    /// (it hears every room announce, and directed messages addressed to
+    /// it) but existing peers are never told it arrived, and its eventual
+    /// departure is never broadcast — to the room, it simply isn't there.
+    /// Mirrors the Nostr driver's `announce: false` so in-process tests
+    /// exercise the same lurk semantics as production signaling.
+    pub fn join_with(
+        &self,
+        room: &str,
+        device_id: &str,
+        announce: bool,
+    ) -> (
+        mpsc::UnboundedSender<LocalOutbound>,
+        mpsc::UnboundedReceiver<LocalInbound>,
+    ) {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
 
@@ -84,18 +108,26 @@ impl LocalBroker {
             let peers = inner.rooms.entry(room.to_string()).or_default();
             // Existing peers learn about us, and we learn about
             // them. Both directions fire so each side initiates
-            // its handshake from the same announce signal.
+            // its handshake from the same announce signal. A
+            // listen-only joiner only gets the inbound half — and a
+            // registered listen-only peer is never backfilled to a
+            // later joiner (it has no presence to replay).
             for p in peers.iter() {
-                let _ = p.inbound_tx.send(LocalInbound::PeerAnnounced {
-                    device_id: device_id.to_string(),
-                });
-                let _ = in_tx.send(LocalInbound::PeerAnnounced {
-                    device_id: p.device_id.clone(),
-                });
+                if announce {
+                    let _ = p.inbound_tx.send(LocalInbound::PeerAnnounced {
+                        device_id: device_id.to_string(),
+                    });
+                }
+                if p.announce {
+                    let _ = in_tx.send(LocalInbound::PeerAnnounced {
+                        device_id: p.device_id.clone(),
+                    });
+                }
             }
             peers.push(PeerHandle {
                 device_id: device_id.to_string(),
                 inbound_tx: in_tx.clone(),
+                announce,
             });
         }
 
@@ -108,14 +140,18 @@ impl LocalBroker {
                 let routed = route_outbound(&inner, &room, &device_id_for_task, &out);
                 trace!(routed, "broker fanout");
             }
-            // Sender dropped → leave the room.
+            // Sender dropped → leave the room. A listen-only peer was
+            // never present to the room, so there is no departure to
+            // broadcast either.
             let mut guard = inner.lock();
             if let Some(peers) = guard.rooms.get_mut(&room) {
                 let left = device_id_for_task.clone();
                 peers.retain(|p| p.device_id != left);
-                let leave = LocalInbound::PeerLeft { device_id: left };
-                for p in peers.iter() {
-                    let _ = p.inbound_tx.send(leave.clone());
+                if announce {
+                    let leave = LocalInbound::PeerLeft { device_id: left };
+                    for p in peers.iter() {
+                        let _ = p.inbound_tx.send(leave.clone());
+                    }
                 }
                 if peers.is_empty() {
                     guard.rooms.remove(&room);
