@@ -135,7 +135,7 @@ async fn roster_persists_on_mutual_approve_then_gossips() {
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     // --- Scenario 1: the double handshake persists the roster ---------
     let (a1, a1_id, b1, b1_id) = bring_up_pair("roster-gossip-persist", &transport).await;
@@ -178,3 +178,4 @@ async fn roster_persists_on_mutual_approve_then_gossips() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+mod support;

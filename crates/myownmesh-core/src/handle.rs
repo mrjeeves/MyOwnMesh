@@ -26,6 +26,7 @@ use crate::protocol::CapabilityAdvert;
 use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
+use crate::runtime::attempt::{ConnectorResourceOwnerPort, ConnectorResourceOwnerReport};
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
 /// How long [`JoinedNetwork::announce_leave`] waits after queuing the
@@ -68,6 +69,18 @@ impl Mesh {
         Self::open_with_identity(config, identity).await
     }
 
+    /// Build a `Mesh` whose native connector allocations are admitted by the
+    /// caller's process resource owner. Arc 03 supplies no fallback policy or
+    /// inferred capacity.
+    pub async fn open_with_connector_resource_owner(
+        config: MeshConfig,
+        resource_owner: ConnectorResourceOwnerPort,
+    ) -> Result<MeshHandle> {
+        let identity = Arc::new(crate::identity::load_or_create()?);
+        Self::open_with_identity_and_connector_resource_owner(config, identity, resource_owner)
+            .await
+    }
+
     /// Build a fresh `Mesh` with a **caller-supplied identity**, for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.
     /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
@@ -80,6 +93,23 @@ impl Mesh {
         identity: Arc<Identity>,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?;
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    /// Identity-injected form of [`Self::open_with_connector_resource_owner`].
+    pub async fn open_with_identity_and_connector_resource_owner(
+        _config: MeshConfig,
+        identity: Arc<Identity>,
+        resource_owner: ConnectorResourceOwnerPort,
+    ) -> Result<MeshHandle> {
+        let transport = Transport::new()?.with_connector_resource_owner(resource_owner);
+        Self::open_with_identity_and_transport(identity, transport)
+    }
+
+    fn open_with_identity_and_transport(
+        identity: Arc<Identity>,
+        transport: Transport,
+    ) -> Result<MeshHandle> {
         let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
@@ -122,6 +152,12 @@ impl MeshHandle {
     /// Convenience: bare-pubkey device id.
     pub fn device_id(&self) -> String {
         self.mesh.inner.identity.public_id().to_string()
+    }
+
+    /// Current connector resource-owner state. `None` means connector
+    /// allocation is disabled for this process instance.
+    pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
+        self.mesh.inner.transport.connector_resource_report()
     }
 
     /// Subscribe to mesh-wide events (every joined network's

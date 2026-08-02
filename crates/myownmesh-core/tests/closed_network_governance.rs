@@ -17,7 +17,6 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, NetworkKind, PeerEvent, Role, TransitionVariant};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -72,7 +71,7 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
@@ -220,7 +219,7 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
     // Carol is a third device — admitted by the owner's signature, never
@@ -320,7 +319,7 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
     let bob_id = Arc::new(Identity::ephemeral()); // co-member, online
     let carol_id = Arc::new(Identity::ephemeral()); // admitted then evicted, offline
@@ -426,7 +425,7 @@ async fn manager_admits_a_member_which_converges_via_the_member_log() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
     let bob_id = Arc::new(Identity::ephemeral()); // promoted to manager
     let dave_id = Arc::new(Identity::ephemeral()); // admitted by the manager, offline
@@ -553,7 +552,7 @@ async fn deny_invalidates_proposal_on_both_sides() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
     let bob_id = Arc::new(Identity::ephemeral()); // plain member
     let carol_id = Arc::new(Identity::ephemeral()); // whom Bob proposes to admit
@@ -678,7 +677,7 @@ async fn re_admitting_an_evicted_member_supersedes_the_tombstone() {
     // membership (`roles`), which is where the tombstone would otherwise win.
     shared_home();
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let carol_id = Arc::new(Identity::ephemeral());
     let carol_pk = carol_id.public_id().to_string();
@@ -775,7 +774,7 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     // re-projection.
     shared_home();
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let carol_id = Arc::new(Identity::ephemeral());
     let carol_pk = carol_id.public_id().to_string();
@@ -872,7 +871,7 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     // and we read the on-disk roster tag it mirrors for its own peer rows.
     shared_home();
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
     let bob_pk = bob_id.public_id().to_string();
@@ -963,7 +962,7 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
     let bob_id = Arc::new(Identity::ephemeral()); // co-member, online
     let carol_id = Arc::new(Identity::ephemeral()); // evicted while offline
@@ -1102,7 +1101,7 @@ async fn two_owners_converge_their_rosters() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // founder-owner
     let bob_id = Arc::new(Identity::ephemeral()); // promoted to a second owner
     let carol_id = Arc::new(Identity::ephemeral()); // admitted by Alice, offline
@@ -1225,7 +1224,7 @@ async fn owner_signed_topology_converges_and_reshapes_both_nodes() {
     shared_home();
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
@@ -1382,3 +1381,4 @@ fn shared_home() {
     let dir = HOME.get_or_init(|| tempfile::tempdir().expect("tempdir"));
     std::env::set_var("MYOWNMESH_HOME", dir.path());
 }
+mod support;

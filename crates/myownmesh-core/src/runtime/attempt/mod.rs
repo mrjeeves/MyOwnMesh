@@ -3,8 +3,10 @@
 //! The attempt owner admits connector candidates before allocation, retires
 //! losing work, and transfers an exact child claim when a candidate connects.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::resource::{PreAuthResourceFamily, ResourceUse, PRE_AUTH_RESOURCE_FAMILY_COUNT};
@@ -64,13 +66,7 @@ impl PreAuthResourceClaim {
         Some(remainder)
     }
 
-    fn fits_within(self, capacity: Self) -> bool {
-        PreAuthResourceFamily::ALL.into_iter().all(|family| {
-            let index = family.index();
-            self.by_family[index].fits_within(capacity.by_family[index])
-        })
-    }
-
+    #[cfg(test)]
     fn componentwise_max(self, other: Self) -> Self {
         let mut maximum = Self::ZERO;
         for family in PreAuthResourceFamily::ALL {
@@ -129,15 +125,108 @@ impl ConnectorCandidateResourceClaim {
         let mut opening = transport;
         opening.by_family[PreAuthResourceFamily::ConnectorSpecificWork.index()] =
             ResourceUse::observed(1, 0, 0, 0);
-        Self {
-            opening,
-            connected: transport,
-        }
+        opening.by_family[PreAuthResourceFamily::Task.index()] = ResourceUse::observed(1, 0, 0, 1);
+        let mut connected = transport;
+        connected.by_family[PreAuthResourceFamily::Task.index()] =
+            ResourceUse::observed(1, 0, 0, 1);
+        Self { opening, connected }
     }
 
+    #[cfg(test)]
     fn aggregate_capacity(self) -> PreAuthResourceClaim {
         self.opening.componentwise_max(self.connected)
     }
+}
+
+/// Owner-selected bounds for the four independent connector callback
+/// mailboxes. Keeping these values separate prevents video or audio pressure
+/// from occupying the only control or endpoint-data slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorCallbackMailboxCapacities {
+    control: NonZeroUsize,
+    data: NonZeroUsize,
+    audio: NonZeroUsize,
+    video: NonZeroUsize,
+}
+
+impl ConnectorCallbackMailboxCapacities {
+    pub const fn new(
+        control: NonZeroUsize,
+        data: NonZeroUsize,
+        audio: NonZeroUsize,
+        video: NonZeroUsize,
+    ) -> Self {
+        Self {
+            control,
+            data,
+            audio,
+            video,
+        }
+    }
+
+    pub const fn control(self) -> NonZeroUsize {
+        self.control
+    }
+
+    pub const fn data(self) -> NonZeroUsize {
+        self.data
+    }
+
+    pub const fn audio(self) -> NonZeroUsize {
+        self.audio
+    }
+
+    pub const fn video(self) -> NonZeroUsize {
+        self.video
+    }
+}
+
+/// Explicit policy supplied by the process resource owner.
+///
+/// Arc 03 deliberately provides no `Default`: the maximum number of admitted
+/// candidates, callback capacities, and native-close deadline are operational
+/// values that require owner review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorResourcePolicy {
+    max_active_candidates: NonZeroUsize,
+    callback_mailboxes: ConnectorCallbackMailboxCapacities,
+    native_close_timeout: Duration,
+}
+
+impl ConnectorResourcePolicy {
+    pub fn new(
+        max_active_candidates: NonZeroUsize,
+        callback_mailboxes: ConnectorCallbackMailboxCapacities,
+        native_close_timeout: Duration,
+    ) -> Option<Self> {
+        (!native_close_timeout.is_zero()).then_some(Self {
+            max_active_candidates,
+            callback_mailboxes,
+            native_close_timeout,
+        })
+    }
+
+    pub const fn max_active_candidates(self) -> NonZeroUsize {
+        self.max_active_candidates
+    }
+
+    pub const fn callback_mailboxes(self) -> ConnectorCallbackMailboxCapacities {
+        self.callback_mailboxes
+    }
+
+    pub const fn native_close_timeout(self) -> Duration {
+        self.native_close_timeout
+    }
+}
+
+/// Point-in-time report from the connector resource owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorResourceOwnerReport {
+    pub max_active_candidates: NonZeroUsize,
+    pub active_candidates: usize,
+    pub poisoned: bool,
+    pub callback_mailboxes: ConnectorCallbackMailboxCapacities,
+    pub native_close_timeout: Duration,
 }
 
 /// Unique cancellation and retirement owner for one connection attempt.
@@ -201,22 +290,24 @@ impl Drop for AttemptLifetime {
     }
 }
 
-struct AggregateReservationState {
+struct ConnectorResourceOwnerState {
     active: PreAuthResourceClaim,
+    active_candidates: usize,
     poisoned: bool,
 }
 
-struct AggregateReservation {
-    capacity: PreAuthResourceClaim,
-    state: Mutex<AggregateReservationState>,
+struct ConnectorResourceOwnerInner {
+    policy: ConnectorResourcePolicy,
+    state: Mutex<ConnectorResourceOwnerState>,
 }
 
-impl AggregateReservation {
-    fn new(capacity: PreAuthResourceClaim) -> Self {
+impl ConnectorResourceOwnerInner {
+    fn new(policy: ConnectorResourcePolicy) -> Self {
         Self {
-            capacity,
-            state: Mutex::new(AggregateReservationState {
+            policy,
+            state: Mutex::new(ConnectorResourceOwnerState {
                 active: PreAuthResourceClaim::ZERO,
+                active_candidates: 0,
                 poisoned: false,
             }),
         }
@@ -233,14 +324,16 @@ impl AggregateReservation {
         if state.poisoned {
             return None;
         }
-        let next = state.active.checked_add(claim)?;
-        if !next.fits_within(self.capacity) {
+        if state.active_candidates >= self.policy.max_active_candidates.get() {
             return None;
         }
+        let next = state.active.checked_add(claim)?;
         state.active = next;
+        state.active_candidates += 1;
         Some(ConnectorCandidateReservation {
-            aggregate: Arc::clone(self),
+            owner: Arc::clone(self),
             claim,
+            poisoned: false,
         })
     }
 
@@ -266,11 +359,32 @@ impl AggregateReservation {
         let Some(next) = without_old.checked_add(new) else {
             return false;
         };
-        if !next.fits_within(self.capacity) {
-            return false;
-        }
         state.active = next;
         true
+    }
+
+    fn poison(&self) {
+        match self.state.lock() {
+            Ok(mut state) => state.poisoned = true,
+            Err(poisoned) => poisoned.into_inner().poisoned = true,
+        }
+    }
+
+    fn report(&self) -> ConnectorResourceOwnerReport {
+        let (active_candidates, poisoned) = match self.state.lock() {
+            Ok(state) => (state.active_candidates, state.poisoned),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.active_candidates, true)
+            }
+        };
+        ConnectorResourceOwnerReport {
+            max_active_candidates: self.policy.max_active_candidates,
+            active_candidates,
+            poisoned,
+            callback_mailboxes: self.policy.callback_mailboxes,
+            native_close_timeout: self.policy.native_close_timeout,
+        }
     }
 
     #[cfg(test)]
@@ -299,29 +413,89 @@ impl AggregateReservation {
     }
 }
 
+/// Cloneable port into one process resource owner.
+///
+/// The port is constructed only from an explicit owner policy and is shared by
+/// all attempts created by a `Transport`. Attempts can request the fixed
+/// structural connector claim, but only this owner can admit it.
+#[derive(Clone)]
+pub struct ConnectorResourceOwnerPort {
+    inner: Arc<ConnectorResourceOwnerInner>,
+}
+
+impl ConnectorResourceOwnerPort {
+    pub fn new(policy: ConnectorResourcePolicy) -> Self {
+        Self {
+            inner: Arc::new(ConnectorResourceOwnerInner::new(policy)),
+        }
+    }
+
+    pub fn report(&self) -> ConnectorResourceOwnerReport {
+        self.inner.report()
+    }
+
+    pub(crate) fn callback_mailboxes(&self) -> ConnectorCallbackMailboxCapacities {
+        self.inner.policy.callback_mailboxes
+    }
+
+    pub(crate) fn native_close_timeout(&self) -> Duration {
+        self.inner.policy.native_close_timeout
+    }
+
+    pub(crate) fn poison_cleanup(&self) {
+        self.inner.poison();
+    }
+}
+
+#[cfg(test)]
+impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
+    fn from(capacity: PreAuthResourceClaim) -> Self {
+        let candidates = usize::try_from(
+            capacity.by_family[PreAuthResourceFamily::TransportObject.index()].items(),
+        )
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .expect("test owner capacity includes at least one connector");
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let policy = ConnectorResourcePolicy::new(
+            candidates,
+            ConnectorCallbackMailboxCapacities::new(one, one, one, one),
+            Duration::from_secs(1),
+        )
+        .expect("test close timeout is nonzero");
+        Self::new(policy)
+    }
+}
+
 /// One live child claim against an attempt's aggregate reservation.
 ///
 /// Dropping the child returns its claim. This guard is created before the
 /// allocation closure runs, so a candidate cannot consume resources first and
 /// ask for accounting afterward.
 struct ConnectorCandidateReservation {
-    aggregate: Arc<AggregateReservation>,
+    owner: Arc<ConnectorResourceOwnerInner>,
     claim: PreAuthResourceClaim,
+    poisoned: bool,
 }
 
 impl ConnectorCandidateReservation {
     fn transition(&mut self, next: PreAuthResourceClaim) -> bool {
-        if !self.aggregate.transition(self.claim, next) {
+        if !self.owner.transition(self.claim, next) {
             return false;
         }
         self.claim = next;
         true
     }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+        self.owner.poison();
+    }
 }
 
 impl Drop for ConnectorCandidateReservation {
     fn drop(&mut self) {
-        let mut state = match self.aggregate.state.lock() {
+        let mut state = match self.owner.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
@@ -332,9 +506,17 @@ impl Drop for ConnectorCandidateReservation {
         if state.poisoned {
             return;
         }
+        if self.poisoned {
+            state.poisoned = true;
+            return;
+        }
         match state.active.checked_sub(self.claim) {
-            Some(active) => state.active = active,
+            Some(active) if state.active_candidates > 0 => {
+                state.active = active;
+                state.active_candidates -= 1;
+            }
             None => state.poisoned = true,
+            Some(_) => state.poisoned = true,
         }
     }
 }
@@ -347,7 +529,9 @@ impl Drop for ConnectorCandidateReservation {
 #[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 pub struct PreAuthAttemptPermit {
     attempt: Arc<AttemptOwnership>,
-    aggregate: Arc<AggregateReservation>,
+    resource_owner: ConnectorResourceOwnerPort,
+    #[cfg(test)]
+    aggregate: Arc<ConnectorResourceOwnerInner>,
 }
 
 #[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
@@ -356,8 +540,9 @@ impl PreAuthAttemptPermit {
     // the work. It stays private until that production port is migrated.
     fn admitted(
         runtime: RuntimeIncarnation,
-        capacity: PreAuthResourceClaim,
+        resource_owner: impl Into<ConnectorResourceOwnerPort>,
     ) -> (Self, AttemptLifetime) {
+        let resource_owner = resource_owner.into();
         let (retired, _retirement_receiver) = watch::channel(false);
         let attempt = Arc::new(AttemptOwnership {
             runtime,
@@ -371,7 +556,9 @@ impl PreAuthAttemptPermit {
         (
             Self {
                 attempt,
-                aggregate: Arc::new(AggregateReservation::new(capacity)),
+                #[cfg(test)]
+                aggregate: Arc::clone(&resource_owner.inner),
+                resource_owner,
             },
             lifetime,
         )
@@ -402,7 +589,7 @@ impl PreAuthAttemptPermit {
         if !self.attempt.active.load(Ordering::Acquire) {
             return None;
         }
-        let reservation = self.aggregate.reserve(claim.opening)?;
+        let reservation = self.resource_owner.inner.reserve(claim.opening)?;
         Some(ConnectorCandidateCapability {
             attempt: Arc::clone(&self.attempt),
             reservation,
@@ -415,13 +602,14 @@ impl PreAuthAttemptPermit {
 /// This attempt-local capacity is not a process or ingress limit.
 pub(crate) fn admit_single_connector_candidate(
     runtime: RuntimeIncarnation,
+    resource_owner: ConnectorResourceOwnerPort,
 ) -> (
     PreAuthAttemptPermit,
     AttemptLifetime,
     ConnectorCandidateResourceClaim,
 ) {
     let claim = ConnectorCandidateResourceClaim::exact_connector_floor();
-    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, claim.aggregate_capacity());
+    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, resource_owner);
     (permit, lifetime, claim)
 }
 
@@ -497,13 +685,17 @@ impl ConnectorCandidateCapability {
 
     #[cfg(test)]
     pub(crate) fn reservation_is_active_for_test(&self) -> bool {
-        self.reservation.aggregate.active() != PreAuthResourceClaim::ZERO
+        self.reservation.owner.active() != PreAuthResourceClaim::ZERO
     }
 
     #[cfg(test)]
     fn belongs_to(&self, permit: &PreAuthAttemptPermit) -> bool {
         Arc::ptr_eq(&self.attempt, &permit.attempt)
-            && Arc::ptr_eq(&self.reservation.aggregate, &permit.aggregate)
+            && Arc::ptr_eq(&self.reservation.owner, &permit.resource_owner.inner)
+    }
+
+    pub(crate) fn poison_cleanup(&mut self) {
+        self.reservation.poison();
     }
 }
 

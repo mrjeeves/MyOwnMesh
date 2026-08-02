@@ -11,118 +11,131 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 cargo fmt --all -- --check
 cargo check --workspace --all-targets -j 16
 cargo clippy --workspace --all-targets -j 16 -- -D warnings
-cargo test -p myownmesh-core --lib v4_arc03 -j 16 -- --nocapture --test-threads=1
+cargo test -p myownmesh-core --lib v4_arc03_ -j 16 -- --nocapture --test-threads=1
 cargo test -p myownmesh-core --lib v4_arc02_attempt_issues_multiple_candidate_children_from_one_aggregate -j 16 -- --nocapture
 cargo test -p myownmesh-core --lib v4_arc02_inconsistent_child_release_poisoned_aggregate_stays_closed -j 16 -- --nocapture
 python scripts/check-v4-arc03-compiler-boundaries.py
 ```
 
-These controls open no listener and change no firewall rule. Real socket tests run under Ubuntu 24.04 in WSL2.
+These controls open no listener and change no firewall rule. Socket-bearing tests run under Ubuntu 24.04 in WSL2.
 
 ## 2. Real WebRTC controls in WSL
-
-Set the repository and target directory once:
 
 ```powershell
 $repo = "/mnt/c/Users/Admin/MyOwnMesh Security Audit/MyOwnMeshV4Transition"
 $target = "/tmp/myownmesh-v4-arc03-wsl"
-```
 
-Run the ownership and cancellation controls:
-
-```powershell
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_cancelled_construction_closes_partial_native_peer -- --ignored --nocapture --test-threads=1"
-
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_cancelled_delivered_result_closes_native_peer_before_release -- --ignored --nocapture --test-threads=1"
-
+wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed -- --ignored --nocapture --test-threads=1"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_background_construction_failure_closes_partial_native_peer -- --ignored --nocapture --test-threads=1"
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives -- --ignored --nocapture --test-threads=1"
-
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_stale_transport_event_cannot_mutate_replacement_worker -- --ignored --nocapture --test-threads=1"
-
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-core --lib v4_arc03_offerer_observes_data_channel_handlers -- --ignored --nocapture --test-threads=1"
-```
-
-Run the real TURN-selected endpoint test:
-
-```powershell
 wsl.exe -d Ubuntu-24.04 -e bash -lc "cd '$repo' && CARGO_TARGET_DIR='$target' cargo test -p myownmesh-services --test turn_webrtc_endpoint_auth -- --nocapture --test-threads=1"
 ```
 
-The TURN control must report one selected Relay-to-Relay candidate pair at each endpoint, observe authentication before approval, and deliver exact typed endpoint data from the expected authenticated sender in both directions.
+The TURN control must select Relay-to-Relay pairs. The positive path authenticates before admission and carries typed endpoint data in both directions. The negative path authenticates without bilateral admission and rejects endpoint data, lane creation, and real-time sample delivery.
 
-## 3. RT-03-01: confuse ICE input with connector authority
+## 3. RT-03-01: self-issued resource capacity
 
-Attack: treat one `LocalIceCandidate` as one `ConnectorCandidateCapability`, construct a worker externally, or call raw candidate application.
+Attack: let an attempt create the capacity that admits its own connector.
 
-Required result: types and visibility reject each bypass. A connector capability names a complete peer-connection candidate.
-
-Controls:
-
-- `check-v4-arc03-compiler-boundaries.py`;
-- `v4_arc03_connector_candidate_claim_rejects_zero_and_mislabeled_resources`;
-- `v4_arc02_attempt_issues_multiple_candidate_children_from_one_aggregate`.
-
-## 4. RT-03-02: cancel during native construction
-
-Attack: pause immediately after `RTCPeerConnection` allocation or after the complete result reaches the caller, then cancel the parent.
-
-Required result: attempt retirement fences publication. The owned task closes the partial or completed native peer before releasing its candidate reservation. Callback and task observations return to zero after cleanup.
+Required result: `admit_single_connector_candidate` can define only the structural claim. Reservation requires an injected `ConnectorResourceOwnerPort`. No production default or inferred capacity exists.
 
 Controls:
 
 - `v4_arc03_reservation_precedes_allocation_and_retirement_fences_result`;
+- `v4_arc03_connector_candidate_claim_rejects_zero_and_mislabeled_resources`;
+- compiler-boundary checker;
+- source check for `Transport::with_connector_resource_owner` before admitted construction.
+
+## 4. RT-03-02: cancel partial or delivered construction
+
+Attack: cancel after native allocation, after result delivery, during caller-runtime shutdown, or after the owned construction task fails.
+
+Required result: one cleanup owner follows every result. Callback authority retires, partial work is fenced, native close is attempted once, and the reservation releases only after proven close success.
+
+Controls:
+
 - `v4_arc03_cancelled_construction_closes_partial_native_peer` in WSL;
-- `v4_arc03_cancelled_delivered_result_closes_native_peer_before_release` in WSL.
+- `v4_arc03_cancelled_delivered_result_closes_native_peer_before_release` in WSL;
+- `v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed` in WSL;
+- `v4_arc03_background_construction_failure_closes_partial_native_peer` in WSL;
+- `v4_arc03_cleanup_owner_outlives_caller_runtime_shutdown`;
+- `v4_arc03_cleanup_thread_start_failure_is_visible_and_fail_closed`.
 
-The existing 30-second connection-attempt window also bounds how long construction can park the network driver. A timed-out owned constructor remains responsible for closing any later result.
+## 5. RT-03-03: fail or stall native close
 
-## 5. RT-03-03: deadlock promotion and retirement
+Attack: return a close error, never complete close, fail cleanup startup, or add duplicate connected claims after poison.
 
-Attack: acquire connector authority during promotion while another path retires the attempt.
+Required result: the owner reaches a terminal visible poison state within its configured deadline. The process resource report stays consumed and poisoned. Later admission fails. No claim is forgotten or silently reused.
 
-Required result: no path nests connector authority with the attempt-transition mutex. The candidate enters private `Promoting`, releases connector authority, transitions the attempt, then publishes.
+Controls:
+
+- `v4_arc03_native_close_error_poison_is_visible_and_refuses_reuse`;
+- `v4_arc03_native_close_timeout_is_bounded_visible_and_fail_closed`;
+- `v4_arc03_cleanup_thread_start_failure_is_visible_and_fail_closed`;
+- `v4_arc03_duplicate_connected_claims_remain_explicit_when_cleanup_poisoned`;
+- source search rejecting `mem::forget` in Arc 03 ownership code.
+
+## 6. RT-03-04: deadlock promotion and retirement
+
+Attack: retire the attempt or connector at each transition point around promotion.
+
+Required result: connector authority and attempt transition are never nested. Each race has one linearized winner, and the losing candidate is cleaned.
 
 Controls:
 
 - `v4_arc03_promotion_does_not_nest_connector_and_attempt_transitions`;
-- `v4_arc03_promotion_and_retirement_have_one_linearized_order`.
-
-## 6. RT-03-04: keep losing work alive
-
-Attack: retire an attempt while a losing worker is silent, queued, or awaiting dependency work.
-
-Required result: retirement wakes the receiver, rejects later events, drains remote candidates, cancels local awaits, and closes the native peer. Candidate and connected claims remain held through successful native close. A close error is reported and retains the claim conservatively.
-
-Controls:
-
-- `v4_arc03_attempt_retirement_wakes_and_reclaims_silent_candidate`;
-- `v4_arc03_attempt_retirement_invalidates_every_connector_candidate`;
-- `v4_arc03_retirement_cancels_inflight_candidate_observation`;
+- `v4_arc03_promotion_and_retirement_have_one_linearized_order`;
+- `v4_arc03_connector_retirement_before_promotion_rejects_and_cleans`;
 - `v4_arc03_attempt_retirement_preserves_winner_and_invalidates_awaiting_loser`.
-- `v4_arc03_retired_candidate_claim_waits_for_cleanup_completion`.
 
-## 7. RT-03-05: smuggle backlog through callbacks
+## 7. RT-03-05: reorder Endpoint Auth handoff and close
 
-Attack: prequeue a hostile event, block another callback, retire or replace the worker, then drain the engine path.
+Attack: release Endpoint Auth provenance before native close, close before that handoff releases, or retire the peer while an external owner survives.
 
-Required result: the raw callback mailbox retains at most one event. Producers await capacity and wake on retirement. Each worker processes one ordered event handler at a time, outside `NetworkCmd`. Every event retains the exact worker stamp.
+Required result: the exact connected claim remains visible until both native cleanup and handoff ownership allow release. No ordering double-releases or hides it.
 
 Controls:
 
-- `v4_arc03_callback_queue_applies_awaited_backpressure_at_its_floor`;
+- `v4_arc03_endpoint_handoff_release_before_native_close_releases_once`;
+- `v4_arc03_native_close_before_endpoint_handoff_release_keeps_claim_visible`;
+- `v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives` in WSL.
+
+## 8. RT-03-06: smuggle callback backlog
+
+Attack: fill one callback class, prequeue stale events, block a producer, then retire or replace the connector.
+
+Required result: each callback class has its own owner-selected bound. Filling one class cannot consume another class's mailbox. Full-mailbox producers wake on retirement. Exact incarnation stamps reject stale events.
+
+Controls:
+
+- `v4_arc03_control_callback_contention_honors_configured_bound`;
+- `v4_arc03_data_callback_contention_honors_configured_bound`;
+- `v4_arc03_audio_callback_contention_honors_configured_bound`;
+- `v4_arc03_video_callback_contention_honors_configured_bound`;
+- the four callback-capacity independence tests;
 - `v4_arc03_retirement_wakes_producer_blocked_by_full_callback_queue`;
-- `v4_arc03_engine_handoff_allows_one_outstanding_event_per_worker`;
 - `v4_arc03_retirement_stops_event_pump_before_stale_callback_queueing`;
-- `v4_arc03_stale_transport_event_cannot_mutate_replacement_worker` in WSL;
-- shutdown WSL control.
+- `v4_arc03_stale_transport_event_cannot_mutate_replacement_worker` in WSL.
 
-Residual attack: many hostile attempts can create many separately bounded workers. Independently suspended dependency callbacks can also retain payloads outside the mailbox. Arc 03 has no owner-approved anonymous-ingress or process attempt capacity and must not claim process-wide denial-of-service admission.
+These tests prove shape and enforcement, not operational sufficiency. The owner must measure workload-specific capacities. The current biased receive order also needs measurement under mixed sustained load.
 
-## 8. RT-03-06: retain or race remote candidates
+The ignored measurement requires owner-supplied inputs and reports each class separately:
 
-Attack: retain candidates through replacement or shutdown, or cancel while candidate application is pending.
+```powershell
+$env:MYOWNMESH_ARC03_CALLBACK_CAPACITY = "<owner-supplied>"
+$env:MYOWNMESH_ARC03_CALLBACK_SAMPLES = "<owner-supplied>"
+cargo test -p myownmesh-core --lib v4_arc03_measure_callback_classes_without_selecting_a_budget -- --ignored --nocapture --test-threads=1
+```
 
-Required result: the worker owns the queue and observation leases. Retirement drains the queue and cancels the local await. Dependency side effects that completed before cancellation are not claimed rolled back.
+## 9. RT-03-07: retain remote candidates
+
+Attack: retain pre-SDP candidates through cancellation, replacement, or shutdown.
+
+Required result: the connector owns the queue and observation lease. Retirement drains queued items and cancels local apply awaits. Dependency side effects completed before cancellation are not claimed rolled back.
 
 Controls:
 
@@ -130,13 +143,13 @@ Controls:
 - `v4_arc03_candidate_apply_observation_survives_await_and_cancellation`;
 - `v4_arc03_retirement_cancels_inflight_candidate_observation`.
 
-Residual attack: the pre-SDP candidate `Vec` is measured but has no owner-approved item or retained-byte admission limit.
+Residual: the queue is observed but does not yet have an owner-approved item or retained-byte admission limit.
 
-## 9. RT-03-07: carry one undifferentiated reservation
+## 10. RT-03-08: carry one undifferentiated reservation
 
-Attack: promote a candidate while retaining construction-only resource claims forever, or corrupt aggregate subtraction and reopen capacity.
+Attack: keep construction-only claims after connection or reopen capacity after inconsistent subtraction.
 
-Required result: promotion atomically transfers the opening claim to the connected claim. Candidate-only work is released. Inconsistent release poisons the aggregate, preserves conservative use, and refuses later admission.
+Required result: promotion atomically transfers opening resources to connected resources. Inconsistent release poisons the owner and preserves conservative use.
 
 Controls:
 
@@ -144,21 +157,38 @@ Controls:
 - `v4_arc02_inconsistent_child_release_poisoned_aggregate_stays_closed`;
 - `v4_arc03_resource_families_cannot_substitute_for_each_other`.
 
-Residual attack: the structural claim is not a complete capacity model for dependency-owned sockets, ICE pairs, DNS, STUN, TURN, memory, or tasks.
+## 11. RT-03-09: bypass Endpoint Auth provenance
 
-## 10. RT-03-08: bypass Endpoint Auth Task
+Attack: replay `DataChannelOpen`, use a task from another connector, start the handshake from the raw engine arm, or retain provenance after retirement.
 
-Attack: replay or duplicate `DataChannelOpen`, start authentication from the raw engine arm, or retain a connected capability after peer retirement.
-
-Required result: only the exact live candidate can produce one `ConnectedChannelCapability`. A move-only handoff binds it to the exact connector incarnation before it enters `EndpointAuthTask`. A task from another connector in the same runtime is rejected. Peer cleanup releases the task only after native close succeeds.
+Required result: one exact live candidate produces one connected capability. The engine hands it to the exact Endpoint Auth task before authentication begins. Duplicate, stale, or cross-connector values fail.
 
 Controls:
 
 - `v4_arc03_data_channel_open_requires_live_exact_candidate`;
 - `v4_arc03_admitted_worker_rejects_protocol_bytes_before_channel_capability`;
-- `v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives` in WSL.
+- `v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives` in WSL;
+- compiler-boundary checker.
 
-## 11. RT-03-09: activate through a stale owner
+Arc 03 proves provenance ownership only. It does not claim Endpoint Auth resource admission or transcript verification.
+
+## 12. RT-03-10: use worker possession as real-time authority
+
+Attack: call lane or real-time send operations with only `&WebRtcConnectorWorker`, use a capability from another connector, or activate delivery before session admission.
+
+Required result: the narrow worker methods require the exact codec-neutral `ConnectorRealtimeFlowCapability`. The temporary legacy issuer checks current peer admission and exact Endpoint Auth provenance.
+
+Controls:
+
+- core relay-selection negative control;
+- `v4_arc03_outbound_application_send_requires_current_session_admission`;
+- TURN unapproved-session negative control in WSL;
+- source checker for capability-consuming lane, send, and reaper signatures;
+- stale-owner and shutdown controls.
+
+`LaneKind`, H.264, Opus, video, and audio remain in the compatibility adapter. They are not basal capability semantics.
+
+## 13. RT-03-11: activate through a stale owner
 
 Attack: replace owner A with B at roster persistence, then let A finish authentication or approval.
 
@@ -171,79 +201,58 @@ Controls:
 - `v4_arc03_reliable_flush_requires_authenticated_admission`;
 - `v4_arc03_current_effect_linearizes_before_replacement`.
 
-## 12. RT-03-10: manufacture consent
+## 14. RT-03-12: manufacture consent
 
-Attack: treat a successful local `Approve` send as proof that the remote peer consented.
+Attack: treat local connector send success as proof of remote approval.
 
-Required result: only inbound `Approve` records remote consent. Authentication, local send acceptance, and inbound consent must converge on the same exact current owner.
+Required result: only inbound `Approve` records remote consent. Authentication, local send acceptance, and inbound approval must converge on the same exact owner.
 
 Controls:
 
 - `v4_arc03_remote_approve_before_local_send_acceptance_converges`;
 - `v4_arc03_local_approve_without_remote_consent_stays_pending`.
 
-## 13. RT-03-11: retain native ownership after replacement
+## 15. RT-03-13: treat TURN selection as authority
 
-Attack: retain external peer and worker `Arc`s, replace or remove the registry owner, then use the retained objects.
+Attack: use Relay-to-Relay pair selection as endpoint identity, session admission, or real-time-flow admission.
 
-Required result: current-owner authority, endpoint-auth capability, queued candidates, and callback acceptance retire. The native peer receives an explicit close request. The retained object cannot be reinstalled.
-
-Controls:
-
-- `v4_arc03_shutdown_retires_connector_while_external_peer_arc_survives` in WSL;
-- `v4_arc03_retired_peer_arc_cannot_be_reinstalled`;
-- `v4_arc03_installing_current_peer_arc_is_idempotent`;
-- `v4_arc03_stale_owner_cannot_remove_replacement_peer`.
-
-## 14. RT-03-12: leak application data across the boundary
-
-Attack: send application or media bytes before exact endpoint authentication and bilateral activation, or carry endpoint payload through signaling.
-
-Required result: the engine admits only endpoint-authentication protocol before activation. Media is discarded before assembly or event creation. TURN remains an ICE carrier for the same endpoint-authenticated session. Signaling never becomes an endpoint data path.
+Required result: selected-pair diagnostics grant no authority. The positive TURN path still requires endpoint authentication and bilateral admission. The negative TURN path remains connected and authenticated but cannot deliver endpoint data or real-time work without admission.
 
 Controls:
 
-- `v4_arc03_admitted_worker_rejects_protocol_bytes_before_channel_capability`;
-- `v4_arc03_reliable_flush_requires_authenticated_admission`;
-- `turn_webrtc_endpoint_auth` in WSL.
+- `v4_arc03_relay_selection_is_not_authentication_or_session_admission`;
+- `turn_selected_session_authenticates_endpoints_before_bidirectional_data` in WSL.
 
-## 15. Compiler boundary
+TURN remains an ICE carrier for one endpoint session. Signaling remains signaling-only.
 
-`python scripts/check-v4-arc03-compiler-boundaries.py` requires:
+## 16. Compiler boundary
 
-- the positive capability ownership probe to compile;
-- raw candidate application to fail for the expected privacy cause;
-- external worker construction to fail for the expected visibility cause;
-- raw `Transport::open_peer` to be absent from the production API.
+`python scripts/check-v4-arc03-compiler-boundaries.py` must prove the expected privacy or visibility cause for each negative compile probe. An unrelated compiler error is not a pass.
 
-The last control covers the default API surface. An explicit `transport-lab` feature remains capable of enabling the lab constructor and must not be represented as an impossible production opt-in.
+The checker covers raw candidate application, external worker construction, raw peer constructors in the default API, non-cloneable ownership state, capability production boundaries, and all six real-time-flow consumer signatures.
 
-The script cause-matches each negative control. An unrelated compiler error is not a pass.
+## 17. Preservation matrix
 
-## 16. Preservation matrix
-
-Before merge approval, the exact pushed revision must pass:
+Before merge approval, the exact pushed head must pass:
 
 - workspace formatting, check, Clippy, tests, and doctests;
 - direct two-peer handshake and typed data;
-- real TURN-selected WebRTC endpoint data;
+- real TURN-selected endpoint data and its negative controls;
 - mDNS and Nostr signaling;
 - reconnect and recovery;
 - data channel, H.264, Opus, and native RTP controls;
-- the repository's unchanged supported-platform CI matrix.
+- Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl, and Linux ARM64 musl CI.
 
-The supported matrix is Linux x86-64, macOS ARM64, Windows x86-64, Linux RISC-V musl compile, and Linux ARM64 musl compile. A skipped mDNS test must be reported as skipped, not passed.
+A skipped test is reported as skipped, not passed.
 
-## 17. Review blockers that remain explicit
+## 18. Review blockers
 
-The following claims must fail review on this arc:
+Reject these claims on Arc 03:
 
 - complete hostile-ingress resource admission;
-- process-wide worker or attempt bounds;
-- a bounded pre-SDP candidate queue;
 - complete retained-memory or dependency-owned resource accounting;
-- a production numeric budget selected without owner evidence;
-- supported-platform preservation before CI runs on the exact final commit;
+- bounded pre-SDP candidate admission;
+- an operational callback capacity selected from the structural tests;
+- Endpoint Auth transcript verification or resource admission;
+- supported-platform preservation before exact-head CI;
 - removal of unrelated legacy payload routing elsewhere in the repository.
-
-These residuals do not reopen compatibility access or route authority. They define the exact boundary for the next audit.

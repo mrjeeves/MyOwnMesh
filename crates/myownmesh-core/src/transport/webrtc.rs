@@ -17,6 +17,7 @@
 
 use std::future::Future;
 use std::mem::size_of;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +25,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tracing::{debug, info, trace, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
@@ -55,7 +58,8 @@ use crate::resource::{
 };
 use crate::runtime::attempt::{
     admit_single_connector_candidate, AttemptLifetime, AttemptLiveness,
-    ConnectorCandidateCapability,
+    ConnectorCallbackMailboxCapacities, ConnectorCandidateCapability, ConnectorResourceOwnerPort,
+    ConnectorResourceOwnerReport,
 };
 
 use super::ice::build_rtc_configuration;
@@ -97,11 +101,6 @@ pub(crate) fn is_virtual_interface(name: &str) -> bool {
 /// channels (e.g. browser-initiated debug) don't get routed into
 /// the mesh frame path.
 pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
-
-/// Algebraic floor for a lossless awaited queue: one retained event and no
-/// drops. This is a correctness floor, not a throughput budget. Arc 15 may
-/// replace it only with an owner-reviewed measured capacity.
-const CONNECTOR_EVENT_QUEUE_FLOOR: usize = 1;
 
 /// Who initiated this peer pairing. Drives whether we create the
 /// data channel pre-offer (offerer) or wait for the peer to open
@@ -166,7 +165,7 @@ impl WebRtcConnectorIncarnation {
         self.retired.send_replace(true);
     }
 
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
 
@@ -194,7 +193,6 @@ async fn await_until_connector_retirement<T>(
 pub struct WebRtcConnectorEvent {
     incarnation: Arc<WebRtcConnectorIncarnation>,
     event: TransportEvent,
-    _command_slot: Option<OwnedSemaphorePermit>,
     _queue_observation: Option<ObservationLease>,
 }
 
@@ -203,9 +201,47 @@ struct QueuedTransportEvent {
     observation: Option<ObservationLease>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectorCallbackClass {
+    Control,
+    Data,
+    Audio,
+    Video,
+}
+
+impl ConnectorCallbackClass {
+    fn for_event(event: &TransportEvent) -> Self {
+        match event {
+            TransportEvent::Message(_) => Self::Data,
+            TransportEvent::AudioSample(_) => Self::Audio,
+            TransportEvent::VideoSample(_) => Self::Video,
+            _ => Self::Control,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectorEventMailboxes {
+    control: mpsc::Sender<QueuedTransportEvent>,
+    data: mpsc::Sender<QueuedTransportEvent>,
+    audio: mpsc::Sender<QueuedTransportEvent>,
+    video: mpsc::Sender<QueuedTransportEvent>,
+}
+
+impl ConnectorEventMailboxes {
+    fn sender(&self, class: ConnectorCallbackClass) -> &mpsc::Sender<QueuedTransportEvent> {
+        match class {
+            ConnectorCallbackClass::Control => &self.control,
+            ConnectorCallbackClass::Data => &self.data,
+            ConnectorCallbackClass::Audio => &self.audio,
+            ConnectorCallbackClass::Video => &self.video,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ConnectorEventSink {
-    events: mpsc::Sender<QueuedTransportEvent>,
+    events: ConnectorEventMailboxes,
     resource_scope: Option<PeerConnectionResourceScope>,
     realtime_delivery: Arc<AtomicBool>,
     attempt_liveness: Option<AttemptLiveness>,
@@ -215,6 +251,7 @@ struct ConnectorEventSink {
 
 impl ConnectorEventSink {
     async fn emit(&self, event: TransportEvent) -> bool {
+        let callback_class = ConnectorCallbackClass::for_event(&event);
         let payload_bytes = match &event {
             TransportEvent::Message(bytes) => bytes.len(),
             TransportEvent::VideoSample(sample) => sample.data.len(),
@@ -255,6 +292,7 @@ impl ConnectorEventSink {
             )
         });
         let mut queued = Some(QueuedTransportEvent { event, observation });
+        let mailbox = self.events.sender(callback_class);
         loop {
             let mut connector_retirement = self.callback_gate.subscribe_retirement();
             let Some(liveness) = self.attempt_liveness.as_ref() else {
@@ -264,7 +302,7 @@ impl ConnectorEventSink {
                 return tokio::select! {
                     biased;
                     _ = connector_retirement.changed() => false,
-                    result = self.events.send(queued.take().expect("event is sent once")) => result.is_ok(),
+                    result = mailbox.send(queued.take().expect("event is sent once")) => result.is_ok(),
                 };
             };
             let mut retirement = liveness.subscribe_retirement();
@@ -282,7 +320,7 @@ impl ConnectorEventSink {
                         return false;
                     }
                 }
-                result = self.events.send(queued.take().expect("event is sent once")) => {
+                result = mailbox.send(queued.take().expect("event is sent once")) => {
                     return result.is_ok();
                 }
             }
@@ -296,7 +334,6 @@ pub(crate) struct WebRtcConnectorEventReceiver {
     retirement: watch::Receiver<bool>,
     attempt_retirement: Option<watch::Receiver<bool>>,
     raw: TransportEventReceiver,
-    command_slots: Arc<Semaphore>,
     attempt_lifetime: Option<AttemptLifetime>,
     remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
     close_owner: Option<Arc<ConnectorCloseOwner>>,
@@ -305,12 +342,42 @@ pub(crate) struct WebRtcConnectorEventReceiver {
 /// Lab/test receiver for raw WebRTC behavior. Production wraps it in the
 /// connector owner before any event can reach the engine.
 pub struct TransportEventReceiver {
-    events: mpsc::Receiver<QueuedTransportEvent>,
+    control: mpsc::Receiver<QueuedTransportEvent>,
+    data: mpsc::Receiver<QueuedTransportEvent>,
+    audio: mpsc::Receiver<QueuedTransportEvent>,
+    video: mpsc::Receiver<QueuedTransportEvent>,
 }
 
 impl TransportEventReceiver {
     async fn recv_queued(&mut self) -> Option<QueuedTransportEvent> {
-        self.events.recv().await
+        loop {
+            if self.control.is_closed()
+                && self.control.is_empty()
+                && self.data.is_closed()
+                && self.data.is_empty()
+                && self.audio.is_closed()
+                && self.audio.is_empty()
+                && self.video.is_closed()
+                && self.video.is_empty()
+            {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                event = self.control.recv(), if !self.control.is_closed() || !self.control.is_empty() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.data.recv(), if !self.data.is_closed() || !self.data.is_empty() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.audio.recv(), if !self.audio.is_closed() || !self.audio.is_empty() => {
+                    if event.is_some() { return event; }
+                }
+                event = self.video.recv(), if !self.video.is_closed() || !self.video.is_empty() => {
+                    if event.is_some() { return event; }
+                }
+            }
+        }
     }
 
     pub async fn recv(&mut self) -> Option<TransportEvent> {
@@ -318,7 +385,27 @@ impl TransportEventReceiver {
     }
 
     pub fn try_recv(&mut self) -> std::result::Result<TransportEvent, mpsc::error::TryRecvError> {
-        self.events.try_recv().map(|queued| queued.event)
+        for receiver in [
+            &mut self.control,
+            &mut self.data,
+            &mut self.audio,
+            &mut self.video,
+        ] {
+            match receiver.try_recv() {
+                Ok(queued) => return Ok(queued.event),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {}
+            }
+        }
+        if self.control.is_closed()
+            && self.data.is_closed()
+            && self.audio.is_closed()
+            && self.video.is_closed()
+        {
+            Err(mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::error::TryRecvError::Empty)
+        }
     }
 }
 
@@ -336,17 +423,6 @@ impl WebRtcConnectorEventReceiver {
             {
                 return None;
             }
-            let command_slot = tokio::select! {
-                biased;
-                _ = self.retirement.changed() => return None,
-                _ = wait_for_optional_retirement(&mut self.attempt_retirement) => {
-                    if self.reclaim_retired_attempt_candidate() {
-                        return None;
-                    }
-                    continue;
-                }
-                slot = Arc::clone(&self.command_slots).acquire_owned() => slot.ok()?,
-            };
             let queued = tokio::select! {
                 biased;
                 _ = self.retirement.changed() => return None,
@@ -363,7 +439,6 @@ impl WebRtcConnectorEventReceiver {
                     return Some(WebRtcConnectorEvent {
                         incarnation: Arc::clone(&self.ownership.incarnation),
                         event: queued.event,
-                        _command_slot: Some(command_slot),
                         _queue_observation: queued.observation,
                     });
                 }
@@ -898,58 +973,137 @@ fn observe_inexact_item_if(
 enum ConnectorCloseStatus {
     Open,
     Closing,
+    ClosingPoisoned(String),
     Closed,
-    Failed(String),
+    Poisoned(String),
+}
+
+enum ConnectedClaimRetention {
+    Empty,
+    One(Box<crate::connector::ConnectedChannelCapability>),
+    Poisoned(Vec<crate::connector::ConnectedChannelCapability>),
+}
+
+type NativeCloseFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+/// Owner-private close boundary for the native connector allocation.
+/// Production wraps the existing webrtc-rs peer connection. Tests supply a
+/// deterministic close result without allocating a socket-bearing peer.
+trait NativeConnectorClosePort: Send + Sync {
+    fn close(&self) -> NativeCloseFuture<'_>;
+}
+
+struct WebRtcNativeClosePort {
+    peer: Arc<RTCPeerConnection>,
+}
+
+impl NativeConnectorClosePort for WebRtcNativeClosePort {
+    fn close(&self) -> NativeCloseFuture<'_> {
+        Box::pin(async {
+            self.peer
+                .close()
+                .await
+                .map_err(|error| Error::Transport(format!("close: {error}")))
+        })
+    }
 }
 
 /// Single cleanup owner for one native peer connection.
 struct ConnectorCloseOwner {
-    session: Arc<PeerSession>,
     ownership: ConnectorOwnership,
-    remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
+    resource_owner: ConnectorResourceOwnerPort,
+    native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
+    remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
+    native_close_timeout: Duration,
     started: AtomicBool,
     cleanup_complete: AtomicBool,
     status: watch::Sender<ConnectorCloseStatus>,
-    connected_claim: SyncMutex<Option<crate::connector::ConnectedChannelCapability>>,
+    connected_claims: SyncMutex<ConnectedClaimRetention>,
+    #[cfg(test)]
+    fail_background_start: AtomicBool,
 }
 
 impl ConnectorCloseOwner {
-    fn new(
-        session: Arc<PeerSession>,
-        ownership: ConnectorOwnership,
-        remote_candidates: Arc<SyncMutex<RemoteCandidateState>>,
-    ) -> Arc<Self> {
+    fn new(ownership: ConnectorOwnership, resource_owner: ConnectorResourceOwnerPort) -> Arc<Self> {
         let (status, _receiver) = watch::channel(ConnectorCloseStatus::Open);
         Arc::new(Self {
-            session,
             ownership,
-            remote_candidates,
+            native: SyncMutex::new(None),
+            remote_candidates: SyncMutex::new(None),
+            native_close_timeout: resource_owner.native_close_timeout(),
+            resource_owner,
             started: AtomicBool::new(false),
             cleanup_complete: AtomicBool::new(false),
             status,
-            connected_claim: SyncMutex::new(None),
+            connected_claims: SyncMutex::new(ConnectedClaimRetention::Empty),
+            #[cfg(test)]
+            fail_background_start: AtomicBool::new(false),
         })
+    }
+
+    fn attach_native(&self, native: Arc<RTCPeerConnection>) -> bool {
+        self.attach_native_port(Arc::new(WebRtcNativeClosePort { peer: native }))
+    }
+
+    fn attach_native_port(&self, native: Arc<dyn NativeConnectorClosePort>) -> bool {
+        let mut current = self.native.lock();
+        if current.is_some() || self.started.load(Ordering::Acquire) {
+            drop(current);
+            self.poison("duplicate or late native peer installation".to_string());
+            return false;
+        }
+        *current = Some(native);
+        true
+    }
+
+    fn attach_remote_candidates(&self, candidates: Arc<SyncMutex<RemoteCandidateState>>) -> bool {
+        let mut current = self.remote_candidates.lock();
+        if current.is_some() {
+            drop(current);
+            self.poison("duplicate remote-candidate owner installation".to_string());
+            return false;
+        }
+        *current = Some(candidates);
+        true
     }
 
     fn retire_local(&self) {
         self.ownership.retire();
-        drain_remote_candidates(&self.remote_candidates);
+        if let Some(candidates) = self.remote_candidates.lock().as_ref() {
+            drain_remote_candidates(candidates);
+        }
     }
 
-    fn retain_connected_claim(&self, capability: crate::connector::ConnectedChannelCapability) {
-        let mut retained = self.connected_claim.lock();
+    fn retain_connected_claim(
+        self: &Arc<Self>,
+        capability: crate::connector::ConnectedChannelCapability,
+    ) {
+        let mut retained = self.connected_claims.lock();
         if self.cleanup_complete.load(Ordering::Acquire) {
             drop(capability);
             return;
         }
-        if retained.is_none() {
-            *retained = Some(capability);
-        } else {
-            std::mem::forget(capability);
-            self.status.send_replace(ConnectorCloseStatus::Failed(
-                "duplicate connected cleanup claim".to_string(),
-            ));
-        }
+        *retained = match std::mem::replace(&mut *retained, ConnectedClaimRetention::Empty) {
+            ConnectedClaimRetention::Empty => ConnectedClaimRetention::One(Box::new(capability)),
+            ConnectedClaimRetention::One(primary) => {
+                if matches!(
+                    *self.status.borrow(),
+                    ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing
+                ) {
+                    self.status
+                        .send_replace(ConnectorCloseStatus::ClosingPoisoned(
+                            "duplicate connected cleanup claim".to_string(),
+                        ));
+                }
+                ConnectedClaimRetention::Poisoned(vec![*primary, capability])
+            }
+            ConnectedClaimRetention::Poisoned(mut claims) => {
+                claims.push(capability);
+                ConnectedClaimRetention::Poisoned(claims)
+            }
+        };
+        drop(retained);
+        self.start();
     }
 
     fn start(self: &Arc<Self>) {
@@ -957,44 +1111,74 @@ impl ConnectorCloseOwner {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.status.send_replace(ConnectorCloseStatus::Closing);
+        if !matches!(
+            *self.status.borrow(),
+            ConnectorCloseStatus::ClosingPoisoned(_)
+        ) {
+            self.status.send_replace(ConnectorCloseStatus::Closing);
+        }
         let owner = Arc::clone(self);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                owner.run().await;
-            });
+        #[cfg(test)]
+        if self.fail_background_start.load(Ordering::Acquire) {
+            self.poison("cleanup background task failed to start".to_string());
             return;
         }
-
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        if let Err(error) = std::thread::Builder::new()
+            .name("myownmesh-webrtc-close-owner".to_string())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(owner.run()),
+                    Err(error) => owner.poison(format!("build cleanup runtime: {error}")),
+                }
+            })
         {
-            Ok(runtime) => runtime.block_on(owner.run()),
-            Err(error) => {
-                owner
-                    .status
-                    .send_replace(ConnectorCloseStatus::Failed(format!(
-                        "build cleanup runtime: {error}"
-                    )));
-            }
+            self.poison(format!("start cleanup thread: {error}"));
         }
     }
 
     async fn run(self: Arc<Self>) {
-        let result = self.session.close().await;
+        let native = self.native.lock().clone();
+        let Some(native) = native else {
+            self.finish_closed();
+            return;
+        };
+        self.ownership.incarnation.retire();
+        let result = tokio::time::timeout(self.native_close_timeout, native.close()).await;
         match result {
-            Ok(()) => {
-                self.cleanup_complete.store(true, Ordering::Release);
-                self.ownership.complete_cleanup();
-                drop(self.connected_claim.lock().take());
-                self.status.send_replace(ConnectorCloseStatus::Closed);
-            }
-            Err(error) => {
-                self.status
-                    .send_replace(ConnectorCloseStatus::Failed(error.to_string()));
+            Ok(Ok(())) => self.finish_closed(),
+            Ok(Err(error)) => self.poison(error.to_string()),
+            Err(_) => self.poison(format!(
+                "native close exceeded owner deadline of {:?}",
+                self.native_close_timeout
+            )),
+        }
+    }
+
+    fn finish_closed(&self) {
+        self.cleanup_complete.store(true, Ordering::Release);
+        self.ownership.complete_cleanup();
+        self.native.lock().take();
+        self.remote_candidates.lock().take();
+        *self.connected_claims.lock() = ConnectedClaimRetention::Empty;
+        self.status.send_replace(ConnectorCloseStatus::Closed);
+    }
+
+    fn poison(&self, reason: String) {
+        self.resource_owner.poison_cleanup();
+        match &mut *self.connected_claims.lock() {
+            ConnectedClaimRetention::Empty => {}
+            ConnectedClaimRetention::One(capability) => capability.poison_cleanup(),
+            ConnectedClaimRetention::Poisoned(capabilities) => {
+                for capability in capabilities {
+                    capability.poison_cleanup();
+                }
             }
         }
+        self.status
+            .send_replace(ConnectorCloseStatus::Poisoned(reason));
     }
 
     async fn wait(self: &Arc<Self>) -> Result<()> {
@@ -1003,10 +1187,13 @@ impl ConnectorCloseOwner {
         loop {
             match status.borrow().clone() {
                 ConnectorCloseStatus::Closed => return Ok(()),
-                ConnectorCloseStatus::Failed(error) => {
+                ConnectorCloseStatus::Poisoned(error) => {
                     return Err(Error::Transport(format!(
-                        "native peer cleanup failed: {error}"
+                        "native peer cleanup poisoned: {error}"
                     )));
+                }
+                ConnectorCloseStatus::ClosingPoisoned(reason) => {
+                    trace!(reason = %reason, "native cleanup retains duplicate connected claims");
                 }
                 ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing => {}
             }
@@ -1015,6 +1202,20 @@ impl ConnectorCloseOwner {
                     "native peer cleanup owner stopped".to_string(),
                 ));
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_background_start_for_test(&self) {
+        self.fail_background_start.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn retained_connected_claims_for_test(&self) -> usize {
+        match &*self.connected_claims.lock() {
+            ConnectedClaimRetention::Empty => 0,
+            ConnectedClaimRetention::One(_) => 1,
+            ConnectedClaimRetention::Poisoned(claims) => claims.len(),
         }
     }
 }
@@ -1072,11 +1273,10 @@ pub(crate) struct WebRtcConnectorWorker {
 }
 
 struct AdmittedConnectorOwnership {
-    candidate: ConnectorCandidateCapability,
+    ownership: ConnectorOwnership,
     attempt_lifetime: AttemptLifetime,
-    realtime_delivery: Arc<AtomicBool>,
-    candidate_promoted: Arc<AtomicBool>,
-    incarnation: Arc<WebRtcConnectorIncarnation>,
+    attempt_liveness: AttemptLiveness,
+    close_owner: Arc<ConnectorCloseOwner>,
     resource_scope: PeerConnectionResourceScope,
     transport_observation: ObservationLease,
 }
@@ -1088,34 +1288,24 @@ impl WebRtcConnectorWorker {
         admitted: AdmittedConnectorOwnership,
     ) -> (Self, WebRtcConnectorEventReceiver) {
         let AdmittedConnectorOwnership {
-            candidate,
+            ownership,
             attempt_lifetime,
-            realtime_delivery,
-            candidate_promoted,
-            incarnation,
+            attempt_liveness,
+            close_owner,
             resource_scope,
             transport_observation,
         } = admitted;
-        let attempt_retirement = candidate.liveness().subscribe_retirement();
-        let ownership = ConnectorOwnership::admitted(
-            candidate,
-            realtime_delivery,
-            candidate_promoted,
-            incarnation,
-        );
+        let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
         let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::default()));
-        let close_owner = ConnectorCloseOwner::new(
-            Arc::clone(&session),
-            ownership.clone(),
-            Arc::clone(&remote_candidates),
-        );
+        if !close_owner.attach_remote_candidates(Arc::clone(&remote_candidates)) {
+            close_owner.start();
+        }
         let receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
             retirement: ownership.incarnation.subscribe_retirement(),
             attempt_retirement: Some(attempt_retirement),
             raw,
-            command_slots: Arc::new(Semaphore::new(CONNECTOR_EVENT_QUEUE_FLOOR)),
             attempt_lifetime: Some(attempt_lifetime),
             remote_candidates: Arc::clone(&remote_candidates),
             close_owner: Some(Arc::clone(&close_owner)),
@@ -1143,7 +1333,6 @@ impl WebRtcConnectorWorker {
         WebRtcConnectorEvent {
             incarnation: Arc::clone(&self.ownership.incarnation),
             event,
-            _command_slot: None,
             _queue_observation: None,
         }
     }
@@ -1283,7 +1472,23 @@ impl WebRtcConnectorWorker {
         self.ownership.incarnation.is_active() && self.session.awaiting_answer()
     }
 
-    pub(crate) async fn open_media_lane(&self, kind: LaneKind) -> Result<u8> {
+    pub(crate) fn owns_realtime_flow(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+    ) -> bool {
+        capability.belongs_to(&self.ownership.incarnation)
+    }
+
+    pub(crate) async fn open_media_lane(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        kind: LaneKind,
+    ) -> Result<u8> {
+        if !self.owns_realtime_flow(capability) {
+            return Err(Error::Transport(
+                "real-time flow capability does not own this connector".to_string(),
+            ));
+        }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.open_media_lane(kind),
@@ -1292,7 +1497,17 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during lane open".to_string()))?
     }
 
-    pub(crate) async fn close_media_lane(&self, kind: LaneKind, lane: u8) -> Result<()> {
+    pub(crate) async fn close_media_lane(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        kind: LaneKind,
+        lane: u8,
+    ) -> Result<()> {
+        if !self.owns_realtime_flow(capability) {
+            return Err(Error::Transport(
+                "real-time flow capability does not own this connector".to_string(),
+            ));
+        }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.close_media_lane(kind, lane),
@@ -1301,7 +1516,18 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during lane close".to_string()))?
     }
 
-    pub(crate) async fn send_video(&self, lane: u8, data: Bytes, duration: Duration) -> Result<()> {
+    pub(crate) async fn send_video(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        lane: u8,
+        data: Bytes,
+        duration: Duration,
+    ) -> Result<()> {
+        if !self.owns_realtime_flow(capability) {
+            return Err(Error::Transport(
+                "real-time flow capability does not own this connector".to_string(),
+            ));
+        }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.send_video(lane, data, duration),
@@ -1310,7 +1536,18 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during video send".to_string()))?
     }
 
-    pub(crate) async fn send_audio(&self, lane: u8, data: Bytes, duration: Duration) -> Result<()> {
+    pub(crate) async fn send_audio(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        lane: u8,
+        data: Bytes,
+        duration: Duration,
+    ) -> Result<()> {
+        if !self.owns_realtime_flow(capability) {
+            return Err(Error::Transport(
+                "real-time flow capability does not own this connector".to_string(),
+            ));
+        }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.send_audio(lane, data, duration),
@@ -1319,11 +1556,22 @@ impl WebRtcConnectorWorker {
         .ok_or_else(|| Error::Transport("connector worker retired during audio send".to_string()))?
     }
 
-    pub(crate) fn has_reapable_lanes(&self, grace: Duration) -> bool {
-        self.ownership.incarnation.is_active() && self.session.has_reapable_lanes(grace)
+    pub(crate) fn has_reapable_lanes(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        grace: Duration,
+    ) -> bool {
+        self.owns_realtime_flow(capability) && self.session.has_reapable_lanes(grace)
     }
 
-    pub(crate) async fn reap_drained_lanes(&self, grace: Duration) -> usize {
+    pub(crate) async fn reap_drained_lanes(
+        &self,
+        capability: &crate::connector::ConnectorRealtimeFlowCapability,
+        grace: Duration,
+    ) -> usize {
+        if !self.owns_realtime_flow(capability) {
+            return 0;
+        }
         await_until_connector_retirement(
             self.ownership.incarnation.subscribe_retirement(),
             self.session.reap_drained_lanes(grace),
@@ -1396,10 +1644,21 @@ impl WebRtcConnectorWorker {
         self.close_owner.retire_local();
     }
 
-    pub(crate) fn enable_realtime_delivery(&self) {
+    pub(crate) fn admit_legacy_realtime_flow(
+        &self,
+        task: &crate::endpoint_auth::EndpointAuthTask,
+    ) -> Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>> {
+        if !self.owns_endpoint_auth(task) || !self.ownership.incarnation.is_active() {
+            return None;
+        }
         self.ownership
             .realtime_delivery
             .store(true, Ordering::Release);
+        Some(Arc::new(
+            crate::connector::ConnectorRealtimeFlowCapability::new(Arc::clone(
+                &self.ownership.incarnation,
+            )),
+        ))
     }
 
     pub(crate) fn owns_endpoint_auth(&self, task: &crate::endpoint_auth::EndpointAuthTask) -> bool {
@@ -1573,6 +1832,7 @@ pub struct Transport {
     ice_transport_policy: RTCIceTransportPolicy,
     /// Media lanes provisioned per peer connection (see [`resolve_media_lanes`]).
     media_lanes: usize,
+    connector_resource_owner: Option<ConnectorResourceOwnerPort>,
     #[cfg(test)]
     construction_hook: Option<Arc<ConstructionTestHook>>,
 }
@@ -1583,6 +1843,8 @@ struct PeerOpenOwnership {
     attempt_liveness: Option<AttemptLiveness>,
     candidate_promoted: Arc<AtomicBool>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
+    callback_mailboxes: ConnectorCallbackMailboxCapacities,
+    close_owner: Option<Arc<ConnectorCloseOwner>>,
 }
 
 #[cfg(test)]
@@ -1590,6 +1852,7 @@ struct PeerOpenOwnership {
 enum ConstructionPause {
     AfterNativeAllocation,
     AfterResultDelivery,
+    FailAfterNativeAllocation,
 }
 
 #[cfg(test)]
@@ -1612,6 +1875,10 @@ impl ConstructionTestHook {
     }
 
     async fn pause_after_native_allocation(&self, pc: &Arc<RTCPeerConnection>) {
+        if self.pause == ConstructionPause::FailAfterNativeAllocation {
+            *self.peer_connection.lock() = Some(Arc::downgrade(pc));
+            panic!("injected connector construction task failure");
+        }
         self.pause_at(ConstructionPause::AfterNativeAllocation, pc)
             .await;
     }
@@ -1643,19 +1910,19 @@ impl ConstructionTestHook {
 struct ConstructedConnectorResult {
     session: Option<PeerSession>,
     events: Option<TransportEventReceiver>,
-    candidate: Option<ConnectorCandidateCapability>,
+    close_owner: Arc<ConnectorCloseOwner>,
 }
 
 impl ConstructedConnectorResult {
     fn new(
         session: PeerSession,
         events: TransportEventReceiver,
-        candidate: ConnectorCandidateCapability,
+        close_owner: Arc<ConnectorCloseOwner>,
     ) -> Self {
         Self {
             session: Some(session),
             events: Some(events),
-            candidate: Some(candidate),
+            close_owner,
         }
     }
 
@@ -1673,61 +1940,25 @@ impl ConstructedConnectorResult {
     ) -> (
         PeerSession,
         TransportEventReceiver,
-        ConnectorCandidateCapability,
+        Arc<ConnectorCloseOwner>,
     ) {
         (
             self.session.take().expect("constructed session exists"),
             self.events.take().expect("constructed event owner exists"),
-            self.candidate
-                .take()
-                .expect("constructed candidate reservation exists"),
+            Arc::clone(&self.close_owner),
         )
     }
 }
 
 impl Drop for ConstructedConnectorResult {
     fn drop(&mut self) {
-        let (Some(session), Some(events), Some(candidate)) = (
-            self.session.take(),
-            self.events.take(),
-            self.candidate.take(),
-        ) else {
+        let (Some(session), Some(events)) = (self.session.take(), self.events.take()) else {
             return;
         };
-        close_constructed_connector_in_background(session, events, candidate);
+        drop(session);
+        drop(events);
+        self.close_owner.start();
     }
-}
-
-async fn close_constructed_connector(
-    session: PeerSession,
-    events: TransportEventReceiver,
-    candidate: ConnectorCandidateCapability,
-) {
-    drop(events);
-    let _ = session.close().await;
-    drop(candidate);
-}
-
-fn close_constructed_connector_in_background(
-    session: PeerSession,
-    events: TransportEventReceiver,
-    candidate: ConnectorCandidateCapability,
-) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(close_constructed_connector(session, events, candidate));
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("myownmesh-webrtc-result-close".to_string())
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            runtime.block_on(close_constructed_connector(session, events, candidate));
-        });
 }
 
 impl Transport {
@@ -1830,9 +2061,23 @@ impl Transport {
             runtime: crate::runtime::RuntimeIncarnation::new(),
             ice_transport_policy: RTCIceTransportPolicy::All,
             media_lanes,
+            connector_resource_owner: None,
             #[cfg(test)]
             construction_hook: None,
         })
+    }
+
+    /// Bind this transport to an explicitly configured process resource owner.
+    /// Connector construction is refused until this port is present.
+    pub fn with_connector_resource_owner(mut self, owner: ConnectorResourceOwnerPort) -> Self {
+        self.connector_resource_owner = Some(owner);
+        self
+    }
+
+    pub fn connector_resource_report(&self) -> Option<ConnectorResourceOwnerReport> {
+        self.connector_resource_owner
+            .as_ref()
+            .map(|owner| owner.report())
     }
 
     /// Build a lab transport that rejects host and server-reflexive candidate
@@ -1870,6 +2115,12 @@ impl Transport {
         turn: &[crate::config::TurnServer],
         resource_scope: PeerConnectionResourceScope,
     ) -> Result<(WebRtcConnectorWorker, WebRtcConnectorEventReceiver)> {
+        let resource_owner = self.connector_resource_owner.clone().ok_or_else(|| {
+            Error::Transport(
+                "connector resource owner is not configured; refusing native allocation"
+                    .to_string(),
+            )
+        })?;
         let transport_observation = observe_inexact_item(
             &resource_scope,
             PreAuthResourceFamily::TransportObject,
@@ -1879,7 +2130,7 @@ impl Transport {
         let mut config = build_rtc_configuration(stun, turn);
         config.ice_transport_policy = self.ice_transport_policy;
         let (permit, attempt_lifetime, claim) =
-            admit_single_connector_candidate(self.runtime.clone());
+            admit_single_connector_candidate(self.runtime.clone(), resource_owner.clone());
         let candidate = permit.reserve_connector_candidate(claim).ok_or_else(|| {
             Error::Transport("connector candidate reservation refused".to_string())
         })?;
@@ -1891,8 +2142,17 @@ impl Transport {
         let candidate_promoted = Arc::new(AtomicBool::new(false));
         let construction_candidate_promoted = Arc::clone(&candidate_promoted);
         let construction_liveness = liveness.clone();
+        let result_liveness = liveness.clone();
         let incarnation = Arc::new(WebRtcConnectorIncarnation::new());
         let construction_incarnation = Arc::clone(&incarnation);
+        let ownership = ConnectorOwnership::admitted(
+            candidate,
+            Arc::clone(&realtime_delivery),
+            Arc::clone(&candidate_promoted),
+            Arc::clone(&incarnation),
+        );
+        let close_owner = ConnectorCloseOwner::new(ownership.clone(), resource_owner.clone());
+        let construction_close_owner = Arc::clone(&close_owner);
         let (construction_tx, construction_rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = transport
@@ -1905,25 +2165,28 @@ impl Transport {
                         attempt_liveness: Some(construction_liveness),
                         candidate_promoted: construction_candidate_promoted,
                         callback_gate: construction_incarnation,
+                        callback_mailboxes: resource_owner.callback_mailboxes(),
+                        close_owner: Some(Arc::clone(&construction_close_owner)),
                     },
                 )
                 .await;
             match result {
-                Ok((session, events)) if liveness.is_active() => {
+                Ok((session, events)) if result_liveness.is_active() => {
                     let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
-                        session, events, candidate,
+                        session,
+                        events,
+                        construction_close_owner,
                     )));
                 }
                 Ok((session, events)) => {
                     drop(events);
-                    let _ = session.close().await;
-                    drop(candidate);
+                    drop(session);
+                    construction_close_owner.start();
                     let _ = construction_tx.send(Err(Error::Transport(
                         "connector attempt retired during construction".to_string(),
                     )));
                 }
                 Err(error) => {
-                    drop(candidate);
                     let _ = construction_tx.send(Err(error));
                 }
             }
@@ -1936,16 +2199,22 @@ impl Transport {
             hook.pause_after_result_delivery(constructed.peer_connection())
                 .await;
         }
-        let (session, events, candidate) = constructed.into_parts();
+        let (session, events, constructed_close_owner) = constructed.into_parts();
+        if !Arc::ptr_eq(&constructed_close_owner, &close_owner) {
+            close_owner.start();
+            constructed_close_owner.start();
+            return Err(Error::Transport(
+                "connector construction returned a different close owner".to_string(),
+            ));
+        }
         Ok(WebRtcConnectorWorker::admitted(
             session,
             events,
             AdmittedConnectorOwnership {
-                candidate,
+                ownership,
                 attempt_lifetime,
-                realtime_delivery,
-                candidate_promoted,
-                incarnation,
+                attempt_liveness: liveness,
+                close_owner,
                 resource_scope,
                 transport_observation,
             },
@@ -1961,6 +2230,8 @@ impl Transport {
         role: Role,
         config: RTCConfiguration,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
+        let one = std::num::NonZeroUsize::new(1)
+            .ok_or_else(|| Error::Transport("invalid lab callback capacity".to_string()))?;
         self.open_peer_with_config_observed(
             role,
             config,
@@ -1970,6 +2241,8 @@ impl Transport {
                 attempt_liveness: None,
                 candidate_promoted: Arc::new(AtomicBool::new(true)),
                 callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+                callback_mailboxes: ConnectorCallbackMailboxCapacities::new(one, one, one, one),
+                close_owner: None,
             },
         )
         .await
@@ -1987,6 +2260,8 @@ impl Transport {
             attempt_liveness,
             candidate_promoted,
             callback_gate,
+            callback_mailboxes,
+            close_owner,
         } = ownership;
         let pc = self
             .api
@@ -1994,17 +2269,33 @@ impl Transport {
             .await
             .map_err(|e| Error::Transport(format!("new_peer_connection: {e}")))?;
         let pc = Arc::new(pc);
+        if close_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.attach_native(Arc::clone(&pc)))
+        {
+            return Err(Error::Transport(
+                "native peer installation into close owner was refused".to_string(),
+            ));
+        }
         let mut construction =
-            PeerConstructionGuard::new(Arc::clone(&pc), Arc::clone(&callback_gate));
+            PeerConstructionGuard::new(Arc::clone(&pc), Arc::clone(&callback_gate), close_owner);
         let result = async {
             #[cfg(test)]
             if let Some(hook) = self.construction_hook.as_ref() {
                 hook.pause_after_native_allocation(&pc).await;
             }
 
-            let (events_tx, events_rx) = mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR);
+            let (control_tx, control_rx) = mpsc::channel(callback_mailboxes.control().get());
+            let (data_tx, data_rx) = mpsc::channel(callback_mailboxes.data().get());
+            let (audio_tx, audio_rx) = mpsc::channel(callback_mailboxes.audio().get());
+            let (video_tx, video_rx) = mpsc::channel(callback_mailboxes.video().get());
             let event_sink = ConnectorEventSink {
-                events: events_tx,
+                events: ConnectorEventMailboxes {
+                    control: control_tx,
+                    data: data_tx,
+                    audio: audio_tx,
+                    video: video_tx,
+                },
                 resource_scope: resource_scope.clone(),
                 realtime_delivery,
                 attempt_liveness,
@@ -2067,7 +2358,15 @@ impl Transport {
                 role,
                 resource_scope,
             };
-            Ok((session, TransportEventReceiver { events: events_rx }))
+            Ok((
+                session,
+                TransportEventReceiver {
+                    control: control_rx,
+                    data: data_rx,
+                    audio: audio_rx,
+                    video: video_rx,
+                },
+            ))
         }
         .await;
 
@@ -2090,21 +2389,33 @@ impl Transport {
 struct PeerConstructionGuard {
     pc: Option<Arc<RTCPeerConnection>>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
+    close_owner: Option<Arc<ConnectorCloseOwner>>,
 }
 
 impl PeerConstructionGuard {
-    fn new(pc: Arc<RTCPeerConnection>, callback_gate: Arc<WebRtcConnectorIncarnation>) -> Self {
+    fn new(
+        pc: Arc<RTCPeerConnection>,
+        callback_gate: Arc<WebRtcConnectorIncarnation>,
+        close_owner: Option<Arc<ConnectorCloseOwner>>,
+    ) -> Self {
         Self {
             pc: Some(pc),
             callback_gate,
+            close_owner,
         }
     }
 
     fn disarm(&mut self) {
         self.pc = None;
+        self.close_owner = None;
     }
 
     async fn close(&mut self) {
+        if let Some(owner) = self.close_owner.as_ref() {
+            self.pc = None;
+            let _ = owner.wait().await;
+            return;
+        }
         let Some(pc) = self.pc.take() else {
             return;
         };
@@ -2115,6 +2426,11 @@ impl PeerConstructionGuard {
 
 impl Drop for PeerConstructionGuard {
     fn drop(&mut self) {
+        if let Some(owner) = self.close_owner.as_ref() {
+            self.pc = None;
+            owner.start();
+            return;
+        }
         let Some(pc) = self.pc.take() else {
             return;
         };
@@ -3436,7 +3752,86 @@ mod tests {
         ProcessResourceRoot, ResourceFamilyReport, PRE_AUTH_RESOURCE_FAMILY_COUNT,
     };
     use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll, Waker};
+
+    fn test_resource_owner(
+        max_active_candidates: usize,
+        callback_capacity: usize,
+        native_close_timeout: Duration,
+    ) -> ConnectorResourceOwnerPort {
+        let max_active_candidates = std::num::NonZeroUsize::new(max_active_candidates)
+            .expect("fixture has a nonzero candidate bound");
+        let callback_capacity = std::num::NonZeroUsize::new(callback_capacity)
+            .expect("fixture has nonzero callback bounds");
+        let policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
+            max_active_candidates,
+            ConnectorCallbackMailboxCapacities::new(
+                callback_capacity,
+                callback_capacity,
+                callback_capacity,
+                callback_capacity,
+            ),
+            native_close_timeout,
+        )
+        .expect("fixture has a nonzero close timeout");
+        ConnectorResourceOwnerPort::new(policy)
+    }
+
+    fn close_owner_fixture(
+        owner: &ConnectorResourceOwnerPort,
+    ) -> (Arc<ConnectorCloseOwner>, AttemptLifetime) {
+        let (permit, lifetime, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("fixture owner admits one candidate");
+        let ownership = admitted_ownership(candidate);
+        (ConnectorCloseOwner::new(ownership, owner.clone()), lifetime)
+    }
+
+    fn connected_claim_fixture(
+        owner: &ConnectorResourceOwnerPort,
+    ) -> (
+        crate::connector::ConnectedChannelCapability,
+        AttemptLifetime,
+    ) {
+        let (permit, lifetime, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
+        let candidate = permit
+            .reserve_connector_candidate(claim)
+            .expect("fixture owner admits connected candidate");
+        let connected = crate::connector::mark_connected(candidate)
+            .expect("fixture attempt remains live through promotion");
+        (connected, lifetime)
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestNativeCloseResult {
+        Success,
+        Error,
+        Pending,
+    }
+
+    struct TestNativeClosePort {
+        result: TestNativeCloseResult,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NativeConnectorClosePort for TestNativeClosePort {
+        fn close(&self) -> NativeCloseFuture<'_> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                match self.result {
+                    TestNativeCloseResult::Success => Ok(()),
+                    TestNativeCloseResult::Error => Err(Error::Transport(
+                        "injected native close failure".to_string(),
+                    )),
+                    TestNativeCloseResult::Pending => std::future::pending().await,
+                }
+            })
+        }
+    }
 
     fn candidate_report(
         reports: &[ResourceFamilyReport<PreAuthResourceFamily>; PRE_AUTH_RESOURCE_FAMILY_COUNT],
@@ -3479,6 +3874,27 @@ mod tests {
         )
     }
 
+    fn test_event_mailboxes(capacity: usize) -> (ConnectorEventMailboxes, TransportEventReceiver) {
+        let (control, control_rx) = mpsc::channel(capacity);
+        let (data, data_rx) = mpsc::channel(capacity);
+        let (audio, audio_rx) = mpsc::channel(capacity);
+        let (video, video_rx) = mpsc::channel(capacity);
+        (
+            ConnectorEventMailboxes {
+                control,
+                data,
+                audio,
+                video,
+            },
+            TransportEventReceiver {
+                control: control_rx,
+                data: data_rx,
+                audio: audio_rx,
+                video: video_rx,
+            },
+        )
+    }
+
     fn stamped_event(
         ownership: &ConnectorOwnership,
         event: TransportEvent,
@@ -3486,9 +3902,321 @@ mod tests {
         WebRtcConnectorEvent {
             incarnation: Arc::clone(&ownership.incarnation),
             event,
-            _command_slot: None,
             _queue_observation: None,
         }
+    }
+
+    async fn assert_callback_class_has_independent_capacity(
+        first: TransportEvent,
+        second: TransportEvent,
+    ) {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let sink = ConnectorEventSink {
+            events,
+            resource_scope: None,
+            realtime_delivery: Arc::new(AtomicBool::new(true)),
+            attempt_liveness: None,
+            candidate_promoted: Arc::new(AtomicBool::new(true)),
+            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+        };
+        assert!(sink.emit(first).await);
+        assert!(sink.emit(second).await);
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_control_and_data_callback_capacity_are_independent() {
+        assert_callback_class_has_independent_capacity(
+            TransportEvent::DataChannelOpen,
+            TransportEvent::Message(Bytes::from_static(b"endpoint-data")),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_control_and_audio_callback_capacity_are_independent() {
+        assert_callback_class_has_independent_capacity(
+            TransportEvent::DataChannelOpen,
+            TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 0,
+                lane: 0,
+                data: Bytes::from_static(b"audio-fixture"),
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_control_and_video_callback_capacity_are_independent() {
+        assert_callback_class_has_independent_capacity(
+            TransportEvent::DataChannelOpen,
+            TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: 0,
+                key: true,
+                lane: 0,
+                data: Bytes::from_static(b"video-fixture"),
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_data_audio_and_video_callback_capacity_are_independent() {
+        let (events, mut receiver) = test_event_mailboxes(1);
+        let sink = ConnectorEventSink {
+            events,
+            resource_scope: None,
+            realtime_delivery: Arc::new(AtomicBool::new(true)),
+            attempt_liveness: None,
+            candidate_promoted: Arc::new(AtomicBool::new(true)),
+            callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+        };
+        assert!(
+            sink.emit(TransportEvent::Message(Bytes::from_static(b"data")))
+                .await
+        );
+        assert!(
+            sink.emit(TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 0,
+                lane: 0,
+                data: Bytes::from_static(b"audio"),
+            }))
+            .await
+        );
+        assert!(
+            sink.emit(TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: 0,
+                key: true,
+                lane: 0,
+                data: Bytes::from_static(b"video"),
+            }))
+            .await
+        );
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_native_close_success_releases_exact_candidate_claim() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        close_owner
+            .wait()
+            .await
+            .expect("fixture native close succeeds");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert!(!owner.report().poisoned);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_native_close_error_poison_is_visible_and_refuses_reuse() {
+        let owner = test_resource_owner(2, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Error,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("native close failure is fail closed");
+        assert!(error.to_string().contains("native close failure"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert!(owner.report().poisoned);
+
+        let (permit, _lifetime, claim) =
+            admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
+        assert!(permit.reserve_connector_candidate(claim).is_none());
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_native_close_timeout_is_bounded_visible_and_fail_closed() {
+        let owner = test_resource_owner(1, 1, Duration::from_millis(20));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Pending,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), close_owner.wait())
+            .await
+            .expect("owner close deadline bounds the pending dependency")
+            .expect_err("deadline poisons cleanup");
+        assert!(error.to_string().contains("deadline"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert!(owner.report().poisoned);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_cleanup_thread_start_failure_is_visible_and_fail_closed() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        close_owner.fail_background_start_for_test();
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("background start failure poisons cleanup");
+        assert!(error.to_string().contains("failed to start"));
+        assert_eq!(owner.report().active_candidates, 1);
+        assert!(owner.report().poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_cleanup_owner_outlives_caller_runtime_shutdown() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture caller runtime");
+        caller_runtime.block_on(async { close_owner.start() });
+        drop(caller_runtime);
+
+        let verifier_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture verifier runtime");
+        verifier_runtime
+            .block_on(close_owner.wait())
+            .expect("dedicated close owner survives caller runtime shutdown");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_duplicate_connected_claims_remain_explicit_when_cleanup_poisoned() {
+        let owner = test_resource_owner(3, 1, Duration::from_secs(1));
+        let (close_owner, _owner_lifetime) = close_owner_fixture(&owner);
+        let (first, _first_lifetime) = connected_claim_fixture(&owner);
+        let (second, _second_lifetime) = connected_claim_fixture(&owner);
+        close_owner.fail_background_start_for_test();
+
+        close_owner.retain_connected_claim(first);
+        close_owner.retain_connected_claim(second);
+
+        assert!(close_owner.wait().await.is_err());
+        assert_eq!(close_owner.retained_connected_claims_for_test(), 2);
+        assert_eq!(owner.report().active_candidates, 3);
+        assert!(owner.report().poisoned);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_endpoint_handoff_release_before_native_close_releases_once() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        ));
+
+        drop(task);
+        close_owner
+            .wait()
+            .await
+            .expect("native close follows released handoff");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_native_close_before_endpoint_handoff_release_keeps_claim_visible() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = crate::endpoint_auth::EndpointAuthTask::begin(EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        ));
+
+        close_owner
+            .wait()
+            .await
+            .expect("native close completes while handoff owns the claim");
+        assert_eq!(owner.report().active_candidates, 1);
+        drop(task);
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_connector_retirement_before_promotion_rejects_and_cleans() {
+        let owner = test_resource_owner(1, 1, Duration::from_secs(1));
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        close_owner.retire_local();
+        assert!(matches!(
+            close_owner.ownership.mark_data_channel_open(),
+            DataChannelOpenTransition::Rejected
+        ));
+        close_owner
+            .wait()
+            .await
+            .expect("retired unpromoted connector cleans exactly once");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(owner.report().active_candidates, 0);
     }
 
     #[test]
@@ -3624,14 +4352,13 @@ mod tests {
             crate::runtime::runtime_for_test(),
         );
         let ownership = admitted_ownership(candidate);
-        let (events_tx, events) = mpsc::channel(1);
+        let (events_tx, events) = test_event_mailboxes(1);
         let remote_candidates = Arc::new(SyncMutex::new(RemoteCandidateState::default()));
         let mut receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
             retirement: ownership.incarnation.subscribe_retirement(),
             attempt_retirement: None,
-            raw: TransportEventReceiver { events },
-            command_slots: Arc::new(Semaphore::new(1)),
+            raw: events,
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
@@ -3639,6 +4366,7 @@ mod tests {
 
         ownership.retire();
         events_tx
+            .control
             .try_send(QueuedTransportEvent {
                 event: TransportEvent::DataChannelClosed,
                 observation: None,
@@ -3648,9 +4376,8 @@ mod tests {
         assert!(receiver.recv().await.is_none());
     }
 
-    #[test]
-    fn v4_arc03_callback_queue_applies_awaited_backpressure_at_its_floor() {
-        let (events, mut receiver) = mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR);
+    fn assert_callback_class_backpressure(first: TransportEvent, second: TransportEvent) {
+        let (events, mut receiver) = test_event_mailboxes(1);
         let sink = ConnectorEventSink {
             events,
             resource_scope: None,
@@ -3662,10 +4389,10 @@ mod tests {
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
 
-        let mut first = Box::pin(sink.emit(TransportEvent::DataChannelOpen));
+        let mut first = Box::pin(sink.emit(first));
         assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(true));
 
-        let mut second = Box::pin(sink.emit(TransportEvent::DataChannelClosed));
+        let mut second = Box::pin(sink.emit(second));
         assert_eq!(second.as_mut().poll(&mut context), Poll::Pending);
         drop(
             receiver
@@ -3680,9 +4407,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v4_arc03_control_callback_contention_honors_configured_bound() {
+        assert_callback_class_backpressure(
+            TransportEvent::DataChannelOpen,
+            TransportEvent::DataChannelClosed,
+        );
+    }
+
+    #[test]
+    fn v4_arc03_data_callback_contention_honors_configured_bound() {
+        assert_callback_class_backpressure(
+            TransportEvent::Message(Bytes::from_static(b"first")),
+            TransportEvent::Message(Bytes::from_static(b"second")),
+        );
+    }
+
+    #[test]
+    fn v4_arc03_audio_callback_contention_honors_configured_bound() {
+        assert_callback_class_backpressure(
+            TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 0,
+                lane: 0,
+                data: Bytes::from_static(b"first"),
+            }),
+            TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 1,
+                lane: 0,
+                data: Bytes::from_static(b"second"),
+            }),
+        );
+    }
+
+    #[test]
+    fn v4_arc03_video_callback_contention_honors_configured_bound() {
+        assert_callback_class_backpressure(
+            TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: 0,
+                key: true,
+                lane: 0,
+                data: Bytes::from_static(b"first"),
+            }),
+            TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: 1,
+                key: false,
+                lane: 0,
+                data: Bytes::from_static(b"second"),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "owner-run measurement; requires MYOWNMESH_ARC03_CALLBACK_CAPACITY and MYOWNMESH_ARC03_CALLBACK_SAMPLES"]
+    async fn v4_arc03_measure_callback_classes_without_selecting_a_budget() {
+        let capacity = std::env::var("MYOWNMESH_ARC03_CALLBACK_CAPACITY")
+            .expect("owner supplies callback capacity")
+            .parse::<usize>()
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .expect("owner callback capacity must be a nonzero integer");
+        let samples = std::env::var("MYOWNMESH_ARC03_CALLBACK_SAMPLES")
+            .expect("owner supplies sample count")
+            .parse::<usize>()
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .expect("owner sample count must be a nonzero integer");
+
+        for class in [
+            ConnectorCallbackClass::Control,
+            ConnectorCallbackClass::Data,
+            ConnectorCallbackClass::Audio,
+            ConnectorCallbackClass::Video,
+        ] {
+            let (events, mut receiver) = test_event_mailboxes(capacity.get());
+            let sink = ConnectorEventSink {
+                events,
+                resource_scope: None,
+                realtime_delivery: Arc::new(AtomicBool::new(true)),
+                attempt_liveness: None,
+                candidate_promoted: Arc::new(AtomicBool::new(true)),
+                callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
+            };
+            let started = Instant::now();
+            let producer = async {
+                for index in 0..samples.get() {
+                    let event = match class {
+                        ConnectorCallbackClass::Control => TransportEvent::DataChannelClosed,
+                        ConnectorCallbackClass::Data => {
+                            TransportEvent::Message(Bytes::from(index.to_le_bytes().to_vec()))
+                        }
+                        ConnectorCallbackClass::Audio => TransportEvent::AudioSample(AudioSample {
+                            rtp_timestamp: index as u32,
+                            lane: 0,
+                            data: Bytes::new(),
+                        }),
+                        ConnectorCallbackClass::Video => TransportEvent::VideoSample(VideoSample {
+                            rtp_timestamp: index as u32,
+                            key: false,
+                            lane: 0,
+                            data: Bytes::new(),
+                        }),
+                    };
+                    assert!(sink.emit(event).await);
+                }
+            };
+            let consumer = async {
+                for _ in 0..samples.get() {
+                    receiver.recv().await.expect("measurement callback arrives");
+                }
+            };
+            tokio::join!(producer, consumer);
+            println!(
+                "arc03_callback_measurement class={class:?} capacity={} samples={} elapsed_ns={}",
+                capacity,
+                samples,
+                started.elapsed().as_nanos()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn v4_arc03_retirement_wakes_producer_blocked_by_full_callback_queue() {
-        let (events, mut receiver) = mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR);
+        let (events, mut receiver) = test_event_mailboxes(1);
         let callback_gate = Arc::new(WebRtcConnectorIncarnation::new());
         let sink = ConnectorEventSink {
             events,
@@ -3711,33 +4557,30 @@ mod tests {
             .expect("blocked callback task joins"));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(QueuedTransportEvent {
-                event: TransportEvent::DataChannelOpen,
-                ..
-            })
+            Ok(TransportEvent::DataChannelOpen)
         ));
         assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn v4_arc03_engine_handoff_allows_one_outstanding_event_per_worker() {
+    async fn v4_arc03_event_receiver_adds_no_hidden_engine_queue() {
         let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
             crate::runtime::runtime_for_test(),
         );
         let attempt_retirement = candidate.liveness().subscribe_retirement();
         let ownership = admitted_ownership(candidate);
-        let (events_tx, events) = mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR);
+        let (events_tx, events) = test_event_mailboxes(1);
         let mut receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
             retirement: ownership.incarnation.subscribe_retirement(),
             attempt_retirement: Some(attempt_retirement),
-            raw: TransportEventReceiver { events },
-            command_slots: Arc::new(Semaphore::new(CONNECTOR_EVENT_QUEUE_FLOOR)),
+            raw: events,
             attempt_lifetime: Some(lifetime),
             remote_candidates: Arc::new(SyncMutex::new(RemoteCandidateState::default())),
             close_owner: None,
         };
         events_tx
+            .control
             .send(QueuedTransportEvent {
                 event: TransportEvent::DataChannelOpen,
                 observation: None,
@@ -3746,6 +4589,7 @@ mod tests {
             .expect("first callback is queued");
         let first = receiver.recv().await.expect("first event reaches engine");
         events_tx
+            .control
             .send(QueuedTransportEvent {
                 event: TransportEvent::DataChannelClosed,
                 observation: None,
@@ -3758,13 +4602,9 @@ mod tests {
         let mut context = Context::from_waker(waker);
         assert!(matches!(
             second_receive.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
-        drop(first);
-        assert!(matches!(
-            second_receive.as_mut().poll(&mut context),
             Poll::Ready(Some(_))
         ));
+        drop(first);
     }
 
     #[tokio::test]
@@ -3782,13 +4622,12 @@ mod tests {
             .lock()
             .pending
             .push(observed_candidate(), &resource_scope);
-        let (_events_tx, events) = mpsc::channel(CONNECTOR_EVENT_QUEUE_FLOOR);
+        let (_events_tx, events) = test_event_mailboxes(1);
         let mut receiver = WebRtcConnectorEventReceiver {
             ownership: ownership.clone(),
             retirement: ownership.incarnation.subscribe_retirement(),
             attempt_retirement: Some(attempt_retirement),
-            raw: TransportEventReceiver { events },
-            command_slots: Arc::new(Semaphore::new(CONNECTOR_EVENT_QUEUE_FLOOR)),
+            raw: events,
             attempt_lifetime: Some(lifetime),
             remote_candidates,
             close_owner: None,
@@ -3812,7 +4651,9 @@ mod tests {
     async fn v4_arc03_cancelled_construction_closes_partial_native_peer() {
         let process = ProcessResourceRoot::isolated();
         let context = process.mesh_runtime_scope().network_instance_scope();
-        let mut transport = Transport::new().expect("test transport");
+        let mut transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_owner(test_resource_owner(1, 4, Duration::from_secs(10)));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -3876,7 +4717,9 @@ mod tests {
     async fn v4_arc03_cancelled_delivered_result_closes_native_peer_before_release() {
         let process = ProcessResourceRoot::isolated();
         let context = process.mesh_runtime_scope().network_instance_scope();
-        let mut transport = Transport::new().expect("test transport");
+        let mut transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_owner(test_resource_owner(1, 4, Duration::from_secs(10)));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterResultDelivery);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
@@ -3932,6 +4775,110 @@ mod tests {
         })
         .await
         .expect("cancelled delivered result releases callback and task observations");
+    }
+
+    #[test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    fn v4_arc03_construction_runtime_shutdown_is_bounded_and_fail_closed() {
+        let owner = test_resource_owner(1, 4, Duration::from_secs(2));
+        let mut transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_owner(owner.clone());
+        let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
+        transport.construction_hook = Some(Arc::clone(&hook));
+        let process = ProcessResourceRoot::isolated();
+        let construction_scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let caller_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("fixture caller runtime");
+        let construction = caller_runtime.spawn(async move {
+            transport
+                .open_connector_peer(Role::Answerer, &[], &[], construction_scope)
+                .await
+        });
+        let created = caller_runtime
+            .block_on(hook.created.acquire())
+            .expect("construction reaches native allocation");
+        created.forget();
+        let native = hook
+            .peer_connection
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .expect("partial native peer exists");
+        drop(construction);
+        drop(caller_runtime);
+
+        let verifier_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture verifier runtime");
+        verifier_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let report = owner.report();
+                        if (native.connection_state() == RTCPeerConnectionState::Closed
+                            && report.active_candidates == 0)
+                            || report.poisoned
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+            })
+            .expect("cleanup reaches successful close or bounded poison");
+        let report = owner.report();
+        if report.poisoned {
+            assert_eq!(report.active_candidates, 1);
+            let (permit, _lifetime, claim) =
+                admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
+            assert!(permit.reserve_connector_candidate(claim).is_none());
+        } else {
+            assert_eq!(native.connection_state(), RTCPeerConnectionState::Closed);
+            assert_eq!(report.active_candidates, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_background_construction_failure_closes_partial_native_peer() {
+        let owner = test_resource_owner(1, 4, Duration::from_secs(10));
+        let mut transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_owner(owner.clone());
+        transport.construction_hook = Some(ConstructionTestHook::new(
+            ConstructionPause::FailAfterNativeAllocation,
+        ));
+        let process = ProcessResourceRoot::isolated();
+        let construction_scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+
+        let result = transport
+            .open_connector_peer(Role::Answerer, &[], &[], construction_scope)
+            .await;
+        assert!(
+            result.is_err(),
+            "injected construction task failure reaches the caller"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while owner.report().active_candidates != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed construction releases only after successful cleanup");
+        assert!(!owner.report().poisoned);
     }
 
     #[test]

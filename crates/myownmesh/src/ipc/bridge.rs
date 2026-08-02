@@ -375,7 +375,11 @@ mod tests {
     use myownmesh_core::events::{MeshEvent, PeerEvent};
     use myownmesh_core::identity::Identity;
     use myownmesh_core::transport::Transport;
+    use myownmesh_core::{
+        ConnectorCallbackMailboxCapacities, ConnectorResourceOwnerPort, ConnectorResourcePolicy,
+    };
     use myownmesh_signaling::local::LocalBroker;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::Instant;
@@ -394,6 +398,27 @@ mod tests {
             pinned_peers: Vec::new(),
             auto_approve: true,
         }
+    }
+
+    fn test_transport() -> Transport {
+        let connector_count =
+            NonZeroUsize::new(4).expect("test connector count is explicitly nonzero");
+        let callback_capacity =
+            NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
+        let policy = ConnectorResourcePolicy::new(
+            connector_count,
+            ConnectorCallbackMailboxCapacities::new(
+                callback_capacity,
+                callback_capacity,
+                callback_capacity,
+                callback_capacity,
+            ),
+            Duration::from_secs(10),
+        )
+        .expect("test close deadline is explicitly nonzero");
+        Transport::new()
+            .expect("transport")
+            .with_connector_resource_owner(ConnectorResourceOwnerPort::new(policy))
     }
 
     async fn wait_for_approval(
@@ -437,7 +462,7 @@ mod tests {
         std::mem::forget(tmp); // leak — test scope only
 
         let broker = LocalBroker::new();
-        let transport = Transport::new().expect("transport");
+        let transport = test_transport();
 
         let alice_id = Arc::new(Identity::ephemeral());
         let bob_id = Arc::new(Identity::ephemeral());

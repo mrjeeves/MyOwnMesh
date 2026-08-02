@@ -21,7 +21,6 @@ use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::conn_trace::ConnTrace;
 use myownmesh_core::engine::{attach_signaling, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use tokio::time::Instant;
 
@@ -160,7 +159,7 @@ async fn two_peers_handshake_over_mdns_only() {
     };
     let network_id = format!("mdns-only-handshake-{}", std::process::id());
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
 
@@ -237,7 +236,7 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     };
     let network_id = format!("fanout-handshake-{}", std::process::id());
 
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
 
@@ -293,3 +292,4 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     )
     .await;
 }
+mod support;

@@ -257,6 +257,7 @@ pub struct PeerConnection {
     pub state: RwLock<PeerStateData>,
     pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
     endpoint_auth: Mutex<Option<Arc<crate::endpoint_auth::EndpointAuthTask>>>,
+    realtime_flow: Mutex<Option<Arc<crate::connector::ConnectorRealtimeFlowCapability>>>,
     registry_retired: AtomicBool,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
     /// attempt, resource, or application authority.
@@ -273,6 +274,7 @@ impl PeerConnection {
             state: RwLock::new(PeerStateData::default()),
             session: Mutex::new(session),
             endpoint_auth: Mutex::new(None),
+            realtime_flow: Mutex::new(None),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -287,6 +289,7 @@ impl PeerConnection {
     /// External `Arc` holders cannot keep callbacks or queued candidates live.
     pub(super) fn retire_connector(&self) {
         self.registry_retired.store(true, Ordering::Release);
+        drop(self.realtime_flow.lock().take());
         let worker = self.session.lock().clone();
         if let Some(worker) = worker {
             worker.retire();
@@ -338,5 +341,45 @@ impl PeerConnection {
             .lock()
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, task))
+    }
+
+    /// Temporary Arc 03 adapter. Endpoint Auth owns connected-channel
+    /// provenance, while the existing authenticated and mutually-approved
+    /// state machine remains the admission fact until Arc 04 implements the
+    /// channel-bound transcript capability.
+    pub(super) fn install_legacy_realtime_flow(&self) -> bool {
+        if self.registry_retired() || !self.state.read().is_admitted() {
+            return false;
+        }
+        let worker = self.session.lock().clone();
+        let task = self.endpoint_auth.lock().clone();
+        let Some((worker, task)) = worker.zip(task) else {
+            return false;
+        };
+        let Some(capability) = worker.admit_legacy_realtime_flow(&task) else {
+            return false;
+        };
+        let mut current = self.realtime_flow.lock();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(capability);
+        true
+    }
+
+    pub(super) fn realtime_flow_ports(
+        &self,
+    ) -> Option<(
+        Arc<WebRtcConnectorWorker>,
+        Arc<crate::connector::ConnectorRealtimeFlowCapability>,
+    )> {
+        if self.registry_retired() || !self.state.read().is_admitted() {
+            return None;
+        }
+        let worker = self.session.lock().clone()?;
+        let capability = self.realtime_flow.lock().clone()?;
+        worker
+            .owns_realtime_flow(&capability)
+            .then_some((worker, capability))
     }
 }

@@ -18,7 +18,6 @@ use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -47,7 +46,7 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
@@ -130,3 +129,4 @@ async fn wait_for_drop(
         }
     }
 }
+mod support;

@@ -500,8 +500,16 @@ async fn maybe_activate_after_check(
         // replacement is excluded. Replacement therefore linearizes before
         // this complete commit or after it.
         let roster_result = state.approve_roster_now(device_id, &label);
-        if let Some(worker) = peer.session.lock().as_ref() {
-            worker.enable_realtime_delivery();
+        if !peer.install_legacy_realtime_flow() {
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "connector",
+                format!(
+                    "{} ACTIVE without an admitted connector-native real-time flow",
+                    super::short_peer(device_id)
+                ),
+                serde_json::json!({ "peer": device_id }),
+            );
         }
         state.log_diag_with(
             crate::events::DiagLevel::Info,

@@ -1159,16 +1159,15 @@ impl NetworkState {
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let session = {
+        let flow = {
             let Some(p) = self.peers.get(peer) else {
                 return Err(Error::Network(format!("peer not found: {peer}")));
             };
-            let session = p.session.lock().clone();
-            session
+            p.realtime_flow_ports()
         };
-        let session =
-            session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
-        session.send_video(lane, data, duration).await
+        let (session, capability) = flow
+            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
+        session.send_video(&capability, lane, data, duration).await
     }
 
     /// Subscribe to audio frames from every peer on this network
@@ -1197,16 +1196,15 @@ impl NetworkState {
         data: bytes::Bytes,
         duration: std::time::Duration,
     ) -> Result<()> {
-        let session = {
+        let flow = {
             let Some(p) = self.peers.get(peer) else {
                 return Err(Error::Network(format!("peer not found: {peer}")));
             };
-            let session = p.session.lock().clone();
-            session
+            p.realtime_flow_ports()
         };
-        let session =
-            session.ok_or_else(|| Error::Transport("session not yet established".into()))?;
-        session.send_audio(lane, data, duration).await
+        let (session, capability) = flow
+            .ok_or_else(|| Error::Transport("authenticated real-time flow not admitted".into()))?;
+        session.send_audio(&capability, lane, data, duration).await
     }
 
     /// Send a channel frame to one peer via the command queue.
