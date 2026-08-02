@@ -742,11 +742,7 @@ fn spawn_fanout(
             // Directed signaling (offers/answers/candidates) still passes,
             // so a listen-only member can deliberately dial a peer it
             // observed.
-            if listen_only
-                && matches!(
-                    msg,
-                    SignalingOutbound::Announce | SignalingOutbound::Leave
-                )
+            if listen_only && matches!(msg, SignalingOutbound::Announce | SignalingOutbound::Leave)
             {
                 continue;
             }

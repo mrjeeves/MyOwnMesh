@@ -50,9 +50,7 @@ async fn wait_sighted(
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(remaining > Duration::ZERO, "{what}: never sighted {peer}");
         match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(MeshEvent::Peer(PeerEvent::Sighted { device_id, .. })))
-                if device_id == peer =>
-            {
+            Ok(Ok(MeshEvent::Peer(PeerEvent::Sighted { device_id, .. }))) if device_id == peer => {
                 return;
             }
             Ok(Ok(MeshEvent::Peer(PeerEvent::Authenticated { device_id, .. })))
@@ -114,13 +112,10 @@ async fn listen_only_watcher_sees_without_being_seen_and_can_still_dial() {
     let mut watcher_events = watcher_state.events_tx.subscribe();
     attach_local(&watcher_state, &broker);
 
-    let (asker_state, _asker_driver) = spawn_network(
-        network("asker", false),
-        asker_id.clone(),
-        transport.clone(),
-    )
-    .await
-    .expect("asker engine");
+    let (asker_state, _asker_driver) =
+        spawn_network(network("asker", false), asker_id.clone(), transport.clone())
+            .await
+            .expect("asker engine");
     let mut asker_events = asker_state.events_tx.subscribe();
     attach_local(&asker_state, &broker);
 
