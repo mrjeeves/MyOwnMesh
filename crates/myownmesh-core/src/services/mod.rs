@@ -14,8 +14,14 @@
 //! fully self-hosted, internet-isolated network trivial), plus the
 //! relay forwarder, which needs nothing beyond the core channel API.
 
+#[cfg(feature = "legacy-v1")]
 pub mod relay;
 
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this re-export exists only inside the frozen LegacyV1 feature boundary"
+)]
 pub use relay::{relay_targets, RelayEnvelope, RelayService, RELAY_CHANNEL};
 
 use serde::{Deserialize, Serialize};

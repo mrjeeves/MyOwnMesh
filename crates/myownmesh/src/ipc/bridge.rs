@@ -24,6 +24,11 @@
 //!   reference so a swept-away registry doesn't keep tasks
 //!   alive.
 
+#![allow(
+    deprecated,
+    reason = "the IPC bridge retains the frozen legacy media facade for downstream migration"
+)]
+
 use myownmesh_core::JoinedNetwork;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -378,7 +383,7 @@ mod tests {
     use myownmesh_core::{
         ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
         ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-        MeshConnectorResourcePolicy,
+        MeshConnectorResourcePolicy, PendingRemoteCandidatePolicy,
     };
     use myownmesh_signaling::local::LocalBroker;
     use std::num::NonZeroUsize;
@@ -450,9 +455,14 @@ mod tests {
             myownmesh_core::RealtimeConnectorPolicy::Disabled,
         )
         .expect("test data-only callback policy is valid");
-        let process_policy =
-            ConnectorResourcePolicy::new(connector_count, callbacks, Duration::from_secs(10))
-                .expect("test close observation limit is explicitly nonzero");
+        let process_policy = ConnectorResourcePolicy::new(
+            connector_count,
+            callbacks,
+            PendingRemoteCandidatePolicy::new(
+                connector_count,
+                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+            ),
+        );
         let policy = ConnectorCapableResourcePolicy::new(
             process_policy,
             MeshConnectorResourcePolicy::new(connector_count),

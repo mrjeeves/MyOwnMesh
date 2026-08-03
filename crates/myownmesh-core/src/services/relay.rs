@@ -17,6 +17,11 @@
 //! stamps the authenticated sender id into the forwarded envelope so the
 //! recipient can trust the `src` field rather than the wire claim.
 
+#![allow(
+    deprecated,
+    reason = "this entire module is the frozen LegacyV1 compatibility implementation"
+)]
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -29,12 +34,20 @@ use crate::engine::state::NetworkState;
 /// Reserved channel name the relay listens on. Versioned so a future
 /// envelope-shape change can run a second channel in parallel without a
 /// flag day.
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub const RELAY_CHANNEL: &str = "__mesh_relay__/v1";
 
 /// One relayed frame. A member wraps its real payload in this and sends
 /// it to the relay on [`RELAY_CHANNEL`]; the relay rewrites `src`,
 /// clears `dst`, and forwards to the resolved destination(s).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub struct RelayEnvelope {
     /// Final recipient device id. Empty = broadcast to every other
     /// roster member the relay currently has reachable.
@@ -58,6 +71,10 @@ pub struct RelayEnvelope {
 ///    is currently reachable, and never reflect back to the sender.
 ///  - broadcast (`dst` empty): forward to every reachable roster member
 ///    except the sender, capped at `max_fanout` (0 = unlimited).
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub fn relay_targets(
     from: &str,
     dst: &str,
@@ -101,6 +118,10 @@ fn is_reachable_status(status: PeerStatus) -> bool {
 
 /// Running relay forwarder for one network. Holds the spawned task;
 /// drop or call [`RelayService::stop`] to tear it down.
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application relay is frozen and scheduled for removal after downstream migration"
+)]
 pub struct RelayService {
     task: tokio::task::JoinHandle<()>,
 }
@@ -111,9 +132,10 @@ impl RelayService {
     pub fn start(
         state: Arc<NetworkState>,
         max_fanout: u32,
-        _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+        runtime: &crate::legacy_v1::LegacyV1Runtime,
     ) -> RelayService {
-        let task = tokio::spawn(run(state, max_fanout));
+        let marker = runtime.marker();
+        let task = tokio::spawn(run(marker, state, max_fanout));
         RelayService { task }
     }
 
@@ -130,7 +152,7 @@ impl Drop for RelayService {
     }
 }
 
-async fn run(state: Arc<NetworkState>, max_fanout: u32) {
+async fn run(_marker: crate::legacy_v1::LegacyV1Marker, state: Arc<NetworkState>, max_fanout: u32) {
     let channel: Channel<RelayEnvelope> = Channel::new(RELAY_CHANNEL.to_string(), state.clone());
     let mut sub = channel.subscribe();
     debug!(network = %state.network_id, "relay service listening on {RELAY_CHANNEL}");

@@ -10,7 +10,7 @@ instead: `cargo install --path crates/myownmesh` then
 
 ## 1. Dependencies
 
-The library crates aren't on crates.io yet — pin them to a release
+The library crates aren't on crates.io yet. Pin them to a release
 tag via git:
 
 ```toml
@@ -53,12 +53,13 @@ owner-selected value below before startup:
 ```text
 MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES
 MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES
+MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS
+MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_BYTES
 MYOWNMESH_CONNECTOR_CONTROL_CAPACITY
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY
 MYOWNMESH_CONNECTOR_CONTROL_WEIGHT
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT
 MYOWNMESH_CONNECTOR_REALTIME_POLICY
-MYOWNMESH_CONNECTOR_NATIVE_CLOSE_OBSERVATION_MS
 ```
 
 Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only connector.
@@ -73,13 +74,17 @@ MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT
 MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW
-MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES
+MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES
+MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES
+MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES
 ```
 
 MyOwnMesh supplies no numeric fallback. Missing, zero, or invalid values stop
-the connector-capable daemon before it joins a mesh.
+the connector-capable daemon before it joins a mesh. Native close has no
+timeout policy. It stays in the `Closing` state until the WebRTC dependency
+returns success or an error.
 
-The returned `MeshHandle` is cheap to clone — multiple subsystems in
+The returned `MeshHandle` is cheap to clone. Multiple subsystems in
 your app can hold one.
 
 ## 3. Join a network
@@ -275,13 +280,13 @@ net.leave().await?;
 and aborts the event-fanout task. Subsequent calls on the same
 `JoinedNetwork` will fail with `Error::Network`.
 
-The `MeshHandle` itself doesn't need explicit cleanup — drop it.
+The `MeshHandle` itself doesn't need explicit cleanup. Drop it.
 
 ## More
 
-- `docs/PROTOCOL.md` — wire-level frame reference.
+- `docs/PROTOCOL.md`: wire-level frame reference.
 - `CONNECTION-ENGINE-FIELD-NOTES.md`: retained field evidence for the graduated recovery ladder, all
   tunables, every edge case.
-- `examples/` — runnable demos.
-- `tests/two_peer_handshake.rs` — the end-to-end integration test
+- `examples/`: runnable demos.
+- `tests/two_peer_handshake.rs`: the end-to-end integration test
   doubles as an executable spec for the full handshake stack.

@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "this module is the frozen H.264 compatibility implementation"
+)]
+
 //! Structurally bounded H.264 compatibility assembly.
 
 use super::*;

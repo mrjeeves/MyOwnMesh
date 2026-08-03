@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::state::NetworkState;
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
@@ -79,11 +80,10 @@ async fn spawn_node(label: &str, transport: &Transport, broker: &LocalBroker) ->
     }
 }
 
-fn authenticated(state: &Arc<NetworkState>, peer: &str) -> bool {
-    state
-        .peer_info(peer)
-        .map(|p| p.authenticated)
-        .unwrap_or(false)
+fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
+    state.peer_info(peer).is_some_and(|peer| {
+        peer.authenticated && matches!(peer.status, PeerStatus::Active | PeerStatus::Shelved)
+    })
 }
 
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
@@ -146,14 +146,14 @@ async fn run_area(n_spokes: usize) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (i, spoke) in spokes.iter().enumerate() {
         assert!(
-            !authenticated(&spoke.state, &operator.id),
-            "member-{i} authenticated to the operator without a deliberate dial"
+            !admitted(&spoke.state, &operator.id),
+            "member-{i} was admitted to the operator without a deliberate dial"
         );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
-                    "member-{i} authenticated to member-{j} on a silent mesh"
+                    !admitted(&spoke.state, &other.id),
+                    "member-{i} was admitted to member-{j} on a silent mesh"
                 );
             }
         }
@@ -176,9 +176,7 @@ async fn run_area(n_spokes: usize) {
                 operator.state.connect_peer(&spoke.id);
                 next_dial = Instant::now() + Duration::from_secs(4);
             }
-            if authenticated(&operator.state, &spoke.id)
-                && authenticated(&spoke.state, &operator.id)
-            {
+            if admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id) {
                 break;
             }
             assert!(
@@ -197,7 +195,7 @@ async fn run_area(n_spokes: usize) {
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
+                    !admitted(&spoke.state, &other.id),
                     "member-{i} ↔ member-{j} session appeared — spokes must only see the operator"
                 );
             }

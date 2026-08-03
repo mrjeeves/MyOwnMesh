@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [features]
 default = []
 transport-lab = []
+legacy-v1 = []
 
 [[example]]
 name = "spin_min"

@@ -15,13 +15,25 @@
 //! status report as `enabled but not running`, leaving the rest of the
 //! mesh untouched.
 
+#![cfg_attr(
+    feature = "legacy-v1",
+    allow(
+        deprecated,
+        reason = "LegacyV1 calls in this module are confined to the explicit compatibility runtime"
+    )
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use myownmesh_core::services::{ServiceAdvert, ServiceRole};
-use myownmesh_core::{
-    CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, RelayService, ServicesConfig,
-};
+use myownmesh_core::{CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ServicesConfig};
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this import is confined to the frozen LegacyV1 adapter"
+)]
+use myownmesh_core::{LegacyV1Runtime, RelayService};
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
 use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
 use serde::Serialize;
@@ -36,7 +48,19 @@ pub struct ServiceManager {
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
     state: Mutex<ManagerState>,
+    #[cfg(feature = "legacy-v1")]
+    legacy_v1: Option<LegacyV1Runtime>,
 }
+
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this alias is confined to the frozen LegacyV1 adapter"
+)]
+type LegacyRelayService = RelayService;
+
+#[cfg(not(feature = "legacy-v1"))]
+struct LegacyRelayService;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServicePolicyError {
@@ -53,7 +77,7 @@ struct ManagerState {
     turn: Option<TurnServerHandle>,
     signaling: Option<SignalingServerHandle>,
     /// One relay forwarder per joined network, keyed by config id.
-    relays: HashMap<String, RelayService>,
+    relays: HashMap<String, LegacyRelayService>,
 }
 
 /// Status snapshot for the control protocol / CLI / GUI.
@@ -114,7 +138,14 @@ impl ServiceManager {
         &self,
         desired: &ServicesConfig,
     ) -> Result<(), ServicePolicyError> {
-        Self::validate_config(desired)?;
+        if desired.relay.enabled {
+            #[cfg(not(feature = "legacy-v1"))]
+            return Err(ServicePolicyError::LegacyPayloadRelayForbidden);
+            #[cfg(feature = "legacy-v1")]
+            if self.legacy_v1.is_none() {
+                return Err(ServicePolicyError::LegacyPayloadRelayForbidden);
+            }
+        }
         if desired.node.enabled && self.mesh.connector_resource_report().is_none() {
             return Err(ServicePolicyError::ConnectorPolicyRequired);
         }
@@ -132,6 +163,32 @@ impl ServiceManager {
                 signaling: None,
                 relays: HashMap::new(),
             }),
+            #[cfg(feature = "legacy-v1")]
+            legacy_v1: None,
+        })
+    }
+
+    #[cfg(feature = "legacy-v1")]
+    #[allow(
+        deprecated,
+        reason = "this constructor is the explicit frozen LegacyV1 boundary"
+    )]
+    pub fn new_with_legacy_v1(
+        mesh: MeshHandle,
+        registry: Arc<NetworkRegistry>,
+        runtime: LegacyV1Runtime,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            mesh,
+            registry,
+            state: Mutex::new(ManagerState {
+                config: ServicesConfig::default(),
+                stun: None,
+                turn: None,
+                signaling: None,
+                relays: HashMap::new(),
+            }),
+            legacy_v1: Some(runtime),
         })
     }
 
@@ -228,17 +285,17 @@ impl ServiceManager {
         // reserved channel — so reconcile by clearing and re-deriving
         // from the live registry whenever apply runs.
         g.relays.clear();
+        #[cfg(feature = "legacy-v1")]
         if desired.relay.enabled {
+            let Some(runtime) = self.legacy_v1.as_ref() else {
+                return Err(ServicePolicyError::LegacyPayloadRelayForbidden);
+            };
             let fanout = desired.relay.max_fanout;
             for summary in self.registry.summaries() {
                 if let Some(joined) = self.registry.get(&summary.config_id) {
                     g.relays.insert(
                         summary.config_id,
-                        RelayService::start(
-                            joined.state(),
-                            fanout,
-                            myownmesh_core::LegacyV1CompatibilityProfile::frozen(),
-                        ),
+                        RelayService::start(joined.state(), fanout, runtime),
                     );
                 }
             }
@@ -273,21 +330,31 @@ impl ServiceManager {
     /// Hook for when a network joins after services were applied: start a
     /// relay for it if relay hosting is on, and push the current advert.
     pub async fn on_network_added(&self, config_id: &str) {
-        let mut g = self.state.lock().await;
-        let (enabled, fanout) = (g.config.relay.enabled, g.config.relay.max_fanout);
-        if enabled && !g.relays.contains_key(config_id) {
-            if let Some(joined) = self.registry.get(config_id) {
-                g.relays.insert(
-                    config_id.to_string(),
-                    RelayService::start(
-                        joined.state(),
-                        fanout,
-                        myownmesh_core::LegacyV1CompatibilityProfile::frozen(),
-                    ),
-                );
+        #[cfg(feature = "legacy-v1")]
+        {
+            let mut g = self.state.lock().await;
+            let (enabled, fanout) = (g.config.relay.enabled, g.config.relay.max_fanout);
+            if enabled && !g.relays.contains_key(config_id) {
+                if let Some(joined) = self.registry.get(config_id) {
+                    let Some(runtime) = self.legacy_v1.as_ref() else {
+                        warn!("legacy relay enablement has no LegacyV1 runtime");
+                        self.refresh_adverts_locked(&g);
+                        return;
+                    };
+                    g.relays.insert(
+                        config_id.to_string(),
+                        RelayService::start(joined.state(), fanout, runtime),
+                    );
+                }
             }
+            self.refresh_adverts_locked(&g);
         }
-        self.refresh_adverts_locked(&g);
+        #[cfg(not(feature = "legacy-v1"))]
+        {
+            let _ = config_id;
+            let g = self.state.lock().await;
+            self.refresh_adverts_locked(&g);
+        }
     }
 
     /// Hook for when a network leaves: drop its relay forwarder.
@@ -385,6 +452,7 @@ impl ManagerState {
 fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
     let mut tags = Vec::new();
     if config.relay.enabled {
+        #[cfg(feature = "legacy-v1")]
         tags.push(ServiceRole::Relay.tag().to_string());
     }
     if config.signaling.enabled {
@@ -406,7 +474,7 @@ fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
         }
     };
     let mut advert = ServiceAdvert {
-        relay: config.relay.enabled,
+        relay: cfg!(feature = "legacy-v1") && config.relay.enabled,
         ..Default::default()
     };
     if let Some(host) = host {
@@ -564,5 +632,79 @@ mod tests {
             Err(ServicePolicyError::ConnectorPolicyRequired)
         ));
         assert!(!manager.current_config().await.node.enabled);
+    }
+
+    #[cfg(feature = "legacy-v1")]
+    #[allow(
+        deprecated,
+        reason = "this is the positive control for the frozen LegacyV1 daemon and Channel path"
+    )]
+    #[tokio::test]
+    async fn legacy_v1_runtime_explicitly_enables_one_daemon_channel_relay() {
+        use std::num::NonZeroUsize;
+
+        let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
+        let callbacks = myownmesh_core::ConnectorCallbackPolicy::new(
+            myownmesh_core::ConnectorCallbackMailboxCapacities::new(one, one),
+            myownmesh_core::ConnectorCallbackServiceWeights::data_only(one, one),
+            myownmesh_core::RealtimeConnectorPolicy::Disabled,
+        )
+        .expect("fixture data-only callback policy is valid");
+        let process = myownmesh_core::ConnectorResourcePolicy::new(
+            one,
+            callbacks,
+            myownmesh_core::PendingRemoteCandidatePolicy::new(one, one),
+        );
+        let policy = myownmesh_core::ConnectorCapableResourcePolicy::new(
+            process,
+            myownmesh_core::MeshConnectorResourcePolicy::new(one),
+        );
+        let mesh = myownmesh_core::Mesh::open_connector_capable_with_identity(
+            MeshConfig::default(),
+            Arc::new(myownmesh_core::Identity::ephemeral()),
+            policy,
+        )
+        .await
+        .expect("open explicitly bounded compatibility fixture");
+        let joined = mesh
+            .join(NetworkConfig {
+                id: "legacy-v1-positive".to_string(),
+                network_id: "legacy-v1-positive".to_string(),
+                label: "LegacyV1 positive control".to_string(),
+                kind: Default::default(),
+                topology: Default::default(),
+                signaling: Default::default(),
+                stun_servers: Vec::new(),
+                turn_servers: Vec::new(),
+                roster_path: None,
+                pinned_peers: Vec::new(),
+                auto_approve: false,
+            })
+            .await
+            .expect("join one compatibility network");
+        let registry = NetworkRegistry::new();
+        registry.insert(joined, None);
+        let manager = ServiceManager::new_with_legacy_v1(
+            mesh,
+            Arc::clone(&registry),
+            LegacyV1Runtime::frozen(),
+        );
+        let mut desired = ServicesConfig::default();
+        desired.relay.enabled = true;
+        let report = manager
+            .apply(desired)
+            .await
+            .expect("explicit runtime admits the frozen relay path");
+        tokio::task::yield_now().await;
+        assert!(report.relay.enabled);
+        assert_eq!(report.relay.networks, 1);
+
+        manager.shutdown().await;
+        for joined in registry.take_all() {
+            joined
+                .leave()
+                .await
+                .expect("fixture network leaves cleanly");
+        }
     }
 }

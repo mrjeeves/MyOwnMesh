@@ -118,7 +118,7 @@ fn connected_ids(state: &NetworkState) -> Vec<String> {
 /// the caller passes it through to channel subscribers (the legacy
 /// `RelayService` flow).
 pub(crate) async fn on_relay_frame(
-    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+    _marker: crate::legacy_v1::LegacyV1Marker,
     state: &Arc<NetworkState>,
     from: &str,
     payload: &Value,
@@ -249,7 +249,7 @@ async fn send_envelope(state: &Arc<NetworkState>, peer: &str, envelope: &Value) 
 /// accepted it — the routed-delivery guarantee, weaker than an ack and
 /// said so in the docs.
 pub(crate) async fn send_routed(
-    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+    _marker: crate::legacy_v1::LegacyV1Marker,
     state: &Arc<NetworkState>,
     dest: &str,
     channel: &str,
@@ -290,7 +290,7 @@ pub(crate) async fn send_routed(
 /// connected, unshelved peer; forwarders re-fan it across the shape.
 /// Returns how many first-hop peers accepted the frame.
 pub(crate) async fn broadcast_flood(
-    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+    _marker: crate::legacy_v1::LegacyV1Marker,
     state: &Arc<NetworkState>,
     channel: &str,
     payload: &Value,
@@ -383,7 +383,7 @@ mod tests {
         })
         .unwrap();
         let consumed = on_relay_frame(
-            crate::legacy_v1::LegacyV1CompatibilityProfile::frozen(),
+            crate::legacy_v1::LegacyV1Runtime::frozen().marker(),
             &state,
             "peer-x",
             &legacy,
@@ -408,7 +408,7 @@ mod tests {
         })
         .unwrap();
         let consumed = on_relay_frame(
-            crate::legacy_v1::LegacyV1CompatibilityProfile::frozen(),
+            crate::legacy_v1::LegacyV1Runtime::frozen().marker(),
             &state,
             "carrier-spoke",
             &env,

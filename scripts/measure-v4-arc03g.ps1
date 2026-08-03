@@ -1,8 +1,27 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("callback-flow", "direct", "turn", "media", "reconnect", "multi-peer", "multi-mesh", "all")]
+    [ValidateSet(
+        "callback-flow",
+        "flow-fairness",
+        "direct",
+        "turn",
+        "data-only",
+        "h264",
+        "opus",
+        "reconnect",
+        "multi-peer",
+        "multi-mesh",
+        "close-success",
+        "close-error",
+        "candidate-burst",
+        "all"
+    )]
     [string]$Scenario,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$Repeats,
 
     [ValidateRange(1, [int]::MaxValue)]
     [Nullable[int]]$Samples,
@@ -14,13 +33,22 @@ param(
     [Nullable[int]]$PayloadBytes,
 
     [ValidateRange(1, [int]::MaxValue)]
+    [Nullable[int]]$SaturatedUnits,
+
+    [ValidateRange(1, [int]::MaxValue)]
+    [Nullable[int]]$LatencyUnits,
+
+    [ValidateRange(1, [int]::MaxValue)]
     [Nullable[int]]$MultiPeerCount,
 
     [ValidateRange(1, [int]::MaxValue)]
     [Nullable[int]]$MultiMeshCount,
 
     [ValidateRange(1, [int]::MaxValue)]
-    [Nullable[int]]$CandidatesPerMesh
+    [Nullable[int]]$CandidatesPerMesh,
+
+    [ValidateRange(1, [int]::MaxValue)]
+    [Nullable[int]]$CandidateCount
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +62,8 @@ if ($repoWsl.Contains("'")) {
     throw "The repository path cannot contain a single quote."
 }
 $quotedRepo = "'$repoWsl'"
-$targetDir = "/tmp/mom-arc03f"
+$targetDir = "/tmp/mom-arc03g-measure"
+$sourceCommit = (git -C $repoPath rev-parse HEAD).Trim()
 
 function Invoke-MeasuredTest {
     param(
@@ -55,6 +84,7 @@ function Invoke-MeasuredTest {
     $environmentPrefix = @(
         "CARGO_TARGET_DIR=$targetDir",
         "CARGO_INCREMENTAL=0",
+        "CARGO_PROFILE_DEV_DEBUG=0",
         "CARGO_PROFILE_TEST_DEBUG=0"
     )
     $buildCommand = "cd $quotedRepo && env $($environmentPrefix -join ' ') /root/.cargo/bin/cargo test $CargoTargetArguments --no-run --message-format=json"
@@ -87,32 +117,56 @@ function Invoke-MeasuredTest {
     if ($testExecutable.Contains("'")) {
         throw "The test executable path cannot contain a single quote."
     }
-    $command = "cd $quotedRepo && env $($environmentPrefix -join ' ') /usr/bin/time -v '$testExecutable' '$TestName' --exact$ignoredArgument --nocapture --test-threads=1"
 
-    Write-Output "arc03f_measurement_begin scenario=$Label commit=$(git -C $repoPath rev-parse HEAD)"
-    & wsl.exe -d Ubuntu-24.04 -- bash -lc $command
-    if ($LASTEXITCODE -ne 0) {
-        throw "Measurement scenario '$Label' failed with exit code $LASTEXITCODE."
+    for ($iteration = 0; $iteration -lt $Repeats; $iteration++) {
+        $command = "cd $quotedRepo && env $($environmentPrefix -join ' ') MYOWNMESH_ARC03_OBSERVE_ITERATION=$iteration /usr/bin/time -v '$testExecutable' '$TestName' --exact$ignoredArgument --nocapture --test-threads=1"
+        Write-Output "arc03g_measurement_begin scenario=$Label iteration=$iteration commit=$sourceCommit"
+        & wsl.exe -d Ubuntu-24.04 -- bash -lc $command
+        if ($LASTEXITCODE -ne 0) {
+            throw "Measurement scenario '$Label' iteration $iteration failed with exit code $LASTEXITCODE."
+        }
+        Write-Output "arc03g_measurement_end scenario=$Label iteration=$iteration"
     }
-    Write-Output "arc03f_measurement_end scenario=$Label"
 }
 
 $selected = if ($Scenario -eq "all") {
-    @("callback-flow", "direct", "turn", "media", "reconnect", "multi-peer", "multi-mesh")
+    @(
+        "callback-flow",
+        "flow-fairness",
+        "direct",
+        "turn",
+        "data-only",
+        "h264",
+        "opus",
+        "reconnect",
+        "multi-peer",
+        "multi-mesh",
+        "close-success",
+        "close-error",
+        "candidate-burst"
+    )
 } else {
     @($Scenario)
 }
 
 if ($selected -contains "callback-flow") {
     if ($null -eq $Samples -or $null -eq $Flows -or $null -eq $PayloadBytes) {
-        throw "callback-flow requires explicit -Samples, -Flows, and -PayloadBytes workload inputs."
+        throw "callback-flow requires explicit -Samples, -Flows, and -PayloadBytes inputs."
+    }
+}
+if ($selected -contains "flow-fairness") {
+    if ($null -eq $SaturatedUnits -or $null -eq $LatencyUnits -or $null -eq $PayloadBytes) {
+        throw "flow-fairness requires explicit -SaturatedUnits, -LatencyUnits, and -PayloadBytes inputs."
     }
 }
 if ($selected -contains "multi-peer" -and $null -eq $MultiPeerCount) {
-    throw "multi-peer requires an explicit -MultiPeerCount workload input."
+    throw "multi-peer requires an explicit -MultiPeerCount input."
 }
 if ($selected -contains "multi-mesh" -and ($null -eq $MultiMeshCount -or $null -eq $CandidatesPerMesh)) {
-    throw "multi-mesh requires explicit -MultiMeshCount and -CandidatesPerMesh workload inputs."
+    throw "multi-mesh requires explicit -MultiMeshCount and -CandidatesPerMesh inputs."
+}
+if ($selected -contains "candidate-burst" -and $null -eq $CandidateCount) {
+    throw "candidate-burst requires an explicit -CandidateCount input."
 }
 
 foreach ($item in $selected) {
@@ -124,6 +178,13 @@ foreach ($item in $selected) {
                 MYOWNMESH_ARC03_OBSERVE_PAYLOAD_BYTES = $PayloadBytes
             } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03_measure_callback_classes_without_selecting_a_budget" -Ignored
         }
+        "flow-fairness" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_SATURATED_UNITS = $SaturatedUnits
+                MYOWNMESH_ARC03_OBSERVE_LATENCY_UNITS = $LatencyUnits
+                MYOWNMESH_ARC03_OBSERVE_PAYLOAD_BYTES = $PayloadBytes
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03g_measure_saturated_flow_fairness_without_selecting_budget" -Ignored
+        }
         "direct" {
             Invoke-MeasuredTest -Label $item -Environment @{
                 MYOWNMESH_ARC03_OBSERVE_RAW = 1
@@ -134,8 +195,20 @@ foreach ($item in $selected) {
                 MYOWNMESH_ARC03_OBSERVE_RAW = 1
             } -CargoTargetArguments "-p myownmesh-services --test turn_webrtc_endpoint_auth" -TestName "turn_selected_session_authenticates_endpoints_before_bidirectional_data"
         }
-        "media" {
-            Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::lanes_are_lifecycle_managed_not_pre_pooled"
+        "data-only" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03f_data_only_connector_allocates_no_realtime_tracks" -Ignored
+        }
+        "h264" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::loopback_video_lane_carries_h264_samples"
+        }
+        "opus" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::loopback_audio_lane_carries_opus_frames"
         }
         "reconnect" {
             Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --test reconnect_in_place" -TestName "in_place_reconnect_does_not_announce_a_leave"
@@ -151,7 +224,22 @@ foreach ($item in $selected) {
                 MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH = $CandidatesPerMesh
             } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "runtime::attempt::tests::v4_arc03f_measure_multi_mesh_connector_scopes_without_selecting_a_budget" -Ignored
         }
+        "close-success" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03_cancelled_construction_closes_partial_native_peer" -Ignored
+        }
+        "close-error" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03_cancelled_construction_with_native_close_error_retains_exact_claim" -Ignored
+        }
+        "candidate-burst" {
+            Invoke-MeasuredTest -Label $item -Environment @{
+                MYOWNMESH_ARC03_OBSERVE_CANDIDATES = $CandidateCount
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03g_measure_candidate_burst_without_selecting_budget" -Ignored
+        }
     }
 }
 
-Write-Output "No production capacity, weight, close-observation, or flow value is proposed by this raw measurement run."
+Write-Output "Raw observations only. No production capacity, weight, queue, byte, or flow value is proposed."

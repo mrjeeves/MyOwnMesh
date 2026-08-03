@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "this facade retains explicitly deprecated legacy media entry points during migration"
+)]
+
 //! User-facing facade — what embedders actually call.
 //!
 //! - [`Mesh`] is the entry constructor. One per process.
@@ -592,6 +597,10 @@ impl JoinedNetwork {
     /// auto-open (writing to a closed lane opens it transparently).
     /// The new m-line goes live on the next coalesced renegotiation;
     /// writes before that are no-ops, exactly like stream start.
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
     pub async fn open_media_lane(
         &self,
         peer: &str,
@@ -605,6 +614,10 @@ impl JoinedNetwork {
     /// (a settings change's stop→start) is free, and the engine reaps
     /// the m-line only once the grace lapses. Idempotent — a lane that
     /// isn't open is a no-op, so teardown can't double-fault.
+    #[deprecated(
+        since = "0.3.2",
+        note = "temporary legacy WebRTC media facade; use a session-bound codec-neutral flow"
+    )]
     pub async fn close_media_lane(
         &self,
         peer: &str,

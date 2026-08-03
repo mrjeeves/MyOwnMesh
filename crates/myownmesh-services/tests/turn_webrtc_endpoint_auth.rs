@@ -1,4 +1,8 @@
 #![cfg(target_os = "linux")]
+#![allow(
+    deprecated,
+    reason = "this positive control exercises the frozen legacy media compatibility path"
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +19,8 @@ use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
     ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-    MeshConnectorResourcePolicy, MeshEvent, PeerEvent, RealtimeConnectorPolicy,
+    MeshConnectorResourcePolicy, MeshEvent, PeerEvent, PendingRemoteCandidatePolicy,
+    RealtimeConnectorPolicy,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -52,8 +57,14 @@ fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
         RealtimeConnectorPolicy::Disabled,
     )
     .expect("fixture data-only callback policy is valid");
-    let process = ConnectorResourcePolicy::new(two, callbacks, Duration::from_secs(10))
-        .expect("fixture native-close observation limit is nonzero");
+    let process = ConnectorResourcePolicy::new(
+        two,
+        callbacks,
+        PendingRemoteCandidatePolicy::new(
+            two,
+            std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+        ),
+    );
     ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two))
 }
 

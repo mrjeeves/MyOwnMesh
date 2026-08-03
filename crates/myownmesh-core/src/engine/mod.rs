@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "the engine still hosts the frozen legacy media adapter during downstream migration"
+)]
+
 //! Connection engine — the runtime that turns the protocol +
 //! transport + topology primitives into a working mesh.
 //!
@@ -29,9 +34,10 @@ pub mod network_watch;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
+#[cfg(feature = "legacy-v1")]
 #[allow(
     dead_code,
-    reason = "RTM-001 retains the unreachable legacy forwarding implementation for later disposition"
+    reason = "frozen LegacyV1 routing remains unreachable from V4 and awaits named downstream deletion"
 )]
 pub mod routing;
 pub mod scheduler;
@@ -811,6 +817,20 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                             serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
                         );
                     }
+                    Ok(RemoteCandidateDisposition::DuplicateIgnored) => {
+                        trace!(peer = %device_id, "duplicate remote candidate ignored");
+                    }
+                    Ok(RemoteCandidateDisposition::RefusedByOwner) => {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Warn,
+                            "ice",
+                            format!(
+                                "remote {kind:?} candidate from {} exceeded the owner-selected pending queue",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({ "peer": device_id, "kind": format!("{kind:?}") }),
+                        );
+                    }
                     Err(e) => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
@@ -940,10 +960,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         };
         // Anything draining past the grace? (Cheap read; the actual
         // removal happens in the spawned task.)
-        if !pending
-            && !session
-                .has_reapable_lanes(&realtime_flow, *crate::transport::webrtc::LANE_DRAIN_GRACE)
-        {
+        if !pending && !session.has_reapable_lanes(&realtime_flow) {
             continue;
         }
         {
@@ -969,9 +986,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 // Finalize due drains first so the offer below carries
                 // the removals too — one renegotiation for the whole
                 // delta.
-                let reaped = session
-                    .reap_drained_lanes(&realtime_flow, *crate::transport::webrtc::LANE_DRAIN_GRACE)
-                    .await;
+                let reaped = session.reap_drained_lanes(&realtime_flow).await;
                 match session.create_offer().await {
                     Ok(desc) => {
                         if state.peers.get_if_current(&owner).is_none() {
@@ -3286,9 +3301,11 @@ fn build_test_state_parts(
     let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
         max_connectors,
         callbacks,
-        Duration::from_secs(10),
-    )
-    .expect("engine fixture close observation limit is nonzero");
+        crate::runtime::attempt::PendingRemoteCandidatePolicy::new(
+            max_connectors,
+            std::num::NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+        ),
+    );
     let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(connector_policy);
     let scope = owner
         .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(

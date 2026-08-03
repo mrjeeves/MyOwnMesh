@@ -41,6 +41,12 @@ pub struct EmbeddedDaemon {
     shutdown_tx: broadcast::Sender<()>,
 }
 
+enum ServiceCompatibility {
+    V4,
+    #[cfg(feature = "legacy-v1")]
+    LegacyV1(myownmesh_core::LegacyV1Runtime),
+}
+
 impl EmbeddedDaemon {
     /// The device handle — identity, events, joins.
     pub fn mesh(&self) -> &myownmesh_core::MeshHandle {
@@ -66,15 +72,38 @@ impl EmbeddedDaemon {
 /// Start the daemon with the connector policy selected by the process owner.
 ///
 /// This is the only Arc 03 daemon path that can establish connectors. No
-/// capacity, callback weight, structural real-time limit, or native-close observation limit
-/// is inferred here.
+/// capacity, callback weight, or structural real-time limit is inferred here.
 pub async fn start_connector_capable(
     cfg: myownmesh_core::MeshConfig,
     connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     ServiceManager::validate_config(&cfg.services)?;
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
-    start_with_mesh(cfg, mesh).await
+    start_with_mesh(cfg, mesh, ServiceCompatibility::V4).await
+}
+
+/// Start the connector-capable daemon with an explicit frozen LegacyV1
+/// compatibility runtime.
+///
+/// The normal V4 startup path cannot construct or reach this authority. This
+/// function exists only with the `legacy-v1` feature and is scheduled for
+/// deletion after downstream relay migration.
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "this API is the explicit frozen LegacyV1 boundary"
+)]
+#[deprecated(
+    since = "0.3.2",
+    note = "LegacyV1 application routing is frozen and scheduled for removal after downstream migration"
+)]
+pub async fn start_connector_capable_with_legacy_v1(
+    cfg: myownmesh_core::MeshConfig,
+    connector_policy: myownmesh_core::ConnectorCapableResourcePolicy,
+    runtime: myownmesh_core::LegacyV1Runtime,
+) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
+    start_with_mesh(cfg, mesh, ServiceCompatibility::LegacyV1(runtime)).await
 }
 
 /// Start a daemon that only hosts signaling, STUN, or TURN infrastructure.
@@ -90,12 +119,13 @@ pub async fn start_infrastructure_only(
     }
     ServiceManager::validate_config(&cfg.services)?;
     let mesh = myownmesh_core::Mesh::open_infrastructure_only(cfg.clone()).await?;
-    start_with_mesh(cfg, mesh).await
+    start_with_mesh(cfg, mesh, ServiceCompatibility::V4).await
 }
 
 async fn start_with_mesh(
     cfg: myownmesh_core::MeshConfig,
     mesh: myownmesh_core::MeshHandle,
+    compatibility: ServiceCompatibility,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -119,7 +149,13 @@ async fn start_with_mesh(
 
     // Infrastructure services (relay / signaling / STUN / TURN); an all-off
     // config (the default) starts nothing.
-    let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
+    let service_manager = match compatibility {
+        ServiceCompatibility::V4 => ServiceManager::new(mesh.clone(), registry.clone()),
+        #[cfg(feature = "legacy-v1")]
+        ServiceCompatibility::LegacyV1(runtime) => {
+            ServiceManager::new_with_legacy_v1(mesh.clone(), registry.clone(), runtime)
+        }
+    };
     let report = service_manager.apply(cfg.services.clone()).await?;
     info!(
         relay = report.relay.enabled,

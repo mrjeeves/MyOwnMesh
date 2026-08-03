@@ -1,11 +1,10 @@
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
     ConnectorCapableResourcePolicy, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
-    RealtimeConnectorPolicy,
+    PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
 };
 
 /// Explicit integration-test resource owner.
@@ -43,9 +42,14 @@ pub fn test_transport() -> Transport {
         RealtimeConnectorPolicy::Disabled,
     )
     .expect("fixture data-only callback policy is valid");
-    let policy =
-        ConnectorResourcePolicy::new(process_connector_count, callbacks, Duration::from_secs(10))
-            .expect("fixture close observation limit is nonzero");
+    let policy = ConnectorResourcePolicy::new(
+        process_connector_count,
+        callbacks,
+        PendingRemoteCandidatePolicy::new(
+            process_connector_count,
+            NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+        ),
+    );
     let policy = ConnectorCapableResourcePolicy::new(
         policy,
         MeshConnectorResourcePolicy::new(mesh_connector_count),

@@ -14,6 +14,11 @@
 //!   bounded mpsc. One worker pump handles each peer in order, while
 //!   exact owner checks fence replacement races.
 
+#![allow(
+    deprecated,
+    reason = "this module re-exports the explicitly deprecated legacy media facade"
+)]
+
 pub mod diag;
 pub mod ice;
 pub mod webrtc;

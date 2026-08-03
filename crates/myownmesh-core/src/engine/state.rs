@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "this state retains the explicitly deprecated legacy media facade during migration"
+)]
+
 //! Shared per-network state. Exposes the operations subsystems
 //! (`Channel<T>`, `Rpc`, `MeshHandle`) call to interact with the
 //! engine; all per-peer state mutation is funneled through the
@@ -34,6 +39,7 @@ use super::scheduler::{
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
 #[derive(Debug, Clone)]
+#[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility value")]
 pub struct InboundVideoSample {
     /// The authenticated peer the unit arrived from.
     pub from: String,
@@ -43,6 +49,7 @@ pub struct InboundVideoSample {
 /// One audio frame from a peer's track lane, as the engine's
 /// subscribers receive it (tagged with the sending peer).
 #[derive(Debug, Clone)]
+#[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility value")]
 pub struct InboundAudioSample {
     /// Sending peer's device id.
     pub from: String,
@@ -1138,13 +1145,14 @@ impl NetworkState {
     /// Subscribe to assembled video access units from every peer on
     /// this network (filter by [`InboundVideoSample::from`]). Lagging
     /// loses old frames, never delays new ones — video is freshness.
+    #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
     pub fn subscribe_video(&self) -> broadcast::Receiver<InboundVideoSample> {
         self.video_subscribers.subscribe()
     }
 
     /// Engine-side dispatch: fan an assembled access unit out to the
     /// video subscribers. Silently drops with none registered.
-    pub fn dispatch_video(&self, from: &str, sample: VideoSample) {
+    pub(crate) fn dispatch_video(&self, from: &str, sample: VideoSample) {
         let _ = self.video_subscribers.send(InboundVideoSample {
             from: from.to_string(),
             sample,
@@ -1156,6 +1164,7 @@ impl NetworkState {
     /// when the peer is unknown or its session isn't established;
     /// writes on a lane the peer never consumes are simply discarded
     /// by the far side.
+    #[deprecated(since = "0.3.2", note = "temporary legacy H.264 compatibility facade")]
     pub async fn send_video_sample(
         &self,
         peer: &str,
@@ -1177,13 +1186,14 @@ impl NetworkState {
     /// Subscribe to audio frames from every peer on this network
     /// (filter by [`InboundAudioSample::from`]). Lagging loses old
     /// frames, never delays new ones — live audio is freshness too.
+    #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
     pub fn subscribe_audio(&self) -> broadcast::Receiver<InboundAudioSample> {
         self.audio_subscribers.subscribe()
     }
 
     /// Engine-side dispatch: fan an audio frame out to the audio
     /// subscribers. Silently drops with none registered.
-    pub fn dispatch_audio(&self, from: &str, sample: AudioSample) {
+    pub(crate) fn dispatch_audio(&self, from: &str, sample: AudioSample) {
         let _ = self.audio_subscribers.send(InboundAudioSample {
             from: from.to_string(),
             sample,
@@ -1193,6 +1203,7 @@ impl NetworkState {
     /// Write one encoded Opus frame onto the audio lane to `peer`.
     /// `duration` is the frame length (20 ms canonically) — it paces
     /// the RTP clock. Same contract as [`Self::send_video_sample`].
+    #[deprecated(since = "0.3.2", note = "temporary legacy Opus compatibility facade")]
     pub async fn send_audio_sample(
         &self,
         peer: &str,
@@ -1528,7 +1539,7 @@ impl NetworkState {
     }
 
     /// Open the lowest free media lane of `kind` toward `peer`.
-    pub async fn media_lane_open(
+    pub(crate) async fn media_lane_open(
         &self,
         peer: &str,
         kind: crate::transport::webrtc::LaneKind,
@@ -1546,7 +1557,7 @@ impl NetworkState {
     }
 
     /// Close a media lane toward `peer` (idempotent).
-    pub async fn media_lane_close(
+    pub(crate) async fn media_lane_close(
         &self,
         peer: &str,
         kind: crate::transport::webrtc::LaneKind,

@@ -13,6 +13,11 @@
 //! line until the client disconnects. The GUI's Tauri backend uses
 //! this to forward live mesh events into the frontend.
 
+#![allow(
+    deprecated,
+    reason = "the local control protocol retains the frozen legacy media facade for downstream migration"
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

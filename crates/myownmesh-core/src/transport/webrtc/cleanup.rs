@@ -8,7 +8,6 @@ pub(super) enum ConnectorCloseStatus {
     Closing,
     Closed,
     Failed(String),
-    Unproven(String),
 }
 
 enum ConnectedClaimRetention {
@@ -81,7 +80,7 @@ pub(super) struct ConnectorCloseOwner {
     resource_owner: MeshConnectorResourceScope,
     native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
     remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
-    native_close_observation_limit: Duration,
+    realtime_flows: SyncMutex<Option<Arc<RealtimeFlowRegistry>>>,
     started: AtomicBool,
     cleanup_complete: AtomicBool,
     status: watch::Sender<ConnectorCloseStatus>,
@@ -102,7 +101,7 @@ impl ConnectorCloseOwner {
             resource_owner: resource_owner.clone(),
             native: SyncMutex::new(None),
             remote_candidates: SyncMutex::new(None),
-            native_close_observation_limit: resource_owner.native_close_observation_limit(),
+            realtime_flows: SyncMutex::new(None),
             started: AtomicBool::new(false),
             cleanup_complete: AtomicBool::new(false),
             status,
@@ -115,6 +114,10 @@ impl ConnectorCloseOwner {
 
     pub(super) fn attach_native(&self, native: Arc<RTCPeerConnection>) -> bool {
         self.attach_native_port(Arc::new(WebRtcNativeClosePort { peer: native }))
+    }
+
+    pub(super) fn pending_remote_candidate_policy(&self) -> PendingRemoteCandidatePolicy {
+        self.resource_owner.pending_remote_candidates()
     }
 
     pub(super) fn attach_native_port(&self, native: Arc<dyn NativeConnectorClosePort>) -> bool {
@@ -143,10 +146,24 @@ impl ConnectorCloseOwner {
         true
     }
 
+    pub(super) fn attach_realtime_flows(&self, flows: Arc<RealtimeFlowRegistry>) -> bool {
+        let mut current = self.realtime_flows.lock();
+        if current.is_some() {
+            drop(current);
+            self.fail_cleanup("duplicate real-time registry owner installation".to_string());
+            return false;
+        }
+        *current = Some(flows);
+        true
+    }
+
     pub(super) fn retire_local(&self) {
         self.ownership.retire();
         if let Some(candidates) = self.remote_candidates.lock().as_ref() {
             drain_remote_candidates(candidates);
+        }
+        if let Some(flows) = self.realtime_flows.lock().as_ref() {
+            flows.retire();
         }
     }
 
@@ -187,31 +204,24 @@ impl ConnectorCloseOwner {
             let current = self.status.borrow().clone();
             match current {
                 ConnectorCloseStatus::Closed => return,
-                ConnectorCloseStatus::Failed(_) | ConnectorCloseStatus::Unproven(_) => {}
+                ConnectorCloseStatus::Failed(_) => {}
                 ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing => {
                     self.status.send_replace(ConnectorCloseStatus::Closing);
                 }
             }
         }
-        let owner = Arc::clone(self);
         #[cfg(test)]
         if self.fail_background_start.load(Ordering::Acquire) {
             self.fail_cleanup("cleanup background task failed to start".to_string());
             return;
         }
-        if let Err(error) = std::thread::Builder::new()
-            .name("myownmesh-webrtc-close-owner".to_string())
-            .spawn(move || {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(owner.run()),
-                    Err(error) => owner.fail_cleanup(format!("build cleanup runtime: {error}")),
-                }
-            })
+        let owner = Arc::clone(self);
+        if self
+            .resource_owner
+            .submit_cleanup(Box::pin(async move { owner.run().await }))
+            .is_err()
         {
-            self.fail_cleanup(format!("start cleanup thread: {error}"));
+            self.fail_cleanup("process cleanup executor refused the close owner".to_string());
         }
     }
 
@@ -222,30 +232,23 @@ impl ConnectorCloseOwner {
             return;
         };
         self.ownership.incarnation.retire();
-        let result =
-            tokio::time::timeout(self.native_close_observation_limit, native.close()).await;
-        match result {
-            Ok(Ok(())) => self.finish_closed(),
-            Ok(Err(error)) => self.fail_cleanup(error.to_string()),
-            Err(_) => self.mark_cleanup_unproven(format!(
-                "native close did not complete within owner observation limit {:?}",
-                self.native_close_observation_limit
-            )),
+        self.ownership.operation_fence.wait_for_operations().await;
+        match native.close().await {
+            Ok(()) => self.finish_closed(),
+            Err(error) => self.fail_cleanup(error.to_string()),
         }
     }
 
     fn finish_closed(&self) {
         let _transition = self.status_transition.lock();
-        if matches!(
-            *self.status.borrow(),
-            ConnectorCloseStatus::Failed(_) | ConnectorCloseStatus::Unproven(_)
-        ) {
+        if matches!(*self.status.borrow(), ConnectorCloseStatus::Failed(_)) {
             return;
         }
         self.cleanup_complete.store(true, Ordering::Release);
         self.ownership.complete_cleanup();
         self.native.lock().take();
         self.remote_candidates.lock().take();
+        self.realtime_flows.lock().take();
         *self.connected_claims.lock() = ConnectedClaimRetention::Empty;
         self.status.send_replace(ConnectorCloseStatus::Closed);
     }
@@ -257,9 +260,7 @@ impl ConnectorCloseOwner {
         let _transition = self.status_transition.lock();
         if matches!(
             *self.status.borrow(),
-            ConnectorCloseStatus::Closed
-                | ConnectorCloseStatus::Failed(_)
-                | ConnectorCloseStatus::Unproven(_)
+            ConnectorCloseStatus::Closed | ConnectorCloseStatus::Failed(_)
         ) {
             return;
         }
@@ -271,27 +272,6 @@ impl ConnectorCloseOwner {
             .send_replace(ConnectorCloseStatus::Failed(reason));
     }
 
-    /// Elapsed time cannot prove that the dependency failed to close. Keep
-    /// the exact connector claim consumed and report only that cleanup is no
-    /// longer provable through this owner-selected observation window.
-    fn mark_cleanup_unproven(&self, reason: String) {
-        let _transition = self.status_transition.lock();
-        if matches!(
-            *self.status.borrow(),
-            ConnectorCloseStatus::Closed
-                | ConnectorCloseStatus::Failed(_)
-                | ConnectorCloseStatus::Unproven(_)
-        ) {
-            return;
-        }
-        self.ownership.cleanup_failed.store(true, Ordering::Release);
-        self.retire_local();
-        self.ownership.retain_after_cleanup_failure();
-        self.connected_claims.lock().retain_after_cleanup_failure();
-        self.status
-            .send_replace(ConnectorCloseStatus::Unproven(reason));
-    }
-
     pub(super) async fn wait(self: &Arc<Self>) -> Result<()> {
         let mut status = self.status.subscribe();
         self.start();
@@ -301,11 +281,6 @@ impl ConnectorCloseOwner {
                 ConnectorCloseStatus::Failed(error) => {
                     return Err(Error::Transport(format!(
                         "native peer cleanup failed and retained its exact claim: {error}"
-                    )));
-                }
-                ConnectorCloseStatus::Unproven(reason) => {
-                    return Err(Error::Transport(format!(
-                        "native peer cleanup remains unproven and retained its exact claim: {reason}"
                     )));
                 }
                 ConnectorCloseStatus::Open | ConnectorCloseStatus::Closing => {}

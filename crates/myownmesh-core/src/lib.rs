@@ -107,6 +107,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
+#[cfg(feature = "legacy-v1")]
 pub mod legacy_v1;
 pub mod network_state;
 pub(crate) mod persist;
@@ -133,7 +134,8 @@ pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
-pub use legacy_v1::LegacyV1CompatibilityProfile;
+#[cfg(feature = "legacy-v1")]
+pub use legacy_v1::LegacyV1Runtime;
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
     SIGN_DOMAIN_TAG_STATE,
@@ -144,16 +146,21 @@ pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
-    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy,
+    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorRealtimeByteBudgets,
     ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits,
     ConnectorResourceOwnerPort, ConnectorResourceOwnerReport, ConnectorResourcePolicy,
-    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy,
-    MeshConnectorResourceReport, MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy,
+    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, LegacyWebRtcMediaProfile,
+    LegacyWebRtcMediaProfileError, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
+    MeshConnectorResourceScopeIssueError, PendingRemoteCandidatePolicy, RealtimeConnectorPolicy,
     RealtimeQueueOverflowRule,
 };
-pub use services::{
-    relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,
-};
+#[cfg(feature = "legacy-v1")]
+#[allow(
+    deprecated,
+    reason = "these exports exist only inside the frozen LegacyV1 feature boundary"
+)]
+pub use services::{relay_targets, RelayEnvelope, RelayService, RELAY_CHANNEL};
+pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 
 /// Domain-separation tag prefixed to every signed handshake payload.

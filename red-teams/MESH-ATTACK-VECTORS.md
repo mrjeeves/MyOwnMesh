@@ -80,8 +80,8 @@ The source baseline and source evidence remain those recorded in the preceding c
 
 | ID | Source observation | Restored target interpretation | Priority |
 |---|---|---|---|
-| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members | Arc 03F removes its V4 callers and requires a sealed, explicit `LegacyV1CompatibilityProfile`. It remains open until Arc 12 removes the frozen compatibility source. Ordinary implicit member forwarding is prohibited | Critical |
-| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | Arc 03F requires the same sealed LegacyV1 profile, and V4 daemon startup plus live reconfiguration reject the service. It remains open until Arc 12 removes the frozen compatibility source. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
+| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members | Arc 03G removes its V4 callers. Remaining source requires the `legacy-v1` feature, an explicit deprecated `LegacyV1Runtime`, and its crate-private marker. It remains open until Arc 12 deletes the frozen compatibility source. Ordinary implicit member forwarding is prohibited | Critical |
+| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | Arc 03G puts the service behind the same explicit LegacyV1 runtime. Normal V4 daemon startup and live reconfiguration reject it. It remains open until Arc 12 deletes the frozen compatibility source. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
 | RTM-003 | Carrier input allocates transport before Device validation | Not automatically a defect. It fails only if work is unbounded, mutates durable authority, delivers application data, or promotes a session | High conditional |
 | RTM-004 | Closed auto-approve admits a fresh unrostered key | Still a defect | Critical |
 | RTM-005 | Directed application sends bypass admission | Still a defect | Critical |

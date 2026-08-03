@@ -8,7 +8,6 @@
 //! spawn processes) runs the identical daemon in-process.
 
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -44,32 +43,16 @@ fn connector_policy_from_lookup(
             .ok_or_else(|| anyhow!("{name} must be a nonzero integer"))
     }
 
-    fn duration_ms(
-        lookup: &mut impl FnMut(&str) -> Option<String>,
-        name: &'static str,
-    ) -> Result<Duration> {
-        let raw = lookup(name).ok_or_else(|| {
-            anyhow!("connector-capable serve requires owner-selected environment value {name}")
-        })?;
-        let millis = raw
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value != 0)
-            .ok_or_else(|| anyhow!("{name} must be a nonzero integer number of milliseconds"))?;
-        Ok(Duration::from_millis(millis))
-    }
-
     let process_candidates = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES")?;
     let mesh_candidates = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES")?;
+    let pending_candidate_items =
+        nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS")?;
+    let pending_candidate_bytes =
+        nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_BYTES")?;
     let control_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY")?;
     let endpoint_capacity = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY")?;
     let control_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT")?;
     let endpoint_weight = nonzero(&mut lookup, "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT")?;
-    let close_observation_limit = duration_ms(
-        &mut lookup,
-        "MYOWNMESH_CONNECTOR_NATIVE_CLOSE_OBSERVATION_MS",
-    )?;
-
     let realtime_mode = lookup("MYOWNMESH_CONNECTOR_REALTIME_POLICY").ok_or_else(|| {
         anyhow!(
             "connector-capable serve requires owner-selected environment value MYOWNMESH_CONNECTOR_REALTIME_POLICY"
@@ -111,9 +94,17 @@ fn connector_policy_from_lookup(
                 &mut lookup,
                 "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
             )?;
-            let max_accounted_bytes = nonzero(
+            let max_inbound_accounted_bytes = nonzero(
                 &mut lookup,
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES",
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
+            )?;
+            let max_outbound_accounted_bytes = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
+            )?;
+            let max_total_accounted_bytes = nonzero(
+                &mut lookup,
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
             )?;
             let flows = myownmesh_core::ConnectorRealtimeFlowPolicy::new(
                 myownmesh_core::ConnectorRealtimeFlowCapacities::new(
@@ -126,7 +117,11 @@ fn connector_policy_from_lookup(
                     max_inbound_fragments_per_unit,
                     max_in_progress_units_per_flow,
                 ),
-                max_accounted_bytes,
+                myownmesh_core::ConnectorRealtimeByteBudgets::new(
+                    max_inbound_accounted_bytes,
+                    max_outbound_accounted_bytes,
+                    max_total_accounted_bytes,
+                ),
                 myownmesh_core::RealtimeQueueOverflowRule::DropNewest,
             );
             (
@@ -156,9 +151,11 @@ fn connector_policy_from_lookup(
     let process = myownmesh_core::ConnectorResourcePolicy::new(
         process_candidates,
         callbacks,
-        close_observation_limit,
-    )
-    .ok_or_else(|| anyhow!("connector native close observation limit must be nonzero"))?;
+        myownmesh_core::PendingRemoteCandidatePolicy::new(
+            pending_candidate_items,
+            pending_candidate_bytes,
+        ),
+    );
     Ok(myownmesh_core::ConnectorCapableResourcePolicy::new(
         process,
         myownmesh_core::MeshConnectorResourcePolicy::new(mesh_candidates),
@@ -199,18 +196,19 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BASE_POLICY_KEYS: [&str; 8] = [
+    const BASE_POLICY_KEYS: [&str; 9] = [
         "MYOWNMESH_CONNECTOR_PROCESS_MAX_CANDIDATES",
         "MYOWNMESH_CONNECTOR_MESH_MAX_CANDIDATES",
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_ITEMS",
+        "MYOWNMESH_CONNECTOR_PENDING_CANDIDATE_BYTES",
         "MYOWNMESH_CONNECTOR_CONTROL_CAPACITY",
         "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY",
         "MYOWNMESH_CONNECTOR_CONTROL_WEIGHT",
         "MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT",
         "MYOWNMESH_CONNECTOR_REALTIME_POLICY",
-        "MYOWNMESH_CONNECTOR_NATIVE_CLOSE_OBSERVATION_MS",
     ];
 
-    const ENABLED_REALTIME_KEYS: [&str; 9] = [
+    const ENABLED_REALTIME_KEYS: [&str; 11] = [
         "MYOWNMESH_CONNECTOR_REALTIME_WEIGHT",
         "MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS",
@@ -219,7 +217,9 @@ mod tests {
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT",
         "MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW",
-        "MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES",
+        "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
+        "MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_ACCOUNTED_BYTES",
+        "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
     ];
 
     fn fixture_values(realtime: &str) -> HashMap<&'static str, String> {
@@ -235,8 +235,12 @@ mod tests {
                     .map(|key| (key, "1".to_string())),
             );
             values.insert(
-                "MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES",
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_ACCOUNTED_BYTES",
                 "2".to_string(),
+            );
+            values.insert(
+                "MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES",
+                "3".to_string(),
             );
         }
         values
@@ -245,12 +249,12 @@ mod tests {
     #[test]
     fn connector_capable_serve_requires_every_owner_value() {
         let mut values = fixture_values("enabled");
-        values.remove("MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES");
+        values.remove("MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES");
         let error = connector_policy_from_lookup(|name| values.get(name).cloned())
             .expect_err("an omitted owner value is rejected");
         assert!(error
             .to_string()
-            .contains("MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES"));
+            .contains("MYOWNMESH_CONNECTOR_REALTIME_MAX_TOTAL_ACCOUNTED_BYTES"));
     }
 
     #[test]

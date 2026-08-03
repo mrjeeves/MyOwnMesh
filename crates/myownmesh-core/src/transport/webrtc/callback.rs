@@ -1,3 +1,8 @@
+#![allow(
+    deprecated,
+    reason = "the scheduler still classifies frozen legacy media events during migration"
+)]
+
 //! Callback classification, lifecycle fencing, and bounded scheduling.
 
 use super::*;
@@ -35,43 +40,117 @@ impl ConnectorCallbackClass {
     }
 }
 
-/// Source-side ordering boundary for callbacks from one exact data channel.
-///
-/// The mutex gives enqueue and close one total order without assuming the
-/// native dependency invokes callbacks in order. Once close commits, no later
-/// callback can enter either connector mailbox.
-pub(super) struct DataChannelCallbackFence {
-    pub(super) closed: SyncMutex<bool>,
-    closed_signal: watch::Sender<bool>,
+struct ConnectorOperationFenceState {
+    closing: bool,
+    active_operations: usize,
+    accounting_poisoned: bool,
 }
 
-impl Default for DataChannelCallbackFence {
+/// One total ordering boundary for application-affecting connector work.
+///
+/// Inbound callbacks, endpoint sends, real-time writes, lane operations, track
+/// attachment, and close all enter through this owner. Work admitted before
+/// close may finish or be discarded by the receiver, but work presented after
+/// close cannot enter. Native close waits for all earlier operations to drop
+/// their permits.
+pub(super) struct ConnectorOperationFence {
+    state: SyncMutex<ConnectorOperationFenceState>,
+    closed_signal: watch::Sender<bool>,
+    active_signal: watch::Sender<usize>,
+}
+
+impl Default for ConnectorOperationFence {
     fn default() -> Self {
         let (closed_signal, _receiver) = watch::channel(false);
+        let (active_signal, _receiver) = watch::channel(0);
         Self {
-            closed: SyncMutex::new(false),
+            state: SyncMutex::new(ConnectorOperationFenceState {
+                closing: false,
+                active_operations: 0,
+                accounting_poisoned: false,
+            }),
             closed_signal,
+            active_signal,
         }
     }
 }
 
-impl DataChannelCallbackFence {
+impl ConnectorOperationFence {
+    pub(super) fn try_enter(self: &Arc<Self>) -> Option<ConnectorOperationPermit> {
+        let mut state = self.state.lock();
+        if state.closing || state.accounting_poisoned {
+            return None;
+        }
+        let Some(active_operations) = state.active_operations.checked_add(1) else {
+            state.accounting_poisoned = true;
+            state.closing = true;
+            self.closed_signal.send_replace(true);
+            return None;
+        };
+        state.active_operations = active_operations;
+        self.active_signal.send_replace(active_operations);
+        Some(ConnectorOperationPermit {
+            fence: Arc::clone(self),
+            active: true,
+        })
+    }
+
     pub(super) fn begin_close(&self) -> bool {
-        let mut closed = self.closed.lock();
-        if *closed {
+        let mut state = self.state.lock();
+        if state.closing {
             return false;
         }
-        *closed = true;
+        state.closing = true;
         self.closed_signal.send_replace(true);
         true
     }
 
     pub(super) fn is_closed(&self) -> bool {
-        *self.closed.lock()
+        self.state.lock().closing
     }
 
-    pub(super) fn subscribe(&self) -> watch::Receiver<bool> {
+    pub(super) fn subscribe_close(&self) -> watch::Receiver<bool> {
         self.closed_signal.subscribe()
+    }
+
+    pub(super) async fn wait_for_operations(&self) {
+        let mut active = self.active_signal.subscribe();
+        loop {
+            if *active.borrow() == 0 {
+                return;
+            }
+            if active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_operations_for_test(&self) -> usize {
+        self.state.lock().active_operations
+    }
+}
+
+pub(super) struct ConnectorOperationPermit {
+    fence: Arc<ConnectorOperationFence>,
+    active: bool,
+}
+
+impl Drop for ConnectorOperationPermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.fence.state.lock();
+        let Some(active_operations) = state.active_operations.checked_sub(1) else {
+            state.accounting_poisoned = true;
+            state.closing = true;
+            self.fence.closed_signal.send_replace(true);
+            return;
+        };
+        state.active_operations = active_operations;
+        self.fence.active_signal.send_replace(active_operations);
+        self.active = false;
     }
 }
 

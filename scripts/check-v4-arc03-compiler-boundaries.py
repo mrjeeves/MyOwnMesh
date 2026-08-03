@@ -198,6 +198,8 @@ def main() -> int:
         CORE / "src" / "runtime" / "attempt" / "mod.rs",
         CORE / "src" / "runtime" / "attempt" / "admission.rs",
         CORE / "src" / "runtime" / "attempt" / "lifetime.rs",
+        CORE / "src" / "runtime" / "attempt" / "policy.rs",
+        CORE / "src" / "runtime" / "attempt" / "resource_owner.rs",
     )
     engine_source = (CORE / "src" / "engine" / "mod.rs").read_text(
         encoding="utf-8"
@@ -235,12 +237,19 @@ def main() -> int:
             failures.append(
                 f"{consumer} does not consume ConnectorRealtimeFlowCapability"
             )
-        body = re.search(
-            rf"pub\(crate\)\s+(?:async\s+)?fn\s+{consumer}\s*\(.{{0,700}}?\)\s*(?:->[^{{]+)?\{{(?P<body>.{{0,1200}}?)\n\s*\}}",
-            webrtc_source,
-            flags=re.DOTALL,
-        )
-        if body is None or "owns_realtime_flow" not in body.group("body"):
+        implementation = ""
+        if signature is not None:
+            next_method = re.search(
+                r"\n\s+pub\(crate\)\s+(?:async\s+)?fn\s+",
+                webrtc_source[signature.end() :],
+            )
+            implementation_end = (
+                signature.end() + next_method.start()
+                if next_method is not None
+                else min(len(webrtc_source), signature.end() + 2_000)
+            )
+            implementation = webrtc_source[signature.start() : implementation_end]
+        if "owns_realtime_flow" not in implementation:
             failures.append(f"{consumer} does not verify exact connector ownership")
     if "enable_realtime_delivery" in webrtc_source:
         failures.append("legacy worker-only real-time enablement still exists")
@@ -282,7 +291,9 @@ def main() -> int:
             "max_inbound_fragment_bytes",
             "max_inbound_fragments_per_unit",
             "max_in_progress_units_per_flow",
-            "max_accounted_realtime_bytes",
+            "max_inbound_bytes",
+            "max_outbound_bytes",
+            "max_total_bytes",
         ):
             if structural_bound not in attempt_source:
                 failures.append(f"real-time policy is missing {structural_bound}")
@@ -299,14 +310,25 @@ def main() -> int:
         failures.append("real-time queue authority still contains realtime_useful_lifetime")
     if "pub async fn start(" in embedded_source:
         failures.append("ambiguous ownerless embedded::start constructor still exists")
-    if "DataChannelCallbackFence" not in webrtc_source:
-        failures.append("data-channel callback lifecycle fence is missing")
-    if not (
-        "ConnectorCloseStatus::Unproven" in webrtc_source
-        and "mark_cleanup_unproven" in webrtc_source
-        and "native_close_observation_limit" in webrtc_source
+    if "ConnectorOperationFence" not in webrtc_source:
+        failures.append("connector operation lifecycle fence is missing")
+    for forbidden_close_authority in (
+        "ConnectorCloseStatus::Unproven",
+        "mark_cleanup_unproven",
+        "native_close_observation_limit",
+        "MYOWNMESH_CONNECTOR_NATIVE_CLOSE_OBSERVATION_MS",
     ):
-        failures.append("native-close observation limit still implies terminal cleanup truth")
+        if forbidden_close_authority in webrtc_source or forbidden_close_authority in attempt_source:
+            failures.append(
+                f"V4 native close still contains timer-derived authority: {forbidden_close_authority}"
+            )
+    if not (
+        "ConnectorCloseStatus::Closing" in webrtc_source
+        and "match native.close().await" in webrtc_source
+        and "ConnectorCleanupExecutor" in attempt_source
+        and "tokio::sync::mpsc::channel(self.capacity.get())" in attempt_source
+    ):
+        failures.append("native close is not owned by the bounded process cleanup executor")
 
     recv_queued = re.search(
         r"async fn recv_queued\s*\(&mut self\).*?\n\s*\}",
@@ -326,30 +348,32 @@ def main() -> int:
         if legacy_call in engine_source:
             failures.append(f"V4 engine path still invokes legacy forwarding: {legacy_call}")
 
-    if "pub struct LegacyV1CompatibilityProfile" not in legacy_profile_source:
-        failures.append("frozen LegacyV1 compatibility profile is missing")
-    if "impl Default for LegacyV1CompatibilityProfile" in legacy_profile_source:
-        failures.append("LegacyV1 compatibility profile must not be selected by default")
+    if "pub struct LegacyV1Runtime" not in legacy_profile_source:
+        failures.append("frozen LegacyV1 compatibility runtime is missing")
+    if "pub(crate) struct LegacyV1Marker" not in legacy_profile_source:
+        failures.append("private LegacyV1 marker is missing")
+    if "impl Default for LegacyV1Runtime" in legacy_profile_source:
+        failures.append("LegacyV1 runtime must not be selected by default")
     for legacy_api in ("on_relay_frame", "send_routed", "broadcast_flood"):
         signature = re.search(
             rf"fn\s+{legacy_api}\s*\((?P<args>.{{0,900}}?)\)",
             routing_source,
             flags=re.DOTALL,
         )
-        if signature is None or "LegacyV1CompatibilityProfile" not in signature.group("args"):
-            failures.append(f"legacy routing API {legacy_api} lacks the frozen profile")
+        if signature is None or "LegacyV1Marker" not in signature.group("args"):
+            failures.append(f"legacy routing API {legacy_api} lacks the private marker")
     relay_start = re.search(
         r"fn\s+start\s*\((?P<args>.{0,900}?)\)", relay_source, flags=re.DOTALL
     )
-    if relay_start is None or "LegacyV1CompatibilityProfile" not in relay_start.group("args"):
-        failures.append("legacy relay service start lacks the frozen profile")
+    if relay_start is None or "LegacyV1Runtime" not in relay_start.group("args"):
+        failures.append("legacy relay service start lacks the explicit runtime")
     for name, source in (
         ("V4 connector", webrtc_source),
         ("V4 engine", engine_source),
         ("Endpoint Auth", endpoint_auth_source),
     ):
-        if "LegacyV1CompatibilityProfile" in source:
-            failures.append(f"{name} path can reach the LegacyV1 profile")
+        if "LegacyV1Marker" in source or "LegacyV1Runtime" in source:
+            failures.append(f"{name} path can reach the LegacyV1 runtime")
 
     if "LegacyPayloadRelayForbidden" not in services_source:
         failures.append("V4 daemon service policy does not reject the legacy payload relay")
