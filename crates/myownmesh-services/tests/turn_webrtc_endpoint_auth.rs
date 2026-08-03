@@ -15,7 +15,7 @@ use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     Channel, ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy,
     ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorResourcePolicy,
-    MeshConnectorResourcePolicy, MeshEvent, PeerEvent,
+    MeshConnectorResourcePolicy, MeshEvent, PeerEvent, RealtimeConnectorPolicy,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
@@ -48,14 +48,12 @@ fn test_connector_resource_policy() -> ConnectorCapableResourcePolicy {
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
         ConnectorCallbackMailboxCapacities::new(callback, callback),
-        ConnectorCallbackServiceWeights::new(callback, callback, callback),
-        std::num::NonZeroUsize::new(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
-            .expect("fixture real-time unit limit is nonzero"),
-        Duration::from_secs(10),
+        ConnectorCallbackServiceWeights::data_only(callback, callback),
+        RealtimeConnectorPolicy::Disabled,
     )
-    .expect("fixture real-time useful lifetime is nonzero");
+    .expect("fixture data-only callback policy is valid");
     let process = ConnectorResourcePolicy::new(two, callbacks, Duration::from_secs(10))
-        .expect("fixture native-close deadline is nonzero");
+        .expect("fixture native-close observation limit is nonzero");
     ConnectorCapableResourcePolicy::new(process, MeshConnectorResourcePolicy::new(two))
 }
 
@@ -147,6 +145,7 @@ async fn wait_for_relay_pair(state: &myownmesh_core::engine::state::NetworkState
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
+    let observed_at = std::time::Instant::now();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());
 
@@ -195,6 +194,12 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         wait_for_authenticated_then_approved(&mut alice_events, bob_id.public_id()),
         wait_for_authenticated_then_approved(&mut bob_events, alice_id.public_id())
     );
+    if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
+        println!(
+            "arc03_turn_raw authenticated_and_approved_ns={}",
+            observed_at.elapsed().as_nanos()
+        );
+    }
 
     for (state, peer_id) in [(&alice, bob_id.public_id()), (&bob, alice_id.public_id())] {
         let peer = state
@@ -235,6 +240,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         (bob_id.public_id().to_string(), "bob-over-turn".to_string())
     );
 
+    let positive_close_at = std::time::Instant::now();
     alice
         .cmd_tx
         .send(NetworkCmd::Shutdown)
@@ -244,6 +250,12 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         .expect("Bob shutdown reaches its driver");
     alice_driver.await.expect("Alice driver shuts down cleanly");
     bob_driver.await.expect("Bob driver shuts down cleanly");
+    if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
+        println!(
+            "arc03_turn_raw positive_shutdown_ns={}",
+            positive_close_at.elapsed().as_nanos()
+        );
+    }
     drop((alice, bob));
     tokio::task::yield_now().await;
 

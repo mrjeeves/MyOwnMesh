@@ -5,6 +5,7 @@ use myownmesh_core::transport::Transport;
 use myownmesh_core::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackServiceWeights,
     ConnectorCapableResourcePolicy, ConnectorResourcePolicy, MeshConnectorResourcePolicy,
+    RealtimeConnectorPolicy,
 };
 
 /// Explicit integration-test resource owner.
@@ -38,19 +39,13 @@ pub fn test_transport() -> Transport {
     let callback_capacity = NonZeroUsize::new(16).expect("fixture callback capacity is nonzero");
     let callbacks = ConnectorCallbackPolicy::new(
         ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
-        ConnectorCallbackServiceWeights::new(
-            callback_capacity,
-            callback_capacity,
-            callback_capacity,
-        ),
-        NonZeroUsize::new(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
-            .expect("fixture real-time unit limit is nonzero"),
-        Duration::from_secs(10),
+        ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
+        RealtimeConnectorPolicy::Disabled,
     )
-    .expect("fixture real-time useful lifetime is nonzero");
+    .expect("fixture data-only callback policy is valid");
     let policy =
         ConnectorResourcePolicy::new(process_connector_count, callbacks, Duration::from_secs(10))
-            .expect("fixture close deadline is nonzero");
+            .expect("fixture close observation limit is nonzero");
     let policy = ConnectorCapableResourcePolicy::new(
         policy,
         MeshConnectorResourcePolicy::new(mesh_connector_count),

@@ -117,7 +117,12 @@ fn connected_ids(state: &NetworkState) -> Vec<String> {
 /// envelope. Returns `false` when the frame isn't wrapper-shaped —
 /// the caller passes it through to channel subscribers (the legacy
 /// `RelayService` flow).
-pub(crate) async fn on_relay_frame(state: &Arc<NetworkState>, from: &str, payload: &Value) -> bool {
+pub(crate) async fn on_relay_frame(
+    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+    state: &Arc<NetworkState>,
+    from: &str,
+    payload: &Value,
+) -> bool {
     let Ok(env) = serde_json::from_value::<RelayEnvelope>(payload.clone()) else {
         return false;
     };
@@ -244,6 +249,7 @@ async fn send_envelope(state: &Arc<NetworkState>, peer: &str, envelope: &Value) 
 /// accepted it — the routed-delivery guarantee, weaker than an ack and
 /// said so in the docs.
 pub(crate) async fn send_routed(
+    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
     state: &Arc<NetworkState>,
     dest: &str,
     channel: &str,
@@ -284,6 +290,7 @@ pub(crate) async fn send_routed(
 /// connected, unshelved peer; forwarders re-fan it across the shape.
 /// Returns how many first-hop peers accepted the frame.
 pub(crate) async fn broadcast_flood(
+    _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
     state: &Arc<NetworkState>,
     channel: &str,
     payload: &Value,
@@ -375,7 +382,13 @@ mod tests {
             payload: json!({"app": "data"}),
         })
         .unwrap();
-        let consumed = on_relay_frame(&state, "peer-x", &legacy).await;
+        let consumed = on_relay_frame(
+            crate::legacy_v1::LegacyV1CompatibilityProfile::frozen(),
+            &state,
+            "peer-x",
+            &legacy,
+        )
+        .await;
         assert!(
             !consumed,
             "legacy envelope passes through to the channel layer"
@@ -394,7 +407,13 @@ mod tests {
             payload: wrap("app.control", &json!(1), 2, 99),
         })
         .unwrap();
-        let consumed = on_relay_frame(&state, "carrier-spoke", &env).await;
+        let consumed = on_relay_frame(
+            crate::legacy_v1::LegacyV1CompatibilityProfile::frozen(),
+            &state,
+            "carrier-spoke",
+            &env,
+        )
+        .await;
         assert!(consumed, "wrapper-shaped frame is always consumed");
         assert!(
             state.routing_seen.lock().is_empty(),

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,17 @@ fn main() {}
 """,
         "E0624",
         ("new", "private"),
+    ),
+    RejectedProbe(
+        "ambiguous_mesh_open_is_removed",
+        """use myownmesh_core::{Mesh, MeshConfig};
+async fn bypass() {
+    let _ = Mesh::open(MeshConfig::default()).await; // expected-error
+}
+fn main() {}
+""",
+        "E0599",
+        ("open", "not found"),
     ),
 )
 
@@ -171,13 +183,35 @@ def matches(probe: RejectedProbe, diagnostics: list[dict]) -> bool:
 
 def main() -> int:
     failures: list[str] = []
-    webrtc_source = (CORE / "src" / "transport" / "webrtc.rs").read_text(
-        encoding="utf-8"
+    def read_sources(*paths: Path) -> str:
+        return "\n".join(path.read_text(encoding="utf-8") for path in paths)
+
+    webrtc_source = read_sources(
+        CORE / "src" / "transport" / "webrtc.rs",
+        CORE / "src" / "transport" / "webrtc" / "callback.rs",
+        CORE / "src" / "transport" / "webrtc" / "cleanup.rs",
+        CORE / "src" / "transport" / "webrtc" / "h264.rs",
+        CORE / "src" / "transport" / "webrtc" / "media.rs",
+        CORE / "src" / "transport" / "webrtc" / "realtime.rs",
     )
-    attempt_source = (CORE / "src" / "runtime" / "attempt" / "mod.rs").read_text(
-        encoding="utf-8"
+    attempt_source = read_sources(
+        CORE / "src" / "runtime" / "attempt" / "mod.rs",
+        CORE / "src" / "runtime" / "attempt" / "admission.rs",
+        CORE / "src" / "runtime" / "attempt" / "lifetime.rs",
     )
     engine_source = (CORE / "src" / "engine" / "mod.rs").read_text(
+        encoding="utf-8"
+    )
+    routing_source = (CORE / "src" / "engine" / "routing.rs").read_text(
+        encoding="utf-8"
+    )
+    relay_source = (CORE / "src" / "services" / "relay.rs").read_text(
+        encoding="utf-8"
+    )
+    legacy_profile_source = (CORE / "src" / "legacy_v1.rs").read_text(
+        encoding="utf-8"
+    )
+    endpoint_auth_source = (CORE / "src" / "endpoint_auth" / "mod.rs").read_text(
         encoding="utf-8"
     )
     services_source = (DAEMON / "src" / "services.rs").read_text(encoding="utf-8")
@@ -244,6 +278,35 @@ def main() -> int:
             failures.append("generic callback mailbox still contains one shared realtime queue")
         if "queue_capacity_per_flow" not in attempt_source:
             failures.append("codec-neutral per-flow realtime queue bound is missing")
+        for structural_bound in (
+            "max_inbound_fragment_bytes",
+            "max_inbound_fragments_per_unit",
+            "max_in_progress_units_per_flow",
+            "max_accounted_realtime_bytes",
+        ):
+            if structural_bound not in attempt_source:
+                failures.append(f"real-time policy is missing {structural_bound}")
+
+    h264_source = (CORE / "src" / "transport" / "webrtc" / "h264.rs").read_text(
+        encoding="utf-8"
+    )
+    for time_authority in ("tokio::time", "sleep(", "interval(", "timeout(", "deadline"):
+        if time_authority in h264_source:
+            failures.append(
+                f"H.264 assembly contains forbidden elapsed-time authority: {time_authority}"
+            )
+    if "realtime_useful_lifetime" in webrtc_source or "realtime_useful_lifetime" in attempt_source:
+        failures.append("real-time queue authority still contains realtime_useful_lifetime")
+    if "pub async fn start(" in embedded_source:
+        failures.append("ambiguous ownerless embedded::start constructor still exists")
+    if "DataChannelCallbackFence" not in webrtc_source:
+        failures.append("data-channel callback lifecycle fence is missing")
+    if not (
+        "ConnectorCloseStatus::Unproven" in webrtc_source
+        and "mark_cleanup_unproven" in webrtc_source
+        and "native_close_observation_limit" in webrtc_source
+    ):
+        failures.append("native-close observation limit still implies terminal cleanup truth")
 
     recv_queued = re.search(
         r"async fn recv_queued\s*\(&mut self\).*?\n\s*\}",
@@ -263,6 +326,31 @@ def main() -> int:
         if legacy_call in engine_source:
             failures.append(f"V4 engine path still invokes legacy forwarding: {legacy_call}")
 
+    if "pub struct LegacyV1CompatibilityProfile" not in legacy_profile_source:
+        failures.append("frozen LegacyV1 compatibility profile is missing")
+    if "impl Default for LegacyV1CompatibilityProfile" in legacy_profile_source:
+        failures.append("LegacyV1 compatibility profile must not be selected by default")
+    for legacy_api in ("on_relay_frame", "send_routed", "broadcast_flood"):
+        signature = re.search(
+            rf"fn\s+{legacy_api}\s*\((?P<args>.{{0,900}}?)\)",
+            routing_source,
+            flags=re.DOTALL,
+        )
+        if signature is None or "LegacyV1CompatibilityProfile" not in signature.group("args"):
+            failures.append(f"legacy routing API {legacy_api} lacks the frozen profile")
+    relay_start = re.search(
+        r"fn\s+start\s*\((?P<args>.{0,900}?)\)", relay_source, flags=re.DOTALL
+    )
+    if relay_start is None or "LegacyV1CompatibilityProfile" not in relay_start.group("args"):
+        failures.append("legacy relay service start lacks the frozen profile")
+    for name, source in (
+        ("V4 connector", webrtc_source),
+        ("V4 engine", engine_source),
+        ("Endpoint Auth", endpoint_auth_source),
+    ):
+        if "LegacyV1CompatibilityProfile" in source:
+            failures.append(f"{name} path can reach the LegacyV1 profile")
+
     if "LegacyPayloadRelayForbidden" not in services_source:
         failures.append("V4 daemon service policy does not reject the legacy payload relay")
     if "ServiceManager::validate_config(&cfg.services)?" not in embedded_source:
@@ -273,6 +361,7 @@ def main() -> int:
         source_dir = project / "src"
         source_dir.mkdir()
         (project / "Cargo.toml").write_text(cargo_toml(), encoding="utf-8", newline="\n")
+        shutil.copyfile(REPO / "Cargo.lock", project / "Cargo.lock")
         for probe in REJECTED:
             (source_dir / f"{probe.name}.rs").write_text(
                 probe.source, encoding="utf-8", newline="\n"
@@ -316,7 +405,7 @@ def main() -> int:
 
     print(
         "V4 Arc 03 compiler-boundary checks passed: one positive public-type "
-        "control, five cause-matched rejection controls, and six exact "
+        f"control, {len(REJECTED)} cause-matched rejection controls, and six exact "
         "real-time-flow consumers."
     )
     return 0

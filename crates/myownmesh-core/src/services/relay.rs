@@ -108,7 +108,11 @@ pub struct RelayService {
 impl RelayService {
     /// Start forwarding on `state`'s network. `max_fanout` caps
     /// broadcast fan-out (0 = unlimited).
-    pub fn start(state: Arc<NetworkState>, max_fanout: u32) -> RelayService {
+    pub fn start(
+        state: Arc<NetworkState>,
+        max_fanout: u32,
+        _profile: crate::legacy_v1::LegacyV1CompatibilityProfile,
+    ) -> RelayService {
         let task = tokio::spawn(run(state, max_fanout));
         RelayService { task }
     }

@@ -234,7 +234,11 @@ impl ServiceManager {
                 if let Some(joined) = self.registry.get(&summary.config_id) {
                     g.relays.insert(
                         summary.config_id,
-                        RelayService::start(joined.state(), fanout),
+                        RelayService::start(
+                            joined.state(),
+                            fanout,
+                            myownmesh_core::LegacyV1CompatibilityProfile::frozen(),
+                        ),
                     );
                 }
             }
@@ -275,7 +279,11 @@ impl ServiceManager {
             if let Some(joined) = self.registry.get(config_id) {
                 g.relays.insert(
                     config_id.to_string(),
-                    RelayService::start(joined.state(), fanout),
+                    RelayService::start(
+                        joined.state(),
+                        fanout,
+                        myownmesh_core::LegacyV1CompatibilityProfile::frozen(),
+                    ),
                 );
             }
         }
@@ -534,9 +542,12 @@ mod tests {
     #[tokio::test]
     async fn infrastructure_runtime_rejects_later_node_enable_without_mutation() {
         let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_with_identity(MeshConfig::default(), identity)
-            .await
-            .expect("open infrastructure-only mesh");
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+        )
+        .await
+        .expect("open infrastructure-only mesh");
         let registry = NetworkRegistry::new();
         let manager = ServiceManager::new(mesh, registry);
         let mut infrastructure = ServicesConfig::default();

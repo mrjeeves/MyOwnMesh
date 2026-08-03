@@ -3276,22 +3276,19 @@ fn build_test_state_parts(
             callback_capacity,
             callback_capacity,
         ),
-        crate::runtime::attempt::ConnectorCallbackServiceWeights::new(
-            callback_capacity,
+        crate::runtime::attempt::ConnectorCallbackServiceWeights::data_only(
             callback_capacity,
             callback_capacity,
         ),
-        std::num::NonZeroUsize::new(MAX_ENDPOINT_FRAME_BYTES)
-            .expect("engine fixture real-time unit limit is nonzero"),
-        Duration::from_secs(10),
+        crate::runtime::attempt::RealtimeConnectorPolicy::Disabled,
     )
-    .expect("engine fixture real-time useful lifetime is nonzero");
+    .expect("engine fixture data-only callback policy is valid");
     let connector_policy = crate::runtime::attempt::ConnectorResourcePolicy::new(
         max_connectors,
         callbacks,
         Duration::from_secs(10),
     )
-    .expect("engine fixture close deadline is nonzero");
+    .expect("engine fixture close observation limit is nonzero");
     let owner = crate::runtime::attempt::ConnectorResourceOwnerPort::new(connector_policy);
     let scope = owner
         .issue_mesh_scope(crate::runtime::attempt::MeshConnectorResourcePolicy::new(
@@ -3463,7 +3460,11 @@ mod tests {
             9,
             "five peer callbacks plus four data-channel callbacks"
         );
-        assert_eq!(tasks.active.items(), 2, "two sender-drain tasks");
+        assert_eq!(
+            tasks.active.items(),
+            0,
+            "data-only construction creates no sender-drain tasks"
+        );
         println!(
             "arc03_offerer_observation transport_items={} callback_items={} task_items={} task_count={} transport_inexact={} callback_inexact={} task_inexact={}",
             transport.active.items(),

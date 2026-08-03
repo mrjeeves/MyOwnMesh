@@ -14,12 +14,13 @@ use crate::resource::{PreAuthResourceFamily, ResourceUse, PRE_AUTH_RESOURCE_FAMI
 
 use super::RuntimeIncarnation;
 
-struct AttemptOwnership {
-    runtime: RuntimeIncarnation,
-    active: AtomicBool,
-    transition: Mutex<()>,
-    retired: watch::Sender<bool>,
-}
+mod admission;
+mod lifetime;
+pub(crate) use admission::admit_single_connector_candidate;
+use admission::ConnectorCandidateReservation;
+pub use admission::{ConnectorCandidateCapability, PreAuthAttemptPermit};
+use lifetime::AttemptOwnership;
+pub(crate) use lifetime::{AttemptLifetime, AttemptLiveness};
 
 /// One componentwise resource vector indexed by the closed pre-authentication
 /// family set.
@@ -176,7 +177,7 @@ impl ConnectorCallbackMailboxCapacities {
 pub struct ConnectorCallbackServiceWeights {
     control: NonZeroUsize,
     endpoint_data: NonZeroUsize,
-    realtime: NonZeroUsize,
+    realtime: Option<NonZeroUsize>,
 }
 
 impl ConnectorCallbackServiceWeights {
@@ -188,7 +189,15 @@ impl ConnectorCallbackServiceWeights {
         Self {
             control,
             endpoint_data,
-            realtime,
+            realtime: Some(realtime),
+        }
+    }
+
+    pub const fn data_only(control: NonZeroUsize, endpoint_data: NonZeroUsize) -> Self {
+        Self {
+            control,
+            endpoint_data,
+            realtime: None,
         }
     }
 
@@ -200,7 +209,7 @@ impl ConnectorCallbackServiceWeights {
         self.endpoint_data
     }
 
-    pub const fn realtime(self) -> NonZeroUsize {
+    pub const fn realtime(self) -> Option<NonZeroUsize> {
         self.realtime
     }
 }
@@ -208,15 +217,83 @@ impl ConnectorCallbackServiceWeights {
 /// Owner-selected callback behavior for one connector.
 ///
 /// Endpoint frames retain the protocol's independent frame limit. The
-/// real-time unit limit and useful lifetime are separate operational inputs
+/// real-time unit and structural queue limits are separate operational inputs
 /// because an encoded access unit is not an endpoint message frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorCallbackPolicy {
     mailboxes: ConnectorCallbackMailboxCapacities,
     service_weights: ConnectorCallbackServiceWeights,
-    max_realtime_unit_bytes: NonZeroUsize,
-    realtime_useful_lifetime: Duration,
-    realtime_flows: Option<ConnectorRealtimeFlowPolicy>,
+    realtime: RealtimeConnectorPolicy,
+}
+
+/// Owner-selected real-time behavior for one connector.
+///
+/// `Disabled` is a complete data-only policy. It carries no placeholder
+/// media limits. `Enabled` contains every value needed by the generic
+/// real-time owner and has no production default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealtimeConnectorPolicy {
+    Disabled,
+    Enabled(EnabledRealtimeConnectorPolicy),
+}
+
+/// Validated resource and queue policy for enabled real-time work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnabledRealtimeConnectorPolicy {
+    max_unit_bytes: NonZeroUsize,
+    flows: ConnectorRealtimeFlowPolicy,
+}
+
+/// Deterministic compatibility behavior when one bounded real-time flow
+/// queue is full. This is connector-local backpressure, not application flow
+/// policy. Arc 03 supports only dropping the newly offered complete unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealtimeQueueOverflowRule {
+    DropNewest,
+}
+
+/// Owner-selected concurrency and queue bounds for real-time flows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorRealtimeFlowCapacities {
+    max_inbound_active_flows: NonZeroUsize,
+    max_outbound_active_flows: NonZeroUsize,
+    queue_capacity_per_flow: NonZeroUsize,
+}
+
+impl ConnectorRealtimeFlowCapacities {
+    pub const fn new(
+        max_inbound_active_flows: NonZeroUsize,
+        max_outbound_active_flows: NonZeroUsize,
+        queue_capacity_per_flow: NonZeroUsize,
+    ) -> Self {
+        Self {
+            max_inbound_active_flows,
+            max_outbound_active_flows,
+            queue_capacity_per_flow,
+        }
+    }
+}
+
+/// Owner-selected structural bounds for one inbound real-time flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectorRealtimeInboundLimits {
+    max_fragment_bytes: NonZeroUsize,
+    max_fragments_per_unit: NonZeroUsize,
+    max_in_progress_units: NonZeroUsize,
+}
+
+impl ConnectorRealtimeInboundLimits {
+    pub const fn new(
+        max_fragment_bytes: NonZeroUsize,
+        max_fragments_per_unit: NonZeroUsize,
+        max_in_progress_units: NonZeroUsize,
+    ) -> Self {
+        Self {
+            max_fragment_bytes,
+            max_fragments_per_unit,
+            max_in_progress_units,
+        }
+    }
 }
 
 /// Owner-selected resource envelope for connector-local real-time flows.
@@ -227,32 +304,41 @@ pub struct ConnectorCallbackPolicy {
 /// disabled while control and endpoint-data connector work remains usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorRealtimeFlowPolicy {
-    max_active_flows: NonZeroUsize,
+    max_inbound_active_flows: NonZeroUsize,
+    max_outbound_active_flows: NonZeroUsize,
     queue_capacity_per_flow: NonZeroUsize,
     max_inbound_fragment_bytes: NonZeroUsize,
-    max_in_progress_units: NonZeroUsize,
-    max_retained_bytes: NonZeroUsize,
+    max_inbound_fragments_per_unit: NonZeroUsize,
+    max_in_progress_units_per_flow: NonZeroUsize,
+    max_accounted_realtime_bytes: NonZeroUsize,
+    overflow_rule: RealtimeQueueOverflowRule,
 }
 
 impl ConnectorRealtimeFlowPolicy {
     pub const fn new(
-        max_active_flows: NonZeroUsize,
-        queue_capacity_per_flow: NonZeroUsize,
-        max_inbound_fragment_bytes: NonZeroUsize,
-        max_in_progress_units: NonZeroUsize,
-        max_retained_bytes: NonZeroUsize,
+        capacities: ConnectorRealtimeFlowCapacities,
+        inbound: ConnectorRealtimeInboundLimits,
+        max_accounted_realtime_bytes: NonZeroUsize,
+        overflow_rule: RealtimeQueueOverflowRule,
     ) -> Self {
         Self {
-            max_active_flows,
-            queue_capacity_per_flow,
-            max_inbound_fragment_bytes,
-            max_in_progress_units,
-            max_retained_bytes,
+            max_inbound_active_flows: capacities.max_inbound_active_flows,
+            max_outbound_active_flows: capacities.max_outbound_active_flows,
+            queue_capacity_per_flow: capacities.queue_capacity_per_flow,
+            max_inbound_fragment_bytes: inbound.max_fragment_bytes,
+            max_inbound_fragments_per_unit: inbound.max_fragments_per_unit,
+            max_in_progress_units_per_flow: inbound.max_in_progress_units,
+            max_accounted_realtime_bytes,
+            overflow_rule,
         }
     }
 
-    pub const fn max_active_flows(self) -> NonZeroUsize {
-        self.max_active_flows
+    pub const fn max_inbound_active_flows(self) -> NonZeroUsize {
+        self.max_inbound_active_flows
+    }
+
+    pub const fn max_outbound_active_flows(self) -> NonZeroUsize {
+        self.max_outbound_active_flows
     }
 
     pub const fn queue_capacity_per_flow(self) -> NonZeroUsize {
@@ -263,19 +349,46 @@ impl ConnectorRealtimeFlowPolicy {
         self.max_inbound_fragment_bytes
     }
 
-    pub const fn max_in_progress_units(self) -> NonZeroUsize {
-        self.max_in_progress_units
+    pub const fn max_inbound_fragments_per_unit(self) -> NonZeroUsize {
+        self.max_inbound_fragments_per_unit
     }
 
-    pub const fn max_retained_bytes(self) -> NonZeroUsize {
-        self.max_retained_bytes
+    pub const fn max_in_progress_units_per_flow(self) -> NonZeroUsize {
+        self.max_in_progress_units_per_flow
+    }
+
+    /// Bytes whose ownership is visible to this connector's real-time
+    /// reservations. Allocator slack and memory retained internally by native
+    /// WebRTC dependencies are intentionally outside this exact quantity.
+    pub const fn max_accounted_realtime_bytes(self) -> NonZeroUsize {
+        self.max_accounted_realtime_bytes
+    }
+
+    pub const fn overflow_rule(self) -> RealtimeQueueOverflowRule {
+        self.overflow_rule
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectorCallbackPolicyError {
-    #[error("real-time unit useful lifetime must be nonzero")]
-    ZeroRealtimeUsefulLifetime,
+    #[error("real-time inbound fragment limit {fragment_bytes} exceeds unit limit {unit_bytes}")]
+    InboundFragmentExceedsUnit {
+        fragment_bytes: usize,
+        unit_bytes: usize,
+    },
+    #[error("real-time unit limit is too large to derive the guarded assembly bound")]
+    AssemblyBoundOverflow,
+    #[error(
+        "accounted real-time byte limit {available_bytes} cannot hold one guarded assembly requiring {required_bytes} bytes"
+    )]
+    AccountedBytesCannotHoldOneAssembly {
+        required_bytes: usize,
+        available_bytes: usize,
+    },
+    #[error("data-only callback policy must not carry a real-time service weight")]
+    DisabledRealtimeHasServiceWeight,
+    #[error("enabled real-time callback policy requires an explicit real-time service weight")]
+    EnabledRealtimeMissingServiceWeight,
     #[error(
         "{class} callback mailbox capacity {requested} exceeds Tokio's supported maximum {maximum}"
     )]
@@ -290,11 +403,16 @@ impl ConnectorCallbackPolicy {
     pub fn new(
         mailboxes: ConnectorCallbackMailboxCapacities,
         service_weights: ConnectorCallbackServiceWeights,
-        max_realtime_unit_bytes: NonZeroUsize,
-        realtime_useful_lifetime: Duration,
+        realtime: RealtimeConnectorPolicy,
     ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
-        if realtime_useful_lifetime.is_zero() {
-            return Err(ConnectorCallbackPolicyError::ZeroRealtimeUsefulLifetime);
+        match (realtime, service_weights.realtime()) {
+            (RealtimeConnectorPolicy::Disabled, Some(_)) => {
+                return Err(ConnectorCallbackPolicyError::DisabledRealtimeHasServiceWeight)
+            }
+            (RealtimeConnectorPolicy::Enabled(_), None) => {
+                return Err(ConnectorCallbackPolicyError::EnabledRealtimeMissingServiceWeight)
+            }
+            _ => {}
         }
         for (class, requested) in [
             ("control", mailboxes.control().get()),
@@ -313,22 +431,8 @@ impl ConnectorCallbackPolicy {
         Ok(Self {
             mailboxes,
             service_weights,
-            max_realtime_unit_bytes,
-            realtime_useful_lifetime,
-            realtime_flows: None,
+            realtime,
         })
-    }
-
-    /// Install the explicit connector-local real-time resource envelope.
-    ///
-    /// This is a builder instead of a fallback. Production callers that need
-    /// real-time work must deliberately provide every value.
-    pub const fn with_realtime_flow_policy(
-        mut self,
-        realtime_flows: ConnectorRealtimeFlowPolicy,
-    ) -> Self {
-        self.realtime_flows = Some(realtime_flows);
-        self
     }
 
     pub const fn mailboxes(self) -> ConnectorCallbackMailboxCapacities {
@@ -339,16 +443,8 @@ impl ConnectorCallbackPolicy {
         self.service_weights
     }
 
-    pub const fn max_realtime_unit_bytes(self) -> NonZeroUsize {
-        self.max_realtime_unit_bytes
-    }
-
-    pub const fn realtime_useful_lifetime(self) -> Duration {
-        self.realtime_useful_lifetime
-    }
-
-    pub const fn realtime_flow_policy(self) -> Option<ConnectorRealtimeFlowPolicy> {
-        self.realtime_flows
+    pub const fn realtime(self) -> RealtimeConnectorPolicy {
+        self.realtime
     }
 
     #[cfg(any(test, feature = "transport-lab"))]
@@ -360,46 +456,98 @@ impl ConnectorCallbackPolicy {
                 mailbox_capacity,
                 mailbox_capacity,
             ),
-            // Leave arithmetic headroom for simultaneous guarded input and
-            // output observations in the raw compatibility laboratory.
-            max_realtime_unit_bytes: NonZeroUsize::new(usize::MAX / 2)
-                .expect("half of usize::MAX is nonzero"),
-            // Raw transport labs are the compatibility bypass. Production
-            // policy construction rejects a zero useful lifetime.
-            realtime_useful_lifetime: Duration::ZERO,
-            realtime_flows: Some(ConnectorRealtimeFlowPolicy::new(
-                NonZeroUsize::new(usize::MAX / 2).expect("half of usize::MAX is nonzero"),
-                mailbox_capacity,
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-                NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
-            )),
+            realtime: RealtimeConnectorPolicy::Enabled(EnabledRealtimeConnectorPolicy {
+                // Leave arithmetic headroom for simultaneous guarded input
+                // and output observations in the raw compatibility lab.
+                max_unit_bytes: NonZeroUsize::new(usize::MAX / 4)
+                    .expect("quarter of usize::MAX is nonzero"),
+                flows: ConnectorRealtimeFlowPolicy::new(
+                    ConnectorRealtimeFlowCapacities::new(
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                        mailbox_capacity,
+                    ),
+                    ConnectorRealtimeInboundLimits::new(
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                        NonZeroUsize::new(usize::MAX / 4)
+                            .expect("quarter of usize::MAX is nonzero"),
+                    ),
+                    NonZeroUsize::new(usize::MAX).expect("usize::MAX is nonzero"),
+                    RealtimeQueueOverflowRule::DropNewest,
+                ),
+            }),
         }
+    }
+}
+
+impl RealtimeConnectorPolicy {
+    pub fn enabled(
+        max_unit_bytes: NonZeroUsize,
+        flows: ConnectorRealtimeFlowPolicy,
+    ) -> std::result::Result<Self, ConnectorCallbackPolicyError> {
+        if flows.max_inbound_fragment_bytes().get() > max_unit_bytes.get() {
+            return Err(ConnectorCallbackPolicyError::InboundFragmentExceedsUnit {
+                fragment_bytes: flows.max_inbound_fragment_bytes().get(),
+                unit_bytes: max_unit_bytes.get(),
+            });
+        }
+        let required_bytes = max_unit_bytes
+            .get()
+            .checked_mul(2)
+            .ok_or(ConnectorCallbackPolicyError::AssemblyBoundOverflow)?;
+        if flows.max_accounted_realtime_bytes().get() < required_bytes {
+            return Err(
+                ConnectorCallbackPolicyError::AccountedBytesCannotHoldOneAssembly {
+                    required_bytes,
+                    available_bytes: flows.max_accounted_realtime_bytes().get(),
+                },
+            );
+        }
+        Ok(Self::Enabled(EnabledRealtimeConnectorPolicy {
+            max_unit_bytes,
+            flows,
+        }))
+    }
+}
+
+impl EnabledRealtimeConnectorPolicy {
+    pub const fn max_unit_bytes(self) -> NonZeroUsize {
+        self.max_unit_bytes
+    }
+
+    pub const fn flows(self) -> ConnectorRealtimeFlowPolicy {
+        self.flows
     }
 }
 
 /// Explicit policy supplied by the process resource owner.
 ///
 /// Arc 03 deliberately provides no `Default`: the maximum number of admitted
-/// candidates, callback capacities, and native-close deadline are operational
-/// values that require owner review.
+/// candidates, callback capacities, and the native-close observation limit are
+/// operational values that require owner review. The observation limit only
+/// bounds waiting. It does not prove that native cleanup succeeded or failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectorResourcePolicy {
     max_active_candidates: NonZeroUsize,
     callbacks: ConnectorCallbackPolicy,
-    native_close_timeout: Duration,
+    native_close_observation_limit: Duration,
 }
 
 impl ConnectorResourcePolicy {
     pub fn new(
         max_active_candidates: NonZeroUsize,
         callbacks: ConnectorCallbackPolicy,
-        native_close_timeout: Duration,
+        native_close_observation_limit: Duration,
     ) -> Option<Self> {
-        (!native_close_timeout.is_zero()).then_some(Self {
+        (!native_close_observation_limit.is_zero()).then_some(Self {
             max_active_candidates,
             callbacks,
-            native_close_timeout,
+            native_close_observation_limit,
         })
     }
 
@@ -411,8 +559,8 @@ impl ConnectorResourcePolicy {
         self.callbacks
     }
 
-    pub const fn native_close_timeout(self) -> Duration {
-        self.native_close_timeout
+    pub const fn native_close_observation_limit(self) -> Duration {
+        self.native_close_observation_limit
     }
 }
 
@@ -439,7 +587,7 @@ pub struct ConnectorResourceOwnerReport {
     /// refused. A known per-candidate cleanup failure does not set this flag.
     pub accounting_poisoned: bool,
     pub callbacks: ConnectorCallbackPolicy,
-    pub native_close_timeout: Duration,
+    pub native_close_observation_limit: Duration,
 }
 
 /// Explicit owner-selected connector ceiling for one live [`crate::Mesh`]
@@ -511,67 +659,6 @@ pub enum MeshConnectorResourceScopeIssueError {
     AccountingUnavailable,
     #[error("the process exhausted its local Mesh connector scope identities")]
     ScopeIdentityExhausted,
-}
-
-/// Unique cancellation and retirement owner for one connection attempt.
-///
-/// This value is not a resource permit and cannot create connector authority.
-/// It only controls whether capabilities already issued by the same admitted
-/// attempt remain live. Dropping or retiring it invalidates candidate
-/// capabilities that have not already been consumed into a later capability,
-/// including candidate values held by delayed callbacks.
-pub(crate) struct AttemptLifetime {
-    attempt: Arc<AttemptOwnership>,
-}
-
-impl AttemptLifetime {
-    pub(crate) fn retire(&self) {
-        {
-            let _transition = match self.attempt.transition.lock() {
-                Ok(transition) => transition,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            self.attempt.active.store(false, Ordering::Release);
-        }
-        // Notify after releasing the attempt transition. Connector cleanup may
-        // take its own authority mutex, so this prevents a reverse nested edge.
-        self.attempt.retired.send_replace(true);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_active(&self) -> bool {
-        self.attempt.active.load(Ordering::Acquire)
-    }
-}
-
-/// Cloneable, non-retiring witness for work owned by one attempt.
-///
-/// Only [`AttemptLifetime`] can retire the attempt. Candidate workers retain
-/// this witness so they can reject and cancel work after that unique owner has
-/// ended the attempt without gaining cancellation authority themselves.
-#[derive(Clone)]
-pub(crate) struct AttemptLiveness {
-    attempt: Arc<AttemptOwnership>,
-}
-
-impl AttemptLiveness {
-    pub(crate) fn is_active(&self) -> bool {
-        self.attempt.active.load(Ordering::Acquire)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "production admitted workers will select this signal with connector retirement"
-    )]
-    pub(crate) fn subscribe_retirement(&self) -> watch::Receiver<bool> {
-        self.attempt.retired.subscribe()
-    }
-}
-
-impl Drop for AttemptLifetime {
-    fn drop(&mut self) {
-        self.retire();
-    }
 }
 
 struct ConnectorResourceOwnerState {
@@ -936,7 +1023,7 @@ impl ConnectorResourceOwnerInner {
             failed_cleanup_candidates,
             accounting_poisoned,
             callbacks: self.policy.callbacks,
-            native_close_timeout: self.policy.native_close_timeout,
+            native_close_observation_limit: self.policy.native_close_observation_limit,
         }
     }
 
@@ -1049,8 +1136,8 @@ impl MeshConnectorResourceScope {
         self.token.owner.policy.callbacks
     }
 
-    pub(crate) fn native_close_timeout(&self) -> Duration {
-        self.token.owner.policy.native_close_timeout
+    pub(crate) fn native_close_observation_limit(&self) -> Duration {
+        self.token.owner.policy.native_close_observation_limit
     }
 
     pub(crate) fn poison_accounting(&self) {
@@ -1086,14 +1173,12 @@ impl From<PreAuthResourceClaim> for ConnectorResourceOwnerPort {
         let one = NonZeroUsize::new(1).expect("one is nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::new(one, one, one),
-            NonZeroUsize::new(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
-                .expect("endpoint frame fixture limit is nonzero"),
-            Duration::from_secs(1),
+            ConnectorCallbackServiceWeights::data_only(one, one),
+            RealtimeConnectorPolicy::Disabled,
         )
-        .expect("test real-time useful lifetime is nonzero");
+        .expect("test data-only callback policy is valid");
         let policy = ConnectorResourcePolicy::new(candidates, callbacks, Duration::from_secs(1))
-            .expect("test close timeout is nonzero");
+            .expect("test close observation limit is nonzero");
         Self::new(policy)
     }
 }
@@ -1119,223 +1204,6 @@ impl From<PreAuthResourceClaim> for MeshConnectorResourceScope {
 /// Dropping the child returns its claim. This guard is created before the
 /// allocation closure runs, so a candidate cannot consume resources first and
 /// ask for accounting afterward.
-struct ConnectorCandidateReservation {
-    owner: Arc<ConnectorResourceOwnerInner>,
-    mesh_scope: Arc<MeshConnectorResourceScopeToken>,
-    claim: PreAuthResourceClaim,
-    release_on_drop: bool,
-}
-
-impl ConnectorCandidateReservation {
-    fn transition(&mut self, next: PreAuthResourceClaim) -> bool {
-        if !self.owner.transition(self.mesh_scope.id, self.claim, next) {
-            return false;
-        }
-        self.claim = next;
-        true
-    }
-
-    /// Convert this exact live claim into a process-owned failed-cleanup slot.
-    /// The aggregate already includes the claim, so this records the terminal
-    /// disposition and prevents `Drop` from making the slot reusable.
-    fn retain_after_cleanup_failure(&mut self) {
-        if !self.release_on_drop {
-            return;
-        }
-        self.owner.retain_after_cleanup_failure(self.mesh_scope.id);
-        self.release_on_drop = false;
-    }
-}
-
-impl Drop for ConnectorCandidateReservation {
-    fn drop(&mut self) {
-        if !self.release_on_drop {
-            return;
-        }
-        self.owner.release(self.mesh_scope.id, self.claim);
-    }
-}
-
-/// Proof that pre-authentication work was admitted for one attempt.
-///
-/// The private field prevents public IDs, wire values, and serialized state
-/// from being treated as a permit. The permit is intentionally neither
-/// `Clone` nor serializable.
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
-pub struct PreAuthAttemptPermit {
-    attempt: Arc<AttemptOwnership>,
-    resource_scope: MeshConnectorResourceScope,
-    #[cfg(test)]
-    aggregate: Arc<ConnectorResourceOwnerInner>,
-}
-
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
-impl PreAuthAttemptPermit {
-    // The attempt owner will call this only after the resource owner admits
-    // the work. It stays private until that production port is migrated.
-    fn admitted(
-        runtime: RuntimeIncarnation,
-        resource_scope: impl Into<MeshConnectorResourceScope>,
-    ) -> (Self, AttemptLifetime) {
-        let resource_scope = resource_scope.into();
-        #[cfg(test)]
-        let aggregate = Arc::clone(&resource_scope.token.owner);
-        let (retired, _retirement_receiver) = watch::channel(false);
-        let attempt = Arc::new(AttemptOwnership {
-            runtime,
-            active: AtomicBool::new(true),
-            transition: Mutex::new(()),
-            retired,
-        });
-        let lifetime = AttemptLifetime {
-            attempt: Arc::clone(&attempt),
-        };
-        (
-            Self {
-                attempt,
-                #[cfg(test)]
-                aggregate,
-                resource_scope,
-            },
-            lifetime,
-        )
-    }
-
-    /// Reserve one child and only then run the candidate allocation.
-    ///
-    /// The attempt permit remains alive and may issue more child reservations
-    /// from the same aggregate. The closure is never called when admission
-    /// fails.
-    fn allocate_connector_candidate<T>(
-        &self,
-        claim: ConnectorCandidateResourceClaim,
-        allocate: impl FnOnce() -> T,
-    ) -> Option<(ConnectorCandidateCapability, T)> {
-        let capability = self.reserve_connector_candidate(claim)?;
-        let candidate = allocate();
-        Some((capability, candidate))
-    }
-
-    /// Reserve the opening claim before asynchronous connector construction.
-    /// The attempt permit remains available for other racing candidates.
-    pub(crate) fn reserve_connector_candidate(
-        &self,
-        claim: ConnectorCandidateResourceClaim,
-    ) -> Option<ConnectorCandidateCapability> {
-        let _transition = self.attempt.transition.lock().ok()?;
-        if !self.attempt.active.load(Ordering::Acquire) {
-            return None;
-        }
-        let reservation = self.resource_scope.reserve(claim.opening)?;
-        Some(ConnectorCandidateCapability {
-            attempt: Arc::clone(&self.attempt),
-            reservation,
-            connected_claim: claim.connected,
-        })
-    }
-}
-
-/// Admit one single-candidate attempt at the exact Arc 03 connector floor.
-/// This attempt-local capacity is not a process or ingress limit.
-pub(crate) fn admit_single_connector_candidate(
-    runtime: RuntimeIncarnation,
-    resource_scope: MeshConnectorResourceScope,
-) -> (
-    PreAuthAttemptPermit,
-    AttemptLifetime,
-    ConnectorCandidateResourceClaim,
-) {
-    let claim = ConnectorCandidateResourceClaim::exact_connector_floor();
-    let (permit, lifetime) = PreAuthAttemptPermit::admitted(runtime, resource_scope);
-    (permit, lifetime, claim)
-}
-
-/// Local authority to attempt one connector candidate.
-///
-/// The capability owns one child resource reservation and an exact, local
-/// witness for the attempt that issued it. It does not consume the attempt
-/// permit. One admitted attempt can therefore own multiple candidates under
-/// one aggregate reservation. The capability has no public constructor and is
-/// neither `Clone` nor serializable.
-///
-/// A public peer label cannot create a candidate capability:
-///
-/// ```compile_fail,E0308
-/// use myownmesh_core::runtime::attempt::ConnectorCandidateCapability;
-///
-/// let public_peer_id = String::new();
-/// let _candidate = ConnectorCandidateCapability::from(public_peer_id);
-/// ```
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
-pub struct ConnectorCandidateCapability {
-    attempt: Arc<AttemptOwnership>,
-    reservation: ConnectorCandidateReservation,
-    connected_claim: PreAuthResourceClaim,
-}
-
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
-impl ConnectorCandidateCapability {
-    pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
-        &self.attempt.runtime
-    }
-
-    pub(crate) fn liveness(&self) -> AttemptLiveness {
-        AttemptLiveness {
-            attempt: Arc::clone(&self.attempt),
-        }
-    }
-
-    pub(crate) fn is_live(&self) -> bool {
-        let Ok(_transition) = self.attempt.transition.lock() else {
-            return false;
-        };
-        self.attempt.active.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn retain_after_cleanup_failure(&mut self) {
-        self.reservation.retain_after_cleanup_failure();
-    }
-
-    pub(crate) fn promote_if_live<T>(self, promote: impl FnOnce(Self) -> T) -> Option<T> {
-        self.try_promote_if_live(promote).ok()
-    }
-
-    /// Promote without losing cleanup ownership when retirement or a
-    /// fail-closed aggregate refuses the transition.
-    #[allow(
-        clippy::result_large_err,
-        reason = "boxing the move-only cleanup claim would add an unaccounted allocation"
-    )]
-    pub(crate) fn try_promote_if_live<T>(
-        mut self,
-        promote: impl FnOnce(Self) -> T,
-    ) -> std::result::Result<T, Self> {
-        let attempt = Arc::clone(&self.attempt);
-        let _transition = match attempt.transition.lock() {
-            Ok(transition) => transition,
-            Err(_) => return Err(self),
-        };
-        if !attempt.active.load(Ordering::Acquire) {
-            return Err(self);
-        }
-        if !self.reservation.transition(self.connected_claim) {
-            return Err(self);
-        }
-        Ok(promote(self))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reservation_is_active_for_test(&self) -> bool {
-        self.reservation.owner.active() != PreAuthResourceClaim::ZERO
-    }
-
-    #[cfg(test)]
-    fn belongs_to(&self, permit: &PreAuthAttemptPermit) -> bool {
-        Arc::ptr_eq(&self.attempt, &permit.attempt)
-            && Arc::ptr_eq(&self.reservation.mesh_scope, &permit.resource_scope.token)
-    }
-}
-
 #[cfg(test)]
 fn candidate_capacity(items: u64) -> PreAuthResourceClaim {
     PreAuthResourceClaim::single(
@@ -1392,18 +1260,16 @@ mod tests {
         let one = NonZeroUsize::new(1).expect("fixture value is nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(one, one),
-            ConnectorCallbackServiceWeights::new(one, one, one),
-            NonZeroUsize::new(crate::engine::MAX_ENDPOINT_FRAME_BYTES)
-                .expect("fixture real-time unit limit is nonzero"),
-            Duration::from_secs(1),
+            ConnectorCallbackServiceWeights::data_only(one, one),
+            RealtimeConnectorPolicy::Disabled,
         )
-        .expect("fixture real-time useful lifetime is nonzero");
+        .expect("fixture data-only callback policy is valid");
         ConnectorResourcePolicy::new(
             NonZeroUsize::new(max_active_candidates).expect("fixture connector bound is nonzero"),
             callbacks,
             Duration::from_secs(1),
         )
-        .expect("fixture close timeout is nonzero")
+        .expect("fixture close observation limit is nonzero")
     }
 
     #[test]
@@ -1686,6 +1552,78 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "owner-run observation; requires only multi-Mesh workload-shape inputs"]
+    fn v4_arc03f_measure_multi_mesh_connector_scopes_without_selecting_a_budget() {
+        fn workload_nonzero(name: &str) -> NonZeroUsize {
+            std::env::var(name)
+                .unwrap_or_else(|_| panic!("observation scenario supplies {name}"))
+                .parse::<usize>()
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .unwrap_or_else(|| panic!("{name} must be a nonzero integer"))
+        }
+
+        let mesh_count = workload_nonzero("MYOWNMESH_ARC03_OBSERVE_MESHES");
+        let candidates_per_mesh = workload_nonzero("MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH");
+        let process_candidates = mesh_count
+            .get()
+            .checked_mul(candidates_per_mesh.get())
+            .and_then(NonZeroUsize::new)
+            .expect("finite observation workload fits usize");
+        let root = crate::resource::ProcessResourceRoot::isolated();
+        root.install_connector_policy(explicit_test_policy(process_candidates.get()))
+            .expect("observation installs its derived finite process envelope");
+
+        let mut scopes = Vec::with_capacity(mesh_count.get());
+        let mut reservations = Vec::with_capacity(process_candidates.get());
+        let mut lifetimes = Vec::with_capacity(mesh_count.get());
+        for mesh_index in 0..mesh_count.get() {
+            let scope = root
+                .issue_mesh_connector_scope(MeshConnectorResourcePolicy::new(candidates_per_mesh))
+                .expect("observation issues one exact Mesh child scope");
+            let (attempt, lifetime) =
+                PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scope.clone());
+            for candidate_index in 0..candidates_per_mesh.get() {
+                reservations.push(
+                    attempt
+                        .reserve_connector_candidate(candidate_claim())
+                        .expect("derived observation envelope admits requested candidate"),
+                );
+                println!(
+                    "arc03_multi_mesh_raw mesh_index={mesh_index} candidate_index={candidate_index} mesh_active={} process_active={}",
+                    scope.report().active_candidates,
+                    root.connector_resource_owner()
+                        .expect("process owner remains installed")
+                        .report()
+                        .active_candidates,
+                );
+            }
+            scopes.push(scope);
+            lifetimes.push(lifetime);
+        }
+
+        assert_eq!(
+            root.connector_resource_owner()
+                .expect("process owner remains installed")
+                .report()
+                .active_candidates,
+            process_candidates.get()
+        );
+        drop(reservations);
+        assert_eq!(
+            root.connector_resource_owner()
+                .expect("process owner remains installed")
+                .report()
+                .active_candidates,
+            0
+        );
+        assert!(scopes
+            .iter()
+            .all(|scope| scope.report().active_candidates == 0));
+        drop(lifetimes);
+    }
+
+    #[test]
     fn v4_arc03d_process_root_rejects_a_conflicting_policy() {
         let root = crate::resource::ProcessResourceRoot::isolated();
         let installed = explicit_test_policy(1);
@@ -1752,9 +1690,8 @@ mod tests {
 
         let error = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(unsupported, one),
-            ConnectorCallbackServiceWeights::new(one, one, one),
-            one,
-            Duration::from_secs(1),
+            ConnectorCallbackServiceWeights::data_only(one, one),
+            RealtimeConnectorPolicy::Disabled,
         )
         .expect_err("policy construction rejects a capacity that mpsc::channel would panic on");
 
@@ -1766,6 +1703,49 @@ mod tests {
                 maximum,
             } if requested == tokio::sync::Semaphore::MAX_PERMITS + 1
                 && maximum == tokio::sync::Semaphore::MAX_PERMITS
+        ));
+    }
+
+    #[test]
+    fn v4_arc03f_realtime_policy_rejects_vectors_that_cannot_hold_one_assembly() {
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let four = NonZeroUsize::new(4).expect("four is nonzero");
+        let seven = NonZeroUsize::new(7).expect("seven is nonzero");
+        let flows = ConnectorRealtimeFlowPolicy::new(
+            ConnectorRealtimeFlowCapacities::new(one, one, one),
+            ConnectorRealtimeInboundLimits::new(four, one, one),
+            seven,
+            RealtimeQueueOverflowRule::DropNewest,
+        );
+        assert!(matches!(
+            RealtimeConnectorPolicy::enabled(four, flows),
+            Err(
+                ConnectorCallbackPolicyError::AccountedBytesCannotHoldOneAssembly {
+                    required_bytes: 8,
+                    available_bytes: 7,
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn v4_arc03f_realtime_policy_rejects_fragment_limit_above_unit_limit() {
+        let one = NonZeroUsize::new(1).expect("one is nonzero");
+        let four = NonZeroUsize::new(4).expect("four is nonzero");
+        let five = NonZeroUsize::new(5).expect("five is nonzero");
+        let eight = NonZeroUsize::new(8).expect("eight is nonzero");
+        let flows = ConnectorRealtimeFlowPolicy::new(
+            ConnectorRealtimeFlowCapacities::new(one, one, one),
+            ConnectorRealtimeInboundLimits::new(five, one, one),
+            eight,
+            RealtimeQueueOverflowRule::DropNewest,
+        );
+        assert!(matches!(
+            RealtimeConnectorPolicy::enabled(four, flows),
+            Err(ConnectorCallbackPolicyError::InboundFragmentExceedsUnit {
+                fragment_bytes: 5,
+                unit_bytes: 4,
+            })
         ));
     }
 

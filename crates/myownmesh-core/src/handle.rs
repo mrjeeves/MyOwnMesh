@@ -68,22 +68,22 @@ impl Mesh {
     ///
     /// This form can host non-participating infrastructure services, but its
     /// handle cannot join a network or allocate a native peer connector. A
-    /// network-capable owner must use [`Self::open_with_connector_resource_policy`]
+    /// network-capable owner must use [`Self::open_connector_capable`]
     /// and provide the reviewed process policy explicitly.
-    pub async fn open(config: MeshConfig) -> Result<MeshHandle> {
+    pub async fn open_infrastructure_only(config: MeshConfig) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
-        Self::open_with_identity(config, identity).await
+        Self::open_infrastructure_only_with_identity(config, identity).await
     }
 
     /// Build a `Mesh` whose native connector allocations are admitted by the
     /// caller's process resource owner. Arc 03 supplies no fallback policy or
     /// inferred capacity.
-    pub async fn open_with_connector_resource_policy(
+    pub async fn open_connector_capable(
         config: MeshConfig,
         policy: ConnectorCapableResourcePolicy,
     ) -> Result<MeshHandle> {
         let identity = Arc::new(crate::identity::load_or_create()?);
-        Self::open_with_identity_and_connector_resource_policy(config, identity, policy).await
+        Self::open_connector_capable_with_identity(config, identity, policy).await
     }
 
     /// Build an infrastructure-only `Mesh` with a **caller-supplied identity**,
@@ -92,10 +92,10 @@ impl Mesh {
     /// a mobile app holding its ed25519 seed in the iOS Keychain / Android
     /// Keystore, or any host that has already loaded a key. Pair with
     /// [`Identity::from_signing_key`](crate::identity::Identity::from_signing_key).
-    /// Otherwise identical to [`Mesh::open`]. It has no connector authority;
-    /// use [`Self::open_with_identity_and_connector_resource_policy`] for
+    /// Otherwise identical to [`Mesh::open_infrastructure_only`]. It has no connector authority;
+    /// use [`Self::open_connector_capable_with_identity`] for
     /// network participation.
-    pub async fn open_with_identity(
+    pub async fn open_infrastructure_only_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
     ) -> Result<MeshHandle> {
@@ -103,8 +103,8 @@ impl Mesh {
         Self::open_with_identity_and_transport(identity, transport)
     }
 
-    /// Identity-injected form of [`Self::open_with_connector_resource_policy`].
-    pub async fn open_with_identity_and_connector_resource_policy(
+    /// Identity-injected form of [`Self::open_connector_capable`].
+    pub async fn open_connector_capable_with_identity(
         _config: MeshConfig,
         identity: Arc<Identity>,
         policy: ConnectorCapableResourcePolicy,
@@ -136,7 +136,8 @@ impl Mesh {
     }
 }
 
-/// Clonable handle to the mesh. Created by [`Mesh::open`].
+/// Clonable handle to the mesh. Created by one of the explicitly named
+/// [`Mesh`] constructors.
 #[derive(Clone)]
 pub struct MeshHandle {
     mesh: Mesh,
@@ -775,7 +776,7 @@ mod tests {
         let identity = Arc::new(Identity::ephemeral());
         let want = identity.public_id().to_string();
 
-        let mesh = Mesh::open_with_identity(MeshConfig::default(), identity)
+        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
             .await
             .expect("open_with_identity");
 
@@ -786,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn ownerless_mesh_rejects_network_join_with_typed_policy_error() {
         let identity = Arc::new(Identity::ephemeral());
-        let mesh = Mesh::open_with_identity(MeshConfig::default(), identity)
+        let mesh = Mesh::open_infrastructure_only_with_identity(MeshConfig::default(), identity)
             .await
             .expect("open infrastructure-only mesh");
 

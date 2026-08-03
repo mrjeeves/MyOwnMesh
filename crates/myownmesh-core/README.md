@@ -30,7 +30,7 @@ catalogue and the path to crates.io.
 use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkConfig, TopologyMode};
 
 // `connector_policy` is selected by the process owner. The library has no default.
-let mesh = Mesh::open_with_connector_resource_policy(MeshConfig::default(), connector_policy).await?;
+let mesh = Mesh::open_connector_capable(MeshConfig::default(), connector_policy).await?;
 let net = mesh.join(NetworkConfig { /* ... */ }).await?;
 let chan = net.channel::<MyMessage>("my-channel");
 let rpc  = net.rpc();

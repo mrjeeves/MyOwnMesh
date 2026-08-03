@@ -12,7 +12,7 @@
 //! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
-//! let mesh = Mesh::open_with_connector_resource_policy(
+//! let mesh = Mesh::open_connector_capable(
 //!     MeshConfig::default(),
 //!     connector_policy,
 //! ).await?;
@@ -107,6 +107,7 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
+pub mod legacy_v1;
 pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
@@ -132,6 +133,7 @@ pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
+pub use legacy_v1::LegacyV1CompatibilityProfile;
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
     SIGN_DOMAIN_TAG_STATE,
@@ -142,10 +144,12 @@ pub use roster::{AuthorizedPeer, Roster};
 pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
 pub use runtime::attempt::{
     ConnectorCallbackMailboxCapacities, ConnectorCallbackPolicy, ConnectorCallbackPolicyError,
-    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy, ConnectorRealtimeFlowPolicy,
+    ConnectorCallbackServiceWeights, ConnectorCapableResourcePolicy,
+    ConnectorRealtimeFlowCapacities, ConnectorRealtimeFlowPolicy, ConnectorRealtimeInboundLimits,
     ConnectorResourceOwnerPort, ConnectorResourceOwnerReport, ConnectorResourcePolicy,
-    ConnectorResourcePolicyConflict, MeshConnectorResourcePolicy, MeshConnectorResourceReport,
-    MeshConnectorResourceScopeIssueError,
+    ConnectorResourcePolicyConflict, EnabledRealtimeConnectorPolicy, MeshConnectorResourcePolicy,
+    MeshConnectorResourceReport, MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy,
+    RealtimeQueueOverflowRule,
 };
 pub use services::{
     relay_targets, RelayEnvelope, RelayService, ServiceAdvert, ServiceRole, RELAY_CHANNEL,

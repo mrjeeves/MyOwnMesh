@@ -135,7 +135,7 @@ use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkCo
 async fn run(
     connector_policy: ConnectorCapableResourcePolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mesh = Mesh::open_with_connector_resource_policy(
+    let mesh = Mesh::open_connector_capable(
         MeshConfig::load().unwrap_or_default(),
         connector_policy,
     ).await?;

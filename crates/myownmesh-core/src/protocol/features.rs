@@ -50,7 +50,7 @@ impl Feature {
 
 /// The set of features this build advertises to peers. Embedders
 /// that subset MyOwnMesh's API (e.g. headless-only, no RPC) can
-/// override at the [`crate::handle::Mesh::open`] boundary.
+/// override at an explicitly named [`crate::handle::Mesh`] construction boundary.
 pub const ADVERTISED_FEATURES: &[&str] = &[
     Feature::RING_TOPOLOGY,
     Feature::GENERIC_RPC,

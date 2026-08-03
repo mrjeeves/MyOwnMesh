@@ -446,19 +446,13 @@ mod tests {
             NonZeroUsize::new(16).expect("test callback capacity is explicitly nonzero");
         let callbacks = ConnectorCallbackPolicy::new(
             ConnectorCallbackMailboxCapacities::new(callback_capacity, callback_capacity),
-            ConnectorCallbackServiceWeights::new(
-                callback_capacity,
-                callback_capacity,
-                callback_capacity,
-            ),
-            NonZeroUsize::new(myownmesh_core::engine::MAX_ENDPOINT_FRAME_BYTES)
-                .expect("test real-time unit limit is nonzero"),
-            Duration::from_secs(10),
+            ConnectorCallbackServiceWeights::data_only(callback_capacity, callback_capacity),
+            myownmesh_core::RealtimeConnectorPolicy::Disabled,
         )
-        .expect("test real-time useful lifetime is explicitly nonzero");
+        .expect("test data-only callback policy is valid");
         let process_policy =
             ConnectorResourcePolicy::new(connector_count, callbacks, Duration::from_secs(10))
-                .expect("test close deadline is explicitly nonzero");
+                .expect("test close observation limit is explicitly nonzero");
         let policy = ConnectorCapableResourcePolicy::new(
             process_policy,
             MeshConnectorResourcePolicy::new(connector_count),

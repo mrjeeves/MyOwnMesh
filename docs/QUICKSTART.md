@@ -29,17 +29,17 @@ catalogue.
 
 ## 2. Open the mesh
 
-`Mesh::open_with_connector_resource_policy` loads (or generates on first call) this device's
+`Mesh::open_connector_capable` loads (or generates on first call) this device's
 long-lived ed25519 identity from
 `~/.myownmesh/.secrets/identity.json` and constructs the shared
 WebRTC API with the process owner's reviewed process and exact-Mesh connector
-policy. MyOwnMesh does not provide default policy values. `Mesh::open` is reserved for an
-infrastructure-only runtime and cannot join a network.
+policy. MyOwnMesh does not provide default policy values. Use
+`Mesh::open_infrastructure_only` only for a runtime that cannot join a network.
 
 ```rust
 use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig};
 
-let mesh = Mesh::open_with_connector_resource_policy(
+let mesh = Mesh::open_connector_capable(
     MeshConfig::default(),
     connector_policy,
 ).await?;
@@ -57,15 +57,23 @@ MYOWNMESH_CONNECTOR_CONTROL_CAPACITY
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_CAPACITY
 MYOWNMESH_CONNECTOR_CONTROL_WEIGHT
 MYOWNMESH_CONNECTOR_ENDPOINT_DATA_WEIGHT
+MYOWNMESH_CONNECTOR_REALTIME_POLICY
+MYOWNMESH_CONNECTOR_NATIVE_CLOSE_OBSERVATION_MS
+```
+
+Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only connector.
+That form requires no media values. The `enabled` form additionally requires:
+
+```text
 MYOWNMESH_CONNECTOR_REALTIME_WEIGHT
 MYOWNMESH_CONNECTOR_MAX_REALTIME_UNIT_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_USEFUL_LIFETIME_MS
-MYOWNMESH_CONNECTOR_REALTIME_MAX_ACTIVE_FLOWS
+MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FLOWS
+MYOWNMESH_CONNECTOR_REALTIME_MAX_OUTBOUND_FLOWS
 MYOWNMESH_CONNECTOR_REALTIME_QUEUE_CAPACITY_PER_FLOW
 MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENT_BYTES
-MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS
-MYOWNMESH_CONNECTOR_REALTIME_MAX_RETAINED_BYTES
-MYOWNMESH_CONNECTOR_NATIVE_CLOSE_TIMEOUT_MS
+MYOWNMESH_CONNECTOR_REALTIME_MAX_INBOUND_FRAGMENTS_PER_UNIT
+MYOWNMESH_CONNECTOR_REALTIME_MAX_IN_PROGRESS_UNITS_PER_FLOW
+MYOWNMESH_CONNECTOR_REALTIME_MAX_ACCOUNTED_BYTES
 ```
 
 MyOwnMesh supplies no numeric fallback. Missing, zero, or invalid values stop
@@ -89,6 +97,7 @@ let net = mesh.join(NetworkConfig {
     stun_servers: Default::default(),
     turn_servers: Default::default(),
     roster_path: None,
+    pinned_peers: Vec::new(),
     auto_approve: false,
 }).await?;
 ```

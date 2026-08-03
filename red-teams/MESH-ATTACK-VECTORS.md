@@ -80,8 +80,8 @@ The source baseline and source evidence remain those recorded in the preceding c
 
 | ID | Source observation | Restored target interpretation | Priority |
 |---|---|---|---|
-| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members; Arc 03D removes its V4 engine callers | Still open until the legacy module and compatibility surface are removed or separately dispositioned. Ordinary implicit member forwarding is prohibited | Critical |
-| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | V4 daemon startup and live service reconfiguration reject this service. The legacy direct construction surface remains open until removed or separately fenced. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
+| RTM-001 | Legacy shaped-topology code can route application payload through ordinary mesh members | Arc 03F removes its V4 callers and requires a sealed, explicit `LegacyV1CompatibilityProfile`. It remains open until Arc 12 removes the frozen compatibility source. Ordinary implicit member forwarding is prohibited | Critical |
+| RTM-002 | Optional `RelayService` forwards application payload through an ordinary mesh member | Arc 03F requires the same sealed LegacyV1 profile, and V4 daemon startup plus live reconfiguration reject the service. It remains open until Arc 12 removes the frozen compatibility source. Any application payload through a mesh member violates the endpoint-only data invariant | Critical |
 | RTM-003 | Carrier input allocates transport before Device validation | Not automatically a defect. It fails only if work is unbounded, mutates durable authority, delivers application data, or promotes a session | High conditional |
 | RTM-004 | Closed auto-approve admits a fresh unrostered key | Still a defect | Critical |
 | RTM-005 | Directed application sends bypass admission | Still a defect | Critical |
