@@ -1,9 +1,7 @@
 name: Release
 
-# Triggered either by pushing a tag `v*` or by `gh workflow run`
-# (which is what `just release X.Y.Z` does). The `tag` input lets a
-# maintainer kick off a release for a tag that doesn't exist yet —
-# the tauri-action call below creates the GitHub release at that name.
+# Triggered by the immutable `v*` tag that `just release X.Y.Z` pushes.
+# workflow_dispatch is only an escape hatch for rebuilding an existing tag.
 on:
   push:
     tags: ["v*"]
