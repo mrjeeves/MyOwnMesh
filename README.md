@@ -113,8 +113,8 @@ so both crates resolve out of the same checkout:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }  # Nostr + mDNS drivers
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.3" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.3" }  # Nostr + mDNS drivers
 tokio = { version = "1", features = ["full"] }
 ```
 
