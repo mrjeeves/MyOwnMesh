@@ -16,6 +16,7 @@
 
 pub mod diag;
 pub mod ice;
+mod turn_stream;
 pub mod webrtc;
 
 pub use diag::{

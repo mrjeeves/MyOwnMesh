@@ -47,6 +47,7 @@ use webrtc::track::track_remote::TrackRemote;
 use crate::error::{Error, Result};
 
 use super::ice::build_rtc_configuration;
+use super::turn_stream::TurnStreamBridges;
 
 /// Interface-name prefixes for virtual / container / overlay networks
 /// whose host addresses can never be reached by a remote peer. Gathering
@@ -278,6 +279,7 @@ impl LocalIceCandidate {
 #[derive(Clone)]
 pub struct Transport {
     api: Arc<webrtc::api::API>,
+    turn_stream_bridges: Arc<TurnStreamBridges>,
     /// Media lanes provisioned per peer connection (see [`resolve_media_lanes`]).
     media_lanes: usize,
 }
@@ -379,6 +381,7 @@ impl Transport {
         );
         Ok(Self {
             api: Arc::new(api),
+            turn_stream_bridges: Arc::new(TurnStreamBridges::default()),
             media_lanes,
         })
     }
@@ -393,7 +396,8 @@ impl Transport {
         stun: &[crate::config::StunServer],
         turn: &[crate::config::TurnServer],
     ) -> Result<(PeerSession, mpsc::UnboundedReceiver<TransportEvent>)> {
-        let config = build_rtc_configuration(stun, turn);
+        let turn = self.turn_stream_bridges.rewrite(turn).await;
+        let config = build_rtc_configuration(stun, &turn);
         self.open_peer_with_config(role, config).await
     }
 

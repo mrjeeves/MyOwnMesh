@@ -106,12 +106,21 @@ Tag the file with the hostname so the merge tool can label rows.
 
 > **Log filter — use `MYOWNMESH_LOG_EXTRA`, not `MYOWNMESH_LOG`.** Setting
 > `MYOWNMESH_LOG` *replaces* the default filter, which is what keeps the
-> `webrtc-rs` sibling crates pinned to `error` — drop it and you get a
+> `webrtc-rs` sibling crates pinned to `error` — and its public TURN server
+> target disabled — drop it and you get a
 > firehose of per-candidate `pingAllCandidates` / `could not listen udp …`
 > noise. `MYOWNMESH_LOG_EXTRA` instead *appends* to the default, so you
 > bump our crates to debug while the webrtc quieting stays in place. (Use
 > `MYOWNMESH_LOG` only when you deliberately want raw webrtc detail, e.g.
 > `MYOWNMESH_LOG="info,webrtc_ice=debug"`.)
+
+> **TURN server restarts.** Peers can briefly keep sending ChannelData for an
+> allocation the restarted server no longer has. ChannelData has no error
+> response, but the upstream TURN crate logs every such packet at `error`.
+> MyOwnMesh disables only that dependency's `turn::server` log target by
+> default; its own TURN startup/configuration failures and TURN client errors
+> remain visible. Set `MYOWNMESH_LOG_EXTRA=turn::server=debug` only when raw
+> server protocol flow is the thing you are investigating.
 
 > **Where the negotiation stage lines went.** `create_offer` /
 > `create_answer` / `set_remote_description` / `ensure_peer_session`, and the

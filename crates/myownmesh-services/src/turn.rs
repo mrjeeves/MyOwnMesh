@@ -32,6 +32,7 @@ use webrtc_util::Conn;
 
 use myownmesh_core::config::{TurnCredential, TurnServiceConfig};
 
+use crate::turn_stream::TurnTcpBridge;
 use crate::{Error, Result};
 
 /// Smallest burst the per-connection bandwidth cap always allows, so a
@@ -273,6 +274,7 @@ pub struct TurnServer;
 /// in-flight allocations get a clean close.
 pub struct TurnServerHandle {
     server: Server,
+    tcp: Option<TurnTcpBridge>,
     local_addr: SocketAddr,
     relay_ip: IpAddr,
 }
@@ -291,6 +293,9 @@ impl TurnServerHandle {
 
     /// Stop the server, closing allocations and the listener.
     pub async fn stop(self) -> Result<()> {
+        if let Some(tcp) = self.tcp {
+            tcp.stop().await;
+        }
         self.server
             .close()
             .await
@@ -360,6 +365,36 @@ impl TurnServer {
         .await
         .map_err(|e| Error::Turn(e.to_string()))?;
 
+        let tcp = if config.tcp_enabled {
+            let tcp_port = if config.port == 0 {
+                local_addr.port()
+            } else {
+                config.port
+            };
+            let tcp_bind: SocketAddr = format!("{}:{tcp_port}", config.bind)
+                .parse()
+                .map_err(|e| Error::TurnConfig(format!("invalid TURN TCP bind: {e}")))?;
+            let udp_target = SocketAddr::new(
+                if local_addr.ip().is_unspecified() {
+                    if local_addr.is_ipv4() {
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    }
+                } else {
+                    local_addr.ip()
+                },
+                local_addr.port(),
+            );
+            Some(
+                TurnTcpBridge::start(tcp_bind, udp_target)
+                    .await
+                    .map_err(|e| Error::Bind(tcp_bind.to_string(), e))?,
+            )
+        } else {
+            None
+        };
+
         let relay_ports = if relay_port_min == 0 {
             "OS ephemeral range".to_string()
         } else {
@@ -376,6 +411,7 @@ impl TurnServer {
         );
         Ok(TurnServerHandle {
             server,
+            tcp,
             local_addr,
             relay_ip,
         })
@@ -408,6 +444,87 @@ fn resolve_relay_ip(config: &TurnServiceConfig) -> Result<IpAddr> {
 mod tests {
     use super::*;
 
+    struct TcpTurnConn {
+        reader: AsyncMutex<tokio::net::tcp::OwnedReadHalf>,
+        writer: AsyncMutex<tokio::net::tcp::OwnedWriteHalf>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    }
+
+    impl TcpTurnConn {
+        async fn connect_to(remote: SocketAddr) -> std::io::Result<Self> {
+            let stream = tokio::net::TcpStream::connect(remote).await?;
+            let local = stream.local_addr()?;
+            let (reader, writer) = stream.into_split();
+            Ok(Self {
+                reader: AsyncMutex::new(reader),
+                writer: AsyncMutex::new(writer),
+                local,
+                remote,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Conn for TcpTurnConn {
+        async fn connect(&self, _addr: SocketAddr) -> std::result::Result<(), webrtc_util::Error> {
+            Ok(())
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> std::result::Result<usize, webrtc_util::Error> {
+            let frame =
+                crate::turn_stream::read_turn_stream_frame(&mut *self.reader.lock().await).await?;
+            if frame.len() > buf.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TURN frame exceeds receive buffer",
+                )
+                .into());
+            }
+            buf[..frame.len()].copy_from_slice(&frame);
+            Ok(frame.len())
+        }
+
+        async fn recv_from(
+            &self,
+            buf: &mut [u8],
+        ) -> std::result::Result<(usize, SocketAddr), webrtc_util::Error> {
+            Ok((self.recv(buf).await?, self.remote))
+        }
+
+        async fn send(&self, buf: &[u8]) -> std::result::Result<usize, webrtc_util::Error> {
+            crate::turn_stream::write_turn_stream_frame(&mut *self.writer.lock().await, buf)
+                .await?;
+            Ok(buf.len())
+        }
+
+        async fn send_to(
+            &self,
+            buf: &[u8],
+            _target: SocketAddr,
+        ) -> std::result::Result<usize, webrtc_util::Error> {
+            self.send(buf).await
+        }
+
+        fn local_addr(&self) -> std::result::Result<SocketAddr, webrtc_util::Error> {
+            Ok(self.local)
+        }
+
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some(self.remote)
+        }
+
+        async fn close(&self) -> std::result::Result<(), webrtc_util::Error> {
+            use tokio::io::AsyncWriteExt;
+            self.writer.lock().await.shutdown().await?;
+            Ok(())
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
     fn cred(u: &str, p: &str) -> TurnCredential {
         TurnCredential {
             username: u.into(),
@@ -418,6 +535,7 @@ mod tests {
     fn loopback_config() -> TurnServiceConfig {
         TurnServiceConfig {
             enabled: true,
+            tcp_enabled: false,
             bind: "127.0.0.1".into(),
             port: 0,
             public_ip: "127.0.0.1".into(),
@@ -443,6 +561,7 @@ mod tests {
     async fn rejects_wildcard_bind_without_public_ip() {
         let cfg = TurnServiceConfig {
             enabled: true,
+            tcp_enabled: false,
             bind: "0.0.0.0".into(),
             port: 0,
             public_ip: "".into(),
@@ -618,6 +737,95 @@ mod tests {
         .expect("binding request failed");
         // The server saw us come from loopback.
         assert_eq!(mapped.ip().to_string(), "127.0.0.1");
+
+        client.close().await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    // Exercises the real TCP listener and its stream framing all the way
+    // through the same TURN engine used by UDP. A parser-only test would not
+    // catch a broken bind, five-tuple adapter, or response framing path.
+    #[tokio::test]
+    async fn answers_binding_request_through_tcp_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut cfg = loopback_config();
+        cfg.tcp_enabled = true;
+        let server = TurnServer::start(&cfg).await.unwrap();
+        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
+        stream.write_all(&request).await.unwrap();
+
+        let mut header = [0u8; 20];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut header))
+            .await
+            .expect("TURN TCP binding response timed out")
+            .unwrap();
+        assert_eq!(&header[..2], &[0x01, 0x01]);
+        assert_eq!(&header[4..8], &[0x21, 0x12, 0xa4, 0x42]);
+        assert_eq!(&header[8..20], &request[8..20]);
+        let body_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).await.unwrap();
+        assert!(
+            body_len >= 8,
+            "binding response has no mapped-address attribute"
+        );
+
+        drop(stream);
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocates_and_relays_data_through_tcp_listener() {
+        use turn::client::{Client, ClientConfig};
+
+        let mut cfg = loopback_config();
+        cfg.tcp_enabled = true;
+        let server = TurnServer::start(&cfg).await.unwrap();
+        let transport = Arc::new(TcpTurnConn::connect_to(server.local_addr()).await.unwrap());
+        let client = Client::new(ClientConfig {
+            stun_serv_addr: server.local_addr().to_string(),
+            turn_serv_addr: server.local_addr().to_string(),
+            username: "alice".into(),
+            password: "s3cret".into(),
+            realm: "myownmesh".into(),
+            software: "myownmesh-test".into(),
+            rto_in_ms: 0,
+            conn: transport,
+            vnet: None,
+        })
+        .await
+        .unwrap();
+        client.listen().await.unwrap();
+        let relay = tokio::time::timeout(Duration::from_secs(3), client.allocate())
+            .await
+            .expect("TURN TCP allocation timed out")
+            .expect("TURN TCP allocation failed");
+
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        relay.send_to(b"through-turn-tcp", echo_addr).await.unwrap();
+        let mut packet = [0u8; 64];
+        let (received, relay_source) =
+            tokio::time::timeout(Duration::from_secs(3), echo.recv_from(&mut packet))
+                .await
+                .expect("relayed datagram did not reach echo socket")
+                .unwrap();
+        assert_eq!(&packet[..received], b"through-turn-tcp");
+        echo.send_to(b"back-through-turn-tcp", relay_source)
+            .await
+            .unwrap();
+        let (received, source) =
+            tokio::time::timeout(Duration::from_secs(3), relay.recv_from(&mut packet))
+                .await
+                .expect("echo did not return through TURN TCP")
+                .unwrap();
+        assert_eq!(source, echo_addr);
+        assert_eq!(&packet[..received], b"back-through-turn-tcp");
 
         client.close().await.unwrap();
         server.stop().await.unwrap();

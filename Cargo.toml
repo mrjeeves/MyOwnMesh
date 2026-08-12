@@ -46,6 +46,9 @@ webrtc-util = "0.11"
 
 # WebSocket (Nostr signaling)
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 # DNS-SD / mDNS (LAN signaling). Pure Rust — no avahi/bonjour binding, so it
 # cross-compiles for the riscv64-musl NanoKVM target and coexists with an

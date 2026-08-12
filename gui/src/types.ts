@@ -190,6 +190,8 @@ export interface TurnCredential {
 
 export interface TurnServiceConfig {
   enabled: boolean;
+  /** Accept TURN stream framing over TCP on the same port as UDP. */
+  tcp_enabled: boolean;
   bind: string;
   port: number;
   public_ip: string;
@@ -198,6 +200,9 @@ export interface TurnServiceConfig {
   /** Per-connection (per-allocation) relayed-bandwidth cap in bytes per
    *  second, each direction. 0 = unlimited. */
   max_bps_per_connection: number;
+  /** Inclusive UDP allocation window. min=0 uses the OS ephemeral range. */
+  relay_port_min: number;
+  relay_port_max: number;
 }
 
 export interface ServicesConfig {

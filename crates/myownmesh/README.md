@@ -41,7 +41,7 @@ myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config path      # print ~/.myownmesh/config.json
 myownmesh config edit      # open in $EDITOR
-myownmesh install caddy <domain>    # TLS reverse proxy (Caddy) for the signaling relay
+myownmesh install caddy <domain>    # signaling WSS + TURN TCP/TLS + firewall setup
 myownmesh caddy path       # print the Caddyfile location to edit
 ```
 
@@ -94,6 +94,10 @@ If `serve` lives in your home (e.g. a `cargo install` build), a
 `--system` install copies it to `/usr/local/lib/myownmesh/` so the
 service account can execute it. Follow logs with the printed hint
 (`journalctl -u myownmesh -f`, or `tail -f` the launchd log).
+Generated systemd units identify records as `myownmesh` and cap the daemon at
+100 records per five minutes. Normal operation is well below that ceiling; it
+prevents a dependency regression or hostile packet stream from filling the
+journal and `/var/log/syslog` before the host's normal rotation runs.
 
 Windows isn't wired to a service manager yet — `service` there points
 you at Task Scheduler / NSSM instead. On a headless / SSH-only Mac,
@@ -127,7 +131,7 @@ a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
       "signaling": { "strategy": "nostr", "redundancy": 5 },
       "stun_servers": [{ "urls": ["stun:stun.myownmesh.com:3478"] }],
       "turn_servers": [
-        { "urls": ["turn:turn.myownmesh.com:3478"], "username": "guest", "credential": "theguestpassword" }
+        { "urls": ["turn:turn.myownmesh.com:3478", "turn:turn.myownmesh.com:3478?transport=tcp", "turns:turn.myownmesh.com:5349?transport=tcp"], "username": "guest", "credential": "theguestpassword" }
       ],
       "auto_approve": false
     }
