@@ -410,6 +410,14 @@ TCP transport. Do not omit the UDP relay range; a successful allocation
 on 3478 followed by no media is the characteristic symptom of that
 mistake.
 
+**IONOS note.** IONOS places servers behind an external hardware
+firewall even when UFW and iptables are open. In **Menu → Server & Cloud
+→ Network → Firewall Policies**, edit the policy assigned to the server
+and add the TCP and UDP rows from the table above; IONOS accepts a range
+such as `49152-65535` in the Ports field. Only one policy can be active
+per IP, so confirm the edited policy is assigned to the relay. See the
+[IONOS firewall policy instructions](https://www.ionos.com/help/server-cloud-infrastructure/firewall-policies/editing-a-firewall-policy/).
+
 ### 2. Give it its own hostname
 
 If a name is a static site (GitHub Pages, etc.) its DNS points at the

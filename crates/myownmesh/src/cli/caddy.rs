@@ -186,8 +186,14 @@ async fn install_and_configure(
     println!("Done. Peers can now point at  wss://{host}");
     println!();
     println!("Two things still have to be true for TLS to come up:");
-    println!("  • DNS — an A/AAAA record for {host} resolves to this server's public IP.");
-    println!("  • Firewall/cloud group: TCP 80,443,3478,5349; UDP 3478 and 49152:65535.");
+    println!("  • DNS — {host} and {turn_host} resolve to this server (TURN currently requires an IPv4 A record).");
+    println!(
+        "  • Firewall/cloud group: TCP 80,443,{},5349; UDP {} and {}:{}.",
+        services.turn.port,
+        services.turn.port,
+        services.turn.relay_port_min,
+        services.turn.relay_port_max
+    );
     println!();
     println!(
         "Verify:  npx wscat -c wss://{host}   (a real WebSocket handshake — expect a connect)"
