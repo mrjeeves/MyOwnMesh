@@ -8,15 +8,17 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const MAX_TURN_FRAME: usize = 65_556;
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct TurnTcpBridge {
     cancel: CancellationToken,
@@ -70,34 +72,27 @@ async fn bridge_connection(
         IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
     };
-    let udp = Arc::new(UdpSocket::bind(udp_bind).await?);
+    let udp = UdpSocket::bind(udp_bind).await?;
     udp.connect(udp_target).await?;
     let (mut reader, mut writer) = stream.into_split();
-    let udp_read = udp.clone();
-    let udp_write = udp;
-
-    let to_turn = async move {
-        loop {
-            let frame = read_turn_stream_frame(&mut reader).await?;
-            udp_write.send(&frame).await?;
+    let mut datagram = vec![0u8; MAX_TURN_FRAME];
+    let idle = tokio::time::sleep(CLIENT_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            result = read_turn_stream_frame(&mut reader) => {
+                udp.send(&result?).await?;
+            },
+            result = udp.recv(&mut datagram) => {
+                let received = result?;
+                write_turn_stream_frame(&mut writer, &datagram[..received]).await?;
+            },
+            _ = &mut idle => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "TURN TCP idle timeout"));
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), io::Error>(())
-    };
-    let from_turn = async move {
-        let mut datagram = vec![0u8; MAX_TURN_FRAME];
-        loop {
-            let n = udp_read.recv(&mut datagram).await?;
-            write_turn_stream_frame(&mut writer, &datagram[..n]).await?;
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), io::Error>(())
-    };
-
-    tokio::select! {
-        _ = cancel.cancelled() => Ok(()),
-        result = to_turn => result,
-        result = from_turn => result,
+        idle.as_mut().reset(Instant::now() + CLIENT_IDLE_TIMEOUT);
     }
 }
 
