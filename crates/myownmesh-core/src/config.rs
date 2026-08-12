@@ -2,7 +2,7 @@
 //! lives here so any caller (binary, library embedder, tests) shares
 //! the same parse / default behavior.
 //!
-//! Schema versioning: a single `version` field on the root. v1 is
+//! Schema versioning: a single `version` field on the root. v3 is
 //! current; additive changes (new optional fields, new networks)
 //! don't bump the version. Field-shape-breaking changes will bump and
 //! ship a migration in this module.
@@ -19,7 +19,7 @@ use crate::identity::DeviceId;
 /// config, the daemon, and the relay all share one shape.
 pub use myownmesh_signaling::server::Limits as SignalingLimits;
 
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 /// Topology selector for a single network. Wire-form matches the
 /// JSON-tagged shape; embedders construct these directly.
@@ -651,6 +651,24 @@ fn migrate(mut cfg: MeshConfig) -> MeshConfig {
         }
         cfg.version = 2;
     }
+    if cfg.version < 3 {
+        let legacy_reference_turn = TurnServer {
+            urls: vec!["turn:turn.myownmesh.com:3478".to_string()],
+            username: Some("guest".to_string()),
+            credential: Some("theguestpassword".to_string()),
+        };
+        for net in &mut cfg.networks {
+            // v0.3.3 and older persisted the built-in reference relay as an
+            // explicit one-URL value. Serde defaults therefore cannot add the
+            // TCP/TLS fallbacks when a newer daemon loads that file. Upgrade
+            // only the exact old project default: explicit opt-outs and every
+            // user-supplied TURN service remain untouched.
+            if net.turn_servers == [legacy_reference_turn.clone()] {
+                net.turn_servers = default_turn_servers();
+            }
+        }
+        cfg.version = 3;
+    }
     cfg
 }
 
@@ -773,6 +791,51 @@ mod tests {
         // Idempotent: running the migration again changes nothing.
         let again = migrate(migrated.clone());
         assert_eq!(again, migrated);
+    }
+
+    #[test]
+    fn v2_reference_turn_migrates_to_udp_tcp_and_tls() {
+        let mut cfg = MeshConfig {
+            version: 2,
+            ..Default::default()
+        };
+        let mut net = NetworkConfig::from_network_id("n1", "net-one");
+        net.turn_servers = vec![TurnServer {
+            urls: vec!["turn:turn.myownmesh.com:3478".into()],
+            username: Some("guest".into()),
+            credential: Some("theguestpassword".into()),
+        }];
+        cfg.networks.push(net);
+
+        let migrated = migrate(cfg);
+        assert_eq!(migrated.version, CONFIG_VERSION);
+        assert_eq!(migrated.networks[0].turn_servers, default_turn_servers());
+        assert_eq!(
+            migrate(migrated.clone()),
+            migrated,
+            "migration is idempotent"
+        );
+    }
+
+    #[test]
+    fn v2_turn_migration_preserves_opt_outs_and_custom_servers() {
+        let mut cfg = MeshConfig {
+            version: 2,
+            ..Default::default()
+        };
+        let mut disabled = NetworkConfig::from_network_id("n1", "disabled");
+        disabled.turn_servers.clear();
+        let mut custom = NetworkConfig::from_network_id("n2", "custom");
+        custom.turn_servers = vec![TurnServer {
+            urls: vec!["turns:relay.example.com:5349?transport=tcp".into()],
+            username: Some("alice".into()),
+            credential: Some("secret".into()),
+        }];
+        cfg.networks.extend([disabled.clone(), custom.clone()]);
+
+        let migrated = migrate(cfg);
+        assert_eq!(migrated.networks[0].turn_servers, disabled.turn_servers);
+        assert_eq!(migrated.networks[1].turn_servers, custom.turn_servers);
     }
 
     #[test]
