@@ -128,7 +128,7 @@ async fn install_and_configure(
         }
     }
 
-    ensure_caddy_layer4()?;
+    let caddy_binary_changed = ensure_caddy_layer4()?;
 
     // 2. Write / merge the Caddyfile (managed block only; backed up).
     let path = caddyfile_path();
@@ -153,7 +153,18 @@ async fn install_and_configure(
     }
 
     // 3. Reload (or start) Caddy.
-    if let Err(error) = reload_caddy(&path) {
+    let caddyfile_changed = updated != existing;
+    let caddy_reload = if !caddy_apply_required(
+        caddy_binary_changed,
+        caddyfile_changed,
+        caddy_service_running(),
+    ) {
+        println!("✓ Caddy module, configuration, and service already converged.");
+        Ok(())
+    } else {
+        reload_caddy(&path)
+    };
+    if let Err(error) = caddy_reload {
         if updated != existing {
             if path_existed {
                 std::fs::write(&path, &existing)
@@ -206,6 +217,10 @@ async fn install_and_configure(
         "If it doesn't answer:  sudo systemctl status caddy  ·  sudo journalctl -u caddy -n 50"
     );
     Ok(())
+}
+
+fn caddy_apply_required(module_changed: bool, config_changed: bool, running: bool) -> bool {
+    module_changed || config_changed || !running
 }
 
 /// Fallback for when the daemon isn't running: persist the loopback bind
@@ -540,10 +555,10 @@ fn caddy_has_layer4() -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_caddy_layer4() -> Result<()> {
+fn ensure_caddy_layer4() -> Result<bool> {
     if caddy_has_layer4() {
         println!("✓ Caddy Layer 4 module already installed.");
-        return Ok(());
+        return Ok(false);
     }
     println!("Installing the pinned Caddy Layer 4 module for TURN TLS…");
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -584,7 +599,24 @@ fn ensure_caddy_layer4() -> Result<()> {
         run_sudo("systemctl", &["start", "caddy"]);
     }
     println!("✓ Caddy Layer 4 module installed.");
-    Ok(())
+    Ok(true)
+}
+
+fn caddy_service_running() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if has_systemd_caddy() {
+        return Command::new("systemctl")
+            .args(["is-active", "--quiet", "caddy"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 2019)),
+        std::time::Duration::from_millis(500),
+    )
+    .is_ok()
 }
 
 fn configure_firewall(turn_port: u16, turns_port: u16, relay_min: u16, relay_max: u16) {
@@ -664,9 +696,13 @@ fn reload_caddy(path: &Path) -> Result<()> {
             // Start now and at boot, then load our config (reload is
             // graceful; restart is the fallback if reload can't).
             run_sudo("systemctl", &["enable", "--now", "caddy"]);
-            if run_sudo("systemctl", &["reload", "caddy"])
-                || run_sudo("systemctl", &["restart", "caddy"])
-            {
+            if run_sudo("timeout", &["15s", "systemctl", "reload", "caddy"]) || {
+                // A Layer 4 connection can keep a Caddy reload draining
+                // indefinitely. Clear only the reload control process,
+                // then bound the restart as well.
+                run_sudo("systemctl", &["kill", "--kill-who=control", "caddy"]);
+                run_sudo("timeout", &["30s", "systemctl", "restart", "caddy"])
+            } {
                 println!("✓ Caddy service is running with the new config.");
                 return Ok(());
             }
@@ -1046,5 +1082,13 @@ mod tests {
                 5349,
             )
         );
+    }
+
+    #[test]
+    fn identical_running_install_skips_caddy_reload() {
+        assert!(!caddy_apply_required(false, false, true));
+        assert!(caddy_apply_required(true, false, true));
+        assert!(caddy_apply_required(false, true, true));
+        assert!(caddy_apply_required(false, false, false));
     }
 }
