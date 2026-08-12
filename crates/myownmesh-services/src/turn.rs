@@ -32,6 +32,7 @@ use webrtc_util::Conn;
 
 use myownmesh_core::config::{TurnCredential, TurnServiceConfig};
 
+use crate::turn_stream::TurnTcpBridge;
 use crate::{Error, Result};
 
 /// Smallest burst the per-connection bandwidth cap always allows, so a
@@ -273,6 +274,7 @@ pub struct TurnServer;
 /// in-flight allocations get a clean close.
 pub struct TurnServerHandle {
     server: Server,
+    tcp: Option<TurnTcpBridge>,
     local_addr: SocketAddr,
     relay_ip: IpAddr,
 }
@@ -291,6 +293,9 @@ impl TurnServerHandle {
 
     /// Stop the server, closing allocations and the listener.
     pub async fn stop(self) -> Result<()> {
+        if let Some(tcp) = self.tcp {
+            tcp.stop().await;
+        }
         self.server
             .close()
             .await
@@ -360,6 +365,36 @@ impl TurnServer {
         .await
         .map_err(|e| Error::Turn(e.to_string()))?;
 
+        let tcp = if config.tcp_enabled {
+            let tcp_port = if config.port == 0 {
+                local_addr.port()
+            } else {
+                config.port
+            };
+            let tcp_bind: SocketAddr = format!("{}:{tcp_port}", config.bind)
+                .parse()
+                .map_err(|e| Error::TurnConfig(format!("invalid TURN TCP bind: {e}")))?;
+            let udp_target = SocketAddr::new(
+                if local_addr.ip().is_unspecified() {
+                    if local_addr.is_ipv4() {
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    } else {
+                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    }
+                } else {
+                    local_addr.ip()
+                },
+                local_addr.port(),
+            );
+            Some(
+                TurnTcpBridge::start(tcp_bind, udp_target)
+                    .await
+                    .map_err(|e| Error::Bind(tcp_bind.to_string(), e))?,
+            )
+        } else {
+            None
+        };
+
         let relay_ports = if relay_port_min == 0 {
             "OS ephemeral range".to_string()
         } else {
@@ -376,6 +411,7 @@ impl TurnServer {
         );
         Ok(TurnServerHandle {
             server,
+            tcp,
             local_addr,
             relay_ip,
         })
@@ -418,6 +454,7 @@ mod tests {
     fn loopback_config() -> TurnServiceConfig {
         TurnServiceConfig {
             enabled: true,
+            tcp_enabled: false,
             bind: "127.0.0.1".into(),
             port: 0,
             public_ip: "127.0.0.1".into(),
@@ -443,6 +480,7 @@ mod tests {
     async fn rejects_wildcard_bind_without_public_ip() {
         let cfg = TurnServiceConfig {
             enabled: true,
+            tcp_enabled: false,
             bind: "0.0.0.0".into(),
             port: 0,
             public_ip: "".into(),
@@ -620,6 +658,43 @@ mod tests {
         assert_eq!(mapped.ip().to_string(), "127.0.0.1");
 
         client.close().await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    // Exercises the real TCP listener and its stream framing all the way
+    // through the same TURN engine used by UDP. A parser-only test would not
+    // catch a broken bind, five-tuple adapter, or response framing path.
+    #[tokio::test]
+    async fn answers_binding_request_through_tcp_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut cfg = loopback_config();
+        cfg.tcp_enabled = true;
+        let server = TurnServer::start(&cfg).await.unwrap();
+        let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ];
+        stream.write_all(&request).await.unwrap();
+
+        let mut header = [0u8; 20];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut header))
+            .await
+            .expect("TURN TCP binding response timed out")
+            .unwrap();
+        assert_eq!(&header[..2], &[0x01, 0x01]);
+        assert_eq!(&header[4..8], &[0x21, 0x12, 0xa4, 0x42]);
+        assert_eq!(&header[8..20], &request[8..20]);
+        let body_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).await.unwrap();
+        assert!(
+            body_len >= 8,
+            "binding response has no mapped-address attribute"
+        );
+
+        drop(stream);
         server.stop().await.unwrap();
     }
 }

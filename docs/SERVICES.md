@@ -24,7 +24,7 @@ is a normal member).
 | **Relay** | Forwards traffic between roster members so peers that can each reach this device, but not each other, can still talk. | off | node on |
 | **Signaling** | An *intelligent* Nostr relay (NIP-01 / WebSocket) peers use in place of public Nostr — live presence, instant departure, flood limits. | off · :4848 | nothing |
 | **STUN** | Answers RFC 5389 binding requests so peers learn their reflexive address. | off · :3478 | nothing |
-| **TURN** | Relays media / data for peers behind symmetric NAT (RFC 5766), with an optional per-connection bandwidth cap. | off · :3478 | public IP + credentials |
+| **TURN** | Relays media / data for peers behind symmetric NAT. UDP is primary; TCP and TLS are production fallbacks. | off · UDP/TCP :3478 | public IPv4 + credentials |
 
 ### Node
 
@@ -125,9 +125,14 @@ allocations. Peers add `stun:your-host:3478` to a network's STUN servers.
 
 ### TURN
 
-A full TURN server (via the webrtc-rs `turn` crate) for peers behind
-symmetric NAT, where a direct path can't be punched. TURN needs three
-things that STUN/signaling don't:
+A full TURN server for peers behind symmetric NAT, where a direct path
+can't be punched. It accepts the normal UDP control transport and can
+also accept RFC 8656 stream framing over TCP. The Caddy installer adds
+TLS termination on `turns:` port 5349. MyOwnMesh clients try the three
+paths in order—UDP, TCP, then TLS—without changing the relay allocation
+engine or the resulting ICE candidate.
+
+TURN needs three things that STUN/signaling don't:
 
 - **A public IP** (`public_ip`) — the routable address the server hands
   out in relay allocations. It can't guess this; if the bind address is a
@@ -135,12 +140,12 @@ things that STUN/signaling don't:
 - **At least one credential** — a username / password pair. Mirror the
   same pair into each peer's TURN config. Enabled without credentials,
   TURN shows as *enabled, not running*.
-- **Open UDP ports — the one that bites people.** `:3478` is only the
+- **Open every control and relay port—the one that bites people.** `:3478` is only the
   *control* channel; every relayed allocation flows through a *separate*
   UDP port. By default the server draws those from the **OS ephemeral
   range** (so the relay is never artificially capped) — on Linux that's
   `sysctl net.ipv4.ip_local_port_range`, e.g. Ubuntu's `32768–60999`.
-  Open `udp 3478` **and that whole range**:
+  For UDP-only TURN, open `udp 3478` **and that whole range**:
 
       sudo ufw allow 3478/udp
       sudo ufw allow 32768:60999/udp     # your sysctl range
@@ -151,8 +156,14 @@ things that STUN/signaling don't:
   failure is opening only 443 for the signaling proxy and then seeing
   `0 srflx · 0 relay` candidates on every client. To shrink the firewall
   surface, pin a fixed window via `relay_port_min` / `relay_port_max`
-  (e.g. `49152`–`65535`) and open only that. `myownmesh ctl services
-  enable turn` prints the right checklist either way.
+  (e.g. `49152`–`65535`) and open only that. When `tcp_enabled` is true,
+  also open TCP 3478; when Caddy provides TURN TLS, open TCP 5349.
+  `myownmesh ctl services enable turn` prints the right checklist either
+  way.
+
+The TCP/TLS path protects connectivity on networks that suppress UDP.
+Relay allocations still use UDP ports from the configured relay window,
+even when the client reaches the TURN control server over TCP or TLS.
 
 A TURN server also answers STUN binding requests, so enabling TURN gives
 you STUN for free on the same port — you rarely need both the STUN and
@@ -194,12 +205,15 @@ Services live under `services` in `~/.myownmesh/config.json`:
     "stun":      { "enabled": true, "bind": "0.0.0.0", "port": 3478 },
     "turn": {
       "enabled": true,
+      "tcp_enabled": true,
       "bind": "0.0.0.0",
       "port": 3478,
       "public_ip": "203.0.113.7",
       "realm": "myownmesh",
       "credentials": [ { "username": "alice", "password": "s3cret" } ],
-      "max_bps_per_connection": 0
+      "max_bps_per_connection": 0,
+      "relay_port_min": 49152,
+      "relay_port_max": 65535
     }
   },
   "networks": []
@@ -288,7 +302,7 @@ instead of (or alongside) the public defaults:
   `stun_servers` (write an explicit `[]` first if you want *only* your
   STUN).
 - **TURN** → add
-  `{ "urls": ["turn:your-host:3478"], "username": "alice", "credential": "s3cret" }`
+  `{ "urls": ["turn:turn.your-host:3478", "turn:turn.your-host:3478?transport=tcp", "turns:turn.your-host:5349?transport=tcp"], "username": "alice", "credential": "s3cret" }`
   to `turn_servers`.
 
 In the GUI these live under a network's gear icon → **Settings**
@@ -309,13 +323,25 @@ restrictive firewalls that block oddball ports — so a public endpoint
 wants a TLS-terminating reverse proxy on **443** that forwards the
 WebSocket upgrade to the relay on loopback.
 
-One command does the lot — installs Caddy if it's missing, writes the
-site block, binds the relay to loopback, and (re)starts the Caddy
+One command does the lot for signaling **and TURN**: installs Caddy if
+it is missing, idempotently adds the pinned `caddy-l4` module, writes
+only MyOwnMesh-managed blocks, enables signaling plus UDP/TCP TURN,
+pins an unbounded relay range to 49152–65535, configures UFW or firewalld
+when either is active, validates the complete Caddyfile, and reloads the
 service:
 
 ```
-myownmesh install caddy relay.example.com
+sudo myownmesh install caddy relay.example.com \
+  --turn-domain turn.example.com \
+  --public-ip 203.0.113.7
 ```
+
+`--turn-domain` defaults to `turn.<signaling-domain>`. `--public-ip` may
+be omitted after that TURN hostname has a working IPv4 A record. The
+command is safe to re-run: it checks the installed Caddy modules, updates
+fenced managed blocks in place, preserves custom relay ranges, and backs
+up the Caddyfile before changing it. A failed validation restores the
+previous file and never applies the bad configuration.
 
 It generates a Caddy site that proxies **only** WebSocket upgrades to the
 relay and answers everything else (browsers, scanners, health checks)
@@ -353,6 +379,36 @@ and 443** at the firewall (Caddy needs 80 for the ACME challenge) and keep
 the relay's own port (4848) on loopback — `install caddy` sets
 `services.signaling.bind` to `127.0.0.1` for you, so the only public door
 is the TLS one.
+
+For the complete public deployment, both the host firewall **and any
+provider/cloud firewall** must allow this exact ingress plan:
+
+| Protocol | Port(s) | Purpose |
+|---|---:|---|
+| TCP | 80 | ACME HTTP challenge / HTTPS redirect |
+| TCP | 443 | signaling over WSS and TURN hostname certificate management |
+| UDP | 3478 | STUN and preferred TURN control transport |
+| TCP | 3478 | TURN-over-TCP fallback |
+| TCP | 5349 | TURN-over-TLS fallback terminated by Caddy |
+| UDP | 49152–65535 | relayed peer traffic (or your custom bounded range) |
+
+For UFW, the installer converges these rules when UFW is active:
+
+```sh
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 3478/udp
+sudo ufw allow 3478/tcp
+sudo ufw allow 5349/tcp
+sudo ufw allow 49152:65535/udp
+```
+
+If neither UFW nor firewalld is active, the installer prints the exact
+rules but cannot modify an external cloud security group. Configure the
+same ports in the provider console. Do not open UDP 5349; TURN TLS is a
+TCP transport. Do not omit the UDP relay range; a successful allocation
+on 3478 followed by no media is the characteristic symptom of that
+mistake.
 
 ### 2. Give it its own hostname
 

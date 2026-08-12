@@ -27,6 +27,9 @@ async-trait = { workspace = true }
 pin-project-lite = { workspace = true }
 
 webrtc = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 dashmap = { workspace = true }
 parking_lot = { workspace = true }

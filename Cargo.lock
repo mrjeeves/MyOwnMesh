@@ -1402,6 +1402,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
@@ -1409,10 +1410,12 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.7",
  "webrtc",
 ]
 
@@ -1425,6 +1428,7 @@ dependencies = [
  "stun",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "turn",
  "webrtc-util",

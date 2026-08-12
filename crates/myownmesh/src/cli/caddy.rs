@@ -4,9 +4,9 @@
 //! enabled) speaks plain `ws://`. To expose it publicly over `wss://`
 //! it needs TLS termination in front, and Caddy is the least-friction
 //! option: it provisions and renews a Let's Encrypt certificate on its
-//! own. These commands stand that up — print the steps, or, given a
-//! domain, install Caddy, write the reverse-proxy site block pointed at
-//! the relay, and reload Caddy so peers can connect over `wss://`.
+//! own. The same installation adds Caddy Layer 4 for TURN TLS, enables
+//! TURN-over-TCP, and converges the host firewall. These commands stand
+//! that up without disturbing operator-owned Caddy configuration.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,19 +19,26 @@ use myownmesh_core::MeshConfig;
 /// `myownmesh install …`
 #[derive(Subcommand, Debug)]
 pub enum InstallCmd {
-    /// Install the Caddy reverse proxy in front of the signaling relay.
+    /// Install signaling WSS plus TURN TCP/TLS and firewall rules.
     ///
     /// With no DOMAIN it prints the install steps for your OS plus the
     /// reverse-proxy snippet to paste. With a DOMAIN (e.g. `myownmesh
     /// install caddy myownmesh.com`) it does the lot: installs Caddy if
     /// it's missing, writes a Caddy site that terminates TLS on 443 and
-    /// proxies WebSocket upgrades to your relay, binds the relay to
-    /// loopback, and starts the Caddy service — so peers can reach it at
-    /// `wss://DOMAIN`. Safe to re-run: it only touches its own managed
-    /// block and backs the file up first.
+    /// proxies WebSocket upgrades to your relay, adds Caddy Layer 4 for
+    /// `turns:` on 5349, enables TURN UDP/TCP on 3478, and converges UFW
+    /// or firewalld. Safe to re-run: it only touches fenced managed blocks
+    /// and backs the Caddyfile up first.
     Caddy {
         /// Domain the relay is served on. Omit to just print the steps.
         domain: Option<String>,
+        /// DNS name used for TURN TLS. Defaults to `turn.DOMAIN`.
+        #[arg(long)]
+        turn_domain: Option<String>,
+        /// Routable address advertised in TURN allocations. When omitted,
+        /// the installer resolves TURN_DOMAIN.
+        #[arg(long)]
+        public_ip: Option<String>,
     },
 }
 
@@ -44,8 +51,14 @@ pub enum CaddyCmd {
 
 pub async fn run_install(cmd: InstallCmd) -> Result<()> {
     match cmd {
-        InstallCmd::Caddy { domain } => match domain {
-            Some(d) => install_and_configure(&d).await,
+        InstallCmd::Caddy {
+            domain,
+            turn_domain,
+            public_ip,
+        } => match domain {
+            Some(d) => {
+                install_and_configure(&d, turn_domain.as_deref(), public_ip.as_deref()).await
+            }
             None => {
                 print_install_help();
                 Ok(())
@@ -71,16 +84,25 @@ pub async fn run_caddy(cmd: CaddyCmd) -> Result<()> {
 
 // ---- the "do it all" path ------------------------------------------------
 
-async fn install_and_configure(domain: &str) -> Result<()> {
+async fn install_and_configure(
+    domain: &str,
+    turn_domain: Option<&str>,
+    public_ip: Option<&str>,
+) -> Result<()> {
     let host = normalize_domain(domain);
     if host.is_empty() {
         anyhow::bail!("couldn't parse a domain out of {domain:?}");
     }
     let port = signaling_port();
+    let turn_host = turn_domain
+        .map(normalize_domain)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("turn.{host}"));
 
     println!("Setting up Caddy as a wss:// reverse proxy for the signaling relay.");
     println!("  domain : {host}  (TLS on 443)");
     println!("  relay  : 127.0.0.1:{port}  (services.signaling, loopback)");
+    println!("  TURN   : {turn_host}:3478 udp/tcp + :5349 TLS");
     println!();
 
     // 1. Ensure Caddy is present.
@@ -106,10 +128,13 @@ async fn install_and_configure(domain: &str) -> Result<()> {
         }
     }
 
+    ensure_caddy_layer4()?;
+
     // 2. Write / merge the Caddyfile (managed block only; backed up).
     let path = caddyfile_path();
+    let path_existed = path.exists();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let updated = upsert_managed_block(&existing, &host, port);
+    let updated = upsert_managed_block(&existing, &host, &turn_host, port, 3478, 5349);
     if updated == existing {
         println!("✓ Caddyfile already up to date: {}", path.display());
     } else {
@@ -128,26 +153,33 @@ async fn install_and_configure(domain: &str) -> Result<()> {
     }
 
     // 3. Reload (or start) Caddy.
-    reload_caddy(&path);
-
-    // 4. Harden the relay: enable it and bind it to loopback so the only
-    //    public door is Caddy's TLS — no plaintext ws://host:{port}
-    //    straight to the relay. Applied live through the daemon when it's
-    //    running; otherwise persisted to config for the next start.
-    match crate::cli::ctl::bind_signaling_loopback().await {
-        Ok(true) => println!("✓ Relay enabled and bound to 127.0.0.1 (reachable only via Caddy)."),
-        Ok(false) => match persist_signaling_loopback() {
-            Ok(()) => println!(
-                "✓ Set the relay to 127.0.0.1 in config — restart the daemon (or `myownmesh \
-                 serve`) to apply."
-            ),
-            Err(e) => println!(
-                "• Couldn't update the relay bind ({e}). Set services.signaling.bind = \
-                 \"127.0.0.1\" yourself."
-            ),
-        },
-        Err(e) => println!("• Couldn't reach the daemon to bind the relay to loopback: {e}"),
+    if let Err(error) = reload_caddy(&path) {
+        if updated != existing {
+            if path_existed {
+                std::fs::write(&path, &existing)
+                    .with_context(|| format!("restore {}", path.display()))?;
+                let _ = reload_caddy(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        return Err(error).context("Caddy configuration was rolled back");
     }
+
+    // 4. Converge persisted and running services. Stream TURN remains opt-in
+    //    for existing hosts and is enabled here together with TLS/firewalls.
+    let services = persist_public_services(&turn_host, public_ip)?;
+    match crate::cli::ctl::apply_services(services.clone()).await {
+        Ok(true) => println!("✓ Signaling and UDP/TCP TURN applied to the running daemon."),
+        Ok(false) => println!("• Services saved; restart MyOwnMesh to apply them."),
+        Err(error) => println!("• Services saved but live apply failed: {error}"),
+    }
+    configure_firewall(
+        services.turn.port,
+        5349,
+        services.turn.relay_port_min,
+        services.turn.relay_port_max,
+    );
 
     // 5. What's left for the user.
     println!();
@@ -155,7 +187,7 @@ async fn install_and_configure(domain: &str) -> Result<()> {
     println!();
     println!("Two things still have to be true for TLS to come up:");
     println!("  • DNS — an A/AAAA record for {host} resolves to this server's public IP.");
-    println!("  • Firewall — inbound TCP 80 AND 443 open (Caddy needs 80 for the ACME challenge).");
+    println!("  • Firewall/cloud group: TCP 80,443,3478,5349; UDP 3478 and 49152:65535.");
     println!();
     println!(
         "Verify:  npx wscat -c wss://{host}   (a real WebSocket handshake — expect a connect)"
@@ -172,11 +204,53 @@ async fn install_and_configure(domain: &str) -> Result<()> {
 
 /// Fallback for when the daemon isn't running: persist the loopback bind
 /// (and enable signaling) to config.json so it takes effect on next start.
-fn persist_signaling_loopback() -> Result<()> {
+fn persist_public_services(
+    turn_host: &str,
+    public_ip: Option<&str>,
+) -> Result<myownmesh_core::ServicesConfig> {
+    use std::net::{IpAddr, ToSocketAddrs};
+
     let mut cfg = MeshConfig::load().unwrap_or_default();
     cfg.services.signaling.enabled = true;
     cfg.services.signaling.bind = "127.0.0.1".to_string();
-    cfg.save().context("save config")
+    cfg.services.turn.enabled = true;
+    cfg.services.turn.tcp_enabled = true;
+    cfg.services.turn.bind = "0.0.0.0".to_string();
+    cfg.services.turn.port = 3478;
+    if cfg.services.turn.relay_port_min == 0 {
+        cfg.services.turn.relay_port_min = 49152;
+        cfg.services.turn.relay_port_max = 65535;
+    } else {
+        cfg.services.turn.relay_port_max = cfg
+            .services
+            .turn
+            .relay_port_max
+            .max(cfg.services.turn.relay_port_min);
+    }
+    let resolved = public_ip
+        .map(str::parse::<IpAddr>)
+        .transpose()
+        .context("parse --public-ip")?
+        .or_else(|| {
+            if cfg.services.turn.public_ip.trim().is_empty() {
+                (turn_host, 0)
+                    .to_socket_addrs()
+                    .ok()?
+                    .map(|address| address.ip())
+                    .find(IpAddr::is_ipv4)
+            } else {
+                cfg.services.turn.public_ip.parse().ok()
+            }
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not resolve {turn_host}; create its A record or pass --public-ip"
+            )
+        })?;
+    cfg.services.turn.public_ip = resolved.to_string();
+    let services = cfg.services.clone();
+    cfg.save().context("save config")?;
+    Ok(services)
 }
 
 // ---- pure helpers (unit-tested) ------------------------------------------
@@ -207,7 +281,7 @@ fn end_marker(host: &str) -> String {
 /// relay, and answer everything else (browsers, scanners, health checks)
 /// with a plain 200 instead of letting the WS-only relay reject them with
 /// an EOF — which Caddy would otherwise log as a 502 on every stray hit.
-fn site_block(host: &str, port: u16) -> String {
+fn site_block(host: &str, turn_host: &str, port: u16) -> String {
     format!(
         "{host} {{\n\
          \t@ws {{\n\
@@ -220,6 +294,9 @@ fn site_block(host: &str, port: u16) -> String {
          \thandle {{\n\
          \t\trespond \"MyOwnMesh signaling relay — connect over wss://\" 200\n\
          \t}}\n\
+         }}\n\n\
+         {turn_host} {{\n\
+         \trespond \"MyOwnMesh TURN relay — use turn:/turns:, not HTTPS\" 200\n\
          }}\n"
     )
 }
@@ -229,10 +306,17 @@ fn site_block(host: &str, port: u16) -> String {
 /// running again with the same args yields identical output; running
 /// with a new port rewrites just the block. We fence our block with
 /// comment markers so user-authored config is never disturbed.
-fn upsert_managed_block(existing: &str, host: &str, port: u16) -> String {
+fn upsert_managed_block(
+    existing: &str,
+    host: &str,
+    turn_host: &str,
+    port: u16,
+    turn_port: u16,
+    turns_port: u16,
+) -> String {
     let begin = begin_marker(host);
     let end = end_marker(host);
-    let managed = format!("{begin}\n{}{end}\n", site_block(host, port));
+    let managed = format!("{begin}\n{}{end}\n", site_block(host, turn_host, port));
 
     if let (Some(b), Some(e)) = (existing.find(&begin), existing.find(&end)) {
         if e > b {
@@ -246,7 +330,7 @@ fn upsert_managed_block(existing: &str, host: &str, port: u16) -> String {
             out.push_str(&existing[..b]);
             out.push_str(&managed);
             out.push_str(after);
-            return out;
+            return upsert_layer4_global(&out, turn_host, turn_port, turns_port);
         }
     }
 
@@ -261,7 +345,91 @@ fn upsert_managed_block(existing: &str, host: &str, port: u16) -> String {
         }
     }
     out.push_str(&managed);
-    out
+    upsert_layer4_global(&out, turn_host, turn_port, turns_port)
+}
+
+fn upsert_layer4_global(
+    existing: &str,
+    turn_host: &str,
+    turn_port: u16,
+    turns_port: u16,
+) -> String {
+    const BEGIN: &str = "# >>> myownmesh-turn-layer4";
+    const END: &str = "# <<< myownmesh-turn-layer4";
+    let block = format!(
+        "{BEGIN}\n\
+         layer4 {{\n\
+         \ttcp/:{turns_port} {{\n\
+         \t\t@turn tls sni {turn_host}\n\
+         \t\troute @turn {{\n\
+         \t\t\ttls\n\
+         \t\t\tproxy tcp/127.0.0.1:{turn_port}\n\
+         \t\t}}\n\
+         \t}}\n\
+         }}\n\
+         {END}\n"
+    );
+    if let (Some(start), Some(end)) = (existing.find(BEGIN), existing.find(END)) {
+        let after = end + END.len();
+        let line_start = existing[..start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let leading = &existing[line_start..start];
+        let (replace_from, replacement) = if leading.chars().all(|ch| ch == ' ' || ch == '\t') {
+            (line_start, indent(&block, leading))
+        } else {
+            (start, block)
+        };
+        return format!(
+            "{}{}{}",
+            &existing[..replace_from],
+            replacement,
+            existing[after..].trim_start_matches('\n')
+        );
+    }
+
+    if let Some(offset) = global_options_open(existing) {
+        let global = &existing[offset..];
+        let mut depth = 0usize;
+        for (relative, ch) in global.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let close = offset + relative;
+                        return format!(
+                            "{}\n{}{}",
+                            &existing[..close],
+                            indent(&block, "\t"),
+                            &existing[close..]
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    format!("{{\n{}}}\n\n{existing}", indent(&block, "\t"))
+}
+
+/// Return the opening brace of Caddy's global-options block when it is the
+/// first meaningful line. Leading comments are allowed and preserved. Caddy
+/// permits exactly one global block and requires it before site blocks.
+fn global_options_open(input: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in input.split_inclusive('\n') {
+        let meaningful = line.trim_start();
+        if meaningful.trim().is_empty() || meaningful.starts_with('#') {
+            offset += line.len();
+            continue;
+        }
+        return meaningful
+            .starts_with('{')
+            .then_some(offset + (line.len() - meaningful.len()));
+    }
+    None
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -353,16 +521,128 @@ fn caddy_installed() -> bool {
         .unwrap_or(false)
 }
 
-fn reload_caddy(path: &Path) {
+const CADDY_LAYER4_PACKAGE: &str = "github.com/mholt/caddy-l4@v0.1.2";
+
+fn caddy_has_layer4() -> bool {
+    Command::new("caddy")
+        .args(["list-modules", "--packages"])
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("github.com/mholt/caddy-l4")
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_caddy_layer4() -> Result<()> {
+    if caddy_has_layer4() {
+        println!("✓ Caddy Layer 4 module already installed.");
+        return Ok(());
+    }
+    println!("Installing the pinned Caddy Layer 4 module for TURN TLS…");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let managed_service = has_systemd_caddy();
+        if managed_service {
+            run_sudo("systemctl", &["stop", "caddy"]);
+        }
+        if !run_sudo(
+            "caddy",
+            &["add-package", CADDY_LAYER4_PACKAGE, "--keep-backup"],
+        ) {
+            if managed_service {
+                run_sudo("systemctl", &["start", "caddy"]);
+            }
+            anyhow::bail!("failed to install {CADDY_LAYER4_PACKAGE}");
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    if !run_echo(
+        "caddy",
+        &["add-package", CADDY_LAYER4_PACKAGE, "--keep-backup"],
+    ) {
+        anyhow::bail!("failed to install {CADDY_LAYER4_PACKAGE}");
+    }
+    if !caddy_has_layer4() {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if has_systemd_caddy() {
+            run_sudo("systemctl", &["start", "caddy"]);
+        }
+        anyhow::bail!("Caddy was rebuilt but the Layer 4 module is still absent");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if has_systemd_caddy() {
+        // `add-package` replaces the on-disk binary but does not restart the
+        // running process. Bring the known-good old config back immediately;
+        // the managed TURN config is validated and reloaded separately.
+        run_sudo("systemctl", &["start", "caddy"]);
+    }
+    println!("✓ Caddy Layer 4 module installed.");
+    Ok(())
+}
+
+fn configure_firewall(turn_port: u16, turns_port: u16, relay_min: u16, relay_max: u16) {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let ufw_active = Command::new("ufw")
+            .arg("status")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("Status: active"))
+            .unwrap_or(false);
+        if ufw_active {
+            for rule in [
+                "80/tcp".to_string(),
+                "443/tcp".to_string(),
+                format!("{turn_port}/udp"),
+                format!("{turn_port}/tcp"),
+                format!("{turns_port}/tcp"),
+                format!("{relay_min}:{relay_max}/udp"),
+            ] {
+                run_sudo("ufw", &["allow", &rule]);
+            }
+            println!("✓ UFW rules converged.");
+            return;
+        }
+
+        let firewalld_active = Command::new("systemctl")
+            .args(["is-active", "firewalld"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if firewalld_active {
+            for rule in [
+                "80/tcp".to_string(),
+                "443/tcp".to_string(),
+                format!("{turn_port}/udp"),
+                format!("{turn_port}/tcp"),
+                format!("{turns_port}/tcp"),
+                format!("{relay_min}-{relay_max}/udp"),
+            ] {
+                run_sudo("firewall-cmd", &["--permanent", "--add-port", &rule]);
+            }
+            run_sudo("firewall-cmd", &["--reload"]);
+            println!("✓ firewalld rules converged.");
+            return;
+        }
+    }
+    println!(
+        "• No active UFW/firewalld detected. Open TCP 80,443,{turn_port},{turns_port} and UDP {turn_port},{relay_min}:{relay_max} in the host firewall and cloud security group."
+    );
+}
+
+fn reload_caddy(path: &Path) -> Result<()> {
     let cfg = path.to_string_lossy().to_string();
 
     // Validate first so a typo in the merged file can't take down a
-    // running relay. Non-fatal — just a heads-up if it fails.
+    // running relay. Never apply a configuration that failed validation.
     if !run_echo(
         "caddy",
         &["validate", "--config", &cfg, "--adapter", "caddyfile"],
     ) {
-        println!("• Couldn't validate the Caddyfile — continuing anyway.");
+        anyhow::bail!(
+            "Caddy rejected {}; the running configuration was not changed",
+            path.display()
+        );
     }
 
     // A packaged Caddy (apt / dnf, or Homebrew) runs as a *managed
@@ -382,7 +662,7 @@ fn reload_caddy(path: &Path) {
                 || run_sudo("systemctl", &["restart", "caddy"])
             {
                 println!("✓ Caddy service is running with the new config.");
-                return;
+                return Ok(());
             }
         }
     }
@@ -390,7 +670,7 @@ fn reload_caddy(path: &Path) {
     {
         if which("brew") && run_echo("brew", &["services", "restart", "caddy"]) {
             println!("✓ Caddy service restarted with the new config.");
-            return;
+            return Ok(());
         }
     }
 
@@ -401,7 +681,7 @@ fn reload_caddy(path: &Path) {
         &["reload", "--config", &cfg, "--adapter", "caddyfile"],
     ) {
         println!("✓ Reloaded Caddy.");
-        return;
+        return Ok(());
     }
     println!("• Reload didn't take (Caddy may not be running yet) — starting it…");
     if run_echo(
@@ -409,7 +689,7 @@ fn reload_caddy(path: &Path) {
         &["start", "--config", &cfg, "--adapter", "caddyfile"],
     ) {
         println!("✓ Started Caddy.");
-        return;
+        return Ok(());
     }
     println!();
     println!("Couldn't start Caddy automatically. Start it yourself:");
@@ -421,6 +701,7 @@ fn reload_caddy(path: &Path) {
         "  or in the foreground:  caddy run --config {} --adapter caddyfile",
         path.display()
     );
+    anyhow::bail!("Caddy could not be started with the managed configuration")
 }
 
 /// Whether this box runs Caddy as a systemd service — the packaged
@@ -580,25 +861,41 @@ fn which(cmd: &str) -> bool {
 fn print_install_help() {
     let port = signaling_port();
     let path = caddyfile_path();
-    println!("Caddy fronts your plain-ws signaling relay with TLS so peers can use wss://.");
+    println!("Caddy provides signaling WSS and terminates TURN TLS on TCP 5349.");
     println!();
     println!("1) Install Caddy:");
     print_manual_install_steps();
     println!();
-    println!("2) Add this to your Caddyfile ({}):", path.display());
+    println!("2) Add the Layer 4 module (idempotent):");
+    println!("    caddy add-package {CADDY_LAYER4_PACKAGE} --keep-backup");
+    println!();
+    println!("3) Merge this into your Caddyfile ({}):", path.display());
     println!();
     print!(
         "{}",
-        indent(&site_block("your-domain.example", port), "    ")
+        indent(
+            &upsert_managed_block(
+                "",
+                "your-domain.example",
+                "turn.your-domain.example",
+                port,
+                3478,
+                5349,
+            ),
+            "    ",
+        )
     );
     println!();
     println!(
-        "3) Reload:  caddy reload --config {} --adapter caddyfile",
+        "4) Validate and reload:  caddy validate --config {} --adapter caddyfile && caddy reload --config {} --adapter caddyfile",
+        path.display(),
         path.display()
     );
     println!();
-    println!("Or let me do all three for you:");
-    println!("    myownmesh install caddy your-domain.example");
+    println!("5) Enable services.turn.tcp_enabled and open TCP 80,443,3478,5349 plus UDP 3478 and your relay range in both host and provider firewalls.");
+    println!();
+    println!("Or let me converge all of it for you:");
+    println!("    sudo myownmesh install caddy your-domain.example --turn-domain turn.your-domain.example --public-ip 203.0.113.7");
     println!();
     println!("(`myownmesh caddy path` prints just the Caddyfile location.)");
 }
@@ -646,7 +943,7 @@ mod tests {
 
     #[test]
     fn site_block_targets_local_relay() {
-        let b = site_block("myownmesh.com", 4848);
+        let b = site_block("myownmesh.com", "turn.myownmesh.com", 4848);
         assert!(b.contains("myownmesh.com {"));
         assert!(b.contains("reverse_proxy 127.0.0.1:4848"));
         // Only WebSocket upgrades are proxied; plain hits get a 200 so a
@@ -658,7 +955,7 @@ mod tests {
 
     #[test]
     fn upsert_into_empty_has_all_parts() {
-        let out = upsert_managed_block("", "myownmesh.com", 4848);
+        let out = upsert_managed_block("", "myownmesh.com", "turn.myownmesh.com", 4848, 3478, 5349);
         assert!(out.contains("# >>> myownmesh-managed: myownmesh.com"));
         assert!(out.contains("myownmesh.com {"));
         assert!(out.contains("reverse_proxy 127.0.0.1:4848"));
@@ -667,15 +964,23 @@ mod tests {
 
     #[test]
     fn upsert_is_idempotent() {
-        let once = upsert_managed_block("", "myownmesh.com", 4848);
-        let twice = upsert_managed_block(&once, "myownmesh.com", 4848);
+        let once =
+            upsert_managed_block("", "myownmesh.com", "turn.myownmesh.com", 4848, 3478, 5349);
+        let twice = upsert_managed_block(
+            &once,
+            "myownmesh.com",
+            "turn.myownmesh.com",
+            4848,
+            3478,
+            5349,
+        );
         assert_eq!(once, twice);
     }
 
     #[test]
     fn upsert_rewrites_port_in_place() {
-        let v1 = upsert_managed_block("", "myownmesh.com", 4848);
-        let v2 = upsert_managed_block(&v1, "myownmesh.com", 9000);
+        let v1 = upsert_managed_block("", "myownmesh.com", "turn.myownmesh.com", 4848, 3478, 5349);
+        let v2 = upsert_managed_block(&v1, "myownmesh.com", "turn.myownmesh.com", 9000, 3478, 5349);
         assert!(v2.contains("reverse_proxy 127.0.0.1:9000"));
         assert!(!v2.contains("4848"));
         // Exactly one managed block (begin + end markers = 2 hits).
@@ -685,13 +990,55 @@ mod tests {
     #[test]
     fn upsert_preserves_user_content() {
         let user = "example.org {\n\trespond \"hi\"\n}\n";
-        let out = upsert_managed_block(user, "myownmesh.com", 4848);
-        assert!(out.starts_with("example.org {"));
+        let out = upsert_managed_block(
+            user,
+            "myownmesh.com",
+            "turn.myownmesh.com",
+            4848,
+            3478,
+            5349,
+        );
+        // Caddy's single global-options block must remain first, so adding
+        // Layer 4 necessarily moves pre-existing site blocks below it.
         assert!(out.contains("respond \"hi\""));
         assert!(out.contains("myownmesh.com {"));
         // Second run leaves everything — user and managed — untouched.
-        let again = upsert_managed_block(&out, "myownmesh.com", 4848);
+        let again = upsert_managed_block(
+            &out,
+            "myownmesh.com",
+            "turn.myownmesh.com",
+            4848,
+            3478,
+            5349,
+        );
         assert_eq!(out, again);
         assert!(again.contains("respond \"hi\""));
+    }
+
+    #[test]
+    fn upsert_reuses_global_block_after_leading_comments() {
+        let input = "# operator note\n\n{\n\temail ops@example.com\n}\n\nexample.org {\n\trespond \"hi\"\n}\n";
+        let out = upsert_managed_block(
+            input,
+            "myownmesh.com",
+            "turn.myownmesh.com",
+            4848,
+            3478,
+            5349,
+        );
+        assert_eq!(out.matches("layer4 {").count(), 1);
+        assert_eq!(out.matches("email ops@example.com").count(), 1);
+        assert_eq!(out.matches("\n{\n").count(), 1);
+        assert_eq!(
+            out,
+            upsert_managed_block(
+                &out,
+                "myownmesh.com",
+                "turn.myownmesh.com",
+                4848,
+                3478,
+                5349,
+            )
+        );
     }
 }

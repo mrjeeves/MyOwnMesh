@@ -231,7 +231,7 @@ myownmesh update           # update everything now (daemon + GUI), then restart
 myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
-myownmesh install caddy <domain>    # TLS reverse proxy (Caddy) in front of the signaling relay
+myownmesh install caddy <domain>    # idempotent signaling WSS + TURN TCP/TLS + firewall setup
 myownmesh caddy path       # print the Caddyfile location to edit
 ```
 

@@ -493,6 +493,7 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
     let turn_help = if enabled && service == "turn" {
         Some((
             services.turn.port,
+            services.turn.tcp_enabled,
             services.turn.relay_port_min,
             services.turn.relay_port_max,
             services.turn.public_ip.clone(),
@@ -504,8 +505,8 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
     let ok = response.ok;
     print_response(response)?;
     if ok {
-        if let Some((port, relay_min, relay_max, public_ip)) = turn_help {
-            print_turn_firewall_help(port, relay_min, relay_max, &public_ip);
+        if let Some((port, tcp_enabled, relay_min, relay_max, public_ip)) = turn_help {
+            print_turn_firewall_help(port, tcp_enabled, relay_min, relay_max, &public_ip);
         }
     }
     Ok(())
@@ -516,12 +517,22 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
 /// control port (or nothing) is open — every relayed allocation flows
 /// through a separate port in the relay range, and a cloud security group
 /// blocks them even when the host firewall is off.
-fn print_turn_firewall_help(port: u16, relay_min: u16, relay_max: u16, public_ip: &str) {
+fn print_turn_firewall_help(
+    port: u16,
+    tcp_enabled: bool,
+    relay_min: u16,
+    relay_max: u16,
+    public_ip: &str,
+) {
     println!();
     println!("TURN is on. For NAT'd peers to actually relay, these UDP ports must be");
     println!("reachable — at the host firewall AND your cloud/provider security group");
     println!("(a host firewall being inactive does NOT mean the provider lets them in):");
     println!("  • udp {port}  — STUN/TURN control");
+    if tcp_enabled {
+        println!("  • tcp {port}  — TURN control fallback");
+        println!("  • tcp 5349    — TURN TLS when installed with `myownmesh install caddy`");
+    }
     if relay_min == 0 {
         // Unbounded (default): relay sockets come from the OS ephemeral
         // range — open that whole range.
@@ -529,12 +540,20 @@ fn print_turn_firewall_help(port: u16, relay_min: u16, relay_max: u16, public_ip
         println!("    find your range:  sysctl net.ipv4.ip_local_port_range   (e.g. 32768 60999)");
         println!("ufw, if that's what you run (substitute your range):");
         println!("  sudo ufw allow {port}/udp");
+        if tcp_enabled {
+            println!("  sudo ufw allow {port}/tcp");
+            println!("  sudo ufw allow 5349/tcp");
+        }
         println!("  sudo ufw allow 32768:60999/udp");
         println!("(Want a smaller firewall rule? Pin services.turn.relay_port_min/max.)");
     } else {
         println!("  • udp {relay_min}:{relay_max}  — relay allocations (one port per active peer)");
         println!("ufw, if that's what you run:");
         println!("  sudo ufw allow {port}/udp");
+        if tcp_enabled {
+            println!("  sudo ufw allow {port}/tcp");
+            println!("  sudo ufw allow 5349/tcp");
+        }
         println!("  sudo ufw allow {relay_min}:{relay_max}/udp");
     }
     if public_ip.trim().is_empty() {
@@ -546,29 +565,14 @@ fn print_turn_firewall_help(port: u16, relay_min: u16, relay_max: u16, public_ip
     println!("And point your stun./turn. DNS records at this box.");
 }
 
-/// Put the signaling relay behind a reverse proxy: enable it and bind it
-/// to loopback so the only public door is the TLS one Caddy owns (no
-/// plaintext `ws://host:4848` straight to the relay). Applied live via
-/// the daemon — `ServicesSet` rebinds the listener without a restart.
-/// Returns `Ok(true)` when applied, `Ok(false)` when the daemon isn't
-/// reachable (the caller persists to config.json and asks for a restart
-/// instead). Used by `myownmesh install caddy <domain>`.
-pub(crate) async fn bind_signaling_loopback() -> Result<bool> {
-    let status = match roundtrip(&Request::ServicesStatus).await {
-        Ok(s) => s,
-        Err(_) => return Ok(false), // daemon not running
+/// Apply a complete hosted-services configuration to a running daemon. The
+/// Caddy installer persists the same values first, so repeated installs
+/// converge both disk and live state without requiring a restart.
+pub(crate) async fn apply_services(services: ServicesConfig) -> Result<bool> {
+    let response = match roundtrip(&Request::ServicesSet { services }).await {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
     };
-    if !status.ok {
-        return Ok(false);
-    }
-    let Some(config_val) = status.data.unwrap_or(Value::Null).get("config").cloned() else {
-        return Ok(false);
-    };
-    let mut services: ServicesConfig =
-        serde_json::from_value(config_val).context("parse current services config")?;
-    services.signaling.enabled = true;
-    services.signaling.bind = "127.0.0.1".to_string();
-    let response = roundtrip(&Request::ServicesSet { services }).await?;
     Ok(response.ok)
 }
 

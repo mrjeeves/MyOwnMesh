@@ -135,7 +135,14 @@ pub fn default_stun_servers() -> Vec<StunServer> {
 /// explicit empty array (`"turn_servers": []`).
 pub fn default_turn_servers() -> Vec<TurnServer> {
     vec![TurnServer {
-        urls: vec!["turn:turn.myownmesh.com:3478".to_string()],
+        // Ordered from lowest overhead to broadest firewall compatibility.
+        // The transport rewrites the stream URLs through a local adapter
+        // because upstream webrtc-rs currently gathers UDP TURN only.
+        urls: vec![
+            "turn:turn.myownmesh.com:3478".to_string(),
+            "turn:turn.myownmesh.com:3478?transport=tcp".to_string(),
+            "turns:turn.myownmesh.com:5349?transport=tcp".to_string(),
+        ],
         username: Some("guest".to_string()),
         credential: Some("theguestpassword".to_string()),
     }]
@@ -522,6 +529,10 @@ impl Default for StunServiceConfig {
 #[serde(default)]
 pub struct TurnServiceConfig {
     pub enabled: bool,
+    /// Accept RFC 8656 TURN stream framing on TCP at the same bind/port as
+    /// UDP. Kept opt-in for existing self-hosts; `install caddy` enables it
+    /// while installing the matching firewall and TLS proxy configuration.
+    pub tcp_enabled: bool,
     pub bind: String,
     pub port: u16,
     /// Public IP the server hands out in relay allocations. TURN can't
@@ -558,6 +569,7 @@ impl Default for TurnServiceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            tcp_enabled: false,
             bind: "0.0.0.0".to_string(),
             port: DEFAULT_STUN_TURN_PORT,
             public_ip: String::new(),
