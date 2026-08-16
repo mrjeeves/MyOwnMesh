@@ -71,6 +71,25 @@ fn pk(device_id: &str) -> String {
     crate::signing::pubkey_part(device_id).to_string()
 }
 
+/// Legacy CEC clients and current clients deliberately use the same network
+/// id but disagree on its original kind (`Open/0` vs `Silent/0`). With no
+/// signed transitions on either side this is a stable compatibility fact, not
+/// convergence progress, so it should be reported once rather than on every
+/// signaling heartbeat.
+fn stable_open_silent_drift(
+    local_kind: NetworkKind,
+    local_count: u32,
+    remote_kind: NetworkKind,
+    remote_count: u32,
+) -> bool {
+    local_count == 0
+        && remote_count == 0
+        && matches!(
+            (local_kind, remote_kind),
+            (NetworkKind::Open, NetworkKind::Silent) | (NetworkKind::Silent, NetworkKind::Open)
+        )
+}
+
 /// Iterate active peers — those whose data channel is ACTIVE +
 /// authenticated. Used to broadcast governance frames.
 fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
@@ -655,18 +674,28 @@ pub async fn on_state_broadcast(
         )
     };
     if local_kind != msg.kind || local_count != msg.transitions_count {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "governance drift with {}: local {:?}/{} vs theirs {:?}/{}",
-                &peer_id[..peer_id.len().min(12)],
+        let stable_legacy =
+            stable_open_silent_drift(local_kind, local_count, msg.kind, msg.transitions_count);
+        let first = !stable_legacy
+            || state.stable_governance_drifts.lock().insert((
+                peer_id.to_string(),
                 local_kind,
-                local_count,
                 msg.kind,
-                msg.transitions_count
-            ),
-        );
+            ));
+        if first {
+            diag(
+                state,
+                crate::events::DiagLevel::Info,
+                format!(
+                    "governance drift with {}: local {:?}/{} vs theirs {:?}/{}",
+                    &peer_id[..peer_id.len().min(12)],
+                    local_kind,
+                    local_count,
+                    msg.kind,
+                    msg.transitions_count
+                ),
+            );
+        }
     }
     // Pull the peer's roster — which now carries the signed governance log —
     // when *either* our membership root differs or the peer's log is ahead of
@@ -1587,4 +1616,37 @@ pub async fn broadcast_state(state: &Arc<EngineState>) {
         roster_root,
     });
     broadcast(state, msg).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_zero_transition_open_silent_drift_is_stable() {
+        assert!(stable_open_silent_drift(
+            NetworkKind::Silent,
+            0,
+            NetworkKind::Open,
+            0
+        ));
+        assert!(stable_open_silent_drift(
+            NetworkKind::Open,
+            0,
+            NetworkKind::Silent,
+            0
+        ));
+        assert!(!stable_open_silent_drift(
+            NetworkKind::Closed,
+            4,
+            NetworkKind::Closed,
+            3
+        ));
+        assert!(!stable_open_silent_drift(
+            NetworkKind::Silent,
+            1,
+            NetworkKind::Open,
+            0
+        ));
+    }
 }

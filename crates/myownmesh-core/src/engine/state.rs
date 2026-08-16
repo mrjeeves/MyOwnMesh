@@ -353,6 +353,17 @@ pub struct NetworkState {
     /// 0600 on Unix). Loaded once on construction; the engine
     /// persists after every signed transition that lands.
     pub governance_state: RwLock<crate::network_state::NetworkState>,
+    /// Stable zero-transition Open/Silent mismatches already reported for
+    /// each peer. Legacy support clients can announce the old Open shape on
+    /// every heartbeat while a current client holds the corrected Silent
+    /// shape; the fact is useful once, not once per heartbeat forever.
+    pub(crate) stable_governance_drifts: Mutex<
+        std::collections::HashSet<(
+            String,
+            crate::network_state::NetworkKind,
+            crate::network_state::NetworkKind,
+        )>,
+    >,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
@@ -566,6 +577,7 @@ impl NetworkState {
             peers: DashMap::new(),
             roster: RwLock::new(roster),
             governance_state: RwLock::new(governance_state),
+            stable_governance_drifts: Mutex::new(std::collections::HashSet::new()),
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             channel_subscribers: DashMap::new(),

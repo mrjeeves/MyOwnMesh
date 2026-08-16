@@ -1632,6 +1632,19 @@ impl PeerSession {
 mod tests {
     use super::*;
 
+    fn skip_live_socket_test_on_windows() -> bool {
+        #[cfg(windows)]
+        {
+            if std::env::var("MYOWNMESH_RUN_LAN_TESTS").as_deref() != Ok("1") {
+                eprintln!(
+                    "SKIP WebRTC socket test on Windows: set MYOWNMESH_RUN_LAN_TESTS=1 to permit the live listener/firewall test"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
     fn sdp_fingerprint_extracts_and_normalises() {
         let sdp = "v=0\r\n\
@@ -1904,6 +1917,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_handshake_opens_data_channel() {
+        if skip_live_socket_test_on_windows() {
+            return;
+        }
         // Bring up two peer sessions on the same in-process
         // Transport. No STUN / TURN — they exchange host
         // candidates over the same loopback interface. Verifies
@@ -2049,6 +2065,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_video_lane_carries_h264_samples() {
+        if skip_live_socket_test_on_windows() {
+            return;
+        }
         // Same loopback bring-up as the data-channel test, but the
         // assertion is on the provisioned video lane: an Annex-B access
         // unit written on the offerer's track arrives at the answerer as
@@ -2144,6 +2163,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_audio_lane_carries_opus_frames() {
+        if skip_live_socket_test_on_windows() {
+            return;
+        }
         // The audio twin of the video lane test: an Opus frame written
         // on the offerer's audio track arrives at the answerer as one
         // AudioSample, byte-equal — the same single offer/answer
@@ -2237,6 +2259,9 @@ mod tests {
 
     #[tokio::test]
     async fn lanes_are_lifecycle_managed_not_pre_pooled() {
+        if skip_live_socket_test_on_windows() {
+            return;
+        }
         let transport = Transport::new().expect("transport");
         let (session, mut events) = transport
             .open_peer(Role::Offerer, &[], &[])
@@ -2375,6 +2400,9 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_lane_drains_but_is_never_reaped() {
+        if skip_live_socket_test_on_windows() {
+            return;
+        }
         let transport = Transport::new().expect("transport");
         let (session, mut events) = transport
             .open_peer(Role::Offerer, &[], &[])

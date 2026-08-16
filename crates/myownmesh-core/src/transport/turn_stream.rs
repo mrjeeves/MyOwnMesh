@@ -312,6 +312,14 @@ mod tests {
 
     #[tokio::test]
     async fn rewritten_tcp_url_round_trips_a_turn_frame() {
+        #[cfg(windows)]
+        if std::env::var("MYOWNMESH_RUN_LAN_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIP TURN stream socket test on Windows: set MYOWNMESH_RUN_LAN_TESTS=1 to permit the live listener/firewall test"
+            );
+            return;
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
         let responder = tokio::spawn(async move {
