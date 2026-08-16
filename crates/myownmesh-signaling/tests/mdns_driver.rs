@@ -8,6 +8,13 @@
 //! grace window the test SKIPS — loudly — instead of failing, so the
 //! suite stays deterministic; the wire-format logic is covered by
 //! always-run unit tests in `mdns::wire`.
+//!
+//! Windows asks the interactive user for firewall permission the first time
+//! each hashed test executable binds the LAN exchange listener, then leaves a
+//! new per-build rule behind. That is hostile for ordinary `cargo test` runs,
+//! so the live LAN test is opt-in there with
+//! `MYOWNMESH_RUN_LAN_TESTS=1`. Unit coverage remains unconditional on every
+//! platform, and Linux/macOS continue running this integration test normally.
 
 use std::time::Duration;
 
@@ -47,6 +54,14 @@ async fn wait_for_announce(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_drivers_discover_and_exchange() {
+    #[cfg(windows)]
+    if std::env::var("MYOWNMESH_RUN_LAN_TESTS").as_deref() != Ok("1") {
+        eprintln!(
+            "SKIP mdns_driver test on Windows: set MYOWNMESH_RUN_LAN_TESTS=1 to permit the live LAN/firewall test"
+        );
+        return;
+    }
+
     let network = format!("mdns-driver-test-{}", std::process::id());
 
     let (a_out_tx, a_out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();

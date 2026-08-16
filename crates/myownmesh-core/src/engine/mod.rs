@@ -2935,7 +2935,10 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
     };
 
     state.log_diag_with(
-        crate::events::DiagLevel::Info,
+        // This is a routine liveness check and can recur for a sleeping peer.
+        // Keep the actual failed-probe/rebuild warning visible below, but do
+        // not fill normal logs with the probe preamble every backoff window.
+        crate::events::DiagLevel::Debug,
         "signaling",
         format!(
             "{} re-announced but its session has been silent > {} ms — probing before trusting ICE",
