@@ -24,10 +24,10 @@
 //!   there; mDNSResponder isn't). The exchange below is backend-independent.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -91,7 +91,25 @@ pub enum MdnsOutbound {
 
 /// How long a dial to a peer's advertised exchange port may take
 /// before we try its next address (or give up).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Do not open an unbounded socket fan-out on a machine whose DNS-SD advert
+/// contains every physical, virtual, and stale adapter. Two concurrent probes
+/// are enough to get control-plane signaling moving quickly while keeping a
+/// broken multi-homed peer cheap to retry.
+const MAX_PARALLEL_DIALS: usize = 2;
+
+/// Per-endpoint retry pacing after a failed TCP exchange dial. A fresh resolve
+/// can add another address immediately; an address we already proved dead is
+/// cooled instead of being hammered on every offer/candidate burst.
+const ENDPOINT_BACKOFF: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// An outbound exchange connection is closed after this much idle —
 /// signaling for one handshake is bursty; anything longer-lived than
@@ -162,6 +180,7 @@ pub fn start(
         registered: AtomicBool::new(registered),
         peers: Mutex::new(HashMap::new()),
         key_to_peer: Mutex::new(HashMap::new()),
+        endpoint_health: Mutex::new(HashMap::new()),
         conns: Mutex::new(HashMap::new()),
         conn_gen: AtomicU64::new(0),
         inbound_tx,
@@ -251,6 +270,10 @@ struct Shared {
     /// Backend discovery key → device id, so a `Removed` (which only
     /// carries the key) maps back to the peer it withdraws.
     key_to_peer: Mutex<HashMap<String, String>>,
+    /// Failed TCP exchange endpoints, paced independently. DNS-SD can expose
+    /// several addresses for one host; one dead adapter must not make every
+    /// subsequent offer wait on or repeatedly hit it.
+    endpoint_health: Mutex<HashMap<(String, SocketAddr), EndpointHealth>>,
     /// Live exchange connections, either direction: device id →
     /// writer. Outbound dials register at connect; inbound accepts
     /// register under the first `from` their frames carry, so a reply
@@ -264,6 +287,12 @@ struct Shared {
 struct PeerEntry {
     addrs: Vec<IpAddr>,
     port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EndpointHealth {
+    failures: u8,
+    retry_after: Instant,
 }
 
 #[derive(Clone)]
@@ -293,9 +322,8 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                     continue;
                 }
                 addrs.sort();
-                let entry = PeerEntry { addrs, port };
                 shared.key_to_peer.lock().insert(key, advert.peer.clone());
-                shared.peers.lock().insert(advert.peer.clone(), entry);
+                merge_peer_entry(&mut shared.peers.lock(), &advert.peer, addrs, port);
                 debug!(peer = %&advert.peer[..advert.peer.len().min(16)], "mdns peer resolved");
                 // Every resolve (first sight or cache refresh) surfaces as
                 // an announce; the engine is idempotent on repeats, same
@@ -308,6 +336,10 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 let peer = shared.key_to_peer.lock().remove(&key);
                 if let Some(peer) = peer {
                     shared.peers.lock().remove(&peer);
+                    shared
+                        .endpoint_health
+                        .lock()
+                        .retain(|(known_peer, _), _| known_peer != &peer);
                     shared.conns.lock().remove(&peer);
                     debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
                     let _ = shared
@@ -374,37 +406,141 @@ async fn send_directed(shared: &Arc<Shared>, to: String, msg: SignalingMessage) 
         debug!(peer = %&to[..to.len().min(16)], "mdns directed message for unknown peer dropped");
         return;
     };
-    // All advertised addresses race concurrently and the first
-    // connect wins — a host advertises every interface (docker
-    // bridges, secondary NICs, …) and dialing serially would burn a
-    // full DIAL_TIMEOUT per dead address, longer than a handshake
-    // window.
-    let attempts: Vec<_> = entry
+    // DNS-SD can resolve one service repeatedly through different adapters.
+    // Try a small batch at a time, and cool endpoints that already failed.
+    // A newly observed address has no penalty and is therefore tried on the
+    // next directed frame without waiting for a stale adapter's backoff.
+    let endpoints = dial_candidates(shared, &to, &entry, Instant::now());
+    let mut last_error = None;
+    for batch in endpoints.chunks(MAX_PARALLEL_DIALS) {
+        let attempts: Vec<_> = batch
+            .iter()
+            .copied()
+            .map(|endpoint| {
+                Box::pin(async move {
+                    let stream = timeout(DIAL_TIMEOUT, TcpStream::connect(endpoint))
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")
+                        })??;
+                    Ok::<_, std::io::Error>((stream, endpoint))
+                })
+            })
+            .collect();
+        match futures::future::select_ok(attempts).await {
+            Ok(((stream, endpoint), _rest)) => {
+                shared
+                    .endpoint_health
+                    .lock()
+                    .remove(&(to.clone(), endpoint));
+                let tx = adopt_stream(shared, stream, Some(to));
+                let _ = tx.send(line);
+                return;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                note_endpoint_failures(shared, &to, batch, Instant::now());
+            }
+        }
+    }
+    if let Some(e) = last_error {
+        debug!(
+            peer = %&to[..to.len().min(16)],
+            "mdns peer unreachable on every due advertised address: {e}"
+        );
+    }
+}
+
+/// Fold another DNS-SD resolution into a peer without letting a single
+/// interface-specific refresh erase addresses learned through its siblings.
+/// A changed SRV port means a new listener generation, so old addresses are
+/// replaced rather than paired with a port they never advertised.
+fn merge_peer_entry(
+    peers: &mut HashMap<String, PeerEntry>,
+    peer: &str,
+    mut addrs: Vec<IpAddr>,
+    port: u16,
+) {
+    addrs.sort();
+    addrs.dedup();
+    match peers.get_mut(peer) {
+        Some(entry) if entry.port == port => {
+            entry.addrs.extend(addrs);
+            entry.addrs.sort();
+            entry.addrs.dedup();
+        }
+        Some(entry) => *entry = PeerEntry { addrs, port },
+        None => {
+            peers.insert(peer.to_string(), PeerEntry { addrs, port });
+        }
+    }
+}
+
+/// Pick endpoints whose backoff has elapsed. If every address is cooling,
+/// probe only the one due soonest so the control plane can self-heal without
+/// turning a burst of ICE candidates into a burst of socket timeouts.
+fn dial_candidates(
+    shared: &Shared,
+    peer: &str,
+    entry: &PeerEntry,
+    now: Instant,
+) -> Vec<SocketAddr> {
+    let health = shared.endpoint_health.lock();
+    select_dial_candidates(&health, peer, entry, now)
+}
+
+fn select_dial_candidates(
+    health: &HashMap<(String, SocketAddr), EndpointHealth>,
+    peer: &str,
+    entry: &PeerEntry,
+    now: Instant,
+) -> Vec<SocketAddr> {
+    let mut endpoints: Vec<_> = entry
         .addrs
         .iter()
-        .map(|addr| {
-            let addr = *addr;
-            let port = entry.port;
-            Box::pin(async move {
-                timeout(DIAL_TIMEOUT, TcpStream::connect((addr, port)))
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")
-                    })?
-            })
+        .copied()
+        .map(|addr| SocketAddr::new(addr, entry.port))
+        .collect();
+    endpoints.sort_by_key(|endpoint| {
+        health
+            .get(&(peer.to_string(), *endpoint))
+            .map(|h| (h.retry_after, h.failures))
+            .unwrap_or((now, 0))
+    });
+    let mut due: Vec<_> = endpoints
+        .iter()
+        .copied()
+        .filter(|endpoint| {
+            health
+                .get(&(peer.to_string(), *endpoint))
+                .is_none_or(|h| h.retry_after <= now)
         })
         .collect();
-    match futures::future::select_ok(attempts).await {
-        Ok((stream, _rest)) => {
-            let tx = adopt_stream(shared, stream, Some(to));
-            let _ = tx.send(line);
+    if due.is_empty() {
+        if let Some(first) = endpoints.first().copied() {
+            due.push(first);
         }
-        Err(e) => {
-            debug!(
-                peer = %&to[..to.len().min(16)],
-                "mdns peer unreachable on every advertised address: {e}"
-            );
-        }
+    }
+    due
+}
+
+fn note_endpoint_failures(shared: &Shared, peer: &str, endpoints: &[SocketAddr], now: Instant) {
+    let mut health = shared.endpoint_health.lock();
+    for endpoint in endpoints {
+        let key = (peer.to_string(), *endpoint);
+        let failures = health
+            .get(&key)
+            .map(|h| h.failures.saturating_add(1))
+            .unwrap_or(1);
+        let delay = ENDPOINT_BACKOFF
+            [usize::from(failures.saturating_sub(1)).min(ENDPOINT_BACKOFF.len() - 1)];
+        health.insert(
+            key,
+            EndpointHealth {
+                failures,
+                retry_after: now + delay,
+            },
+        );
     }
 }
 
@@ -634,5 +770,126 @@ async fn run_reannounce(shared: Arc<Shared>) {
                 .inbound_tx
                 .send(MdnsInbound::PeerAnnounced { device_id });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn repeated_resolves_union_addresses_for_one_listener() {
+        let mut peers = HashMap::new();
+        merge_peer_entry(
+            &mut peers,
+            "peer",
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))],
+            41000,
+        );
+        merge_peer_entry(
+            &mut peers,
+            "peer",
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            ],
+            41000,
+        );
+
+        let entry = peers.get("peer").unwrap();
+        assert_eq!(entry.port, 41000);
+        assert_eq!(
+            entry.addrs,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_listener_port_replaces_stale_addresses() {
+        let mut peers = HashMap::new();
+        merge_peer_entry(
+            &mut peers,
+            "peer",
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))],
+            41000,
+        );
+        merge_peer_entry(
+            &mut peers,
+            "peer",
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30))],
+            42000,
+        );
+
+        let entry = peers.get("peer").unwrap();
+        assert_eq!(entry.port, 42000);
+        assert_eq!(
+            entry.addrs,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30))]
+        );
+    }
+
+    #[test]
+    fn endpoint_selection_skips_cooling_adapters() {
+        let now = Instant::now();
+        let entry = PeerEntry {
+            addrs: vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            ],
+            port: 41000,
+        };
+        let cooling = SocketAddr::new(entry.addrs[0], entry.port);
+        let ready = SocketAddr::new(entry.addrs[1], entry.port);
+        let health = HashMap::from([(
+            ("peer".to_string(), cooling),
+            EndpointHealth {
+                failures: 3,
+                retry_after: now + Duration::from_secs(5),
+            },
+        )]);
+
+        assert_eq!(
+            select_dial_candidates(&health, "peer", &entry, now),
+            vec![ready]
+        );
+    }
+
+    #[test]
+    fn all_cooling_endpoints_allow_one_earliest_probe() {
+        let now = Instant::now();
+        let entry = PeerEntry {
+            addrs: vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ],
+            port: 41000,
+        };
+        let first = SocketAddr::new(entry.addrs[0], entry.port);
+        let second = SocketAddr::new(entry.addrs[1], entry.port);
+        let health = HashMap::from([
+            (
+                ("peer".to_string(), first),
+                EndpointHealth {
+                    failures: 2,
+                    retry_after: now + Duration::from_secs(10),
+                },
+            ),
+            (
+                ("peer".to_string(), second),
+                EndpointHealth {
+                    failures: 1,
+                    retry_after: now + Duration::from_secs(2),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            select_dial_candidates(&health, "peer", &entry, now),
+            vec![second]
+        );
     }
 }
