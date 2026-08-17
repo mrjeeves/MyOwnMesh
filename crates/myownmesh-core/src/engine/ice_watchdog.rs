@@ -251,8 +251,9 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // single stuck peer while others are live trades one bad link for all
     // of them. When we're already alone there's nothing to lose, and a
     // genuinely-stale socket is the likeliest reason we can't reach
-    // anyone — that's the case worth the redial. The throttle still caps
-    // it to one per RELAY_RESCUE_MIN_INTERVAL_MS.
+    // anyone — that's the case worth the redial. Candidate traffic now
+    // validates the hypothesis; unconfirmed rescues retry on exponential
+    // backoff rather than this peer's flat connect-timeout cadence.
     let no_remote = state
         .peers
         .get(device_id)
@@ -290,13 +291,13 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
                     "redial": false,
                 }),
             );
-        } else if state.request_relay_reconnect_throttled() {
+        } else if let Some(attempt) = state.request_relay_reconnect_throttled(device_id) {
             state.log_diag_with(
                 DiagLevel::Info,
                 "signaling",
                 format!(
                     "no remote candidates arrived for {} and we're alone — forcing relay \
-                     reconnect (socket likely went stale)",
+                     reconnect (unconfirmed rescue attempt {attempt})",
                     super::short_peer(device_id),
                 ),
                 serde_json::json!({
@@ -304,6 +305,7 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
                     "reason": "no_remote_candidates",
                     "other_live_peers": 0,
                     "redial": true,
+                    "unconfirmed_attempt": attempt,
                 }),
             );
         }

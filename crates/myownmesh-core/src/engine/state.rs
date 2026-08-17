@@ -4,6 +4,7 @@
 //! command queue so the driver loop owns serial access.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -25,7 +26,7 @@ use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
 use super::scheduler::{
-    RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_MIN_INTERVAL_MS,
+    RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_RETRY_BACKOFF_MS,
 };
 
 /// One assembled video access unit from a peer's track lane, as the
@@ -85,6 +86,46 @@ fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
         .unwrap_or(15_000);
     intent.attempt = intent.attempt.saturating_add(1);
     intent.next_retry_at = now + std::time::Duration::from_millis(step);
+}
+
+/// Evidence and pacing for the network-global "relay socket may be stale"
+/// rescue. A relay redial is only a hypothesis test: until a remote candidate
+/// arrives it has not proved that signaling recovered, so retries widen rather
+/// than re-arming on every per-peer connect timeout.
+#[derive(Debug, Default)]
+struct RelayRescueWatch {
+    last_attempt_at: Option<Instant>,
+    unconfirmed_attempts: usize,
+    awaiting_peer: Option<String>,
+}
+
+impl RelayRescueWatch {
+    fn take_permit(&mut self, peer: &str, now: Instant) -> Option<usize> {
+        if let Some(last) = self.last_attempt_at {
+            let delay = RELAY_RESCUE_RETRY_BACKOFF_MS
+                .get(self.unconfirmed_attempts.saturating_sub(1))
+                .copied()
+                .or_else(|| RELAY_RESCUE_RETRY_BACKOFF_MS.last().copied())
+                .unwrap_or(300_000);
+            if now.saturating_duration_since(last).as_millis() < u128::from(delay) {
+                return None;
+            }
+        }
+
+        self.last_attempt_at = Some(now);
+        self.unconfirmed_attempts = self.unconfirmed_attempts.saturating_add(1);
+        self.awaiting_peer = Some(peer.to_string());
+        Some(self.unconfirmed_attempts)
+    }
+
+    fn note_remote_candidate(&mut self, peer: &str) {
+        if self.awaiting_peer.as_deref() != Some(peer) {
+            return;
+        }
+        self.last_attempt_at = None;
+        self.unconfirmed_attempts = 0;
+        self.awaiting_peer = None;
+    }
 }
 
 /// Engine command queue entry. Anything that mutates per-peer
@@ -472,15 +513,11 @@ pub struct NetworkState {
     /// a relay that hasn't reconnected yet. `None` when no driver is attached.
     relay_connected: Mutex<Option<Arc<watch::Sender<u64>>>>,
 
-    /// Last time the ICE-failure path forced a relay redial via
-    /// [`request_relay_reconnect_throttled`]. Gates the "no remote
-    /// candidates arrived" rescue (see
-    /// `ice_watchdog::on_checking_timeout`) so a peer that keeps timing
-    /// out every `ICE_CHECKING_TIMEOUT_MS` can't redial the relays on
-    /// every cycle — one redial per
-    /// [`RELAY_RESCUE_MIN_INTERVAL_MS`] window is enough to recover a
-    /// genuinely-wedged signaling socket without churning healthy ones.
-    last_relay_rescue_at: Mutex<Option<std::time::Instant>>,
+    /// State for the automatic "zero remote candidates" relay rescue. Tracks
+    /// whether a forced redial actually produced candidate traffic and backs
+    /// off unconfirmed retries so an unreachable peer cannot churn the shared
+    /// signaling sockets forever.
+    relay_rescue: Mutex<RelayRescueWatch>,
 
     /// Set by the network watcher when the OS reports *no* primary
     /// outbound IP (neither v4 nor v6) — i.e. the host is fully
@@ -600,7 +637,7 @@ impl NetworkState {
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
-            last_relay_rescue_at: Mutex::new(None),
+            relay_rescue: Mutex::new(RelayRescueWatch::default()),
             offline: std::sync::atomic::AtomicBool::new(false),
             conn_trace_tx,
             conn_trace_force_on,
@@ -726,39 +763,28 @@ impl NetworkState {
         }
     }
 
-    /// Like [`request_relay_reconnect`], but throttled to at most one
-    /// redial per [`RELAY_RESCUE_MIN_INTERVAL_MS`]. This is the rescue
-    /// path for the "ICE timed out with zero remote candidates"
-    /// fingerprint — the peer's candidates never crossed the relay, which
-    /// is almost always a relay socket that went stale after a network
-    /// blip (held open for minutes because the kernel never saw a
-    /// FIN/RST). Unlike the bare redial, this fires *even when other peers
-    /// are still up*: a wedged relay socket starves candidate delivery for
-    /// every peer, not just one, so gating on "no other live peer" (the
-    /// old behavior) left the wedge in place whenever the room wasn't
-    /// completely dark. The throttle is what makes that safe — a peer
-    /// stuck re-timing-out every `ICE_CHECKING_TIMEOUT_MS` can still only
-    /// bounce the relays once per window.
+    /// Try the automatic "zero remote candidates" relay rescue. The first
+    /// attempt is immediate. If it produces no remote candidate traffic,
+    /// retries follow [`RELAY_RESCUE_RETRY_BACKOFF_MS`]. A remote candidate
+    /// from the peer the rescue targeted confirms that candidate delivery was
+    /// restored and resets the backoff.
     ///
-    /// Returns `true` when a redial was actually issued (driver attached
-    /// *and* past the throttle), `false` when suppressed — callers log the
-    /// distinction so the rescue's decisions are visible in diagnostics.
-    pub fn request_relay_reconnect_throttled(&self) -> bool {
-        let now = std::time::Instant::now();
-        {
-            let mut guard = self.last_relay_rescue_at.lock();
-            let due = guard
-                .map(|prev| {
-                    now.duration_since(prev)
-                        >= std::time::Duration::from_millis(RELAY_RESCUE_MIN_INTERVAL_MS)
-                })
-                .unwrap_or(true);
-            if !due {
-                return false;
-            }
-            *guard = Some(now);
+    /// Returns the one-based unconfirmed attempt number when a redial was
+    /// actually issued, or `None` when no driver is attached, signaling was
+    /// already proven healthy, or the retry is still backing off.
+    pub fn request_relay_reconnect_throttled(&self, peer: &str) -> Option<usize> {
+        if self.relay_reconnect.lock().is_none() {
+            return None;
         }
-        self.request_relay_reconnect()
+        let attempt = self.relay_rescue.lock().take_permit(peer, Instant::now())?;
+        self.request_relay_reconnect().then_some(attempt)
+    }
+
+    /// Record hard evidence that directed signaling is reaching this network.
+    /// Called for every inbound ICE candidate, even when its peer session has
+    /// already gone away, because receipt itself proves the relay path works.
+    pub fn note_remote_candidate(&self, peer: &str) {
+        self.relay_rescue.lock().note_remote_candidate(peer);
     }
 
     /// Record whether the host currently has any primary outbound IP.
@@ -1408,4 +1434,75 @@ pub(crate) fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod relay_rescue_tests {
+    use super::RelayRescueWatch;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unconfirmed_rescues_back_off_instead_of_following_connect_timeouts() {
+        let started = Instant::now();
+        let mut watch = RelayRescueWatch::default();
+
+        assert_eq!(watch.take_permit("peer-a", started), Some(1));
+        assert_eq!(
+            watch.take_permit("peer-b", started + Duration::from_secs(32)),
+            None,
+            "a second peer's timeout must share the network-global backoff"
+        );
+        assert_eq!(
+            watch.take_permit("peer-b", started + Duration::from_secs(60)),
+            Some(2)
+        );
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(179)),
+            None,
+            "after a second unconfirmed rescue the gap widens to two minutes"
+        );
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(180)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn candidate_traffic_proves_the_relay_for_the_inflight_session() {
+        let started = Instant::now();
+        let mut watch = RelayRescueWatch::default();
+        assert_eq!(watch.take_permit("peer-a", started), Some(1));
+
+        watch.note_remote_candidate("peer-b");
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(32)),
+            None,
+            "an unrelated peer does not falsely confirm this rescue"
+        );
+
+        watch.note_remote_candidate("peer-a");
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(33)),
+            Some(1),
+            "a candidate from the rescued peer confirms recovery and resets backoff"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_rescue_backoff_caps_at_five_minutes() {
+        let started = Instant::now();
+        let mut watch = RelayRescueWatch {
+            last_attempt_at: Some(started),
+            unconfirmed_attempts: 99,
+            awaiting_peer: Some("peer-a".into()),
+        };
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(299)),
+            None
+        );
+        assert_eq!(
+            watch.take_permit("peer-a", started + Duration::from_secs(300)),
+            Some(100)
+        );
+    }
 }
