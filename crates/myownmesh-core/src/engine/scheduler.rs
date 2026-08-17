@@ -149,18 +149,17 @@ pub const PEER_SEND_TIMEOUT_MS: u64 = 2_000;
 /// in seconds, not at the heartbeat timeout a minute later.
 pub const RESTART_TRAFFIC_GRACE_MS: u64 = 10_000;
 
-/// Minimum gap between relay redials forced by the "connect timed out with
-/// zero remote candidates" rescue (see
-/// [`crate::engine::state::NetworkState::request_relay_reconnect_throttled`]).
-/// A peer whose candidates never cross the relay re-times-out every
-/// `DATA_CHANNEL_OPEN_TIMEOUT_MS`; without this throttle the rescue would
-/// bounce the relay sockets on every one of those cycles. One redial per
-/// this window is enough to recover a socket that actually went stale
-/// after a network blip, while leaving healthy sockets — the ones already
-/// delivering candidates for other peers — undisturbed. Matched to the
-/// connect-timeout so a single stuck peer maps to at most one redial per
-/// timeout cycle.
-pub const RELAY_RESCUE_MIN_INTERVAL_MS: u64 = 30_000;
+/// Retry schedule for an automatic relay rescue that did not produce any
+/// inbound remote ICE candidate afterward. The first rescue is immediate;
+/// subsequent unconfirmed rescues back off through this schedule and park at
+/// the final interval. A real inbound candidate resets the schedule because
+/// it proves directed signaling crossed the fresh relay session.
+///
+/// This is intentionally longer than `DATA_CHANNEL_OPEN_TIMEOUT_MS` from the
+/// first retry onward. Otherwise a peer that is simply offline re-times-out on
+/// that clock and turns every failed per-peer rebuild into a network-global
+/// relay redial forever.
+pub const RELAY_RESCUE_RETRY_BACKOFF_MS: &[u64] = &[60_000, 120_000, 240_000, 300_000];
 
 /// After a network change kicks an ICE-restart fan-out, ignore further
 /// change-triggered restarts for this long. A Wi-Fi→cellular handoff

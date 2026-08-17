@@ -778,6 +778,11 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             device_id,
             candidate,
         } => {
+            // This is the success criterion for the automatic relay rescue:
+            // directed candidate traffic reached us through signaling. Record
+            // it even if the session disappeared before this late candidate,
+            // because receipt itself disproves a zombie relay socket.
+            state.note_remote_candidate(&device_id);
             // Classify the inbound candidate so the no-TURN
             // diagnostic has accurate remote-side counts. Record
             // before adding to the session — recording is cheap and
@@ -3618,6 +3623,36 @@ mod tests {
         state.clear_reconnect_intent("peer-y");
         assert!(!state.has_reconnect_intent("peer-y"));
         assert!(state.due_reconnect_intents().is_empty());
+    }
+
+    #[test]
+    fn relay_rescue_redials_immediately_then_requires_confirmation_or_backoff() {
+        let state = build_test_state("relay-rescue-watch");
+        let (signal, generation) = tokio::sync::watch::channel(0u64);
+        state.set_relay_reconnect(Arc::new(signal));
+
+        assert_eq!(state.request_relay_reconnect_throttled("peer-a"), Some(1));
+        assert_eq!(*generation.borrow(), 1, "the first rescue redials now");
+        assert_eq!(
+            state.request_relay_reconnect_throttled("peer-b"),
+            None,
+            "another dead peer cannot bypass the network-global backoff"
+        );
+        assert_eq!(*generation.borrow(), 1);
+
+        state.note_remote_candidate("peer-b");
+        assert_eq!(
+            state.request_relay_reconnect_throttled("peer-a"),
+            None,
+            "a different peer cannot falsely confirm the attempted rescue"
+        );
+        state.note_remote_candidate("peer-a");
+        assert_eq!(state.request_relay_reconnect_throttled("peer-a"), Some(1));
+        assert_eq!(
+            *generation.borrow(),
+            2,
+            "confirmed candidate delivery resets the rescue state"
+        );
     }
 
     #[tokio::test]
