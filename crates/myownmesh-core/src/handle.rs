@@ -17,12 +17,13 @@ use crate::channels::Channel;
 use crate::config::{MeshConfig, NetworkConfig, TopologyMode};
 use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
-use crate::engine::spawn_network;
+use crate::engine::spawn_network_in_mesh_scope;
 use crate::engine::state::{NetworkCmd, NetworkState};
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
+use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot, ResourceReport};
 use crate::roster::AuthorizedPeer;
 use crate::rpc::Rpc;
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
@@ -44,6 +45,7 @@ pub struct Mesh {
 struct MeshInner {
     identity: Arc<Identity>,
     transport: Transport,
+    resource_scope: MeshRuntimeResourceScope,
     events_tx: broadcast::Sender<MeshEvent>,
     networks: Mutex<Vec<NetworkEntry>>,
 }
@@ -78,10 +80,12 @@ impl Mesh {
         identity: Arc<Identity>,
     ) -> Result<MeshHandle> {
         let transport = Transport::new()?;
+        let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
         let (events_tx, _) = broadcast::channel(256);
         let inner = Arc::new(MeshInner {
             identity,
             transport,
+            resource_scope,
             events_tx,
             networks: Mutex::new(Vec::new()),
         });
@@ -127,6 +131,11 @@ impl MeshHandle {
         self.mesh.inner.events_tx.subscribe()
     }
 
+    /// Read observations aggregated for this live Mesh runtime.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.mesh.inner.resource_scope.report()
+    }
+
     /// Join a network. Returns a [`JoinedNetwork`] handle for
     /// channels / RPC / roster. The driver task keeps running
     /// until [`JoinedNetwork::leave`] is called (or the
@@ -136,10 +145,11 @@ impl MeshHandle {
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
 
-        let (state, driver) = spawn_network(
+        let (state, driver) = spawn_network_in_mesh_scope(
             config.clone(),
             self.mesh.inner.identity.clone(),
             self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
         )
         .await?;
         let rpc = Rpc::new(state.clone());
@@ -214,6 +224,13 @@ impl JoinedNetwork {
     /// at create time — the GUI falls back to `network_id`.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Read observations for this live joined network instance.
+    ///
+    /// This runtime rollup is not bound to an immutable context identity.
+    pub fn resource_report(&self) -> ResourceReport {
+        self.state.resource_report()
     }
 
     /// Snapshot the per-network rollup.

@@ -4,13 +4,19 @@
 
 ### A private mesh network you actually own — pure Rust, embed it in anything.
 
-[Quick start](docs/QUICKSTART.md) · [Protocol](docs/PROTOCOL.md) · [Architecture](ARCHITECTURE.md) · [Connection engine](CONNECTION-ENGINE.md) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
+[Quick start](docs/QUICKSTART.md) · [Protocol](docs/PROTOCOL.md) · [V4 architecture](ARCHITECTURE.md) · [Transition playbook](TRANSITION-PLAYBOOK.md) · [Arc 00 baseline](docs/v4-transition/ARC-00-BASELINE.md) · [Connection field notes](CONNECTION-ENGINE-FIELD-NOTES.md) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows_·_Pi-2ea44f.svg)](#platforms)
 [![Tests](https://img.shields.io/badge/tests-passing-2ea44f.svg)](crates/myownmesh-core/tests)
 
 </div>
+
+> The owner-adopted V4 architecture is the target contract. Descriptions of
+> current engine behavior elsewhere in this repository are migration evidence,
+> not competing authority. See `ARCHITECTURE-OWNERSHIP.md` for the precedence
+> rule and `CURRENT-TO-TARGET-MIGRATION-MATRIX.md` for preservation and deletion
+> gates.
 
 ## One workspace, three personas
 
@@ -205,7 +211,7 @@ protocol-message checklist, and the topology-mode checklist.
 ## What it gives you
 
 - **ed25519 mutual auth, with eyeballs.** Every peer encounter exchanges a `hello` + `auth_response` where each side signs the other's nonce under `myownmesh-mesh-auth-v1:`. A 6-char `[a-z0-9]` verification code rides along for out-of-band confirmation ("the code I see matches what you read me"). Approved peers land in a per-network roster and skip the prompt on reconnect.
-- **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. A graduated ladder — Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start — does the cheapest action that still recovers from the failure class above it, and never tears a live link down on an ICE-state blip. Every tunable constant is documented in [`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) with the field bug it was discovered through.
+- **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. Its graduated sequence is Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start. It uses the cheapest action that still recovers from the failure class above it and never tears a live link down on an ICE-state blip. The retained pre-V4 evidence for each tunable is in [`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md); V4 ownership and authority come from the canonical architecture documents.
 - **Trystero-wire-compatible Nostr signaling.** Same room-handle derivation as JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), same deterministic relay shuffle. Eight published-fix patches against `@trystero-p2p/core` are baked in natively — catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs) so upstream-tracking is a code-level diff, not a patches/ folder.
 - **Zeroconf LAN discovery, on by default.** An mDNS/DNS-SD driver runs alongside Nostr: each network registers a `_myownmesh._tcp.local.` instance with the room handle in TXT, browses for peers in the same room, and exchanges SDP over a unicast TCP port advertised in SRV. Pure Rust (`mdns-sd` — no Avahi/Bonjour binding; coexists with system daemons on 5353) and clock-free, so it works on a device whose RTC still reads the epoch. Outbound signals fan out to both drivers and an inbound gate drops cross-transport duplicates, so co-located peers mesh even with every relay unreachable. Set `signaling.strategy = "none"` and keep `mdns = true` for a fully air-gapped mesh — zero remote infrastructure. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
 - **Host your own infrastructure.** A device can be any combination of a mesh node and hosted services: a relay (roster-gated routing), an **intelligent signaling relay** (a NIP-01 server the built-in driver speaks to unchanged — with live presence, instant-departure coordination, and flood limits, so it's safe to run publicly), and STUN / TURN servers (RFC 5389 / 5766, the latter with a per-connection bandwidth cap). Turn off the node role for a **pure-infrastructure box**. Toggle everything from the GUI (Settings → Services), the CLI (`myownmesh ctl services …`), or `config.json`; hosts advertise their roles + endpoints so the fleet self-discovers them. This is what makes a **fully internet-isolated network** trivial — no Google STUN, no Cloudflare TURN, no public relay. See [`docs/SERVICES.md`](docs/SERVICES.md).
@@ -305,7 +311,8 @@ relationship to the original TypeScript modules.
 [`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
 [`docs/NANOKVM.md`](docs/NANOKVM.md) — cross-building the daemon for a NanoKVM (riscv64 + musl) or NanoKVM-Pro (aarch64 + musl) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
-[`CONNECTION-ENGINE.md`](CONNECTION-ENGINE.md) — the recovery ladder, every tunable ·
+[`docs/v4-transition/ARC-00-BASELINE.md`](docs/v4-transition/ARC-00-BASELINE.md): exact V4 intake and baseline evidence ·
+[`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md): retained recovery evidence and tunables ·
 [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, conventions, testing ·
 [`RELEASE.md`](RELEASE.md) — cutting a release ·
 [`gui/README.md`](gui/README.md) — desktop GUI ·

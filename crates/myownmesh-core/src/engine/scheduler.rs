@@ -1,5 +1,5 @@
 //! Engine timing constants. Mirrored from MyOwnLLM's
-//! `mesh-client.svelte.ts` — see `CONNECTION-ENGINE.md` for the
+//! `mesh-client.svelte.ts`; see `CONNECTION-ENGINE-FIELD-NOTES.md` for the
 //! rationale on each one. Do not relax without understanding the
 //! field-discovered behavior the value defends.
 

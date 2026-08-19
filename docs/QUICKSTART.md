@@ -241,7 +241,7 @@ The `MeshHandle` itself doesn't need explicit cleanup — drop it.
 ## More
 
 - `docs/PROTOCOL.md` — wire-level frame reference.
-- `CONNECTION-ENGINE.md` — the graduated recovery ladder, all
+- `CONNECTION-ENGINE-FIELD-NOTES.md`: retained field evidence for the graduated recovery ladder, all
   tunables, every edge case.
 - `examples/` — runnable demos.
 - `tests/two_peer_handshake.rs` — the end-to-end integration test

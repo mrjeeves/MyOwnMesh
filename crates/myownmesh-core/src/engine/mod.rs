@@ -15,7 +15,7 @@
 //!   queue.
 //!
 //! Constants are mirrored from MyOwnLLM's `mesh-client.svelte.ts`
-//! and are documented in `CONNECTION-ENGINE.md`. Do not relax them
+//! and are documented in `CONNECTION-ENGINE-FIELD-NOTES.md`. Do not relax them
 //! without understanding the corresponding field-discovered bug.
 
 pub mod conn_trace;
@@ -80,6 +80,7 @@ use crate::protocol::{
     topology::ShelveMessage,
     CapabilityAdvert, MeshMessage,
 };
+use crate::resource::{MeshRuntimeResourceScope, ProcessResourceRoot};
 use crate::transport::{Role, Transport, TransportEvent};
 
 use connection::{PeerConnection, PeerStatus};
@@ -97,7 +98,18 @@ pub async fn spawn_network(
     identity: Arc<Identity>,
     transport: Transport,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let (state, signaling_inbound_rx, cmd_rx) = NetworkState::new(config, identity, transport)?;
+    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+    spawn_network_in_mesh_scope(config, identity, transport, &mesh_scope).await
+}
+
+pub(crate) async fn spawn_network_in_mesh_scope(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    mesh_scope: &MeshRuntimeResourceScope,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let (state, signaling_inbound_rx, cmd_rx) =
+        NetworkState::new_in_mesh_scope(config, identity, transport, mesh_scope)?;
     let driver_state = state.clone();
     let handle = tokio::spawn(async move {
         run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;
@@ -800,7 +812,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // peer-reflexive pair and the GUI to mis-paint the
             // link as STUN instead of LAN.
             enum Action {
-                Apply(Arc<crate::transport::PeerSession>),
+                Apply {
+                    session: Arc<crate::transport::PeerSession>,
+                    candidate: connection::PendingRemoteCandidate,
+                },
                 Queued,
                 NoPeer,
             }
@@ -808,13 +823,16 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 let mut data = peer.state.write();
                 data.diag.remote_candidates.record(kind);
                 if !data.remote_description_set {
-                    data.pending_remote_candidates.push(candidate.clone());
+                    peer.queue_remote_candidate(&mut data, candidate);
                     Action::Queued
                 } else {
                     let session = peer.session.lock().clone();
                     drop(data);
                     match session {
-                        Some(s) => Action::Apply(s),
+                        Some(session) => Action::Apply {
+                            session,
+                            candidate: peer.observe_remote_candidate(candidate),
+                        },
                         None => Action::NoPeer,
                     }
                 }
@@ -822,8 +840,13 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 Action::NoPeer
             };
             match action {
-                Action::Apply(session) => {
-                    if let Err(e) = session.add_ice_candidate(candidate).await {
+                Action::Apply { session, candidate } => {
+                    let result = connection::apply_pending_remote_candidate(
+                        candidate,
+                        move |candidate| async move { session.add_ice_candidate(candidate).await },
+                    )
+                    .await;
+                    if let Err(e) = result {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
                             "ice",
@@ -1288,9 +1311,14 @@ fn note_sighted_without_dialing(state: &Arc<NetworkState>, device_id: &str, why:
     if state.peers.contains_key(device_id) {
         return;
     }
-    state.peers.insert(
+    install_peer(
+        &state.peers,
         device_id.to_string(),
-        Arc::new(PeerConnection::new(device_id.to_string(), None)),
+        Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            None,
+            state.peer_connection_resource_scope(),
+        )),
     );
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
@@ -1388,13 +1416,14 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     let peer = Arc::new(PeerConnection::new(
         device_id.clone(),
         Some(session.clone()),
+        state.peer_connection_resource_scope(),
     ));
     // Start the connect-timeout clock the moment the session exists: if the
     // data channel hasn't opened within DATA_CHANNEL_OPEN_TIMEOUT_MS of
     // now, the attempt is reclaimed and rebuilt (see
     // `ice_watchdog::poll_all`).
     peer.state.write().session_started_at = Some(Instant::now());
-    state.peers.insert(device_id.clone(), peer.clone());
+    install_peer(&state.peers, device_id.clone(), peer.clone());
 
     state.emit(MeshEvent::Peer(PeerEvent::Sighted {
         network_id: state.network_id.clone(),
@@ -1571,9 +1600,9 @@ async fn apply_remote_sdp(
             let pending = if let Some(peer) = state.peers.get(device_id) {
                 let mut data = peer.state.write();
                 data.remote_description_set = true;
-                std::mem::take(&mut data.pending_remote_candidates)
+                data.take_pending_remote_candidates()
             } else {
-                Vec::new()
+                connection::PendingRemoteCandidateDrain::default()
             };
             if !pending.is_empty() {
                 state.log_diag_with(
@@ -1586,8 +1615,14 @@ async fn apply_remote_sdp(
                     ),
                     serde_json::json!({ "peer": device_id, "count": pending.len() }),
                 );
-                for cand in pending {
-                    if let Err(e) = session.add_ice_candidate(cand).await {
+                for candidate in pending {
+                    let session = Arc::clone(&session);
+                    let result = connection::apply_pending_remote_candidate(
+                        candidate,
+                        move |candidate| async move { session.add_ice_candidate(candidate).await },
+                    )
+                    .await;
+                    if let Err(e) = result {
                         warn!(peer = %device_id, "queued add_ice_candidate failed: {e}");
                     }
                 }
@@ -3000,8 +3035,8 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
 }
 
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
-    let removed = state.peers.remove(device_id);
-    if let Some((_, peer)) = removed {
+    let removed = remove_peer(&state.peers, device_id);
+    if let Some(peer) = removed {
         let session = peer.session.lock().clone();
         if let Some(session) = session {
             // Spawn the close so the driver loop never blocks on
@@ -3079,6 +3114,19 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
     ladder::reevaluate_topology(state).await;
 }
 
+/// Install the current peer owner and retire any replaced compatibility queue.
+/// Explicit retirement is required because other tasks may still hold an
+/// `Arc` to the replaced peer object.
+fn install_peer(peers: &state::PeerRegistry, device_id: String, peer: Arc<PeerConnection>) {
+    peers.install(device_id, peer);
+}
+
+/// Remove the current peer owner and retire its compatibility queue before the
+/// returned `Arc` can outlive its place in the peer map.
+fn remove_peer(peers: &state::PeerRegistry, device_id: &str) -> Option<Arc<PeerConnection>> {
+    peers.remove(device_id)
+}
+
 /// Build a minimal `NetworkState` for unit tests. One process-wide
 /// `MYOWNMESH_HOME` is set once (so parallel unit tests don't clobber
 /// each other's env var) and each caller passes a unique suffix so
@@ -3123,15 +3171,133 @@ pub(crate) fn insert_session_less_peer(
     device_id: &str,
     last_recv_at: Option<Instant>,
 ) {
-    let peer = Arc::new(PeerConnection::new(device_id.to_string(), None));
+    let peer = Arc::new(PeerConnection::new(
+        device_id.to_string(),
+        None,
+        state.peer_connection_resource_scope(),
+    ));
     peer.state.write().last_recv_at = last_recv_at;
-    state.peers.insert(device_id.to_string(), peer);
+    install_peer(&state.peers, device_id.to_string(), peer);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::{
+        NetworkInstanceResourceScope, PreAuthResourceFamily, ProcessResourceRoot, ResourceUse,
+    };
     use std::time::{Duration, Instant};
+
+    fn arc02_candidate_fixture() -> crate::transport::LocalIceCandidate {
+        crate::transport::LocalIceCandidate {
+            candidate: "candidate:arc02 1 udp host".to_string(),
+            sdp_mid: Some("data".to_string()),
+            sdp_mline_index: None,
+            username_fragment: Some("arc02-fragment".to_string()),
+        }
+    }
+
+    fn arc02_peer_with_pending_candidate(
+        context: &NetworkInstanceResourceScope,
+        device_id: &str,
+    ) -> Arc<PeerConnection> {
+        let peer = Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            None,
+            context.peer_connection_scope(),
+        ));
+        {
+            let mut state = peer.state.write();
+            peer.queue_remote_candidate(&mut state, arc02_candidate_fixture());
+        }
+        peer
+    }
+
+    fn arc02_candidate_use(context: &NetworkInstanceResourceScope) -> ResourceUse {
+        context
+            .report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+            .active
+    }
+
+    #[test]
+    fn v4_arc02_peer_replacement_releases_queue_while_retired_arc_survives() {
+        let process = ProcessResourceRoot::isolated();
+        let mesh = process.mesh_runtime_scope();
+        let context = mesh.network_instance_scope();
+        let peers = state::PeerRegistry::default();
+        let device_id = "arc02-replaced-peer";
+        let retired = arc02_peer_with_pending_candidate(&context, device_id);
+        install_peer(&peers, device_id.to_string(), Arc::clone(&retired));
+        assert_ne!(arc02_candidate_use(&context), ResourceUse::ZERO);
+
+        let replacement = Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            None,
+            context.peer_connection_scope(),
+        ));
+        install_peer(&peers, device_id.to_string(), replacement);
+
+        assert_eq!(arc02_candidate_use(&context), ResourceUse::ZERO);
+        assert_eq!(retired.device_id, device_id);
+    }
+
+    #[test]
+    fn v4_arc02_peer_removal_releases_queue_while_removed_arc_survives() {
+        let process = ProcessResourceRoot::isolated();
+        let mesh = process.mesh_runtime_scope();
+        let context = mesh.network_instance_scope();
+        let peers = state::PeerRegistry::default();
+        let device_id = "arc02-removed-peer";
+        let retained = arc02_peer_with_pending_candidate(&context, device_id);
+        install_peer(&peers, device_id.to_string(), Arc::clone(&retained));
+        assert_ne!(arc02_candidate_use(&context), ResourceUse::ZERO);
+
+        let removed = remove_peer(&peers, device_id).expect("installed peer is removable");
+
+        assert!(Arc::ptr_eq(&retained, &removed));
+        assert_eq!(arc02_candidate_use(&context), ResourceUse::ZERO);
+    }
+
+    #[tokio::test]
+    async fn v4_arc02_shutdown_retires_queue_while_external_peer_arc_survives() {
+        let state = build_test_state("arc02-shutdown-external-peer");
+        let device_id = "arc02-shutdown-peer";
+        let retained = Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            None,
+            state.peer_connection_resource_scope(),
+        ));
+        {
+            let mut peer_state = retained.state.write();
+            retained.queue_remote_candidate(&mut peer_state, arc02_candidate_fixture());
+        }
+        install_peer(&state.peers, device_id.to_string(), Arc::clone(&retained));
+        let before = state
+            .resource_report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+            .active;
+        assert_ne!(before, ResourceUse::ZERO);
+
+        state.shutdown().await;
+
+        let after = state
+            .resource_report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
+            .expect("candidate family is present")
+            .active;
+        assert_eq!(after, ResourceUse::ZERO);
+        assert_eq!(retained.device_id, device_id);
+        assert!(state.peers.is_empty());
+    }
 
     fn stale_instant() -> Instant {
         Instant::now()
@@ -3284,28 +3450,21 @@ mod tests {
             Offline,
             Error,
         ] {
-            let d = connection::PeerStateData {
-                authenticated: true,
-                status,
-                ..Default::default()
-            };
+            let mut d = connection::PeerStateData::default();
+            d.authenticated = true;
+            d.status = status;
             assert!(!d.is_admitted(), "{status:?} is not an admitted status");
         }
         for status in [Active, Shelved] {
-            let ok = connection::PeerStateData {
-                authenticated: true,
-                status,
-                ..Default::default()
-            };
+            let mut ok = connection::PeerStateData::default();
+            ok.authenticated = true;
+            ok.status = status;
             assert!(
                 ok.is_admitted(),
                 "authenticated {status:?} must be admitted"
             );
-            let no_auth = connection::PeerStateData {
-                authenticated: false,
-                status,
-                ..Default::default()
-            };
+            let mut no_auth = connection::PeerStateData::default();
+            no_auth.status = status;
             assert!(
                 !no_auth.is_admitted(),
                 "{status:?} without authentication is never admitted"
@@ -3499,29 +3658,21 @@ mod tests {
 
         // Fresh session, channel not open yet → still legitimately
         // negotiating, NOT stuck (don't churn a new attempt).
-        let fresh = connection::PeerStateData {
-            session_started_at: Some(Instant::now()),
-            data_channel_open: false,
-            ..Default::default()
-        };
+        let mut fresh = connection::PeerStateData::default();
+        fresh.session_started_at = Some(Instant::now());
         assert!(!connecting_stuck_past_grace(&fresh, grace));
 
         // Old session, channel still never opened → stuck; a fresh offer
         // should rebuild rather than renegotiate onto the corpse.
-        let stuck = connection::PeerStateData {
-            session_started_at: Some(old),
-            data_channel_open: false,
-            ..Default::default()
-        };
+        let mut stuck = connection::PeerStateData::default();
+        stuck.session_started_at = Some(old);
         assert!(connecting_stuck_past_grace(&stuck, grace));
 
         // Channel opened → never "stuck" regardless of age; liveness is the
         // heartbeat's job from here, and an offer is a real renegotiation.
-        let open = connection::PeerStateData {
-            session_started_at: Some(old),
-            data_channel_open: true,
-            ..Default::default()
-        };
+        let mut open = connection::PeerStateData::default();
+        open.session_started_at = Some(old);
+        open.data_channel_open = true;
         assert!(!connecting_stuck_past_grace(&open, grace));
     }
 
