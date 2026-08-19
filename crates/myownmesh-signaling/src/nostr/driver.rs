@@ -19,7 +19,7 @@
 //! [`crate::SignalingChannel`] trait is the seam.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -475,6 +475,59 @@ struct RelayHandle {
     connected: bool,
 }
 
+/// A WebSocket upgrade is not proof that a Nostr relay admitted the
+/// session. Public relays commonly upgrade first, then send a NOTICE and
+/// close over policy/capacity. Only an EOSE for our room subscription proves
+/// the session is usable; it must then remain up long enough to reset retry
+/// history, or a fast-closing relay can trap us in a two-second flap forever.
+const RELAY_STABLE_SESSION_MS: u64 = 10_000;
+
+#[derive(Debug, Default)]
+struct RelayRetryState {
+    backoff_attempt: u32,
+    failed_attempts: u32,
+    ever_admitted: bool,
+}
+
+impl RelayRetryState {
+    fn note_failure(&mut self) -> u32 {
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        self.failed_attempts
+    }
+
+    fn note_admitted(&mut self) -> bool {
+        let first = !self.ever_admitted;
+        self.ever_admitted = true;
+        first
+    }
+
+    fn note_stable(&mut self) -> u32 {
+        let recovered_after = self.failed_attempts;
+        self.failed_attempts = 0;
+        self.backoff_attempt = 0;
+        recovered_after
+    }
+
+    fn reset_forced_reconnect(&mut self) {
+        self.backoff_attempt = 0;
+    }
+
+    fn next_wait_ms(&mut self, seed: &str) -> u64 {
+        self.backoff_attempt = (self.backoff_attempt + 1).min(6);
+        let base_ms = (1u64 << self.backoff_attempt).min(60) * 1_000;
+        jittered_ms(base_ms, seed, self.backoff_attempt as u64)
+    }
+}
+
+fn record_relay_failure(state: &mut RelayRetryState, url: &str, reason: &str) {
+    let attempt = state.note_failure();
+    if attempt == 1 {
+        warn!(relay = %short(url), "relay unavailable: {reason}");
+    } else {
+        debug!(relay = %short(url), attempt, "relay still unavailable: {reason}");
+    }
+}
+
 async fn run_relay(
     url: String,
     shared: Arc<DriverShared>,
@@ -482,79 +535,72 @@ async fn run_relay(
     cancel: Arc<std::sync::atomic::AtomicBool>,
     live: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) {
-    let mut backoff_attempt = 0u32;
+    let mut retry = RelayRetryState::default();
     // Receiver for forced reconnects. `borrow_and_update` marks the
     // current generation as seen so a stale value from before this
     // task started can't fire a spurious immediate reconnect.
     let mut force_rx = shared.force_reconnect.subscribe();
     force_rx.borrow_and_update();
-    // Tracks consecutive connect failures so we can dampen the log
-    // spam from chronically-broken public relays (DNS no-such-host,
-    // 403s, TLS handshake timeouts). Without this, a single bad
-    // relay floods stderr with one WARN every 1/2/4/8/16/32/60s
-    // forever — drowning out everything else. We surface the first
-    // failure of a streak at WARN, drop subsequent failures to
-    // DEBUG, then announce recovery at INFO once the relay starts
-    // accepting again. Mirrors the rationale behind MyOwnLLM's
-    // Trystero-patch noise suppression.
-    let mut consecutive_failures = 0u32;
+    // Include the room in the jitter seed. One process may have several
+    // networks on the same relay; device-only jitter gives every one of them
+    // the exact same delay and turns a rejection into a synchronized herd.
+    let retry_seed = format!("{}:{}:{}", shared.device_id, shared.room_handle, url);
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         match tokio_tungstenite::connect_async(&url).await {
             Ok((stream, _)) => {
-                if consecutive_failures > 0 {
-                    info!(
-                        relay = %short(&url),
-                        attempts = consecutive_failures,
-                        "relay recovered after failed attempts"
-                    );
-                } else {
-                    info!(relay = %short(&url), "relay connected");
-                }
-                consecutive_failures = 0;
-                backoff_attempt = 0;
-                // Tell the engine a relay is freshly up so a network-change
-                // renegotiation can publish into a live relay instead of a
-                // redialing one (the "0 remote candidates arrived" stall).
-                shared
-                    .relay_connected
-                    .send_modify(|g| *g = g.wrapping_add(1));
-                // Count this live session so the fallback supervisor can
-                // tell whether any primary relay is currently connected.
-                // `None` for fallback tasks (they don't gate themselves).
-                if let Some(c) = &live {
-                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                let outcome =
-                    run_relay_session(&url, stream, &shared, &inbound_tx, &cancel, &mut force_rx)
-                        .await;
-                if let Some(c) = &live {
-                    c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
-                if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
-                    // Engine asked us to redial now (e.g. resume from
-                    // sleep). Skip the backoff entirely and reconnect on
-                    // the next loop turn so a fresh socket — and the
-                    // open-announce it sends — lands immediately.
-                    debug!(relay = %short(&url), "forced reconnect — redialing now");
-                    backoff_attempt = 0;
-                    continue;
+                let report = run_relay_session(
+                    &url,
+                    stream,
+                    &shared,
+                    &inbound_tx,
+                    &cancel,
+                    &mut force_rx,
+                    RelaySessionLifecycle {
+                        retry: &mut retry,
+                        live: live.as_ref(),
+                    },
+                )
+                .await;
+                trace!(relay = %short(&url), outcome = ?report.outcome, admitted = report.admitted, stable = report.stable, "relay session ended");
+                match report.outcome {
+                    RelaySessionOutcome::ForcedReconnect => {
+                        // Engine asked us to redial now (e.g. resume from
+                        // sleep). Skip the backoff entirely and reconnect on
+                        // the next loop turn so a fresh socket — and the
+                        // open-announce it sends — lands immediately.
+                        debug!(relay = %short(&url), "forced reconnect — redialing now");
+                        retry.reset_forced_reconnect();
+                        continue;
+                    }
+                    RelaySessionOutcome::Cancelled => return,
+                    RelaySessionOutcome::Rejected(reason) => {
+                        record_relay_failure(
+                            &mut retry,
+                            &url,
+                            &format!("session rejected by relay ({reason})"),
+                        );
+                    }
+                    RelaySessionOutcome::Error(reason) if !report.stable => {
+                        record_relay_failure(&mut retry, &url, &reason);
+                    }
+                    RelaySessionOutcome::SocketClosed if !report.stable => {
+                        record_relay_failure(
+                            &mut retry,
+                            &url,
+                            "session closed before becoming stable",
+                        );
+                    }
+                    RelaySessionOutcome::Error(reason) => {
+                        debug!(relay = %short(&url), "stable relay session ended with error: {reason}");
+                    }
+                    RelaySessionOutcome::SocketClosed => {}
                 }
             }
             Err(e) => {
-                if consecutive_failures == 0 {
-                    warn!(relay = %short(&url), "relay connect failed: {e}");
-                } else {
-                    debug!(
-                        relay = %short(&url),
-                        attempt = consecutive_failures + 1,
-                        "relay still failing: {e}"
-                    );
-                }
-                consecutive_failures = consecutive_failures.saturating_add(1);
+                record_relay_failure(&mut retry, &url, &format!("connect failed: {e}"));
             }
         }
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -567,15 +613,13 @@ async fn run_relay(
         // A forced-reconnect bump cuts the wait short so resume-from-sleep
         // recovery doesn't sit through a backoff that accrued while the
         // host was suspended.
-        backoff_attempt = (backoff_attempt + 1).min(6);
-        let base_ms = (1u64 << backoff_attempt).min(60) * 1_000;
-        let wait_ms = jittered_ms(base_ms, &shared.device_id, backoff_attempt as u64);
+        let wait_ms = retry.next_wait_ms(&retry_seed);
         debug!(relay = %short(&url), wait_ms, "relay backoff before reconnect");
         tokio::select! {
             _ = sleep(Duration::from_millis(wait_ms)) => {}
             _ = force_rx.changed() => {
                 debug!(relay = %short(&url), "forced reconnect during backoff — redialing now");
-                backoff_attempt = 0;
+                retry.reset_forced_reconnect();
             }
         }
     }
@@ -692,10 +736,37 @@ enum RelaySessionOutcome {
     Cancelled,
     SocketClosed,
     Error(String),
+    /// The WebSocket upgrade succeeded, but the relay explicitly refused the
+    /// Nostr session (for example, its connection-capacity NOTICE).
+    Rejected(String),
     /// The engine bumped the force-reconnect signal — drop this socket
     /// and redial immediately, skipping the backoff. Matched in
     /// [`run_relay`].
     ForcedReconnect,
+}
+
+#[derive(Debug)]
+struct RelaySessionReport {
+    outcome: RelaySessionOutcome,
+    /// The relay returned EOSE for our room subscription.
+    admitted: bool,
+    /// The admitted session survived [`RELAY_STABLE_SESSION_MS`].
+    stable: bool,
+}
+
+struct RelaySessionLifecycle<'a> {
+    retry: &'a mut RelayRetryState,
+    live: Option<&'a Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl RelaySessionReport {
+    fn early(outcome: RelaySessionOutcome) -> Self {
+        Self {
+            outcome,
+            admitted: false,
+            stable: false,
+        }
+    }
 }
 
 /// How often the relay read loop wakes on an otherwise-idle socket to
@@ -715,7 +786,8 @@ async fn run_relay_session(
     inbound_tx: &mpsc::UnboundedSender<NostrInbound>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     force_rx: &mut watch::Receiver<u64>,
-) -> RelaySessionOutcome {
+    lifecycle: RelaySessionLifecycle<'_>,
+) -> RelaySessionReport {
     let (mut write, mut read) = stream.split();
 
     // Open the room subscription — one REQ, several filters (see
@@ -738,7 +810,7 @@ async fn run_relay_session(
     let req_text = build_req(shared, sub_id, compat);
 
     if let Err(e) = write.send(WsMessage::Text(req_text)).await {
-        return RelaySessionOutcome::Error(format!("send REQ: {e}"));
+        return RelaySessionReport::early(RelaySessionOutcome::Error(format!("send REQ: {e}")));
     }
 
     // Subscribe to the broadcast so outbound events fan to this socket.
@@ -781,32 +853,74 @@ async fn run_relay_session(
         let event = build_announce_event(shared);
         let frame = serde_json::json!(["EVENT", event]).to_string();
         if let Err(e) = write.send(WsMessage::Text(frame)).await {
-            return RelaySessionOutcome::Error(format!("send open-announce: {e}"));
+            return RelaySessionReport::early(RelaySessionOutcome::Error(format!(
+                "send open-announce: {e}"
+            )));
         }
     }
 
-    loop {
+    let mut admitted_at: Option<Instant> = None;
+    let mut stable = false;
+    let outcome = loop {
+        if !stable
+            && admitted_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(RELAY_STABLE_SESSION_MS))
+        {
+            stable = true;
+            let recovered_after = lifecycle.retry.note_stable();
+            if recovered_after > 0 {
+                info!(
+                    relay = %short(url),
+                    attempts = recovered_after,
+                    "relay session stable after failed attempts"
+                );
+            }
+        }
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             // Best-effort clean close so the relay sees our departure
             // immediately (a Close frame, falling back to the TCP FIN
             // from dropping the stream). Bounded so a wedged socket
             // can't hang teardown.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), write.close()).await;
-            return RelaySessionOutcome::Cancelled;
+            break RelaySessionOutcome::Cancelled;
         }
         tokio::select! {
             msg = read.next() => {
-                let Some(msg) = msg else { return RelaySessionOutcome::SocketClosed };
+                let Some(msg) = msg else { break RelaySessionOutcome::SocketClosed };
                 let frame = match msg {
                     Ok(WsMessage::Text(t)) => t,
                     Ok(WsMessage::Binary(b)) => match std::str::from_utf8(&b) {
                         Ok(s) => s.to_string(),
                         Err(_) => continue,
                     },
-                    Ok(WsMessage::Close(_)) => return RelaySessionOutcome::SocketClosed,
+                    Ok(WsMessage::Close(_)) => break RelaySessionOutcome::SocketClosed,
                     Ok(_) => continue,
-                    Err(e) => return RelaySessionOutcome::Error(format!("ws read: {e}")),
+                    Err(e) => break RelaySessionOutcome::Error(format!("ws read: {e}")),
                 };
+                match relay_control_frame(&frame) {
+                    RelayControlFrame::Rejected(reason) => {
+                        break RelaySessionOutcome::Rejected(reason);
+                    }
+                    RelayControlFrame::Eose if admitted_at.is_none() => {
+                        admitted_at = Some(Instant::now());
+                        if lifecycle.retry.note_admitted() {
+                            info!(relay = %short(url), "relay connected");
+                        } else {
+                            debug!(relay = %short(url), "relay session re-admitted");
+                        }
+                        // A room subscription is actually live now. Tell the
+                        // engine/fallback supervisor here, not at WebSocket
+                        // upgrade time where a policy NOTICE can still reject
+                        // the session.
+                        shared
+                            .relay_connected
+                            .send_modify(|g| *g = g.wrapping_add(1));
+                        if let Some(c) = lifecycle.live {
+                            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    _ => {}
+                }
                 if let Err(e) = handle_inbound_frame(url, &frame, shared, inbound_tx) {
                     trace!(relay = %short(url), "inbound frame parse: {e}");
                 }
@@ -816,11 +930,11 @@ async fn run_relay_session(
                     Ok(event) => {
                         let frame = serde_json::json!(["EVENT", &*event]).to_string();
                         if let Err(e) = write.send(WsMessage::Text(frame)).await {
-                            return RelaySessionOutcome::Error(format!("send publish: {e}"));
+                            break RelaySessionOutcome::Error(format!("send publish: {e}"));
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        return RelaySessionOutcome::Cancelled;
+                        break RelaySessionOutcome::Cancelled;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(relay = %short(url), "publish bus lagged {n} events");
@@ -835,7 +949,7 @@ async fn run_relay_session(
             // a second trying to close it gracefully would defeat the
             // "reconnect now" intent.
             _ = force_rx.changed() => {
-                return RelaySessionOutcome::ForcedReconnect;
+                break RelaySessionOutcome::ForcedReconnect;
             }
             // The room's directed-subscription shape changed (a legacy
             // peer appeared, or the last one left). Re-issue the REQ
@@ -849,7 +963,7 @@ async fn run_relay_session(
                         let req_text = build_req(shared, sub_id, compat);
                         debug!(relay = %short(url), compat, "re-issuing room REQ (subscription shape changed)");
                         if let Err(e) = write.send(WsMessage::Text(req_text)).await {
-                            return RelaySessionOutcome::Error(format!("send REQ: {e}"));
+                            break RelaySessionOutcome::Error(format!("send REQ: {e}"));
                         }
                     }
                 }
@@ -862,6 +976,49 @@ async fn run_relay_session(
             // the branches above; this only bites when nothing is moving.
             _ = tokio::time::sleep(std::time::Duration::from_millis(RELAY_CANCEL_POLL_MS)) => {}
         }
+    };
+
+    let admitted = admitted_at.is_some();
+    if admitted {
+        if let Some(c) = lifecycle.live {
+            c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    RelaySessionReport {
+        outcome,
+        admitted,
+        stable,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RelayControlFrame {
+    Eose,
+    Rejected(String),
+    Other,
+}
+
+/// Extract only lifecycle-significant NIP-01 frames. A capacity NOTICE is an
+/// admission rejection, not a successful session followed by an ordinary
+/// disconnect.
+fn relay_control_frame(frame: &str) -> RelayControlFrame {
+    let Ok(value) = serde_json::from_str::<Value>(frame) else {
+        return RelayControlFrame::Other;
+    };
+    let Some(arr) = value.as_array() else {
+        return RelayControlFrame::Other;
+    };
+    match arr.first().and_then(Value::as_str) {
+        Some("EOSE") => RelayControlFrame::Eose,
+        Some("NOTICE") => {
+            let body = arr.get(1).and_then(Value::as_str).unwrap_or("");
+            if body.to_ascii_lowercase().contains("too many connections") {
+                RelayControlFrame::Rejected(body.to_string())
+            } else {
+                RelayControlFrame::Other
+            }
+        }
+        _ => RelayControlFrame::Other,
     }
 }
 
@@ -1703,5 +1860,50 @@ mod tests {
             "three nodes shouldn't share one jitter offset"
         );
         assert_eq!(jittered_ms(0, "x", 0), 0, "zero base stays zero");
+    }
+
+    #[test]
+    fn relay_capacity_notice_is_an_admission_rejection() {
+        assert_eq!(
+            relay_control_frame(r#"["NOTICE","too many connections from your address"]"#),
+            RelayControlFrame::Rejected("too many connections from your address".into())
+        );
+        assert_eq!(
+            relay_control_frame(r#"["EOSE","mom-sig-1"]"#),
+            RelayControlFrame::Eose
+        );
+        assert_eq!(
+            relay_control_frame(r#"["NOTICE","scheduled maintenance"]"#),
+            RelayControlFrame::Other,
+            "an informational NOTICE is not an admission rejection"
+        );
+    }
+
+    #[test]
+    fn relay_retry_backoff_grows_until_a_session_is_stable() {
+        let mut retry = RelayRetryState::default();
+        assert_eq!(retry.note_failure(), 1);
+        let first = retry.next_wait_ms("device:room:relay");
+        assert_eq!(retry.note_failure(), 2);
+        let second = retry.next_wait_ms("device:room:relay");
+        assert!(first <= 2_300, "first retry is around two seconds");
+        assert!(second >= 3_400, "second retry grows to around four seconds");
+
+        assert_eq!(retry.note_stable(), 2);
+        assert_eq!(retry.failed_attempts, 0);
+        let reset = retry.next_wait_ms("device:room:relay");
+        assert_eq!(reset, first, "a stable session resets the retry curve");
+    }
+
+    #[test]
+    fn network_room_decorrelates_same_device_retries() {
+        let mut a = RelayRetryState::default();
+        let mut b = RelayRetryState::default();
+        let wait_a = a.next_wait_ms("same-device:room-a:wss://relay");
+        let wait_b = b.next_wait_ms("same-device:room-b:wss://relay");
+        assert_ne!(
+            wait_a, wait_b,
+            "separate networks on one device must not redial in lockstep"
+        );
     }
 }

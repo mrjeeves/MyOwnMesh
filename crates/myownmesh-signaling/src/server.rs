@@ -46,7 +46,12 @@ use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::{
+    handshake::server::{Request as WsRequest, Response as WsResponse},
+    http::HeaderMap,
+    Message as WsMessage,
+};
 use tracing::{debug, info, trace, warn};
 
 use crate::nostr::event::{
@@ -223,7 +228,19 @@ async fn accept_loop(listener: TcpListener, hub: Hub) {
 }
 
 async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()> {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
+    // Caddy's supported deployment terminates TLS and reverse-proxies the
+    // WebSocket over loopback. Admission control must count the original
+    // client, not the local proxy, or `max_connections_per_ip` silently
+    // becomes a global connection ceiling. Only trust forwarded identity
+    // from a loopback TCP peer; a direct internet client must never be able
+    // to evade the cap by supplying its own X-Forwarded-For header.
+    let mut forwarded_ip = None;
+    let ws = match accept_hdr_async(stream, |request: &WsRequest, response: WsResponse| {
+        forwarded_ip = forwarded_client_ip(peer.ip(), request.headers());
+        Ok(response)
+    })
+    .await
+    {
         Ok(ws) => ws,
         Err(e) => {
             // A failed handshake means something reached us on the TCP
@@ -241,9 +258,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
     };
     let (mut write, mut read) = ws.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let client_ip = forwarded_ip.unwrap_or_else(|| peer.ip());
 
     // Per-IP admission control happens at register time.
-    let Some(conn_id) = hub.register(out_tx.clone(), peer.ip()) else {
+    let Some(conn_id) = hub.register(out_tx.clone(), client_ip) else {
         let _ = write
             .send(WsMessage::Text(
                 json!(["NOTICE", "too many connections from your address"]).to_string(),
@@ -286,6 +304,25 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
     hub.unregister(conn_id);
     writer.abort();
     Ok(())
+}
+
+/// Resolve the original client behind the supported loopback reverse proxy.
+///
+/// Caddy writes `X-Forwarded-For` on proxied requests. The right-most valid
+/// address is the hop Caddy received directly, which remains correct if an
+/// upstream supplied a pre-existing chain. Forwarded headers from non-local
+/// TCP peers are deliberately ignored as untrusted input.
+fn forwarded_client_ip(peer_ip: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
+    if !peer_ip.is_loopback() {
+        return None;
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .rev()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.rsplit(','))
+        .find_map(|value| value.trim().parse().ok())
 }
 
 /// Shared relay state. Cheap to clone — wraps an `Arc<Mutex<…>>`. All the
@@ -958,6 +995,36 @@ mod tests {
             }
         }
         assert_eq!(passed, 5);
+    }
+
+    #[test]
+    fn loopback_proxy_uses_rightmost_forwarded_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.8, 203.0.113.42".parse().unwrap(),
+        );
+        assert_eq!(
+            forwarded_client_ip("127.0.0.1".parse().unwrap(), &headers),
+            Some("203.0.113.42".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn direct_peer_cannot_spoof_forwarded_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.42".parse().unwrap());
+        assert_eq!(
+            forwarded_client_ip("198.51.100.8".parse().unwrap(), &headers),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_forwarded_entries_are_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip, also-bad".parse().unwrap());
+        assert_eq!(forwarded_client_ip("::1".parse().unwrap(), &headers), None);
     }
 
     #[test]

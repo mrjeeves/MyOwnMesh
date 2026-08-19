@@ -13,7 +13,9 @@ use std::time::Duration;
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest, http::HeaderValue, Error as WsError, Message,
+};
 
 use myownmesh_signaling::server::{Limits, SignalingServer};
 
@@ -49,6 +51,47 @@ fn signed_event(kind: u16, room: &str, content: &str, created_at: u64) -> Value 
         created_at,
     );
     serde_json::to_value(&ev).expect("event serializes")
+}
+
+async fn connect_forwarded(
+    url: &str,
+    client_ip: &'static str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-forwarded-for", HeaderValue::from_static(client_ip));
+    connect_async(request).await.unwrap().0
+}
+
+#[tokio::test]
+async fn loopback_proxy_limit_counts_forwarded_clients_independently() {
+    let limits = Limits {
+        max_connections_per_ip: 1,
+        ..Limits::default()
+    };
+    let server = SignalingServer::start("127.0.0.1", 0, limits)
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+
+    let mut client_a = connect_forwarded(&url, "198.51.100.10").await;
+    let mut client_b = connect_forwarded(&url, "198.51.100.11").await;
+    for (client, sub) in [(&mut client_a, "a"), (&mut client_b, "b")] {
+        client
+            .send(Message::Text(json!(["REQ", sub, {}]).to_string()))
+            .await
+            .unwrap();
+        let eose = parse(&next_text(client).await);
+        assert_eq!(eose[0], "EOSE", "separate forwarded clients are admitted");
+    }
+
+    let mut second_a = connect_forwarded(&url, "198.51.100.10").await;
+    let notice = parse(&next_text(&mut second_a).await);
+    assert_eq!(notice[0], "NOTICE");
+    assert_eq!(notice[1], "too many connections from your address");
+
+    server.stop();
 }
 
 #[tokio::test]
