@@ -116,6 +116,12 @@ is rate-limited and the relay sheds abuse. All limits are tunable
 
 Rates use a token bucket (1-second burst); a connection that keeps
 violating limits accrues strikes and is disconnected with a `NOTICE`.
+When the relay is reached through the supported loopback reverse proxy,
+`max_connections_per_ip` uses the right-most valid `X-Forwarded-For`
+address supplied by that proxy. Forwarded headers are ignored on direct,
+non-loopback connections so a public client cannot spoof its way around the
+cap. This keeps the per-client limit per-client instead of accidentally
+turning it into one global limit for every connection passing through Caddy.
 
 ### STUN
 
@@ -371,6 +377,7 @@ location / {
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
