@@ -57,6 +57,10 @@ const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 /// peers converge inside a handful of seconds.
 const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
 
+/// Bound early trickle candidates per peer. A missing/malformed remote SDP
+/// must not turn candidate traffic into an unbounded queue.
+const MAX_PENDING_REMOTE_CANDIDATES: usize = 256;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +68,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -501,7 +506,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // advances to `Handshaking` / `Active` / etc. we stop
             // re-offering automatically — no extra teardown
             // logic, no extra timer.
-            let reoffer_session = if role == Role::Offerer {
+            let reoffer_session = if role == Role::Offerer
+                && !state.local_socket_recovery_active()
+                && !state.peer_is_closing(&device_id)
+            {
                 state.peers.get(&device_id).and_then(|p| {
                     let mut data = p.state.write();
                     if !matches!(data.status, PeerStatus::Sighted) {
@@ -518,14 +526,40 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                         return None;
                     }
                     data.last_offer_sent_at = Some(Instant::now());
-                    p.session.lock().clone()
+                    p.session.lock().clone().map(|session| (session, p.epoch))
                 })
             } else {
                 None
             };
-            if let Some(session) = reoffer_session {
+            if let Some((session, epoch)) = reoffer_session {
+                if state.local_socket_recovery_active() {
+                    // The circuit may have armed after the selection above.
+                    // Undo the throttle stamp so the recovery announce can
+                    // drive this re-offer instead of losing it for the window.
+                    if let Some(peer) = state
+                        .peers
+                        .get(&device_id)
+                        .filter(|peer| peer.epoch == epoch)
+                    {
+                        peer.state.write().last_offer_sent_at = None;
+                    }
+                    return;
+                }
                 match session.create_offer().await {
                     Ok(desc) => {
+                        if !peer_epoch_matches(state, &device_id, epoch) {
+                            return;
+                        }
+                        if state.local_socket_recovery_active() {
+                            if let Some(peer) = state
+                                .peers
+                                .get(&device_id)
+                                .filter(|peer| peer.epoch == epoch)
+                            {
+                                peer.state.write().last_offer_sent_at = None;
+                            }
+                            return;
+                        }
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
                             "signaling",
@@ -536,8 +570,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                                 "reason": "stuck-at-sighted",
                             }),
                         );
+                        let Some(offer_id) = issue_offer_id(state, &device_id, epoch) else {
+                            return;
+                        };
                         let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                             device_id: device_id.clone(),
+                            offer_id,
                             sdp: desc.sdp,
                         });
                     }
@@ -585,7 +623,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                         at.elapsed().as_millis() < scheduler::STALE_INBOUND_MS as u128
                     });
                 if unhealthy && recently_alive {
-                    renegotiate_ice(state, &device_id, false, "announce-unhealthy").await;
+                    renegotiate_ice(state, &device_id, false, "announce-unhealthy", None).await;
                 }
             }
             clear_stale_session_if_zombie(state, &device_id).await;
@@ -655,7 +693,18 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 }
             }
         }
-        SignalingInbound::Offer { device_id, sdp } => {
+        SignalingInbound::Offer {
+            device_id,
+            offer_id,
+            sdp,
+        } => {
+            // Do not let remote retry cadence bypass the network-scoped UDP
+            // pressure circuit. The one recovery announce prompts a fresh
+            // offer after local capacity has actually returned.
+            if state.local_socket_recovery_active() || state.peer_is_closing(&device_id) {
+                trace!(peer = %device_id, "deferring inbound offer during local socket recovery");
+                return;
+            }
             // If we didn't already start an answerer, do so now.
             let role = Role::Answerer;
             state.log_diag_with(
@@ -737,11 +786,24 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // would make the future non-Send.
             let session = {
                 let peer = state.peers.get(&device_id);
-                peer.and_then(|p| p.session.lock().clone())
+                peer.and_then(|p| p.session.lock().clone().map(|session| (session, p.epoch)))
             };
-            if let Some(session) = session {
+            if let Some((session, epoch)) = session {
+                if state.local_socket_recovery_active() {
+                    trace!(peer = %device_id, "deferring answer during local socket recovery");
+                    drop_peer_if_epoch(state, &device_id, epoch, DropReason::IceFailed).await;
+                    return;
+                }
                 match session.create_answer().await {
                     Ok(desc) => {
+                        if !peer_epoch_matches(state, &device_id, epoch) {
+                            return;
+                        }
+                        if state.local_socket_recovery_active() {
+                            drop_peer_if_epoch(state, &device_id, epoch, DropReason::IceFailed)
+                                .await;
+                            return;
+                        }
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
                             "signaling",
@@ -750,6 +812,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                         );
                         let _ = state.signaling_tx.send(SignalingOutbound::Answer {
                             device_id: device_id.clone(),
+                            offer_id: offer_id.clone(),
                             sdp: desc.sdp,
                         });
                     }
@@ -765,7 +828,34 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 }
             }
         }
-        SignalingInbound::Answer { device_id, sdp } => {
+        SignalingInbound::Answer {
+            device_id,
+            offer_id,
+            sdp,
+        } => {
+            // Signaling state only proves that some offer is outstanding. If a
+            // delayed answer to offer N arrives after offer N+1 was sent, both
+            // observe HaveLocalOffer; correlate on the wire id before applying.
+            // Empty ids remain accepted for pre-correlation peers.
+            if let Some(peer) = state.peers.get(&device_id) {
+                let mut data = peer.state.write();
+                if !offer_id.is_empty()
+                    && data.pending_offer_id.as_deref() != Some(offer_id.as_str())
+                {
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Debug,
+                        "signaling",
+                        format!("superseded answer from {} ignored", short_peer(&device_id)),
+                        serde_json::json!({
+                            "peer": device_id,
+                            "offer_id": offer_id,
+                            "expected_offer_id": data.pending_offer_id,
+                        }),
+                    );
+                    return;
+                }
+                data.pending_offer_id = None;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "signaling",
@@ -800,7 +890,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
             // peer-reflexive pair and the GUI to mis-paint the
             // link as STUN instead of LAN.
             enum Action {
-                Apply(Arc<crate::transport::PeerSession>),
+                Apply(Arc<crate::transport::PeerSession>, u64),
                 Queued,
                 NoPeer,
             }
@@ -808,13 +898,17 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 let mut data = peer.state.write();
                 data.diag.remote_candidates.record(kind);
                 if !data.remote_description_set {
+                    if data.pending_remote_candidates.len() >= MAX_PENDING_REMOTE_CANDIDATES {
+                        data.pending_remote_candidates.remove(0);
+                    }
                     data.pending_remote_candidates.push(candidate.clone());
                     Action::Queued
                 } else {
                     let session = peer.session.lock().clone();
+                    let epoch = peer.epoch;
                     drop(data);
                     match session {
-                        Some(s) => Action::Apply(s),
+                        Some(s) => Action::Apply(s, epoch),
                         None => Action::NoPeer,
                     }
                 }
@@ -822,8 +916,30 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 Action::NoPeer
             };
             match action {
-                Action::Apply(session) => {
-                    if let Err(e) = session.add_ice_candidate(candidate).await {
+                Action::Apply(session, epoch) => {
+                    let active_ufrags = session.remote_ice_ufrags().await;
+                    if !peer_epoch_matches(state, &device_id, epoch) {
+                        return;
+                    }
+                    if !crate::transport::webrtc::candidate_matches_ufrags(
+                        &candidate,
+                        &active_ufrags,
+                    ) {
+                        state.log_diag_with(
+                            crate::events::DiagLevel::Debug,
+                            "ice",
+                            format!(
+                                "stale remote {kind:?} candidate from {} ignored",
+                                short_peer(&device_id)
+                            ),
+                            serde_json::json!({
+                                "peer": device_id,
+                                "kind": format!("{kind:?}"),
+                                "candidate_ufrag": crate::transport::webrtc::candidate_ufrag(&candidate),
+                                "active_ufrags": active_ufrags,
+                            }),
+                        );
+                    } else if let Err(e) = session.add_ice_candidate(candidate).await {
                         state.log_diag_with(
                             crate::events::DiagLevel::Warn,
                             "ice",
@@ -889,6 +1005,9 @@ pub(crate) fn short_peer(id: &str) -> String {
 /// actually emitted. The driver's own steady-state announcer is
 /// independent of this and unaffected.
 pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
+    if state.local_socket_recovery_active() {
+        return false;
+    }
     let mut guard = state.last_reactive_announce_at.lock();
     let now = Instant::now();
     let due = guard
@@ -913,20 +1032,19 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
 /// clean rebuild to meet our fresh offer. Shared by the event paths
 /// (relay-reconnect flush) and the tick's backstop retry.
 pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
-    if state.is_offline() {
+    if state.is_offline()
+        || state.local_socket_recovery_active()
+        || state.peer_is_closing(device_id)
+    {
         return;
     }
     if state.peers.contains_key(device_id) {
         return;
     }
-    // Only the deterministic offerer (lex-lower id) re-offers; the answerer
-    // waits for that offer rather than sending a competing one. A sticky
-    // (pinned) peer bypasses the gate: the pin lives on exactly one side —
-    // the dialing side — and on a Silent network the other end will never
-    // initiate, lex order or not.
-    if state.identity.public_id() >= device_id && !state.is_sticky(device_id) {
-        return;
-    }
+    // Automatic drop paths only create intents on the deterministic offerer,
+    // so they remain glare-free. A deliberate connect queued during socket
+    // pressure may legitimately be on the lex-higher side; once capacity is
+    // back, the intent must preserve that explicit user action.
     maybe_reactive_announce(state);
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
 }
@@ -941,7 +1059,7 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
 /// webrtc-rs with a mid-negotiation offer. Single-flighted per peer via
 /// `media_reneg_inflight`.
 pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
-    if state.is_offline() {
+    if state.is_offline() || state.local_socket_recovery_active() {
         return;
     }
     let candidates: Vec<String> = state
@@ -959,6 +1077,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(entry) = state.peers.get(&device_id) else {
             continue;
         };
+        let epoch = entry.epoch;
         let Some(session) = entry.session.lock().clone() else {
             continue;
         };
@@ -979,7 +1098,11 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         drop(entry);
         let state = state.clone();
         tokio::spawn(async move {
-            let outcome = if session.signaling_state()
+            let outcome = if !peer_epoch_matches(&state, &device_id, epoch) {
+                Err("peer generation changed".to_string())
+            } else if state.local_socket_recovery_active() {
+                Err("local socket recovery active".to_string())
+            } else if session.signaling_state()
                 != webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
             {
                 // Mid-negotiation (glare, or our own earlier offer still
@@ -994,32 +1117,62 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
                 let reaped = session
                     .reap_drained_lanes(*crate::transport::webrtc::LANE_DRAIN_GRACE)
                     .await;
-                match session.create_offer().await {
-                    Ok(desc) => {
-                        state.log_diag_with(
-                            crate::events::DiagLevel::Debug,
-                            "media",
-                            format!(
-                                "media renegotiation offer to {} (lane set changed{})",
-                                short_peer(&device_id),
-                                if reaped > 0 { ", drains reaped" } else { "" }
-                            ),
-                            serde_json::json!({
-                                "peer": device_id,
-                                "sdp_bytes": desc.sdp.len(),
-                                "reaped": reaped,
-                            }),
-                        );
-                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                            device_id: device_id.clone(),
-                            sdp: desc.sdp,
-                        });
-                        Ok(())
+                if !peer_epoch_matches(&state, &device_id, epoch) {
+                    Err("peer generation changed".to_string())
+                } else if state.local_socket_recovery_active() {
+                    Err("local socket recovery active".to_string())
+                } else {
+                    match session.create_offer().await {
+                        Ok(desc) => {
+                            if !peer_epoch_matches(&state, &device_id, epoch) {
+                                return;
+                            }
+                            if state.local_socket_recovery_active() {
+                                if let Some(peer) = state
+                                    .peers
+                                    .get(&device_id)
+                                    .filter(|peer| peer.epoch == epoch)
+                                {
+                                    let mut data = peer.state.write();
+                                    data.media_reneg_inflight = false;
+                                    data.media_reneg_pending = true;
+                                }
+                                return;
+                            }
+                            state.log_diag_with(
+                                crate::events::DiagLevel::Debug,
+                                "media",
+                                format!(
+                                    "media renegotiation offer to {} (lane set changed{})",
+                                    short_peer(&device_id),
+                                    if reaped > 0 { ", drains reaped" } else { "" }
+                                ),
+                                serde_json::json!({
+                                    "peer": device_id,
+                                    "sdp_bytes": desc.sdp.len(),
+                                    "reaped": reaped,
+                                }),
+                            );
+                            if let Some(offer_id) = issue_offer_id(&state, &device_id, epoch) {
+                                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
+                                    device_id: device_id.clone(),
+                                    offer_id,
+                                    sdp: desc.sdp,
+                                });
+                                Ok(())
+                            } else {
+                                Err("peer generation changed".to_string())
+                            }
+                        }
+                        Err(e) => Err(e.to_string()),
                     }
-                    Err(e) => Err(e.to_string()),
                 }
             };
-            if let Some(peer) = state.peers.get(&device_id) {
+            if let Some(peer) = state
+                .peers
+                .get(&device_id)
+                .filter(|peer| peer.epoch == epoch)
+            {
                 let mut d = peer.state.write();
                 d.media_reneg_inflight = false;
                 match outcome {
@@ -1049,7 +1202,7 @@ async fn service_reconnect_intents(state: &Arc<NetworkState>) {
     // socket, and burning the backoff schedule on no-op retries would leave
     // an intent over-backed-off when we return. The offline→online edge
     // flushes every intent at once (see `network_watch::fan_out_restart`).
-    if state.is_offline() {
+    if state.is_offline() || state.local_socket_recovery_active() {
         return;
     }
     for device_id in state.due_reconnect_intents() {
@@ -1088,11 +1241,37 @@ async fn service_reconnect_intents(state: &Arc<NetworkState>) {
 /// watcher exists), so we must renegotiate despite the stale "healthy"
 /// state. The watchdog / announce callers pass `force = false` and skip a
 /// genuinely-connected link.
+pub(crate) fn peer_epoch_matches(
+    state: &NetworkState,
+    device_id: &str,
+    expected_epoch: u64,
+) -> bool {
+    state
+        .peers
+        .get(device_id)
+        .is_some_and(|peer| peer.epoch == expected_epoch)
+}
+
+fn issue_offer_id(state: &NetworkState, device_id: &str, expected_epoch: u64) -> Option<String> {
+    use rand::Rng;
+
+    let peer = state
+        .peers
+        .get(device_id)
+        .filter(|peer| peer.epoch == expected_epoch)?;
+    let id = data_encoding::BASE32_NOPAD
+        .encode(&rand::thread_rng().gen::<[u8; 8]>())
+        .to_lowercase();
+    peer.state.write().pending_offer_id = Some(id.clone());
+    Some(id)
+}
+
 pub(crate) async fn renegotiate_ice(
     state: &Arc<NetworkState>,
     device_id: &str,
     force: bool,
     trigger: &'static str,
+    expected_epoch: Option<u64>,
 ) {
     // No primary interface → a `restart_ice()` here can't bind a socket
     // and only feeds the `Network is unreachable` gather spam. Hold off;
@@ -1101,14 +1280,30 @@ pub(crate) async fn renegotiate_ice(
     if state.is_offline() {
         return;
     }
-    let session = {
+    // ID-scoped requests (manual/recovery fan-out) remain meaningful even if
+    // the peer has not been instantiated yet, so pressure may queue them by
+    // id. Generation-scoped callbacks must validate their epoch first below;
+    // otherwise stale work could be deferred onto a replacement session.
+    if expected_epoch.is_none() && state.local_socket_recovery_active() {
+        state.defer_ice_restart(device_id, force);
+        return;
+    }
+    let (session, session_epoch) = {
         let Some(peer) = state.peers.get(device_id) else {
             return;
         };
+        if expected_epoch.is_some_and(|expected| peer.epoch != expected) {
+            return;
+        }
+        let epoch = peer.epoch;
         let s = peer.session.lock().clone();
-        s
+        (s, epoch)
     };
     let Some(session) = session else { return };
+    if state.local_socket_recovery_active() {
+        state.defer_ice_restart(device_id, force);
+        return;
+    }
 
     // Snapshot the ICE state we're firing from — together with `trigger`
     // this is the instrumentation that answers "what kicked a link that
@@ -1124,7 +1319,11 @@ pub(crate) async fn renegotiate_ice(
         // (`force`), leave it alone — and opportunistically settle the
         // tier back to Steady if a prior restart has since recovered.
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed if !force => {
-            if let Some(peer) = state.peers.get(device_id) {
+            if let Some(peer) = state
+                .peers
+                .get(device_id)
+                .filter(|peer| peer.epoch == session_epoch)
+            {
                 let mut data = peer.state.write();
                 data.ice_disconnected_since = None;
                 if matches!(
@@ -1138,7 +1337,12 @@ pub(crate) async fn renegotiate_ice(
         }
         // A gather/connectivity check is already in flight — don't
         // interrupt it, even on a forced network-change pass.
-        RTCIceConnectionState::Checking => return,
+        RTCIceConnectionState::Checking => {
+            if trigger == "socket-recovery" {
+                state.defer_ice_restart(device_id, force);
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -1147,6 +1351,9 @@ pub(crate) async fn renegotiate_ice(
         let Some(peer) = state.peers.get(device_id) else {
             return;
         };
+        if peer.epoch != session_epoch {
+            return;
+        }
         let mut data = peer.state.write();
         let due = data
             .last_offer_sent_at
@@ -1155,6 +1362,10 @@ pub(crate) async fn renegotiate_ice(
             })
             .unwrap_or(true);
         if !due {
+            if trigger == "socket-recovery" {
+                drop(data);
+                state.defer_ice_restart(device_id, force);
+            }
             return;
         }
         data.last_offer_sent_at = Some(Instant::now());
@@ -1175,8 +1386,12 @@ pub(crate) async fn renegotiate_ice(
     let restarts = state
         .peers
         .get(device_id)
-        .map(|p| p.state.read().diag.ice_restarts)
+        .filter(|peer| peer.epoch == session_epoch)
+        .map(|peer| peer.state.read().diag.ice_restarts)
         .unwrap_or(0);
+    if !peer_epoch_matches(state, device_id, session_epoch) {
+        return;
+    }
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "ice",
@@ -1204,6 +1419,20 @@ pub(crate) async fn renegotiate_ice(
         // a network change fires `force_ice_restart_all` on each of them at
         // once. The answerer re-gathers implicitly when it applies this offer
         // (the design this function's header already describes).
+        if !peer_epoch_matches(state, device_id, session_epoch) {
+            return;
+        }
+        if state.local_socket_recovery_active() {
+            state.defer_ice_restart(device_id, force);
+            if let Some(peer) = state
+                .peers
+                .get(device_id)
+                .filter(|peer| peer.epoch == session_epoch)
+            {
+                peer.state.write().last_offer_sent_at = None;
+            }
+            return;
+        }
         if let Err(e) = session.restart_ice().await {
             // Benign when a gather from a previous trigger is still in flight;
             // the next watchdog poll picks it up once that settles.
@@ -1220,6 +1449,20 @@ pub(crate) async fn renegotiate_ice(
         // mis-fired a full network-change fan-out. (restart_ice above is a quick
         // ufrag/pwd flip, not a gather, so it isn't wrapped — and timing it out
         // would cancel it mid-flight, which we don't know to be safe.)
+        if !peer_epoch_matches(state, device_id, session_epoch) {
+            return;
+        }
+        if state.local_socket_recovery_active() {
+            state.defer_ice_restart(device_id, force);
+            if let Some(peer) = state
+                .peers
+                .get(device_id)
+                .filter(|peer| peer.epoch == session_epoch)
+            {
+                peer.state.write().last_offer_sent_at = None;
+            }
+            return;
+        }
         let built = tokio::time::timeout(
             Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
             session.create_offer(),
@@ -1227,6 +1470,13 @@ pub(crate) async fn renegotiate_ice(
         .await;
         match built {
             Ok(Ok(desc)) => {
+                if !peer_epoch_matches(state, device_id, session_epoch) {
+                    return;
+                }
+                if state.local_socket_recovery_active() {
+                    state.defer_ice_restart(device_id, force);
+                    return;
+                }
                 // The single INFO line for this restart is the `trigger=…`
                 // line above; the offer/nudge mechanics ride at DEBUG so a
                 // renegotiation is one line in the default stream.
@@ -1243,8 +1493,12 @@ pub(crate) async fn renegotiate_ice(
                         "sdp_bytes": desc.sdp.len(),
                     }),
                 );
+                let Some(offer_id) = issue_offer_id(state, device_id, session_epoch) else {
+                    return;
+                };
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.to_string(),
+                    offer_id,
                     sdp: desc.sdp,
                 });
             }
@@ -1255,6 +1509,20 @@ pub(crate) async fn renegotiate_ice(
             ),
         }
     } else {
+        if !peer_epoch_matches(state, device_id, session_epoch) {
+            return;
+        }
+        if state.local_socket_recovery_active() {
+            state.defer_ice_restart(device_id, force);
+            if let Some(peer) = state
+                .peers
+                .get(device_id)
+                .filter(|peer| peer.epoch == session_epoch)
+            {
+                peer.state.write().last_offer_sent_at = None;
+            }
+            return;
+        }
         // Answerer: avoid glare. Deliberately do NOT restart our own ICE —
         // applying the offerer's restart offer is what re-gathers us, and
         // self-gathering here is exactly what makes that offer bounce off our
@@ -1341,6 +1609,13 @@ async fn connect_peer(
             state.register_connect_waiter(device_id, reply);
         }
     }
+    if state.local_socket_recovery_active() || state.peer_is_closing(device_id) {
+        // Preserve deliberate dials across the pause. Sticky support dials
+        // remain pending indefinitely; ordinary connects retain the existing
+        // reconnect grace rather than creating an unbounded retry source.
+        state.record_reconnect_intent(device_id, sticky);
+        return;
+    }
     ensure_peer_session(state, device_id.to_string(), Role::Offerer).await;
     // Nudge presence so the relays are warm and the remote sees us promptly;
     // globally rate-limited, so this can't add signaling load.
@@ -1348,6 +1623,12 @@ async fn connect_peer(
 }
 
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role: Role) {
+    if state.is_offline()
+        || state.local_socket_recovery_active()
+        || state.peer_is_closing(&device_id)
+    {
+        return;
+    }
     // Return only if we already hold a live *session* for this peer. A
     // session-less discovery placeholder — what a Silent network records for a
     // co-present peer it hasn't dialed (see `note_sighted_without_dialing`) —
@@ -1384,6 +1665,18 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
             return;
         }
     };
+    // Pressure or teardown may have started while `open_peer` was awaiting.
+    // Close this not-yet-published session instead of letting it become an
+    // overlapping socket generation.
+    if state.local_socket_recovery_active() || state.peer_is_closing(&device_id) {
+        let mut close_task = tokio::spawn(async move { session.close().await });
+        let _ = tokio::time::timeout(
+            Duration::from_millis(scheduler::PEER_CLOSE_TIMEOUT_MS),
+            &mut close_task,
+        )
+        .await;
+        return;
+    }
     let session = Arc::new(session);
     let peer = Arc::new(PeerConnection::new(
         device_id.clone(),
@@ -1416,6 +1709,10 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
     // now costs this one attempt (the watchdog rebuilds it), not the engine.
     debug!(peer = %short_peer(&device_id), "ensure_peer_session: building offer");
     if role == Role::Offerer {
+        if state.local_socket_recovery_active() {
+            drop_peer_if_epoch(state, &device_id, peer.epoch, DropReason::IceFailed).await;
+            return;
+        }
         let built = tokio::time::timeout(
             Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
             session.create_offer(),
@@ -1423,14 +1720,25 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: String, role:
         .await;
         match built {
             Ok(Ok(desc)) => {
+                if !peer_epoch_matches(state, &device_id, peer.epoch) {
+                    return;
+                }
+                if state.local_socket_recovery_active() {
+                    drop_peer_if_epoch(state, &device_id, peer.epoch, DropReason::IceFailed).await;
+                    return;
+                }
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
                     "signaling",
                     format!("offer sent to {}", short_peer(&device_id)),
                     serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
                 );
+                let Some(offer_id) = issue_offer_id(state, &device_id, peer.epoch) else {
+                    return;
+                };
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.clone(),
+                    offer_id,
                     sdp: desc.sdp,
                 });
                 if let Some(p) = state.peers.get(&device_id) {
@@ -1492,11 +1800,12 @@ async fn apply_remote_sdp(
     sdp_type: RTCSdpType,
     sdp: String,
 ) {
+    let remote_ufrags = crate::transport::webrtc::sdp_ice_ufrags(&sdp);
     let session = {
         let peer = state.peers.get(device_id);
-        peer.and_then(|p| p.session.lock().clone())
+        peer.and_then(|p| p.session.lock().clone().map(|session| (session, p.epoch)))
     };
-    let Some(session) = session else {
+    let Some((session, session_epoch)) = session else {
         state.log_diag_with(
             crate::events::DiagLevel::Warn,
             "signaling",
@@ -1563,6 +1872,9 @@ async fn apply_remote_sdp(
                 reoffer_after_failed_answer(state, device_id).await;
             }
         } else {
+            if !peer_epoch_matches(state, device_id, session_epoch) {
+                return;
+            }
             // Drain any ICE candidates that arrived ahead of the
             // SDP. The lock comes off before any await — we pull
             // the pending vec out, then apply each candidate
@@ -1575,18 +1887,30 @@ async fn apply_remote_sdp(
             } else {
                 Vec::new()
             };
-            if !pending.is_empty() {
+            let (pending, stale): (Vec<_>, Vec<_>) = pending.into_iter().partition(|candidate| {
+                crate::transport::webrtc::candidate_matches_ufrags(candidate, &remote_ufrags)
+            });
+            if !pending.is_empty() || !stale.is_empty() {
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
                     "ice",
                     format!(
-                        "applying {} queued remote candidate(s) for {}",
+                        "applying {} queued remote candidate(s) for {}; {} stale ignored",
                         pending.len(),
-                        short_peer(device_id)
+                        short_peer(device_id),
+                        stale.len()
                     ),
-                    serde_json::json!({ "peer": device_id, "count": pending.len() }),
+                    serde_json::json!({
+                        "peer": device_id,
+                        "count": pending.len(),
+                        "stale_count": stale.len(),
+                        "active_ufrags": remote_ufrags,
+                    }),
                 );
                 for cand in pending {
+                    if !peer_epoch_matches(state, device_id, session_epoch) {
+                        return;
+                    }
                     if let Err(e) = session.add_ice_candidate(cand).await {
                         warn!(peer = %device_id, "queued add_ice_candidate failed: {e}");
                     }
@@ -1619,7 +1943,11 @@ async fn apply_remote_sdp(
 /// while offline, and it's throttled by `last_offer_sent_at` so a burst of
 /// stale answers collapses to a single offer.
 async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str) {
-    if state.identity.public_id() >= device_id || state.is_offline() {
+    if state.identity.public_id() >= device_id
+        || state.is_offline()
+        || state.local_socket_recovery_active()
+        || state.peer_is_closing(device_id)
+    {
         return;
     }
     // Resolve the throttle + session under the peer lock, then act
@@ -1644,12 +1972,40 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
             if !due {
                 return;
             }
-            peer.session.lock().clone()
+            peer.session
+                .lock()
+                .clone()
+                .map(|session| (session, peer.epoch))
         }
     };
+    if state.local_socket_recovery_active() {
+        if let Some((_, epoch)) = session.as_ref() {
+            if let Some(peer) = state
+                .peers
+                .get(device_id)
+                .filter(|peer| peer.epoch == *epoch)
+            {
+                peer.state.write().last_offer_sent_at = None;
+            }
+        }
+        return;
+    }
     match session {
-        Some(session) => match session.create_offer().await {
+        Some((session, epoch)) => match session.create_offer().await {
             Ok(desc) => {
+                if !peer_epoch_matches(state, device_id, epoch) {
+                    return;
+                }
+                if state.local_socket_recovery_active() {
+                    if let Some(peer) = state
+                        .peers
+                        .get(device_id)
+                        .filter(|peer| peer.epoch == epoch)
+                    {
+                        peer.state.write().last_offer_sent_at = None;
+                    }
+                    return;
+                }
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
                     "signaling",
@@ -1663,8 +2019,12 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
                         "reason": "failed-answer",
                     }),
                 );
+                let Some(offer_id) = issue_offer_id(state, device_id, epoch) else {
+                    return;
+                };
                 let _ = state.signaling_tx.send(SignalingOutbound::Offer {
                     device_id: device_id.to_string(),
+                    offer_id,
                     sdp: desc.sdp,
                 });
             }
@@ -1715,7 +2075,7 @@ async fn handle_transport_event(
             // host/srflx/relay counts to report.
             let kind = crate::transport::classify_candidate_sdp(&cand.candidate);
             if let Some(peer) = state.peers.get(&device_id) {
-                peer.state.write().diag.local_candidates.record(kind);
+                peer.state.write().record_local_candidate(kind);
             }
             // Debug-level: candidates are noisy (one per
             // host/srflx/relay), so the per-candidate detail lands
@@ -1738,36 +2098,52 @@ async fn handle_transport_event(
             });
         }
         TransportEvent::LocalIceCandidate(None) => {
-            // Gathering complete sentinel. Surface as a single info
-            // line with a summary of what we ended up offering — if
-            // the peer never connects we want the user to see at a
-            // glance "we sent 3 host, 1 srflx, 0 relay candidates"
-            // so the TURN-needed diagnosis is one read away.
-            let (h, s, r) = if let Some(peer) = state.peers.get(&device_id) {
-                let data = peer.state.read();
-                (
-                    data.diag.local_candidates.host,
-                    data.diag.local_candidates.server_reflexive,
-                    data.diag.local_candidates.relay,
-                )
-            } else {
-                (0, 0, 0)
+            // Completion is handled from IceGatheringStateChanged(Complete),
+            // which supplies a generation boundary and is idempotent. This
+            // legacy sentinel can be duplicated by transports.
+        }
+        TransportEvent::IceGatheringStateChanged(RTCIceGathererState::Gathering) => {
+            if let Some(peer) = state.peers.get(&device_id) {
+                peer.state.write().begin_local_gather();
+            }
+        }
+        TransportEvent::IceGatheringStateChanged(RTCIceGathererState::Complete) => {
+            let completed = state
+                .peers
+                .get(&device_id)
+                .and_then(|peer| peer.state.write().finish_local_gather());
+            let Some(stats) = completed else {
+                return;
             };
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "ice",
                 format!(
-                    "local gathering complete for {} — {h} host · {s} srflx · {r} relay",
-                    short_peer(&device_id)
+                    "local gathering complete for {} — {} host · {} srflx · {} relay",
+                    short_peer(&device_id),
+                    stats.host,
+                    stats.server_reflexive,
+                    stats.relay,
                 ),
                 serde_json::json!({
                     "peer": device_id,
-                    "host": h,
-                    "srflx": s,
-                    "relay": r,
+                    "host": stats.host,
+                    "srflx": stats.server_reflexive,
+                    "relay": stats.relay,
+                    "total": stats.total(),
                 }),
             );
+            if stats.total() == 0 {
+                ice_watchdog::on_empty_local_gather(state, &device_id, epoch).await;
+            }
         }
+        TransportEvent::IceGatheringStateChanged(RTCIceGathererState::New) => {
+            // New is the idle state before a generation; Gathering performs
+            // the reset so duplicate New callbacks cannot erase candidates.
+        }
+        TransportEvent::IceGatheringStateChanged(
+            RTCIceGathererState::Closed | RTCIceGathererState::Unspecified,
+        ) => {}
         TransportEvent::IceConnectionStateChanged(ice_state) => {
             // Every ICE state lands in the log — these are the
             // single biggest signal of whether NAT traversal is
@@ -1781,7 +2157,7 @@ async fn handle_transport_event(
                 format!("ICE → {ice_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{ice_state:?}") }),
             );
-            handle_ice_state_change(state, &device_id, ice_state).await;
+            handle_ice_state_change(state, &device_id, epoch, ice_state).await;
         }
         TransportEvent::PeerConnectionStateChanged(pc_state) => {
             // Peer connection state is the higher-level view of the
@@ -1794,7 +2170,7 @@ async fn handle_transport_event(
                 format!("PC → {pc_state:?} for {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "state": format!("{pc_state:?}") }),
             );
-            handle_pc_state_change(state, &device_id, pc_state).await;
+            handle_pc_state_change(state, &device_id, epoch, pc_state).await;
         }
         TransportEvent::DataChannelOpen => {
             // The reliable "transport is up" milestone — record it so the
@@ -1806,6 +2182,7 @@ async fn handle_transport_event(
             // The link is back — retire any reconnect intent we were driving
             // for this peer so the tick stops re-offering it.
             state.clear_reconnect_intent(&device_id);
+            state.clear_deferred_ice_restart(&device_id);
             state.log_diag_with(
                 crate::events::DiagLevel::Debug,
                 "transport",
@@ -1837,7 +2214,7 @@ async fn handle_transport_event(
                 ),
                 serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
             );
-            drop_peer(state, &device_id, reason).await;
+            drop_peer_if_epoch(state, &device_id, epoch, reason).await;
         }
         TransportEvent::Message(bytes) => {
             handle_inbound_frame(state, &device_id, bytes).await;
@@ -1860,6 +2237,7 @@ async fn handle_transport_event(
 async fn handle_ice_state_change(
     state: &Arc<NetworkState>,
     device_id: &str,
+    epoch: u64,
     ice: RTCIceConnectionState,
 ) {
     // Instrumentation: a breadcrumb on every ICE transition so the log
@@ -1889,6 +2267,9 @@ async fn handle_ice_state_change(
         let Some(peer) = state.peers.get(device_id) else {
             return;
         };
+        if peer.epoch != epoch {
+            return;
+        }
         let mut data = peer.state.write();
         data.diag.ice_transitions += 1;
         // ICE state never tears a peer down — it only clears or schedules
@@ -1967,7 +2348,10 @@ async fn handle_ice_state_change(
         // record: every candidate pair, every STUN check counter, and a
         // plain-language diagnosis the user can act on.
         log_ice_check_snapshot(state, device_id, "ICE failed", true).await;
-        ice_watchdog::on_failed(state, device_id).await;
+        if !peer_epoch_matches(state, device_id, epoch) {
+            return;
+        }
+        ice_watchdog::on_failed(state, device_id, epoch).await;
     }
     if confirm_ping {
         // Probe the restarted path with traffic right now instead of
@@ -2210,6 +2594,7 @@ fn render_candidate_list(items: &[String]) -> String {
 async fn handle_pc_state_change(
     state: &Arc<NetworkState>,
     device_id: &str,
+    epoch: u64,
     pc: RTCPeerConnectionState,
 ) {
     // A closed connection is a real teardown — drop and let discovery
@@ -2220,7 +2605,7 @@ async fn handle_pc_state_change(
     // inbound silence. (`Failed` used to arm the old checking-timeout; that
     // machinery is gone — ICE/PC state no longer tears anyone down.)
     if pc == RTCPeerConnectionState::Closed {
-        drop_peer(state, device_id, DropReason::IceFailed).await;
+        drop_peer_if_epoch(state, device_id, epoch, DropReason::IceFailed).await;
     }
 }
 
@@ -2986,9 +3371,10 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
                 ),
                 serde_json::json!({ "peer": device_id }),
             );
-            drop_peer(
+            drop_peer_if_epoch(
                 &state,
                 &device_id,
+                probe_epoch,
                 crate::events::DropReason::HeartbeatTimeout,
             )
             .await;
@@ -3000,15 +3386,76 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
 }
 
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
-    let removed = state.peers.remove(device_id);
+    let _ = drop_peer_inner(state, device_id, None, reason).await;
+}
+
+pub(crate) async fn drop_peer_if_epoch(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    epoch: u64,
+    reason: DropReason,
+) -> bool {
+    drop_peer_inner(state, device_id, Some(epoch), reason).await
+}
+
+async fn drop_peer_inner(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    expected_epoch: Option<u64>,
+    reason: DropReason,
+) -> bool {
+    if !state.begin_peer_close(device_id) {
+        return false;
+    }
+    let removed = match expected_epoch {
+        Some(epoch) => state
+            .peers
+            .remove_if(device_id, |_, peer| peer.epoch == epoch),
+        None => state.peers.remove(device_id),
+    };
+    if removed.is_none() {
+        state.finish_peer_close(device_id);
+        return false;
+    }
+    let mut release_close_gate = true;
     if let Some((_, peer)) = removed {
+        state.clear_deferred_ice_restart(device_id);
         let session = peer.session.lock().clone();
         if let Some(session) = session {
-            // Spawn the close so the driver loop never blocks on
-            // the WebRTC teardown's potentially-slow path.
-            tokio::spawn(async move {
-                let _ = session.close().await;
-            });
+            // Release the old socket generation before any replacement can
+            // open. This is bounded so a broken WebRTC teardown cannot wedge
+            // the driver; the normal close path completes quickly.
+            let mut close_task = tokio::spawn(async move { session.close().await });
+            match tokio::time::timeout(
+                Duration::from_millis(scheduler::PEER_CLOSE_TIMEOUT_MS),
+                &mut close_task,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => warn!(
+                    peer = %device_id,
+                    "peer session close failed before replacement: {error}"
+                ),
+                Ok(Err(error)) => warn!(
+                    peer = %device_id,
+                    "peer session close task failed before replacement: {error}"
+                ),
+                Err(_) => {
+                    warn!(
+                        peer = %device_id,
+                        timeout_ms = scheduler::PEER_CLOSE_TIMEOUT_MS,
+                        "peer session close timed out; replacement remains quarantined until cleanup finishes"
+                    );
+                    release_close_gate = false;
+                    let state = Arc::clone(state);
+                    let device_id = device_id.to_string();
+                    tokio::spawn(async move {
+                        let _ = close_task.await;
+                        state.finish_peer_close(&device_id);
+                    });
+                }
+            }
         }
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
@@ -3075,8 +3522,12 @@ pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason
             state.resolve_connect_waiters(device_id, Some(&why));
         }
     }
+    if release_close_gate {
+        state.finish_peer_close(device_id);
+    }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
+    true
 }
 
 /// Build a minimal `NetworkState` for unit tests. One process-wide
@@ -3616,6 +4067,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socket_pressure_does_not_announce_or_burn_reconnect_backoff() {
+        let state = build_test_state("socket-pressure-pauses-reconnect");
+        let mut outbound = state
+            .take_signaling_outbound_rx()
+            .expect("outbound receiver");
+        assert!(state.note_local_socket_pressure());
+        state.record_reconnect_intent("peer-pressure", false);
+
+        assert!(!maybe_reactive_announce(&state));
+        service_reconnect_intents(&state).await;
+        assert!(
+            matches!(
+                outbound.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "pressure must not emit an announce or offer"
+        );
+        assert_eq!(
+            state.due_reconnect_intents(),
+            vec!["peer-pressure".to_string()],
+            "the due intent proves the paused supervisor did not advance its backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_pressure_blocks_announce_driven_reoffer_without_stamping_throttle() {
+        let state = build_test_state("pressure-blocks-announce-reoffer");
+        let peer_id = "z".repeat(60);
+        assert!(state.identity.public_id() < peer_id.as_str());
+        insert_session_less_peer(&state, &peer_id, None);
+        assert!(state.note_local_socket_pressure());
+
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::PeerAnnounced {
+                device_id: peer_id.clone(),
+            },
+        )
+        .await;
+
+        let peer = state.peers.get(&peer_id).expect("peer remains tracked");
+        assert!(
+            peer.state.read().last_offer_sent_at.is_none(),
+            "a suppressed reoffer must not consume its per-peer throttle"
+        );
+    }
+
+    #[tokio::test]
+    async fn pressure_deferred_renegotiation_is_coalesced_for_recovery() {
+        let state = build_test_state("pressure-defers-renegotiation");
+        assert!(state.note_local_socket_pressure());
+
+        renegotiate_ice(&state, "peer-a", false, "test", None).await;
+        renegotiate_ice(&state, "peer-a", true, "test", None).await;
+
+        assert_eq!(
+            state.take_deferred_ice_restarts(),
+            vec![("peer-a".to_string(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_guarded_drop_cannot_remove_a_replacement_generation() {
+        let state = build_test_state("epoch-guarded-drop");
+        insert_session_less_peer(&state, "peer-epoch-drop", None);
+        let current_epoch = state
+            .peers
+            .get("peer-epoch-drop")
+            .expect("peer present")
+            .epoch;
+
+        assert!(
+            !drop_peer_if_epoch(
+                &state,
+                "peer-epoch-drop",
+                current_epoch.wrapping_add(1),
+                DropReason::HeartbeatTimeout,
+            )
+            .await
+        );
+        assert!(state.peers.contains_key("peer-epoch-drop"));
+        assert!(!state.peer_is_closing("peer-epoch-drop"));
+    }
+
+    #[tokio::test]
     async fn reconnect_intent_cleared_on_success() {
         let state = build_test_state("reconnect-intent-clear");
         state.record_reconnect_intent("peer-y", false);
@@ -3874,7 +4410,7 @@ mod tests {
         // The offline guard sits ahead of every peer-map / session access,
         // so a renegotiation request while offline simply returns — no
         // gather attempt, no panic on a peer that isn't there.
-        renegotiate_ice(&state, "ghost-peer", true, "test").await;
+        renegotiate_ice(&state, "ghost-peer", true, "test", None).await;
         assert!(
             state.peers.is_empty(),
             "renegotiate_ice must not touch state while offline"

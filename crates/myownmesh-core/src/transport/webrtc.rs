@@ -32,6 +32,7 @@ use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -60,15 +61,18 @@ use super::turn_stream::TurnStreamBridges;
 /// legitimate peer path — are deliberately *not* listed, so they keep
 /// gathering candidates.
 const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
-    "docker",  // docker0 and the default bridge
-    "br-",     // docker user-defined bridge networks
-    "veth",    // per-container veth pairs
-    "virbr",   // libvirt
-    "vmnet",   // vmware / parallels host-only nets
-    "cni",     // container network interface plugins (k8s)
-    "flannel", // flannel overlay
-    "cali",    // calico
-    "kube",    // kube-* bridges
+    "docker",    // docker0 and the default bridge
+    "br-",       // docker user-defined bridge networks
+    "veth",      // per-container veth pairs
+    "virbr",     // libvirt
+    "vmnet",     // vmware / parallels host-only nets
+    "cni",       // container network interface plugins (k8s)
+    "flannel",   // flannel overlay
+    "cali",      // calico
+    "kube",      // kube-* bridges
+    "vethernet", // Windows Hyper-V / WSL virtual Ethernet
+    "vswitch",   // Windows Hyper-V virtual switches
+    "hyper-v",   // explicit Hyper-V adapter labels
 ];
 
 /// True when `name` is a virtual interface we exclude from ICE gathering
@@ -76,6 +80,7 @@ const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
 /// and `veth9f2` all hit; `eth0`, `wlan0`, `enp3s0`, and `tailscale0`
 /// don't.
 pub(crate) fn is_virtual_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     VIRTUAL_IFACE_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
@@ -105,6 +110,11 @@ pub enum TransportEvent {
     /// A locally-gathered ICE candidate the engine should ship to
     /// the peer over signaling. `None` after gathering completes.
     LocalIceCandidate(Option<LocalIceCandidate>),
+    /// ICE gathering entered a new generation or completed one. The
+    /// engine uses this boundary to distinguish a genuinely empty gather
+    /// from cumulative candidate diagnostics and duplicate completion
+    /// sentinels.
+    IceGatheringStateChanged(RTCIceGathererState),
     /// ICE connection state changed.
     IceConnectionStateChanged(RTCIceConnectionState),
     /// PeerConnection state changed (covers the full DTLS+ICE
@@ -557,6 +567,20 @@ fn register_callbacks(
                     None => None,
                 };
                 let _ = tx.send(TransportEvent::LocalIceCandidate(msg));
+            })
+        }));
+    }
+
+    // ICE gathering generation changed. Keep this separate from the
+    // candidate callback: a gather that cannot allocate even one socket
+    // produces no `Some(candidate)` event, so only this boundary lets the
+    // engine identify the empty generation reliably.
+    {
+        let tx = events_tx.clone();
+        pc.on_ice_gathering_state_change(Box::new(move |state| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(TransportEvent::IceGatheringStateChanged(state));
             })
         }));
     }
@@ -1025,6 +1049,56 @@ pub(crate) fn sdp_fingerprint(sdp: &str) -> Option<String> {
         .map(|v| v.trim().to_ascii_lowercase())
 }
 
+/// Every remote ICE username fragment advertised by an SDP. Bundle sessions
+/// normally repeat one value, but collecting all media sections avoids assuming
+/// that every peer presents the exact SDP shape we generate.
+pub(crate) fn sdp_ice_ufrags(sdp: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("a=ice-ufrag") {
+            let value = value.trim();
+            if !value.is_empty() && !out.iter().any(|known| known == value) {
+                out.push(value.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Candidate generation marker. Modern signaling carries it in the structured
+/// field; some stacks only append the optional `ufrag <value>` extension to the
+/// candidate line, so recognize both representations.
+pub(crate) fn candidate_ufrag(candidate: &LocalIceCandidate) -> Option<&str> {
+    if let Some(value) = candidate
+        .username_fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value);
+    }
+    let mut tokens = candidate.candidate.split_ascii_whitespace();
+    while let Some(token) = tokens.next() {
+        if token.eq_ignore_ascii_case("ufrag") {
+            return tokens.next().filter(|value| !value.is_empty());
+        }
+    }
+    None
+}
+
+pub(crate) fn candidate_matches_ufrags(
+    candidate: &LocalIceCandidate,
+    active_ufrags: &[String],
+) -> bool {
+    active_ufrags.is_empty()
+        || candidate_ufrag(candidate)
+            .map(|candidate_ufrag| active_ufrags.iter().any(|active| active == candidate_ufrag))
+            .unwrap_or(true)
+}
+
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -1117,6 +1191,14 @@ impl PeerSession {
     /// remote description is set.
     pub async fn remote_fingerprint(&self) -> Option<String> {
         sdp_fingerprint(&self.pc.remote_description().await?.sdp)
+    }
+
+    pub async fn remote_ice_ufrags(&self) -> Vec<String> {
+        self.pc
+            .remote_description()
+            .await
+            .map(|desc| sdp_ice_ufrags(&desc.sdp))
+            .unwrap_or_default()
     }
 
     /// DTLS fingerprint of our *local* description — the fingerprint of the
@@ -1677,6 +1759,43 @@ mod tests {
     }
 
     #[test]
+    fn ice_ufrag_matching_handles_structured_and_candidate_line_forms() {
+        let active = sdp_ice_ufrags(
+            "v=0\r\na=ice-ufrag:old\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nA=ICE-UFRAG:new\r\n",
+        );
+        assert_eq!(active, vec!["old", "new"]);
+
+        let candidate = |structured: Option<&str>, line: &str| LocalIceCandidate {
+            candidate: line.to_string(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            username_fragment: structured.map(str::to_string),
+        };
+        assert!(candidate_matches_ufrags(
+            &candidate(Some("new"), "candidate:1 1 udp 1 10.0.0.1 9 typ host"),
+            &active
+        ));
+        assert!(candidate_matches_ufrags(
+            &candidate(
+                None,
+                "candidate:1 1 udp 1 10.0.0.1 9 typ host generation 0 ufrag old"
+            ),
+            &active
+        ));
+        assert!(!candidate_matches_ufrags(
+            &candidate(Some("stale"), "candidate:1 1 udp 1 10.0.0.1 9 typ host"),
+            &active
+        ));
+        assert!(
+            candidate_matches_ufrags(
+                &candidate(None, "candidate:1 1 udp 1 10.0.0.1 9 typ host"),
+                &active
+            ),
+            "legacy candidates without a generation marker remain compatible"
+        );
+    }
+
+    #[test]
     fn track_id_carries_its_lane() {
         // The id a lane's track advertises round-trips to its index…
         assert_eq!(lane_of_track_id("video-0"), 0);
@@ -1700,6 +1819,7 @@ mod tests {
         // sources we trim. `br-…` and `veth…` carry hashed suffixes.
         for name in [
             "docker0",
+            "DOCKER0",
             "br-1a2b3c4d5e6f",
             "veth9f2a1b",
             "virbr0",
@@ -1708,6 +1828,10 @@ mod tests {
             "flannel.1",
             "cali1234abcd",
             "kube-bridge",
+            "vEthernet (WSL (Hyper-V firewall))",
+            "vEthernet (Default Switch)",
+            "vSwitch (Internal)",
+            "Hyper-V Virtual Ethernet Adapter",
         ] {
             assert!(
                 is_virtual_interface(name),
@@ -1727,6 +1851,9 @@ mod tests {
             "tailscale0",
             "utun3",
             "wg0",
+            "wgd5f8a1",
+            "Ethernet 2",
+            "Wi-Fi",
             "lo",
         ] {
             assert!(

@@ -149,6 +149,31 @@ pub const PEER_SEND_TIMEOUT_MS: u64 = 2_000;
 /// in seconds, not at the heartbeat timeout a minute later.
 pub const RESTART_TRAFFIC_GRACE_MS: u64 = 10_000;
 
+/// Delay before the first local-only socket-capacity probe after an ICE
+/// generation completes with zero candidates. This coalesces a wave of
+/// per-peer failures into one network-scoped recovery attempt.
+pub const LOCAL_SOCKET_PROBE_INITIAL_DELAY_MS: u64 = 5_000;
+
+/// Backoff after failed local socket probes. Probes only bind loopback-free
+/// wildcard UDP sockets and never send packets; the widening cadence prevents
+/// a persistent host-wide port exhaustion from turning into a retry loop.
+pub const LOCAL_SOCKET_PROBE_BACKOFF_MS: &[u64] = &[15_000, 30_000, 60_000, 120_000];
+
+/// A circuit that reopens inside this window is treated as flapping and starts
+/// at a wider delay instead of returning to the five-second first probe.
+pub const LOCAL_SOCKET_RECOVERY_MEMORY_MS: u64 = 120_000;
+
+/// Number of UDP sockets held simultaneously by the capacity probe. This is
+/// close to the observed footprint of a small multi-peer ICE fan-out: one
+/// lucky free port is not sufficient evidence that normal gathering can
+/// resume safely.
+pub const LOCAL_SOCKET_PROBE_WIDTH: usize = 64;
+
+/// Explicit WebRTC teardown is awaited only up to this bound. Releasing the
+/// old session before replacement avoids overlapping socket generations,
+/// while the cap prevents a broken close from wedging the engine driver.
+pub const PEER_CLOSE_TIMEOUT_MS: u64 = 1_000;
+
 /// Retry schedule for an automatic relay rescue that did not produce any
 /// inbound remote ICE candidate afterward. The first rescue is immediate;
 /// subsequent unconfirmed rescues back off through this schedule and park at

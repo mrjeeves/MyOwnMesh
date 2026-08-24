@@ -102,7 +102,7 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
         debug!(network = %state.network_id, "wake — forcing relay reconnect");
     }
 
-    let active: Vec<String> = state
+    let active: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter(|e| {
@@ -111,10 +111,10 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 PeerStatus::Active | PeerStatus::Shelved
             )
         })
-        .map(|e| e.key().clone())
+        .map(|e| (e.key().clone(), e.value().epoch))
         .collect();
     let now = monotonic_ms();
-    for peer_id in &active {
+    for (peer_id, _) in &active {
         if let Some(peer) = state.peers.get(peer_id) {
             peer.state.write().last_ping_t = Some(now);
         }
@@ -133,11 +133,14 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
         tokio::time::sleep(Duration::from_millis(WAKE_PROBE_DELAY_MS)).await;
         let now = Instant::now();
         let mut any_rebuilt = false;
-        for peer_id in peers {
+        for (peer_id, epoch) in peers {
             let stale = {
                 let Some(peer) = state_clone.peers.get(&peer_id) else {
                     continue;
                 };
+                if peer.epoch != epoch {
+                    continue;
+                }
                 let data = peer.state.read();
                 data.last_recv_at
                     .map(|t| now.saturating_duration_since(t).as_millis() as u64)
@@ -150,13 +153,14 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 // channel can't work; rebuild and let discovery
                 // re-establish it (same reasoning as the heartbeat path).
                 debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
-                super::drop_peer(
+                let dropped = super::drop_peer_if_epoch(
                     &state_clone,
                     &peer_id,
+                    epoch,
                     crate::events::DropReason::HeartbeatTimeout,
                 )
                 .await;
-                any_rebuilt = true;
+                any_rebuilt |= dropped;
             }
         }
         if any_rebuilt {

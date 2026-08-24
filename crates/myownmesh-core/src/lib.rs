@@ -123,7 +123,9 @@ pub use engine::ladder::ConnectionTier;
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
-pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
+pub use identity::{
+    generate_network_id, normalize_device_id, normalize_network_id, DeviceId, Identity,
+};
 pub use network_state::{
     NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
     SIGN_DOMAIN_TAG_STATE,

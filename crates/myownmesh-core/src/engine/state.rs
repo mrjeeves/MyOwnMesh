@@ -4,7 +4,7 @@
 //! command queue so the driver loop owns serial access.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -26,8 +26,32 @@ use crate::transport::{LocalIceCandidate, Transport, TransportEvent};
 use super::conn_trace::ConnTrace;
 use super::connection::PeerConnection;
 use super::scheduler::{
-    RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_RETRY_BACKOFF_MS,
+    LOCAL_SOCKET_PROBE_BACKOFF_MS, LOCAL_SOCKET_PROBE_INITIAL_DELAY_MS,
+    LOCAL_SOCKET_RECOVERY_MEMORY_MS, RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS,
+    RELAY_RESCUE_RETRY_BACKOFF_MS,
 };
+
+/// Number of joined networks in this process that have independently observed
+/// host-local UDP allocation pressure and have not yet passed a capacity
+/// probe. The Windows ephemeral-port pool is process/host-wide, not scoped to
+/// one mesh network, so a circuit on network A must also pause gathers on B.
+///
+/// Unit tests intentionally retain instance-local behavior: Rust runs them in
+/// parallel in one process, and an armed fixture must not suppress an unrelated
+/// fixture. Integration tests and production binaries compile the real shared
+/// counter.
+#[cfg(not(test))]
+static LOCAL_SOCKET_PRESSURE_OWNERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(test))]
+fn release_local_socket_pressure_owner() {
+    let _ = LOCAL_SOCKET_PRESSURE_OWNERS.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |owners| owners.checked_sub(1),
+    );
+}
 
 /// One assembled video access unit from a peer's track lane, as the
 /// embedder-facing subscription surfaces it.
@@ -310,10 +334,12 @@ pub enum SignalingInbound {
     },
     Offer {
         device_id: String,
+        offer_id: String,
         sdp: String,
     },
     Answer {
         device_id: String,
+        offer_id: String,
         sdp: String,
     },
     Candidate {
@@ -355,16 +381,91 @@ pub enum SignalingOutbound {
     Leave,
     Offer {
         device_id: String,
+        offer_id: String,
         sdp: String,
     },
     Answer {
         device_id: String,
+        offer_id: String,
         sdp: String,
     },
     Candidate {
         device_id: String,
         candidate: LocalIceCandidate,
     },
+}
+
+/// Network-scoped circuit for host UDP allocation pressure. A single empty
+/// ICE generation is enough to arm it, but any number of peers reporting the
+/// same symptom share one probe clock. Only failed capacity probes widen the
+/// backoff; duplicate transport callbacks do not.
+#[derive(Debug, Default)]
+struct LocalSocketRecoveryWatch {
+    active: bool,
+    probe_inflight: bool,
+    retry_at: Option<Instant>,
+    backoff_level: usize,
+    last_recovered_at: Option<Instant>,
+}
+
+impl LocalSocketRecoveryWatch {
+    fn arm(&mut self, now: Instant) -> bool {
+        if self.active {
+            return false;
+        }
+
+        let rapid_reentry = self.last_recovered_at.is_some_and(|at| {
+            now.saturating_duration_since(at)
+                < Duration::from_millis(LOCAL_SOCKET_RECOVERY_MEMORY_MS)
+        });
+        let delay_ms = if rapid_reentry {
+            self.backoff_level = self.backoff_level.saturating_add(1).max(1);
+            LOCAL_SOCKET_PROBE_BACKOFF_MS[self
+                .backoff_level
+                .saturating_sub(1)
+                .min(LOCAL_SOCKET_PROBE_BACKOFF_MS.len() - 1)]
+        } else {
+            self.backoff_level = 0;
+            LOCAL_SOCKET_PROBE_INITIAL_DELAY_MS
+        };
+
+        self.active = true;
+        self.probe_inflight = false;
+        self.retry_at = Some(now + Duration::from_millis(delay_ms));
+        true
+    }
+
+    fn take_probe_permit(&mut self, now: Instant) -> bool {
+        if !self.active || self.probe_inflight {
+            return false;
+        }
+        if self.retry_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.probe_inflight = true;
+        true
+    }
+
+    /// Returns true only on a transition from pressured to recovered.
+    fn finish_probe(&mut self, now: Instant, success: bool) -> bool {
+        if !self.active || !self.probe_inflight {
+            return false;
+        }
+        self.probe_inflight = false;
+        if success {
+            self.active = false;
+            self.retry_at = None;
+            self.last_recovered_at = Some(now);
+            return true;
+        }
+
+        let delay_ms = LOCAL_SOCKET_PROBE_BACKOFF_MS[self
+            .backoff_level
+            .min(LOCAL_SOCKET_PROBE_BACKOFF_MS.len() - 1)];
+        self.backoff_level = self.backoff_level.saturating_add(1);
+        self.retry_at = Some(now + Duration::from_millis(delay_ms));
+        false
+    }
 }
 
 /// The shared state for a single joined network. Every long-lived
@@ -490,6 +591,21 @@ pub struct NetworkState {
     /// for the discovery rationale.
     pub last_reactive_announce_at: Mutex<Option<std::time::Instant>>,
 
+    /// Host UDP-allocation pressure is shared by every peer, so recovery must
+    /// be shared too. This circuit suppresses new gathers and signaling nudges
+    /// until a local-only capacity probe proves enough headroom is back.
+    local_socket_recovery: Mutex<LocalSocketRecoveryWatch>,
+
+    /// ICE restarts requested while local socket recovery owns the network.
+    /// Force is ORed per peer so overlapping watchdog/network/manual triggers
+    /// collapse without losing the strongest request.
+    deferred_ice_restarts: Mutex<std::collections::HashMap<String, bool>>,
+
+    /// Peers whose previous transport generation is being closed. Session
+    /// creation checks this set so a timer/signaling race cannot overlap the
+    /// old and replacement socket generations.
+    closing_peers: Mutex<std::collections::HashSet<String>>,
+
     /// Latched state of the passive clock-skew diagnostic — warn once when
     /// this device's wall clock has disagreed with its peers' (measured off
     /// the heartbeat pings they already send) for several consecutive
@@ -550,7 +666,7 @@ impl NetworkState {
     /// the driver consumes.
     #[allow(clippy::type_complexity)]
     pub fn new(
-        config: NetworkConfig,
+        mut config: NetworkConfig,
         identity: Arc<Identity>,
         transport: Transport,
     ) -> Result<(
@@ -561,6 +677,15 @@ impl NetworkState {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
         // re-arms them without any runtime re-pinning.
+        let mut canonical_pins = Vec::with_capacity(config.pinned_peers.len());
+        for pin in &config.pinned_peers {
+            let canonical = crate::identity::normalize_device_id(pin)
+                .map_err(|e| Error::Config(format!("invalid pinned peer {pin:?}: {e}")))?;
+            if !canonical_pins.contains(&canonical) {
+                canonical_pins.push(canonical);
+            }
+        }
+        config.pinned_peers = canonical_pins;
         let pinned: std::collections::HashSet<String> =
             config.pinned_peers.iter().cloned().collect();
         let roster = crate::roster::load(&config.network_id)?;
@@ -634,6 +759,9 @@ impl NetworkState {
             traffic: super::traffic::TrafficCounters::default(),
             connect_waiters: Mutex::new(std::collections::HashMap::new()),
             last_reactive_announce_at: Mutex::new(None),
+            local_socket_recovery: Mutex::new(LocalSocketRecoveryWatch::default()),
+            deferred_ice_restarts: Mutex::new(std::collections::HashMap::new()),
+            closing_peers: Mutex::new(std::collections::HashSet::new()),
             clock_skew_watch: Mutex::new(super::heartbeat::ClockSkewWatch::default()),
             relay_reconnect: Mutex::new(None),
             relay_connected: Mutex::new(None),
@@ -693,10 +821,14 @@ impl NetworkState {
     /// the state-watch tick re-offers each at most once per backoff step.
     pub fn due_reconnect_intents(&self) -> Vec<String> {
         let now = std::time::Instant::now();
+        let closing = self.closing_peers.lock().clone();
         let mut map = self.reconnect_intents.lock();
         map.retain(|_, i| i.sticky || now < i.give_up_at);
         let mut due = Vec::new();
         for (id, intent) in map.iter_mut() {
+            if closing.contains(id) {
+                continue;
+            }
             if now < intent.next_retry_at {
                 continue;
             }
@@ -718,12 +850,18 @@ impl NetworkState {
     /// one's backoff to come due on the tick.
     pub fn flush_reconnect_intents(&self) -> Vec<String> {
         let now = std::time::Instant::now();
+        let closing = self.closing_peers.lock().clone();
         let mut map = self.reconnect_intents.lock();
         map.retain(|_, i| i.sticky || now < i.give_up_at);
-        for intent in map.values_mut() {
+        let mut ready = Vec::new();
+        for (id, intent) in map.iter_mut() {
+            if closing.contains(id) {
+                continue;
+            }
             advance_backoff(intent, now);
+            ready.push(id.clone());
         }
-        map.keys().cloned().collect()
+        ready
     }
 
     /// Register the signaling driver's force-reconnect signal. Called
@@ -801,6 +939,80 @@ impl NetworkState {
     /// during a brief network outage (see `set_offline`).
     pub fn is_offline(&self) -> bool {
         self.offline.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm the network-global UDP pressure circuit. Returns true only for the
+    /// first symptom in a pressure wave, so callers can log once.
+    pub(crate) fn note_local_socket_pressure(&self) -> bool {
+        let first_for_network = self.local_socket_recovery.lock().arm(Instant::now());
+        #[cfg(not(test))]
+        if first_for_network {
+            LOCAL_SOCKET_PRESSURE_OWNERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        first_for_network
+    }
+
+    pub(crate) fn local_socket_recovery_active(&self) -> bool {
+        let local_active = self.local_socket_recovery.lock().active;
+        #[cfg(not(test))]
+        {
+            local_active
+                || LOCAL_SOCKET_PRESSURE_OWNERS.load(std::sync::atomic::Ordering::Acquire) > 0
+        }
+        #[cfg(test)]
+        {
+            local_active
+        }
+    }
+
+    pub(crate) fn take_local_socket_probe_permit(&self) -> bool {
+        self.local_socket_recovery
+            .lock()
+            .take_probe_permit(Instant::now())
+    }
+
+    pub(crate) fn finish_local_socket_probe(&self, success: bool) -> bool {
+        let recovered = self
+            .local_socket_recovery
+            .lock()
+            .finish_probe(Instant::now(), success);
+        #[cfg(not(test))]
+        if recovered {
+            release_local_socket_pressure_owner();
+        }
+        recovered
+    }
+
+    /// Remember recovery work that could not safely gather candidates while
+    /// the host was under UDP allocation pressure.
+    pub(crate) fn defer_ice_restart(&self, device_id: &str, force: bool) {
+        self.deferred_ice_restarts
+            .lock()
+            .entry(device_id.to_string())
+            .and_modify(|queued_force| *queued_force |= force)
+            .or_insert(force);
+    }
+
+    /// Drain the coalesced pressure-deferred restart set after a successful
+    /// capacity probe. Each peer appears once.
+    pub(crate) fn take_deferred_ice_restarts(&self) -> Vec<(String, bool)> {
+        self.deferred_ice_restarts.lock().drain().collect()
+    }
+
+    pub(crate) fn clear_deferred_ice_restart(&self, device_id: &str) {
+        self.deferred_ice_restarts.lock().remove(device_id);
+    }
+
+    pub(crate) fn begin_peer_close(&self, device_id: &str) -> bool {
+        self.closing_peers.lock().insert(device_id.to_string())
+    }
+
+    pub(crate) fn finish_peer_close(&self, device_id: &str) {
+        self.closing_peers.lock().remove(device_id);
+    }
+
+    pub(crate) fn peer_is_closing(&self, device_id: &str) -> bool {
+        self.closing_peers.lock().contains(device_id)
     }
 
     /// Emit a top-level mesh event. Silently drops if no
@@ -1170,12 +1382,14 @@ impl NetworkState {
     /// Per-peer detail. Returns `None` if the peer is not in the
     /// engine's map.
     pub fn peer_info(&self, device_id: &str) -> Option<crate::handle::PeerInfo> {
-        let peer = self.peers.get(device_id)?;
+        let canonical = crate::identity::normalize_device_id(device_id).ok();
+        let lookup = canonical.as_deref().unwrap_or(device_id);
+        let peer = self.peers.get(lookup)?;
         let data = peer.state.read();
-        let pubkey = crate::signing::pubkey_part(device_id);
+        let pubkey = crate::signing::pubkey_part(lookup);
         let device_suffix = crate::identity::display_suffix(pubkey.as_bytes());
         Some(crate::handle::PeerInfo {
-            device_id: device_id.to_string(),
+            device_id: lookup.to_string(),
             status: data.status,
             tier: data.tier,
             rtt_ms: data.rtt_ms,
@@ -1424,6 +1638,18 @@ impl NetworkState {
     }
 }
 
+#[cfg(not(test))]
+impl Drop for NetworkState {
+    fn drop(&mut self) {
+        // A joined network can be removed while its circuit is armed. Release
+        // its process-global ownership here so other networks are not paused
+        // forever waiting for a probe that can no longer run.
+        if self.local_socket_recovery.get_mut().active {
+            release_local_socket_pressure_owner();
+        }
+    }
+}
+
 /// Unix epoch milliseconds. Stamped on every [`DiagEntry`] so the
 /// GUI's Activity log can render a per-entry HH:MM:SS clock — wall
 /// time, not monotonic: the user cares what time it actually was
@@ -1504,5 +1730,82 @@ mod relay_rescue_tests {
             watch.take_permit("peer-a", started + Duration::from_secs(300)),
             Some(100)
         );
+    }
+}
+
+#[cfg(test)]
+mod local_socket_recovery_tests {
+    use super::LocalSocketRecoveryWatch;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn peer_failure_wave_coalesces_into_one_probe_clock() {
+        let started = Instant::now();
+        let mut watch = LocalSocketRecoveryWatch::default();
+        assert!(watch.arm(started));
+        assert!(!watch.arm(started + Duration::from_secs(1)));
+        assert!(!watch.take_probe_permit(started + Duration::from_secs(4)));
+        assert!(watch.take_probe_permit(started + Duration::from_secs(5)));
+        assert!(!watch.take_probe_permit(started + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn failed_probes_back_off_and_success_closes_the_circuit() {
+        let started = Instant::now();
+        let mut watch = LocalSocketRecoveryWatch::default();
+        watch.arm(started);
+        assert!(watch.take_probe_permit(started + Duration::from_secs(5)));
+        assert!(!watch.finish_probe(started + Duration::from_secs(5), false));
+        assert!(!watch.take_probe_permit(started + Duration::from_secs(19)));
+        assert!(watch.take_probe_permit(started + Duration::from_secs(20)));
+        assert!(watch.finish_probe(started + Duration::from_secs(20), true));
+        assert!(!watch.active);
+    }
+
+    #[test]
+    fn rapid_reentry_uses_a_wider_delay_instead_of_flapping() {
+        let started = Instant::now();
+        let mut watch = LocalSocketRecoveryWatch::default();
+        watch.arm(started);
+        assert!(watch.take_probe_permit(started + Duration::from_secs(5)));
+        assert!(watch.finish_probe(started + Duration::from_secs(5), true));
+
+        let reentered = started + Duration::from_secs(30);
+        assert!(watch.arm(reentered));
+        assert!(!watch.take_probe_permit(reentered + Duration::from_secs(14)));
+        assert!(watch.take_probe_permit(reentered + Duration::from_secs(15)));
+    }
+}
+
+#[cfg(test)]
+mod recovery_collision_state_tests {
+    use crate::engine::build_test_state;
+
+    #[test]
+    fn deferred_restart_requests_coalesce_and_preserve_force() {
+        let state = build_test_state("deferred-restart-coalesce");
+        state.defer_ice_restart("peer-a", false);
+        state.defer_ice_restart("peer-a", true);
+        state.defer_ice_restart("peer-b", false);
+
+        let mut deferred = state.take_deferred_ice_restarts();
+        deferred.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            deferred,
+            vec![("peer-a".to_string(), true), ("peer-b".to_string(), false)]
+        );
+        assert!(state.take_deferred_ice_restarts().is_empty());
+    }
+
+    #[test]
+    fn closing_peer_is_not_returned_or_advanced_by_reconnect_scans() {
+        let state = build_test_state("closing-peer-reconnect-gate");
+        state.record_reconnect_intent("peer-a", false);
+        assert!(state.begin_peer_close("peer-a"));
+        assert!(state.due_reconnect_intents().is_empty());
+        assert!(state.flush_reconnect_intents().is_empty());
+
+        state.finish_peer_close("peer-a");
+        assert_eq!(state.due_reconnect_intents(), vec!["peer-a".to_string()]);
     }
 }

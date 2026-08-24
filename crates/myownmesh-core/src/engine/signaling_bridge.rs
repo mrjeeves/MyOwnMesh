@@ -90,19 +90,27 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 SignalingOutbound::Leave => LocalOutbound::Leave {
                     device_id: device_id_for_out.clone(),
                 },
-                SignalingOutbound::Offer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => LocalOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Offer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: new_short_id(),
+                        offer_id,
                         sdp,
                     },
                 },
-                SignalingOutbound::Answer { device_id: to, sdp } => LocalOutbound::DirectedToPeer {
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => LocalOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Answer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: String::new(),
+                        offer_id,
                         sdp,
                     },
                 },
@@ -132,42 +140,14 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     tokio::spawn(async move {
         while let Some(inbound) = in_rx.recv().await {
             let translated = match inbound {
-                LocalInbound::PeerAnnounced { device_id } => {
-                    SignalingInbound::PeerAnnounced { device_id }
-                }
-                LocalInbound::PeerLeft { device_id } => SignalingInbound::PeerLeft { device_id },
-                LocalInbound::Message { from, msg } => match msg {
-                    SignalingMessage::Announce { peer_id, .. } => {
-                        let _ = peer_id; // peer id is informational; we use `from`
-                        SignalingInbound::PeerAnnounced { device_id: from }
-                    }
-                    SignalingMessage::Leave { peer_id } => {
-                        SignalingInbound::PeerLeft { device_id: peer_id }
-                    }
-                    SignalingMessage::Offer { sdp, .. } => SignalingInbound::Offer {
-                        device_id: from,
-                        sdp,
-                    },
-                    SignalingMessage::Answer { sdp, .. } => SignalingInbound::Answer {
-                        device_id: from,
-                        sdp,
-                    },
-                    SignalingMessage::Candidate {
-                        candidate,
-                        sdp_mid,
-                        sdp_mline_index,
-                        username_fragment,
-                        ..
-                    } => SignalingInbound::Candidate {
-                        device_id: from,
-                        candidate: LocalIceCandidate {
-                            candidate,
-                            sdp_mid,
-                            sdp_mline_index,
-                            username_fragment,
-                        },
-                    },
-                },
+                LocalInbound::PeerAnnounced { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerAnnounced { device_id }),
+                LocalInbound::PeerLeft { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerLeft { device_id }),
+                LocalInbound::Message { from, msg } => translate_message(from, msg),
+            };
+            let Some(translated) = translated else {
+                continue;
             };
             if inbound_tx.send(translated).is_err() {
                 break;
@@ -180,13 +160,6 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
 fn resolve_app_id() -> String {
     std::env::var("MYOWNMESH_TRYSTERO_APP_ID")
         .unwrap_or_else(|_| crate::TRYSTERO_APP_ID.to_string())
-}
-
-fn new_short_id() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 8] = rng.gen();
-    data_encoding::BASE32_NOPAD.encode(&bytes).to_lowercase()
 }
 
 /// Window of the cross-driver dedup ring. Same order of magnitude as
@@ -239,11 +212,19 @@ impl InboundGate {
 fn dedup_key(msg: &SignalingInbound) -> Option<u64> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     match msg {
-        SignalingInbound::Offer { device_id, sdp } => {
-            (1u8, device_id, sdp).hash(&mut h);
+        SignalingInbound::Offer {
+            device_id,
+            offer_id,
+            sdp,
+        } => {
+            (1u8, device_id, offer_id, sdp).hash(&mut h);
         }
-        SignalingInbound::Answer { device_id, sdp } => {
-            (2u8, device_id, sdp).hash(&mut h);
+        SignalingInbound::Answer {
+            device_id,
+            offer_id,
+            sdp,
+        } => {
+            (2u8, device_id, offer_id, sdp).hash(&mut h);
         }
         SignalingInbound::Candidate {
             device_id,
@@ -267,28 +248,38 @@ fn dedup_key(msg: &SignalingInbound) -> Option<u64> {
 /// Translate one driver-level directed message into the engine's
 /// inbound shape — shared by every driver pump so the transports
 /// can't drift.
-fn translate_message(from: String, msg: SignalingMessage) -> SignalingInbound {
+fn translate_message(from: String, msg: SignalingMessage) -> Option<SignalingInbound> {
+    if msg.peer_id() != from {
+        warn!(
+            envelope_from = %from,
+            claimed_peer = %msg.peer_id(),
+            "signaling sender mismatch dropped"
+        );
+        return None;
+    }
+    let from = canonical_wire_device_id(from)?;
     match msg {
-        SignalingMessage::Announce { peer_id, .. } => {
-            let _ = peer_id; // peer id is informational; we use `from`
-            SignalingInbound::PeerAnnounced { device_id: from }
+        SignalingMessage::Announce { .. } => {
+            Some(SignalingInbound::PeerAnnounced { device_id: from })
         }
-        SignalingMessage::Leave { peer_id } => SignalingInbound::PeerLeft { device_id: peer_id },
-        SignalingMessage::Offer { sdp, .. } => SignalingInbound::Offer {
+        SignalingMessage::Leave { .. } => Some(SignalingInbound::PeerLeft { device_id: from }),
+        SignalingMessage::Offer { offer_id, sdp, .. } => Some(SignalingInbound::Offer {
             device_id: from,
+            offer_id,
             sdp,
-        },
-        SignalingMessage::Answer { sdp, .. } => SignalingInbound::Answer {
+        }),
+        SignalingMessage::Answer { offer_id, sdp, .. } => Some(SignalingInbound::Answer {
             device_id: from,
+            offer_id,
             sdp,
-        },
+        }),
         SignalingMessage::Candidate {
             candidate,
             sdp_mid,
             sdp_mline_index,
             username_fragment,
             ..
-        } => SignalingInbound::Candidate {
+        } => Some(SignalingInbound::Candidate {
             device_id: from,
             candidate: LocalIceCandidate {
                 candidate,
@@ -296,7 +287,29 @@ fn translate_message(from: String, msg: SignalingMessage) -> SignalingInbound {
                 sdp_mline_index,
                 username_fragment,
             },
-        },
+        }),
+    }
+}
+
+/// Wire traffic is stricter than the public API: peers always publish the raw
+/// base32-lowercase key, never a display suffix or alternate casing. Rejecting
+/// noncanonical forms here prevents role-order asymmetry and duplicate peer-map
+/// entries even though user-facing methods deliberately normalize those forms.
+fn canonical_wire_device_id(device_id: String) -> Option<String> {
+    match crate::identity::normalize_device_id(&device_id) {
+        Ok(canonical) if canonical == device_id => Some(canonical),
+        Ok(canonical) => {
+            warn!(
+                supplied = %device_id,
+                canonical = %canonical,
+                "noncanonical signaling device id dropped"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(supplied = %device_id, %error, "invalid signaling device id dropped");
+            None
+        }
     }
 }
 
@@ -384,19 +397,27 @@ fn attach_nostr_with(
             let translated = match outbound {
                 SignalingOutbound::Announce => NostrOutbound::Announce,
                 SignalingOutbound::Leave => NostrOutbound::Leave,
-                SignalingOutbound::Offer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => NostrOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Offer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: new_short_id(),
+                        offer_id,
                         sdp,
                     },
                 },
-                SignalingOutbound::Answer { device_id: to, sdp } => NostrOutbound::DirectedToPeer {
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => NostrOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Answer {
                         peer_id: device_id_for_out.clone(),
-                        offer_id: String::new(),
+                        offer_id,
                         sdp,
                     },
                 },
@@ -426,14 +447,17 @@ fn attach_nostr_with(
     tokio::spawn(async move {
         while let Some(inbound) = in_rx.recv().await {
             let translated = match inbound {
-                NostrInbound::PeerAnnounced { device_id } => {
-                    SignalingInbound::PeerAnnounced { device_id }
-                }
+                NostrInbound::PeerAnnounced { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerAnnounced { device_id }),
                 // An intelligent relay told us the peer's signaling socket
                 // dropped — tear the peer down now rather than waiting for
                 // the heartbeat timeout.
-                NostrInbound::PeerLeft { device_id } => SignalingInbound::PeerLeft { device_id },
+                NostrInbound::PeerLeft { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerLeft { device_id }),
                 NostrInbound::Message { from, msg } => translate_message(from, msg),
+            };
+            let Some(translated) = translated else {
+                continue;
             };
             if !gate.deliver(translated) {
                 break;
@@ -514,19 +538,27 @@ fn attach_mdns_with(
             let translated = match outbound {
                 SignalingOutbound::Announce => MdnsOutbound::Announce,
                 SignalingOutbound::Leave => MdnsOutbound::Leave,
-                SignalingOutbound::Offer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
+                SignalingOutbound::Offer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => MdnsOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Offer {
                         peer_id: device_id.clone(),
-                        offer_id: new_short_id(),
+                        offer_id,
                         sdp,
                     },
                 },
-                SignalingOutbound::Answer { device_id: to, sdp } => MdnsOutbound::DirectedToPeer {
+                SignalingOutbound::Answer {
+                    device_id: to,
+                    offer_id,
+                    sdp,
+                } => MdnsOutbound::DirectedToPeer {
                     to,
                     msg: SignalingMessage::Answer {
                         peer_id: device_id.clone(),
-                        offer_id: String::new(),
+                        offer_id,
                         sdp,
                     },
                 },
@@ -555,11 +587,14 @@ fn attach_mdns_with(
     tokio::spawn(async move {
         while let Some(inbound) = in_rx.recv().await {
             let translated = match inbound {
-                MdnsInbound::PeerAnnounced { device_id } => {
-                    SignalingInbound::PeerAnnounced { device_id }
-                }
-                MdnsInbound::PeerLeft { device_id } => SignalingInbound::PeerLeft { device_id },
+                MdnsInbound::PeerAnnounced { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerAnnounced { device_id }),
+                MdnsInbound::PeerLeft { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::PeerLeft { device_id }),
                 MdnsInbound::Message { from, msg } => translate_message(from, msg),
+            };
+            let Some(translated) = translated else {
+                continue;
             };
             if !gate.deliver(translated) {
                 break;
@@ -785,6 +820,7 @@ mod tests {
     fn offer(from: &str, sdp: &str) -> SignalingInbound {
         SignalingInbound::Offer {
             device_id: from.into(),
+            offer_id: "offer-1".into(),
             sdp: sdp.into(),
         }
     }

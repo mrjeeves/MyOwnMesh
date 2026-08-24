@@ -703,16 +703,20 @@ async fn run_reader(
             trace!("mdns frame for another room/recipient dropped");
             continue;
         }
+        if frame.msg.peer_id() != frame.from {
+            trace!(
+                envelope_from = %frame.from,
+                claimed_peer = %frame.msg.peer_id(),
+                "mdns frame sender mismatch dropped"
+            );
+            continue;
+        }
         on_peer_frame(&frame.from);
+        let from = frame.from;
         let inbound = match frame.msg {
-            SignalingMessage::Announce { .. } => MdnsInbound::PeerAnnounced {
-                device_id: frame.from,
-            },
-            SignalingMessage::Leave { peer_id } => MdnsInbound::PeerLeft { device_id: peer_id },
-            other => MdnsInbound::Message {
-                from: frame.from,
-                msg: other,
-            },
+            SignalingMessage::Announce { .. } => MdnsInbound::PeerAnnounced { device_id: from },
+            SignalingMessage::Leave { .. } => MdnsInbound::PeerLeft { device_id: from },
+            other => MdnsInbound::Message { from, msg: other },
         };
         if shared.inbound_tx.send(inbound).is_err() {
             return;
