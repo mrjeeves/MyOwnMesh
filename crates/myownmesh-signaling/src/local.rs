@@ -179,8 +179,8 @@ fn route_outbound(
             continue;
         }
         let msg = match out {
-            LocalOutbound::Announce { device_id } => LocalInbound::PeerAnnounced {
-                device_id: device_id.clone(),
+            LocalOutbound::Announce { device_id: _ } => LocalInbound::PeerAnnounced {
+                device_id: from.to_string(),
             },
             LocalOutbound::DirectedToPeer { to, msg } => {
                 if &p.device_id != to {
@@ -191,8 +191,8 @@ fn route_outbound(
                     msg: msg.clone(),
                 }
             }
-            LocalOutbound::Leave { device_id } => LocalInbound::PeerLeft {
-                device_id: device_id.clone(),
+            LocalOutbound::Leave { device_id: _ } => LocalInbound::PeerLeft {
+                device_id: from.to_string(),
             },
         };
         if p.inbound_tx.send(msg).is_ok() {

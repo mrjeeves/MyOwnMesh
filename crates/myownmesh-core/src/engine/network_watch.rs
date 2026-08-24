@@ -186,21 +186,63 @@ async fn resolve_probe(state: &Arc<NetworkState>) -> Option<SocketAddr> {
             .next()
             .cloned()
     }?;
-    let bare = url
-        .strip_prefix("stun://")
-        .or_else(|| url.strip_prefix("stun:"))
-        .unwrap_or(&url);
-    let bare = bare.split('?').next().unwrap_or(bare);
-    let target = if bare.contains(':') {
-        bare.to_string()
-    } else {
-        format!("{bare}:3478")
-    };
+    let target = stun_probe_target(&url)?;
     tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(target))
         .await
         .ok()?
         .ok()?
         .next()
+}
+
+/// Convert the STUN URL shapes accepted by ICE into an unambiguous resolver
+/// target. In particular, a colon does not necessarily mean "port": it may be
+/// an IPv6 literal. Keeping this pure also prevents a malformed URL from
+/// silently steering the network watcher to a surprising host.
+fn stun_probe_target(url: &str) -> Option<String> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (rest, default_port) = if lower.starts_with("stuns:") {
+        (&raw[6..], 5349)
+    } else if lower.starts_with("stun:") {
+        (&raw[5..], 3478)
+    } else {
+        (raw, 3478)
+    };
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let authority = rest
+        .split(['?', '#', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.contains('@'))?;
+
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[..=close];
+        let tail = &authority[close + 1..];
+        return match tail {
+            "" => Some(format!("{host}:{default_port}")),
+            _ if tail.strip_prefix(':').is_some_and(valid_port) => Some(authority.to_string()),
+            _ => None,
+        };
+    }
+
+    match authority.matches(':').count() {
+        0 => Some(format!("{authority}:{default_port}")),
+        1 => {
+            let (_, port) = authority.rsplit_once(':')?;
+            valid_port(port).then(|| authority.to_string())
+        }
+        // Non-standard but common raw IPv6 literal without brackets.
+        _ if authority.parse::<Ipv6Addr>().is_ok() => Some(format!("[{authority}]:{default_port}")),
+        _ => None,
+    }
+}
+
+fn valid_port(port: &str) -> bool {
+    port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 /// Hash of the usable local address set (+ its size): v4 addresses and v6
@@ -212,6 +254,7 @@ fn local_fingerprint() -> (u64, usize) {
         .map(|ifs| {
             ifs.into_iter()
                 .filter(|i| !i.is_loopback())
+                .filter(|i| !crate::transport::webrtc::is_virtual_interface(&i.name))
                 .filter_map(|i| match i.addr.ip() {
                     ip if crate::transport::webrtc::is_link_local_ip(&ip) => None,
                     IpAddr::V4(v4) => Some(v4.to_string()),
@@ -568,7 +611,7 @@ pub(crate) async fn reconnect_peer_in_place(state: &Arc<NetworkState>, device_id
     // the link is quiet despite what ICE reports, the same reason the
     // network-change watcher passes `force = true`. A no-op if we hold no
     // session for the peer.
-    super::renegotiate_ice(state, device_id, true, "manual-reconnect").await;
+    super::renegotiate_ice(state, device_id, true, "manual-reconnect", None).await;
     // If we'd lost the peer entirely, nudge discovery (and flush any owed
     // offer) so it rebuilds rather than waiting for its own announce schedule.
     super::try_reoffer(state, device_id).await;
@@ -580,6 +623,15 @@ pub(crate) async fn reconnect_peer_in_place(state: &Arc<NetworkState>, device_id
 /// relay is confirmed back (see [`on_network_change`]).
 async fn fan_out_restart(state: &Arc<NetworkState>) {
     ice_watchdog::force_ice_restart_all(state).await;
+    // `force_ice_restart_all` coalesces active peers into the pressure-
+    // deferred set while the circuit is open. Do not flush reconnect intents
+    // now: `flush_reconnect_intents` advances their backoff, while every
+    // `try_reoffer` would be suppressed — a lost-wakeup collision. The
+    // successful capacity probe replays deferred restarts and the normal
+    // supervisor services still-due reconnect intents afterward.
+    if state.local_socket_recovery_active() {
+        return;
+    }
     // Re-offer every peer we owe an offer to (offerer-role peers dropped on
     // the way down). A fresh relay session after a handoff is exactly when a
     // dropped peer's offer can finally cross — flush them all at once here,
@@ -601,6 +653,52 @@ async fn fan_out_restart(state: &Arc<NetworkState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stun_probe_targets_cover_hostname_ports_tls_and_ipv6_shapes() {
+        for (input, expected) in [
+            ("stun:stun.example.com", "stun.example.com:3478"),
+            (
+                "STUN://stun.example.com:19302?transport=udp",
+                "stun.example.com:19302",
+            ),
+            ("stuns:relay.example.com", "relay.example.com:5349"),
+            ("stun:[2001:db8::1]", "[2001:db8::1]:3478"),
+            ("stuns:[2001:db8::1]:443", "[2001:db8::1]:443"),
+            ("2001:db8::1", "[2001:db8::1]:3478"),
+        ] {
+            assert_eq!(
+                stun_probe_target(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for invalid in [
+            "",
+            "stun:",
+            "stun:host:not-a-port",
+            "stun:[2001:db8::1",
+            "stun:user@host",
+            "stun:host:0",
+        ] {
+            assert_eq!(stun_probe_target(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pressure_deferred_fanout_does_not_consume_reconnect_intents() {
+        let state = crate::engine::build_test_state("pressure-network-fanout");
+        state.record_reconnect_intent("peer-a", false);
+        assert!(state.note_local_socket_pressure());
+
+        fan_out_restart(&state).await;
+
+        assert_eq!(
+            state.due_reconnect_intents(),
+            vec!["peer-a".to_string()],
+            "a fan-out suppressed by pressure must leave the intent immediately due"
+        );
+    }
 
     #[test]
     fn snapshot_equality_compares_every_field() {

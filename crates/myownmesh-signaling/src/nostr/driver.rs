@@ -1091,6 +1091,20 @@ fn handle_inbound_frame(
             let event_value = arr.get(2).ok_or_else(|| "missing event body".to_string())?;
             let event: NostrEvent =
                 serde_json::from_value(event_value.clone()).map_err(|e| e.to_string())?;
+            // Never trust a relay to have performed NIP-01 verification for us.
+            // Verify before touching the dedup ring: otherwise an invalid frame
+            // that reuses a real event id can suppress the later authentic one.
+            if !event.verify() {
+                trace!(relay = %short(url), "invalid nostr event dropped");
+                return Ok(());
+            }
+            if !event.tags.iter().any(|tag| {
+                tag.first().map(String::as_str) == Some("r")
+                    && tag.get(1) == Some(&shared.room_handle)
+            }) {
+                trace!(relay = %short(url), "nostr event for another room dropped");
+                return Ok(());
+            }
             // Skip events we sent ourselves.
             if event.pubkey == shared.identity.pubkey_hex() {
                 return Ok(());
@@ -1124,11 +1138,29 @@ fn handle_inbound_frame(
             let envelope: SignalingEnvelope =
                 serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
 
-            // Skip messages directed to a different recipient.
-            if let Some(to) = &envelope.to {
-                if to != &shared.device_id {
-                    return Ok(());
-                }
+            // The signed transport envelope and its embedded payload must name
+            // the same sender. Presence/departure are broadcasts; negotiation
+            // is always explicitly addressed. Accepting an undirected Offer or
+            // an embedded peer_id from another device creates ambiguous peer-map
+            // keys and lets one event mutate another peer's session.
+            if envelope.msg.peer_id() != envelope.from {
+                trace!(
+                    relay = %short(url),
+                    envelope_from = %envelope.from,
+                    claimed_peer = %envelope.msg.peer_id(),
+                    "nostr signaling sender mismatch dropped"
+                );
+                return Ok(());
+            }
+            let broadcast = matches!(
+                &envelope.msg,
+                SignalingMessage::Announce { .. } | SignalingMessage::Leave { .. }
+            );
+            if (broadcast && envelope.to.is_some())
+                || (!broadcast && envelope.to.as_deref() != Some(shared.device_id.as_str()))
+            {
+                trace!(relay = %short(url), "nostr signaling recipient shape dropped");
+                return Ok(());
             }
 
             // Enforce the presence/negotiation kind split on receive.
@@ -1666,6 +1698,102 @@ mod tests {
             1_700_000_000,
         );
         serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
+    }
+
+    fn frame_for_envelope(
+        envelope: SignalingEnvelope,
+        signer: &NostrIdentity,
+        kind: u16,
+        room: &str,
+    ) -> String {
+        let event = crate::nostr::event::make_event(
+            signer,
+            kind,
+            vec![vec!["r".into(), room.into()]],
+            serde_json::to_string(&envelope).unwrap(),
+            1_700_000_000,
+        );
+        serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
+    }
+
+    #[test]
+    fn invalid_signature_is_dropped_before_dedup() {
+        let shared = fixture_shared();
+        let peer_signer = NostrIdentity::generate();
+        let peer_pub = peer_signer.pubkey_hex().to_string();
+        let (frame, _) = announce_frame_for(&peer_pub, &peer_signer);
+        let mut value: Value = serde_json::from_str(&frame).unwrap();
+        value[2]["content"] = Value::String("tampered after signing".into());
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &value.to_string(), &shared, &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            shared.seen_event_ids.lock().is_empty(),
+            "invalid events must not poison the cross-relay dedup ring"
+        );
+    }
+
+    #[test]
+    fn mismatched_embedded_sender_is_dropped() {
+        let shared = fixture_shared();
+        let signer = NostrIdentity::generate();
+        let frame = frame_for_envelope(
+            SignalingEnvelope {
+                from: "peer-a".into(),
+                to: None,
+                msg: SignalingMessage::Leave {
+                    peer_id: "peer-b".into(),
+                },
+            },
+            &signer,
+            SIGNALING_EPHEMERAL_KIND,
+            "test-room",
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn undirected_offer_and_wrong_room_are_dropped() {
+        let shared = fixture_shared();
+        let signer = NostrIdentity::generate();
+        let peer = signer.pubkey_hex().to_string();
+        let offer = || SignalingMessage::Offer {
+            peer_id: peer.clone(),
+            offer_id: "off-1".into(),
+            sdp: "v=0\r\n".into(),
+        };
+        let undirected = frame_for_envelope(
+            SignalingEnvelope {
+                from: peer.clone(),
+                to: None,
+                msg: offer(),
+            },
+            &signer,
+            SIGNALING_EPHEMERAL_KIND,
+            "test-room",
+        );
+        let wrong_room = frame_for_envelope(
+            SignalingEnvelope {
+                from: peer.clone(),
+                to: Some("self-device".into()),
+                msg: offer(),
+            },
+            &signer,
+            SIGNALING_EPHEMERAL_KIND,
+            "other-room",
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+
+        handle_inbound_frame("wss://relay-a", &undirected, &shared, &tx).unwrap();
+        handle_inbound_frame("wss://relay-a", &wrong_room, &shared, &tx).unwrap();
+
+        assert!(rx.try_recv().is_err());
     }
 
     /// A live offer on the ephemeral kind is delivered to the engine.

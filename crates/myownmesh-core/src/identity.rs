@@ -153,6 +153,55 @@ pub fn display_suffix(pubkey_string_bytes: &[u8]) -> String {
     hex.chars().take(5).collect()
 }
 
+/// Normalize a Device ID at an API boundary.
+///
+/// The wire identity is always the 52-character base32-lowercase encoding of
+/// an Ed25519 public key. User-facing surfaces may hand that value back in
+/// uppercase, surrounded by whitespace, or with the deterministic `-XXXXX`
+/// display suffix. Collapse all accepted forms to the wire identity so peer
+/// maps, reconnect intents, signaling recipients, and roster rows cannot key
+/// the same public key under different strings.
+///
+/// A supplied display suffix must be the one derived from the key. Treating an
+/// arbitrary five-character tail as cosmetic makes a mistyped UI ID silently
+/// target a different identity than the operator intended.
+pub fn normalize_device_id(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Identity("device id is empty".into()));
+    }
+
+    let (body, supplied_suffix) = match trimmed.rsplit_once('-') {
+        Some((body, suffix)) if suffix.len() == 5 => (body, Some(suffix)),
+        _ => (trimmed, None),
+    };
+    let canonical = body.to_ascii_lowercase();
+    let decoded = BASE32_NOPAD
+        .decode(canonical.to_ascii_uppercase().as_bytes())
+        .map_err(|e| Error::Identity(format!("device id is not valid base32: {e}")))?;
+    if decoded.len() != ed25519_dalek::PUBLIC_KEY_LENGTH {
+        return Err(Error::Identity(format!(
+            "device id decodes to {} bytes; expected {}",
+            decoded.len(),
+            ed25519_dalek::PUBLIC_KEY_LENGTH
+        )));
+    }
+    let mut bytes = [0u8; ed25519_dalek::PUBLIC_KEY_LENGTH];
+    bytes.copy_from_slice(&decoded);
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|e| Error::Identity(format!("device id is not an Ed25519 public key: {e}")))?;
+
+    if let Some(supplied) = supplied_suffix {
+        let expected = display_suffix(canonical.as_bytes());
+        if !supplied.eq_ignore_ascii_case(&expected) {
+            return Err(Error::Identity(format!(
+                "device id display suffix does not match (expected {expected})"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
 /// Path of the anchor file. The directory `~/.myownmesh/.secrets/` is
 /// created on demand.
 fn anchor_path() -> Result<PathBuf> {
@@ -434,5 +483,30 @@ mod tests {
         let a = display_suffix(&[1u8; 32]);
         let b = display_suffix(&[2u8; 32]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn normalize_device_id_collapses_wire_and_display_forms() {
+        let identity = Identity::ephemeral();
+        let raw = identity.public_id();
+        assert_eq!(normalize_device_id(raw).unwrap(), raw);
+        assert_eq!(
+            normalize_device_id(&format!("  {}  ", raw.to_ascii_uppercase())).unwrap(),
+            raw
+        );
+        assert_eq!(normalize_device_id(&identity.display_id()).unwrap(), raw);
+        assert_eq!(
+            normalize_device_id(&identity.display_id().to_ascii_lowercase()).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn normalize_device_id_rejects_malformed_or_mistyped_forms() {
+        let identity = Identity::ephemeral();
+        assert!(normalize_device_id("").is_err());
+        assert!(normalize_device_id("peer-a").is_err());
+        assert!(normalize_device_id(&format!("{}-00000", identity.public_id())).is_err());
+        assert!(normalize_device_id(&"0".repeat(52)).is_err());
     }
 }

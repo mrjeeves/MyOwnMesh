@@ -258,7 +258,8 @@ impl JoinedNetwork {
 
     /// Single-peer detail.
     pub fn peer(&self, device_id: &str) -> Option<PeerInfo> {
-        self.state.peer_info(device_id)
+        let device_id = crate::identity::normalize_device_id(device_id).ok()?;
+        self.state.peer_info(&device_id)
     }
 
     /// List approved peers from the on-disk roster.
@@ -269,11 +270,12 @@ impl JoinedNetwork {
     /// Approve a peer into the roster (and send the on-the-wire
     /// `approve` if a session is currently open).
     pub async fn roster_approve(&self, device_id: &str, label: &str) -> Result<()> {
+        let device_id = crate::identity::normalize_device_id(device_id)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.state
             .cmd_tx
             .send(NetworkCmd::ApproveRoster {
-                device_id: device_id.to_string(),
+                device_id: device_id.clone(),
                 label: label.to_string(),
                 reply,
             })
@@ -281,25 +283,26 @@ impl JoinedNetwork {
         rx.await
             .map_err(|_| Error::Network("engine dropped approve reply".into()))??;
         // Emit local approve frame after roster persistence.
-        crate::engine::handshake::send_local_approve(&self.state, device_id).await;
+        crate::engine::handshake::send_local_approve(&self.state, &device_id).await;
         Ok(())
     }
 
     /// Remove a peer from the roster. Drops the active session
     /// if any.
     pub async fn roster_remove(&self, device_id: &str) -> Result<()> {
+        let device_id = crate::identity::normalize_device_id(device_id)?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.state
             .cmd_tx
             .send(NetworkCmd::RemoveRoster {
-                device_id: device_id.to_string(),
+                device_id: device_id.clone(),
                 reply,
             })
             .map_err(|_| Error::Network("engine command queue closed".into()))?;
         rx.await
             .map_err(|_| Error::Network("engine dropped reply".into()))??;
         let _ = self.state.cmd_tx.send(NetworkCmd::DropPeer {
-            device_id: device_id.to_string(),
+            device_id,
             reason: DropReason::Denied,
         });
         Ok(())
@@ -457,6 +460,13 @@ impl JoinedNetwork {
     /// re-adding the network. Fire-and-forget: the work runs on the engine
     /// driver so it's serialized with every other per-peer mutation.
     pub fn reconnect(&self, peer: Option<String>) {
+        let peer = match peer {
+            Some(peer) => match crate::identity::normalize_device_id(&peer) {
+                Ok(peer) => Some(peer),
+                Err(_) => return,
+            },
+            None => None,
+        };
         self.state.reconnect(peer);
     }
 
@@ -477,10 +487,11 @@ impl JoinedNetwork {
     /// presence. `Ok(())` means the command was queued, not that the peer
     /// connected — observe [`crate::PeerEvent`]s for the outcome.
     pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
+        let device_id = crate::identity::normalize_device_id(device_id)?;
         self.state
             .cmd_tx
             .send(NetworkCmd::ConnectPeer {
-                device_id: device_id.to_string(),
+                device_id,
                 sticky: false,
                 reply: None,
             })
@@ -503,7 +514,9 @@ impl JoinedNetwork {
         sticky: bool,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await {
+        let device_id = crate::identity::normalize_device_id(device_id)?;
+        match tokio::time::timeout(timeout, self.state.connect_peer_wait(&device_id, sticky)).await
+        {
             Ok(result) => result,
             Err(_) => Err(Error::Network(format!(
                 "connect to {device_id} still pending after {timeout:?} (the dial keeps going{})",
@@ -522,7 +535,8 @@ impl JoinedNetwork {
         peer: &str,
         kind: crate::transport::webrtc::LaneKind,
     ) -> Result<u8> {
-        self.state.media_lane_open(peer, kind).await
+        let peer = crate::identity::normalize_device_id(peer)?;
+        self.state.media_lane_open(&peer, kind).await
     }
 
     /// Close a media lane toward `peer`. The close is a *drain*: the
@@ -536,7 +550,8 @@ impl JoinedNetwork {
         kind: crate::transport::webrtc::LaneKind,
         lane: u8,
     ) -> Result<()> {
-        self.state.media_lane_close(peer, kind, lane).await
+        let peer = crate::identity::normalize_device_id(peer)?;
+        self.state.media_lane_close(&peer, kind, lane).await
     }
 
     /// Point-in-time traffic accounting for this network: frames and
@@ -554,7 +569,9 @@ impl JoinedNetwork {
     /// being redialed on announce and its never-expiring intent is
     /// dropped. Does not tear down a live session.
     pub fn unpin_peer(&self, device_id: &str) {
-        self.state.remove_sticky(device_id);
+        if let Ok(device_id) = crate::identity::normalize_device_id(device_id) {
+            self.state.remove_sticky(&device_id);
+        }
     }
 
     /// Send an application frame with the acknowledged-delivery
@@ -571,8 +588,9 @@ impl JoinedNetwork {
         payload: serde_json::Value,
         ttl: Option<std::time::Duration>,
     ) -> Result<()> {
+        let peer = crate::identity::normalize_device_id(peer)?;
         self.state
-            .send_channel_reliable(peer, channel, payload, ttl.map(|d| d.as_millis() as u64))
+            .send_channel_reliable(&peer, channel, payload, ttl.map(|d| d.as_millis() as u64))
             .await
     }
 

@@ -11,8 +11,9 @@
 //! link stays down; the data channel is preserved across the restart, so
 //! a brief blip never tears it down.
 
+use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::warn;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
@@ -20,7 +21,8 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
 use super::scheduler::{
-    DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
+    DATA_CHANNEL_OPEN_TIMEOUT_MS, HEARTBEAT_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS,
+    LOCAL_SOCKET_PROBE_WIDTH, RESTART_TRAFFIC_GRACE_MS, WAKE_DETECTION_THRESHOLD_MS,
 };
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
@@ -37,8 +39,10 @@ const NO_TURN_DIAG_AFTER_FAILURES: u32 = 3;
 /// threshold. Cheap to call on every tick: it's an O(N) scan
 /// over the peers map with no per-peer locks held across awaits.
 pub async fn poll_all(state: &Arc<NetworkState>) {
+    service_local_socket_recovery(state).await;
+
     let now = Instant::now();
-    let candidates: Vec<String> = state
+    let candidates: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter_map(|e| {
@@ -50,21 +54,28 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             if now.saturating_duration_since(since).as_millis() as u64
                 >= ICE_DISCONNECTED_RESTART_MS
             {
-                Some(e.key().clone())
+                Some((e.key().clone(), e.value().epoch))
             } else {
                 None
             }
         })
         .collect();
 
-    for peer_id in candidates {
+    for (peer_id, epoch) in candidates {
         // Renegotiate (restart_ice + a fresh offer), not a bare
         // restart_ice — see `engine::renegotiate_ice`. Single-flighted
         // there, so polling every few seconds while a link stays down
         // retries the offer without flooding signaling. Not forced: ICE
         // is genuinely disconnected here, so there's no stale-Connected
         // state to push past.
-        super::renegotiate_ice(state, &peer_id, false, "ice-disconnected-watchdog").await;
+        super::renegotiate_ice(
+            state,
+            &peer_id,
+            false,
+            "ice-disconnected-watchdog",
+            Some(epoch),
+        )
+        .await;
     }
 
     // Retry selected-pair classification for any peer whose ICE
@@ -133,7 +144,7 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // milestone — `data_channel_open` — not ICE state, which has been seen
     // to lie in both directions. A peer whose channel already opened is
     // never a candidate here; its liveness is the heartbeat.
-    let timed_out: Vec<String> = state
+    let timed_out: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter_map(|e| {
@@ -144,11 +155,11 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             let started = data.session_started_at?;
             (now.saturating_duration_since(started).as_millis() as u64
                 >= DATA_CHANNEL_OPEN_TIMEOUT_MS)
-                .then(|| e.key().clone())
+                .then(|| (e.key().clone(), e.value().epoch))
         })
         .collect();
-    for peer_id in timed_out {
-        on_connect_timeout(state, &peer_id).await;
+    for (peer_id, epoch) in timed_out {
+        on_connect_timeout(state, &peer_id, epoch).await;
     }
 
     // Restart-verify watchdog. A peer recovering from an ICE restart stays
@@ -160,7 +171,7 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // while it's still re-gathering — the clock is re-stamped to the moment
     // ICE reconnects, so a restart legitimately crossing slow signaling
     // isn't killed early.
-    let restart_unconfirmed: Vec<String> = state
+    let restart_unconfirmed: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter_map(|e| {
@@ -186,12 +197,146 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
                 DATA_CHANNEL_OPEN_TIMEOUT_MS
             };
             (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
-                .then(|| e.key().clone())
+                .then(|| (e.key().clone(), e.value().epoch))
         })
         .collect();
-    for peer_id in restart_unconfirmed {
-        on_restart_unconfirmed(state, &peer_id).await;
+    for (peer_id, epoch) in restart_unconfirmed {
+        on_restart_unconfirmed(state, &peer_id, epoch).await;
     }
+}
+
+/// An empty local ICE generation means the host could not allocate even a
+/// host candidate. Treat that as network-global socket pressure, not as N
+/// independent peer failures. A never-opened or already-stale session is
+/// closed now to release anything it owns, while a recently active path is
+/// preserved until heartbeat evidence says it is actually dead.
+pub(crate) async fn on_empty_local_gather(state: &Arc<NetworkState>, device_id: &str, epoch: u64) {
+    let first_in_wave = state.note_local_socket_pressure();
+    if first_in_wave {
+        state.log_diag_with(
+            DiagLevel::Warn,
+            "ice",
+            "local ICE gathering produced zero candidates — pausing new gathers while UDP capacity recovers",
+            serde_json::json!({
+                "peer": device_id,
+                "scope": "network",
+                "probe_width": LOCAL_SOCKET_PROBE_WIDTH,
+            }),
+        );
+    }
+
+    let Some(reclaim) = state.peers.get(device_id).and_then(|peer| {
+        (peer.epoch == epoch)
+            .then(|| should_reclaim_after_empty_gather(&peer.state.read(), Instant::now()))
+    }) else {
+        return;
+    };
+    if reclaim {
+        super::drop_peer_if_epoch(
+            state,
+            device_id,
+            epoch,
+            crate::events::DropReason::IceFailed,
+        )
+        .await;
+    } else {
+        // The old path may still be carrying traffic, so do not tear it down.
+        // It still owes one forced re-gather once the capacity probe succeeds;
+        // otherwise the path can die later with no recovery owner.
+        state.defer_ice_restart(device_id, true);
+        state.log_diag_with(
+            DiagLevel::Debug,
+            "ice",
+            format!(
+                "empty gather for {} but its recent data path is still live — preserving it",
+                super::short_peer(device_id)
+            ),
+            serde_json::json!({ "peer": device_id, "preserved": true }),
+        );
+    }
+}
+
+fn should_reclaim_after_empty_gather(
+    data: &super::connection::PeerStateData,
+    now: Instant,
+) -> bool {
+    if !data.data_channel_open {
+        return true;
+    }
+    let freshest_evidence = data.last_recv_at.or(data.session_started_at);
+    freshest_evidence
+        .map(|at| {
+            now.saturating_duration_since(at)
+                >= Duration::from_millis(HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS)
+        })
+        .unwrap_or(false)
+}
+
+/// Run one quiet, local-only capacity check when the shared circuit allows.
+/// The sockets are held together so one lucky free port cannot reopen the
+/// full peer fan-out; no packets are emitted, and every probe socket is
+/// dropped before reconnect work resumes.
+async fn service_local_socket_recovery(state: &Arc<NetworkState>) {
+    if state.is_offline() {
+        return;
+    }
+
+    let mut recovered = false;
+    if state.take_local_socket_probe_permit() {
+        let probe = probe_local_udp_capacity();
+        let success = probe.is_ok();
+        recovered = state.finish_local_socket_probe(success);
+        if recovered {
+            state.log_diag_with(
+                DiagLevel::Info,
+                "ice",
+                "local UDP capacity recovered — resuming queued peer reconnects",
+                serde_json::json!({ "probe_width": LOCAL_SOCKET_PROBE_WIDTH }),
+            );
+        } else if let Err(error) = probe {
+            state.log_diag_with(
+                DiagLevel::Debug,
+                "ice",
+                format!("local UDP capacity still constrained — recovery remains paused: {error}"),
+                serde_json::json!({
+                    "probe_width": LOCAL_SOCKET_PROBE_WIDTH,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+    }
+    if state.local_socket_recovery_active() {
+        return;
+    }
+
+    // Replay coalesced recovery requests. A request that still collides with
+    // Checking or the two-second offer single-flight requeues itself and is
+    // retried by the next watchdog poll instead of being lost.
+    for (device_id, force) in state.take_deferred_ice_restarts() {
+        if state.local_socket_recovery_active() {
+            state.defer_ice_restart(&device_id, force);
+            continue;
+        }
+        if state.peers.contains_key(&device_id) {
+            super::renegotiate_ice(state, &device_id, force, "socket-recovery", None).await;
+        } else {
+            super::try_reoffer(state, &device_id).await;
+        }
+    }
+    if recovered {
+        // One discovery nudge for the whole pressure wave. Any announce calls
+        // made by answerer-side deferred restarts collapse through the same
+        // global rate limiter.
+        super::maybe_reactive_announce(state);
+    }
+}
+
+fn probe_local_udp_capacity() -> std::io::Result<()> {
+    let mut sockets = Vec::with_capacity(LOCAL_SOCKET_PROBE_WIDTH);
+    for _ in 0..LOCAL_SOCKET_PROBE_WIDTH {
+        sockets.push(UdpSocket::bind(("0.0.0.0", 0))?);
+    }
+    Ok(())
 }
 
 /// A connecting peer whose data channel never opened within the timeout.
@@ -208,12 +353,29 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
 /// socket left by a network blip is the usual cause, and redialing is what
 /// unblocks candidate delivery for the rebuilt session. The re-announce is
 /// rate-limited so a wave of timeouts can't flood the relays.
-async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
+async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str, epoch: u64) {
     // While the host is offline (no primary interface) every peer will time
     // out, but tearing them all down now just means re-discovering them a
     // second later when the interface returns. Hold in place — the
     // network-change handler restarts everything once we're back online.
     if state.is_offline() {
+        return;
+    }
+    if !super::peer_epoch_matches(state, device_id, epoch) {
+        return;
+    }
+    if state.local_socket_recovery_active() {
+        // Another peer already proved host-local allocation pressure. Reclaim
+        // this failed attempt, but do not misdiagnose it as a relay problem or
+        // force a signaling redial while the shared circuit is intentionally
+        // quiet.
+        super::drop_peer_if_epoch(
+            state,
+            device_id,
+            epoch,
+            crate::events::DropReason::IceFailed,
+        )
+        .await;
         return;
     }
 
@@ -234,6 +396,23 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
     // diagnosis) is the record of why this attempt never completed — log
     // it before the teardown removes the agent.
     super::log_ice_check_snapshot(state, device_id, "connect timed out", true).await;
+    // The snapshot is bounded but asynchronous. A replacement can land while
+    // it is being collected; never diagnose or redial signaling on behalf of
+    // the new generation. Pressure may also arm during the read, in which case
+    // the circuit owns recovery and relay rescue must stay quiet.
+    if !super::peer_epoch_matches(state, device_id, epoch) {
+        return;
+    }
+    if state.local_socket_recovery_active() {
+        super::drop_peer_if_epoch(
+            state,
+            device_id,
+            epoch,
+            crate::events::DropReason::IceFailed,
+        )
+        .await;
+        return;
+    }
 
     // Zero remote candidates is the fingerprint of wedged signaling, not a
     // blocked network: the peer's candidates never crossed the relay (or
@@ -311,11 +490,19 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
         }
     }
 
-    super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
+    let dropped = super::drop_peer_if_epoch(
+        state,
+        device_id,
+        epoch,
+        crate::events::DropReason::IceFailed,
+    )
+    .await;
     // Nudge discovery so we don't wait for the peer's next scheduled
     // announce; rate-limited, so several simultaneous timeouts collapse
     // into a single publish.
-    super::maybe_reactive_announce(state);
+    if dropped {
+        super::maybe_reactive_announce(state);
+    }
 }
 
 /// A peer whose ICE restart reconnected (or should have) but never produced
@@ -323,8 +510,11 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
 /// rather than ride a dead "connected" peer until the heartbeat notices a
 /// minute later. (Real traffic would have promoted it back to Steady in
 /// `handle_inbound_frame`, taking it out of this watchdog's sights.)
-async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str) {
+async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str, epoch: u64) {
     if state.is_offline() {
+        return;
+    }
+    if !super::peer_epoch_matches(state, device_id, epoch) {
         return;
     }
     state.log_diag_with(
@@ -336,14 +526,25 @@ async fn on_restart_unconfirmed(state: &Arc<NetworkState>, device_id: &str) {
         ),
         serde_json::json!({ "peer": device_id }),
     );
-    super::drop_peer(state, device_id, crate::events::DropReason::IceFailed).await;
-    super::maybe_reactive_announce(state);
+    let dropped = super::drop_peer_if_epoch(
+        state,
+        device_id,
+        epoch,
+        crate::events::DropReason::IceFailed,
+    )
+    .await;
+    if dropped {
+        super::maybe_reactive_announce(state);
+    }
 }
 
 /// Called directly from the ICE state-change handler when ICE
 /// reports `Failed`. Skips the watchdog window — we know the
 /// connection is gone.
-pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
+pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str, epoch: u64) {
+    if !super::peer_epoch_matches(state, device_id, epoch) {
+        return;
+    }
     state.log_diag_with(
         crate::events::DiagLevel::Warn,
         "ice",
@@ -356,7 +557,7 @@ pub async fn on_failed(state: &Arc<NetworkState>, device_id: &str) {
     // re-exchange. The old path escalated to a Tier-4 re-handshake, which
     // only re-sends `hello` over the already-dead data channel and can't
     // bring the transport back. Single-flighted in `renegotiate_ice`.
-    super::renegotiate_ice(state, device_id, false, "ice-failed").await;
+    super::renegotiate_ice(state, device_id, false, "ice-failed", Some(epoch)).await;
 }
 
 /// Inspect the peer's candidate stats after an ICE failure and, if
@@ -443,18 +644,54 @@ fn maybe_emit_no_turn_diag(state: &Arc<NetworkState>, device_id: &str) {
 /// reconnected within seconds instead of half a minute, and the
 /// per-peer single-flight keeps the fan-out from flooding signaling.
 pub async fn force_ice_restart_all(state: &Arc<NetworkState>) {
-    let candidates: Vec<String> = state
+    let candidates: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter_map(|e| {
             let data = e.value().state.read();
-            matches!(data.status, PeerStatus::Active | PeerStatus::Shelved).then(|| e.key().clone())
+            matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
+                .then(|| (e.key().clone(), e.value().epoch))
         })
         .collect();
 
-    for peer_id in candidates {
+    for (peer_id, epoch) in candidates {
         // Forced: on a network change ICE often still reads Connected
         // (consent-freshness hasn't fired), so push past the stale state.
-        super::renegotiate_ice(state, &peer_id, true, "network-change").await;
+        super::renegotiate_ice(state, &peer_id, true, "network-change", Some(epoch)).await;
+    }
+}
+
+#[cfg(test)]
+mod local_socket_pressure_tests {
+    use super::should_reclaim_after_empty_gather;
+    use crate::engine::connection::PeerStateData;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn empty_gather_reclaims_a_session_that_never_opened() {
+        let data = PeerStateData::default();
+        assert!(should_reclaim_after_empty_gather(&data, Instant::now()));
+    }
+
+    #[test]
+    fn empty_restart_gather_preserves_a_recently_live_path() {
+        let now = Instant::now();
+        let data = PeerStateData {
+            data_channel_open: true,
+            last_recv_at: Some(now),
+            ..PeerStateData::default()
+        };
+        assert!(!should_reclaim_after_empty_gather(&data, now));
+    }
+
+    #[test]
+    fn empty_restart_gather_reclaims_a_stale_path() {
+        let now = Instant::now();
+        let data = PeerStateData {
+            data_channel_open: true,
+            last_recv_at: Some(now - Duration::from_secs(91)),
+            ..PeerStateData::default()
+        };
+        assert!(should_reclaim_after_empty_gather(&data, now));
     }
 }

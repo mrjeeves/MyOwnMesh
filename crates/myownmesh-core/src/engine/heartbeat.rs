@@ -44,7 +44,7 @@ pub async fn tick(state: &Arc<NetworkState>) {
     // the wake-threshold buffer prevents a long-paused tokio runtime
     // from immediately tearing down every peer the moment it resumes.
     let stale_cutoff_ms = HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS;
-    let stale: Vec<String> = state
+    let stale: Vec<(String, u64)> = state
         .peers
         .iter()
         .filter_map(|e| {
@@ -56,7 +56,7 @@ pub async fn tick(state: &Arc<NetworkState>) {
                 .last_recv_at
                 .map(|t| now.duration_since(t).as_millis() as u64);
             match elapsed {
-                Some(ms) if ms > stale_cutoff_ms => Some(e.key().clone()),
+                Some(ms) if ms > stale_cutoff_ms => Some((e.key().clone(), e.value().epoch)),
                 _ => None,
             }
         })
@@ -70,19 +70,31 @@ pub async fn tick(state: &Arc<NetworkState>) {
     // Handshaking for minutes after a network change). Rebuild instead and
     // let discovery re-establish a fresh connection.
     if !stale.is_empty() {
-        for peer_id in &stale {
+        let mut any_dropped = false;
+        for (peer_id, epoch) in &stale {
+            if !super::peer_epoch_matches(state, peer_id, *epoch) {
+                continue;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
                 "heartbeat",
                 format!("peer silent past heartbeat timeout — rebuilding: {peer_id}"),
                 serde_json::json!({ "peer": peer_id }),
             );
-            super::drop_peer(state, peer_id, crate::events::DropReason::HeartbeatTimeout).await;
+            any_dropped |= super::drop_peer_if_epoch(
+                state,
+                peer_id,
+                *epoch,
+                crate::events::DropReason::HeartbeatTimeout,
+            )
+            .await;
         }
         // Re-seed discovery so the rebuilt peers rediscover promptly rather
         // than waiting for their next scheduled announce. Rate-limited, so
         // a wave of timeouts collapses into one publish.
-        super::maybe_reactive_announce(state);
+        if any_dropped {
+            super::maybe_reactive_announce(state);
+        }
     }
 }
 

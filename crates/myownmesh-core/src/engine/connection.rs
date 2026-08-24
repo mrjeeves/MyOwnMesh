@@ -12,7 +12,10 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::CapabilityAdvert;
-use crate::transport::{LocalIceCandidate, PeerDiag, PeerSession, SelectedCandidatePair};
+use crate::transport::{
+    IceCandidateKind, IceCandidateStats, LocalIceCandidate, PeerDiag, PeerSession,
+    SelectedCandidatePair,
+};
 
 use super::ladder::ConnectionTier;
 
@@ -72,6 +75,11 @@ pub struct PeerStateData {
     /// offers. `None` until we've sent the first offer for this
     /// session; cleared on `drop_peer`.
     pub last_offer_sent_at: Option<Instant>,
+    /// Correlation id of the newest offer this session emitted. A late Answer
+    /// may arrive while a newer offer is already outstanding; signaling state
+    /// alone only says "awaiting some answer", so this id prevents applying the
+    /// old response to the new negotiation.
+    pub pending_offer_id: Option<String>,
     /// Wall-clock of the most recent announce-driven liveness probe we
     /// fired for this peer. When a peer we believe is connected re-announces
     /// but its inbound has gone silent, we ping it and rebuild if no traffic
@@ -160,6 +168,13 @@ pub struct PeerStateData {
     /// finished). Drives a power-of-two-throttled warn so a pre-admission
     /// flood can't be turned into a log-amplification primitive.
     pub admission_rejected: u64,
+    /// Candidate counts for the current ICE gathering generation only.
+    /// `diag.local_candidates` is intentionally cumulative and therefore
+    /// cannot tell whether a restart produced zero candidates.
+    pub local_gather_candidates: IceCandidateStats,
+    /// True between Gathering and Complete for the current generation.
+    /// Makes duplicate Complete callbacks harmless.
+    pub local_gather_in_progress: bool,
     pub diag: PeerDiag,
 }
 
@@ -176,6 +191,35 @@ impl PeerStateData {
     /// traffic flows.
     pub fn is_admitted(&self) -> bool {
         self.authenticated && matches!(self.status, PeerStatus::Active | PeerStatus::Shelved)
+    }
+
+    pub(crate) fn begin_local_gather(&mut self) {
+        // The state callback is normally delivered before candidates, but
+        // callbacks are asynchronous. If a candidate defensively opened the
+        // generation first, a late/duplicate Gathering event must not erase it.
+        if self.local_gather_in_progress {
+            return;
+        }
+        self.local_gather_candidates = IceCandidateStats::default();
+        self.local_gather_in_progress = true;
+    }
+
+    pub(crate) fn record_local_candidate(&mut self, kind: IceCandidateKind) {
+        // Defensive against a transport delivering the first candidate just
+        // before its Gathering state callback.
+        if !self.local_gather_in_progress {
+            self.begin_local_gather();
+        }
+        self.local_gather_candidates.record(kind);
+        self.diag.local_candidates.record(kind);
+    }
+
+    pub(crate) fn finish_local_gather(&mut self) -> Option<IceCandidateStats> {
+        if !self.local_gather_in_progress {
+            return None;
+        }
+        self.local_gather_in_progress = false;
+        Some(self.local_gather_candidates.clone())
     }
 }
 
@@ -199,6 +243,7 @@ impl Default for PeerStateData {
             last_recv_at: None,
             last_ping_sent_at: None,
             last_offer_sent_at: None,
+            pending_offer_id: None,
             last_liveness_probe_at: None,
             last_ping_t: None,
             rtt_ms: None,
@@ -217,6 +262,8 @@ impl Default for PeerStateData {
             remote_description_set: false,
             pending_remote_candidates: Vec::new(),
             admission_rejected: 0,
+            local_gather_candidates: IceCandidateStats::default(),
+            local_gather_in_progress: false,
             diag: PeerDiag::default(),
         }
     }
@@ -248,5 +295,46 @@ impl PeerConnection {
             session: Mutex::new(session),
             epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod gathering_tests {
+    use super::PeerStateData;
+    use crate::transport::IceCandidateKind;
+
+    #[test]
+    fn gathering_counts_are_per_generation_but_diagnostics_are_cumulative() {
+        let mut data = PeerStateData::default();
+        data.begin_local_gather();
+        data.record_local_candidate(IceCandidateKind::Host);
+        let first = data.finish_local_gather().expect("first completion");
+        assert_eq!(first.total(), 1);
+        assert_eq!(data.diag.local_candidates.total(), 1);
+
+        data.begin_local_gather();
+        let second = data.finish_local_gather().expect("second completion");
+        assert_eq!(second.total(), 0, "the new generation must start empty");
+        assert_eq!(
+            data.diag.local_candidates.total(),
+            1,
+            "operator diagnostics remain cumulative"
+        );
+    }
+
+    #[test]
+    fn duplicate_gathering_complete_is_ignored() {
+        let mut data = PeerStateData::default();
+        data.begin_local_gather();
+        assert!(data.finish_local_gather().is_some());
+        assert!(data.finish_local_gather().is_none());
+    }
+
+    #[test]
+    fn late_gathering_state_does_not_erase_an_early_candidate() {
+        let mut data = PeerStateData::default();
+        data.record_local_candidate(IceCandidateKind::Host);
+        data.begin_local_gather();
+        assert_eq!(data.finish_local_gather().expect("completion").total(), 1);
     }
 }
