@@ -1092,6 +1092,19 @@ fn verified_projection(
     Ok((roles, removed))
 }
 
+/// Whether `device_id` is an active member of a closed network's verified
+/// signed projection. Callers use this before applying any legacy/local roster
+/// mutation: the cache may add manual approvals, but it may never subtract a
+/// membership the signed log still grants.
+pub(super) fn signed_projection_contains(
+    network_id: &str,
+    governance: &network_state::NetworkState,
+    device_id: &str,
+) -> Result<bool> {
+    let (roles, _) = verified_projection(network_id, governance)?;
+    Ok(roles.contains_key(&pk(device_id)))
+}
+
 /// Session keys may carry a display suffix while signed membership always uses
 /// the bare public key. Keep the live-session projection on that same identity
 /// surface so a tombstoned device cannot survive merely because its connection
@@ -1825,6 +1838,60 @@ mod tests {
             state.is_rostered(member.public_id()),
             "an identical signed snapshot must still repair its derived roster"
         );
+    }
+
+    #[tokio::test]
+    async fn local_remove_cannot_override_signed_closed_membership() {
+        let state = crate::engine::build_test_state("signed-roster-remove-guard");
+        let member = crate::identity::Identity::ephemeral();
+
+        propose(
+            &state,
+            TransitionVariant::KindChange {
+                to: NetworkKind::Closed,
+            },
+            None,
+        )
+        .await
+        .expect("found closed network");
+        propose(
+            &state,
+            TransitionVariant::RoleGrant {
+                target: member.public_id().to_string(),
+                role: Role::Member,
+            },
+            None,
+        )
+        .await
+        .expect("sign member grant");
+
+        let display_id = format!("{}-ABCDE", member.public_id());
+        let error = state
+            .remove_roster(&display_id)
+            .await
+            .expect_err("local removal must not subtract signed membership");
+        assert!(
+            error.to_string().contains("active signed member"),
+            "the refusal should identify the source-of-truth collision: {error}"
+        );
+        assert!(
+            state.is_rostered(member.public_id()),
+            "the signed member must remain authorized"
+        );
+
+        // A local/manual approval is outside the signed projection and remains
+        // locally removable. The guard protects authority without turning the
+        // roster cache into an append-only store.
+        let manual = crate::identity::Identity::ephemeral();
+        {
+            let mut roster = state.roster.write();
+            crate::roster::add_peer_in(&mut roster, manual.public_id(), "manual");
+        }
+        state
+            .remove_roster(manual.public_id())
+            .await
+            .expect("manual approval remains locally removable");
+        assert!(!state.is_rostered(manual.public_id()));
     }
 
     #[test]
