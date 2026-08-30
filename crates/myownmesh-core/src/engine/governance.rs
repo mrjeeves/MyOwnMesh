@@ -1092,6 +1092,14 @@ fn verified_projection(
     Ok((roles, removed))
 }
 
+/// Session keys may carry a display suffix while signed membership always uses
+/// the bare public key. Keep the live-session projection on that same identity
+/// surface so a tombstoned device cannot survive merely because its connection
+/// key is decorated for display.
+fn matches_tombstone(removed: &std::collections::BTreeSet<String>, device_id: &str) -> bool {
+    removed.contains(&pk(device_id))
+}
+
 /// Rebuild the derived governance-role and operative-roster projections from
 /// the signed logs. Verification happens before either cache is touched: an
 /// invalid log can never add, remove, or re-role a roster entry.
@@ -1287,16 +1295,26 @@ async fn adopt_transition_log(
     for device_id in roles.keys() {
         super::handshake::send_local_approve(state, device_id).await;
     }
-    // Every verified tombstone must terminate a session admitted under stale
-    // state, even if its roster row had already disappeared. Intersect with the
-    // live peer map so stable gossip performs no repeated drop work.
-    let tombstoned_sessions: Vec<String> = removed
-        .iter()
-        .filter(|device_id| state.peers.contains_key(*device_id))
-        .cloned()
-        .collect();
-    for device_id in tombstoned_sessions {
-        super::drop_peer(state, &device_id, DropReason::Denied).await;
+    // A newly learned/repaired tombstone must terminate any session admitted
+    // under stale state, even if its roster row had already disappeared. Route
+    // it through the existing deny-with-proof path: data-channel sends are
+    // buffered, so an immediate drop here can discard the signed proof before
+    // the evicted device learns it must stand down. The delayed janitor in
+    // `deny_if_evicted` still guarantees teardown. Gate this work on a real
+    // change/repair so identical steady-state gossip cannot repeatedly deny or
+    // schedule drops, and compare canonical pubkeys because live peer keys may
+    // carry display suffixes.
+    if changed || repair.roster_changed() {
+        let tombstoned_sessions: Vec<String> = state
+            .peers
+            .iter()
+            .filter_map(|entry| {
+                matches_tombstone(&removed, entry.key()).then(|| entry.key().clone())
+            })
+            .collect();
+        for device_id in tombstoned_sessions {
+            deny_if_evicted(state, &device_id).await;
+        }
     }
     if changed {
         diag(
@@ -1734,6 +1752,9 @@ mod tests {
             ("signed-member".to_string(), Role::Member),
         ]);
         let removed = std::collections::BTreeSet::from(["removed".to_string()]);
+
+        assert!(matches_tombstone(&removed, "removed-A1234"));
+        assert!(!matches_tombstone(&removed, "another-A1234"));
 
         let repair = mirror_roles_to_roster(&roles, &mut roster, &removed, "owner-A1234");
 
