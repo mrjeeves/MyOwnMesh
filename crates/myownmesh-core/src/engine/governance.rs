@@ -1054,6 +1054,71 @@ fn project_roles(
     roles
 }
 
+/// The operative roster is a cache of the closed network's verified signed
+/// state, plus any not-yet-signed/manual approvals. A crash or failed write can
+/// leave that cache behind the governance log, so every load and governance
+/// exchange reconciles these invariants:
+///
+/// * every effective signed role is rostered with the same role;
+/// * every effective signed tombstone is absent (except our own local row);
+/// * unrelated roster-only approvals are preserved.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct RosterProjectionRepair {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub roles_updated: Vec<String>,
+    pub governance_roles_updated: bool,
+}
+
+impl RosterProjectionRepair {
+    pub fn roster_changed(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty() || !self.roles_updated.is_empty()
+    }
+}
+
+fn verified_projection(
+    network_id: &str,
+    governance: &network_state::NetworkState,
+) -> Result<(
+    std::collections::BTreeMap<String, Role>,
+    std::collections::BTreeSet<String>,
+)> {
+    let verified = network_state::verify_log(network_id, &governance.transitions)?;
+    let mut roles = verified.roles.clone();
+    for member in network_state::verify_member_log(&verified, &governance.member_log, network_id) {
+        roles.entry(member).or_insert(Role::Member);
+    }
+    let removed = network_state::member_log_removed(&verified, &governance.member_log, network_id);
+    Ok((roles, removed))
+}
+
+/// Session keys may carry a display suffix while signed membership always uses
+/// the bare public key. Keep the live-session projection on that same identity
+/// surface so a tombstoned device cannot survive merely because its connection
+/// key is decorated for display.
+fn matches_tombstone(removed: &std::collections::BTreeSet<String>, device_id: &str) -> bool {
+    removed.contains(&pk(device_id))
+}
+
+/// Rebuild the derived governance-role and operative-roster projections from
+/// the signed logs. Verification happens before either cache is touched: an
+/// invalid log can never add, remove, or re-role a roster entry.
+pub(super) fn reconcile_signed_projection(
+    network_id: &str,
+    governance: &mut network_state::NetworkState,
+    roster: &mut crate::roster::Roster,
+    self_pubkey: &str,
+) -> Result<RosterProjectionRepair> {
+    let (roles, removed) = verified_projection(network_id, governance)?;
+    let governance_roles_updated = governance.roles != roles;
+    if governance_roles_updated {
+        governance.roles = roles.clone();
+    }
+    let mut repair = mirror_roles_to_roster(&roles, roster, &removed, self_pubkey);
+    repair.governance_roles_updated = governance_roles_updated;
+    Ok(repair)
+}
+
 /// Adopt a peer's two signed logs, converging both tiers of the cert chain.
 ///
 /// The **governance** log (kind changes, owner/manager grants and removals,
@@ -1151,17 +1216,23 @@ async fn adopt_transition_log(
             }
         }
 
-        if !changed {
-            (false, gov.roles.clone(), Default::default(), None)
-        } else {
-            let projected = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
-            // Devices the signed log explicitly evicted/revoked — the only ones
-            // the roster mirror deletes.
-            let verified = network_state::verify_log(&state.network_id, &gov.transitions)
-                .unwrap_or_else(|_| network_state::NetworkState::empty_for(&state.network_id));
-            let removed =
-                network_state::member_log_removed(&verified, &gov.member_log, &state.network_id);
+        let (projected, removed) = match verified_projection(&state.network_id, &gov) {
+            Ok(projection) => projection,
+            Err(e) => {
+                drop(gov);
+                diag(
+                    state,
+                    crate::events::DiagLevel::Warn,
+                    format!("refusing to reconcile an invalid signed state: {e}"),
+                );
+                return;
+            }
+        };
+        let roles_changed = gov.roles != projected;
+        if roles_changed {
             gov.roles = projected.clone();
+        }
+        if changed || roles_changed {
             if let Err(e) = network_state::save(&gov) {
                 diag(
                     state,
@@ -1169,13 +1240,9 @@ async fn adopt_transition_log(
                     format!("persist after adopting logs failed: {e}"),
                 );
             }
-            (true, projected, removed, adopted_topology)
         }
+        (changed, projected, removed, adopted_topology)
     };
-
-    if !changed {
-        return;
-    }
 
     if let Some(mode) = adopted_topology {
         // Governance carried a topology this node hadn't applied yet —
@@ -1195,10 +1262,11 @@ async fn adopt_transition_log(
     // (`removed`). This is how an eviction learned via gossip de-authorises the
     // target on this node, matching the local-ratify path — without over-pruning
     // devices that are simply not (yet) in the signed projection.
-    {
+    let repair = {
         let mut roster = state.roster.write();
         let self_pk = state.identity.public_id().to_string();
-        if mirror_roles_to_roster(&roles, &mut roster, &removed, &self_pk) {
+        let repair = mirror_roles_to_roster(&roles, &mut roster, &removed, &self_pk);
+        if repair.roster_changed() {
             if let Err(e) = crate::roster::save(&roster) {
                 diag(
                     state,
@@ -1207,22 +1275,68 @@ async fn adopt_transition_log(
                 );
             }
         }
+        repair
+    };
+    if repair.roster_changed() {
+        diag(
+            state,
+            crate::events::DiagLevel::Info,
+            format!(
+                "repaired signed roster projection: added={} removed={} roles_updated={}",
+                repair.added.len(),
+                repair.removed.len(),
+                repair.roles_updated.len()
+            ),
+        );
     }
-    diag(
-        state,
-        crate::events::DiagLevel::Info,
-        format!(
-            "adopted converged logs from {}",
-            &peer_id[..peer_id.len().min(12)]
-        ),
-    );
+    // A valid signed member may already be authenticated and waiting only for
+    // our approval. Complete the existing bilateral handshake in place; the
+    // send path is idempotent, so active or disconnected members are no-ops.
+    for device_id in roles.keys() {
+        super::handshake::send_local_approve(state, device_id).await;
+    }
+    // A newly learned/repaired tombstone must terminate any session admitted
+    // under stale state, even if its roster row had already disappeared. Route
+    // it through the existing deny-with-proof path: data-channel sends are
+    // buffered, so an immediate drop here can discard the signed proof before
+    // the evicted device learns it must stand down. The delayed janitor in
+    // `deny_if_evicted` still guarantees teardown. Gate this work on a real
+    // change/repair so identical steady-state gossip cannot repeatedly deny or
+    // schedule drops, and compare canonical pubkeys because live peer keys may
+    // carry display suffixes.
+    if changed || repair.roster_changed() {
+        let tombstoned_sessions: Vec<String> = state
+            .peers
+            .iter()
+            .filter_map(|entry| {
+                matches_tombstone(&removed, entry.key()).then(|| entry.key().clone())
+            })
+            .collect();
+        for device_id in tombstoned_sessions {
+            deny_if_evicted(state, &device_id).await;
+        }
+    }
+    if changed {
+        diag(
+            state,
+            crate::events::DiagLevel::Info,
+            format!(
+                "adopted converged logs from {}",
+                &peer_id[..peer_id.len().min(12)]
+            ),
+        );
+    }
     // The adopted logs may have evicted (or re-admitted) THIS device —
     // settle the cached verdict before telling anyone anything.
     refresh_self_evicted(state);
     // Tell our own peers — both the new membership and the new governance
     // counts — so it ripples on.
-    broadcast_roster_summary(state).await;
-    broadcast_state(state).await;
+    if changed || repair.roster_changed() {
+        broadcast_roster_summary(state).await;
+    }
+    if changed {
+        broadcast_state(state).await;
+    }
 }
 
 /// Mirror the converged signed state into the roster. Role-bearing pubkeys
@@ -1243,34 +1357,37 @@ fn mirror_roles_to_roster(
     roster: &mut crate::roster::Roster,
     removed: &std::collections::BTreeSet<String>,
     self_pubkey: &str,
-) -> bool {
-    let mut changed = false;
+) -> RosterProjectionRepair {
+    let mut repair = RosterProjectionRepair::default();
     for (pubkey, role) in roles {
         if !crate::roster::is_authorized(roster, pubkey) {
             crate::roster::add_peer_in(roster, pubkey, "");
-            changed = true;
+            repair.added.push(pubkey.clone());
         }
         if crate::roster::set_role_in(roster, pubkey, *role) {
-            changed = true;
+            repair.roles_updated.push(pubkey.clone());
         }
     }
     // Drop only the explicitly-evicted, and never ourselves.
     let self_pk = crate::signing::pubkey_part(self_pubkey);
-    let before = roster.authorized_devices.len();
+    repair.removed.extend(
+        roster
+            .authorized_devices
+            .iter()
+            .filter(|entry| entry.device_id != self_pk && removed.contains(&entry.device_id))
+            .map(|entry| entry.device_id.clone()),
+    );
     roster
         .authorized_devices
         .retain(|e| e.device_id == self_pk || !removed.contains(&e.device_id));
-    if roster.authorized_devices.len() != before {
-        changed = true;
-    }
     // Clear a stale role tag on any entry the signed roles no longer cover.
     for entry in roster.authorized_devices.iter_mut() {
         if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
             entry.role = Role::Member;
-            changed = true;
+            repair.roles_updated.push(entry.device_id.clone());
         }
     }
-    changed
+    repair
 }
 
 /// If `their_root` (a membership root) differs from ours, send a targeted
@@ -1621,6 +1738,94 @@ pub async fn broadcast_state(state: &Arc<EngineState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_projection_repairs_only_verified_requirements_and_tombstones() {
+        let mut roster = crate::roster::empty_for("projection-repair");
+        crate::roster::add_peer_in(&mut roster, "owner", "Owner label");
+        crate::roster::add_peer_in(&mut roster, "manual", "Manual approval");
+        crate::roster::add_peer_in(&mut roster, "removed", "Removed member");
+        let owner_approved_at = roster.authorized_devices[0].approved_at;
+
+        let roles = std::collections::BTreeMap::from([
+            ("owner".to_string(), Role::Owner),
+            ("signed-member".to_string(), Role::Member),
+        ]);
+        let removed = std::collections::BTreeSet::from(["removed".to_string()]);
+
+        assert!(matches_tombstone(&removed, "removed-A1234"));
+        assert!(!matches_tombstone(&removed, "another-A1234"));
+
+        let repair = mirror_roles_to_roster(&roles, &mut roster, &removed, "owner-A1234");
+
+        assert_eq!(repair.added, vec!["signed-member"]);
+        assert_eq!(repair.removed, vec!["removed"]);
+        assert_eq!(repair.roles_updated, vec!["owner"]);
+        assert!(crate::roster::is_authorized(&roster, "signed-member-Z9999"));
+        assert!(crate::roster::is_authorized(&roster, "manual"));
+        assert!(!crate::roster::is_authorized(&roster, "removed"));
+        let owner = roster
+            .authorized_devices
+            .iter()
+            .find(|entry| entry.device_id == "owner")
+            .expect("owner preserved");
+        assert_eq!(owner.label, "Owner label");
+        assert_eq!(owner.approved_at, owner_approved_at);
+        assert_eq!(owner.role, Role::Owner);
+
+        let second = mirror_roles_to_roster(&roles, &mut roster, &removed, "owner-A1234");
+        assert!(
+            !second.roster_changed(),
+            "a converged projection must not write or gossip again"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_signed_snapshot_repairs_a_divergent_live_roster() {
+        let state = crate::engine::build_test_state("unchanged-roster-repair");
+        let member = crate::identity::Identity::ephemeral();
+
+        propose(
+            &state,
+            TransitionVariant::KindChange {
+                to: NetworkKind::Closed,
+            },
+            None,
+        )
+        .await
+        .expect("found closed network");
+        propose(
+            &state,
+            TransitionVariant::RoleGrant {
+                target: member.public_id().to_string(),
+                role: Role::Member,
+            },
+            None,
+        )
+        .await
+        .expect("sign member grant");
+
+        {
+            let mut roster = state.roster.write();
+            crate::roster::remove_peer_in(&mut roster, member.public_id());
+            crate::roster::save(&roster).expect("persist intentionally stale roster");
+        }
+        assert!(!state.is_rostered(member.public_id()));
+
+        let (transitions, member_log) = {
+            let governance = state.governance_state.read();
+            (
+                governance.transitions.clone(),
+                governance.member_log.clone(),
+            )
+        };
+        adopt_transition_log(&state, "already-converged-peer", &transitions, &member_log).await;
+
+        assert!(
+            state.is_rostered(member.public_id()),
+            "an identical signed snapshot must still repair its derived roster"
+        );
+    }
 
     #[test]
     fn only_zero_transition_open_silent_drift_is_stable() {

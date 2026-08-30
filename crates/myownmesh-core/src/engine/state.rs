@@ -688,13 +688,13 @@ impl NetworkState {
         config.pinned_peers = canonical_pins;
         let pinned: std::collections::HashSet<String> =
             config.pinned_peers.iter().cloned().collect();
-        let roster = crate::roster::load(&config.network_id)?;
+        let mut roster = crate::roster::load(&config.network_id)?;
         // Load (or initialise) the per-network signed state log. If
         // the config requests Closed kind but the on-disk log says
         // Open (or vice-versa), the on-disk log wins — kind is
         // authoritatively a signed-state property, not a config one.
         // The config field only seeds new networks at first attach.
-        let governance_state = {
+        let mut governance_state = {
             let mut s = crate::network_state::load(&config.network_id)?;
             if s.transitions.is_empty() && s.kind == crate::network_state::NetworkKind::Open {
                 // Brand-new state log — adopt the config's initial
@@ -705,6 +705,51 @@ impl NetworkState {
             }
             s
         };
+        // Closed-network governance is authoritative, while the operative
+        // roster is a separately-persisted cache used by the handshake. Repair
+        // that projection before signaling starts so a crash between the two
+        // atomic file writes cannot strand a valid signed member at
+        // PendingApproval forever.
+        if !governance_state.kind.is_open_governance() {
+            match super::governance::reconcile_signed_projection(
+                &config.network_id,
+                &mut governance_state,
+                &mut roster,
+                identity.public_id(),
+            ) {
+                Ok(repair) => {
+                    if repair.governance_roles_updated {
+                        if let Err(e) = crate::network_state::save(&governance_state) {
+                            tracing::warn!(
+                                network = %config.network_id,
+                                "persist repaired governance-role projection failed: {e}"
+                            );
+                        }
+                    }
+                    if repair.roster_changed() {
+                        if let Err(e) = crate::roster::save(&roster) {
+                            // Keep the verified repair in memory for this run;
+                            // the next startup deterministically retries it.
+                            tracing::warn!(
+                                network = %config.network_id,
+                                "persist repaired signed roster projection failed: {e}"
+                            );
+                        }
+                        tracing::info!(
+                            network = %config.network_id,
+                            added = repair.added.len(),
+                            removed = repair.removed.len(),
+                            roles_updated = repair.roles_updated.len(),
+                            "repaired signed roster projection at startup"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    network = %config.network_id,
+                    "refusing to repair roster from invalid signed governance: {e}"
+                ),
+            }
+        }
         // Topology has the same precedence as kind: a ratified
         // `TopologyChange` in the signed log outranks whatever the
         // local config says; the config value only shapes networks

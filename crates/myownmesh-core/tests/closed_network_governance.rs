@@ -209,6 +209,75 @@ async fn founder_self_elects_open_to_closed_even_when_populated() {
 }
 
 #[tokio::test]
+async fn startup_repairs_a_roster_missing_a_signed_member() {
+    shared_home();
+
+    let transport = Transport::new().expect("transport");
+    let owner = Arc::new(Identity::ephemeral());
+    let member = Identity::ephemeral();
+    let network_id = "closed-startup-roster-repair";
+    let config = fresh_network("owner", network_id);
+
+    let (state, driver) = spawn_network(config.clone(), owner.clone(), transport.clone())
+        .await
+        .expect("owner engine");
+
+    myownmesh_core::engine::governance::propose(
+        &state,
+        TransitionVariant::KindChange {
+            to: NetworkKind::Closed,
+        },
+        None,
+    )
+    .await
+    .expect("found closed network");
+    myownmesh_core::engine::governance::propose(
+        &state,
+        TransitionVariant::RoleGrant {
+            target: member.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("sign member grant");
+
+    assert!(rostered(&state, member.public_id()));
+    assert_eq!(
+        state.governance_state.read().roles.get(member.public_id()),
+        Some(&Role::Member)
+    );
+
+    driver.abort();
+    let _ = driver.await;
+
+    {
+        let mut roster = state.roster.write();
+        myownmesh_core::roster::remove_peer_in(&mut roster, member.public_id());
+        myownmesh_core::roster::save(&roster).expect("persist intentionally stale roster");
+    }
+    assert!(
+        !rostered(&state, member.public_id()),
+        "fixture must reproduce the split signed-state/roster condition"
+    );
+
+    let (restarted, _signaling_rx, _command_rx) =
+        myownmesh_core::engine::state::NetworkState::new(config, owner, transport)
+            .expect("restart with stale roster");
+
+    assert!(
+        rostered(&restarted, member.public_id()),
+        "startup must restore every verified signed member before signaling"
+    );
+    let persisted =
+        myownmesh_core::roster::load(network_id).expect("load repaired operative roster");
+    assert!(
+        myownmesh_core::roster::is_authorized(&persisted, member.public_id()),
+        "startup repair must survive another restart"
+    );
+}
+
+#[tokio::test]
 async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     // Closed-network membership is owner-**signed**: an owner admits a member
     // by authoring a ratified `RoleGrant`, and that membership converges to
