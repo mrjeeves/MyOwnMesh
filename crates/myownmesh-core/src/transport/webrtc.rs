@@ -133,6 +133,14 @@ pub enum TransportEvent {
     RenegotiationNeeded,
     /// One assembled access unit from the peer's video track lane.
     VideoSample(VideoSample),
+    /// The receiver abandoned a damaged H.264 access unit after its bounded
+    /// retransmit window. The consumer applies its negotiated codec recovery
+    /// policy (key reset or gradual convergence) before decoding later units.
+    VideoDiscontinuity {
+        lane: u8,
+        rtp_timestamp: u32,
+        sequence: u64,
+    },
     /// One encoded audio frame from the peer's audio track lane.
     AudioSample(AudioSample),
 }
@@ -146,6 +154,10 @@ pub struct VideoSample {
     pub rtp_timestamp: u32,
     pub key: bool,
     pub lane: u8,
+    /// Monotonic per remote track, including discontinuity events. Consumers
+    /// can detect an access unit shed by an internal bounded fan-out without
+    /// interpreting codec timestamps or payloads.
+    pub sequence: u64,
     pub data: Bytes,
 }
 
@@ -678,19 +690,42 @@ async fn pump_audio_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
 async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<TransportEvent>) {
     let lane = lane_of_track_id(&track.id());
     let mut assembler = H264AuAssembler::default();
+    let mut sequence = 0u64;
     loop {
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
         };
-        match assembler.push(&pkt) {
-            Ok(Some(mut sample)) => {
-                sample.lane = lane;
-                if tx.send(TransportEvent::VideoSample(sample)).is_err() {
-                    break;
+        match assembler.push_events(&pkt) {
+            Ok(events) => {
+                for event in events {
+                    sequence = sequence.wrapping_add(1);
+                    if sequence == 0 {
+                        sequence = 1;
+                    }
+                    let sent = match event {
+                        H264AssemblyEvent::Sample(mut sample) => {
+                            sample.lane = lane;
+                            sample.sequence = sequence;
+                            tx.send(TransportEvent::VideoSample(sample))
+                        }
+                        H264AssemblyEvent::Discontinuity { rtp_timestamp } => {
+                            tx.send(TransportEvent::VideoDiscontinuity {
+                                lane,
+                                rtp_timestamp,
+                                sequence,
+                            })
+                        }
+                    };
+                    if sent.is_err() {
+                        return;
+                    }
+                    // A repaired hole can release a few already-complete access
+                    // units at once. Give the engine/IPC/decoder tasks a chance
+                    // to drain between them without adding a pacing delay.
+                    tokio::task::yield_now().await;
                 }
             }
-            Ok(None) => {}
             // A malformed packet (or one straddling a loss the NACK
             // retransmit didn't cover) costs the current unit only —
             // the stream re-syncs on the next timestamp, and the
@@ -708,19 +743,19 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
 /// reaches a decoder (the bug shape: at streaming bitrates a keyframe
 /// spans hundreds of packets, and one hole per keyframe means a decode
 /// error every time). A hole simply waits — the NACK interceptor's
-/// retransmit fills it out of order and the unit still emits — and a
-/// unit whose hole never fills is dropped whole when the next timestamp
-/// arrives. Late retransmits of an abandoned unit can't clobber the
-/// live one. Depacketization runs per-unit in sequence order, so FU-A
-/// fragment state never straddles a loss.
+/// retransmit fills it out of order and the unit still emits. Newer access
+/// units wait behind a hole for a short, bounded recovery window: the next
+/// frame commonly arrives before a NACK can make one network round trip.
+/// When recovery fails, one discontinuity is surfaced before complete units
+/// resume; the consumer chooses key-reset versus gradual recovery. Late
+/// retransmits of an abandoned unit cannot clobber the live stream.
+/// Depacketization runs per-unit in sequence order, so FU-A fragment state
+/// never straddles a loss.
 #[derive(Default)]
 struct H264AuAssembler {
-    /// RTP timestamp of the unit being collected.
-    timestamp: u32,
-    /// Unwrapped seq → raw RTP payload, for the current timestamp only.
-    parts: std::collections::BTreeMap<i64, Bytes>,
-    /// Unwrapped seq of the current unit's marker packet, once seen.
-    marker_seq: Option<i64>,
+    /// Access units in RTP timestamp order. Only the front may emit; newer
+    /// complete units remain here while a missing reference is recoverable.
+    pending: std::collections::VecDeque<PendingH264Au>,
     /// Unwrapped seq of the last *emitted* unit's marker — the next unit
     /// must start at exactly +1, which is what makes the contiguity
     /// check exact. `None` after an abandoned unit (the anchor is lost);
@@ -728,52 +763,167 @@ struct H264AuAssembler {
     prev_end: Option<i64>,
     /// Sequence unwrapper state: (last raw seq, its unwrapped value).
     last_seq: Option<(u16, i64)>,
+    /// Newest RTP timestamp admitted. Unknown older timestamps are stale
+    /// retransmits for units that have already emitted or been abandoned.
+    newest_timestamp: Option<u32>,
+    /// Coalesces consecutive damaged units until one complete AU is emitted.
+    /// Recovery policy belongs to the consumer, not the RTP transport.
+    gap_open: bool,
+}
+
+struct PendingH264Au {
+    timestamp: u32,
+    parts: std::collections::BTreeMap<i64, Bytes>,
+    marker_seq: Option<i64>,
+    /// Starts only once a hole is observable (marker/newer timestamp), so a
+    /// large access unit does not spend its recovery budget while arriving.
+    blocked_since: Option<Instant>,
+    overflowed: bool,
+}
+
+enum H264AssemblyEvent {
+    Sample(VideoSample),
+    Discontinuity { rtp_timestamp: u32 },
 }
 
 /// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
 /// this size means the stream is wedged — drop it rather than balloon.
 const MAX_AU_PARTS: usize = 2048;
+/// A gap marker plus every retained AU fits the engine's 16-item video
+/// broadcast, even if the consumer is descheduled for the whole release.
+const MAX_PENDING_AUS: usize = 15;
+/// Aggregate per-track memory guard (roughly 5 MiB at normal RTP MTUs).
+const MAX_PENDING_PARTS: usize = 4096;
+/// Long enough for NACK detection plus the measured 55 ms live-path RTT,
+/// while still bounding visible recovery latency on genuinely lost packets.
+const RETRANSMIT_GRACE: Duration = Duration::from_millis(150);
 
 impl H264AuAssembler {
+    fn push_events(&mut self, pkt: &webrtc::rtp::packet::Packet) -> Result<Vec<H264AssemblyEvent>> {
+        self.push_at(pkt, Instant::now())
+    }
+
+    /// Keep focused assembler tests terse while production drains every event.
+    #[cfg(test)]
     fn push(&mut self, pkt: &webrtc::rtp::packet::Packet) -> Result<Option<VideoSample>> {
+        Ok(self
+            .push_events(pkt)?
+            .into_iter()
+            .find_map(|event| match event {
+                H264AssemblyEvent::Sample(sample) => Some(sample),
+                H264AssemblyEvent::Discontinuity { .. } => None,
+            }))
+    }
+
+    fn push_at(
+        &mut self,
+        pkt: &webrtc::rtp::packet::Packet,
+        now: Instant,
+    ) -> Result<Vec<H264AssemblyEvent>> {
         if pkt.payload.is_empty() {
-            return Ok(None); // padding / probe
+            return self.collect_ready(now); // padding / probe still advances expiry
         }
         let seq = self.unwrap_seq(pkt.header.sequence_number);
         let ts = pkt.header.timestamp;
-        if ts != self.timestamp {
-            if self.parts.is_empty() || newer_rtp_ts(ts, self.timestamp) {
-                // The next unit begins; an unfinished current one is
-                // dropped whole (its hole is now hopeless) and the exact
-                // start anchor is gone with it.
-                if !self.parts.is_empty() {
-                    self.prev_end = None;
-                }
-                self.parts.clear();
-                self.marker_seq = None;
-                self.timestamp = ts;
+        let pos = if let Some(pos) = self.pending.iter().position(|au| au.timestamp == ts) {
+            pos
+        } else {
+            if self
+                .newest_timestamp
+                .is_some_and(|newest| !newer_rtp_ts(ts, newest))
+            {
+                return self.collect_ready(now);
+            }
+            self.newest_timestamp = Some(ts);
+            self.pending.push_back(PendingH264Au {
+                timestamp: ts,
+                parts: std::collections::BTreeMap::new(),
+                marker_seq: None,
+                blocked_since: None,
+                overflowed: false,
+            });
+            self.pending.len() - 1
+        };
+
+        let au = &mut self.pending[pos];
+        if !au.parts.contains_key(&seq) {
+            if au.parts.len() >= MAX_AU_PARTS {
+                au.overflowed = true;
             } else {
-                // A late retransmit of a unit we already abandoned —
-                // never let it wipe the one being collected.
-                return Ok(None);
+                au.parts.insert(seq, pkt.payload.clone());
             }
         }
-        if self.parts.len() >= MAX_AU_PARTS {
-            self.parts.clear();
-            self.marker_seq = None;
-            self.prev_end = None;
-            return Err(Error::Transport("video unit overflowed reassembly".into()));
-        }
-        self.parts.insert(seq, pkt.payload.clone());
         if pkt.header.marker {
-            self.marker_seq = Some(seq);
+            au.marker_seq = Some(seq);
         }
-        self.try_emit()
+        self.collect_ready(now)
     }
 
-    /// Emit the collected unit if its packet chain is complete.
-    fn try_emit(&mut self) -> Result<Option<VideoSample>> {
-        let Some(end) = self.marker_seq else {
+    fn collect_ready(&mut self, now: Instant) -> Result<Vec<H264AssemblyEvent>> {
+        let mut events = Vec::new();
+        loop {
+            let total_parts: usize = self.pending.iter().map(|au| au.parts.len()).sum();
+            let mut force_abandon = self.pending.len() > MAX_PENDING_AUS
+                || total_parts > MAX_PENDING_PARTS
+                || self.pending.front().is_some_and(|au| au.overflowed);
+
+            let complete = match self.pending.front() {
+                Some(au) if !au.overflowed => match self.depacketize_if_complete(au) {
+                    Ok(complete) => complete,
+                    Err(e) => {
+                        // A syntactically complete but invalid AU is just as
+                        // unsafe as a packet hole. Consume it through the same
+                        // single discontinuity/key fence instead of retrying
+                        // the same bad bytes on every subsequent packet.
+                        trace!("video depacketize: {e}");
+                        force_abandon = true;
+                        None
+                    }
+                },
+                Some(_) => None,
+                None => break,
+            };
+            if let Some((sample, end)) = complete {
+                self.pending.pop_front();
+                self.prev_end = Some(end);
+                self.gap_open = false;
+                events.push(H264AssemblyEvent::Sample(sample));
+                continue;
+            }
+
+            let observable_hole = self
+                .pending
+                .front()
+                .is_some_and(|au| au.marker_seq.is_some())
+                || self.pending.len() > 1;
+            if observable_hole {
+                let front = self.pending.front_mut().expect("front checked above");
+                let blocked_since = front.blocked_since.get_or_insert(now);
+                if !force_abandon && now.duration_since(*blocked_since) < RETRANSMIT_GRACE {
+                    break;
+                }
+            } else if !force_abandon {
+                break;
+            }
+
+            let abandoned = self.pending.pop_front().expect("front checked above");
+            // A received marker still provides the exact anchor for the next
+            // AU. Without it, the next AU must prove that its first payload
+            // really starts an access unit before it can re-anchor.
+            self.prev_end = abandoned.marker_seq;
+            if !self.gap_open {
+                self.gap_open = true;
+                events.push(H264AssemblyEvent::Discontinuity {
+                    rtp_timestamp: abandoned.timestamp,
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    /// Depacketize the front unit only when its exact sequence chain is whole.
+    fn depacketize_if_complete(&self, au: &PendingH264Au) -> Result<Option<(VideoSample, i64)>> {
+        let Some(end) = au.marker_seq else {
             return Ok(None);
         };
         let start = match self.prev_end {
@@ -783,7 +933,7 @@ impl H264AuAssembler {
                 // abandoned): accept the lowest packet we hold only if it
                 // plausibly *begins* a unit — a mid-unit join waits for
                 // the next one instead of emitting a headless tail.
-                let Some((&lo, first)) = self.parts.iter().next() else {
+                let Some((&lo, first)) = au.parts.iter().next() else {
                     return Ok(None);
                 };
                 if !payload_starts_au(first) {
@@ -796,7 +946,7 @@ impl H264AuAssembler {
             return Ok(None); // a stale marker from before the anchor
         }
         let need = (end - start + 1) as usize;
-        if self.parts.range(start..=end).count() < need {
+        if au.parts.range(start..=end).count() < need {
             return Ok(None); // a hole — wait for the retransmit
         }
         // Complete: depacketize in sequence order with fresh FU state.
@@ -804,7 +954,7 @@ impl H264AuAssembler {
         let mut depacketizer = webrtc::rtp::codecs::h264::H264Packet::default();
         let mut data = Vec::new();
         let mut failed = None;
-        for (_, payload) in self.parts.range(start..=end) {
+        for (_, payload) in au.parts.range(start..=end) {
             match depacketizer.depacketize(payload) {
                 Ok(part) => data.extend_from_slice(&part),
                 Err(e) => {
@@ -813,11 +963,6 @@ impl H264AuAssembler {
                 }
             }
         }
-        // Either way this unit is consumed and the next one anchors
-        // right after it.
-        self.prev_end = Some(end);
-        self.parts.clear();
-        self.marker_seq = None;
         if let Some(e) = failed {
             return Err(Error::Transport(e));
         }
@@ -825,14 +970,18 @@ impl H264AuAssembler {
             return Ok(None);
         }
         let data = Bytes::from(data);
-        Ok(Some(VideoSample {
-            rtp_timestamp: self.timestamp,
-            key: au_has_idr(&data),
-            // The pump that owns the track stamps the real lane; the
-            // assembler is lane-agnostic.
-            lane: 0,
-            data,
-        }))
+        Ok(Some((
+            VideoSample {
+                rtp_timestamp: au.timestamp,
+                key: au_has_idr(&data),
+                // The pump that owns the track stamps the real lane; the
+                // assembler is lane-agnostic.
+                lane: 0,
+                sequence: 0,
+                data,
+            },
+            end,
+        )))
     }
 
     /// Map a raw 16-bit RTP sequence number onto an unbounded line, so
@@ -1940,17 +2089,36 @@ mod tests {
     #[test]
     fn a_hole_mid_unit_drops_that_unit_never_a_torn_one() {
         let mut asm = H264AuAssembler::default();
-        asm.push(&rtp_pkt(20, 100, true, IDR_NAL)).unwrap().unwrap();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(20, 100, true, IDR_NAL), now).unwrap();
         // Unit 2 loses its middle fragment for good.
-        assert!(asm.push(&rtp_pkt(21, 200, false, FU_S)).unwrap().is_none());
-        assert!(asm.push(&rtp_pkt(23, 200, true, FU_E)).unwrap().is_none());
-        // Unit 3 arrives — unit 2 is abandoned, and unit 3 (which starts
-        // an AU) emits despite the lost anchor.
-        let s = asm
-            .push(&rtp_pkt(24, 300, true, IDR_NAL))
+        assert!(asm
+            .push_at(&rtp_pkt(21, 200, false, FU_S), now)
             .unwrap()
-            .expect("the stream re-syncs on the next unit");
-        assert_eq!(s.rtp_timestamp, 300);
+            .is_empty());
+        assert!(asm
+            .push_at(&rtp_pkt(23, 200, true, FU_E), now)
+            .unwrap()
+            .is_empty());
+        // A newer IDR waits during the bounded NACK window.
+        assert!(asm
+            .push_at(&rtp_pkt(24, 300, true, IDR_NAL), now)
+            .unwrap()
+            .is_empty());
+        // Once the window really expires, the torn unit never emits: one gap
+        // is surfaced and the buffered IDR becomes the clean re-entry point.
+        let events = asm
+            .push_at(&rtp_pkt(25, 400, true, IDR_NAL), now + RETRANSMIT_GRACE)
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 },
+                H264AssemblyEvent::Sample(first),
+                H264AssemblyEvent::Sample(second)
+            ] if first.rtp_timestamp == 300 && first.key
+                && second.rtp_timestamp == 400 && second.key
+        ));
     }
 
     #[test]
@@ -1970,21 +2138,116 @@ mod tests {
     }
 
     #[test]
+    fn an_anchored_hole_survives_newer_timestamps_until_the_retransmit() {
+        let mut asm = H264AuAssembler::default();
+        asm.push(&rtp_pkt(40, 100, true, IDR_NAL)).unwrap().unwrap();
+
+        // At 60 fps the next timestamp arrives in about 17 ms. The live KVM
+        // path has a 55 ms RTT, so its NACK retransmit necessarily arrives
+        // after one or more newer access units. Seeing a newer timestamp is
+        // therefore not evidence that this hole is hopeless.
+        assert!(asm.push(&rtp_pkt(41, 200, false, FU_S)).unwrap().is_none());
+        assert!(asm.push(&rtp_pkt(43, 200, true, FU_E)).unwrap().is_none());
+        assert!(
+            asm.push(&rtp_pkt(44, 300, true, IDR_NAL))
+                .unwrap()
+                .is_none(),
+            "newer access units wait behind a still-recoverable reference"
+        );
+
+        let repaired = asm
+            .push(&rtp_pkt(42, 200, false, FU_M))
+            .unwrap()
+            .expect("the late NACK retransmit still repairs the older unit");
+        assert_eq!(repaired.rtp_timestamp, 200);
+        assert_eq!(&repaired.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn pending_window_is_memory_bounded_and_release_fits_fanout() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(1, 100, true, IDR_NAL), now).unwrap();
+        // One torn front unit, then enough complete IDRs to hit the cap before
+        // the wall-clock grace expires.
+        asm.push_at(&rtp_pkt(2, 200, false, FU_S), now).unwrap();
+        asm.push_at(&rtp_pkt(4, 200, true, FU_E), now).unwrap();
+        let mut released = Vec::new();
+        for offset in 0..MAX_PENDING_AUS {
+            released = asm
+                .push_at(
+                    &rtp_pkt(5 + offset as u16, 300 + offset as u32 * 100, true, IDR_NAL),
+                    now,
+                )
+                .unwrap();
+        }
+        assert_eq!(released.len(), 1 + MAX_PENDING_AUS);
+        assert!(matches!(
+            released.first(),
+            Some(H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 })
+        ));
+        assert!(released[1..]
+            .iter()
+            .all(|event| matches!(event, H264AssemblyEvent::Sample(sample) if sample.key)));
+        assert!(asm.pending.is_empty());
+    }
+
+    #[test]
+    fn malformed_complete_unit_is_consumed_once_and_recovers_on_key() {
+        let mut asm = H264AuAssembler::default();
+        asm.push(&rtp_pkt(1, 100, true, IDR_NAL)).unwrap();
+
+        // Anchored and sequence-complete, but an invalid one-byte FU-A packet.
+        // It must become one gap rather than being retried forever.
+        let events = asm.push_events(&rtp_pkt(2, 200, true, &[0x7c])).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 }]
+        ));
+        let recovered = asm
+            .push(&rtp_pkt(3, 300, true, IDR_NAL))
+            .unwrap()
+            .expect("next IDR recovers after malformed AU");
+        assert_eq!(recovered.rtp_timestamp, 300);
+        assert!(recovered.key);
+    }
+
+    #[test]
     fn late_retransmit_of_an_abandoned_unit_cannot_clobber_the_live_one() {
         let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
         // Unit at ts 100 never completes (tail lost)…
-        assert!(asm.push(&rtp_pkt(40, 100, false, FU_S)).unwrap().is_none());
-        // …the next unit begins…
-        assert!(asm.push(&rtp_pkt(42, 200, false, FU_S)).unwrap().is_none());
-        // …a stale retransmit for ts 100 arrives and must be ignored…
-        assert!(asm.push(&rtp_pkt(41, 100, true, FU_E)).unwrap().is_none());
-        // …and the live unit still completes intact.
-        let s = asm
-            .push(&rtp_pkt(43, 200, true, FU_E))
+        assert!(asm
+            .push_at(&rtp_pkt(40, 100, false, FU_S), now)
             .unwrap()
-            .expect("live unit unaffected by the stale packet");
-        assert_eq!(s.rtp_timestamp, 200);
-        assert_eq!(&s.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x33]);
+            .is_empty());
+        // …the next unit begins…
+        assert!(asm
+            .push_at(&rtp_pkt(42, 200, false, FU_S), now)
+            .unwrap()
+            .is_empty());
+        // …and completes only after the older unit's recovery window expires.
+        let events = asm
+            .push_at(&rtp_pkt(43, 200, true, FU_E), now + RETRANSMIT_GRACE)
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 100 },
+                H264AssemblyEvent::Sample(sample)
+            ] if sample.rtp_timestamp == 200 && sample.key
+        ));
+        // A stale retransmit for the abandoned timestamp is ignored rather
+        // than creating a second gap or clobbering the live timestamp.
+        assert!(asm
+            .push_at(&rtp_pkt(41, 100, true, FU_E), now + RETRANSMIT_GRACE,)
+            .unwrap()
+            .is_empty());
+        let s = asm
+            .push(&rtp_pkt(44, 300, true, IDR_NAL))
+            .unwrap()
+            .expect("live stream remains anchored after the stale retransmit");
+        assert_eq!(s.rtp_timestamp, 300);
     }
 
     #[test]
@@ -2158,6 +2421,7 @@ mod tests {
     #[test]
     fn au_assembler_groups_by_timestamp_and_drops_torn_units() {
         let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
         // Two single-NAL packets of one frame; marker closes it.
         assert!(asm
             .push(&rtp_pkt(1, 1000, false, &[0x41, 1, 1, 1]))
@@ -2175,19 +2439,29 @@ mod tests {
             &[0, 0, 0, 1, 0x41, 1, 1, 1, 0, 0, 0, 1, 0x65, 2, 2, 2]
         );
 
-        // A unit whose marker never arrived is dropped when the next
-        // timestamp starts; the new unit is unaffected.
+        // A unit whose marker never arrives holds newer units only for the
+        // bounded retransmit window. Transport reports the gap, then preserves
+        // complete AUs; the consumer owns reset-vs-gradual recovery policy.
         assert!(asm
-            .push(&rtp_pkt(3, 2000, false, &[0x41, 7, 7, 7]))
+            .push_at(&rtp_pkt(3, 2000, false, &[0x41, 7, 7, 7]), now)
             .unwrap()
-            .is_none());
-        let s = asm
-            .push(&rtp_pkt(4, 3000, true, &[0x41, 9, 9, 9]))
+            .is_empty());
+        assert!(asm
+            .push_at(&rtp_pkt(4, 3000, true, &[0x41, 9, 9, 9]), now)
             .unwrap()
-            .expect("fresh unit completes");
-        assert_eq!(s.rtp_timestamp, 3000);
-        assert!(!s.key);
-        assert_eq!(s.data.as_ref(), &[0, 0, 0, 1, 0x41, 9, 9, 9]);
+            .is_empty());
+        let events = asm
+            .push_at(&rtp_pkt(5, 4000, true, IDR_NAL), now + RETRANSMIT_GRACE)
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 2000 },
+                H264AssemblyEvent::Sample(delta),
+                H264AssemblyEvent::Sample(key)
+            ] if delta.rtp_timestamp == 3000 && !delta.key
+                && key.rtp_timestamp == 4000 && key.key
+        ));
     }
 
     #[tokio::test]

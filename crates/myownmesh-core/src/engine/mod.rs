@@ -2228,6 +2228,13 @@ async fn handle_transport_event(
             // outer layer), not per frame here.
             state.dispatch_video(&device_id, sample);
         }
+        TransportEvent::VideoDiscontinuity {
+            lane,
+            rtp_timestamp,
+            sequence,
+        } => {
+            state.dispatch_video_discontinuity(&device_id, lane, rtp_timestamp, sequence);
+        }
         TransportEvent::AudioSample(sample) => {
             state.dispatch_audio(&device_id, sample);
         }

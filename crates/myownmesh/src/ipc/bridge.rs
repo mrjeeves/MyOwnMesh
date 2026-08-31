@@ -211,13 +211,18 @@ pub fn spawn_channel_pump(
 /// the task exits once the subscriber list empties (same passive
 /// teardown as the channel pump) or the network is torn down.
 ///
-/// The engine's video broadcast is shallow by design: if this
-/// pump (or a slow client socket) lags, old samples are dropped
-/// at the broadcast and the stream resumes from the freshest one
-/// — video is freshness, never a backlog.
+/// The engine broadcast and each client socket handoff are shallow by design.
+/// Either may shed old samples under pressure, but every shed H.264 unit is
+/// converted into one ordered discontinuity/key fence — video stays fresh
+/// without feeding dependent deltas across a hidden gap.
 pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
     let mut sub = network.state().subscribe_video();
     tokio::spawn(async move {
+        let mut last_sequence = std::collections::HashMap::<(String, u8), u64>::new();
+        let mut sink_recovery = std::collections::HashMap::<
+            (crate::ipc::ClientId, String, u8),
+            MediaSinkVideoRecovery,
+        >::new();
         loop {
             let subscribers = registry.video_subscribers(&network_key);
             if subscribers.is_empty() {
@@ -235,9 +240,24 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                     break;
                 }
             };
+            let lane_key = (inbound.from.clone(), inbound.sample.lane);
+            let sequence_gap = last_sequence
+                .insert(lane_key, inbound.sample.sequence)
+                .is_some_and(|previous| {
+                    video_sequence_discontinuous(previous, inbound.sample.sequence)
+                });
             // Binary body for clients on a media-source pipe; built once.
+            let discontinuity = inbound.sample.data.is_empty();
+            let gap_body = crate::control::encode_inbound_frame(
+                crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY,
+                false,
+                inbound.sample.lane,
+                inbound.sample.rtp_timestamp,
+                &inbound.from,
+                &[],
+            );
             let body = crate::control::encode_inbound_frame(
-                crate::control::MEDIA_KIND_VIDEO,
+                inbound_video_kind(&inbound.sample),
                 inbound.sample.key,
                 inbound.sample.lane,
                 inbound.sample.rtp_timestamp,
@@ -247,8 +267,31 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
             for client_id in subscribers {
                 if let Some(client) = registry.client(client_id) {
                     if let Some(sink) = client.media_sink() {
-                        let _ = sink.send(body.clone());
-                    } else {
+                        let recovery_key = (client_id, inbound.from.clone(), inbound.sample.lane);
+                        let state = sink_recovery.get(&recovery_key).copied();
+                        let (keep_open, next) = forward_video_to_media_sink(
+                            &sink,
+                            state,
+                            sequence_gap || discontinuity,
+                            discontinuity,
+                            &gap_body,
+                            &body,
+                        );
+                        match next {
+                            Some(next) => {
+                                sink_recovery.insert(recovery_key.clone(), next);
+                            }
+                            None => {
+                                sink_recovery.remove(&recovery_key);
+                            }
+                        }
+                        if !keep_open {
+                            sink_recovery.remove(&recovery_key);
+                        }
+                    } else if !discontinuity {
+                        // The legacy JSON event has no discontinuity variant.
+                        // Older clients retain periodic-IDR recovery rather than
+                        // receiving an enum value they cannot deserialize.
                         client.send(ServerOut::VideoInbound {
                             network: network_key.clone(),
                             from: inbound.from.clone(),
@@ -262,6 +305,62 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
             }
         }
     });
+}
+
+fn inbound_video_kind(sample: &myownmesh_core::transport::VideoSample) -> u8 {
+    if sample.data.is_empty() {
+        crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY
+    } else {
+        crate::control::MEDIA_KIND_VIDEO
+    }
+}
+
+fn video_sequence_discontinuous(previous: u64, current: u64) -> bool {
+    current != previous.wrapping_add(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaSinkVideoRecovery {
+    NeedGap,
+    GapSent,
+}
+
+/// Non-blocking per-client video handoff. A full socket queue never becomes a
+/// replay backlog: mark one gap, then resume with the next complete AU. Codec
+/// recovery policy belongs to the consumer, which knows reset vs gradual mode.
+fn forward_video_to_media_sink(
+    sink: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut recovery: Option<MediaSinkVideoRecovery>,
+    observed_gap: bool,
+    discontinuity: bool,
+    gap_body: &[u8],
+    body: &[u8],
+) -> (bool, Option<MediaSinkVideoRecovery>) {
+    if observed_gap && recovery.is_none() {
+        recovery = Some(MediaSinkVideoRecovery::NeedGap);
+    }
+
+    if recovery == Some(MediaSinkVideoRecovery::NeedGap) {
+        match sink.try_send(gap_body.to_vec()) {
+            Ok(()) => recovery = Some(MediaSinkVideoRecovery::GapSent),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return (true, recovery),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return (false, None),
+        }
+    }
+
+    // A discontinuity carries no media. Its gap marker was sent above; the
+    // next successfully queued complete AU ends this handoff-level episode.
+    if discontinuity {
+        return (true, recovery);
+    }
+    match sink.try_send(body.to_vec()) {
+        Ok(()) => (true, None),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            let next = recovery.or(Some(MediaSinkVideoRecovery::NeedGap));
+            (true, next)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => (false, None),
+    }
 }
 
 /// Spawn the per-network audio fan-out for IPC subscribers — the
@@ -301,7 +400,9 @@ pub fn spawn_audio_pump(network: &JoinedNetwork, network_key: String, registry: 
             for client_id in subscribers {
                 if let Some(client) = registry.client(client_id) {
                     if let Some(sink) = client.media_sink() {
-                        let _ = sink.send(body.clone());
+                        // Stale audio is less useful than current audio and has
+                        // no inter-frame reference chain to repair.
+                        let _ = sink.try_send(body.clone());
                     } else {
                         client.send(ServerOut::AudioInbound {
                             network: network_key.clone(),
@@ -758,4 +859,61 @@ mod tests {
     fn _alice_id_arg(state: &Arc<myownmesh_core::engine::NetworkState>) -> &str {
         state.identity.public_id()
     }
+}
+#[test]
+fn empty_video_sentinel_maps_only_to_the_discontinuity_wire_kind() {
+    let mut sample = myownmesh_core::transport::VideoSample {
+        rtp_timestamp: 90_000,
+        key: false,
+        lane: 2,
+        sequence: 1,
+        data: Vec::<u8>::new().into(),
+    };
+    assert_eq!(
+        inbound_video_kind(&sample),
+        crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY
+    );
+    sample.data = vec![0, 0, 0, 1, 0x65].into();
+    assert_eq!(
+        inbound_video_kind(&sample),
+        crate::control::MEDIA_KIND_VIDEO
+    );
+}
+
+#[test]
+fn per_track_sequence_detects_only_real_internal_fanout_gaps() {
+    assert!(!video_sequence_discontinuous(7, 8));
+    assert!(video_sequence_discontinuous(7, 9));
+    assert!(!video_sequence_discontinuous(u64::MAX, 0));
+}
+
+#[test]
+fn full_media_sink_orders_one_gap_then_preserves_recovery_policy() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(vec![99]).unwrap();
+    let gap = vec![crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY];
+    let delta = vec![crate::control::MEDIA_KIND_VIDEO, 1];
+
+    let (open, mut state) = forward_video_to_media_sink(&tx, None, false, false, &gap, &delta);
+    assert!(open);
+    assert_eq!(state, Some(MediaSinkVideoRecovery::NeedGap));
+    assert_eq!(rx.try_recv().unwrap(), vec![99]);
+
+    let (open, next) = forward_video_to_media_sink(&tx, state, false, false, &gap, &delta);
+    assert!(open);
+    state = next;
+    assert_eq!(state, Some(MediaSinkVideoRecovery::GapSent));
+    assert_eq!(rx.try_recv().unwrap(), gap);
+    assert!(
+        rx.try_recv().is_err(),
+        "full queue cannot take the current AU"
+    );
+
+    // The next complete AU is forwarded regardless of keyness. AllMyStuff's
+    // negotiated recovery gate decides whether to decode this delta.
+    let (open, state) = forward_video_to_media_sink(&tx, state, false, false, &gap, &delta);
+    assert!(open);
+    assert_eq!(state, None);
+    assert_eq!(rx.try_recv().unwrap(), delta);
+    assert!(rx.try_recv().is_err(), "no duplicate gap was queued");
 }
