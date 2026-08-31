@@ -1369,8 +1369,31 @@ impl NetworkState {
         Ok(())
     }
 
-    /// Remove a peer from the roster and tear down any session.
+    /// Remove a peer from the local roster cache.
+    ///
+    /// On a closed network the verified signed projection is authoritative:
+    /// a legacy/local caller cannot subtract an active signed member. Such a
+    /// removal must first be recorded in governance, after which projection
+    /// reconciliation removes it everywhere. Unsigned manual approvals remain
+    /// locally removable, and open-network behavior is unchanged.
     pub async fn remove_roster(&self, device_id: &str) -> Result<()> {
+        // Keep the governance read lock through the roster mutation. Otherwise
+        // a concurrent signed grant could land after the check but before the
+        // local deletion, briefly making the cache contradict its authority.
+        // Governance reconciliation takes these locks in the same order.
+        let governance = self.governance_state.read();
+        if !governance.kind.is_open_governance()
+            && super::governance::signed_projection_contains(
+                &self.network_id,
+                &governance,
+                device_id,
+            )?
+        {
+            return Err(Error::Network(
+                "cannot remove an active signed member from a closed network's local roster; record a signed membership removal instead"
+                    .into(),
+            ));
+        }
         let mut roster = self.roster.write();
         crate::roster::remove_peer_in(&mut roster, device_id);
         crate::roster::save(&roster)?;
