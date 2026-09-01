@@ -1195,6 +1195,28 @@ impl NetworkState {
         });
     }
 
+    /// Surface a receiver-side H.264 reference discontinuity through the same
+    /// ordered subscription as access units. An empty payload is reserved for
+    /// this sentinel; assembled H.264 units are always non-empty.
+    pub fn dispatch_video_discontinuity(
+        &self,
+        from: &str,
+        lane: u8,
+        rtp_timestamp: u32,
+        sequence: u64,
+    ) {
+        self.dispatch_video(
+            from,
+            VideoSample {
+                rtp_timestamp,
+                key: false,
+                lane,
+                sequence,
+                data: bytes::Bytes::new(),
+            },
+        );
+    }
+
     /// Write one encoded H.264 access unit (Annex-B) onto the video
     /// lane to `peer`. `duration` paces the RTP clock (1/fps). Errors
     /// when the peer is unknown or its session isn't established;

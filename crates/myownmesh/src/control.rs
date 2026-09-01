@@ -782,7 +782,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await?;
                 continue;
             };
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, rx) = tokio::sync::mpsc::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
             client.set_media_sink(tx);
             let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
             writer
@@ -868,7 +868,7 @@ where
 async fn run_media_source_pipe<R, W>(
     mut reader: R,
     writer: &mut W,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2361,8 +2361,15 @@ static CTL_STATE: Mutex<Option<Arc<ControlState>>> = parking_lot::const_mutex(No
 pub const MEDIA_KIND_VIDEO: u8 = 0;
 /// `kind` byte for an Opus frame.
 pub const MEDIA_KIND_AUDIO: u8 = 1;
+/// `kind` byte for a receiver-side H.264 reference discontinuity. This is an
+/// inbound-only event: consumers reset the decoder and request one key unit.
+pub const MEDIA_KIND_VIDEO_DISCONTINUITY: u8 = 2;
 /// Defensive cap on one frame body — a corrupt length never allocates more.
 pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// The daemon-to-client socket is a live handoff, not a playout buffer. A
+/// short bounded queue absorbs scheduler jitter; video explicitly fences and
+/// signals a shed H.264 unit, while audio may shed stale packets.
+pub const MEDIA_SOURCE_QUEUE_CAPACITY: usize = 8;
 
 /// One decoded media-track frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2547,5 +2554,23 @@ mod media_frame_tests {
                 8, // data
             ]
         );
+    }
+
+    #[test]
+    fn inbound_video_discontinuity_layout_matches_allmystuff() {
+        let body = encode_inbound_frame(
+            MEDIA_KIND_VIDEO_DISCONTINUITY,
+            false,
+            3,
+            180_000,
+            "peer-gap",
+            &[],
+        );
+        assert_eq!(body[0], MEDIA_KIND_VIDEO_DISCONTINUITY);
+        assert_eq!(body[1], 0);
+        assert_eq!(body[2], 3);
+        assert_eq!(&body[3..7], &180_000u32.to_le_bytes());
+        assert_eq!(&body[7..9], &(8u16).to_le_bytes());
+        assert_eq!(&body[9..], b"peer-gap");
     }
 }
