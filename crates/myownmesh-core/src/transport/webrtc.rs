@@ -23,7 +23,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, trace, warn};
-use webrtc::api::interceptor_registry::register_default_interceptors;
+use webrtc::api::interceptor_registry::{configure_rtcp_reports, configure_twcc_receiver_only};
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
@@ -33,6 +33,8 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
+use webrtc::interceptor::nack::generator::Generator;
+use webrtc::interceptor::nack::responder::Responder;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -41,6 +43,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -91,6 +94,45 @@ pub(crate) fn is_virtual_interface(name: &str) -> bool {
 /// channels (e.g. browser-initiated debug) don't get routed into
 /// the mesh frame path.
 pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
+
+/// The stock webrtc-rs NACK generator remembers 8,192 sequence numbers and
+/// requests every unresolved hole again every 100 ms. A single discontinuity
+/// can therefore turn into hundreds of megabits of stale video retransmits.
+/// Keep enough history for the live path's NACK round trip, but bound one
+/// feedback epoch to 256 packets and let eight newer packets settle before a
+/// gap is declared. AllMyStuff's access-unit sequence and key/GDR recovery own
+/// losses that age out of this deliberately short transport window.
+const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 2; // 64 << 2 = 256 packets
+const NACK_REORDER_TAIL_PACKETS: u16 = 8;
+const NACK_INTERVAL: Duration = Duration::from_millis(100);
+const NACK_RESPONDER_LOG2_SIZE: u8 = 13; // retain 8,192 sent packets
+
+fn register_media_interceptors(
+    mut registry: Registry,
+    media_engine: &mut MediaEngine,
+) -> webrtc::error::Result<Registry> {
+    for parameter in ["", "pli"] {
+        media_engine.register_feedback(
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: parameter.to_owned(),
+            },
+            RTPCodecType::Video,
+        );
+    }
+
+    registry.add(Box::new(
+        Responder::builder().with_log2_size(NACK_RESPONDER_LOG2_SIZE),
+    ));
+    registry.add(Box::new(
+        Generator::builder()
+            .with_log2_size_minus_6(NACK_GENERATOR_LOG2_SIZE_MINUS_6)
+            .with_skip_last_n(NACK_REORDER_TAIL_PACKETS)
+            .with_interval(NACK_INTERVAL),
+    ));
+    registry = configure_rtcp_reports(registry);
+    configure_twcc_receiver_only(registry, media_engine)
+}
 
 /// Who initiated this peer pairing. Drives whether we create the
 /// data channel pre-offer (offerer) or wait for the peer to open
@@ -316,7 +358,7 @@ impl Transport {
             .register_default_codecs()
             .map_err(|e| Error::Transport(format!("register codecs: {e}")))?;
         let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine)
+        registry = register_media_interceptors(registry, &mut media_engine)
             .map_err(|e| Error::Transport(format!("register interceptors: {e}")))?;
 
         // Trim ICE candidate gathering to interfaces that can actually
@@ -828,11 +870,20 @@ impl H264AuAssembler {
         let pos = if let Some(pos) = self.pending.iter().position(|au| au.timestamp == ts) {
             pos
         } else {
-            if self
-                .newest_timestamp
-                .is_some_and(|newest| !newer_rtp_ts(ts, newest))
-            {
-                return self.collect_ready(now);
+            if let Some(newest) = self.newest_timestamp {
+                if ts == newest {
+                    // A TrackLocal sample owns one RTP marker, but paced
+                    // callers may deliberately write several samples at the
+                    // same timestamp. Once the preceding sample emitted, a
+                    // higher sequence number starts the next one. A late
+                    // retransmit from an already-emitted sample is at or
+                    // behind `prev_end` and remains stale.
+                    if self.prev_end.is_none_or(|end| seq <= end) {
+                        return self.collect_ready(now);
+                    }
+                } else if !newer_rtp_ts(ts, newest) {
+                    return self.collect_ready(now);
+                }
             }
             self.newest_timestamp = Some(ts);
             self.pending.push_back(PendingH264Au {
@@ -2067,6 +2118,37 @@ mod tests {
         assert_eq!(&s1.data[..], &[0, 0, 0, 1, 0x65, 0xAA, 0xBB]);
         let s2 = asm.push(&rtp_pkt(2, 200, true, IDR_NAL)).unwrap();
         assert!(s2.is_some(), "the anchored next unit emits too");
+    }
+
+    #[test]
+    fn paced_samples_can_share_a_timestamp_without_reviving_stale_packets() {
+        let mut asm = H264AuAssembler::default();
+        let first = asm
+            .push(&rtp_pkt(10, 100, true, IDR_NAL))
+            .unwrap()
+            .expect("first same-timestamp sample");
+        assert!(first.key);
+
+        assert!(asm.push(&rtp_pkt(11, 100, false, FU_S)).unwrap().is_none());
+        let second = asm
+            .push(&rtp_pkt(12, 100, true, FU_E))
+            .unwrap()
+            .expect("later same-timestamp sample");
+        assert_eq!(second.rtp_timestamp, 100);
+        assert_eq!(&second.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x33]);
+
+        assert!(
+            asm.push(&rtp_pkt(10, 100, true, IDR_NAL))
+                .unwrap()
+                .is_none(),
+            "late replay from the first sample stays stale"
+        );
+        assert!(
+            asm.push(&rtp_pkt(13, 200, true, IDR_NAL))
+                .unwrap()
+                .is_some(),
+            "the next timestamp remains anchored"
+        );
     }
 
     #[test]
