@@ -98,14 +98,23 @@ pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
 /// The stock webrtc-rs NACK generator remembers 8,192 sequence numbers and
 /// requests every unresolved hole again every 100 ms. A single discontinuity
 /// can therefore turn into hundreds of megabits of stale video retransmits.
-/// Keep enough history for the live path's NACK round trip, but bound one
-/// feedback epoch to 256 packets and let eight newer packets settle before a
-/// gap is declared. AllMyStuff's access-unit sequence and key/GDR recovery own
-/// losses that age out of this deliberately short transport window.
-const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 2; // 64 << 2 = 256 packets
+/// Keep enough history for one shaped AllMyStuff burst plus the packets that
+/// can arrive before the next feedback tick, but bound one feedback epoch to
+/// 512 packets and let eight newer packets settle before declaring a gap.
+/// The shorter tick is important: a large motion-heavy access unit must not
+/// advance an early hole out of the history before its first NACK is emitted.
+/// AllMyStuff's access-unit sequence and key/GDR recovery still owns losses
+/// that age out of this deliberately finite transport window.
+const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 3; // 64 << 3 = 512 packets
 const NACK_REORDER_TAIL_PACKETS: u16 = 8;
-const NACK_INTERVAL: Duration = Duration::from_millis(100);
+const NACK_INTERVAL: Duration = Duration::from_millis(20);
 const NACK_RESPONDER_LOG2_SIZE: u8 = 13; // retain 8,192 sent packets
+
+#[cfg(test)]
+const NACK_GENERATOR_PACKETS: usize = 64 << NACK_GENERATOR_LOG2_SIZE_MINUS_6;
+/// `TrackLocalStaticSample` packetizes against a 1,200-byte outbound MTU.
+#[cfg(test)]
+const RTP_OUTBOUND_PACKET_BYTES: usize = 1_200;
 
 fn register_media_interceptors(
     mut registry: Registry,
@@ -836,8 +845,9 @@ const MAX_AU_PARTS: usize = 2048;
 const MAX_PENDING_AUS: usize = 15;
 /// Aggregate per-track memory guard (roughly 5 MiB at normal RTP MTUs).
 const MAX_PENDING_PARTS: usize = 4096;
-/// Long enough for NACK detection plus the measured 55 ms live-path RTT,
-/// while still bounding visible recovery latency on genuinely lost packets.
+/// Long enough for several NACK attempts plus the measured 55 ms live-path
+/// RTT, while still bounding visible recovery latency on genuinely lost
+/// packets.
 const RETRANSMIT_GRACE: Duration = Duration::from_millis(150);
 
 impl H264AuAssembler {
@@ -1959,6 +1969,37 @@ impl PeerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nack_window_covers_the_shaped_game_burst_before_feedback() {
+        // Keep this contract in sync with AllMyStuff's route pacer. At its
+        // non-Studio ceiling, the receive history must retain the initial
+        // burst and everything that can arrive during one worst-case NACK
+        // interval. Otherwise an early packet loss in a high-motion frame can
+        // age out before the receiver ever asks for it again.
+        const ALLMYSTUFF_BURST_BYTES: usize = 96 * 1024;
+        const ALLMYSTUFF_GAME_CEILING_BPS: usize = 200_000_000;
+
+        let bytes_during_feedback_interval =
+            ALLMYSTUFF_GAME_CEILING_BPS * NACK_INTERVAL.as_millis() as usize / 8 / 1_000;
+        let recovery_capacity = NACK_GENERATOR_PACKETS * RTP_OUTBOUND_PACKET_BYTES;
+
+        assert!(
+            recovery_capacity >= ALLMYSTUFF_BURST_BYTES + bytes_during_feedback_interval,
+            "the first lost packet can age out before the first NACK"
+        );
+        let responder_packets = 1usize << usize::from(NACK_RESPONDER_LOG2_SIZE);
+        assert!(
+            NACK_GENERATOR_PACKETS < responder_packets,
+            "receiver history must stay below the sender's bounded cache"
+        );
+        let attempts_within_grace = RETRANSMIT_GRACE.as_millis() / NACK_INTERVAL.as_millis();
+        assert!(
+            attempts_within_grace > 3,
+            "the assembler should permit several feedback attempts"
+        );
+        assert!((NACK_REORDER_TAIL_PACKETS as usize) < NACK_GENERATOR_PACKETS);
+    }
 
     fn skip_live_socket_test_on_windows() -> bool {
         #[cfg(windows)]
