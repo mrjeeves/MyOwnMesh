@@ -867,7 +867,7 @@ impl H264AuAssembler {
         }
         let seq = self.unwrap_seq(pkt.header.sequence_number);
         let ts = pkt.header.timestamp;
-        let pos = if let Some(pos) = self.pending.iter().position(|au| au.timestamp == ts) {
+        let pos = if let Some(pos) = self.pending_position(ts, seq) {
             pos
         } else {
             if let Some(newest) = self.newest_timestamp {
@@ -896,18 +896,64 @@ impl H264AuAssembler {
             self.pending.len() - 1
         };
 
-        let au = &mut self.pending[pos];
-        if !au.parts.contains_key(&seq) {
-            if au.parts.len() >= MAX_AU_PARTS {
-                au.overflowed = true;
-            } else {
-                au.parts.insert(seq, pkt.payload.clone());
+        let mut split_tail = None;
+        {
+            let au = &mut self.pending[pos];
+            if !au.parts.contains_key(&seq) {
+                if au.parts.len() >= MAX_AU_PARTS {
+                    au.overflowed = true;
+                } else {
+                    au.parts.insert(seq, pkt.payload.clone());
+                }
+            }
+            if pkt.header.marker {
+                // Several TrackLocal samples may deliberately share one RTP
+                // timestamp (AllMyStuff's paced-video fragments do). If a
+                // packet in sample A is missing, packets from sample B can
+                // arrive before A's marker/retransmit. Preserve the marker as
+                // a hard sample boundary and move already-seen later packets
+                // into their own pending unit instead of permanently merging
+                // A and B when the hole is repaired.
+                let previous_marker = au.marker_seq;
+                au.marker_seq = Some(seq);
+                let tail = au.parts.split_off(&seq.saturating_add(1));
+                if !tail.is_empty() {
+                    split_tail = Some(PendingH264Au {
+                        timestamp: ts,
+                        parts: tail,
+                        marker_seq: previous_marker.filter(|end| *end > seq),
+                        blocked_since: None,
+                        overflowed: false,
+                    });
+                }
             }
         }
-        if pkt.header.marker {
-            au.marker_seq = Some(seq);
+        if let Some(tail) = split_tail {
+            self.pending.insert(pos + 1, tail);
         }
         self.collect_ready(now)
+    }
+
+    /// Locate the marker-delimited TrackLocal sample that owns `seq`.
+    /// Timestamp alone is insufficient because paced callers intentionally
+    /// write multiple samples at duration zero. Marker sequence numbers make
+    /// those samples unambiguous even while an earlier packet awaits NACK.
+    fn pending_position(&self, timestamp: u32, seq: i64) -> Option<usize> {
+        let mut lower = self.prev_end;
+        for (pos, au) in self.pending.iter().enumerate() {
+            if au.timestamp != timestamp {
+                continue;
+            }
+            let above_lower = lower.is_none_or(|end| seq > end);
+            let below_upper = au.marker_seq.is_none_or(|end| seq <= end);
+            if above_lower && below_upper {
+                return Some(pos);
+            }
+            if let Some(end) = au.marker_seq {
+                lower = Some(end);
+            }
+        }
+        None
     }
 
     fn collect_ready(&mut self, now: Instant) -> Result<Vec<H264AssemblyEvent>> {
@@ -2149,6 +2195,70 @@ mod tests {
                 .is_some(),
             "the next timestamp remains anchored"
         );
+    }
+
+    #[test]
+    fn retransmit_preserves_marker_boundaries_between_same_timestamp_samples() {
+        let mut asm = H264AuAssembler::default();
+        asm.push(&rtp_pkt(9, 50, true, IDR_NAL))
+            .unwrap()
+            .expect("anchor sample");
+
+        // AllMyStuff's paced-video contract writes several TrackLocal samples
+        // for one encoded frame with duration zero, so they intentionally share
+        // one RTP timestamp. Lose one packet in the first sample long enough
+        // for the next marker-delimited sample to arrive, then repair it by
+        // NACK. The assembler must return the two original samples separately;
+        // merging them makes AllMyStuff's fragment-count marker report damage
+        // even though every byte was recovered.
+        assert!(asm.push(&rtp_pkt(10, 100, false, FU_S)).unwrap().is_none());
+        assert!(asm.push(&rtp_pkt(12, 100, true, FU_E)).unwrap().is_none());
+        assert!(asm
+            .push(&rtp_pkt(13, 100, true, IDR_NAL))
+            .unwrap()
+            .is_none());
+
+        let events = asm.push_events(&rtp_pkt(11, 100, false, FU_M)).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                H264AssemblyEvent::Sample(first),
+                H264AssemblyEvent::Sample(second)
+            ] if first.rtp_timestamp == 100
+                && second.rtp_timestamp == 100
+                && first.key
+                && second.key
+        ));
+    }
+
+    #[test]
+    fn reordered_marker_splits_same_timestamp_samples_before_retransmit() {
+        let mut asm = H264AuAssembler::default();
+        asm.push(&rtp_pkt(9, 50, true, IDR_NAL))
+            .unwrap()
+            .expect("anchor sample");
+
+        // The next sample's one-packet marker overtakes the first sample's
+        // marker. When the earlier marker arrives, it must split the packets
+        // already collected after that boundary and retain both markers.
+        assert!(asm.push(&rtp_pkt(10, 100, false, FU_S)).unwrap().is_none());
+        assert!(asm
+            .push(&rtp_pkt(13, 100, true, IDR_NAL))
+            .unwrap()
+            .is_none());
+        assert!(asm.push(&rtp_pkt(12, 100, true, FU_E)).unwrap().is_none());
+
+        let events = asm.push_events(&rtp_pkt(11, 100, false, FU_M)).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                H264AssemblyEvent::Sample(first),
+                H264AssemblyEvent::Sample(second)
+            ] if first.rtp_timestamp == 100
+                && second.rtp_timestamp == 100
+                && first.key
+                && second.key
+        ));
     }
 
     #[test]
