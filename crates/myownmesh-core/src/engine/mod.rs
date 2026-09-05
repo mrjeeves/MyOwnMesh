@@ -2232,7 +2232,17 @@ async fn handle_transport_event(
             lane,
             rtp_timestamp,
             sequence,
+            diagnostic,
         } => {
+            debug!(target: "myownmesh_core::video_recovery",
+                network = %state.network_id, peer = %device_id,
+                lane, rtp_timestamp, sequence,
+                reason = diagnostic.reason,
+                pending_samples = diagnostic.pending_samples,
+                pending_frames = diagnostic.pending_frames,
+                pending_packets = diagnostic.pending_packets,
+                blocked_ms = diagnostic.blocked_ms,
+                "RTP video recovery abandoned a sample");
             state.dispatch_video_discontinuity(&device_id, lane, rtp_timestamp, sequence);
             tokio::task::yield_now().await;
         }

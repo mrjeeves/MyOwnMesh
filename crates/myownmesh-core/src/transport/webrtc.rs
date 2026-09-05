@@ -191,9 +191,21 @@ pub enum TransportEvent {
         lane: u8,
         rtp_timestamp: u32,
         sequence: u64,
+        diagnostic: VideoRecoveryDiagnostic,
     },
     /// One encoded audio frame from the peer's audio track lane.
     AudioSample(AudioSample),
+}
+
+/// Local recovery evidence, not part of the media wire format. Report the
+/// first abandoned sample in a loss episode rather than tracing every packet.
+#[derive(Debug, Clone)]
+pub struct VideoRecoveryDiagnostic {
+    pub reason: &'static str,
+    pub pending_samples: usize,
+    pub pending_frames: usize,
+    pub pending_packets: usize,
+    pub blocked_ms: u64,
 }
 
 /// One H.264 access unit off a peer's video track — Annex-B bytes
@@ -760,13 +772,15 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
                             sample.sequence = sequence;
                             tx.send(TransportEvent::VideoSample(sample))
                         }
-                        H264AssemblyEvent::Discontinuity { rtp_timestamp } => {
-                            tx.send(TransportEvent::VideoDiscontinuity {
-                                lane,
-                                rtp_timestamp,
-                                sequence,
-                            })
-                        }
+                        H264AssemblyEvent::Discontinuity {
+                            rtp_timestamp,
+                            diagnostic,
+                        } => tx.send(TransportEvent::VideoDiscontinuity {
+                            lane,
+                            rtp_timestamp,
+                            sequence,
+                            diagnostic,
+                        }),
                     };
                     if sent.is_err() {
                         return;
@@ -834,15 +848,21 @@ struct PendingH264Au {
 
 enum H264AssemblyEvent {
     Sample(VideoSample),
-    Discontinuity { rtp_timestamp: u32 },
+    Discontinuity {
+        rtp_timestamp: u32,
+        diagnostic: VideoRecoveryDiagnostic,
+    },
 }
 
 /// More packets than any sane unit (a 40 Mbps keyframe is ~400): a unit
 /// this size means the stream is wedged — drop it rather than balloon.
 const MAX_AU_PARTS: usize = 2048;
-/// A gap marker plus every retained AU fits the engine's 16-item video
-/// broadcast, even if the consumer is descheduled for the whole release.
-const MAX_PENDING_AUS: usize = 15;
+/// Count encoded-picture timestamps, not marker-delimited paced samples.
+/// One picture can contain many samples; counting those used to cancel the
+/// retransmit grace after only a few milliseconds. Packet and time bounds
+/// below remain independent. Cooperative downstream handoffs drain releases;
+/// their queue capacities must not define the RTP repair window.
+const MAX_PENDING_FRAMES: usize = 15;
 /// Aggregate per-track memory guard (roughly 5 MiB at normal RTP MTUs).
 const MAX_PENDING_PARTS: usize = 4096;
 /// Long enough for several NACK attempts plus the measured 55 ms live-path
@@ -968,11 +988,36 @@ impl H264AuAssembler {
 
     fn collect_ready(&mut self, now: Instant) -> Result<Vec<H264AssemblyEvent>> {
         let mut events = Vec::new();
+        // Start each observable hole's clock when its marker or a later
+        // sample arrives, even behind another hole. Starting only at the head
+        // charged another full grace per damaged slice in a bunched frame.
+        let pending_len = self.pending.len();
+        for (index, au) in self.pending.iter_mut().enumerate() {
+            if au.marker_seq.is_some() || index + 1 < pending_len {
+                au.blocked_since.get_or_insert(now);
+            }
+        }
         loop {
             let total_parts: usize = self.pending.iter().map(|au| au.parts.len()).sum();
-            let mut force_abandon = self.pending.len() > MAX_PENDING_AUS
-                || total_parts > MAX_PENDING_PARTS
-                || self.pending.front().is_some_and(|au| au.overflowed);
+            // Pending samples are timestamp-ordered and equal timestamps are
+            // contiguous, including reordered markers split by push_at.
+            let mut previous_timestamp = None;
+            let mut pending_frames = 0;
+            for au in &self.pending {
+                if previous_timestamp != Some(au.timestamp) {
+                    pending_frames += 1;
+                    previous_timestamp = Some(au.timestamp);
+                }
+            }
+            let mut abandon_reason = if self.pending.front().is_some_and(|au| au.overflowed) {
+                Some("sample_packet_limit")
+            } else if total_parts > MAX_PENDING_PARTS {
+                Some("pending_packet_limit")
+            } else if pending_frames > MAX_PENDING_FRAMES {
+                Some("pending_frame_limit")
+            } else {
+                None
+            };
 
             let complete = match self.pending.front() {
                 Some(au) if !au.overflowed => match self.depacketize_if_complete(au) {
@@ -983,7 +1028,7 @@ impl H264AuAssembler {
                         // single discontinuity/key fence instead of retrying
                         // the same bad bytes on every subsequent packet.
                         trace!("video depacketize: {e}");
-                        force_abandon = true;
+                        abandon_reason = Some("invalid_payload");
                         None
                     }
                 },
@@ -1006,13 +1051,15 @@ impl H264AuAssembler {
             if observable_hole {
                 let front = self.pending.front_mut().expect("front checked above");
                 let blocked_since = front.blocked_since.get_or_insert(now);
-                if !force_abandon && now.duration_since(*blocked_since) < RETRANSMIT_GRACE {
+                if abandon_reason.is_none() && now.duration_since(*blocked_since) < RETRANSMIT_GRACE
+                {
                     break;
                 }
-            } else if !force_abandon {
+            } else if abandon_reason.is_none() {
                 break;
             }
 
+            let pending_samples = self.pending.len();
             let abandoned = self.pending.pop_front().expect("front checked above");
             // A received marker still provides the exact anchor for the next
             // AU. Without it, the next AU must prove that its first payload
@@ -1022,6 +1069,15 @@ impl H264AuAssembler {
                 self.gap_open = true;
                 events.push(H264AssemblyEvent::Discontinuity {
                     rtp_timestamp: abandoned.timestamp,
+                    diagnostic: VideoRecoveryDiagnostic {
+                        reason: abandon_reason.unwrap_or("retransmit_deadline"),
+                        pending_samples,
+                        pending_frames,
+                        pending_packets: total_parts,
+                        blocked_ms: abandoned
+                            .blocked_since
+                            .map_or(0, |at| now.duration_since(at).as_millis() as u64),
+                    },
                 });
             }
         }
@@ -2346,7 +2402,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 },
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 200, .. },
                 H264AssemblyEvent::Sample(first),
                 H264AssemblyEvent::Sample(second)
             ] if first.rtp_timestamp == 300 && first.key
@@ -2396,8 +2452,171 @@ mod tests {
         assert_eq!(&repaired.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
     }
 
+    #[tokio::test]
+    async fn paced_recovery_keeps_fragment_count_out_of_the_frame_budget() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(1, 50, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(2, 100, false, FU_S), now).unwrap();
+        asm.push_at(&rtp_pkt(4, 100, true, FU_E), now).unwrap();
+
+        // Three encoded pictures can contain many paced marker-delimited
+        // samples. A packet repaired after 55 ms is still inside the existing
+        // 150 ms recovery grace, even when >15 slice groups arrived meanwhile.
+        for n in 0..24u16 {
+            let ts = 100 + u32::from(n / 8) * 100;
+            let events = asm
+                .push_at(
+                    &rtp_pkt(5 + n, ts, true, IDR_NAL),
+                    now + Duration::from_millis(u64::from(n) * 2),
+                )
+                .unwrap();
+            assert!(events.is_empty(), "premature loss at paced sample {n}");
+        }
+        let events = asm
+            .push_at(
+                &rtp_pkt(3, 100, false, FU_M),
+                now + Duration::from_millis(55),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 25);
+        for (index, event) in events.iter().enumerate() {
+            let H264AssemblyEvent::Sample(sample) = event else {
+                panic!("repaired reference chain must not contain a discontinuity");
+            };
+            if index == 0 {
+                assert_eq!(&sample.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
+            } else {
+                assert_eq!(sample.rtp_timestamp, 100 + ((index - 1) / 8) as u32 * 100);
+                assert_eq!(&sample.data[..], &[0, 0, 0, 1, 0x65, 0xAA, 0xBB]);
+            }
+        }
+        assert!(asm.pending.is_empty());
+
+        // Exercise the actual engine broadcast too: the repaired release is
+        // larger than its shallow queue, but a ready subscriber loses nothing.
+        let state = crate::engine::build_test_state("paced-repair-fanout");
+        let mut rx = state.subscribe_video();
+        let expected: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                H264AssemblyEvent::Sample(sample) => (sample.rtp_timestamp, sample.data.clone()),
+                _ => unreachable!(),
+            })
+            .collect();
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for sequence in 1..=25 {
+                let inbound = rx.recv().await.expect("ready fanout must not lag");
+                assert_eq!(inbound.sample.sequence, sequence);
+                received.push((inbound.sample.rtp_timestamp, inbound.sample.data));
+            }
+            received
+        });
+        for (index, event) in events.into_iter().enumerate() {
+            if let H264AssemblyEvent::Sample(mut sample) = event {
+                sample.sequence = index as u64 + 1;
+                state.dispatch_video_cooperative("sender", sample).await;
+            }
+        }
+        let received = tokio::time::timeout(Duration::from_secs(1), consumer)
+            .await
+            .expect("fanout must make progress")
+            .unwrap();
+        assert_eq!(received, expected);
+    }
+
     #[test]
-    fn pending_window_is_memory_bounded_and_release_fits_fanout() {
+    fn paced_recovery_keeps_the_existing_deadline_for_unrepaired_loss() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(1, 50, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(2, 100, false, FU_S), now).unwrap();
+        asm.push_at(&rtp_pkt(4, 100, true, FU_E), now).unwrap();
+        for n in 0..24 {
+            assert!(asm
+                .push_at(&rtp_pkt(5 + n, 100, true, IDR_NAL), now)
+                .unwrap()
+                .is_empty());
+        }
+        assert!(asm
+            .collect_ready(now + RETRANSMIT_GRACE - Duration::from_millis(1))
+            .unwrap()
+            .is_empty());
+        let events = asm.collect_ready(now + RETRANSMIT_GRACE).unwrap();
+        assert_eq!(events.len(), 25);
+        assert!(
+            matches!(&events[0], H264AssemblyEvent::Discontinuity { diagnostic, .. }
+            if diagnostic.reason == "retransmit_deadline"
+                && diagnostic.blocked_ms == 150
+                && diagnostic.pending_samples == 25
+                && diagnostic.pending_frames == 1)
+        );
+        assert!(events[1..]
+            .iter()
+            .all(|event| matches!(event, H264AssemblyEvent::Sample(_))));
+        assert!(asm.pending.is_empty());
+    }
+
+    #[test]
+    fn paced_recovery_does_not_restart_the_deadline_for_each_damaged_sample() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(1, 50, true, IDR_NAL), now).unwrap();
+        // Both holes are observable now, not when they reach the queue head.
+        for (seq, marker, payload) in [
+            (2, false, FU_S),
+            (4, true, FU_E),
+            (5, false, FU_S),
+            (7, true, FU_E),
+            (8, true, IDR_NAL),
+        ] {
+            assert!(asm
+                .push_at(&rtp_pkt(seq, 100, marker, payload), now)
+                .unwrap()
+                .is_empty());
+        }
+        let events = asm.collect_ready(now + RETRANSMIT_GRACE).unwrap();
+        assert!(matches!(events.as_slice(), [
+            H264AssemblyEvent::Discontinuity { diagnostic, .. },
+            H264AssemblyEvent::Sample(sample),
+        ] if diagnostic.reason == "retransmit_deadline" && sample.key));
+        assert!(
+            asm.pending.is_empty(),
+            "do not charge another 150 ms for an already-expired hole"
+        );
+    }
+
+    #[test]
+    fn paced_recovery_keeps_the_packet_memory_guard_for_one_timestamp() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(1, 50, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(2, 100, false, FU_S), now).unwrap();
+        asm.push_at(&rtp_pkt(4, 100, true, FU_E), now).unwrap();
+        let mut gaps = 0;
+        for n in 0..MAX_PENDING_PARTS {
+            let events = asm
+                .push_at(&rtp_pkt(5 + n as u16, 100, true, IDR_NAL), now)
+                .unwrap();
+            for event in events {
+                if let H264AssemblyEvent::Discontinuity { diagnostic, .. } = event {
+                    assert_eq!(diagnostic.reason, "pending_packet_limit");
+                    assert_eq!(diagnostic.pending_frames, 1);
+                    assert_eq!(diagnostic.pending_packets, MAX_PENDING_PARTS + 1);
+                    gaps += 1;
+                }
+            }
+            assert!(
+                asm.pending.iter().map(|au| au.parts.len()).sum::<usize>() <= MAX_PENDING_PARTS
+            );
+        }
+        assert_eq!(gaps, 1);
+        assert!(asm.pending.is_empty());
+    }
+
+    #[test]
+    fn pending_window_still_bounds_distinct_frames() {
         let mut asm = H264AuAssembler::default();
         let now = Instant::now();
         asm.push_at(&rtp_pkt(1, 100, true, IDR_NAL), now).unwrap();
@@ -2406,7 +2625,7 @@ mod tests {
         asm.push_at(&rtp_pkt(2, 200, false, FU_S), now).unwrap();
         asm.push_at(&rtp_pkt(4, 200, true, FU_E), now).unwrap();
         let mut released = Vec::new();
-        for offset in 0..MAX_PENDING_AUS {
+        for offset in 0..MAX_PENDING_FRAMES {
             released = asm
                 .push_at(
                     &rtp_pkt(5 + offset as u16, 300 + offset as u32 * 100, true, IDR_NAL),
@@ -2414,10 +2633,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(released.len(), 1 + MAX_PENDING_AUS);
+        assert_eq!(released.len(), 1 + MAX_PENDING_FRAMES);
         assert!(matches!(
             released.first(),
-            Some(H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 })
+            Some(H264AssemblyEvent::Discontinuity { rtp_timestamp: 200, diagnostic })
+                if diagnostic.reason == "pending_frame_limit"
         ));
         assert!(released[1..]
             .iter()
@@ -2435,7 +2655,8 @@ mod tests {
         let events = asm.push_events(&rtp_pkt(2, 200, true, &[0x7c])).unwrap();
         assert!(matches!(
             events.as_slice(),
-            [H264AssemblyEvent::Discontinuity { rtp_timestamp: 200 }]
+            [H264AssemblyEvent::Discontinuity { rtp_timestamp: 200, diagnostic }]
+                if diagnostic.reason == "invalid_payload"
         ));
         let recovered = asm
             .push(&rtp_pkt(3, 300, true, IDR_NAL))
@@ -2466,7 +2687,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                H264AssemblyEvent::Discontinuity { rtp_timestamp: 100 },
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 100, .. },
                 H264AssemblyEvent::Sample(sample)
             ] if sample.rtp_timestamp == 200 && sample.key
         ));
@@ -2689,7 +2910,7 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                H264AssemblyEvent::Discontinuity { rtp_timestamp: 2000 },
+                H264AssemblyEvent::Discontinuity { rtp_timestamp: 2000, .. },
                 H264AssemblyEvent::Sample(delta),
                 H264AssemblyEvent::Sample(key)
             ] if delta.rtp_timestamp == 3000 && !delta.key
