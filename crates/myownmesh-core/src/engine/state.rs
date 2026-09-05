@@ -1195,6 +1195,14 @@ impl NetworkState {
         });
     }
 
+    /// The engine can itself drain a buffered transport-command burst without
+    /// awaiting I/O. Preserve fairness at this boundary too: a yield upstream
+    /// in the RTP reader does not schedule these downstream subscribers.
+    pub(crate) async fn dispatch_video_cooperative(&self, from: &str, sample: VideoSample) {
+        self.dispatch_video(from, sample);
+        tokio::task::yield_now().await;
+    }
+
     /// Surface a receiver-side H.264 reference discontinuity through the same
     /// ordered subscription as access units. An empty payload is reserved for
     /// this sentinel; assembled H.264 units are always non-empty.
@@ -1870,6 +1878,51 @@ mod local_socket_recovery_tests {
 #[cfg(test)]
 mod recovery_collision_state_tests {
     use crate::engine::build_test_state;
+
+    #[tokio::test]
+    async fn buffered_video_fanout_does_not_lag_a_ready_subscriber() {
+        for cooperative in [false, true] {
+            let state = build_test_state(if cooperative {
+                "video-fair-handoff"
+            } else {
+                "video-burst-repro"
+            });
+            let mut rx = state.subscribe_video();
+            let consumer = tokio::spawn(async move {
+                let mut sequences = Vec::new();
+                for _ in 0..32 {
+                    sequences.push(rx.recv().await?.sample.sequence);
+                }
+                Ok::<_, tokio::sync::broadcast::error::RecvError>(sequences)
+            });
+            for sequence in 1..=32 {
+                let sample = crate::transport::VideoSample {
+                    rtp_timestamp: sequence as u32,
+                    key: sequence == 1,
+                    lane: 0,
+                    sequence,
+                    data: bytes::Bytes::from_static(&[1]),
+                };
+                if cooperative {
+                    state.dispatch_video_cooperative("peer", sample).await;
+                } else {
+                    state.dispatch_video("peer", sample);
+                }
+            }
+            let result = consumer.await.unwrap();
+            if cooperative {
+                assert_eq!(result.unwrap(), (1..=32).collect::<Vec<_>>());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(16))
+                    ),
+                    "the pre-fix synchronous handoff reproduces local loss"
+                );
+            }
+        }
+    }
 
     #[test]
     fn deferred_restart_requests_coalesce_and_preserve_force() {
