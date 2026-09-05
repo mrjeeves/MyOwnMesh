@@ -218,6 +218,7 @@ pub fn spawn_channel_pump(
 pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: ClientRegistry) {
     let mut sub = network.state().subscribe_video();
     tokio::spawn(async move {
+        let mut last_sink_pressure_log: Option<std::time::Instant> = None;
         let mut last_sequence = std::collections::HashMap::<(String, u8), u64>::new();
         let mut sink_recovery = std::collections::HashMap::<
             (crate::ipc::ClientId, String, u8),
@@ -248,6 +249,11 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                 });
             // Binary body for clients on a media-source pipe; built once.
             let discontinuity = inbound.sample.data.is_empty();
+            if sequence_gap || discontinuity {
+                debug!(%network_key, from = %inbound.from, lane = inbound.sample.lane,
+                    sequence = inbound.sample.sequence, sequence_gap, rtp_discontinuity = discontinuity,
+                    "video loss before daemon IPC handoff");
+            }
             let gap_body = crate::control::encode_inbound_frame(
                 crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY,
                 false,
@@ -269,14 +275,26 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                     if let Some(sink) = client.media_sink() {
                         let recovery_key = (client_id, inbound.from.clone(), inbound.sample.lane);
                         let state = sink_recovery.get(&recovery_key).copied();
-                        let (keep_open, next) = forward_video_to_media_sink(
+                        let (keep_open, next) = handoff_video_to_media_sink(
                             &sink,
                             state,
                             sequence_gap || discontinuity,
                             discontinuity,
                             &gap_body,
                             &body,
-                        );
+                        )
+                        .await;
+                        let shed = next == Some(MediaSinkVideoRecovery::NeedGap)
+                            || (next == Some(MediaSinkVideoRecovery::GapSent) && !discontinuity);
+                        if shed
+                            && last_sink_pressure_log
+                                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
+                        {
+                            last_sink_pressure_log = Some(std::time::Instant::now());
+                            debug!(%network_key, from = %inbound.from, lane = inbound.sample.lane,
+                                sequence = inbound.sample.sequence,
+                                "video daemon IPC queue overflow; ordering a discontinuity");
+                        }
                         match next {
                             Some(next) => {
                                 sink_recovery.insert(recovery_key.clone(), next);
@@ -313,6 +331,26 @@ fn inbound_video_kind(sample: &myownmesh_core::transport::VideoSample) -> u8 {
     } else {
         crate::control::MEDIA_KIND_VIDEO
     }
+}
+
+/// A socket writer that is ready must get a turn before this pump drains a
+/// repaired burst into its eight-sample queue. Fragments are not whole frames:
+/// even one valid large AU can exceed that count. Keep the nonblocking loss
+/// fence for a genuinely blocked client, without sleeping or expanding buffers.
+async fn handoff_video_to_media_sink(
+    sink: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    recovery: Option<MediaSinkVideoRecovery>,
+    observed_gap: bool,
+    discontinuity: bool,
+    gap_body: &[u8],
+    body: &[u8],
+) -> (bool, Option<MediaSinkVideoRecovery>) {
+    let result =
+        forward_video_to_media_sink(sink, recovery, observed_gap, discontinuity, gap_body, body);
+    if sink.capacity() < sink.max_capacity() {
+        tokio::task::yield_now().await;
+    }
+    result
 }
 
 fn video_sequence_discontinuous(previous: u64, current: u64) -> bool {
@@ -916,4 +954,49 @@ fn full_media_sink_orders_one_gap_then_preserves_recovery_policy() {
     assert_eq!(state, None);
     assert_eq!(rx.try_recv().unwrap(), delta);
     assert!(rx.try_recv().is_err(), "no duplicate gap was queued");
+}
+
+#[tokio::test]
+async fn buffered_video_ipc_burst_preserves_ready_consumer_and_stays_bounded_when_stalled() {
+    for cooperative in [false, true] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::control::MEDIA_SOURCE_QUEUE_CAPACITY);
+        let consumer = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some(body) = rx.recv().await {
+                received.push(body);
+            }
+            received
+        });
+        let mut recovery = None;
+        for n in 0..32u8 {
+            let (open, next) = if cooperative {
+                handoff_video_to_media_sink(&tx, recovery, false, false, &[99], &[n]).await
+            } else {
+                forward_video_to_media_sink(&tx, recovery, false, false, &[99], &[n])
+            };
+            assert!(open);
+            recovery = next;
+        }
+        drop(tx);
+        let count = if cooperative {
+            32
+        } else {
+            crate::control::MEDIA_SOURCE_QUEUE_CAPACITY as u8
+        };
+        assert_eq!(
+            consumer.await.unwrap(),
+            (0..count).map(|n| vec![n]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            recovery.is_none(),
+            cooperative,
+            "only the legacy loop manufactures local loss"
+        );
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    handoff_video_to_media_sink(&tx, None, false, false, &[99], &[1]).await;
+    let (_, state) = handoff_video_to_media_sink(&tx, None, false, false, &[99], &[2]).await;
+    assert_eq!(state, Some(MediaSinkVideoRecovery::NeedGap));
+    assert_eq!(rx.len(), 1);
 }

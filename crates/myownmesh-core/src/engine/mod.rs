@@ -2226,7 +2226,7 @@ async fn handle_transport_event(
             // pre-admission — and the embedder matches an inbound sample to an
             // authorized route. Admission is enforced at the route layer (the
             // outer layer), not per frame here.
-            state.dispatch_video(&device_id, sample);
+            state.dispatch_video_cooperative(&device_id, sample).await;
         }
         TransportEvent::VideoDiscontinuity {
             lane,
@@ -2234,6 +2234,7 @@ async fn handle_transport_event(
             sequence,
         } => {
             state.dispatch_video_discontinuity(&device_id, lane, rtp_timestamp, sequence);
+            tokio::task::yield_now().await;
         }
         TransportEvent::AudioSample(sample) => {
             state.dispatch_audio(&device_id, sample);
