@@ -1,13 +1,6 @@
 # Paced-video recovery accounting
 
-## Evidence and reproduced defects
-
-On AMS 0.2.113 / MyOwnMesh 0.3.16, the CECWorkstation2 → Stream PC
-viewer logged repeated RTP/disassembly discontinuities followed by daemon IPC
-overflow. At 2026-09-05 04:21:47 UTC, recovery produced a 2456.9 ms maximum
-accepted-sample gap. At 04:33:27 UTC another episode produced an approximately
-1565 ms painted-frame gap. Sender windows stayed near 30 fps with zero reported
-encoder drops. These are pipeline gaps, not measurements of NIC saturation.
+## Reproduced defects
 
 The new deterministic tests expose two recovery-accounting defects:
 
@@ -24,8 +17,8 @@ The new deterministic tests expose two recovery-accounting defects:
    makes the hole observable. Both expire at the original deadline, with one
    ordered discontinuity before the next complete sample.
 
-These tests prove the defects, not that either was the unique cause of every
-field event. The captured release did not log the assembler abandonment reason.
+These synthetic tests prove the defects, not that either uniquely explains
+every field event. Field verification still requires the new reason diagnostic.
 
 ## Unchanged limits and contracts
 
