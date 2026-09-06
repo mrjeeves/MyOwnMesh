@@ -109,6 +109,12 @@ const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 3; // 64 << 3 = 512 packets
 const NACK_REORDER_TAIL_PACKETS: u16 = 8;
 const NACK_INTERVAL: Duration = Duration::from_millis(20);
 const NACK_RESPONDER_LOG2_SIZE: u8 = 13; // retain 8,192 sent packets
+/// NACK resends the original SSRC/sequence, not an RTX stream. The encrypted
+/// receive window must therefore admit an unseen repair anywhere in the
+/// sender's retained history. The default 64-packet SRTP window rejected
+/// valid repairs before they reached NACK tracking or H.264 assembly.
+/// This is a replay bitmap, not a media queue; duplicate rejection stays on.
+const SRTP_REPLAY_WINDOW_PACKETS: usize = 1 << NACK_RESPONDER_LOG2_SIZE;
 
 #[cfg(test)]
 const NACK_GENERATOR_PACKETS: usize = 64 << NACK_GENERATOR_LOG2_SIZE_MINUS_6;
@@ -133,6 +139,9 @@ fn register_media_interceptors(
     registry.add(Box::new(
         Responder::builder().with_log2_size(NACK_RESPONDER_LOG2_SIZE),
     ));
+    registry.add(Box::new(super::rtp_replay::ReplayFence(
+        SRTP_REPLAY_WINDOW_PACKETS,
+    )));
     registry.add(Box::new(
         Generator::builder()
             .with_log2_size_minus_6(NACK_GENERATOR_LOG2_SIZE_MINUS_6)
@@ -391,6 +400,7 @@ impl Transport {
         // intentionally *kept* (it's a real path); only the dead virtual
         // interfaces in `VIRTUAL_IFACE_PREFIXES` are dropped.
         let mut setting_engine = SettingEngine::default();
+        setting_engine.set_srtp_replay_protection_window(SRTP_REPLAY_WINDOW_PACKETS);
         setting_engine.set_interface_filter(Box::new(|name: &str| {
             let keep = !is_virtual_interface(name);
             // Instrumentation: a one-liner per excluded interface so a log
@@ -2252,6 +2262,99 @@ mod tests {
     const FU_S: &[u8] = &[0x7C, 0x85, 0x11];
     const FU_M: &[u8] = &[0x7C, 0x05, 0x22];
     const FU_E: &[u8] = &[0x7C, 0x45, 0x33];
+
+    #[test]
+    fn encrypted_video_repair_reaches_assembler_after_packet_advance() {
+        use webrtc::srtp::{
+            context::Context, option::srtp_replay_protection, protection_profile::ProtectionProfile,
+        };
+        use webrtc::util::marshal::{Marshal, Unmarshal};
+
+        for profile in [
+            ProtectionProfile::Aes128CmHmacSha1_80,
+            ProtectionProfile::AeadAes128Gcm,
+        ] {
+            for first in [1000u16, 65_500] {
+                for window in [64, SRTP_REPLAY_WINDOW_PACKETS] {
+                    let key = vec![0x42; profile.key_len()];
+                    let salt = vec![0x24; profile.salt_len()];
+                    let mut sender = Context::new(&key, &salt, profile, None, None).unwrap();
+                    let mut receiver = Context::new(
+                        &key,
+                        &salt,
+                        profile,
+                        Some(srtp_replay_protection(window)),
+                        None,
+                    )
+                    .unwrap();
+                    let mut asm = H264AuAssembler::default();
+                    let mut replay =
+                        super::super::rtp_replay::ReplayWindow::new(SRTP_REPLAY_WINDOW_PACKETS);
+                    let now = Instant::now();
+                    let mut missing = None;
+                    let mut newest = None;
+                    for offset in 0..=201u16 {
+                        let payload = match offset {
+                            0 => FU_S,
+                            201 => FU_E,
+                            _ => FU_M,
+                        };
+                        let packet =
+                            rtp_pkt(first.wrapping_add(offset), 90_000, offset == 201, payload);
+                        let encrypted = sender.encrypt_rtp(&packet.marshal().unwrap()).unwrap();
+                        if offset == 1 {
+                            missing = Some(encrypted);
+                            continue;
+                        }
+                        let plaintext = receiver.decrypt_rtp(&encrypted).unwrap();
+                        let packet =
+                            webrtc::rtp::packet::Packet::unmarshal(&mut plaintext.as_ref())
+                                .unwrap();
+                        assert!(replay.accept(packet.header.sequence_number));
+                        assert!(asm
+                            .push_at(&packet, now + Duration::from_millis(20))
+                            .unwrap()
+                            .is_empty());
+                        newest = Some(encrypted);
+                    }
+                    let repair = receiver.decrypt_rtp(missing.as_ref().unwrap());
+                    if window == 64 {
+                        assert!(matches!(
+                            repair,
+                            Err(webrtc::srtp::Error::SrtpSsrcDuplicated(_, _))
+                        ));
+                    } else {
+                        let plaintext =
+                            repair.expect("an unseen requested repair must survive SRTP");
+                        let packet =
+                            webrtc::rtp::packet::Packet::unmarshal(&mut plaintext.as_ref())
+                                .unwrap();
+                        assert!(replay.accept(packet.header.sequence_number));
+                        let events = asm
+                            .push_at(&packet, now + Duration::from_millis(55))
+                            .unwrap();
+                        assert_eq!(events.len(), 1);
+                        assert!(
+                            matches!(&events[0], H264AssemblyEvent::Sample(sample) if sample.key)
+                        );
+                        if let Ok(plaintext) = receiver.decrypt_rtp(missing.as_ref().unwrap()) {
+                            let duplicate =
+                                webrtc::rtp::packet::Packet::unmarshal(&mut plaintext.as_ref())
+                                    .unwrap();
+                            assert!(
+                                !replay.accept(duplicate.header.sequence_number),
+                                "the authenticated fence rejects pre-wrap repair duplicates"
+                            );
+                        }
+                    }
+                    assert!(
+                        receiver.decrypt_rtp(newest.as_ref().unwrap()).is_err(),
+                        "duplicate protection must remain enabled"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn single_packet_units_emit_in_order() {
