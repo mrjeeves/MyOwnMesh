@@ -333,12 +333,12 @@ fn inbound_video_kind(sample: &myownmesh_core::transport::VideoSample) -> u8 {
     }
 }
 
-/// A socket writer that is ready must get a turn before this pump drains a
-/// repaired burst into its eight-sample queue. Fragments are not whole frames:
-/// even one valid large AU can exceed that count. Keep the nonblocking loss
-/// fence for a genuinely blocked client, without sleeping or expanding buffers.
+/// Give a ready socket writer a turn during a repaired release. Correctness
+/// does not depend on the yield: the queue counts pictures, with independent
+/// byte and sample bounds, so a temporarily busy writer can retain a picture's
+/// paced fragments. A genuinely full queue still uses the nonblocking fence.
 async fn handoff_video_to_media_sink(
-    sink: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    sink: &super::media_queue::Sender,
     recovery: Option<MediaSinkVideoRecovery>,
     observed_gap: bool,
     discontinuity: bool,
@@ -367,7 +367,7 @@ enum MediaSinkVideoRecovery {
 /// replay backlog: mark one gap, then resume with the next complete AU. Codec
 /// recovery policy belongs to the consumer, which knows reset vs gradual mode.
 fn forward_video_to_media_sink(
-    sink: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    sink: &super::media_queue::Sender,
     mut recovery: Option<MediaSinkVideoRecovery>,
     observed_gap: bool,
     discontinuity: bool,
@@ -927,7 +927,7 @@ fn per_track_sequence_detects_only_real_internal_fanout_gaps() {
 
 #[test]
 fn full_media_sink_orders_one_gap_then_preserves_recovery_policy() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = super::media_queue::channel(1);
     tx.try_send(vec![99]).unwrap();
     let gap = vec![crate::control::MEDIA_KIND_VIDEO_DISCONTINUITY];
     let delta = vec![crate::control::MEDIA_KIND_VIDEO, 1];
@@ -957,9 +957,42 @@ fn full_media_sink_orders_one_gap_then_preserves_recovery_policy() {
 }
 
 #[tokio::test]
+async fn repaired_picture_handoff_does_not_invent_a_gap_for_a_busy_consumer() {
+    use crate::control::{encode_inbound_frame, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY};
+    let (tx, mut rx) = super::media_queue::channel(1);
+    let gap = encode_inbound_frame(MEDIA_KIND_VIDEO_DISCONTINUITY, false, 0, 100, "peer", &[]);
+    let mut recovery = None;
+    let mut expected = Vec::new();
+    for n in 0..32u8 {
+        let body = encode_inbound_frame(MEDIA_KIND_VIDEO, false, 0, 100, "peer", &[n]);
+        let (open, next) =
+            handoff_video_to_media_sink(&tx, recovery, false, false, &gap, &body).await;
+        assert!(open);
+        assert_eq!(next, None, "paced fragments are not separate pictures");
+        recovery = next;
+        expected.push(body);
+    }
+    // A distinct picture still hits the unchanged one-picture budget.
+    let next_body = encode_inbound_frame(MEDIA_KIND_VIDEO, false, 0, 200, "peer", &[33]);
+    let (_, recovery) = forward_video_to_media_sink(&tx, recovery, false, false, &gap, &next_body);
+    assert_eq!(recovery, Some(MediaSinkVideoRecovery::NeedGap));
+    for body in expected {
+        assert_eq!(rx.try_recv().unwrap(), body);
+    }
+    let gap = encode_inbound_frame(MEDIA_KIND_VIDEO_DISCONTINUITY, false, 0, 200, "peer", &[]);
+    let (open, recovery) =
+        forward_video_to_media_sink(&tx, recovery, false, false, &gap, &next_body);
+    assert!(open);
+    assert_eq!(recovery, None);
+    assert_eq!(rx.try_recv().unwrap(), gap);
+    assert_eq!(rx.try_recv().unwrap(), next_body);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn buffered_video_ipc_burst_preserves_ready_consumer_and_stays_bounded_when_stalled() {
     for cooperative in [false, true] {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(crate::control::MEDIA_SOURCE_QUEUE_CAPACITY);
+        let (tx, mut rx) = super::media_queue::channel(crate::control::MEDIA_SOURCE_QUEUE_CAPACITY);
         let consumer = tokio::spawn(async move {
             let mut received = Vec::new();
             while let Some(body) = rx.recv().await {
@@ -994,9 +1027,10 @@ async fn buffered_video_ipc_burst_preserves_ready_consumer_and_stays_bounded_whe
         );
     }
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = super::media_queue::channel(1);
     handoff_video_to_media_sink(&tx, None, false, false, &[99], &[1]).await;
     let (_, state) = handoff_video_to_media_sink(&tx, None, false, false, &[99], &[2]).await;
     assert_eq!(state, Some(MediaSinkVideoRecovery::NeedGap));
-    assert_eq!(rx.len(), 1);
+    assert_eq!(rx.try_recv().unwrap(), vec![1]);
+    assert!(rx.try_recv().is_err());
 }

@@ -910,6 +910,8 @@ impl H264AuAssembler {
         let pos = if let Some(pos) = self.pending_position(ts, seq) {
             pos
         } else {
+            let mut insert_at = self.pending.len();
+            let mut blocked_since = None;
             if let Some(newest) = self.newest_timestamp {
                 if ts == newest {
                     // A TrackLocal sample owns one RTP marker, but paced
@@ -922,18 +924,61 @@ impl H264AuAssembler {
                         return self.collect_ready(now);
                     }
                 } else if !newer_rtp_ts(ts, newest) {
-                    return self.collect_ready(now);
+                    // A whole picture can arrive after a newer timestamp:
+                    // none of its packets need have created a pending entry
+                    // yet. Admit it only into an unretired sequence hole,
+                    // bounded by the already-observed neighboring pictures.
+                    // Timestamp age alone is not evidence of a stale repair.
+                    let Some(end) = self.prev_end else {
+                        return self.collect_ready(now);
+                    };
+                    let Some(next) = self
+                        .pending
+                        .iter()
+                        .position(|au| newer_rtp_ts(au.timestamp, ts))
+                    else {
+                        return self.collect_ready(now);
+                    };
+                    let right = &self.pending[next];
+                    let left = next.checked_sub(1).map(|index| &self.pending[index]);
+                    if seq <= end
+                        || right
+                            .parts
+                            .first_key_value()
+                            .is_none_or(|(&first, _)| seq >= first)
+                        || left.is_some_and(|au| {
+                            !newer_rtp_ts(ts, au.timestamp)
+                                || au
+                                    .parts
+                                    .last_key_value()
+                                    .is_some_and(|(&last, _)| seq <= last)
+                        })
+                    {
+                        return self.collect_ready(now);
+                    }
+                    insert_at = next;
+                    // The newer picture exposed this hole already. Inserting
+                    // its delayed predecessor must not restart repair grace.
+                    blocked_since = right.blocked_since.or(Some(now));
                 }
             }
-            self.newest_timestamp = Some(ts);
-            self.pending.push_back(PendingH264Au {
-                timestamp: ts,
-                parts: std::collections::BTreeMap::new(),
-                marker_seq: None,
-                blocked_since: None,
-                overflowed: false,
-            });
-            self.pending.len() - 1
+            if self
+                .newest_timestamp
+                .is_none_or(|newest| newer_rtp_ts(ts, newest))
+            {
+                self.newest_timestamp = Some(ts);
+            }
+            self.pending.insert(
+                insert_at,
+                PendingH264Au {
+                    timestamp: ts,
+                    parts: std::collections::BTreeMap::new(),
+                    marker_seq: None,
+                    blocked_since,
+                    overflowed: false,
+                },
+            );
+            insert_at
         };
 
         let mut split_tail = None;
@@ -2553,6 +2598,92 @@ mod tests {
             .expect("the late NACK retransmit still repairs the older unit");
         assert_eq!(repaired.rtp_timestamp, 200);
         assert_eq!(&repaired.data[..], &[0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn entirely_reordered_picture_is_repaired_before_newer_picture() {
+        for base in [100u32, u32::MAX - 150] {
+            let mut asm = H264AuAssembler::default();
+            let now = Instant::now();
+            asm.push_at(&rtp_pkt(30, base, true, IDR_NAL), now).unwrap();
+            // All packets of one picture are late, not just an interior
+            // fragment. The newer picture makes that sequence hole visible.
+            assert!(asm
+                .push_at(&rtp_pkt(34, base.wrapping_add(200), true, IDR_NAL), now)
+                .unwrap()
+                .is_empty());
+            let repaired_at = now + Duration::from_millis(55);
+            for (seq, marker, payload) in [(33, true, FU_E), (31, false, FU_S)] {
+                assert!(asm
+                    .push_at(
+                        &rtp_pkt(seq, base.wrapping_add(100), marker, payload),
+                        repaired_at
+                    )
+                    .unwrap()
+                    .is_empty());
+            }
+            let events = asm
+                .push_at(
+                    &rtp_pkt(32, base.wrapping_add(100), false, FU_M),
+                    repaired_at,
+                )
+                .unwrap();
+            assert!(
+                matches!(events.as_slice(), [H264AssemblyEvent::Sample(first), H264AssemblyEvent::Sample(second)]
+                if first.rtp_timestamp == base.wrapping_add(100) && second.rtp_timestamp == base.wrapping_add(200))
+            );
+            assert!(
+                asm.push_at(
+                    &rtp_pkt(31, base.wrapping_add(100), false, FU_S),
+                    repaired_at
+                )
+                .unwrap()
+                .is_empty(),
+                "retired packets stay stale"
+            );
+        }
+    }
+
+    #[test]
+    fn entirely_reordered_picture_does_not_restart_repair_grace() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(30, 100, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(34, 300, true, IDR_NAL), now).unwrap();
+        // Only the older picture's tail is repaired just before expiry.
+        assert!(asm
+            .push_at(
+                &rtp_pkt(33, 200, true, FU_E),
+                now + RETRANSMIT_GRACE - Duration::from_millis(1)
+            )
+            .unwrap()
+            .is_empty());
+        let events = asm
+            .push_at(&rtp_pkt(35, 400, true, IDR_NAL), now + RETRANSMIT_GRACE)
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [H264AssemblyEvent::Discontinuity { rtp_timestamp: 200, diagnostic }, H264AssemblyEvent::Sample(first), H264AssemblyEvent::Sample(second)]
+            if diagnostic.reason == "retransmit_deadline" && diagnostic.blocked_ms == 150 && first.rtp_timestamp == 300 && second.rtp_timestamp == 400)
+        );
+        assert!(asm
+            .push_at(&rtp_pkt(31, 200, false, FU_S), now + RETRANSMIT_GRACE)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn entirely_reordered_picture_cannot_cross_observed_sequence_boundaries() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(30, 100, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(34, 300, true, IDR_NAL), now).unwrap();
+        for seq in [30, 34, 35] {
+            assert!(asm
+                .push_at(&rtp_pkt(seq, 200, true, IDR_NAL), now)
+                .unwrap()
+                .is_empty());
+            assert_eq!(asm.pending.len(), 1, "outside the known sequence hole");
+        }
     }
 
     #[tokio::test]

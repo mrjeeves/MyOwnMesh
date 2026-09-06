@@ -782,7 +782,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await?;
                 continue;
             };
-            let (tx, rx) = tokio::sync::mpsc::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
+            let (tx, rx) = crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
             client.set_media_sink(tx);
             let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
             writer
@@ -868,7 +868,7 @@ where
 async fn run_media_source_pipe<R, W>(
     mut reader: R,
     writer: &mut W,
-    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut rx: crate::ipc::media_queue::Receiver,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2367,8 +2367,9 @@ pub const MEDIA_KIND_VIDEO_DISCONTINUITY: u8 = 2;
 /// Defensive cap on one frame body — a corrupt length never allocates more.
 pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// The daemon-to-client socket is a live handoff, not a playout buffer. A
-/// short bounded queue absorbs scheduler jitter; video explicitly fences and
-/// signals a shed H.264 unit, while audio may shed stale packets.
+/// short bounded queue absorbs scheduler jitter. Slots count video pictures
+/// (peer/lane/timestamp), not individual paced samples; audio counts per packet.
+/// Aggregate queued bytes are separately bounded by MAX_MEDIA_FRAME_BYTES.
 pub const MEDIA_SOURCE_QUEUE_CAPACITY: usize = 8;
 
 /// One decoded media-track frame.
@@ -2443,6 +2444,59 @@ pub fn encode_inbound_frame(
 #[cfg(test)]
 mod media_frame_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repaired_picture_crosses_media_pipe_with_a_temporarily_busy_reader() {
+        let bodies: Vec<_> = (0..32u8)
+            .map(|n| {
+                encode_inbound_frame(
+                    MEDIA_KIND_VIDEO,
+                    n == 0,
+                    0,
+                    90_000,
+                    "peer",
+                    &vec![n; 24 * 1024],
+                )
+            })
+            .collect();
+
+        // The released queue fails this exact valid single-picture burst.
+        let (legacy, _legacy_rx) = tokio::sync::mpsc::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
+        for body in bodies.iter().take(MEDIA_SOURCE_QUEUE_CAPACITY) {
+            legacy.try_send(body.clone()).unwrap();
+        }
+        assert!(legacy
+            .try_send(bodies[MEDIA_SOURCE_QUEUE_CAPACITY].clone())
+            .is_err());
+
+        let (tx, rx) = crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
+        let (daemon, mut client) = tokio::io::duplex(4096);
+        let (reader, mut writer) = tokio::io::split(daemon);
+        let pump =
+            tokio::spawn(async move { run_media_source_pipe(reader, &mut writer, rx).await });
+        // Writer fills the 4 KiB pipe and becomes Pending. A scheduler yield
+        // cannot make it writable while the reader is busy. The new queue
+        // preserves all slices without a sleep, socket acknowledgement, or
+        // waiting for the rest of the picture before offering the first slice.
+        for body in &bodies {
+            tx.try_send(body.clone())
+                .expect("slices share a picture slot");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tx.capacity(), MEDIA_SOURCE_QUEUE_CAPACITY - 1);
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for expected in &bodies {
+                let len = client.read_u32_le().await.unwrap() as usize;
+                let mut actual = vec![0; len];
+                client.read_exact(&mut actual).await.unwrap();
+                assert_eq!(&actual, expected);
+            }
+            pump.await.unwrap().unwrap();
+        })
+        .await
+        .expect("reader drains the preserved picture without a recovery cycle");
+    }
 
     /// Local copy of the encoder (the daemon only needs to decode) so the
     /// round-trip can be asserted against the exact layout the client writes.
