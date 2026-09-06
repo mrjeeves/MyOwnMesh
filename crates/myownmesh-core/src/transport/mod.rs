@@ -16,6 +16,7 @@
 
 pub mod diag;
 pub mod ice;
+mod rtp_replay;
 mod turn_stream;
 pub mod webrtc;
 
