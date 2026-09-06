@@ -29,6 +29,9 @@
 //!   database reservations are constructed from this policy at startup;
 //!   changing them in place would make existing ownership accounting
 //!   ambiguous, so the exact runtime must be replaced.
+//! - Optional Hub, tree and local-observation policies fix retained owner capacities.
+//!   Their changes, and topology changes involving a Hub/tree controller, also
+//!   require exact runtime replacement.
 
 use std::sync::Arc;
 
@@ -42,7 +45,7 @@ use super::state::NetworkState;
 /// (a different network), `signaling` (the relay set the Nostr driver
 /// is bound to), `closed_relay` (the provider-backed runtime profile),
 /// `semantic_policy` (the admission/store resource envelope), or any
-/// construction-time scheduler/broadcast capacity. STUN/TURN, topology,
+/// construction-time scheduler/broadcast capacity. STUN/TURN, unfunded topology,
 /// label, roster, and auto-approve are all applied in place by [`apply_hot`]
 /// without dropping peers.
 /// Changes to `closed_relay` and `semantic_policy` require restart because
@@ -54,8 +57,28 @@ pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
         || current.closed_relay != next.closed_relay
         || current.semantic_policy != next.semantic_policy
         || current.scheduler != next.scheduler
+        || current.hub != next.hub
+        || current.tree != next.tree
+        || current.local_observations != next.local_observations
+        || topology_requires_restart(current, &next.topology)
         || current.event_capacity != next.event_capacity
         || current.connection_trace_capacity != next.connection_trace_capacity
+}
+
+/// Configuration-bound controllers cannot survive a topology replacement.
+/// Entering HubTree also needs a fresh, validated and funded parent owner.
+pub(crate) fn topology_requires_restart(
+    current: &NetworkConfig,
+    next: &crate::config::TopologyMode,
+) -> bool {
+    current.topology != *next
+        && (current.hub.is_some()
+            || current.tree.is_some()
+            || matches!(
+                current.topology,
+                crate::config::TopologyMode::HubTree { .. }
+            )
+            || matches!(next, crate::config::TopologyMode::HubTree { .. }))
 }
 
 /// Apply the hot-reloadable subset of config without tearing down
@@ -100,6 +123,61 @@ mod tests {
 
     fn base_config() -> NetworkConfig {
         NetworkConfig::from_network_id("test-id", "test-net")
+    }
+
+    #[test]
+    fn tree_owner_policy_and_topology_require_replacement() {
+        use crate::config::{TopologyMode, TreePolicyConfig};
+        let baseline = base_config();
+        let mut tree = baseline.clone();
+        tree.topology = TopologyMode::HubTree {
+            root: "root".into(),
+            hubs: vec!["hub".into()],
+            backup_candidates: 0,
+        };
+        tree.tree = Some(TreePolicyConfig {
+            max_children: 0,
+            max_backups: 0,
+            max_pending: 1,
+            max_age_ms: 1000,
+        });
+        assert!(requires_restart(&baseline, &tree));
+        assert!(topology_requires_restart(&baseline, &tree.topology));
+        assert!(requires_restart(&tree, &baseline));
+        assert!(!requires_restart(&tree, &tree));
+        assert!(!topology_requires_restart(&tree, &tree.topology));
+
+        let mut capacity_change = tree.clone();
+        capacity_change.tree.as_mut().unwrap().max_children = 1;
+        assert!(requires_restart(&tree, &capacity_change));
+        let mut root_change = tree.clone();
+        if let TopologyMode::HubTree { root, .. } = &mut root_change.topology {
+            *root = "replacement-root".into();
+        }
+        assert!(requires_restart(&tree, &root_change));
+        assert!(topology_requires_restart(&tree, &root_change.topology));
+
+        let mut label_change = tree.clone();
+        label_change.label = "local label".into();
+        assert!(!requires_restart(&tree, &label_change));
+    }
+
+    #[test]
+    fn local_observation_policy_requires_replacement() {
+        let baseline = base_config();
+        let mut enabled = baseline.clone();
+        enabled.local_observations = Some(crate::config::LocalObservationPolicyConfig {
+            max_records: 8,
+            max_records_per_subject: 2,
+            max_age_ms: 1000,
+            max_maintenance_per_tick: 1,
+        });
+        assert!(requires_restart(&baseline, &enabled));
+        assert!(requires_restart(&enabled, &baseline));
+        let mut resized = enabled.clone();
+        resized.local_observations.as_mut().unwrap().max_records += 1;
+        assert!(requires_restart(&enabled, &resized));
+        assert!(!requires_restart(&enabled, &enabled));
     }
 
     #[test]

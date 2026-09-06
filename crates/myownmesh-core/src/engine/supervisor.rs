@@ -347,6 +347,17 @@ use super::{
 pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
     match cmd {
         NetworkCmd::SetTopology(mode) => {
+            // A funded Hub controller retains configuration-bound replay and
+            // discovery state. The public API checks this too, but commands
+            // admitted before a configuration change must not bypass it.
+            let requires_replacement = {
+                let config = state.config.read();
+                super::reconcile::topology_requires_restart(&config, &mode)
+            };
+            if requires_replacement {
+                tracing::warn!("topology command refused: funded Hub or tree state requires runtime replacement");
+                return;
+            }
             // Topology is explicit connector/deployment policy, not a
             // governance authority-bearing fact.  Apply the local command
             // directly; canonical governance projection never derives a

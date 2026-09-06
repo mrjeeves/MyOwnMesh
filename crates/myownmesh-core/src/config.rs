@@ -321,7 +321,9 @@ pub enum TopologyMode {
     },
     /// All spokes connect to a single, config-named hub — and only the
     /// hub. Spoke↔spoke frames route through it.
-    Star { hub: DeviceId },
+    Star {
+        hub: DeviceId,
+    },
     /// A hub *tier*: the named hubs hold a full mesh among themselves,
     /// and every other member (spoke) connects to `spoke_redundancy`
     /// of them, assigned by rendezvous hashing so the mapping is
@@ -345,6 +347,15 @@ pub enum TopologyMode {
     /// shaped connections). N² cost — fine for small fleets; pick
     /// [`TopologyMode::Ring`] or [`TopologyMode::Hubs`] deliberately
     /// when a network outgrows it.
+    /// A bounded shallow routing tree. The configured root is a routing role,
+    /// not a semantic trust root; hubs form the finite intermediate tier and
+    /// every leaf has one primary hub. Backup candidates are optional warm
+    /// alternatives, never a second primary parent or a full hub mesh.
+    HubTree {
+        root: DeviceId,
+        hubs: Vec<DeviceId>,
+        backup_candidates: u32,
+    },
     FullMesh,
 }
 
@@ -506,6 +517,108 @@ pub struct RoutingPolicyConfig {
     pub max_dedup_bytes: u64,
     /// Maximum forwarding hop budget for one route envelope.
     pub max_hop_budget: u64,
+}
+
+/// Optional owner-selected maintenance policy for configured hub tiers.
+///
+/// This policy is deliberately separate from [`TopologyMode`]: topology
+/// selects the shape and configured hub identities, while these limits bound
+/// the local maintenance work that shape may schedule.  Omitting the policy
+/// keeps the pre-existing topology behaviour unchanged; a present policy is
+/// fully explicit and is never inferred from peer count or a remote
+/// advertisement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HubPolicyConfig {
+    pub max_parallel_dials: u64,
+    pub max_dials_per_pass: u64,
+    pub max_advertisements_per_pass: u64,
+    pub exploration_interval_ms: u64,
+    pub max_exploration_probes_per_pass: u64,
+    pub max_exploration_peers_per_reply: u16,
+    pub trickle_imin_ms: u64,
+    pub trickle_imax_ms: u64,
+    pub trickle_redundancy: u32,
+    pub trickle_reset_window_ms: u64,
+    pub trickle_max_resets_per_window: u32,
+}
+
+impl HubPolicyConfig {
+    pub(crate) fn validate(&self) -> bool {
+        let semaphore_max = u64::try_from(tokio::sync::Semaphore::MAX_PERMITS).ok();
+        self.max_parallel_dials > 0
+            && self.max_dials_per_pass > 0
+            && self.max_advertisements_per_pass > 0
+            && self.exploration_interval_ms > 0
+            && self.max_exploration_probes_per_pass > 0
+            && self.max_exploration_peers_per_reply > 0
+            && usize::from(self.max_exploration_peers_per_reply)
+                <= crate::protocol::HUB_DISCOVERY_HARD_MAX_PEERS
+            && self.max_parallel_dials <= self.max_dials_per_pass
+            && semaphore_max.is_some_and(|max| self.max_dials_per_pass <= max)
+            && self.trickle_imin_ms >= 2
+            && self.trickle_imax_ms >= self.trickle_imin_ms
+            && self.trickle_redundancy > 0
+            && self.trickle_reset_window_ms > 0
+            && self.trickle_max_resets_per_window > 0
+            && usize::try_from(self.max_parallel_dials).is_ok()
+            && usize::try_from(self.max_dials_per_pass).is_ok()
+            && usize::try_from(self.max_advertisements_per_pass).is_ok()
+            && usize::try_from(self.max_exploration_probes_per_pass).is_ok()
+    }
+}
+
+/// Optional local custody bounds for the explicit shallow HubTree adapter.
+/// These values fund relation state only; they are not part of the shared
+/// topology digest and are never learned from a peer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TreePolicyConfig {
+    pub max_children: u64,
+    pub max_backups: u64,
+    pub max_pending: u64,
+    pub max_age_ms: u64,
+}
+
+impl TreePolicyConfig {
+    pub(crate) fn validate(&self) -> bool {
+        self.max_pending == 1
+            && self.max_age_ms > 0
+            && self
+                .max_backups
+                .checked_add(1)
+                .is_some_and(|slots| u16::try_from(slots).is_ok())
+            && usize::try_from(self.max_children).is_ok()
+            && usize::try_from(self.max_backups).is_ok()
+            && usize::try_from(self.max_pending).is_ok()
+    }
+}
+
+/// Optional owner-selected bounds for the node-local observation aggregate.
+///
+/// This is a diagnostic cache only. It has no wire representation, semantic
+/// authority, persistence, or routing effect. The option is intentionally
+/// absent by default; when present, every bound is explicit and finite.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalObservationPolicyConfig {
+    pub max_records: u64,
+    pub max_records_per_subject: u64,
+    pub max_age_ms: u64,
+    pub max_maintenance_per_tick: u64,
+}
+
+impl LocalObservationPolicyConfig {
+    pub(crate) fn validate(&self) -> bool {
+        self.max_records > 0
+            && self.max_records_per_subject > 0
+            && self.max_records_per_subject <= self.max_records
+            && self.max_age_ms > 0
+            && self.max_maintenance_per_tick > 0
+            && usize::try_from(self.max_records).is_ok()
+            && usize::try_from(self.max_records_per_subject).is_ok()
+            && usize::try_from(self.max_maintenance_per_tick).is_ok()
+    }
 }
 
 impl Default for RoutingPolicyConfig {
@@ -1130,6 +1243,11 @@ pub(crate) const SEMANTIC_SCHEMA_TABLES: &[SemanticSchemaTableDescriptor] = &[
 pub(crate) const SEMANTIC_SCHEMA_INDEXES: &[(&str, &str, &[&str])] = &[
     ("facts_seq_idx", "facts", &["seq"]),
     ("dependencies_dep_idx", "dependencies", &["dep_id"]),
+    (
+        "proofs_pending_idx",
+        "proofs",
+        &["context_id", "state", "delivery_id"],
+    ),
 ];
 
 // Every usage value is persisted as one fixed-width eight-byte BLOB.  Keep
@@ -1403,7 +1521,7 @@ impl SemanticPolicyConfig {
         // autoindex b-tree. The small composite/key-only tables are declared
         // WITHOUT ROWID and their primary keys are already the table b-tree;
         // charging those again would reserve storage that SQLite cannot use.
-        // The two named secondary indexes remain separate objects. Separate roots,
+        // The three named secondary indexes remain separate objects. Separate roots,
         // interior rounding, and overflow streams are all retained in the
         // envelope rather than being hidden by a combined row count.
         let primary_index_trees = [
@@ -1419,6 +1537,7 @@ impl SemanticPolicyConfig {
         let secondary_index_trees = [
             (fact_rows, SQL_INTEGER_BYTES),
             (workload.max_dependency_edges, FACT_ID_BYTES),
+            (workload.max_proof_records, checked_sum(&[32, 12, 32])?),
         ];
         debug_assert_eq!(secondary_index_trees.len(), SEMANTIC_SCHEMA_INDEXES.len());
         for (rows, key_bytes) in secondary_index_trees {
@@ -1747,6 +1866,19 @@ pub struct NetworkConfig {
     /// Checked owner-selected bounds for topology forwarding. This field is
     /// intentionally required on persisted V4 network records.
     pub routing_policy: RoutingPolicyConfig,
+    /// Optional bounded local hub maintenance and topology advertisement
+    /// policy. `None` is the explicit disabled state; no enabled defaults are
+    /// synthesized during V4 deserialization.
+    #[serde(default)]
+    pub hub: Option<HubPolicyConfig>,
+    /// Optional local custody bounds for explicit HubTree parenting. This is
+    /// independent from the shared root/hub/backup topology digest.
+    #[serde(default)]
+    pub tree: Option<TreePolicyConfig>,
+    /// Optional in-process observation aggregate. It has no serde/wire
+    /// authority and is never consulted by semantic admission or routing.
+    #[serde(default)]
+    pub local_observations: Option<LocalObservationPolicyConfig>,
     #[serde(default)]
     pub signaling: SignalingConfig,
     /// Closed-member opaque relay policy for this network. It is a network
@@ -1869,6 +2001,9 @@ impl NetworkConfig {
             semantic_policy,
             topology: Default::default(),
             routing_policy: RoutingPolicyConfig::default(),
+            hub: None,
+            tree: None,
+            local_observations: None,
             signaling: Default::default(),
             closed_relay: ClosedRelayPolicyConfig::default(),
             stun_servers: default_stun_servers(),
@@ -1890,10 +2025,90 @@ impl NetworkConfig {
     /// effects. Callers must pass this value through rather than substituting
     /// process-wide timing constants.
     pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
+        self.validate_topology()?;
+        match (&self.topology, self.tree) {
+            (TopologyMode::HubTree { .. }, None) => {
+                return Err(Error::Config(
+                    "HubTree requires an explicit local tree policy".into(),
+                ));
+            }
+            (TopologyMode::HubTree { .. }, Some(tree)) if !tree.validate() => {
+                return Err(Error::Config("HubTree local policy is invalid".into()));
+            }
+            (TopologyMode::HubTree { .. }, Some(_)) => {}
+            (_, Some(_)) => {
+                return Err(Error::Config(
+                    "tree policy requires HubTree topology".into(),
+                ));
+            }
+            _ => {}
+        }
+        if matches!(&self.topology, TopologyMode::HubTree { .. }) && self.hub.is_none() {
+            return Err(Error::Config(
+                "HubTree requires an explicit hub timing/profile policy".into(),
+            ));
+        }
         self.routing_policy()?;
         self.semantic_policy()?;
         self.validate_ice_servers()?;
-        self.scheduler.checked()
+        let scheduler = self.scheduler.checked()?;
+        if let Some(hub) = self.hub {
+            if !hub.validate()
+                || scheduler.state_watch_interval_ms > hub.trickle_imin_ms / 2
+                || scheduler.state_watch_interval_ms > hub.exploration_interval_ms
+            {
+                return Err(Error::Config(
+                    "hub policy is invalid or its Trickle interval is not observable by the state-watch tick".into(),
+                ));
+            }
+        }
+        if let Some(observations) = self.local_observations {
+            if !observations.validate() {
+                return Err(Error::Config(
+                    "local observation policy contains zero or inconsistent bounds".into(),
+                ));
+            }
+        }
+        Ok(scheduler)
+    }
+
+    fn validate_topology(&self) -> Result<()> {
+        let TopologyMode::HubTree {
+            root,
+            hubs,
+            backup_candidates,
+        } = &self.topology
+        else {
+            return Ok(());
+        };
+        let root = crate::semantic::DeviceId::from_canonical_str(root)
+            .map_err(|_| Error::Config("HubTree root must be a canonical DeviceId".into()))?;
+        if hubs.is_empty() {
+            return Err(Error::Config("HubTree requires at least one hub".into()));
+        }
+        let mut normalized = Vec::with_capacity(hubs.len());
+        for hub in hubs {
+            let hub = crate::semantic::DeviceId::from_canonical_str(hub)
+                .map_err(|_| Error::Config("HubTree hubs must be canonical DeviceIds".into()))?;
+            if hub == root {
+                return Err(Error::Config(
+                    "HubTree root cannot also be a configured hub".into(),
+                ));
+            }
+            normalized.push(hub);
+        }
+        normalized.sort();
+        if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Config("HubTree hubs must be unique".into()));
+        }
+        let backup_candidates = usize::try_from(*backup_candidates)
+            .map_err(|_| Error::Config("HubTree backup candidate count overflows".into()))?;
+        if backup_candidates >= normalized.len() {
+            return Err(Error::Config(
+                "HubTree backup candidates must be fewer than configured hubs".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Return this network's checked forwarding bounds before route planning
@@ -3583,6 +3798,61 @@ mod tests {
         let full = TopologyMode::FullMesh;
         let s = serde_json::to_string(&full).unwrap();
         assert!(s.contains("\"kind\":\"full_mesh\""));
+    }
+
+    #[test]
+    fn hub_tree_scheduler_policy_accepts_valid_tree_and_refuses_invalid_policy() {
+        let root = crate::identity::Identity::from_signing_key(
+            ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+            "hub-tree-root",
+        )
+        .public_id()
+        .to_owned();
+        let hub = crate::identity::Identity::from_signing_key(
+            ed25519_dalek::SigningKey::from_bytes(&[2; 32]),
+            "hub-tree-hub",
+        )
+        .public_id()
+        .to_owned();
+
+        let mut network = NetworkConfig::from_network_id("hub-tree", "hub-tree-net");
+        network.topology = TopologyMode::HubTree {
+            root,
+            hubs: vec![hub],
+            backup_candidates: 0,
+        };
+        network.tree = Some(TreePolicyConfig {
+            max_children: 0,
+            max_backups: 0,
+            max_pending: 1,
+            max_age_ms: 1_000,
+        });
+        network.hub = Some(HubPolicyConfig {
+            max_parallel_dials: 1,
+            max_dials_per_pass: 1,
+            max_advertisements_per_pass: 1,
+            exploration_interval_ms: 4_000,
+            max_exploration_probes_per_pass: 1,
+            max_exploration_peers_per_reply: 1,
+            trickle_imin_ms: 4_000,
+            trickle_imax_ms: 8_000,
+            trickle_redundancy: 1,
+            trickle_reset_window_ms: 8_000,
+            trickle_max_resets_per_window: 1,
+        });
+        network
+            .scheduler_policy()
+            .expect("valid HubTree policy is accepted");
+
+        let mut missing_hub = network.clone();
+        missing_hub.hub = None;
+        assert!(missing_hub.scheduler_policy().is_err());
+
+        network.tree = Some(TreePolicyConfig {
+            max_pending: 2,
+            ..network.tree.expect("tree policy remains present")
+        });
+        assert!(network.scheduler_policy().is_err());
     }
 
     #[test]

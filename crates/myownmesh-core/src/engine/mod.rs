@@ -26,10 +26,13 @@ pub mod connection;
 pub mod governance;
 pub mod handshake;
 pub mod heartbeat;
+pub(crate) mod hub;
 pub mod ice_watchdog;
 pub mod ladder;
 pub(crate) mod lifecycle;
+pub(crate) mod local_observation;
 pub mod network_watch;
+pub(crate) mod parenting;
 pub(crate) mod peer_registry;
 pub mod phase;
 pub mod reconcile;
@@ -43,6 +46,7 @@ pub(crate) mod state;
 pub(crate) mod supervisor;
 pub mod tick;
 pub mod traffic;
+pub(crate) mod trickle;
 pub mod wake;
 
 #[cfg(feature = "transport-lab")]
@@ -176,7 +180,17 @@ pub mod transport_lab {
     use crate::transport::{PeerSession, Role, Transport};
     use crate::{Channel, ConnectorCallbackPolicy};
 
+    pub use super::closed_relay::{
+        transport_lab_closed_relay_fixture_grant, transport_lab_pending_share_capacity_witness,
+        ClosedRelayFixtureGrant, ClosedRelayFixtureWorkload, ClosedRelayPendingShareCapacities,
+        ClosedRelayPendingShareCapacityWitness,
+    };
     pub use super::state::NetworkState;
+    pub use crate::semantic::store::SemanticCommitFaultForLab;
+
+    /// One-shot fault boundary for a real semantic commit on this exact
+    /// durable owner.  This is transport-lab evidence only; it cannot alter
+    /// authority, custody, or the ordinary production commit path.
 
     /// Explicit low-level constructors for integration harnesses. Production
     /// callers use [`crate::MeshHandle::join`], `create_network`, or
@@ -433,6 +447,38 @@ pub mod transport_lab {
             selected_pair: snapshot.selected_pair,
             state: snapshot.state,
         })
+    }
+
+    /// Request exact transport-channel terminal notification for a captured
+    /// owner.
+    ///
+    /// The witness must be captured before the link is closed.  This is a
+    /// transport-lab observation seam only: the current-owner check is a quick
+    /// stale witness filter, while the production terminal path below remains
+    /// authoritative and rechecks the same installation and worker.  A
+    /// replacement, already-retired owner, or a witness from another network
+    /// is harmless.  This function intentionally does not claim that registry
+    /// removal is synchronous; callers observe eventual removal through the
+    /// existing exact-owner snapshot helpers.  Another live channel may keep
+    /// the logical session installed; this seam names only the captured
+    /// channel's terminal path.
+    #[doc(hidden)]
+    pub async fn retire_transport_channel_for_lab(
+        state: &Arc<NetworkState>,
+        witness: &TransportChannelWitness,
+    ) {
+        let authenticated = state
+            .peers
+            .with_current(&witness.0, |peer| peer.has_authenticated_channel())
+            == Some(true);
+        let exact_worker = state
+            .peers
+            .with_current_transport_worker(&witness.0, |_| true)
+            == Some(true);
+        if !authenticated || !exact_worker {
+            return;
+        }
+        super::drop_peer_if_current(state, &witness.0, crate::events::DropReason::UserLeft).await;
     }
 
     /// A one-shot transport-lab park at the capability replay send boundary.
@@ -3063,6 +3109,14 @@ async fn start_speculative_offer(
         forget_dedup_owned(state, dedup.take());
         return;
     }
+    // A speculative connector also owns provider-backed native state before
+    // it can be attached to the exact promoted owner.  Keep the same
+    // lifecycle admission across construction, installation, and pump
+    // registration so shutdown cannot close the pump registry in the gap.
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        forget_dedup_owned(state, dedup.take());
+        return;
+    };
     let cfg = {
         let config = state.config.read();
         if config.validate_ice_servers().is_err() {
@@ -3335,6 +3389,10 @@ async fn retire_speculative_terminal(
                 warn!("promoted terminal close custody was already settled");
             }
             if removed.session_empty {
+                // A carrier terminal retires the tree relation only when it
+                // also ends the logical session.  A promoted carrier can be
+                // replaced while the logical session remains live.
+                state.retire_parenting_owner(owner);
                 peer.start_all_retired_workers();
                 let state = Arc::clone(state);
                 let task_state = Arc::clone(&state);
@@ -3664,6 +3722,14 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
             return;
         }
     }
+    // Connector construction is asynchronous and owns provider-backed native
+    // state before the registry can see it.  Admit the complete construction
+    // and installation interval as one lifecycle mutation so shutdown cannot
+    // pass the mutation fence while this function is between those points.
+    // The permit is deliberately retained through pump registration below.
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     // Per-peer negotiation stage, same reasoning as the webrtc.rs stage logs:
     // one line per peer per attempt is fine when connects are rare and a flood
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
@@ -3737,7 +3803,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // displaced can never legitimately be heard from again: release its keys.
     // Doing this is what keeps the ring from accumulating a record of every
     // attempt a long-lived reconnecting peer ever made.
-    let replaced = install_peer_for_state(state, peer.clone());
+    let replaced = install_peer_for_state_admitted(state, peer.clone(), &shutdown_permit);
     // Capture the installation fence before offer construction can await. A
     // replacement may arrive while that offer is building; resolving by
     // device id after the await would stamp the successor with this worker.
@@ -5060,6 +5126,16 @@ async fn handle_inbound_frame_from(
         );
         return;
     }
+    let is_hub_tree_attachment = bytes.starts_with(br#"{"kind":"hub_tree_attach_request"#)
+        || bytes.starts_with(br#"{"kind":"hub_tree_attach_response"#);
+    if is_hub_tree_attachment && bytes.len() > crate::protocol::HUB_TREE_ATTACH_MAX_WIRE_BYTES {
+        warn!(
+            peer = %device_id,
+            bytes = bytes.len(),
+            "discarding HubTree attachment above its exact wire boundary"
+        );
+        return;
+    }
     let Some(class) = crate::protocol::classify_frame(&bytes) else {
         warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
@@ -5438,6 +5514,30 @@ async fn handle_inbound_frame_from(
         MeshMessage::Unshelve(_) => on_unshelve(state, &dispatch).await,
         MeshMessage::SessionControl(control) => on_session_control(state, &dispatch, control).await,
         MeshMessage::CapabilitiesUpdate(u) => on_capabilities_update(state, &dispatch, u).await,
+        MeshMessage::HubAdvertisement(advertisement) => {
+            if !state.observe_hub_advertisement(dispatch.owner(), &advertisement) {
+                trace!(
+                    peer = %device_id,
+                    "hub advertisement refused by exact owner, context, digest, or replay fence"
+                );
+            }
+        }
+        MeshMessage::HubDiscoveryRequest(request) => {
+            state
+                .handle_hub_discovery_request(dispatch.owner(), request)
+                .await;
+        }
+        MeshMessage::HubDiscoveryResponse(response) => {
+            state.handle_hub_discovery_response(dispatch.owner(), response);
+        }
+        MeshMessage::HubTreeAttachRequest(request) => {
+            state
+                .handle_hub_tree_attach_request(dispatch.owner(), request)
+                .await;
+        }
+        MeshMessage::HubTreeAttachResponse(response) => {
+            state.handle_hub_tree_attach_response(dispatch.owner(), response);
+        }
         MeshMessage::ClosedRelayControl(control) => {
             let relay_profile = state.config.read().closed_relay.clone();
             if !relay_profile.validate_closed_relay_control(&control) {
@@ -7177,9 +7277,10 @@ async fn on_routed_application(
     let Ok(previous_hop) = DeviceId::from_canonical_str(dispatch.owner().device_id()) else {
         return;
     };
+    let preferred_parent = state.tree_preferred_parent_for_route();
     let admission = {
         let topology = state.topology_impl.read();
-        state.routing.admit_captured_previous_hop(
+        state.routing.admit_captured_previous_hop_with_tree_parent(
             &local_id,
             &previous_hop,
             || {
@@ -7196,6 +7297,7 @@ async fn on_routed_application(
             state.mesh_context_id(),
             envelope,
             state.identity.signing_key(),
+            preferred_parent.as_deref(),
         )
     };
     match admission {
@@ -7957,9 +8059,25 @@ impl routing::ExactApprovedSession for NetworkRoutingSession {
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), routing::RouteSendError>> + Send + 'a>>
     {
         Box::pin(async move {
-            send_application_bytes(&self.state, &self.owner, frame, traffic::FrameClass::App)
+            let timeout = Duration::from_millis(scheduler_policy(&self.state).peer_send_timeout_ms);
+            // Refusal before acquiring an application operation proves that
+            // no write was attempted. Once send_frame starts, an error does
+            // not establish whether the remote endpoint received the frame.
+            let operation = self
+                .state
+                .peers
+                .admit_application_operation(
+                    &self.owner,
+                    self.state.session_broker.as_ref(),
+                    &self.state.mesh_context_id().to_string(),
+                )
+                .ok_or(routing::RouteSendError::Refused)?;
+            let sent = operation
+                .send_frame(&self.state.peers, frame, timeout)
                 .await
-                .map_err(|_| routing::RouteSendError::Refused)
+                .map_err(|_| routing::RouteSendError::OutcomeUnknown)?;
+            self.state.traffic.record_tx(traffic::FrameClass::App, sent);
+            Ok(())
         })
     }
 }
@@ -8000,9 +8118,10 @@ async fn send_routed_channel_frame(
         limits,
     )
     .map_err(|error| Error::Network(format!("routed envelope refused: {error}")))?;
+    let preferred_parent = state.tree_preferred_parent_for_route();
     let admission = {
         let topology = state.topology_impl.read();
-        state.routing.admit_captured_previous_hop(
+        state.routing.admit_captured_previous_hop_with_tree_parent(
             &origin,
             &origin,
             || {
@@ -8022,6 +8141,7 @@ async fn send_routed_channel_frame(
             state.mesh_context_id(),
             envelope,
             state.identity.signing_key(),
+            preferred_parent.as_deref(),
         )
     };
     let (envelope, plan) = match admission {
@@ -8044,6 +8164,11 @@ async fn send_routed_channel_frame(
         .map_err(Error::Serde)?;
     let report = routing::dispatch_routed_frame(plan, frame, &provider).await;
     if report.delivered == 0 {
+        if report.outcome_unknown > 0 || report.failed > 0 {
+            return Err(Error::Network(
+                "routed channel frame delivery outcome is unknown".into(),
+            ));
+        }
         return Err(Error::Network(
             "no approved route delivered channel frame".into(),
         ));
@@ -8057,9 +8182,14 @@ async fn send_channel_frame(
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    // Direct sends use the same application admission as before; routing is
-    // considered only after the registry has no direct owner.
-    if let Some(owner) = state.peers.owner(peer) {
+    // An absent or definitively unusable direct owner cannot veto a route.
+    // Once the direct write starts, its error is returned without fallback:
+    // it may already have delivered the application payload.
+    if let Some(owner) = state
+        .peers
+        .owner(peer)
+        .filter(|owner| state.peers.has_usable_authenticated_current(owner))
+    {
         return send_to_peer_owner(
             state,
             &owner,
@@ -8810,6 +8940,7 @@ async fn drop_peer_if_current_with_correlation(
                 .speculative_is_exact(correlation, &worker)
         }) {
             retire_speculative_carrier_exact(state, owner, correlation, &worker).await;
+            state.retire_parenting_owner(owner);
             cancel_recovery_demand(recovery);
             return;
         }
@@ -8836,6 +8967,7 @@ async fn drop_peer_if_current_with_correlation(
                 dispatch.exact_channel_operation(Arc::clone(&worker)),
             ) {
                 peer_registry::ChannelTerminal::Channel { channel } => {
+                    state.retire_parenting_owner(owner);
                     let started = owner.connection().start_exact_retired_worker(
                         &channel.worker,
                         channel.dedup,
@@ -8848,6 +8980,7 @@ async fn drop_peer_if_current_with_correlation(
                     return;
                 }
                 peer_registry::ChannelTerminal::Peer { peer, channel } => {
+                    state.retire_parenting_owner(owner);
                     let opened_as = Some(OpenedAs::of(&channel.worker));
                     let recovery = publish_terminal_recovery(state, recovery);
                     peer.retire_connector();
@@ -8886,6 +9019,7 @@ async fn drop_peer_if_current_with_correlation(
             .terminal_speculative_cleanup(owner, &correlation, &worker)
         {
             Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+                state.retire_parenting_owner(owner);
                 let started = owner.connection().start_exact_retired_worker(
                     &retired.worker,
                     retired.dedup,
@@ -8897,6 +9031,7 @@ async fn drop_peer_if_current_with_correlation(
                 cancel_recovery_demand(recovery);
             }
             Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+                state.retire_parenting_owner(owner);
                 let opened_as = Some(OpenedAs::of(&removed.worker));
                 let recovery = if removed.session_empty {
                     publish_terminal_recovery(state, recovery)
@@ -8949,8 +9084,10 @@ async fn drop_peer_if_current_with_correlation(
     } else if let Some(dispatch) = admit_logical_terminal_dispatch(state, owner) {
         cancel_recovery_demand(recovery);
         retire_admitted_logical_session(state, &dispatch).await;
+        state.retire_parenting_owner(owner);
     } else if let Some(removed) = state.peers.remove_if_current_unpromoted(owner) {
         cancel_recovery_demand(recovery);
+        state.retire_parenting_owner(owner);
         finish_drop_peer(state, owner.device_id(), reason, Some(removed)).await;
     } else if let Some(recovery) = recovery {
         cancel_recovery_demand(Some(recovery));
@@ -9019,6 +9156,7 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                 warn!("carrier promoted close custody was already settled");
             }
             if removed.session_empty {
+                state.retire_parenting_owner(owner);
                 peer.start_all_retired_workers();
                 if let Err(error) = peer.retire_and_close().await {
                     warn!(%error, "carrier promoted cleanup did not complete");
@@ -9042,6 +9180,7 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                 .is_some_and(|current| Arc::ptr_eq(&current, &worker));
             if exact_current && !owner.connection().holds_promoted_session() {
                 if let Some(peer) = state.peers.remove_if_current_unpromoted(owner) {
+                    state.retire_parenting_owner(owner);
                     let recovery = publish_terminal_recovery(state, recovery);
                     peer.start_all_retired_workers();
                     if let Err(error) = peer.retire_and_close().await {
@@ -9121,6 +9260,7 @@ pub(super) fn drop_carrier_if_current_now(
                 warn!("carrier promoted close custody was already settled");
             }
             if removed.session_empty {
+                state.retire_parenting_owner(owner);
                 peer.start_all_retired_workers();
                 if recovery.is_none() {
                     state.clear_reconnect_intent(owner.device_id());
@@ -9134,6 +9274,7 @@ pub(super) fn drop_carrier_if_current_now(
                 .is_some_and(|current| Arc::ptr_eq(&current, &worker));
             if exact_current && !owner.connection().holds_promoted_session() {
                 if let Some(peer) = state.peers.remove_if_current_unpromoted(owner) {
+                    state.retire_parenting_owner(owner);
                     let recovery = publish_terminal_recovery(state, recovery);
                     peer.retire_connector();
                     peer.start_all_retired_workers();
@@ -9271,13 +9412,28 @@ fn install_peer_for_state(
     peer: Arc<PeerConnection>,
 ) -> Option<connection::AttemptDisplacement> {
     let shutdown_permit = state.try_admit_shutdown_mutation()?;
+    install_peer_for_state_admitted(state, peer, &shutdown_permit)
+}
+
+/// Install a peer while the caller retains the lifecycle admission witness.
+///
+/// `None` is the normal result for a fresh installation with no displaced
+/// peer; it is not a shutdown/refusal signal.  Keeping admission separate from
+/// displacement lets asynchronous connector construction use the same exact
+/// lifecycle fence without mistaking a first install for a failed install.
+fn install_peer_for_state_admitted(
+    state: &Arc<NetworkState>,
+    peer: Arc<PeerConnection>,
+    shutdown_permit: &state::ShutdownMutationPermit<'_>,
+) -> Option<connection::AttemptDisplacement> {
     let displaced = state.peers.install_with_displaced_owner(peer)?;
+    state.retire_parenting_owner(&displaced.owner);
     let replaced = displaced.peer;
     state.settle_displaced_owner_emissions(&displaced.owner);
     let mut attempt = replaced.take_attempt_displacement();
     replaced.retire_connector();
     attempt.retired_dedup = replaced.take_retired_dedup();
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_shutdown_task(shutdown_permit, || {
         tokio::spawn(async move {
             if let Err(error) = replaced.retire_and_close().await {
                 warn!(%error, "replaced peer cleanup did not complete successfully");
@@ -9446,6 +9602,9 @@ fn build_test_state_parts_metered_with_creation(
         scheduler: crate::config::SchedulerPolicyConfig::default(),
         topology: crate::config::TopologyMode::FullMesh,
         routing_policy: crate::config::RoutingPolicyConfig::default(),
+        hub: None,
+        tree: None,
+        local_observations: None,
         signaling: crate::config::SignalingConfig::default(),
         closed_relay: crate::config::ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
@@ -27249,6 +27408,116 @@ mod tests {
         );
     }
 
+    /// The transport-lab terminal facade carries the exact worker through a
+    /// real promoted replacement.  A predecessor witness must not retire the
+    /// successor, while the successor witness must retire its own last
+    /// promoted session.  The native snapshots make both halves non-vacuous:
+    /// each witness names a live channel before the terminal request.
+    #[cfg(all(test, feature = "transport-lab"))]
+    #[tokio::test]
+    #[ignore = "opens native WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_transport_lab_retire_facade_is_exact_across_real_replacement() {
+        let state = build_test_state_with_connector_slots("transport-lab-retire-facade", 4);
+        let old_far = build_test_state("transport-lab-retire-facade-old-far");
+        let device_id = old_far.identity.public_id().to_string();
+        let old_link = insert_promoted_peer_over_real_link(&state, &old_far, &device_id).await;
+        let old_proof = transport_lab::proof_owner_for_device(&state, &device_id)
+            .expect("the real predecessor is installed under its exact device id");
+        let old_witness = transport_lab::capture_transport_channel(&state, &old_proof)
+            .expect("the predecessor witness captures a live exact worker");
+        assert!(
+            transport_lab::transport_channel_snapshot(&state, &old_witness)
+                .await
+                .is_some(),
+            "non-vacuity: the predecessor witness names a live native channel"
+        );
+        let old_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the predecessor owner remains current before replacement");
+
+        // Reusing the same far identity keeps the replacement's semantic
+        // device/context binding honest while the fresh connector makes W1 a
+        // distinct installation.
+        let new_link = insert_promoted_peer_over_real_link(&state, &old_far, &device_id).await;
+        let successor_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the replacement owner is current");
+        assert!(
+            state.peers.get_if_current(&old_owner).is_none(),
+            "non-vacuity: the real replacement displaces the predecessor owner"
+        );
+        assert!(
+            !Arc::ptr_eq(old_owner.connection(), successor_owner.connection()),
+            "the predecessor and successor are distinct real installations"
+        );
+        assert!(new_link.peer.holds_promoted_session());
+        let successor_proof = transport_lab::proof_owner_for_device(&state, &device_id)
+            .expect("the facade can capture the replacement owner");
+        let successor_witness = transport_lab::capture_transport_channel(&state, &successor_proof)
+            .expect("the successor witness captures its exact live worker");
+        assert!(
+            transport_lab::transport_channel_snapshot(&state, &successor_witness)
+                .await
+                .is_some(),
+            "non-vacuity: the successor witness names a live native channel"
+        );
+
+        // The stale predecessor is harmless and cannot resolve by device id to
+        // the replacement.  The successor remains fully live after this call.
+        transport_lab::retire_transport_channel_for_lab(&state, &old_witness).await;
+        let current_after_stale = state
+            .peers
+            .owner(&device_id)
+            .expect("the stale facade request leaves the successor installed");
+        assert!(
+            Arc::ptr_eq(
+                current_after_stale.connection(),
+                successor_owner.connection()
+            ),
+            "the stale predecessor witness cannot retire the successor"
+        );
+        assert!(
+            transport_lab::transport_channel_snapshot(&state, &successor_witness)
+                .await
+                .is_some(),
+            "the successor channel remains snapshot-visible after stale retirement"
+        );
+
+        // The live successor witness drives the actual terminal path.  The
+        // owner and exact snapshot checks observe the result; the facade's
+        // return type intentionally makes no synchronous-removal claim.
+        transport_lab::retire_transport_channel_for_lab(&state, &successor_witness).await;
+        assert!(
+            state.peers.owner(&device_id).is_none(),
+            "the current witness retires the final promoted installation"
+        );
+        assert!(
+            transport_lab::transport_channel_snapshot(&state, &successor_witness)
+                .await
+                .is_none(),
+            "the retired successor worker is no longer snapshot-visible"
+        );
+        assert!(
+            !new_link.peer.holds_promoted_session(),
+            "the final terminal request removes the successor logical session"
+        );
+
+        state.shutdown().await;
+        old_far.shutdown().await;
+        let old_close = old_link.receive_ready.close_outcomes().await;
+        assert!(
+            old_close.into_iter().all(|outcome| outcome.is_ok()),
+            "the predecessor real link reaches a terminal outcome"
+        );
+        let new_close = new_link.receive_ready.close_outcomes().await;
+        assert!(
+            new_close.into_iter().all(|outcome| outcome.is_ok()),
+            "the successor real link reaches a terminal outcome"
+        );
+    }
+
     /// A deliberately dropped, exact-id delta inventory is repaired by the
     /// production full-inventory/request/page path. The ACK probe is attached
     /// to B's logical owner: it must remain zero while B lacks durable
@@ -27387,6 +27656,153 @@ mod tests {
         assert!(
             close_outcomes.into_iter().all(|outcome| outcome.is_ok()),
             "the repair fixture's real link reaches terminal outcomes"
+        );
+    }
+
+    /// Shutdown refuses connector construction before any native/provider
+    /// ownership is created.  This is the pre-allocation half of the race
+    /// control and calls the same production ensure path used by signaling.
+    #[tokio::test]
+    async fn shutdown_rejects_peer_construction_before_allocation() {
+        let (state, _signaling_rx, command_rx, provider, _grant) =
+            build_test_state_parts_metered("shutdown-before-peer-allocation", None, 2, None);
+        state.park_command_receiver_for_test(command_rx);
+        let before = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+
+        state.request_shutdown();
+        ensure_peer_session(&state, "shutdown-peer", Role::Offerer).await;
+
+        assert!(!state.peers.contains_key("shutdown-peer"));
+        assert_eq!(
+            before,
+            (
+                provider.in_use(),
+                provider.active_reservations(),
+                provider.active_scopes()
+            ),
+            "shutdown refusal happens before connector/provider ownership"
+        );
+        assert_eq!(state.peer_event_pump_counts_for_test(), (0, 0));
+        state.shutdown().await;
+    }
+
+    /// A real connector opened under a pre-admitted lifecycle operation may
+    /// finish its exact install after shutdown is requested.  The admitted
+    /// install seam preserves the normal fresh-install `None` displacement
+    /// result, and shutdown then owns and closes the worker through the normal
+    /// peer/pump custody path.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn shutdown_waits_for_admitted_postconstruction_install() {
+        let (state, _signaling_rx, command_rx, provider, _grant) =
+            build_test_state_parts_metered("shutdown-postconstruction-install", None, 2, None);
+        state.park_command_receiver_for_test(command_rx);
+        let before = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let shutdown_permit = state
+            .try_admit_shutdown_mutation()
+            .expect("construction starts before shutdown linearization");
+        let (worker, events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the real connector construction is funded");
+        let worker = Arc::new(worker);
+        let peer = Arc::new(PeerConnection::new(
+            "postconstruction-peer".to_owned(),
+            Some(Arc::clone(&worker)),
+        ));
+
+        let shutdown_state = Arc::clone(&state);
+        let shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits on the admitted operation"
+        );
+        state.request_shutdown();
+
+        let displacement = install_peer_for_state_admitted(&state, peer, &shutdown_permit);
+        assert!(
+            displacement.is_none(),
+            "a fresh install has no displaced peer, not a shutdown refusal"
+        );
+        assert!(state.peers.contains_key("postconstruction-peer"));
+        let pump_owner = state
+            .peers
+            .owner("postconstruction-peer")
+            .map(|owner| owner.for_worker(Arc::clone(&worker)));
+        spawn_registered_peer_event_pump(
+            &state,
+            Arc::clone(&state),
+            "postconstruction-peer".to_owned(),
+            worker,
+            events,
+            pump_owner,
+        )
+        .await;
+        drop(shutdown_permit);
+
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("admitted connector shutdown completes")
+            .expect("shutdown task joins");
+        // `NetworkState::shutdown` also releases its long-lived durable
+        // semantic-store lease.  Compare against the exact terminal
+        // network-state baseline, not the live baseline captured before the
+        // connector was opened; the connector dimensions must still return
+        // unchanged.  The store claim is the checked SQLite envelope, not
+        // merely the policy's max database file size.
+        let semantic_policy = state.config.read().semantic_policy;
+        let semantic_storage_claim = crate::resource::ResourceClaim::single(
+            crate::resource::ResourceClass::StorageBytes,
+            semantic_policy
+                .checked_storage_envelope(
+                    crate::config::SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+                    semantic_policy.storage_workload(),
+                )
+                .expect("the live semantic policy has a checked storage envelope")
+                .total_bytes,
+        );
+        let semantic_storage_release =
+            crate::resource::FiniteResourceProvider::reservation_planning_charge(
+                semantic_storage_claim,
+            )
+            .expect("the live semantic storage reservation charge is representable");
+        let terminal_in_use = before
+            .0
+            .checked_sub(semantic_storage_release)
+            .expect("the live baseline contains the semantic storage lease");
+        let terminal_reservations = before
+            .1
+            .checked_sub(1)
+            .expect("the live baseline contains the semantic storage reservation");
+        assert_eq!(
+            (terminal_in_use, terminal_reservations, before.2),
+            (
+                provider.in_use(),
+                provider.active_reservations(),
+                provider.active_scopes()
+            ),
+            "connector ownership is released while the whole NetworkState shutdown also releases its durable store lease"
+        );
+        assert_eq!(
+            state.peer_event_pump_counts_for_test(),
+            (0, 0),
+            "shutdown leaves no registered or pending peer-event pumps"
         );
     }
 }

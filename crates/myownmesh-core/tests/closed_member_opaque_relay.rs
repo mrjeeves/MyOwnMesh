@@ -9,6 +9,7 @@ use myownmesh_core::config::{
     ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
     SignalingConfig, TopologyMode,
 };
+use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::resource::{
     PostAuthResourceFamily, PreAuthResourceFamily, ResourceFamilyReport, ResourceReport,
     ResourceUse,
@@ -24,6 +25,19 @@ use myownmesh_core::{
 };
 
 const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn assert_active_profile(network: &myownmesh_core::JoinedNetwork, peer: &str) {
+    let info = network
+        .peer(peer)
+        .expect("the exact promoted peer is observable");
+    assert!(matches!(info.status, PeerStatus::Active));
+    assert!(info.authenticated);
+    let profile = info
+        .authenticated_profile()
+        .expect("active peer has a redacted authenticated profile");
+    assert_eq!(profile.protocol_version, myownmesh_core::PROTOCOL_VERSION);
+    assert!(profile.endpoint_auth_v1);
+}
 
 fn semantic_fact_page(
     context_id: MeshContextId,
@@ -63,7 +77,13 @@ async fn bounded_result<T>(
     stage: &'static str,
     future: impl Future<Output = myownmesh_core::Result<T>>,
 ) -> myownmesh_core::Result<T> {
-    bounded_value(stage, future).await?
+    let outcome = bounded_value(stage, future).await;
+    match &outcome {
+        Err(error) => eprintln!("[closed-relay-stage] timeout stage={stage}: {error:?}"),
+        Ok(Err(error)) => eprintln!("[closed-relay-stage] error stage={stage}: {error:?}"),
+        Ok(Ok(_)) => {}
+    }
+    outcome?
 }
 
 fn init_relay_trace() {
@@ -102,9 +122,12 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
             after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
             "{label} oldest-active precision state returned to baseline"
         );
-        assert_eq!(
-            after.measurement_inexact, before.measurement_inexact,
-            "{label} measurement precision state returned to baseline"
+        // Precision metadata is scope-wide sticky history: an inexact
+        // transport observation may set it during the lifecycle, but it must
+        // never disappear after cleanup.
+        assert!(
+            !before.measurement_inexact || after.measurement_inexact,
+            "{label} measurement precision state is monotonic"
         );
     }
     for (before, after) in before
@@ -133,9 +156,9 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
             after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
             "{label} oldest-active precision state returned to baseline"
         );
-        assert_eq!(
-            after.measurement_inexact, before.measurement_inexact,
-            "{label} measurement precision state returned to baseline"
+        assert!(
+            !before.measurement_inexact || after.measurement_inexact,
+            "{label} measurement precision state is monotonic"
         );
     }
 }
@@ -261,6 +284,20 @@ fn assert_no_activity_baseline(label: &str, before: &ResourceReport, after: &Res
     }
 }
 
+fn assert_inexact_transport_observed(label: &str, report: &ResourceReport) {
+    assert!(
+        report
+            .pre_authentication
+            .iter()
+            .any(|family| family.measurement_inexact)
+            || report
+                .post_authentication
+                .iter()
+                .any(|family| family.measurement_inexact),
+        "{label} final report records an inexact transport observation"
+    );
+}
+
 fn synthetic_resource_report(oldest_active_lifetime: Duration) -> ResourceReport {
     ResourceReport {
         pre_authentication: PreAuthResourceFamily::ALL.map(|family| ResourceFamilyReport {
@@ -308,13 +345,12 @@ fn resource_report_baseline_helpers_distinguish_live_and_history() {
     .is_err());
     assert_live_custody_baseline("completed-history change", &before, &after);
 
-    for change in ["active", "lease count", "family", "measurement precision"] {
+    for change in ["active", "lease count", "family"] {
         let mut changed = synthetic_resource_report(Duration::from_millis(8));
         match change {
             "active" => changed.pre_authentication[0].active = ResourceUse::observed(1, 0, 0, 0),
             "lease count" => changed.pre_authentication[0].active_lease_count = 2,
             "family" => changed.pre_authentication[0].family = PreAuthResourceFamily::Cleanup,
-            "measurement precision" => changed.pre_authentication[0].measurement_inexact = true,
             _ => unreachable!(),
         }
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -322,6 +358,29 @@ fn resource_report_baseline_helpers_distinguish_live_and_history() {
         }))
         .is_err());
     }
+    for post_authentication in [false, true] {
+        let mut inexact = synthetic_resource_report(Duration::from_millis(8));
+        if post_authentication {
+            inexact.post_authentication[0].measurement_inexact = true;
+        } else {
+            inexact.pre_authentication[0].measurement_inexact = true;
+        }
+        assert_live_custody_baseline("sticky precision acquired", &before, &inexact);
+        assert_live_custody_baseline("sticky precision retained", &inexact, &inexact);
+        assert_inexact_transport_observed("positive observation", &inexact);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_live_custody_baseline("sticky precision cannot reset", &inexact, &before);
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_no_activity_baseline("precision change is activity", &before, &inexact);
+        }))
+        .is_err());
+    }
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_inexact_transport_observed("missing observation must fail", &before);
+    }))
+    .is_err());
 }
 
 fn resource_snapshot(
@@ -331,9 +390,11 @@ fn resource_snapshot(
 ) {
     let in_use = provider.in_use();
     eprintln!(
-        "[closed-relay-resource] stage={stage} WorkerOrTask={} NativeTransportObject={} active_reservations=not-public",
+        "[closed-relay-resource] stage={stage} WorkerOrTask={} NativeTransportObject={} active_reservations={} active_scopes={}",
         in_use.amount(ResourceClass::WorkerOrTask),
         in_use.amount(ResourceClass::NativeTransportObject),
+        provider.active_reservations(),
+        provider.active_scopes(),
     );
     for (name, mesh) in meshes {
         if let Some(report) = mesh.connector_resource_report() {
@@ -350,9 +411,25 @@ fn resource_snapshot(
 
 fn connector_policy(
     session_identity: &str,
+    share_identity: &Identity,
+    share_peer: DeviceId,
+    share_context: MeshContextId,
 ) -> (WebRtcConnectorCapablePolicy, FiniteResourceProvider) {
     let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
-    let connector_count = NonZeroU64::new(4).expect("connector count is nonzero");
+    // The complete fixture overlaps two original links with one replacement
+    // before W0 is retired: three real links, two endpoints each.
+    let connector_profiles = [
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+    ];
+    let connector_count = NonZeroU64::new(
+        u64::try_from(connector_profiles.len()).expect("connector profile count fits u64"),
+    )
+    .expect("connector count is nonzero");
     let max_relay_frame_bytes = usize::try_from(
         myownmesh_core::protocol::relay::closed_relay_worst_case_json_bytes(
             myownmesh_core::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
@@ -390,17 +467,17 @@ fn connector_policy(
     };
     // The raw connector grant funds callback/opening work only. Promotion
     // retains one exact Session Broker reservation per real-link endpoint, so
-    // price four promoted sessions separately rather than borrowing slack
+    // price six promoted sessions separately rather than borrowing slack
     // from connector construction.
     let promoted_sessions =
         myownmesh_core::session_reservation_planning_claim_for_correlation(session_identity)
             .checked_scale(connector_count.get())
-            .expect("four promoted-session planning claims are representable");
+            .expect("six promoted-session planning claims are representable");
     // Native inbound frames are parsed twice at a live connector boundary:
     // one retained Hello and one current application frame. Use the public
     // gateway formula at the maximum serialized Closed relay frame, then add
     // the provider reservation bookkeeping for each of the two claims and
-    // each of the four connectors. The raw connector grant does not fund
+    // each of the six connectors. The raw connector grant does not fund
     // promoted-session or application JSON parsing retention.
     let json_frame_reservation =
         myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
@@ -413,12 +490,7 @@ fn connector_policy(
         .and_then(|claim| claim.checked_scale(connector_count.get()))
         .expect("two maximum-frame JSON claims per connector are representable");
     let relay_grant = myownmesh_core::transport_lab_connector_fixture_grant(
-        &[
-            profile.clone(),
-            profile.clone(),
-            profile.clone(),
-            profile.clone(),
-        ],
+        &connector_profiles,
         NonZeroU64::new(3).expect("mesh scope count is nonzero"),
         workload,
     )
@@ -468,6 +540,118 @@ fn connector_policy(
         .expect("the finite remote-description grant is representable"),
     )
     .expect("the combined finite connector grant is representable");
+    let share_profile = ClosedRelayPolicyConfig {
+        enabled: true,
+        ..ClosedRelayPolicyConfig::default()
+    };
+    let share_witness =
+        myownmesh_core::engine::transport_lab::transport_lab_pending_share_capacity_witness(
+            share_identity,
+            share_context,
+            share_peer,
+            DeviceId::from_canonical_str(&session_identity)
+                .expect("relay id is canonical for the share witness"),
+            [0x51; 16],
+            &share_profile,
+        )
+        .expect("generated key-share survives the exact JSON decode boundary");
+    for (capacity, length) in [
+        (
+            share_witness.capacities.mesh,
+            share_witness.decoded_lengths.mesh,
+        ),
+        (
+            share_witness.capacities.from,
+            share_witness.decoded_lengths.from,
+        ),
+        (
+            share_witness.capacities.to,
+            share_witness.decoded_lengths.to,
+        ),
+        (
+            share_witness.capacities.signature,
+            share_witness.decoded_lengths.signature,
+        ),
+    ] {
+        assert!(
+            capacity >= length,
+            "decoded key-share capacity must upper-bound its retained string"
+        );
+    }
+    let closed_relay_workload = myownmesh_core::engine::transport_lab::ClosedRelayFixtureWorkload {
+        network_roots: NonZeroU64::new(3).expect("three Closed relay networks are nonzero"),
+        endpoint_leases: NonZeroU64::new(10).expect("five endpoint pairs are nonzero"),
+        pending_leases: NonZeroU64::new(1).expect("one pending lease is nonzero"),
+        engine_allocations: NonZeroU64::new(5).expect("five engine allocations are nonzero"),
+        runtime_allocations: NonZeroU64::new(5).expect("five runtime allocations are nonzero"),
+        pending_expiry_tasks: NonZeroU64::new(5).expect("five expiry reservations are nonzero"),
+        pending_share: share_witness.capacities,
+    };
+    let closed_relay_grant =
+        myownmesh_core::engine::transport_lab::transport_lab_closed_relay_fixture_grant(
+            &ClosedRelayPolicyConfig {
+                enabled: true,
+                ..ClosedRelayPolicyConfig::default()
+            },
+            closed_relay_workload,
+        )
+        .expect("the finite Closed relay fixture grant is representable");
+    let closed_relay_components = [
+        closed_relay_grant.runtime_roots,
+        closed_relay_grant.engine_roots,
+        closed_relay_grant.endpoint_leases,
+        closed_relay_grant.pending_leases,
+        closed_relay_grant.engine_allocations,
+        closed_relay_grant.runtime_allocations,
+        closed_relay_grant.pending_expiry_tasks,
+    ]
+    .into_iter()
+    .try_fold(ResourceClaim::ZERO, |total, component| {
+        total.checked_add(component)
+    })
+    .expect("Closed relay component totals are representable");
+    assert_eq!(
+        closed_relay_components, closed_relay_grant.total,
+        "Closed relay grant exposes its exact checked component decomposition"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .endpoint_leases
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        10,
+        "endpoint reservation count is charged once per planned endpoint lease"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .pending_leases
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        1,
+        "pending reservation count is charged once per planned pending lease"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .engine_allocations
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        5,
+        "engine allocation reservation count is charged once per planned allocation"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .runtime_allocations
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        5,
+        "runtime allocation reservation count is charged once per planned allocation"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .total
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        21,
+        "the five-open construction bound charges endpoint+pending+engine+runtime relay units"
+    );
+    let relay_grant = relay_grant
+        .checked_add(closed_relay_grant.total)
+        .expect("Closed relay grant combines without overflow");
     let semantic_policy = SemanticPolicyConfig::default();
     let semantic_storage_owner_count = 3_u64;
     let semantic_storage_claim = ResourceClaim::single(
@@ -518,6 +702,9 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         kind: NetworkKind::Closed,
         semantic_policy: Default::default(),
         routing_policy: RoutingPolicyConfig::default(),
+        hub: None,
+        local_observations: None,
+        tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::Star { hub: relay.into() },
         signaling: SignalingConfig::default(),
@@ -549,9 +736,19 @@ fn member_grant(graph: &FactGraph, signer: &Identity, target: DeviceId) -> Signe
     .expect("root-signed member grant is valid")
 }
 
-#[tokio::test]
+// Match the production-shaped relay runtime while keeping the libtest root
+// future small: Tokio's macro still polls that root on the calling test
+// thread, so the complete scenario is spawned onto a worker below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownmesh_core::Result<()>
 {
+    tokio::spawn(closed_members_exchange_opaque_payloads_only_through_relay_inner())
+        .await
+        .expect("opaque relay scenario task joined")
+}
+
+async fn closed_members_exchange_opaque_payloads_only_through_relay_inner(
+) -> myownmesh_core::Result<()> {
     init_relay_trace();
     let home = tempfile::tempdir().expect("temporary mesh home");
     // This control runs as one isolated integration-test process. The public
@@ -591,7 +788,12 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     assert_eq!(signed_members_wire.len(), 2);
     assert!(signed_members_wire[0].id > signed_members_wire[1].id);
 
-    let (policy, provider) = connector_policy(&relay_id);
+    let (policy, provider) = connector_policy(
+        &relay_id,
+        &alice,
+        DeviceId::from_canonical_str(&carol_id).expect("Carol id is canonical"),
+        context_id,
+    );
     resource_snapshot("policy", &provider, &[]);
     let alice_mesh = bounded_result(
         "open Alice mesh",
@@ -626,6 +828,10 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     let baseline_alice = alice_mesh.resource_report();
     let baseline_relay = relay_mesh.resource_report();
     let baseline_carol = carol_mesh.resource_report();
+    let provider_baseline = provider.in_use();
+    let provider_failed_cleanup_baseline = provider.retained_after_failed_cleanup();
+    let provider_reservations_baseline = provider.active_reservations();
+    let provider_scopes_baseline = provider.active_scopes();
 
     // An invalid finite relay profile is refused before NetworkState admits
     // any pending handshake or allocation. Keep this production constructor
@@ -763,7 +969,7 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
             ("carol", &carol_mesh),
         ],
     );
-    let alice_relay = bounded_value(
+    let alice_relay_w0 = bounded_value(
         "install Alice-relay link",
         alice_net.install_promoted_peer_over_real_link(&relay_net),
     )
@@ -800,7 +1006,7 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
             ("carol", &carol_mesh),
         ],
     );
-    assert_eq!(alice_relay.peer_device_id(), relay_id);
+    assert_eq!(alice_relay_w0.peer_device_id(), relay_id);
     assert_eq!(relay_carol.peer_device_id(), carol_id);
     assert!(alice_net.peer(&carol_id).is_none(), "no direct A-C session");
     assert!(carol_net.peer(&alice_id).is_none(), "no direct C-A session");
@@ -876,6 +1082,36 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         bounded_result("receive maximum Alice-to-Carol payload", c_from_a.recv()).await?,
         max_a_to_c
     );
+
+    // Re-installing the same far identity is the public transport-lab
+    // replacement seam: it displaces the exact W0 owner on both sides while
+    // retaining W0's opaque link for a delayed close.  This is intentionally
+    // a peer-owner replacement, not merely a new Closed-relay session.
+    let alice_relay_w1 = bounded_value(
+        "replace Alice-relay owner installation",
+        alice_net.install_promoted_peer_over_real_link(&relay_net),
+    )
+    .await?;
+    assert_eq!(alice_relay_w1.peer_device_id(), relay_id);
+    assert_active_profile(&alice_net, &relay_id);
+    assert_active_profile(&relay_net, &alice_id);
+    let _ = bounded_value(
+        "retire stale Alice-relay W0 transport",
+        alice_relay_w0.retire(),
+    )
+    .await?;
+    assert_active_profile(&alice_net, &relay_id);
+    assert_active_profile(&relay_net, &alice_id);
+    assert!(matches!(
+        bounded_result(
+            "reject stale relay-owner W0 data",
+            a_to_c.send(b"stale relay W0")
+        )
+        .await,
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::Owner
+        ))
+    ));
     bounded_result("close Carol endpoint", c_from_a.close()).await?;
     assert!(matches!(
         bounded_result(
@@ -1042,7 +1278,7 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     .await?;
 
     let _ = bounded_value("retire relay-Carol link", relay_carol.retire()).await?;
-    let _ = bounded_value("retire Alice-relay link", alice_relay.retire()).await?;
+    let _ = bounded_value("retire Alice-relay W1 link", alice_relay_w1.retire()).await?;
     bounded_result("shutdown Alice network", alice_net.shutdown()).await?;
     bounded_result("shutdown relay network", relay_net.shutdown()).await?;
     bounded_result("shutdown Carol network", carol_net.shutdown()).await?;
@@ -1055,5 +1291,28 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     assert_live_custody_baseline("Alice", &baseline_alice, &live_alice);
     assert_live_custody_baseline("relay", &baseline_relay, &live_relay);
     assert_live_custody_baseline("Carol", &baseline_carol, &live_carol);
+    assert_inexact_transport_observed("Alice", &live_alice);
+    assert_inexact_transport_observed("relay", &live_relay);
+    assert_inexact_transport_observed("Carol", &live_carol);
+    assert_eq!(
+        provider.in_use(),
+        provider_baseline,
+        "provider in-use claim returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.retained_after_failed_cleanup(),
+        provider_failed_cleanup_baseline,
+        "failed-cleanup retention returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.active_reservations(),
+        provider_reservations_baseline,
+        "provider reservation cardinality returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.active_scopes(),
+        provider_scopes_baseline,
+        "provider scope cardinality returns to its exact pre-network baseline"
+    );
     Ok(())
 }

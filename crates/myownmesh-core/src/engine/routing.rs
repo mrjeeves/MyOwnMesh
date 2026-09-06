@@ -209,6 +209,48 @@ pub(crate) fn plan_next_hops(
     incoming_ttl: u8,
     policy: RoutingPolicy,
 ) -> Result<RoutePlan, RouteRefusal> {
+    plan_next_hops_with_local_origin(
+        topology,
+        self_id,
+        destination,
+        connected,
+        incoming_ttl,
+        policy,
+        false,
+    )
+}
+
+fn plan_next_hops_with_local_origin(
+    topology: &dyn Topology,
+    self_id: &str,
+    destination: &str,
+    connected: &[String],
+    incoming_ttl: u8,
+    policy: RoutingPolicy,
+    allow_local_origination: bool,
+) -> Result<RoutePlan, RouteRefusal> {
+    plan_next_hops_with_local_origin_and_tree_parent(
+        topology,
+        self_id,
+        destination,
+        connected,
+        incoming_ttl,
+        policy,
+        allow_local_origination,
+        None,
+    )
+}
+
+fn plan_next_hops_with_local_origin_and_tree_parent(
+    topology: &dyn Topology,
+    self_id: &str,
+    destination: &str,
+    connected: &[String],
+    incoming_ttl: u8,
+    policy: RoutingPolicy,
+    allow_local_origination: bool,
+    preferred_parent: Option<&str>,
+) -> Result<RoutePlan, RouteRefusal> {
     if destination.is_empty() {
         return Err(RouteRefusal::Envelope(
             RoutedApplicationError::NonCanonicalDeviceId,
@@ -230,10 +272,22 @@ pub(crate) fn plan_next_hops(
             max_parallel_routes: 1,
         });
     }
-    if !topology.forwards(self_id, connected) {
+    if !allow_local_origination && !topology.forwards(self_id, connected) {
         return Err(RouteRefusal::NotForwarder);
     }
     let mut next_hops = Vec::with_capacity(limit.min(connected.len()));
+    if let Some(preferred_parent) = preferred_parent {
+        let is_connected = connected
+            .iter()
+            .any(|candidate| candidate == preferred_parent);
+        if limit > 0
+            && is_connected
+            && preferred_parent != self_id
+            && topology.preferred_next_hop(self_id, destination, connected, preferred_parent)
+        {
+            next_hops.push(preferred_parent.to_owned());
+        }
+    }
     for hop in topology.next_hops(self_id, destination, connected, limit) {
         if hop == self_id || !connected.iter().any(|candidate| candidate == &hop) {
             return Err(RouteRefusal::InvalidNextHop);
@@ -315,8 +369,37 @@ impl RoutingState {
         origin_policy_admits: P,
         topology: &dyn Topology,
         context_id: MeshContextId,
+        envelope: RoutedApplicationEnvelope,
+        signing_key: &SigningKey,
+    ) -> Result<RouteAdmission, RouteRefusal>
+    where
+        C: FnOnce() -> Vec<String>,
+        P: FnOnce(&RoutedApplicationEnvelope) -> bool,
+    {
+        self.admit_captured_previous_hop_with_tree_parent(
+            local_id,
+            captured_previous_hop,
+            connected,
+            origin_policy_admits,
+            topology,
+            context_id,
+            envelope,
+            signing_key,
+            None,
+        )
+    }
+
+    pub(crate) fn admit_captured_previous_hop_with_tree_parent<C, P>(
+        &self,
+        local_id: &DeviceId,
+        captured_previous_hop: &DeviceId,
+        connected: C,
+        origin_policy_admits: P,
+        topology: &dyn Topology,
+        context_id: MeshContextId,
         mut envelope: RoutedApplicationEnvelope,
         signing_key: &SigningKey,
+        preferred_parent: Option<&str>,
     ) -> Result<RouteAdmission, RouteRefusal>
     where
         C: FnOnce() -> Vec<String>,
@@ -345,14 +428,19 @@ impl RoutingState {
             };
         }
 
+        let local_origination = captured_previous_hop == local_id
+            && envelope.origin() == local_id
+            && envelope.hops().is_empty();
         let connected = connected();
-        let plan = plan_next_hops(
+        let plan = plan_next_hops_with_local_origin_and_tree_parent(
             topology,
             local_id,
             envelope.destination(),
             &connected,
             envelope.remaining_ttl(),
             self.policy,
+            local_origination,
+            preferred_parent,
         )?;
         envelope
             .append_hop_with_limits(local_id.clone(), signing_key, self.policy.protocol_limits())
@@ -531,12 +619,18 @@ pub(crate) trait ExactApprovedSessionProvider: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RouteSendError {
+    /// The exact approved session was already closed before a write began.
     #[error("approved session closed")]
     Closed,
+    /// The exact approved session refused before a write began.
     #[error("approved session refused routed application frame")]
     Refused,
+    /// A legacy generic send failure; conservatively treated as uncertain.
     #[error("approved session send failed")]
     Failed,
+    /// The write boundary was crossed, but delivery cannot be established.
+    #[error("approved session send outcome is unknown")]
+    OutcomeUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -546,6 +640,7 @@ pub(crate) struct RouteDispatchReport {
     pub(crate) unavailable: usize,
     pub(crate) refused: usize,
     pub(crate) failed: usize,
+    pub(crate) outcome_unknown: usize,
 }
 
 type RouteSendFuture = Pin<Box<dyn Future<Output = Result<(), RouteSendError>> + Send>>;
@@ -582,6 +677,7 @@ pub(crate) async fn dispatch_routed_frame(
     }
 
     let mut succeeded = false;
+    let mut uncertain = false;
     while let Some(result) = futures.next().await {
         report.attempted = report.attempted.saturating_add(1);
         match result {
@@ -593,9 +689,16 @@ pub(crate) async fn dispatch_routed_frame(
                 report.unavailable = report.unavailable.saturating_add(1)
             }
             Err(RouteSendError::Refused) => report.refused = report.refused.saturating_add(1),
-            Err(RouteSendError::Failed) => report.failed = report.failed.saturating_add(1),
+            Err(RouteSendError::Failed) => {
+                report.failed = report.failed.saturating_add(1);
+                uncertain = true;
+            }
+            Err(RouteSendError::OutcomeUnknown) => {
+                report.outcome_unknown = report.outcome_unknown.saturating_add(1);
+                uncertain = true;
+            }
         }
-        if !succeeded {
+        if !succeeded && !uncertain {
             while next_hop < plan.next_hops().len() && futures.len() < window {
                 let hop = &plan.next_hops()[next_hop];
                 next_hop += 1;
@@ -618,7 +721,16 @@ pub(crate) async fn dispatch_routed_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_encoding::BASE32_NOPAD;
+    use ed25519_dalek::SigningKey;
     use std::collections::HashSet;
+
+    fn canonical_key(seed: u8) -> String {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        BASE32_NOPAD
+            .encode(key.verifying_key().as_bytes())
+            .to_lowercase()
+    }
 
     struct TestTopology;
 
@@ -650,6 +762,75 @@ mod tests {
         }
     }
 
+    struct CandidateTopology {
+        hops: &'static [&'static str],
+    }
+
+    impl Topology for CandidateTopology {
+        fn select_preferred(&self, _self_id: &str, _peer_ids: &[String]) -> HashSet<String> {
+            HashSet::new()
+        }
+
+        fn forwards(&self, _self_id: &str, _all: &[String]) -> bool {
+            true
+        }
+
+        fn preferred_next_hop(
+            &self,
+            _self_id: &str,
+            _dest: &str,
+            _connected: &[String],
+            _preferred_parent: &str,
+        ) -> bool {
+            true
+        }
+
+        fn next_hops(
+            &self,
+            _self_id: &str,
+            _dest: &str,
+            _connected: &[String],
+            limit: usize,
+        ) -> Vec<String> {
+            self.hops
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .take(limit)
+                .collect()
+        }
+
+        fn flood_ttl(&self) -> u8 {
+            4
+        }
+    }
+
+    pub(super) struct LeafTopology;
+
+    impl Topology for LeafTopology {
+        fn select_preferred(&self, _self_id: &str, _peer_ids: &[String]) -> HashSet<String> {
+            HashSet::new()
+        }
+
+        fn forwards(&self, _self_id: &str, _all: &[String]) -> bool {
+            false
+        }
+
+        fn next_hops(
+            &self,
+            _self_id: &str,
+            _dest: &str,
+            _connected: &[String],
+            limit: usize,
+        ) -> Vec<String> {
+            vec!["b".to_owned()].into_iter().take(limit).collect()
+        }
+
+        fn flood_ttl(&self) -> u8 {
+            4
+        }
+    }
+
     #[test]
     fn plan_is_best_first_deduplicated_and_bounded() {
         let policy = RoutingPolicy::checked(3, 2, 1024, 2, 4096, 4).expect("valid policy");
@@ -659,6 +840,142 @@ mod tests {
         assert_eq!(plan.next_hops(), &["b".to_owned(), "a".to_owned()]);
         assert_eq!(plan.outgoing_ttl(), 2);
         assert_eq!(plan.max_parallel_routes(), 2);
+    }
+
+    #[test]
+    fn preferred_tree_parent_is_connected_preference_only() {
+        let policy = RoutingPolicy::checked(1, 1, 1024, 1, 4096, 4).expect("valid policy");
+        let topology = CandidateTopology {
+            hops: &["h0", "h1"],
+        };
+        let connected = vec!["h0".to_owned(), "h1".to_owned(), "h2".to_owned()];
+
+        let preferred = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            "leaf",
+            "destination",
+            &connected,
+            3,
+            policy,
+            false,
+            Some("h2"),
+        )
+        .expect("connected parent preference is usable");
+        assert_eq!(preferred.next_hops(), &["h2"]);
+
+        let absent = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            "leaf",
+            "destination",
+            &connected,
+            3,
+            policy,
+            false,
+            Some("h9"),
+        )
+        .expect("stale parent falls back to generic route");
+        assert_eq!(absent.next_hops(), &["h0"]);
+
+        let ordinary = plan_next_hops(&topology, "leaf", "destination", &connected, 3, policy)
+            .expect("ordinary route");
+        assert_eq!(ordinary.next_hops(), &["h0"]);
+
+        let direct = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            "leaf",
+            "h1",
+            &connected,
+            3,
+            policy,
+            false,
+            Some("h2"),
+        )
+        .expect("direct destination route");
+        assert_eq!(direct.next_hops(), &["h1"]);
+
+        let no_route = plan_next_hops_with_local_origin_and_tree_parent(
+            &CandidateTopology { hops: &[] },
+            "leaf",
+            "destination",
+            &connected,
+            3,
+            policy,
+            false,
+            None,
+        );
+        assert!(matches!(no_route, Err(RouteRefusal::NoRoute)));
+    }
+
+    #[test]
+    fn real_hub_tree_accepts_connected_parent_outside_static_prefix() {
+        let root = canonical_key(41);
+        let hubs = (42..=44).map(canonical_key).collect::<Vec<_>>();
+        let leaf = canonical_key(45);
+        let destination = canonical_key(46);
+        let topology = crate::topology::tree::HubTreeSelector {
+            root: root.clone(),
+            hubs: hubs.clone(),
+            backup_candidates: 1,
+        };
+        let static_prefix = topology.next_hops(&leaf, &destination, &hubs, 2);
+        assert_eq!(static_prefix.len(), 2);
+        let accepted_parent = hubs
+            .iter()
+            .find(|hub| !static_prefix.contains(hub))
+            .expect("third hub is outside the static parent prefix")
+            .clone();
+        let policy = RoutingPolicy::checked(1, 1, 1024, 1, 4096, 4).expect("valid policy");
+
+        let preferred = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            &leaf,
+            &destination,
+            &hubs,
+            3,
+            policy,
+            true,
+            Some(&accepted_parent),
+        )
+        .expect("accepted connected parent is preferred");
+        assert_eq!(preferred.next_hops(), &[accepted_parent]);
+
+        let generic = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            &leaf,
+            &destination,
+            &hubs,
+            3,
+            policy,
+            true,
+            None,
+        )
+        .expect("generic tree route");
+        assert_eq!(generic.next_hops(), &static_prefix[..1]);
+
+        let stale = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            &leaf,
+            &destination,
+            &hubs,
+            3,
+            policy,
+            true,
+            Some("unknown-parent"),
+        )
+        .expect("unknown parent falls back");
+        assert_eq!(stale.next_hops(), &static_prefix[..1]);
+        let root_hint = plan_next_hops_with_local_origin_and_tree_parent(
+            &topology,
+            &leaf,
+            &destination,
+            &hubs,
+            3,
+            policy,
+            true,
+            Some(&root),
+        )
+        .expect("invalid leaf parent role falls back");
+        assert_eq!(root_hint.next_hops(), &static_prefix[..1]);
     }
 
     #[test]
@@ -680,6 +997,35 @@ mod tests {
             ))
         ));
     }
+
+    #[test]
+    fn leaf_origination_bypasses_forwarder_gate_but_transit_does_not() {
+        let policy = RoutingPolicy::checked(2, 1, 1024, 1, 4096, 4).expect("valid policy");
+        let connected = vec!["b".to_owned()];
+        assert!(matches!(
+            plan_next_hops_with_local_origin(
+                &LeafTopology,
+                "leaf",
+                "destination",
+                &connected,
+                3,
+                policy,
+                false,
+            ),
+            Err(RouteRefusal::NotForwarder)
+        ));
+        let plan = plan_next_hops_with_local_origin(
+            &LeafTopology,
+            "leaf",
+            "destination",
+            &connected,
+            3,
+            policy,
+            true,
+        )
+        .expect("verified local origin can use its topology-selected route");
+        assert_eq!(plan.next_hops(), &["b".to_owned()]);
+    }
 }
 
 #[cfg(test)]
@@ -692,7 +1038,9 @@ mod dispatch_controls {
     #[derive(Clone, Copy)]
     enum MockOutcome {
         Delivered,
+        Refused,
         Failed,
+        OutcomeUnknown,
         Closed,
     }
 
@@ -774,7 +1122,9 @@ mod dispatch_controls {
                 }
                 let result = match outcome {
                     MockOutcome::Delivered => Ok(()),
+                    MockOutcome::Refused => Err(RouteSendError::Refused),
                     MockOutcome::Failed => Err(RouteSendError::Failed),
+                    MockOutcome::OutcomeUnknown => Err(RouteSendError::OutcomeUnknown),
                     MockOutcome::Closed => Err(RouteSendError::Closed),
                 };
                 active.fetch_sub(1, Ordering::SeqCst);
@@ -867,8 +1217,8 @@ mod dispatch_controls {
     }
 
     #[test]
-    fn failed_best_hop_backfills_later_hop() {
-        let sessions = sessions(&[("a", MockOutcome::Failed), ("b", MockOutcome::Delivered)]);
+    fn refused_best_hop_backfills_later_hop() {
+        let sessions = sessions(&[("a", MockOutcome::Refused), ("b", MockOutcome::Delivered)]);
         let report = futures::executor::block_on(dispatch_routed_frame(
             plan(&["a", "b"], 1),
             encoded_frame(),
@@ -876,9 +1226,39 @@ mod dispatch_controls {
         ));
         assert_eq!(report.attempted, 2);
         assert_eq!(report.delivered, 1);
-        assert_eq!(report.failed, 1);
+        assert_eq!(report.refused, 1);
         assert_eq!(sessions.sessions[0].calls.load(Ordering::SeqCst), 1);
         assert_eq!(sessions.sessions[1].calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn uncertain_result_stops_new_fallback_scheduling() {
+        let sessions = sessions(&[
+            ("a", MockOutcome::OutcomeUnknown),
+            ("b", MockOutcome::Delivered),
+        ]);
+        let report = futures::executor::block_on(dispatch_routed_frame(
+            plan(&["a", "b"], 1),
+            encoded_frame(),
+            &sessions,
+        ));
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.outcome_unknown, 1);
+        assert_eq!(sessions.sessions[0].calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sessions.sessions[1].calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn generic_failure_is_conservatively_uncertain() {
+        let sessions = sessions(&[("a", MockOutcome::Failed), ("b", MockOutcome::Delivered)]);
+        let report = futures::executor::block_on(dispatch_routed_frame(
+            plan(&["a", "b"], 1),
+            encoded_frame(),
+            &sessions,
+        ));
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(sessions.sessions[1].calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1142,5 +1522,82 @@ mod replay_controls {
             state.replay.lock().expect("replay lock").retained_entries,
             0
         );
+    }
+
+    #[test]
+    fn production_admission_allows_signed_leaf_origin_but_refuses_transit() {
+        use ed25519_dalek::SigningKey;
+
+        let (_provider, scope, state, policy) = exact_cap_fixture();
+        let local_key = SigningKey::from_bytes(&[21; 32]);
+        let origin_key = SigningKey::from_bytes(&[22; 32]);
+        let previous_key = SigningKey::from_bytes(&[23; 32]);
+        let destination_key = SigningKey::from_bytes(&[24; 32]);
+        let local = DeviceId::from_public_key_bytes(*local_key.verifying_key().as_bytes())
+            .expect("local id");
+        let origin = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
+            .expect("origin id");
+        let previous = DeviceId::from_public_key_bytes(*previous_key.verifying_key().as_bytes())
+            .expect("previous id");
+        let destination =
+            DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
+                .expect("destination id");
+        let context = MeshContextId::from_bytes([25; 32]);
+        let payload = || crate::protocol::ClosedRoutedPayload::ChannelFrame {
+            channel: "leaf-origin".to_owned(),
+            payload: serde_json::json!({"value": "signed"}),
+        };
+
+        let local_envelope = RoutedApplicationEnvelope::new(
+            context,
+            local.clone(),
+            destination.clone(),
+            [26; 16],
+            2,
+            payload(),
+            &local_key,
+        )
+        .expect("signed local-origin envelope");
+        let local_admission = state
+            .admit_captured_previous_hop(
+                &local,
+                &local,
+                || vec!["b".to_owned()],
+                |_| true,
+                &super::tests::LeafTopology,
+                context,
+                local_envelope,
+                &local_key,
+            )
+            .expect("local origin can route from a leaf");
+        assert!(matches!(local_admission, RouteAdmission::Relay { .. }));
+
+        let mut transit_envelope = RoutedApplicationEnvelope::new(
+            context,
+            origin,
+            destination,
+            [27; 16],
+            3,
+            payload(),
+            &origin_key,
+        )
+        .expect("signed transit envelope");
+        transit_envelope
+            .append_hop_with_limits(previous.clone(), &previous_key, policy.protocol_limits())
+            .expect("signed prior transit hop");
+        let transit_refusal = state.admit_captured_previous_hop(
+            &local,
+            &previous,
+            || vec!["b".to_owned()],
+            |_| true,
+            &super::tests::LeafTopology,
+            context,
+            transit_envelope,
+            &local_key,
+        );
+        assert!(matches!(transit_refusal, Err(RouteRefusal::NotForwarder)));
+
+        drop(state);
+        drop(scope);
     }
 }

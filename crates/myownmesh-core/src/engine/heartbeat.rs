@@ -180,6 +180,10 @@ pub(super) async fn on_pong(
                 }
             });
         });
+    // This is a local diagnostic sighting only. The state method repeats the
+    // exact current authenticated/promoted-owner fence and ignores all cache
+    // refusals, so observation cannot affect heartbeat or mesh behavior.
+    state.observe_authenticated_peer(dispatch.owner());
 }
 
 fn monotonic_ms() -> i64 {

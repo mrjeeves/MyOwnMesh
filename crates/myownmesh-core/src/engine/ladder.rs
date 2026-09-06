@@ -14,6 +14,7 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::config::TopologyMode;
 use crate::events::MeshEvent;
 
 use super::connection::PeerStatus;
@@ -135,6 +136,13 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
     if !state.topology_impl.read().prunes() {
         return;
     }
+    // HubTree is a preferred sparse forwarding shape, not a permission
+    // boundary for independently authenticated direct links.  Such a link
+    // may be established by an explicit peer action or another admissible
+    // route; retaining it does not auto-dial non-edges or grant forwarding.
+    // The routed application and session-provider fences enforce the separate
+    // accepted-parent requirement when the link is used as tree transit.
+    let hub_tree = matches!(&*state.topology.read(), TopologyMode::HubTree { .. });
     let me = state.identity.public_id().to_string();
     let mut known = state.peers.device_ids_snapshot();
     known.push(me.clone());
@@ -151,7 +159,7 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
                 let data = peer.state.read();
                 let both_shelved = data.local_shelved && data.remote_shelved;
                 let settled = matches!(data.status, PeerStatus::Shelved);
-                if !edge && both_shelved && settled && !state.is_sticky(id) {
+                if !hub_tree && !edge && both_shelved && settled && !state.is_sticky(id) {
                     to_prune.push(id.clone());
                 }
             } else if (edge || state.is_sticky(id)) && me < *id {
@@ -167,6 +175,32 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
     to_prune.dedup();
     to_dial.sort_unstable();
     to_dial.dedup();
+
+    // Hub mode is explicitly owner-selected: rotate the finite wanted-edge
+    // list each pass and fill only the configured number of concurrent dials.
+    // This prevents an unavailable early edge from starving later edges while
+    // preserving the existing unbounded-by-policy path for other topologies.
+    let hub_limits = state.config.read().hub.map(|policy| {
+        (
+            usize::try_from(policy.max_parallel_dials).unwrap_or(usize::MAX),
+            usize::try_from(policy.max_dials_per_pass).unwrap_or(usize::MAX),
+        )
+    });
+    if let Some((_, max_per_pass)) = hub_limits {
+        if !to_dial.is_empty() {
+            let start = state
+                .hub_dial_cursor
+                .load(std::sync::atomic::Ordering::Acquire)
+                % to_dial.len();
+            to_dial.rotate_left(start);
+            let advance = max_per_pass.min(to_dial.len());
+            state.hub_dial_cursor.store(
+                (start + advance) % to_dial.len(),
+                std::sync::atomic::Ordering::Release,
+            );
+            to_dial.truncate(advance);
+        }
+    }
 
     for id in to_prune {
         state.log_diag_with(
@@ -190,20 +224,33 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
     // carriers. The transport worker may be created here, but it remains
     // Sighted/pending until the existing signed handshake and approval path
     // promotes it to Active or a usable application session.
+    let mut pending = to_dial.into_iter();
+    let parallel = hub_limits
+        .map(|(max_parallel, _)| max_parallel)
+        .unwrap_or(usize::MAX);
     let mut dials = FuturesUnordered::new();
-    for id in to_dial {
-        let state = Arc::clone(state);
-        dials.push(async move {
-            state.log_diag_with(
-                crate::events::DiagLevel::Info,
-                "topology",
-                format!("dialing shape edge to {}", super::short_peer(&id)),
-                serde_json::json!({ "peer": id }),
-            );
-            super::ensure_peer_session(&state, &id, crate::transport::Role::Offerer).await;
-        });
+    for _ in 0..parallel {
+        let Some(id) = pending.next() else {
+            break;
+        };
+        dials.push(dial_shape_edge(Arc::clone(state), id));
     }
-    while dials.next().await.is_some() {}
+    while dials.next().await.is_some() {
+        let Some(id) = pending.next() else {
+            continue;
+        };
+        dials.push(dial_shape_edge(Arc::clone(state), id));
+    }
+}
+
+async fn dial_shape_edge(state: Arc<NetworkState>, id: String) {
+    state.log_diag_with(
+        crate::events::DiagLevel::Info,
+        "topology",
+        format!("dialing shape edge to {}", super::short_peer(&id)),
+        serde_json::json!({ "peer": id }),
+    );
+    super::ensure_peer_session(&state, &id, crate::transport::Role::Offerer).await;
 }
 
 async fn send_shelve_unshelve(state: &Arc<NetworkState>, device_id: &str, shelved: bool) {

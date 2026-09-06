@@ -13,7 +13,7 @@
 use std::any::Any;
 use std::borrow::Borrow;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -65,6 +65,23 @@ const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static ORDERED_RESTORE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn hash_json_into<T: Serialize>(hasher: &mut Sha256, value: &T) -> Result<(), JsonError> {
+    serde_json::to_writer(DigestWriter(hasher), value)
+}
 
 #[cfg(feature = "transport-lab")]
 const ADMISSION_PHASE_COUNT: usize = 13;
@@ -298,6 +315,29 @@ pub struct DurableSemanticStore {
     lock_path: PathBuf,
     process_gate: Arc<Mutex<()>>,
     policy: SemanticPolicyConfig,
+    #[cfg(any(test, feature = "transport-lab"))]
+    commit_injection: Arc<CommitInjectionControl>,
+}
+
+/// One-shot commit controls belong to one exact store slot.  They are test
+/// and transport-lab custody only; keeping them behind the store clone means
+/// a cloned owner observes the same slot-local control without introducing
+/// process-global state or affecting another semantic owner.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Debug, Default)]
+struct CommitInjectionControl {
+    next: Mutex<Option<SemanticCommitFaultForLab>>,
+}
+
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticCommitFaultForLab {
+    /// Fail after semantic SQL apply and before SQLite COMMIT. Dropping the
+    /// transaction rolls back the actual SQL mutation.
+    BeforeCommit,
+    /// Commit the semantic delta, then lose the worker reply so the caller
+    /// receives the real `OutcomeUnknown` boundary and must reconcile.
+    CommitOutcomeUnknown,
 }
 
 /// The ordinary SQLite connection owned by the semantic storage worker.
@@ -438,6 +478,7 @@ enum WorkerCommand {
         create: bool,
         reopen: bool,
         compact_after_reopen: bool,
+        drop_commit_result: bool,
         operation: WorkerOperation,
         reply: Sender<WorkerResult>,
     },
@@ -525,6 +566,7 @@ impl SemanticStorageWorker {
                 create,
                 reopen,
                 compact_after_reopen,
+                drop_commit_result: false,
                 operation,
                 reply,
             })
@@ -562,6 +604,7 @@ impl SemanticStorageWorker {
         create: bool,
         reopen: bool,
         compact_after_reopen: bool,
+        drop_commit_result: bool,
         operation: F,
     ) -> Result<(), DurableStoreError>
     where
@@ -586,6 +629,7 @@ impl SemanticStorageWorker {
                 create,
                 reopen,
                 compact_after_reopen,
+                drop_commit_result,
                 operation,
                 reply,
             })
@@ -633,21 +677,30 @@ fn semantic_storage_worker_loop(
 ) {
     let mut connection: Option<SemanticSqliteConnection> = None;
     while let Ok(command) = receiver.recv() {
-        let (create, reopen, compact_after_reopen, operation, reply) = match command {
-            WorkerCommand::Run {
-                create,
-                reopen,
-                compact_after_reopen,
-                operation,
-                reply,
-            } => (create, reopen, compact_after_reopen, operation, reply),
-            WorkerCommand::Shutdown(reply) => {
-                let closing = connection.take();
-                drop(closing);
-                let _ = reply.send(());
-                break;
-            }
-        };
+        let (create, reopen, compact_after_reopen, drop_commit_result, operation, reply) =
+            match command {
+                WorkerCommand::Run {
+                    create,
+                    reopen,
+                    compact_after_reopen,
+                    drop_commit_result,
+                    operation,
+                    reply,
+                } => (
+                    create,
+                    reopen,
+                    compact_after_reopen,
+                    drop_commit_result,
+                    operation,
+                    reply,
+                ),
+                WorkerCommand::Shutdown(reply) => {
+                    let closing = connection.take();
+                    drop(closing);
+                    let _ = reply.send(());
+                    break;
+                }
+            };
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut result = if connection.is_none() {
                 match store.open_database(create) {
@@ -682,6 +735,18 @@ fn semantic_storage_worker_loop(
         }));
         match result {
             Ok(result) => {
+                if drop_commit_result
+                    && matches!(
+                        &result,
+                        Err(DurableStoreError::InjectedCommitOutcomeUnknown)
+                    )
+                {
+                    // The SQLite COMMIT already succeeded.  Dropping only
+                    // this reply models a lost owner result while retaining
+                    // the worker/connection for the caller's reconciliation.
+                    drop(reply);
+                    continue;
+                }
                 let _ = reply.send(result);
             }
             Err(_) => {
@@ -1181,7 +1246,52 @@ impl DurableSemanticStore {
             lock_path: directory.join(format!("{slot}.lock")),
             process_gate: Arc::new(Mutex::new(())),
             policy: policy,
+            #[cfg(any(test, feature = "transport-lab"))]
+            commit_injection: Arc::new(CommitInjectionControl::default()),
         }
+    }
+
+    /// Arm one exact, one-shot owner-commit control for deterministic
+    /// transport-lab and unit evidence.  The control is slot-local and is
+    /// consumed only at its named commit boundary; it is never production
+    /// behavior or shared cross-test state.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(crate) fn arm_commit_injection(
+        &self,
+        injection: SemanticCommitFaultForLab,
+    ) -> Result<(), DurableStoreError> {
+        let mut next = self
+            .commit_injection
+            .next
+            .lock()
+            .map_err(|_| DurableStoreError::CommitInjectionPoisoned)?;
+        if next.is_some() {
+            return Err(DurableStoreError::CommitInjectionAlreadyArmed);
+        }
+        *next = Some(injection);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "transport-lab"))]
+    fn take_commit_injection(&self, expected: SemanticCommitFaultForLab) -> bool {
+        let Ok(mut next) = self.commit_injection.next.lock() else {
+            return false;
+        };
+        if *next == Some(expected) {
+            *next = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(any(test, feature = "transport-lab"))]
+    fn commit_injection_is_armed(&self, expected: SemanticCommitFaultForLab) -> bool {
+        self.commit_injection
+            .next
+            .lock()
+            .map(|next| *next == Some(expected))
+            .unwrap_or(false)
     }
 
     fn encode_stored_fact(&self, fact: &SignedFact) -> Result<Vec<u8>, DurableStoreError> {
@@ -1460,6 +1570,16 @@ impl DurableSemanticStore {
         self.proof_records_unlocked(context_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_proof_records(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let _gate = self.lock_process()?;
+        let connection = self.open_database(true)?;
+        self.pending_proof_records_connection(&connection, context_id)
+    }
+
     fn proof_records_unlocked(
         &self,
         context_id: MeshContextId,
@@ -1476,6 +1596,180 @@ impl DurableSemanticStore {
         connection
             .with_read_snapshot(|connection| {
                 Ok(self.proof_records_in_snapshot(connection, context_id))
+            })
+            .map_err(DurableStoreError::Sqlite)?
+    }
+
+    fn pending_proof_records_connection(
+        &self,
+        connection: &SemanticSqliteConnection,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let pending_state = serde_json::to_string(&ProofRecordState::Pending)?;
+        connection
+            .with_read_snapshot(|connection| {
+                Ok((|| -> Result<Vec<ProofRecord>, DurableStoreError> {
+                    let stored_context: Vec<u8> = connection
+                        .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                            row.get(0)
+                        })
+                        .map_err(DurableStoreError::Sqlite)?;
+                    if stored_context.as_slice() != context_id.as_bytes() {
+                        let actual = stored_context
+                            .try_into()
+                            .map(MeshContextId::from_bytes)
+                            .map_err(|_| DurableStoreError::Corrupt {
+                                path: self.path.clone(),
+                                reason: "invalid context id".into(),
+                            })?;
+                        return Err(DurableStoreError::ContextMismatch {
+                            expected: context_id,
+                            actual,
+                        });
+                    }
+
+                    // A semantic slot has one context. Refuse a mixed-context
+                    // database before returning a partial Pending view; this is
+                    // scalar and does not materialize terminal records.
+                    let context_bytes = context_id.as_bytes().to_vec();
+                    let foreign_context: Option<Vec<u8>> = connection
+                        .query_row(
+                            "SELECT context_id FROM proofs
+                         WHERE context_id < ? ORDER BY context_id LIMIT 1",
+                            params![context_bytes.clone()],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(DurableStoreError::Sqlite)?
+                        .or(connection
+                            .query_row(
+                                "SELECT context_id FROM proofs
+                             WHERE context_id > ? ORDER BY context_id LIMIT 1",
+                                params![context_bytes],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(DurableStoreError::Sqlite)?);
+                    if let Some(actual) = foreign_context {
+                        let actual =
+                            actual
+                                .try_into()
+                                .map(MeshContextId::from_bytes)
+                                .map_err(|_| DurableStoreError::Corrupt {
+                                    path: self.path.clone(),
+                                    reason: "invalid proof context index".into(),
+                                })?;
+                        return Err(DurableStoreError::ContextMismatch {
+                            expected: context_id,
+                            actual,
+                        });
+                    }
+
+                    let fixed_row_bytes = self
+                        .policy
+                        .max_pending_proofs
+                        .checked_mul(108)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    let row_bytes = self
+                        .policy
+                        .max_pending_proof_bytes
+                        .checked_add(fixed_row_bytes)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    let rows = bounded_query_collect(
+                        connection,
+                        "SELECT delivery_id,encoded,context_id,target,state
+                     FROM proofs
+                     WHERE context_id=? AND state=?
+                     ORDER BY delivery_id",
+                        params![context_id.as_bytes().to_vec(), pending_state],
+                        self.policy.max_pending_proofs,
+                        row_bytes,
+                        "pending proof rows",
+                        |row| {
+                            let delivery_id: Vec<u8> = row.get(0)?;
+                            let encoded: Vec<u8> = row.get(1)?;
+                            let row_context: Vec<u8> = row.get(2)?;
+                            let target: Vec<u8> = row.get(3)?;
+                            let state: String = row.get(4)?;
+                            let bytes = [
+                                delivery_id.len(),
+                                encoded.len(),
+                                row_context.len(),
+                                target.len(),
+                                state.len(),
+                            ]
+                            .into_iter()
+                            .try_fold(
+                                0u64,
+                                |total, length| -> rusqlite::Result<u64> {
+                                    total
+                                        .checked_add(
+                                            u64::try_from(length)
+                                                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                                        )
+                                        .ok_or(rusqlite::Error::InvalidQuery)
+                                },
+                            )?;
+                            Ok(((delivery_id, encoded, row_context, target, state), bytes))
+                        },
+                    )?;
+                    let proofs = rows
+                        .into_iter()
+                        .map(|row| self.decode_proof_row(row))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    canonical_proofs(&proofs)?;
+
+                    let stored_usage = self.read_proof_usage_raw(connection)?;
+                    let expected_usage = Self::proof_usage(&proofs, stored_usage.generation)?;
+                    if expected_usage.pending_count != stored_usage.pending_count
+                        || expected_usage.pending_bytes != stored_usage.pending_bytes
+                    {
+                        return Err(DurableStoreError::Corrupt {
+                            path: self.path.clone(),
+                            reason: "pending proof usage does not match indexed rows".into(),
+                        });
+                    }
+                    if stored_usage.total_count > self.policy.max_proof_records
+                        || stored_usage.total_bytes > self.policy.max_proof_bytes
+                        || stored_usage.total_links > self.policy.max_proof_links
+                        || expected_usage.pending_count > self.policy.max_pending_proofs
+                        || expected_usage.pending_bytes > self.policy.max_pending_proof_bytes
+                    {
+                        return Err(DurableStoreError::LimitExceeded("pending proof retention"));
+                    }
+
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT fact_id FROM proof_facts WHERE delivery_id=? ORDER BY fact_id",
+                        )
+                        .map_err(DurableStoreError::Sqlite)?;
+                    for proof in &proofs {
+                        let mut rows = statement
+                            .query(params![proof.delivery_id.as_bytes().to_vec()])
+                            .map_err(DurableStoreError::Sqlite)?;
+                        let mut fact_ids = Vec::with_capacity(proof.fact_ids.len());
+                        while let Some(row) = rows.next().map_err(DurableStoreError::Sqlite)? {
+                            if fact_ids.len() >= proof.fact_ids.len().saturating_add(1) {
+                                return Err(DurableStoreError::LimitExceeded("proof links"));
+                            }
+                            let value: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
+                            let value: [u8; 32] =
+                                value.try_into().map_err(|_| DurableStoreError::Corrupt {
+                                    path: self.path.clone(),
+                                    reason: "invalid pending proof fact link".into(),
+                                })?;
+                            fact_ids.push(FactId::from_bytes(value));
+                        }
+                        if fact_ids != proof.fact_ids {
+                            return Err(DurableStoreError::Corrupt {
+                                path: self.path.clone(),
+                                reason: "pending proof fact index does not match proof bytes"
+                                    .into(),
+                            });
+                        }
+                    }
+                    Ok(proofs)
+                })())
             })
             .map_err(DurableStoreError::Sqlite)?
     }
@@ -1761,6 +2055,26 @@ impl DurableSemanticStore {
         Ok(snapshot)
     }
 
+    fn ensure_pending_proof_index(connection: &Connection) -> Result<(), DurableStoreError> {
+        let proofs_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='proofs'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        if proofs_table != 0 {
+            connection
+                .execute_batch(
+                    "CREATE INDEX IF NOT EXISTS proofs_pending_idx
+                     ON proofs(context_id,state,delivery_id);",
+                )
+                .map_err(DurableStoreError::Sqlite)?;
+        }
+        Ok(())
+    }
+
     fn open_database(&self, create: bool) -> Result<SemanticSqliteConnection, DurableStoreError> {
         if !self.policy.validate() {
             return Err(DurableStoreError::InvalidPolicy);
@@ -1838,6 +2152,15 @@ impl DurableSemanticStore {
                  PRAGMA wal_autocheckpoint={autocheckpoint};"
             ))
             .map_err(DurableStoreError::Sqlite)?;
+
+        // A legacy V4 database may predate the pending-proof index.  Install
+        // only this additive schema object before a write-capable fast path;
+        // never rebuild, delete, or rewrite existing proof rows here.  New
+        // databases have no proofs table yet and receive the index atomically
+        // from create_schema during their first snapshot publication.
+        if create {
+            Self::ensure_pending_proof_index(&connection)?;
+        }
 
         let connection = SemanticSqliteConnection { inner: connection };
         let page_size = connection.page_size().map_err(DurableStoreError::Sqlite)?;
@@ -1934,6 +2257,8 @@ impl DurableSemanticStore {
                     target BLOB NOT NULL,
                     state TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS proofs_pending_idx
+                    ON proofs(context_id,state,delivery_id);
                 CREATE TABLE IF NOT EXISTS proof_facts (
                     delivery_id BLOB NOT NULL REFERENCES proofs(delivery_id) ON DELETE CASCADE,
                     fact_id BLOB NOT NULL REFERENCES facts(fact_id),
@@ -4365,11 +4690,20 @@ impl DurableSemanticStore {
             self.policy.max_proof_records,
             "proof rows",
         )?;
-        count_at_most(
-            "SELECT COUNT(*) FROM proofs WHERE state='pending'",
-            self.policy.max_pending_proofs,
-            "pending proof rows",
+        let pending_state = serde_json::to_string(&ProofRecordState::Pending)?;
+        let pending_proof_count = checked(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM proofs WHERE state=?",
+                    params![pending_state.clone()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(DurableStoreError::Sqlite)?,
+            "negative pending proof row count",
         )?;
+        if pending_proof_count > self.policy.max_pending_proofs {
+            return Err(DurableStoreError::LimitExceeded("pending proof rows"));
+        }
         max_length_at_most(
             "SELECT MAX(LENGTH(encoded)) FROM proofs",
             self.policy.max_proof_bytes,
@@ -4383,7 +4717,13 @@ impl DurableSemanticStore {
             return Err(DurableStoreError::LimitExceeded("proof bytes"));
         }
         let pending_proof_bytes = checked(
-            scalar("SELECT COALESCE(SUM(CASE WHEN state='pending' THEN LENGTH(encoded) ELSE 0 END),0) FROM proofs")?,
+            connection
+                .query_row(
+                    "SELECT COALESCE(SUM(CASE WHEN state=? THEN LENGTH(encoded) ELSE 0 END),0) FROM proofs",
+                    params![pending_state],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(DurableStoreError::Sqlite)?,
             "negative pending proof byte sum",
         )?;
         if pending_proof_bytes > self.policy.max_pending_proof_bytes {
@@ -5662,6 +6002,17 @@ impl DurableSemanticStore {
 }
 
 impl DurableSemanticOwner {
+    /// Arm a slot-local one-shot commit control on this exact durable owner.
+    /// The control is intended only for deterministic unit/transport-lab
+    /// failure evidence and never changes ordinary production behavior.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(crate) fn arm_commit_injection(
+        &self,
+        injection: SemanticCommitFaultForLab,
+    ) -> Result<(), DurableStoreError> {
+        self.store.arm_commit_injection(injection)
+    }
+
     fn worker_call<T, F>(
         &self,
         create: bool,
@@ -5701,12 +6052,24 @@ impl DurableSemanticOwner {
             + Send
             + 'static,
     {
+        #[cfg(any(test, feature = "transport-lab"))]
+        let drop_commit_result = self
+            .store
+            .commit_injection_is_armed(SemanticCommitFaultForLab::CommitOutcomeUnknown);
+        #[cfg(not(any(test, feature = "transport-lab")))]
+        let drop_commit_result = false;
         self.worker
             .lock()
             .map_err(|_| DurableStoreError::InProcessGatePoisoned)?
             .as_ref()
             .ok_or(DurableStoreError::OwnerReleased)?
-            .call_commit(create, reopen, compact_after_reopen, operation)
+            .call_commit(
+                create,
+                reopen,
+                compact_after_reopen,
+                drop_commit_result,
+                operation,
+            )
     }
 
     fn ensure_live_unlocked(&self) -> Result<(), DurableStoreError> {
@@ -5896,7 +6259,7 @@ impl DurableSemanticOwner {
                                 let fact = store
                                     .decode_stored_fact(&encoded, context_id, &author, &fact_id)?;
                                 hasher.update(&fact_id);
-                                hasher.update(serde_json::to_vec(&fact)?);
+                                hash_json_into(&mut hasher, &fact)?;
                                 hasher.update([0]);
                                 observed = observed
                                     .checked_add(1)
@@ -6091,11 +6454,23 @@ impl DurableSemanticOwner {
             store.apply_semantic_delta(&transaction, &plan)?;
             #[cfg(feature = "transport-lab")]
             drop(apply_phase);
+            #[cfg(any(test, feature = "transport-lab"))]
+            if store.take_commit_injection(SemanticCommitFaultForLab::BeforeCommit) {
+                return Err(DurableStoreError::InjectedPrecommitFailure);
+            }
             #[cfg(feature = "transport-lab")]
             let _commit_phase = AdmissionPhaseGuard::new(AdmissionPhase::CommitWalTerminal);
             transaction
                 .commit()
                 .map_err(|_| DurableStoreError::OutcomeUnknown)
+                .and_then(|()| {
+                    #[cfg(any(test, feature = "transport-lab"))]
+                    if store.take_commit_injection(SemanticCommitFaultForLab::CommitOutcomeUnknown)
+                    {
+                        return Err(DurableStoreError::InjectedCommitOutcomeUnknown);
+                    }
+                    Ok(())
+                })
         })
     }
 
@@ -6342,6 +6717,21 @@ impl DurableSemanticOwner {
         self.ensure_live_unlocked()?;
         self.worker_call(false, false, false, move |store, connection| {
             store.proof_records_connection(connection, context_id)
+        })
+    }
+
+    pub(crate) fn pending_proof_records(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        // Preserve the historical Missing error instead of allowing the
+        // migration-capable worker open to create an empty slot.
+        drop(self.store.open_database(false)?);
+        self.worker_call(true, false, false, move |store, connection| {
+            DurableSemanticStore::ensure_pending_proof_index(&connection.inner)?;
+            store.pending_proof_records_connection(connection, context_id)
         })
     }
 
@@ -6991,6 +7381,14 @@ pub enum DurableStoreError {
     /// indication.
     #[error("semantic snapshot commit outcome is unknown; reconcile durable state")]
     OutcomeUnknown,
+    #[error("semantic snapshot commit was refused before SQLite mutation by the test control")]
+    InjectedPrecommitFailure,
+    #[error("semantic snapshot commit result was intentionally lost after SQLite COMMIT")]
+    InjectedCommitOutcomeUnknown,
+    #[error("semantic snapshot commit injection control is poisoned")]
+    CommitInjectionPoisoned,
+    #[error("semantic snapshot commit injection is already armed")]
+    CommitInjectionAlreadyArmed,
     #[error("semantic snapshot path has no parent: {0}")]
     InvalidPath(PathBuf),
     #[error("semantic snapshot I/O at {path}: {source}")]
@@ -8638,6 +9036,312 @@ mod tests {
         );
         drop(owner);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_proof_read_is_bounded_and_refuses_selected_corruption() {
+        let root = root();
+        let signing_key = key(20);
+        let bootstrap = closed("pending-index", 20, [20; 32]);
+        let target_key = key(21);
+        let target =
+            super::super::DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes())
+                .expect("target id");
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("author id");
+        let first = root_fact_for_target(&bootstrap, &signing_key, target.clone());
+        let second = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleRevoke {
+                    target: target.clone(),
+                },
+                author.clone(),
+                vec![first.id],
+            ),
+            &signing_key,
+        )
+        .expect("second fact");
+        let third = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target: target.clone(),
+                    role: super::super::Role::Member,
+                },
+                author,
+                vec![second.id],
+            ),
+            &signing_key,
+        )
+        .expect("third fact");
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(first.clone()).expect("first fact");
+        graph.admit(second.clone()).expect("second fact");
+        graph.admit(third.clone()).expect("third fact");
+        let store = DurableSemanticStore::new(&root, "pending-index-slot");
+        store.commit(&graph, Vec::new()).expect("initial graph");
+        let explain = store.open_database(false).expect("query-plan connection");
+        let mut plan = explain
+            .inner
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT delivery_id FROM proofs
+                 WHERE context_id=? AND state=?
+                 ORDER BY delivery_id",
+            )
+            .expect("pending query plan");
+        let pending_state =
+            serde_json::to_string(&ProofRecordState::Pending).expect("pending state token");
+        let details = plan
+            .query_map(
+                params![bootstrap.context_id().as_bytes().to_vec(), pending_state],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("pending query plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("pending query plan details");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("proofs_pending_idx")),
+            "pending listing uses the bounded context/state/order index: {details:?}"
+        );
+        drop(plan);
+        let mut lower_plan = explain
+            .inner
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT context_id FROM proofs
+                 WHERE context_id < ? ORDER BY context_id LIMIT 1",
+            )
+            .expect("lower foreign-context plan");
+        let lower_details = lower_plan
+            .query_map(params![bootstrap.context_id().as_bytes().to_vec()], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("lower foreign-context plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("lower foreign-context plan details");
+        assert!(
+            lower_details
+                .iter()
+                .any(|detail| detail.contains("proofs_pending_idx")),
+            "lower foreign-context probe uses the bounded context index: {lower_details:?}"
+        );
+        drop(lower_plan);
+        let mut upper_plan = explain
+            .inner
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT context_id FROM proofs
+                 WHERE context_id > ? ORDER BY context_id LIMIT 1",
+            )
+            .expect("upper foreign-context plan");
+        let upper_details = upper_plan
+            .query_map(params![bootstrap.context_id().as_bytes().to_vec()], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("upper foreign-context plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("upper foreign-context plan details");
+        assert!(
+            upper_details
+                .iter()
+                .any(|detail| detail.contains("proofs_pending_idx")),
+            "upper foreign-context probe uses the bounded context index: {upper_details:?}"
+        );
+        drop(upper_plan);
+        drop(explain);
+        let owner = store.open_writable().expect("proof owner");
+        let context_id = bootstrap.context_id();
+        let pending = ProofRecord::pending(
+            context_id,
+            target.clone(),
+            vec![first.id],
+            "pending-owner",
+            "pending-binding",
+        )
+        .expect("pending record");
+        owner
+            .enqueue_proof(pending.clone())
+            .expect("pending enqueue");
+
+        let terminal_one = ProofRecord::pending(
+            context_id,
+            target.clone(),
+            vec![second.id],
+            "terminal-owner-1",
+            "terminal-binding-1",
+        )
+        .expect("first terminal record");
+        owner
+            .enqueue_proof(terminal_one.clone())
+            .expect("first terminal enqueue");
+        assert!(owner
+            .supersede_proof(context_id, terminal_one.delivery_id, &target, None)
+            .expect("first terminal supersession"));
+        let pending_after_one = owner
+            .pending_proof_records(context_id)
+            .expect("pending after first terminal");
+        assert_eq!(pending_after_one, vec![pending.clone()]);
+
+        let terminal_two = ProofRecord::pending(
+            context_id,
+            target.clone(),
+            vec![third.id],
+            "terminal-owner-2",
+            "terminal-binding-2",
+        )
+        .expect("second terminal record");
+        owner
+            .enqueue_proof(terminal_two.clone())
+            .expect("second terminal enqueue");
+        assert!(owner
+            .supersede_proof(context_id, terminal_two.delivery_id, &target, None)
+            .expect("second terminal supersession"));
+        let pending_after_two = owner
+            .pending_proof_records(context_id)
+            .expect("pending after second terminal");
+        assert_eq!(pending_after_two, vec![pending.clone()]);
+        let mut expected_terminal_one = terminal_one.clone();
+        expected_terminal_one.state = ProofRecordState::Superseded;
+        let mut expected_terminal_two = terminal_two.clone();
+        expected_terminal_two.state = ProofRecordState::Superseded;
+        let mut expected_records = vec![
+            pending.clone(),
+            expected_terminal_one,
+            expected_terminal_two,
+        ];
+        expected_records.sort_by_key(|record| record.delivery_id);
+        assert_eq!(
+            owner.proof_records(context_id).expect("full proof audit"),
+            expected_records,
+            "full audit retains terminal tombstones while pending read stays fixed"
+        );
+
+        owner.release().expect("release before reopen");
+        let reopened = store.open_writable().expect("reopen proof owner");
+        assert_eq!(
+            reopened
+                .proof_records(context_id)
+                .expect("reopened full proof audit"),
+            expected_records,
+            "reopen preserves the exact full record set"
+        );
+        assert_eq!(
+            reopened
+                .pending_proof_records(context_id)
+                .expect("reopened pending index"),
+            vec![pending.clone()]
+        );
+
+        reopened
+            .release()
+            .expect("release before legacy-index migration");
+        let legacy_connection = store
+            .open_database(false)
+            .expect("open legacy schema connection");
+        legacy_connection
+            .inner
+            .execute_batch("DROP INDEX IF EXISTS proofs_pending_idx")
+            .expect("remove pending index from legacy fixture");
+        drop(legacy_connection);
+        let migrated = store
+            .open_writable()
+            .expect("legacy schema migration owner");
+        assert_eq!(
+            migrated
+                .pending_proof_records(context_id)
+                .expect("legacy migration restores pending index"),
+            vec![pending.clone()]
+        );
+        assert_eq!(
+            migrated
+                .proof_records(context_id)
+                .expect("legacy migration preserves full records"),
+            expected_records,
+        );
+        let index_present = migrated
+            .worker_call(false, false, false, |_store, connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='index' AND name='proofs_pending_idx'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(DurableStoreError::Sqlite)
+            })
+            .expect("legacy index presence");
+        assert_eq!(
+            index_present, 1,
+            "legacy migration installs only the additive index"
+        );
+
+        let usage_before = migrated
+            .worker_call(false, false, false, |store, connection| {
+                store.read_proof_usage(connection)
+            })
+            .expect("read usage before selected corruption");
+        migrated.release().expect("release before corruption");
+        let connection = store
+            .open_database(true)
+            .expect("open corruption connection");
+        connection
+            .inner
+            .execute(
+                "UPDATE proofs SET encoded=? WHERE delivery_id=?",
+                params![
+                    b"not-json".to_vec(),
+                    pending.delivery_id.as_bytes().to_vec()
+                ],
+            )
+            .expect("corrupt selected pending row");
+        drop(connection);
+        let corrupted = store.open_writable().expect("reopen corrupted owner");
+        assert!(matches!(
+            corrupted.pending_proof_records(context_id),
+            Err(DurableStoreError::Serialization(_)) | Err(DurableStoreError::Corrupt { .. })
+        ));
+        let usage_after = corrupted
+            .worker_call(false, false, false, |store, connection| {
+                store.read_proof_usage(connection)
+            })
+            .expect("read usage after refused pending read");
+        assert_eq!(
+            usage_after, usage_before,
+            "failed pending read does not mutate usage"
+        );
+        corrupted.release().expect("release corrupted owner");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn digest_writer_preserves_json_bytes_and_propagates_serializer_errors() {
+        let bootstrap = closed("digest-writer", 22, [22; 32]);
+        let fact = root_fact(&bootstrap, &key(22));
+        let bytes = serde_json::to_vec(&fact).expect("representative fact JSON");
+        let mut expected = Sha256::new();
+        expected.update(&bytes);
+        let mut streamed = Sha256::new();
+        hash_json_into(&mut streamed, &fact).expect("stream representative fact JSON");
+        assert_eq!(expected.finalize(), streamed.finalize());
+
+        struct FailingJson;
+        impl serde::Serialize for FailingJson {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("deliberate serializer failure"))
+            }
+        }
+        let mut hasher = Sha256::new();
+        assert!(hash_json_into(&mut hasher, &FailingJson).is_err());
     }
 
     #[test]

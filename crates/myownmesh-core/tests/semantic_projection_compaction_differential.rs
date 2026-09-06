@@ -7,20 +7,23 @@
 //! side imports one fact at a time through `JoinedNetwork`, exports the
 //! resulting canonical page, and compares the exact graph identity and pure
 //! projection.  Five fixed closed orders cover dependency-first/last,
-//! reverse, and two domain-interleaved schedules.  These orders are finite but
-//! discriminate every causal edge and each adopted domain without depending on
-//! randomness.  Open participation is ephemeral presence, so its lifecycle
-//! control asserts a zero semantic/durable delta across leave and restart.
+//! reverse, and two domain-interleaved schedules.  Each positive order keeps
+//! the controller's authorizing grant before its member grant; a separate
+//! fresh-network control proves that the inverse order is refused without
+//! custody.  These orders are finite but discriminate every causal edge and
+//! each adopted domain without depending on randomness.  Open participation is
+//! ephemeral presence, so its lifecycle control asserts a zero semantic/durable
+//! delta across leave and restart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
-    TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
+    SignalingConfig, TopologyMode, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
@@ -216,37 +219,182 @@ fn closed_scenario(network_id: &str, root: &SigningKey) -> Scenario {
     }
 }
 
+const PROJECTION_COMMITMENT_DOMAIN: &[u8] = b"myownmesh-v4/projection-patricia-merkle/v1";
+
+struct ReferenceMerkleEntry {
+    key: Vec<u8>,
+    key_digest: [u8; 32],
+    value: [u8; 32],
+}
+
+fn reference_encoder_text(bytes: &mut Vec<u8>, value: &[u8]) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value);
+}
+
+fn reference_cell_key(cell: &ExclusiveCell) -> Vec<u8> {
+    let mut key = Vec::new();
+    reference_encoder_text(&mut key, b"cell");
+    match cell {
+        ExclusiveCell::Role { subject } => {
+            reference_encoder_text(&mut key, b"role");
+            key.extend_from_slice(&subject.as_bytes());
+        }
+        ExclusiveCell::Membership { subject } => {
+            reference_encoder_text(&mut key, b"membership");
+            key.extend_from_slice(&subject.as_bytes());
+        }
+        ExclusiveCell::Decision { proposal } => {
+            reference_encoder_text(&mut key, b"decision");
+            key.extend_from_slice(proposal.as_bytes());
+        }
+    }
+    key
+}
+
+fn reference_cell_value(value: &CellProjection) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    match value {
+        CellProjection::Value(id) => {
+            reference_encoder_text(&mut encoded, b"value");
+            encoded.extend_from_slice(id.as_bytes());
+        }
+        CellProjection::Conflict(ids) => {
+            reference_encoder_text(&mut encoded, b"conflict");
+            encoded.extend_from_slice(&(ids.len() as u64).to_be_bytes());
+            for id in ids {
+                encoded.extend_from_slice(id.as_bytes());
+            }
+        }
+    }
+    let digest = Sha256::digest(encoded);
+    let mut value_hash = [0u8; 32];
+    value_hash.copy_from_slice(&digest);
+    value_hash
+}
+
+fn reference_stand_down_key(target: &DeviceId) -> Vec<u8> {
+    let mut key = Vec::new();
+    reference_encoder_text(&mut key, b"stand_down");
+    key.extend_from_slice(&target.as_bytes());
+    key
+}
+
+fn reference_stand_down_value(target: &DeviceId, proof: FactId) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&target.as_bytes());
+    encoded.extend_from_slice(proof.as_bytes());
+    let digest = Sha256::digest(encoded);
+    let mut value_hash = [0u8; 32];
+    value_hash.copy_from_slice(&digest);
+    value_hash
+}
+
+fn reference_key_digest(key: &[u8]) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(PROJECTION_COMMITMENT_DOMAIN);
+    encoded.push(b'k');
+    encoded.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(key);
+    let digest = Sha256::digest(encoded);
+    let mut key_digest = [0u8; 32];
+    key_digest.copy_from_slice(&digest);
+    key_digest
+}
+
+fn reference_digest_bit(digest: &[u8; 32], depth: usize) -> bool {
+    digest[depth / 8] & (0x80 >> (depth % 8)) != 0
+}
+
+fn reference_empty_node(depth: usize) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(PROJECTION_COMMITMENT_DOMAIN);
+    encoded.push(b'e');
+    encoded.extend_from_slice(&(depth as u16).to_be_bytes());
+    let digest = Sha256::digest(encoded);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
+fn reference_leaf_node(entries: &[ReferenceMerkleEntry]) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(PROJECTION_COMMITMENT_DOMAIN);
+    encoded.push(b'l');
+    encoded.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+    for entry in entries {
+        encoded.extend_from_slice(&(entry.key.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&entry.key);
+        encoded.extend_from_slice(&entry.value);
+    }
+    let digest = Sha256::digest(encoded);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
+fn reference_branch_node(depth: usize, left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(PROJECTION_COMMITMENT_DOMAIN);
+    encoded.push(b'b');
+    encoded.extend_from_slice(&(depth as u16).to_be_bytes());
+    encoded.extend_from_slice(&left);
+    encoded.extend_from_slice(&right);
+    let digest = Sha256::digest(encoded);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
+fn reference_merkle(entries: &[ReferenceMerkleEntry], depth: usize) -> [u8; 32] {
+    if entries.is_empty() {
+        return reference_empty_node(depth);
+    }
+    if depth == 256 {
+        return reference_leaf_node(entries);
+    }
+    let split = entries
+        .iter()
+        .position(|entry| reference_digest_bit(&entry.key_digest, depth))
+        .unwrap_or(entries.len());
+    let left = reference_merkle(&entries[..split], depth + 1);
+    let right = reference_merkle(&entries[split..], depth + 1);
+    reference_branch_node(depth, left, right)
+}
+
 fn projection_commitment(projection: &Projection) -> [u8; 32] {
-    let mut bytes = Vec::new();
-    for (cell, value) in projection.cells() {
-        bytes.extend_from_slice(cell.to_string().as_bytes());
-        bytes.push(0);
-        match value {
-            CellProjection::Value(id) => {
-                bytes.push(1);
-                bytes.extend_from_slice(id.as_bytes());
+    let mut entries = projection
+        .cells()
+        .map(|(cell, value)| {
+            let key = reference_cell_key(cell);
+            let key_digest = reference_key_digest(&key);
+            let value = reference_cell_value(value);
+            ReferenceMerkleEntry {
+                key,
+                key_digest,
+                value,
             }
-            CellProjection::Conflict(ids) => {
-                bytes.push(2);
-                for id in ids {
-                    bytes.extend_from_slice(id.as_bytes());
-                }
-            }
+        })
+        .collect::<Vec<_>>();
+    entries.extend(projection.stand_down_targets().map(|target| {
+        let stand_down = projection
+            .stand_down(target)
+            .expect("stand-down target has a projected value");
+        let key = reference_stand_down_key(target);
+        let key_digest = reference_key_digest(&key);
+        let value = reference_stand_down_value(&stand_down.target, stand_down.proof);
+        ReferenceMerkleEntry {
+            key,
+            key_digest,
+            value,
         }
-        bytes.push(0xff);
-    }
-    for target in projection.stand_down_targets() {
-        bytes.extend_from_slice(b"stand_down:");
-        bytes.extend_from_slice(target.to_string().as_bytes());
-        if let Some(stand_down) = projection.stand_down(target) {
-            bytes.extend_from_slice(stand_down.proof.as_bytes());
-        }
-        bytes.push(0xfe);
-    }
-    let digest = Sha256::digest(bytes);
-    let mut commitment = [0; 32];
-    commitment.copy_from_slice(&digest);
-    commitment
+    }));
+    entries.sort_by(|left, right| {
+        left.key_digest
+            .cmp(&right.key_digest)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    reference_merkle(&entries, 0)
 }
 
 fn identity(graph: &FactGraph) -> IdentitySnapshot {
@@ -353,6 +501,9 @@ fn config(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
         kind,
         semantic_policy: Default::default(),
         routing_policy: RoutingPolicyConfig::default(),
+        hub: None,
+        local_observations: None,
+        tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig {
@@ -369,9 +520,20 @@ fn config(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
 }
 
 fn connector_policy() -> WebRtcConnectorCapablePolicy {
+    let semantic_policy = SemanticPolicyConfig::default();
+    // One live semantic storage owner is acquired by each joined network.
+    // Fund the complete checked SQLite envelope, including MainJournal, WAL,
+    // SHM, and emergency reserve; this is not merely the database file size.
+    let semantic_storage_bytes = semantic_policy
+        .checked_storage_envelope(
+            SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+            semantic_policy.storage_workload(),
+        )
+        .expect("finite default semantic storage envelope")
+        .total_bytes;
     let grant = ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
         let amount = if class == ResourceClass::StorageBytes {
-            256 * 1024 * 1024
+            semantic_storage_bytes
         } else {
             100_000_000
         };
@@ -403,10 +565,15 @@ async fn import_one(
     network: &myownmesh_core::JoinedNetwork,
     context_id: myownmesh_core::semantic::MeshContextId,
     fact: &SignedFact,
+    label: &str,
 ) -> myownmesh_core::Result<()> {
-    network
+    let outcome = network
         .import_semantic_fact_page(one_fact_page(context_id, fact))
-        .await?;
+        .await;
+    if let Err(error) = &outcome {
+        eprintln!("[semantic-differential-stage] {label}: {error}");
+    }
+    outcome?;
     Ok(())
 }
 
@@ -456,12 +623,62 @@ fn fresh_oracle(bootstrap: &VerifiedBootstrap, transcript: &[SignedFact]) -> Fac
     graph
 }
 
-fn graph_from_exported_facts(bootstrap: &VerifiedBootstrap, facts: &[SignedFact]) -> FactGraph {
-    let mut graph = FactGraph::from_bootstrap(bootstrap);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExportReplayError {
+    DuplicateExport(FactId),
+    DuplicateReplay(FactId),
+    MissingTranscript(FactId),
+    BodyMismatch(FactId),
+    ExtraExport(FactId),
+    AdmissionRefused(FactId),
+    RetryRefused,
+}
+
+/// Reconstruct the graph from the actual exported bodies while preserving the
+/// original causal input order. Durable export order is canonical storage
+/// order, not an admission schedule; replaying that order can incorrectly
+/// reject a signer whose authorizing parent is present elsewhere in the page.
+/// The set checks make this an independent export-integrity oracle: no body is
+/// copied from the expected graph and no absent external dependency is
+/// topologically invented.
+fn graph_from_exported_facts(
+    bootstrap: &VerifiedBootstrap,
+    facts: &[SignedFact],
+    replay_order: &[SignedFact],
+) -> Result<FactGraph, ExportReplayError> {
+    let mut exported = BTreeMap::new();
     for fact in facts {
-        admit(&mut graph, fact.clone());
+        if exported.insert(fact.id, fact.clone()).is_some() {
+            return Err(ExportReplayError::DuplicateExport(fact.id));
+        }
     }
-    graph
+
+    let mut graph = FactGraph::from_bootstrap(bootstrap);
+    let mut replayed = BTreeSet::new();
+    for expected in replay_order {
+        if !replayed.insert(expected.id) {
+            return Err(ExportReplayError::DuplicateReplay(expected.id));
+        }
+        let Some(actual) = exported.remove(&expected.id) else {
+            return Err(ExportReplayError::MissingTranscript(expected.id));
+        };
+        if &actual != expected
+            || actual.content.canonical_bytes() != expected.content.canonical_bytes()
+        {
+            return Err(ExportReplayError::BodyMismatch(expected.id));
+        }
+        graph
+            .admit(actual)
+            .map_err(|_| ExportReplayError::AdmissionRefused(expected.id))?;
+        graph
+            .retry_quarantined()
+            .map_err(|_| ExportReplayError::RetryRefused)?;
+    }
+    if let Some((&id, _)) = exported.first_key_value() {
+        return Err(ExportReplayError::ExtraExport(id));
+    }
+
+    Ok(graph)
 }
 
 fn durable_fact_bytes(facts: &[SignedFact]) -> Vec<(FactId, Vec<u8>)> {
@@ -480,7 +697,8 @@ async fn assert_open_presence_zero(
     expected_bytes: &[(FactId, Vec<u8>)],
 ) -> myownmesh_core::Result<()> {
     let observed = export_facts(network, bootstrap).await?;
-    let observed_graph = graph_from_exported_facts(bootstrap, &observed);
+    let observed_graph = graph_from_exported_facts(bootstrap, &observed, &[])
+        .expect("empty Open export replays without semantic rows");
     let observed_snapshot = snapshot(&observed_graph, &[]);
     assert_eq!(
         observed_snapshot, *expected,
@@ -527,7 +745,8 @@ async fn assert_equal(
 ) -> myownmesh_core::Result<()> {
     let expected = fresh_oracle(&scenario.bootstrap, transcript);
     let observed = export_facts(network, &scenario.bootstrap).await?;
-    let observed_graph = graph_from_exported_facts(&scenario.bootstrap, &observed);
+    let observed_graph = graph_from_exported_facts(&scenario.bootstrap, &observed, transcript)
+        .expect("exported semantic rows replay in recorded input order");
     let expected_snapshot = snapshot(&expected, &scenario.subjects);
     let production_identity = network.semantic_state_identity()?;
     assert_eq!(
@@ -618,12 +837,50 @@ async fn run_closed_order(
         .await?;
     let mut transcript = Vec::new();
     assert_equal(&network, &scenario, &transcript).await?;
+    let mut reference = FactGraph::from_bootstrap(&scenario.bootstrap);
+    assert!(matches!(
+        reference.admit(scenario.facts[1].clone()),
+        Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible)
+    ));
+    let refused = import_one(
+        &network,
+        scenario.bootstrap.context_id(),
+        &scenario.facts[1],
+        &format!(
+            "closed-order ordinal={ordinal} prefix=negative kind=unauthorized-before-parent role=grant_member id={}",
+            scenario.facts[1].id
+        ),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "controller-authored grant before its authorizing parent must refuse"
+    );
+    assert_equal(&network, &scenario, &transcript).await?;
     for (prefix, index) in order.iter().copied().enumerate() {
+        let role = match index {
+            0 => "grant_controller",
+            1 => "grant_member",
+            2 => "revoke_controller",
+            3 => "evict_proposal",
+            4 => "evict_attestation",
+            5 => "eviction_proof",
+            _ => "unknown_fixture_fact",
+        };
+        let primary_label = format!(
+            "closed-order ordinal={ordinal} prefix={prefix} kind=primary role={role} id={}",
+            scenario.facts[index].id
+        );
+        let duplicate_label = format!(
+            "closed-order ordinal={ordinal} prefix={prefix} kind=duplicate role={role} id={}",
+            scenario.facts[index].id
+        );
         transcript.push(scenario.facts[index].clone());
         import_one(
             &network,
             scenario.bootstrap.context_id(),
             &scenario.facts[index],
+            &primary_label,
         )
         .await?;
         assert_equal(&network, &scenario, &transcript).await?;
@@ -633,6 +890,7 @@ async fn run_closed_order(
             &network,
             scenario.bootstrap.context_id(),
             &scenario.facts[index],
+            &duplicate_label,
         )
         .await?;
         assert_eq!(
@@ -653,6 +911,10 @@ async fn run_closed_order(
                 &network,
                 scenario.bootstrap.context_id(),
                 &scenario.continuation,
+                &format!(
+                    "closed-order ordinal={ordinal} prefix={prefix} kind=continuation role=membership_admit id={}",
+                    scenario.continuation.id
+                ),
             )
             .await?;
             assert_equal(&network, &scenario, &transcript).await?;
@@ -729,6 +991,89 @@ async fn run_open_presence_zero(
     restarted.shutdown().await
 }
 
+#[test]
+fn exported_reconstruction_is_ordered_and_set_checked() {
+    let root = key(61);
+    let scenario = closed_scenario("semantic-export-replay-order", &root);
+    let mut exported = scenario.facts.clone();
+    exported.reverse();
+    let reconstructed = graph_from_exported_facts(&scenario.bootstrap, &exported, &scenario.facts)
+        .expect("canonical export order differs from causal replay order");
+    assert_eq!(reconstructed.ids().count(), scenario.facts.len());
+    assert_eq!(reconstructed.quarantined().count(), 0);
+}
+
+#[test]
+fn exported_reconstruction_retains_legitimate_unresolved_custody() {
+    let root = key(62);
+    let scenario = closed_scenario("semantic-export-mixed-custody", &root);
+    let admitted = scenario.facts[0].clone();
+    let unresolved = scenario.facts[5].clone();
+    let reconstructed = graph_from_exported_facts(
+        &scenario.bootstrap,
+        &[unresolved.clone(), admitted.clone()],
+        &[admitted.clone(), unresolved.clone()],
+    )
+    .expect("eligible signer with absent dependency remains quarantined");
+    assert_eq!(reconstructed.ids().count(), 1);
+    assert_eq!(reconstructed.quarantined().count(), 1);
+    assert_eq!(
+        reconstructed
+            .quarantined()
+            .next()
+            .expect("unresolved proof remains retained")
+            .1,
+        &unresolved
+    );
+}
+
+#[test]
+fn exported_reconstruction_rejects_missing_extra_duplicate_and_mismatch() {
+    let root = key(64);
+    let scenario = closed_scenario("semantic-export-replay-integrity", &root);
+    let first = scenario.facts[0].clone();
+    let second = scenario.facts[1].clone();
+
+    assert!(matches!(
+        graph_from_exported_facts(
+            &scenario.bootstrap,
+            std::slice::from_ref(&first),
+            &[first.clone(), second.clone()],
+        ),
+        Err(ExportReplayError::MissingTranscript(id)) if id == second.id
+    ));
+    assert!(matches!(
+        graph_from_exported_facts(&scenario.bootstrap, &[first.clone(), second.clone()], std::slice::from_ref(&first)),
+        Err(ExportReplayError::ExtraExport(id)) if id == second.id
+    ));
+    assert!(matches!(
+        graph_from_exported_facts(
+            &scenario.bootstrap,
+            &[first.clone(), first.clone()],
+            std::slice::from_ref(&first),
+        ),
+        Err(ExportReplayError::DuplicateExport(id)) if id == first.id
+    ));
+    assert!(matches!(
+        graph_from_exported_facts(
+            &scenario.bootstrap,
+            std::slice::from_ref(&first),
+            &[first.clone(), first.clone()],
+        ),
+        Err(ExportReplayError::DuplicateReplay(id)) if id == first.id
+    ));
+    let mut altered = second.clone();
+    altered.signature.push('x');
+    assert!(matches!(
+        graph_from_exported_facts(
+            &scenario.bootstrap,
+            &[first.clone(), altered],
+            &[first, second.clone()],
+        ),
+        Err(ExportReplayError::BodyMismatch(id)) if id == second.id
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn semantic_project_and_incremental_compaction_converge() -> myownmesh_core::Result<()> {
     let home = tempfile::tempdir().expect("semantic differential home");
@@ -743,10 +1088,10 @@ async fn semantic_project_and_incremental_compaction_converge() -> myownmesh_cor
 
     let closed_orders = [
         [0, 1, 2, 3, 4, 5],
-        [5, 4, 3, 2, 1, 0],
-        [1, 0, 3, 2, 5, 4],
+        [5, 4, 3, 2, 0, 1],
+        [0, 1, 3, 2, 5, 4],
         [2, 0, 4, 1, 5, 3],
-        [3, 1, 5, 0, 4, 2],
+        [3, 0, 5, 1, 4, 2],
     ];
     for (ordinal, order) in closed_orders.iter().enumerate() {
         run_closed_order(&mesh, order, ordinal).await?;

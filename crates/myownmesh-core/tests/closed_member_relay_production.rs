@@ -1,5 +1,6 @@
 #![cfg(feature = "transport-lab")]
 
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,8 @@ use myownmesh_core::semantic::{
     DeviceId, FactBody, FactContent, FactGraph, MeshContextId, Role, SignedFact,
 };
 use myownmesh_core::{
-    ConnectorCallbackPolicy, Identity, Mesh, MeshConfig, WebRtcConnectorCapablePolicy,
-    WebRtcConnectorProfile,
+    ConnectorCallbackPolicy, Identity, Mesh, MeshConfig, TransportLabCallbackWorkload,
+    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_signaling::local::LocalBroker;
 
@@ -75,22 +76,253 @@ fn init_relay_trace() {
         .try_init();
 }
 
-fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
-    // This is deliberately finite and per Mesh instance.  The three-node
-    // control has one connector-capable runtime per node; every named resource
-    // dimension is bounded, including provider bookkeeping.
-    let relay_grant =
-        ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
+fn finite_connector_policy(
+    session_identity: &str,
+    share_identity: &Identity,
+    share_peer: DeviceId,
+    share_context: MeshContextId,
+) -> (
+    WebRtcConnectorCapablePolicy,
+    FiniteResourceProvider,
+    ResourceProviderPort,
+) {
+    let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
+    // The complete fixture overlaps two original links with one replacement
+    // before W0 is retired: three real links, two endpoints each.
+    let connector_profiles = [
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+        profile.clone(),
+    ];
+    let connector_count = NonZeroU64::new(
+        u64::try_from(connector_profiles.len()).expect("connector profile count fits u64"),
+    )
+    .expect("connector count is nonzero");
+    let max_relay_frame_bytes = usize::try_from(
+        myownmesh_core::protocol::relay::closed_relay_worst_case_json_bytes(
+            myownmesh_core::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+                + myownmesh_core::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES,
+        )
+        .expect("the maximum Closed relay frame size is representable"),
+    )
+    .expect("the maximum Closed relay frame size fits usize");
+    let frame_bytes = NonZeroU64::new(
+        u64::try_from(myownmesh_signaling::mdns::wire::MAX_FRAME_BYTES)
+            .expect("frame limit fits u64"),
+    )
+    .expect("frame limit is nonzero");
+    let candidate_content = NonZeroU64::new(
+        frame_bytes
+            .get()
+            .checked_mul(connector_count.get())
+            .expect("candidate content capacity fits u64"),
+    )
+    .expect("candidate content capacity is nonzero");
+    let candidate_strings = NonZeroU64::new(
+        candidate_content
+            .get()
+            .checked_mul(3)
+            .expect("candidate string capacity fits u64"),
+    )
+    .expect("candidate string capacity is nonzero");
+    let workload = TransportLabCallbackWorkload {
+        control_slots: NonZeroUsize::new(64).expect("control slots are nonzero"),
+        endpoint_slots: NonZeroUsize::new(64).expect("endpoint slots are nonzero"),
+        control_payload_bytes: 16 * 1024,
+        endpoint_payload_bytes: u64::try_from(max_relay_frame_bytes)
+            .expect("the maximum Closed relay frame payload fits u64"),
+        realtime: None,
+    };
+    // The raw connector grant funds callback/opening work only. Promotion
+    // retains one exact Session Broker reservation per real-link endpoint, so
+    // price six promoted sessions separately rather than borrowing slack
+    // from connector construction.
+    let promoted_sessions =
+        myownmesh_core::session_reservation_planning_claim_for_correlation(session_identity)
+            .checked_scale(connector_count.get())
+            .expect("six promoted-session planning claims are representable");
+    // Native inbound frames are parsed twice at a live connector boundary:
+    // one retained Hello and one current application frame. Use the public
+    // gateway formula at the maximum serialized Closed relay frame, then add
+    // the provider reservation bookkeeping for each of the two claims and
+    // each of the six connectors. The raw connector grant does not fund
+    // promoted-session or application JSON parsing retention.
+    let json_frame_reservation =
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+            myownmesh_core::application_gateway::json_input_work_claim(max_relay_frame_bytes)
+                .expect("the maximum-frame JSON claim is representable"),
+        )
+        .expect("the maximum-frame JSON reservation charge is representable");
+    let json_parsing = json_frame_reservation
+        .checked_scale(2)
+        .and_then(|claim| claim.checked_scale(connector_count.get()))
+        .expect("two maximum-frame JSON claims per connector are representable");
+    let relay_grant = myownmesh_core::transport_lab_connector_fixture_grant(
+        &connector_profiles,
+        NonZeroU64::new(3).expect("mesh scope count is nonzero"),
+        workload,
+    )
+    .expect("the finite connector fixture grant is representable")
+    .checked_add(promoted_sessions)
+    .and_then(|claim| claim.checked_add(json_parsing))
+    .expect("the connector, session, and JSON grants combine without overflow")
+    .checked_add(
+        myownmesh_core::transport_lab_remote_candidate_fixture_grant(
+            connector_count,
+            connector_count,
+            candidate_strings,
+            candidate_content,
+            frame_bytes,
+        )
+        .expect("the finite remote-candidate grant is representable"),
+    )
+    .expect("the candidate grant combines without overflow")
+    .checked_add(
+        ResourceClaim::try_from_entries([
             (
-                class,
-                if class == ResourceClass::StorageBytes {
-                    0
-                } else {
-                    100_000_000
-                },
-            )
-        }))
-        .expect("finite three-node connector grant is representable");
+                ResourceClass::StorageObject,
+                connector_count
+                    .get()
+                    .checked_mul(2)
+                    .expect("applied candidate storage capacity fits u64"),
+            ),
+            (
+                ResourceClass::OpaqueDependencyResidual,
+                connector_count
+                    .get()
+                    .checked_mul(3)
+                    .expect("applied candidate residual capacity fits u64"),
+            ),
+        ])
+        .expect("the applied candidate retention claim is representable"),
+    )
+    .expect("the applied candidate retention combines without overflow")
+    .checked_add(
+        myownmesh_core::transport_lab_remote_description_fixture_grant(
+            connector_count,
+            frame_bytes,
+            NonZeroU64::new(1).expect("one media section is nonzero"),
+            NonZeroU64::new(1).expect("one active binding is nonzero"),
+            frame_bytes,
+        )
+        .expect("the finite remote-description grant is representable"),
+    )
+    .expect("the combined finite connector grant is representable");
+    let share_profile = ClosedRelayPolicyConfig {
+        enabled: true,
+        ..ClosedRelayPolicyConfig::default()
+    };
+    let share_witness =
+        myownmesh_core::engine::transport_lab::transport_lab_pending_share_capacity_witness(
+            share_identity,
+            share_context,
+            share_peer,
+            DeviceId::from_canonical_str(&session_identity)
+                .expect("relay id is canonical for the share witness"),
+            [0x51; 16],
+            &share_profile,
+        )
+        .expect("generated key-share survives the exact JSON decode boundary");
+    for (capacity, length) in [
+        (
+            share_witness.capacities.mesh,
+            share_witness.decoded_lengths.mesh,
+        ),
+        (
+            share_witness.capacities.from,
+            share_witness.decoded_lengths.from,
+        ),
+        (
+            share_witness.capacities.to,
+            share_witness.decoded_lengths.to,
+        ),
+        (
+            share_witness.capacities.signature,
+            share_witness.decoded_lengths.signature,
+        ),
+    ] {
+        assert!(
+            capacity >= length,
+            "decoded key-share capacity must upper-bound its retained string"
+        );
+    }
+    let closed_relay_workload = myownmesh_core::engine::transport_lab::ClosedRelayFixtureWorkload {
+        network_roots: NonZeroU64::new(3).expect("three Closed relay networks are nonzero"),
+        endpoint_leases: NonZeroU64::new(10).expect("five endpoint pairs are nonzero"),
+        pending_leases: NonZeroU64::new(1).expect("one pending lease is nonzero"),
+        engine_allocations: NonZeroU64::new(5).expect("five engine allocations are nonzero"),
+        runtime_allocations: NonZeroU64::new(5).expect("five runtime allocations are nonzero"),
+        pending_expiry_tasks: NonZeroU64::new(5).expect("five expiry reservations are nonzero"),
+        pending_share: share_witness.capacities,
+    };
+    let closed_relay_grant =
+        myownmesh_core::engine::transport_lab::transport_lab_closed_relay_fixture_grant(
+            &ClosedRelayPolicyConfig {
+                enabled: true,
+                ..ClosedRelayPolicyConfig::default()
+            },
+            closed_relay_workload,
+        )
+        .expect("the finite Closed relay fixture grant is representable");
+    let closed_relay_components = [
+        closed_relay_grant.runtime_roots,
+        closed_relay_grant.engine_roots,
+        closed_relay_grant.endpoint_leases,
+        closed_relay_grant.pending_leases,
+        closed_relay_grant.engine_allocations,
+        closed_relay_grant.runtime_allocations,
+        closed_relay_grant.pending_expiry_tasks,
+    ]
+    .into_iter()
+    .try_fold(ResourceClaim::ZERO, |total, component| {
+        total.checked_add(component)
+    })
+    .expect("Closed relay component totals are representable");
+    assert_eq!(
+        closed_relay_components, closed_relay_grant.total,
+        "Closed relay grant exposes its exact checked component decomposition"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .endpoint_leases
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        10,
+        "endpoint reservation count is charged once per planned endpoint lease"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .pending_leases
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        1,
+        "pending reservation count is charged once per planned pending lease"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .engine_allocations
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        5,
+        "engine allocation reservation count is charged once per planned allocation"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .runtime_allocations
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        5,
+        "runtime allocation reservation count is charged once per planned allocation"
+    );
+    assert_eq!(
+        closed_relay_grant
+            .total
+            .amount(ResourceClass::RelayOrProviderAllocation),
+        21,
+        "the five-open construction bound charges endpoint+pending+engine+runtime relay units"
+    );
+    let relay_grant = relay_grant
+        .checked_add(closed_relay_grant.total)
+        .expect("Closed relay grant combines without overflow");
     let semantic_policy = SemanticPolicyConfig::default();
     let semantic_storage_owner_count = 3_u64;
     let semantic_storage_claim = ResourceClaim::single(
@@ -124,11 +356,14 @@ fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
         expected_storage_bytes,
         "the three-node provider has no hidden storage slack"
     );
-    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
-        .expect("finite provider is valid");
-    WebRtcConnectorCapablePolicy::new(
-        resources,
-        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
+    let provider = FiniteResourceProvider::new(grant);
+    let meter = provider.clone();
+    let resources = ResourceProviderPort::new(provider).expect("finite provider is valid");
+    let process_scope = resources.clone();
+    (
+        WebRtcConnectorCapablePolicy::new(resources, profile),
+        meter,
+        process_scope,
     )
 }
 
@@ -142,6 +377,9 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         kind: NetworkKind::Closed,
         semantic_policy: Default::default(),
         routing_policy: RoutingPolicyConfig::default(),
+        hub: None,
+        local_observations: None,
+        tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::Star {
             hub: relay.to_string(),
@@ -352,7 +590,12 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     );
     assert!(canonical_ids.windows(2).all(|pair| pair[0] < pair[1]));
 
-    let policy = finite_connector_policy();
+    let (policy, provider, process_scope) = finite_connector_policy(
+        &relay_id,
+        &alice,
+        DeviceId::from_canonical_str(&carol_id).expect("Carol id is canonical"),
+        context_id,
+    );
     let alice_mesh = bounded(
         "open Alice mesh",
         Mesh::open_connector_capable_with_identity(MeshConfig::default(), alice, policy.clone()),
@@ -371,6 +614,11 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     let baseline_alice = alice_mesh.resource_report();
     let baseline_relay = relay_mesh.resource_report();
     let baseline_carol = carol_mesh.resource_report();
+    let provider_baseline = provider.in_use();
+    let provider_failed_cleanup_baseline = provider.retained_after_failed_cleanup();
+    let provider_reservations_baseline = provider.active_reservations();
+    let provider_scopes_baseline = provider.active_scopes();
+    let process_scope_id = process_scope.process_scope().id();
 
     let alice_net = bounded(
         "create Alice network",
@@ -429,6 +677,20 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     alice_ready?;
     relay_ready?;
     carol_ready?;
+
+    // Reinstall the same authenticated device identity over a fresh real
+    // connector after the LocalBroker promotion.  The public transport-lab
+    // seam performs the same PeerRegistry replacement boundary as production;
+    // the route assertions below therefore exercise W1 rather than merely a
+    // second logical Closed-relay session.
+    let alice_relay_w1 = bounded(
+        "replace Alice-relay owner installation",
+        alice_net.install_promoted_peer_over_real_link(&relay_net),
+    )
+    .await?;
+    assert_eq!(alice_relay_w1.peer_device_id(), relay_id);
+    assert_active_profile(&alice_net, &relay_id);
+    assert_active_profile(&relay_net, &alice_id);
 
     assert_active_profile(&alice_net, &relay_id);
     assert_active_profile(&relay_net, &alice_id);
@@ -543,6 +805,11 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
 
     bounded("close Carol endpoint", carol_channel.close()).await??;
     let _ = bounded("close Alice endpoint", alice_channel.close()).await;
+    let _ = bounded(
+        "retire replacement Alice-relay owner",
+        alice_relay_w1.retire(),
+    )
+    .await?;
     bounded("shutdown Alice network", alice_net.shutdown()).await??;
     bounded("shutdown relay network", relay_net.shutdown()).await??;
     bounded("shutdown Carol network", carol_net.shutdown()).await??;
@@ -552,5 +819,30 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     assert_baseline("Alice", &baseline_alice, &alice_mesh.resource_report());
     assert_baseline("relay", &baseline_relay, &relay_mesh.resource_report());
     assert_baseline("Carol", &baseline_carol, &carol_mesh.resource_report());
+    assert_eq!(
+        provider.in_use(),
+        provider_baseline,
+        "provider in-use claim returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.retained_after_failed_cleanup(),
+        provider_failed_cleanup_baseline,
+        "failed-cleanup retention returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.active_reservations(),
+        provider_reservations_baseline,
+        "provider reservation cardinality returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        provider.active_scopes(),
+        provider_scopes_baseline,
+        "provider scope cardinality returns to its exact pre-network baseline"
+    );
+    assert_eq!(
+        process_scope.process_scope().id(),
+        process_scope_id,
+        "the process scope identity remains stable for the provider lifetime"
+    );
     Ok(())
 }

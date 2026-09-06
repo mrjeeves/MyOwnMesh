@@ -30,6 +30,7 @@ pub mod fullmesh;
 pub mod hubs;
 pub mod ring;
 pub mod star;
+pub mod tree;
 
 /// Strategy for the local shape decisions. Implementations MUST be
 /// pure: given the same inputs they must return the same answer on
@@ -86,6 +87,21 @@ pub trait Topology: Send + Sync {
         Vec::new()
     }
 
+    /// Whether an authenticated current primary parent may be placed first
+    /// in the route plan. This is only a topology preference: the caller
+    /// must already have included the exact parent in its authenticated
+    /// connected snapshot, and all ordinary route checks still apply.
+    /// Legacy selectors keep their existing behavior by declining it.
+    fn preferred_next_hop(
+        &self,
+        _self_id: &str,
+        _dest: &str,
+        _connected: &[String],
+        _preferred_parent: &str,
+    ) -> bool {
+        false
+    }
+
     /// Hop budget for forwarded frames under this mode. Loop safety
     /// belongs to the per-node dedup ring; the TTL bounds the blast
     /// radius of a routing disagreement during a membership transient.
@@ -109,6 +125,15 @@ pub fn from_mode(mode: &TopologyMode) -> Box<dyn Topology> {
             spoke_redundancy: spoke_redundancy
                 .unwrap_or(TopologyMode::DEFAULT_SPOKE_REDUNDANCY)
                 .max(1),
+        }),
+        TopologyMode::HubTree {
+            root,
+            hubs,
+            backup_candidates,
+        } => Box::new(tree::HubTreeSelector {
+            root: root.clone(),
+            hubs: hubs.clone(),
+            backup_candidates: *backup_candidates,
         }),
         TopologyMode::FullMesh => Box::new(fullmesh::FullMeshSelector),
     }

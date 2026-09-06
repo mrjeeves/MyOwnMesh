@@ -45,7 +45,9 @@ pub mod departure;
 pub mod facts;
 pub mod features;
 pub mod handshake;
+pub mod hub;
 pub mod keepalive;
+pub mod parenting;
 pub mod relay;
 pub mod rpc;
 pub mod topology;
@@ -62,7 +64,16 @@ pub use features::{Feature, ADVERTISED_FEATURES};
 pub use handshake::{
     ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage, DENY_REASON_EVICTED,
 };
+pub use hub::{
+    configuration_digest, HubAdvertisement, HubDiscoveryRequest, HubDiscoveryResponse,
+    HubTrickleProfile, HUB_CONFIGURATION_DIGEST_DOMAIN, HUB_DISCOVERY_HARD_MAX_PEERS,
+};
 pub use keepalive::{PingMessage, PongMessage};
+pub use parenting::{
+    hub_tree_configuration_digest, HubTreeAttachRejection, HubTreeAttachRequest,
+    HubTreeAttachResponse, HubTreeTopologyKind, HUB_TREE_ATTACH_MAX_WIRE_BYTES,
+    HUB_TREE_CONFIGURATION_DIGEST_DOMAIN, HUB_TREE_PRIMARY_DEPTH,
+};
 pub use relay::{
     ClosedRelayControl, ClosedRelayData, ClosedRelayDataDirection, OpaqueRelayPacket, RelayKeyShare,
 };
@@ -291,7 +302,12 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
         // and bounded hop chain. They are still application traffic: the
         // current authenticated carrier must be admitted before decoding or
         // forwarding one.
-        "routed_application" => ClassifiedFrame {
+        "routed_application"
+        | "hub_advertisement"
+        | "hub_discovery_request"
+        | "hub_discovery_response"
+        | "hub_tree_attach_request"
+        | "hub_tree_attach_response" => ClassifiedFrame {
             admission: FrameAdmission::Application,
             on_failure: FailurePolicy::EndSession,
         },
@@ -381,6 +397,19 @@ pub enum MeshMessage {
     CapabilitiesUpdate(CapabilitiesUpdateMessage),
     Shelve(ShelveMessage),
     Unshelve(UnshelveMessage),
+    /// Session-local advisory hub information. The carrier session supplies
+    /// authenticity; this is never forwarded or applied as configuration.
+    HubAdvertisement(HubAdvertisement),
+    /// Bounded unicast query for other peer identities known by one configured
+    /// hub. This is advisory application traffic, never a routing authority.
+    HubDiscoveryRequest(HubDiscoveryRequest),
+    /// Bounded unicast response to [`MeshMessage::HubDiscoveryRequest`].
+    HubDiscoveryResponse(HubDiscoveryResponse),
+    /// Direct shallow hub-tree relation request. It is advisory application
+    /// traffic and does not transfer authority or an address.
+    HubTreeAttachRequest(HubTreeAttachRequest),
+    /// Direct shallow hub-tree relation result bound to one request.
+    HubTreeAttachResponse(HubTreeAttachResponse),
     /// Authenticated exact-session control. See [`SessionControl`] for why it
     /// has no target field and what a receiver may do with it.
     SessionControl(SessionControl),

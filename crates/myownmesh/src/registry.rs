@@ -598,6 +598,11 @@ enum PreparedTopology {
     Star {
         hub: Box<str>,
     },
+    HubTree {
+        root: Box<str>,
+        hubs: Box<[PreparedSlot<Box<str>>]>,
+        backup_candidates: u32,
+    },
     Hubs {
         hubs: Box<[PreparedSlot<Box<str>>]>,
         spoke_redundancy: Option<u32>,
@@ -880,6 +885,23 @@ fn measure_network_row(
         myownmesh_core::TopologyMode::Star { hub } => {
             measure_network_text(hub, &mut bytes, &mut allocations)?;
         }
+        myownmesh_core::TopologyMode::HubTree { root, hubs, .. } => {
+            measure_network_text(root, &mut bytes, &mut allocations)?;
+            checked_network_bytes_add(
+                &mut bytes,
+                hubs.len()
+                    .checked_mul(std::mem::size_of::<PreparedSlot<Box<str>>>())
+                    .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                        "NetworksList HubTree hubs storage overflowed",
+                    ))?,
+            )?;
+            if !hubs.is_empty() {
+                checked_network_allocations_add(&mut allocations, 1)?;
+            }
+            for hub in hubs {
+                measure_network_text(hub, &mut bytes, &mut allocations)?;
+            }
+        }
         myownmesh_core::TopologyMode::Hubs { hubs, .. } => {
             checked_network_bytes_add(
                 &mut bytes,
@@ -948,6 +970,36 @@ fn add_network_row_fitting(
                 usize::from(!hub.is_empty()),
             )? {
                 return Ok(false);
+            }
+        }
+        myownmesh_core::TopologyMode::HubTree { root, hubs, .. } => {
+            if !add_network_dynamic_fitting(
+                actual,
+                admitted,
+                root.len(),
+                usize::from(!root.is_empty()),
+            )? {
+                return Ok(false);
+            }
+            let slots = hubs
+                .len()
+                .checked_mul(std::mem::size_of::<PreparedSlot<Box<str>>>())
+                .ok_or(myownmesh_core::ResourceMailboxItemError::Measurement(
+                    "NetworksList HubTree hubs storage overflowed",
+                ))?;
+            if !add_network_dynamic_fitting(actual, admitted, slots, usize::from(!hubs.is_empty()))?
+            {
+                return Ok(false);
+            }
+            for hub in hubs {
+                if !add_network_dynamic_fitting(
+                    actual,
+                    admitted,
+                    hub.len(),
+                    usize::from(!hub.is_empty()),
+                )? {
+                    return Ok(false);
+                }
             }
         }
         myownmesh_core::TopologyMode::Hubs { hubs, .. } => {
@@ -1168,10 +1220,13 @@ const fn widest_traffic_json_len() -> u64 {
 }
 
 /// Fixed JSON bytes in the widest row after every variable string is replaced
-/// by its empty form. `Hubs` is the widest topology tag once the hub elements
-/// themselves are excluded; each actual element is added separately below.
+/// by its empty form. `HubTree` is the widest topology tag once the root and
+/// hub elements themselves are excluded; each actual element is added
+/// separately below.
 const WIDEST_FIXED_TOPOLOGY_JSON_BYTES: u64 =
-    "{\"kind\":\"hubs\",\"hubs\":[],\"spoke_redundancy\":".len() as u64 + U32_DECIMAL_DIGITS + 1; // closing brace
+    "{\"kind\":\"hub_tree\",\"root\":\"\",\"hubs\":[],\"backup_candidates\":".len() as u64
+        + U32_DECIMAL_DIGITS
+        + 1; // closing brace
 const WIDEST_FIXED_NETWORK_ROW_JSON_BYTES: u64 =
     "{\"config_id\":\"\",\"network_id\":\"\",\"label\":\"\",\"phase\":\"discovering\",\"topology\":"
         .len() as u64
@@ -1291,6 +1346,21 @@ impl PreparedNetworkSummary {
             myownmesh_core::TopologyMode::Star { hub } => PreparedTopology::Star {
                 hub: hub.as_str().into(),
             },
+            myownmesh_core::TopologyMode::HubTree {
+                root,
+                hubs,
+                backup_candidates,
+            } => {
+                let mut prepared = empty_prepared_slots(hubs.len());
+                for (slot, hub) in prepared.iter_mut().zip(hubs) {
+                    slot.0 = Some(Box::<str>::from(hub.as_str()));
+                }
+                PreparedTopology::HubTree {
+                    root: root.as_str().into(),
+                    hubs: prepared,
+                    backup_candidates: *backup_candidates,
+                }
+            }
             myownmesh_core::TopologyMode::Hubs {
                 hubs,
                 spoke_redundancy,
@@ -2272,6 +2342,9 @@ mod tests {
             kind: Default::default(),
             scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
             routing_policy: myownmesh_core::config::RoutingPolicyConfig::default(),
+            tree: None,
+            hub: None,
+            local_observations: None,
             semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),
@@ -2342,6 +2415,11 @@ mod tests {
                 n_preferred: Some(u32::MAX),
             },
             myownmesh_core::TopologyMode::Star { hub: String::new() },
+            myownmesh_core::TopologyMode::HubTree {
+                root: String::new(),
+                hubs: Vec::new(),
+                backup_candidates: u32::MAX,
+            },
             myownmesh_core::TopologyMode::Hubs {
                 hubs: Vec::new(),
                 spoke_redundancy: Some(u32::MAX),
@@ -2367,6 +2445,54 @@ mod tests {
                 WIDEST_FIXED_NETWORK_ROW_JSON_BYTES
             );
         }
+
+        let hub_tree = myownmesh_core::TopologyMode::HubTree {
+            root: "tree-root".to_string(),
+            hubs: vec!["tree-hub".to_string()],
+            backup_candidates: 7,
+        };
+        let (dynamic_bytes, dynamic_allocations) =
+            measure_network_row("config", "network", "label", &hub_tree)
+                .expect("HubTree dynamic shape is measurable");
+        let (topology_only_bytes, topology_only_allocations) =
+            measure_network_row("", "", "", &hub_tree)
+                .expect("HubTree topology-only shape is measurable");
+        assert_eq!(
+            topology_only_bytes,
+            "tree-root".len() + "tree-hub".len() + std::mem::size_of::<PreparedSlot<Box<str>>>(),
+            "topology-only HubTree measurement charges root, backing, and hub text"
+        );
+        assert_eq!(
+            topology_only_allocations, 3,
+            "topology-only HubTree charges root, backing, and hub string"
+        );
+        assert_eq!(
+            dynamic_bytes,
+            "config".len()
+                + "network".len()
+                + "label".len()
+                + "tree-root".len()
+                + "tree-hub".len()
+                + std::mem::size_of::<PreparedSlot<Box<str>>>(),
+            "HubTree charges root, hub text, and one funded hub-slot backing"
+        );
+        assert_eq!(
+            dynamic_allocations, 6,
+            "HubTree row charges three fixed strings plus root, backing, and hub string"
+        );
+        let encoded_tree = serde_json::to_value(PreparedNetworkSummary::from_view(
+            "config",
+            "network",
+            "label",
+            myownmesh_core::MeshPhase::Discovering,
+            &hub_tree,
+            traffic,
+        ))
+        .expect("HubTree owned shape serializes");
+        assert_eq!(encoded_tree["topology"]["kind"], "hub_tree");
+        assert_eq!(encoded_tree["topology"]["root"], "tree-root");
+        assert_eq!(encoded_tree["topology"]["hubs"][0], "tree-hub");
+        assert_eq!(encoded_tree["topology"]["backup_candidates"], 7);
 
         let mut rows = empty_prepared_slots(1);
         rows[0].0 = Some(PreparedNetworkSummary::from_view(

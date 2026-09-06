@@ -34,6 +34,9 @@
 //!     // hidden production ceiling.
 //!     semantic_policy,
 //!     routing_policy: RoutingPolicyConfig::default(),
+//!     tree: None,
+//!     hub: None,
+//!     local_observations: None,
 //!     event_capacity: 256,
 //!     connection_trace_capacity: 512,
 //!     topology: TopologyMode::default(),

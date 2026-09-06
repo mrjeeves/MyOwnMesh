@@ -36,6 +36,9 @@ use crate::runtime::attempt::{
 };
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
 
+#[cfg(feature = "transport-lab")]
+pub use crate::engine::transport_lab::SemanticCommitFaultForLab;
+
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
 /// across all joined networks.
@@ -63,6 +66,9 @@ pub struct ReconcileStatus {
     pub closed_relay_changed: bool,
     pub semantic_policy_changed: bool,
     pub scheduler_changed: bool,
+    pub hub_policy_changed: bool,
+    pub tree_policy_changed: bool,
+    pub local_observations_changed: bool,
     pub event_capacity_changed: bool,
     pub connection_trace_capacity_changed: bool,
 }
@@ -617,6 +623,18 @@ impl JoinedNetwork {
         self.state.semantic_fact_count()
     }
 
+    /// Arm one owner-scoped fault at the next non-empty semantic commit.
+    /// This is a transport-lab control over the real durable store boundary;
+    /// it does not alter authority validation or provide an ambiguous retry.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn arm_semantic_commit_fault_for_lab(
+        &self,
+        fault: crate::engine::transport_lab::SemanticCommitFaultForLab,
+    ) -> Result<()> {
+        self.state.arm_semantic_commit_fault_for_lab(fault)
+    }
+
     /// Checkpoint the exact durable semantic database owned by this network.
     /// This never reloads or replaces the already-authoritative live graph.
     pub fn compact_semantic_state(&self) -> Result<()> {
@@ -711,6 +729,9 @@ impl JoinedNetwork {
             closed_relay_changed: current.closed_relay != next.closed_relay,
             semantic_policy_changed: current.semantic_policy != next.semantic_policy,
             scheduler_changed: current.scheduler != next.scheduler,
+            hub_policy_changed: current.hub != next.hub,
+            tree_policy_changed: current.tree != next.tree,
+            local_observations_changed: current.local_observations != next.local_observations,
             event_capacity_changed: current.event_capacity != next.event_capacity,
             connection_trace_capacity_changed: current.connection_trace_capacity
                 != next.connection_trace_capacity,
@@ -775,6 +796,15 @@ impl JoinedNetwork {
     /// a synchronous re-evaluation of preferred peers and emits
     /// any necessary shelve / unshelve frames.
     pub async fn set_topology(&self, mode: TopologyMode) -> Result<()> {
+        {
+            let config = self.state.config.read();
+            if crate::engine::reconcile::topology_requires_restart(&config, &mode) {
+                return Err(crate::error::Error::Config(
+                    "changing topology with funded Hub or tree control requires an exact runtime replacement"
+                        .into(),
+                ));
+            }
+        }
         self.state
             .cmd_tx
             .send(NetworkCmd::SetTopology(mode))
@@ -806,6 +836,79 @@ impl JoinedNetwork {
         self.state.peer_info(device_id)
     }
 
+    /// Return a fixed, read-only observation of this node's local HubTree
+    /// relation table.  The parent is a raw routing key, not an authority or
+    /// session witness; traffic must still pass the exact current-owner fence.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn parenting_snapshot_for_lab(&self) -> Option<ParentingSnapshotForLab> {
+        let (primary_parent, accepted_children, pending, generation) =
+            self.state.parenting_snapshot_for_lab()?;
+        Some(ParentingSnapshotForLab {
+            primary_parent,
+            accepted_children,
+            pending,
+            generation,
+        })
+    }
+
+    /// Advance only this network's transport-lab parenting clock. This is a
+    /// deterministic expiry control and does not affect any other clock.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn advance_parenting_clock_for_lab(&self, delta_ms: u64) -> Result<()> {
+        self.state.advance_parenting_clock_for_lab(delta_ms)
+    }
+
+    /// Advance the parenting clock and return the effective relation snapshot
+    /// before a scheduler tick can begin paced reattachment.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn advance_parenting_clock_and_snapshot_for_lab(
+        &self,
+        delta_ms: u64,
+    ) -> Result<Option<ParentingSnapshotForLab>> {
+        let (primary_parent, accepted_children, pending, generation) = self
+            .state
+            .advance_parenting_clock_and_snapshot_for_lab(delta_ms)?
+            .expect("parenting clock snapshot exists when the clock is available");
+        Ok(Some(ParentingSnapshotForLab {
+            primary_parent,
+            accepted_children,
+            pending,
+            generation,
+        }))
+    }
+
+    /// Return bounded aggregate discovery progress without exposing cursor
+    /// identities, peer payloads, or an event history.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn hub_discovery_diagnostics_for_lab(&self) -> Option<HubDiscoveryDiagnosticsForLab> {
+        let snapshot = self.state.hub_discovery_diagnostics_for_lab()?;
+        Some(HubDiscoveryDiagnosticsForLab {
+            configured_hubs: snapshot.configured_hubs,
+            pending_requests: snapshot.pending_requests,
+            requests_started: snapshot.requests_started,
+            requests_bound: snapshot.requests_bound,
+            responses_accepted: snapshot.responses_accepted,
+            responses_rejected: snapshot.responses_rejected,
+            pages_accepted: snapshot.pages_accepted,
+            continuation_pages_accepted: snapshot.continuation_pages_accepted,
+            cursor_advances: snapshot.cursor_advances,
+            cursors_with_after: snapshot.cursors_with_after,
+            exploration_cursor: snapshot.exploration_cursor,
+            last_page_len: snapshot.last_page_len,
+            last_page_has_more: snapshot.last_page_has_more,
+            last_request_after: snapshot.last_request_after,
+            last_accepted_request_after: snapshot.last_accepted_request_after,
+            last_accepted_first: snapshot.last_accepted_first,
+            last_accepted_last: snapshot.last_accepted_last,
+            exploration_sequence: snapshot.exploration_sequence,
+            next_exploration_ms: snapshot.next_exploration_ms,
+        })
+    }
+
     /// Capture the exact current transport owner for one peer for a bounded
     /// transport-lab observation. The device id is used only for this initial
     /// lookup; the returned witness carries the installation and worker that
@@ -830,6 +933,22 @@ impl JoinedNetwork {
         witness: &crate::engine::transport_lab::TransportChannelWitness,
     ) -> Option<crate::engine::transport_lab::ChannelSnapshot> {
         crate::engine::transport_lab::transport_channel_snapshot(&self.state, witness).await
+    }
+
+    /// Request exact transport-channel terminal notification for a previously
+    /// captured owner.  Capture the witness before closing the link; this
+    /// method keeps the witness binding and delegates to the production
+    /// terminal fence.  Replacement, stale, and already-retired witnesses are
+    /// harmless.  Another live channel may preserve the logical session.  The
+    /// request does not promise synchronous registry removal; use the exact
+    /// snapshot helper to observe the terminal state.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn retire_transport_channel_for_lab(
+        &self,
+        witness: &crate::engine::transport_lab::TransportChannelWitness,
+    ) {
+        crate::engine::transport_lab::retire_transport_channel_for_lab(&self.state, witness).await;
     }
 
     /// Open an opaque endpoint channel from this member to `target` through
@@ -1422,6 +1541,46 @@ impl JoinedNetwork {
                 },
             )
     }
+}
+
+/// Fixed transport-lab observation of the local HubTree relation table.
+/// `primary_parent` contains the raw Ed25519 routing key; this type carries no
+/// authority, owner, or session capability and is unavailable in production.
+#[cfg(feature = "transport-lab")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentingSnapshotForLab {
+    pub primary_parent: Option<[u8; 32]>,
+    pub accepted_children: usize,
+    pub pending: usize,
+    pub generation: u64,
+}
+
+/// Fixed transport-lab observation of bounded HubController discovery
+/// progress. Cursor identities and directory payloads remain private.
+#[cfg(feature = "transport-lab")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HubDiscoveryDiagnosticsForLab {
+    pub configured_hubs: u64,
+    pub pending_requests: u64,
+    pub requests_started: u64,
+    pub requests_bound: u64,
+    pub responses_accepted: u64,
+    pub responses_rejected: u64,
+    pub pages_accepted: u64,
+    pub continuation_pages_accepted: u64,
+    pub cursor_advances: u64,
+    pub cursors_with_after: u64,
+    pub exploration_cursor: u64,
+    pub last_page_len: u16,
+    pub last_page_has_more: bool,
+    pub last_request_after: Option<[u8; 32]>,
+    pub last_accepted_request_after: Option<[u8; 32]>,
+    pub last_accepted_first: Option<[u8; 32]>,
+    pub last_accepted_last: Option<[u8; 32]>,
+    pub exploration_sequence: u64,
+    pub next_exploration_ms: u64,
 }
 
 /// User-facing snapshot of a peer's current view in the engine.

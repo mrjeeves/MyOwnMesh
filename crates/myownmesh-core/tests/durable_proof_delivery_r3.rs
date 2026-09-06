@@ -48,6 +48,9 @@ fn closed_config(id: &str) -> NetworkConfig {
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         routing_policy: RoutingPolicyConfig::default(),
+        hub: None,
+        local_observations: None,
+        tree: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
@@ -2651,9 +2654,9 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
         );
         while terminal_history.len() < target_count {
             let role = if terminal_history.len() % 2 == 0 {
-                myownmesh_core::semantic::Role::Member
-            } else {
                 myownmesh_core::semantic::Role::Controller
+            } else {
+                myownmesh_core::semantic::Role::Member
             };
             let fact = authored(
                 &terminal_graph,

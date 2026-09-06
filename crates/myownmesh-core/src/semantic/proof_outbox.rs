@@ -256,11 +256,15 @@ impl DurableProofOutbox {
     /// Enumerate only still-pending records for the exact authenticated
     /// context.  Settled records remain persisted so replay is idempotent.
     pub fn pending(&self, context_id: MeshContextId) -> Result<Vec<ProofRecord>, ProofOutboxError> {
-        Ok(self
-            .proof_records(context_id)?
-            .into_iter()
-            .filter(ProofRecord::is_pending)
-            .collect())
+        match &self.backend {
+            #[cfg(test)]
+            ProofOutboxBackend::Store(store) => store
+                .pending_proof_records(context_id)
+                .map_err(ProofOutboxError::from),
+            ProofOutboxBackend::Owner(owner) => owner
+                .pending_proof_records(context_id)
+                .map_err(ProofOutboxError::from),
+        }
     }
 
     /// Persist one exact pending/settled record.  Re-enqueuing the identical

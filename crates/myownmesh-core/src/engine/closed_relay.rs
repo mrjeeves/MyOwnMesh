@@ -333,6 +333,17 @@ impl EndpointSession {
         if self.0.closed.load(Ordering::Acquire) {
             return Err(ClosedRelayRefusal::OwnerNotLive);
         }
+        let state = self
+            .0
+            .state
+            .upgrade()
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+        // Check the captured owner and session witness before sealing.  A
+        // retained endpoint from W0 must not consume crypto state or enqueue
+        // an ambiguous packet after W1 has replaced its exact owner.
+        if !self.relay_owner_is_current(&state) {
+            return Err(ClosedRelayRefusal::OwnerNotLive);
+        }
         let packet = {
             let mut crypto = self.0.crypto.lock();
             match &mut *crypto {
@@ -342,11 +353,6 @@ impl EndpointSession {
                 EndpointCrypto::Closed => return Err(ClosedRelayRefusal::OwnerNotLive),
             }
         };
-        let state = self
-            .0
-            .state
-            .upgrade()
-            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
         let data = ClosedRelayData {
             version: crate::protocol::relay::CLOSED_RELAY_CONTROL_VERSION,
             context_id: self.0.context,
@@ -357,13 +363,17 @@ impl EndpointSession {
             allocation_epoch: self.0.allocation_epoch.load(Ordering::Acquire),
             packet,
         };
-        super::send_to_peer_owner(
+        match super::send_to_peer_owner(
             &state,
             &self.0.relay_owner,
             &crate::protocol::MeshMessage::ClosedRelayData(data),
         )
         .await
-        .map_err(|_| ClosedRelayRefusal::CarrierUnavailable)
+        {
+            Ok(()) => Ok(()),
+            Err(_) if !self.relay_owner_is_current(&state) => Err(ClosedRelayRefusal::OwnerNotLive),
+            Err(_) => Err(ClosedRelayRefusal::CarrierUnavailable),
+        }
     }
 
     pub(crate) async fn recv(&self) -> Result<Vec<u8>, ClosedRelayRefusal> {
@@ -2461,6 +2471,26 @@ fn checked_claim_bytes(value: usize) -> Result<u64, ClosedRelayRefusal> {
 }
 
 const CANONICAL_BASE32_BYTES: usize = (32 * 8 + 4) / 5;
+const CANONICAL_SIGNATURE_BYTES: usize = (ed25519_dalek::SIGNATURE_LENGTH * 8 + 4) / 5;
+
+/// Retained capacities of the four variable strings in one generated
+/// [`RelayKeyShare`]. The fixture planner receives this typed shape from the
+/// exact generated/serialized/decoded boundary; it does not invent a wire
+/// length or allocator capacity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosedRelayPendingShareCapacities {
+    pub mesh: usize,
+    pub from: usize,
+    pub to: usize,
+    pub signature: usize,
+}
+
+#[cfg(feature = "transport-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosedRelayPendingShareCapacityWitness {
+    pub capacities: ClosedRelayPendingShareCapacities,
+    pub decoded_lengths: ClosedRelayPendingShareCapacities,
+}
 
 fn endpoint_lease_claim(
     profile: &ClosedRelayPolicyConfig,
@@ -2469,6 +2499,13 @@ fn endpoint_lease_claim(
     _requester: &DeviceId,
     _relay: &DeviceId,
     _target: &DeviceId,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    endpoint_lease_claim_for_capacity(profile, capacity)
+}
+
+fn endpoint_lease_claim_for_capacity(
+    profile: &ClosedRelayPolicyConfig,
+    capacity: usize,
 ) -> Result<ResourceClaim, ClosedRelayRefusal> {
     let max_ciphertext =
         crate::runtime::relay::checked_ciphertext_ceiling(profile.max_frame_ciphertext_bytes)?;
@@ -2527,11 +2564,26 @@ fn pending_lease_claim(
     // only their visible lengths. The share has one mesh buffer; charging it
     // twice would create a false refusal without funding any additional
     // retained object.
-    let route_bytes = retained_route_bytes(authorization)?
-        .checked_add(requester_share.mesh.capacity())
-        .and_then(|bytes| bytes.checked_add(requester_share.from.capacity()))
-        .and_then(|bytes| bytes.checked_add(requester_share.to.capacity()))
-        .and_then(|bytes| bytes.checked_add(requester_share.signature.capacity()))
+    pending_lease_claim_for_capacities(
+        retained_route_bytes(authorization)?,
+        ClosedRelayPendingShareCapacities {
+            mesh: requester_share.mesh.capacity(),
+            from: requester_share.from.capacity(),
+            to: requester_share.to.capacity(),
+            signature: requester_share.signature.capacity(),
+        },
+    )
+}
+
+fn pending_lease_claim_for_capacities(
+    route_bytes: usize,
+    capacities: ClosedRelayPendingShareCapacities,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    let route_bytes = route_bytes
+        .checked_add(capacities.mesh)
+        .and_then(|bytes| bytes.checked_add(capacities.from))
+        .and_then(|bytes| bytes.checked_add(capacities.to))
+        .and_then(|bytes| bytes.checked_add(capacities.signature))
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let accounted = std::mem::size_of::<ClosedRelayPending>()
         .checked_add(route_bytes)
@@ -2556,7 +2608,12 @@ fn pending_lease_claim(
 fn allocation_lease_claim(
     authorization: &ClosedRelayAuthorization,
 ) -> Result<ResourceClaim, ClosedRelayRefusal> {
-    let route_bytes = retained_route_bytes(authorization)?;
+    allocation_lease_claim_for_route_bytes(retained_route_bytes(authorization)?)
+}
+
+fn allocation_lease_claim_for_route_bytes(
+    route_bytes: usize,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
     let checkout_route_bytes = 0usize;
     let accounted = std::mem::size_of::<ClosedRelaySlot>()
         .checked_add(route_bytes)
@@ -2586,6 +2643,277 @@ fn retained_route_bytes(
     // MeshContextId is inline and DeviceId clones share the process interner;
     // no route string is retained by ClosedRelayAuthorization or its clones.
     Ok(0)
+}
+
+/// Exact reservation counts for one bounded transport-lab Closed-relay
+/// lifecycle. Counts describe reservations that may be constructed over the
+/// whole control, rather than only the steady-state overlap at one instant;
+/// each count remains constrained by the corresponding production table
+/// policy. `pending_leases` is the concurrent pending bound (one in the
+/// current five-open construction), while expiry-task reservations account for
+/// the bounded terminal history observed over the lifecycle.
+#[cfg(feature = "transport-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosedRelayFixtureWorkload {
+    pub network_roots: std::num::NonZeroU64,
+    pub endpoint_leases: std::num::NonZeroU64,
+    pub pending_leases: std::num::NonZeroU64,
+    pub engine_allocations: std::num::NonZeroU64,
+    pub runtime_allocations: std::num::NonZeroU64,
+    pub pending_expiry_tasks: std::num::NonZeroU64,
+    /// Capacities observed after the generated key share crosses its wire
+    /// serializer and production decoder.
+    pub pending_share: ClosedRelayPendingShareCapacities,
+}
+
+/// Named provider-charge components for a Closed-relay fixture. Each field is
+/// already reservation-planned and can therefore be added directly to the
+/// existing connector/session/JSON grant. `total` is the checked sum of every
+/// component; no provider class is padded or silently omitted.
+#[cfg(feature = "transport-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosedRelayFixtureGrant {
+    pub runtime_roots: ResourceClaim,
+    pub engine_roots: ResourceClaim,
+    pub endpoint_leases: ResourceClaim,
+    pub pending_leases: ResourceClaim,
+    pub engine_allocations: ResourceClaim,
+    pub runtime_allocations: ResourceClaim,
+    pub pending_expiry_tasks: ResourceClaim,
+    pub total: ResourceClaim,
+}
+
+#[cfg(feature = "transport-lab")]
+/// Generate one production key share, pass it through the exact JSON wire
+/// serializer/decoder used at the control boundary, and expose the decoded
+/// string capacities for fixture planning. This is an observation helper; it
+/// creates no authorization, session, or provider reservation.
+pub fn transport_lab_pending_share_capacity_witness(
+    identity: &crate::Identity,
+    mesh: MeshContextId,
+    peer_id: DeviceId,
+    relay_id: DeviceId,
+    session_id: [u8; 16],
+    profile: &ClosedRelayPolicyConfig,
+) -> crate::Result<ClosedRelayPendingShareCapacityWitness> {
+    let (_pending, generated) =
+        PendingEndpointKeyAgreement::begin(identity, mesh, peer_id.clone(), session_id, profile)
+            .map_err(|error| {
+                crate::Error::Transport(format!(
+                    "generated Closed-relay key-share witness failed: {error}"
+                ))
+            })?;
+    generated.validate().map_err(|error| {
+        crate::Error::Transport(format!(
+            "generated Closed-relay key-share witness is invalid: {error}"
+        ))
+    })?;
+    let requester = DeviceId::from_canonical_str(identity.public_id()).map_err(|error| {
+        crate::Error::Transport(format!(
+            "generated Closed-relay requester id is not canonical: {error}"
+        ))
+    })?;
+    let wire_value = crate::protocol::MeshMessage::ClosedRelayControl(ClosedRelayControl::Open {
+        version: generated.version,
+        context_id: mesh,
+        requester,
+        relay: relay_id,
+        target: peer_id,
+        session_id,
+        requester_share: generated.clone(),
+    });
+    let wire = serde_json::to_vec(&wire_value).map_err(|error| {
+        crate::Error::Transport(format!(
+            "generated Closed-relay key-share serialization failed: {error}"
+        ))
+    })?;
+    let decoded_message: crate::protocol::MeshMessage =
+        serde_json::from_slice(&wire).map_err(|error| {
+            crate::Error::Transport(format!(
+                "decoded Closed-relay key-share witness failed: {error}"
+            ))
+        })?;
+    let crate::protocol::MeshMessage::ClosedRelayControl(ClosedRelayControl::Open {
+        requester_share: decoded,
+        ..
+    }) = decoded_message
+    else {
+        return Err(crate::Error::Transport(
+            "decoded Closed-relay witness changed message kind".into(),
+        ));
+    };
+    if generated.mesh != decoded.mesh
+        || generated.from != decoded.from
+        || generated.to != decoded.to
+        || generated.signature != decoded.signature
+    {
+        return Err(crate::Error::Transport(
+            "key-share serialization changed a retained string".into(),
+        ));
+    }
+    decoded.validate().map_err(|error| {
+        crate::Error::Transport(format!(
+            "decoded Closed-relay key-share witness is invalid: {error}"
+        ))
+    })?;
+    let capacities = ClosedRelayPendingShareCapacities {
+        mesh: decoded.mesh.capacity(),
+        from: decoded.from.capacity(),
+        to: decoded.to.capacity(),
+        signature: decoded.signature.capacity(),
+    };
+    let decoded_lengths = ClosedRelayPendingShareCapacities {
+        mesh: decoded.mesh.len(),
+        from: decoded.from.len(),
+        to: decoded.to.len(),
+        signature: decoded.signature.len(),
+    };
+    if capacities.mesh < decoded_lengths.mesh
+        || capacities.from < decoded_lengths.from
+        || capacities.to < decoded_lengths.to
+        || capacities.signature < decoded_lengths.signature
+    {
+        return Err(crate::Error::Transport(
+            "decoded Closed-relay key-share capacity is below its length".into(),
+        ));
+    }
+    Ok(ClosedRelayPendingShareCapacityWitness {
+        capacities,
+        decoded_lengths,
+    })
+}
+
+#[cfg(feature = "transport-lab")]
+fn transport_lab_claim_error(label: &'static str, error: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Transport(format!(
+        "closed relay fixture {label} claim is not representable: {error}"
+    ))
+}
+
+#[cfg(feature = "transport-lab")]
+fn transport_lab_scaled_reservation(
+    label: &'static str,
+    claim: Result<ResourceClaim, ClosedRelayRefusal>,
+    count: std::num::NonZeroU64,
+) -> crate::Result<ResourceClaim> {
+    let claim = claim.map_err(|error| transport_lab_claim_error(label, error))?;
+    let reserved = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+        .map_err(|error| transport_lab_claim_error(label, error))?;
+    reserved
+        .checked_scale(count.get())
+        .map_err(|error| transport_lab_claim_error(label, error))
+}
+
+#[cfg(feature = "transport-lab")]
+fn transport_lab_add_component(
+    total: &mut ResourceClaim,
+    component: ResourceClaim,
+    label: &'static str,
+) -> crate::Result<()> {
+    *total = total
+        .checked_add(component)
+        .map_err(|error| transport_lab_claim_error(label, error))?;
+    Ok(())
+}
+
+/// Plan every Closed-relay reservation used by a bounded transport-lab
+/// lifecycle. This is pure arithmetic: it constructs no owner, session,
+/// authorization, task, or provider reservation. The production claim
+/// formulas remain the source of every component.
+#[cfg(feature = "transport-lab")]
+pub fn transport_lab_closed_relay_fixture_grant(
+    profile: &ClosedRelayPolicyConfig,
+    workload: ClosedRelayFixtureWorkload,
+) -> crate::Result<ClosedRelayFixtureGrant> {
+    if !profile.enabled || !profile.validate() {
+        return Err(transport_lab_claim_error(
+            "profile",
+            "disabled or invalid Closed-relay policy",
+        ));
+    }
+    if workload.endpoint_leases.get() > profile.max_allocations
+        || workload.engine_allocations.get() > profile.max_allocations
+        || workload.runtime_allocations.get() > profile.max_allocations
+    {
+        return Err(transport_lab_claim_error(
+            "workload",
+            "allocation reservation count exceeds max_allocations",
+        ));
+    }
+    if workload.pending_leases.get() > profile.max_pending_handshakes
+        || workload.pending_expiry_tasks.get() > profile.max_pending_handshakes
+    {
+        return Err(transport_lab_claim_error(
+            "workload",
+            "pending reservation count exceeds max_pending_handshakes",
+        ));
+    }
+    let pending_share = pending_lease_claim_for_capacities(0, workload.pending_share);
+    let expiry =
+        super::state::transport_lab_closed_relay_pending_expiry_claim().map_err(|error| {
+            crate::Error::Transport(format!(
+                "closed relay fixture pending-expiry claim is not representable: {error}"
+            ))
+        })?;
+    let runtime_roots = transport_lab_scaled_reservation(
+        "runtime root",
+        ClosedRelayRuntime::runtime_claim(profile),
+        workload.network_roots,
+    )?;
+    let engine_roots = transport_lab_scaled_reservation(
+        "engine root",
+        ClosedRelayEngineRoot::root_claim(profile),
+        workload.network_roots,
+    )?;
+    let endpoint_leases = transport_lab_scaled_reservation(
+        "endpoint",
+        endpoint_lease_claim_for_capacity(
+            profile,
+            usize::try_from(profile.queue_items_per_direction)
+                .map_err(|error| transport_lab_claim_error("endpoint capacity", error))?,
+        ),
+        workload.endpoint_leases,
+    )?;
+    let pending_leases =
+        transport_lab_scaled_reservation("pending", pending_share, workload.pending_leases)?;
+    let engine_allocations = transport_lab_scaled_reservation(
+        "engine allocation",
+        allocation_lease_claim_for_route_bytes(0),
+        workload.engine_allocations,
+    )?;
+    let runtime_allocations = transport_lab_scaled_reservation(
+        "runtime allocation",
+        RelayAllocationPermit::allocation_claim(profile),
+        workload.runtime_allocations,
+    )?;
+    let pending_expiry_tasks =
+        crate::resource::FiniteResourceProvider::reservation_planning_charge(expiry)
+            .map_err(|error| transport_lab_claim_error("pending expiry", error))?
+            .checked_scale(workload.pending_expiry_tasks.get())
+            .map_err(|error| transport_lab_claim_error("pending expiry", error))?;
+
+    let mut total = ResourceClaim::ZERO;
+    for (label, component) in [
+        ("runtime roots", runtime_roots),
+        ("engine roots", engine_roots),
+        ("endpoint leases", endpoint_leases),
+        ("pending leases", pending_leases),
+        ("engine allocations", engine_allocations),
+        ("runtime allocations", runtime_allocations),
+        ("pending expiry tasks", pending_expiry_tasks),
+    ] {
+        transport_lab_add_component(&mut total, component, label)?;
+    }
+    Ok(ClosedRelayFixtureGrant {
+        runtime_roots,
+        engine_roots,
+        endpoint_leases,
+        pending_leases,
+        engine_allocations,
+        runtime_allocations,
+        pending_expiry_tasks,
+        total,
+    })
 }
 
 fn max_frame_ciphertext(state: &NetworkState) -> Result<usize, ClosedRelayRefusal> {
@@ -3782,5 +4110,225 @@ mod tests {
         let waker = std::task::Waker::noop();
         let mut context = std::task::Context::from_waker(waker);
         assert!(registered.poll(&mut context).is_ready());
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn fixture_grant_components_are_checked_and_charge_each_reservation_once() {
+        let profile = ClosedRelayPolicyConfig {
+            enabled: true,
+            ..ClosedRelayPolicyConfig::default()
+        };
+        let workload = ClosedRelayFixtureWorkload {
+            network_roots: std::num::NonZeroU64::new(3).expect("three roots"),
+            endpoint_leases: std::num::NonZeroU64::new(10).expect("ten endpoints"),
+            pending_leases: std::num::NonZeroU64::new(1).expect("one pending lease"),
+            engine_allocations: std::num::NonZeroU64::new(5).expect("five engine allocations"),
+            runtime_allocations: std::num::NonZeroU64::new(5).expect("five runtime allocations"),
+            pending_expiry_tasks: std::num::NonZeroU64::new(5).expect("five expiry tasks"),
+            pending_share: ClosedRelayPendingShareCapacities {
+                mesh: CANONICAL_BASE32_BYTES,
+                from: CANONICAL_BASE32_BYTES,
+                to: CANONICAL_BASE32_BYTES,
+                signature: CANONICAL_SIGNATURE_BYTES,
+            },
+        };
+        let grant = transport_lab_closed_relay_fixture_grant(&profile, workload)
+            .expect("fixture claim is representable");
+        let components = [
+            grant.runtime_roots,
+            grant.engine_roots,
+            grant.endpoint_leases,
+            grant.pending_leases,
+            grant.engine_allocations,
+            grant.runtime_allocations,
+            grant.pending_expiry_tasks,
+        ]
+        .into_iter()
+        .try_fold(ResourceClaim::ZERO, |total, component| {
+            total.checked_add(component)
+        })
+        .expect("component sum is representable");
+        assert_eq!(components, grant.total);
+        assert_eq!(
+            grant.total.amount(ResourceClass::RelayOrProviderAllocation),
+            21
+        );
+        let plan = |raw: Result<ResourceClaim, ClosedRelayRefusal>, count: std::num::NonZeroU64| {
+            crate::resource::FiniteResourceProvider::reservation_planning_charge(
+                raw.expect("raw Closed-relay claim is representable"),
+            )
+            .expect("reservation bookkeeping is representable")
+            .checked_scale(count.get())
+            .expect("scaled reservation is representable")
+        };
+        assert_eq!(
+            grant.runtime_roots,
+            plan(
+                ClosedRelayRuntime::runtime_claim(&profile),
+                workload.network_roots,
+            )
+        );
+        assert_eq!(
+            grant.engine_roots,
+            plan(
+                ClosedRelayEngineRoot::root_claim(&profile),
+                workload.network_roots,
+            )
+        );
+        assert_eq!(
+            grant.endpoint_leases,
+            plan(
+                endpoint_lease_claim_for_capacity(
+                    &profile,
+                    usize::try_from(profile.queue_items_per_direction)
+                        .expect("endpoint capacity fits usize"),
+                ),
+                workload.endpoint_leases,
+            )
+        );
+        assert_eq!(
+            grant.pending_leases,
+            plan(
+                pending_lease_claim_for_capacities(0, workload.pending_share),
+                workload.pending_leases,
+            )
+        );
+        assert_eq!(
+            grant.engine_allocations,
+            plan(
+                allocation_lease_claim_for_route_bytes(0),
+                workload.engine_allocations,
+            )
+        );
+        assert_eq!(
+            grant.runtime_allocations,
+            plan(
+                RelayAllocationPermit::allocation_claim(&profile),
+                workload.runtime_allocations,
+            )
+        );
+        let expected_expiry = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            crate::engine::state::transport_lab_closed_relay_pending_expiry_claim()
+                .expect("expiry claim is representable"),
+        )
+        .expect("expiry reservation bookkeeping is representable")
+        .checked_scale(workload.pending_expiry_tasks.get())
+        .expect("scaled expiry reservation is representable");
+        assert_eq!(grant.pending_expiry_tasks, expected_expiry);
+
+        let base = workload.pending_share;
+        for (label, bumped) in [
+            (
+                "mesh",
+                ClosedRelayPendingShareCapacities {
+                    mesh: base.mesh.checked_add(1).expect("mesh bump fits"),
+                    ..base
+                },
+            ),
+            (
+                "from",
+                ClosedRelayPendingShareCapacities {
+                    from: base.from.checked_add(1).expect("from bump fits"),
+                    ..base
+                },
+            ),
+            (
+                "to",
+                ClosedRelayPendingShareCapacities {
+                    to: base.to.checked_add(1).expect("to bump fits"),
+                    ..base
+                },
+            ),
+            (
+                "signature",
+                ClosedRelayPendingShareCapacities {
+                    signature: base.signature.checked_add(1).expect("signature bump fits"),
+                    ..base
+                },
+            ),
+        ] {
+            let before = pending_lease_claim_for_capacities(0, base)
+                .expect("base pending claim is representable");
+            let after = pending_lease_claim_for_capacities(0, bumped)
+                .expect("capacity+1 pending claim is representable");
+            assert_eq!(
+                after.amount(ResourceClass::AccountedMemoryBytes),
+                before.amount(ResourceClass::AccountedMemoryBytes) + 1,
+                "{label} capacity+1 changes retained byte accounting"
+            );
+            assert_eq!(
+                after.amount(ResourceClass::OpaqueDependencyResidual),
+                before.amount(ResourceClass::OpaqueDependencyResidual),
+                "{label} capacity+1 does not double provider bookkeeping"
+            );
+            let bumped_grant = transport_lab_closed_relay_fixture_grant(
+                &profile,
+                ClosedRelayFixtureWorkload {
+                    pending_share: bumped,
+                    ..workload
+                },
+            )
+            .expect("planner accepts the explicitly increased retained capacity");
+            let additional_bytes = ResourceClaim::try_from_entries([(
+                ResourceClass::AccountedMemoryBytes,
+                workload.pending_leases.get(),
+            )])
+            .expect("one extra byte per pending reservation is representable");
+            let mut expected = grant;
+            expected.pending_leases = expected
+                .pending_leases
+                .checked_add(additional_bytes)
+                .expect("pending capacity increment fits");
+            expected.total = expected
+                .total
+                .checked_add(additional_bytes)
+                .expect("total capacity increment fits");
+            assert_eq!(
+                bumped_grant, expected,
+                "{label} capacity reaches the planner; all other components and bookkeeping stay unchanged"
+            );
+        }
+        assert!(
+            pending_lease_claim_for_capacities(
+                0,
+                ClosedRelayPendingShareCapacities {
+                    mesh: usize::MAX,
+                    from: 1,
+                    to: 0,
+                    signature: 0,
+                },
+            )
+            .is_err(),
+            "pending capacity overflow is refused before claim construction"
+        );
+        assert!(
+            transport_lab_closed_relay_fixture_grant(
+                &profile,
+                ClosedRelayFixtureWorkload {
+                    pending_share: ClosedRelayPendingShareCapacities {
+                        mesh: usize::MAX,
+                        from: 1,
+                        to: 0,
+                        signature: 0,
+                    },
+                    ..workload
+                },
+            )
+            .is_err(),
+            "planner must consume and refuse the overflowing capacity input"
+        );
+        let mut oversized = workload;
+        oversized.endpoint_leases = std::num::NonZeroU64::new(
+            profile
+                .max_allocations
+                .checked_add(1)
+                .expect("default allocation bound leaves an oversized test value"),
+        )
+        .expect("oversized count");
+        assert!(
+            transport_lab_closed_relay_fixture_grant(&profile, oversized).is_err(),
+            "workload over the production allocation table is refused before planning"
+        );
     }
 }

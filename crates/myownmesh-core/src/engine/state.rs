@@ -4,7 +4,7 @@
 //! command queue so the driver loop owns serial access.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -74,6 +74,7 @@ use crate::resource::{
 };
 use crate::roster::Roster;
 use crate::runtime::session_broker::SessionBroker;
+use crate::semantic::DeviceId;
 use crate::topology::Topology;
 use crate::transport::webrtc::{
     RealtimeDirection, RealtimeFlowError, RealtimeFlowName, RealtimeFlowRemains,
@@ -112,6 +113,17 @@ struct PeerEventPumpRegistry {
     handles: Vec<JoinHandle<()>>,
     pending_registrations: usize,
     closed: bool,
+}
+
+/// One exact child-side HubTree registration retained until its matching
+/// response arrives.  The owner token and parenting witness are deliberately
+/// kept together so a replacement cannot inherit the pending relation.
+struct PendingParentAttach {
+    owner: PeerOwnerToken,
+    witness: super::parenting::ParentOwnerWitness,
+    ticket: super::parenting::ParentAttachTicket,
+    request: super::parenting::ParentAttachRequest,
+    wire_request: crate::protocol::HubTreeAttachRequest,
 }
 
 /// Joinable tasks admitted by an exact shutdown mutation witness.  The
@@ -807,6 +819,19 @@ fn closed_relay_pending_expiry_claim(
     .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)
 }
 
+/// Transport-lab access to the production pending-expiry reservation formula.
+/// The fixture planner must price the same future/control/task custody before
+/// an expiry task is constructed; it must not duplicate its private type-size
+/// arithmetic in an integration test.
+#[cfg(feature = "transport-lab")]
+pub(crate) fn transport_lab_closed_relay_pending_expiry_claim() -> Result<ResourceClaim> {
+    closed_relay_pending_expiry_claim().map_err(|error| {
+        Error::Transport(format!(
+            "closed relay pending-expiry claim is not representable: {error}"
+        ))
+    })
+}
+
 /// Acquire the exact shared reservation before constructing the control or
 /// its `Notify`.  The production state and the bounded provider controls both
 /// use this helper, so a refusal is observed before any control/task object is
@@ -918,6 +943,44 @@ pub struct NetworkState {
     /// Its child resource scope makes every retained replay identity part of
     /// this network's provider-funded lifetime rather than an unfunded cache.
     pub(crate) routing: super::routing::RoutingState,
+    pub(crate) hub_dial_cursor: AtomicUsize,
+
+    /// Optional owner-funded hub advertisement scheduler. Spokes retain this
+    /// controller for exact inbound owner/replay checks even when they do not
+    /// emit advertisements themselves.
+    pub(crate) hub: Option<Mutex<super::hub::HubController>>,
+    /// Optional funded HubTree relation owner.  Its local policy and digest
+    /// are fixed for this NetworkState lifetime; topology replacement must
+    /// restart the owner before changing either.
+    parenting:
+        Option<Mutex<super::parenting::ParentingState<super::parenting::MonotonicParentingClock>>>,
+    parenting_local: Option<super::parenting::ParentDeviceKey>,
+    parenting_root: Option<super::parenting::ParentDeviceKey>,
+    parenting_hubs: Box<[DeviceId]>,
+    parenting_backup_candidates: u32,
+    parenting_digest: Option<[u8; 32]>,
+    parenting_role: Option<super::parenting::ParentingRole>,
+    parenting_next_sequence: AtomicU64,
+    /// One bounded rendezvous-order cursor for paced parent alternatives.
+    /// It is a selector cursor only; relation admission still requires the
+    /// exact authenticated owner and a ParentingState ticket.
+    parenting_target_after: Mutex<Option<DeviceId>>,
+    parenting_pending: Mutex<Option<PendingParentAttach>>,
+    /// Declared after the retained parenting payload so the root reservation
+    /// remains live until those payloads have been dropped.
+    _parenting_root_lease: Option<ResourceLease>,
+    /// Optional node-local observation aggregate. It is diagnostic-only and
+    /// cannot affect semantic admission, routing, or wire behavior.
+    pub(crate) local_observation: Option<
+        Mutex<
+            super::local_observation::LocalObservationGraph<
+                super::local_observation::MonotonicObservationClock,
+            >,
+        >,
+    >,
+    /// Fixed inline graph custody, separate from per-entry map reservations.
+    /// This lease is acquired before the graph or its child scope is created.
+    _local_observation_root_lease: Option<ResourceLease>,
 
     pub(crate) peers: PeerRegistry,
     pub roster: RwLock<Roster>,
@@ -1494,6 +1557,242 @@ impl NetworkState {
             crate::resource::resource_mailbox(local_resources.child()?)?;
         let session_broker = transport.session_broker();
         let local_device_id = identity.public_id().to_string();
+        let (
+            parenting,
+            parenting_root_lease,
+            parenting_local,
+            parenting_root,
+            parenting_hubs,
+            parenting_backup_candidates,
+            parenting_digest,
+            parenting_role,
+        ) = match &effective_topology {
+            TopologyMode::HubTree {
+                root,
+                hubs,
+                backup_candidates,
+            } => {
+                let tree = config.tree.ok_or_else(|| {
+                    Error::Network("HubTree requires an explicit local tree policy".into())
+                })?;
+                let hub_policy = config.hub.ok_or_else(|| {
+                    Error::Network("HubTree requires an explicit hub timing/profile policy".into())
+                })?;
+                let max_children = usize::try_from(tree.max_children).map_err(|_| {
+                    Error::Network("HubTree max_children does not fit usize".into())
+                })?;
+                let max_backups = usize::try_from(tree.max_backups)
+                    .map_err(|_| Error::Network("HubTree max_backups does not fit usize".into()))?;
+                let max_pending = usize::try_from(tree.max_pending)
+                    .map_err(|_| Error::Network("HubTree max_pending does not fit usize".into()))?;
+                // Semantic DeviceId interning retains canonical identity
+                // backing that is not represented by size_of::<DeviceId>().
+                // Charge the raw canonical text before parsing/interning it;
+                // the fixed handle slice and pending wrapper are charged in
+                // the same root lease, while the child scope is charged by
+                // LocalApplicationResourceScope::child below.
+                let identity_bytes = hubs
+                    .iter()
+                    .try_fold(root.len(), |bytes, hub| bytes.checked_add(hub.len()))
+                    .and_then(|bytes| bytes.checked_add(local_device_id.len()))
+                    .ok_or_else(|| Error::Network("HubTree identity backing overflows".into()))?;
+                let hub_backing_bytes = hubs
+                    .len()
+                    .checked_mul(std::mem::size_of::<DeviceId>())
+                    .ok_or_else(|| Error::Network("HubTree hub backing overflows".into()))?;
+                let pending_backing_bytes = max_pending
+                    .checked_mul(std::mem::size_of::<PendingParentAttach>())
+                    .ok_or_else(|| Error::Network("HubTree pending backing overflows".into()))?;
+                let root_bytes = std::mem::size_of::<
+                    super::parenting::ParentingState<super::parenting::MonotonicParentingClock>,
+                >()
+                .checked_add(hub_backing_bytes)
+                .and_then(|bytes| bytes.checked_add(pending_backing_bytes))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Mutex<Option<DeviceId>>>()))
+                .and_then(|bytes| bytes.checked_add(identity_bytes))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or_else(|| Error::Network("HubTree root size overflows u64".into()))?;
+                let root_claim =
+                    ResourceClaim::single(ResourceClass::AccountedMemoryBytes, root_bytes);
+                let root_lease = local_resources.acquire(root_claim).map_err(|error| {
+                    Error::Network(format!("HubTree root resource refusal: {error}"))
+                })?;
+                let local = DeviceId::from_canonical_str(&local_device_id)
+                    .map_err(|_| Error::Network("local identity is not canonical".into()))?;
+                let root_device = DeviceId::from_canonical_str(root)
+                    .map_err(|_| Error::Network("HubTree root is not canonical".into()))?;
+                let mut local_is_hub = false;
+                for hub in hubs {
+                    let hub = DeviceId::from_canonical_str(hub)
+                        .map_err(|_| Error::Network("HubTree hub is not canonical".into()))?;
+                    if hub == root_device {
+                        return Err(Error::Network(
+                            "HubTree root cannot also be a configured hub".into(),
+                        ));
+                    }
+                    local_is_hub |= hub == local;
+                }
+                let role = if local == root_device {
+                    super::parenting::ParentingRole::Root
+                } else if local_is_hub {
+                    super::parenting::ParentingRole::Hub(1)
+                } else {
+                    super::parenting::ParentingRole::Leaf
+                };
+                let role_root = super::parenting::ParentDeviceKey::from_device(&root_device);
+                let role_local = super::parenting::ParentDeviceKey::from_device(&local);
+                let trickle = crate::protocol::HubTrickleProfile::new(
+                    hub_policy.trickle_imin_ms,
+                    hub_policy.trickle_imax_ms,
+                    u64::from(hub_policy.trickle_redundancy),
+                    hub_policy.trickle_reset_window_ms,
+                    u64::from(hub_policy.trickle_max_resets_per_window),
+                );
+                let mut policy = super::parenting::ParentingPolicy {
+                    local: role_local,
+                    root: role_root,
+                    role,
+                    max_hub_tier: 1,
+                    max_children,
+                    max_backups,
+                    max_pending,
+                    max_age_ticks: tree.max_age_ms,
+                    context_id: *mesh_context_id.as_bytes(),
+                    configuration_digest: [0; 32],
+                };
+                let planned = super::parenting::ParentingState::<
+                    super::parenting::MonotonicParentingClock,
+                >::planned_retained_claim(policy)
+                .map_err(|error| Error::Network(format!("HubTree claim rejected: {error}")))?;
+                // `planned` is the pure shape check for future per-relation
+                // leases.  Those leases are acquired by ParentingState on
+                // insertion; including them here would reserve the same
+                // dynamic custody twice.
+                let _ = root_claim
+                    .checked_add(planned)
+                    .map_err(|_| Error::Network("HubTree planned claim overflows".into()))?;
+                let scope = local_resources.child().map_err(|error| {
+                    Error::Network(format!("HubTree resource scope refused: {error}"))
+                })?;
+                let mut configured_hubs = hubs
+                    .iter()
+                    .map(|hub| {
+                        DeviceId::from_canonical_str(hub)
+                            .map_err(|_| Error::Network("HubTree hub is not canonical".into()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                configured_hubs.sort();
+                configured_hubs.dedup();
+                let digest = crate::protocol::hub_tree_configuration_digest(
+                    mesh_context_id,
+                    crate::protocol::HubTreeTopologyKind::ShallowV1,
+                    &root_device,
+                    &configured_hubs,
+                    *backup_candidates,
+                    trickle,
+                );
+                policy.configuration_digest = digest;
+                let state = super::parenting::ParentingState::new(
+                    scope,
+                    policy,
+                    super::parenting::MonotonicParentingClock::new(),
+                )
+                .map_err(|error| Error::Network(format!("HubTree policy rejected: {error}")))?;
+                (
+                    Some(Mutex::new(state)),
+                    Some(root_lease),
+                    Some(role_local),
+                    Some(role_root),
+                    configured_hubs.into_boxed_slice(),
+                    *backup_candidates,
+                    Some(digest),
+                    Some(role),
+                )
+            }
+            _ => (
+                None,
+                None,
+                None,
+                None,
+                Vec::new().into_boxed_slice(),
+                0,
+                None,
+                None,
+            ),
+        };
+        let hub = match config.hub {
+            Some(policy) => {
+                let local_device = crate::semantic::DeviceId::from_canonical_str(&local_device_id)
+                    .map_err(|_| {
+                        Error::Network("local identity is not a canonical DeviceId".into())
+                    })?;
+                super::hub::HubController::new(
+                    policy,
+                    &effective_topology,
+                    mesh_context_id,
+                    local_device,
+                    &local_resources,
+                )?
+                .map(|controller| Mutex::new(controller))
+            }
+            None => None,
+        };
+        let (local_observation, local_observation_root_lease) = match config.local_observations {
+            Some(policy) => {
+                let limits = super::local_observation::LocalObservationLimits {
+                    max_records: usize::try_from(policy.max_records).map_err(|_| {
+                        Error::Network("local observation max_records does not fit usize".into())
+                    })?,
+                    max_records_per_subject: usize::try_from(policy.max_records_per_subject)
+                        .map_err(|_| {
+                            Error::Network(
+                                "local observation max_records_per_subject does not fit usize"
+                                    .into(),
+                            )
+                        })?,
+                    max_age_ticks: policy.max_age_ms,
+                    max_maintenance_work: usize::try_from(policy.max_maintenance_per_tick)
+                        .map_err(|_| {
+                            Error::Network(
+                                "local observation max_maintenance_per_tick does not fit usize"
+                                    .into(),
+                            )
+                        })?,
+                };
+                type LocalObservationGraph = super::local_observation::LocalObservationGraph<
+                    super::local_observation::MonotonicObservationClock,
+                >;
+                let graph_bytes = u64::try_from(std::mem::size_of::<LocalObservationGraph>())
+                    .map_err(|_| {
+                        Error::Network("local observation graph size overflows u64".into())
+                    })?;
+                let graph_lease = local_resources
+                    .acquire(ResourceClaim::single(
+                        ResourceClass::AccountedMemoryBytes,
+                        graph_bytes,
+                    ))
+                    .map_err(|error| {
+                        Error::Network(format!("local observation graph resource refusal: {error}"))
+                    })?;
+                let scope = local_resources.child().map_err(|error| {
+                    Error::Network(format!("local observation resource scope refused: {error}"))
+                })?;
+                (
+                    Some(Mutex::new(
+                        super::local_observation::LocalObservationGraph::new(
+                            scope,
+                            limits,
+                            super::local_observation::MonotonicObservationClock::new(),
+                        )
+                        .map_err(|error| {
+                            Error::Network(format!("local observation policy rejected: {error}"))
+                        })?,
+                    )),
+                    Some(graph_lease),
+                )
+            }
+            None => (None, None),
+        };
         let (closed_relay_runtime, closed_relay_root) = if config.closed_relay.enabled {
             let profile_is_supported = matches!(
                 verified_bootstrap.policy(),
@@ -1594,6 +1893,21 @@ impl NetworkState {
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
             routing,
+            hub_dial_cursor: AtomicUsize::new(0),
+            hub,
+            parenting,
+            _parenting_root_lease: parenting_root_lease,
+            parenting_local,
+            parenting_root,
+            parenting_hubs,
+            parenting_backup_candidates,
+            parenting_digest,
+            parenting_role,
+            parenting_next_sequence: AtomicU64::new(1),
+            parenting_target_after: Mutex::new(None),
+            parenting_pending: Mutex::new(None),
+            local_observation,
+            _local_observation_root_lease: local_observation_root_lease,
             peers: PeerRegistry::new(local_device_id),
             roster: RwLock::new(roster),
             fact_graph,
@@ -3021,6 +3335,20 @@ impl NetworkState {
         self.durable_semantic_owner
             .ensure_live()
             .map_err(|error| Error::Network(format!("durable semantic owner unavailable: {error}")))
+    }
+
+    /// Arm one owner-scoped semantic commit fault for the next non-empty
+    /// durable delta.  The store owns the one-shot state and exact commit
+    /// boundary; this facade does not duplicate or bypass that custody.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn arm_semantic_commit_fault_for_lab(
+        &self,
+        fault: crate::semantic::store::SemanticCommitFaultForLab,
+    ) -> Result<()> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .arm_commit_injection(fault)
+            .map_err(|error| Error::Network(format!("semantic commit fault arm: {error}")))
     }
 
     /// Admit one canonical fact through a journal under the publication gate.
@@ -4785,6 +5113,44 @@ impl NetworkState {
         self.signaling_tx.close();
     }
 
+    /// Emit a bounded shutdown breadcrumb for transport-lab qualification.
+    /// The identity disambiguates several fixtures that intentionally share a
+    /// network id; counts expose custody at the exact await without retaining
+    /// any history or changing shutdown behavior.
+    fn log_shutdown_phase(&self, phase: &'static str) {
+        #[cfg(feature = "transport-lab")]
+        {
+            let shutdown_mutations = *self.shutdown_mutations.lock();
+            let shutdown_tasks = self
+                .shutdown_tasks
+                .lock()
+                .as_ref()
+                .map_or(0, |tasks| tasks.handles.len());
+            let (event_pumps, pending_registrations) = {
+                let pumps = self.peer_event_pumps.lock();
+                (pumps.handles.len(), pumps.pending_registrations)
+            };
+            self.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "shutdown",
+                format!(
+                    "shutdown phase {phase} local_device={} peers={} mutations={shutdown_mutations} tasks={shutdown_tasks} pumps={event_pumps} pending_pumps={pending_registrations}",
+                    self.identity.public_id(),
+                    self.peers.len(),
+                ),
+                serde_json::json!({
+                    "local_device": self.identity.public_id(),
+                    "phase": phase,
+                    "peer_count": self.peers.len(),
+                    "shutdown_mutations": shutdown_mutations,
+                    "shutdown_tasks": shutdown_tasks,
+                    "event_pumps": event_pumps,
+                    "pending_event_pump_registrations": pending_registrations,
+                }),
+            );
+        }
+    }
+
     async fn await_shutdown_mutations(&self) {
         loop {
             let notified = self.shutdown_mutations_ready.notified();
@@ -6391,18 +6757,904 @@ impl NetworkState {
         )
     }
 
+    /// Prepare and send one bounded local hub advertisement page. The
+    /// controller lock is held only while advancing Trickle and the recipient
+    /// cursor; every owner check and transport await occurs outside it.
+    pub(crate) async fn poll_hub(self: &Arc<Self>) {
+        if let Some((advertisement, limit)) = self
+            .hub
+            .as_ref()
+            .and_then(|controller| controller.lock().prepare_poll())
+        {
+            let recipient_after = self
+                .hub
+                .as_ref()
+                .and_then(|controller| controller.lock().recipient_after());
+            let mut selected: Vec<(bool, DeviceId, PeerOwnerToken)> = Vec::with_capacity(limit);
+            self.peers.visit_owners(|owner| {
+                if !self.peers.has_usable_authenticated_current(&owner)
+                    || !self.hub.as_ref().is_some_and(|controller| {
+                        controller.lock().configured_hub(owner.device_id())
+                    })
+                {
+                    return;
+                }
+                let Ok(key) = DeviceId::from_canonical_str(owner.device_id()) else {
+                    return;
+                };
+                if recipient_after.as_ref().is_some_and(|after| &key <= after) {
+                    return;
+                }
+                let position =
+                    match selected.binary_search_by(|(_, existing, _)| existing.cmp(&key)) {
+                        Ok(_) => return,
+                        Err(position) => position,
+                    };
+                if selected.len() == limit
+                    && selected
+                        .last()
+                        .is_some_and(|(_, existing, _)| existing <= &key)
+                {
+                    return;
+                }
+                if selected.len() == limit {
+                    selected.pop();
+                }
+                selected.insert(position, (false, key, owner));
+            });
+            if selected.len() < limit && recipient_after.is_some() {
+                self.peers.visit_owners(|owner| {
+                    if !self.peers.has_usable_authenticated_current(&owner)
+                        || !self.hub.as_ref().is_some_and(|controller| {
+                            controller.lock().configured_hub(owner.device_id())
+                        })
+                    {
+                        return;
+                    }
+                    let Ok(key) = DeviceId::from_canonical_str(owner.device_id()) else {
+                        return;
+                    };
+                    if !recipient_after.as_ref().is_some_and(|after| &key <= after) {
+                        return;
+                    }
+                    let prefix_len = selected
+                        .iter()
+                        .position(|(is_wrap, _, _)| *is_wrap)
+                        .unwrap_or(selected.len());
+                    let position = match selected[prefix_len..]
+                        .binary_search_by(|(_, existing, _)| existing.cmp(&key))
+                    {
+                        Ok(_) => return,
+                        Err(position) => prefix_len + position,
+                    };
+                    if selected.len() == limit
+                        && selected
+                            .last()
+                            .is_some_and(|(_, existing, _)| existing <= &key)
+                    {
+                        return;
+                    }
+                    if selected.len() == limit {
+                        selected.pop();
+                    }
+                    selected.insert(position, (true, key, owner));
+                });
+            }
+            if let Some((_, last, _)) = selected.last() {
+                if let Some(controller) = self.hub.as_ref() {
+                    controller.lock().advance_recipient_after(last.clone());
+                }
+            }
+            let mut delivered = false;
+            for (_, _, owner) in selected {
+                if super::send_to_peer_owner(
+                    self,
+                    &owner,
+                    &crate::protocol::MeshMessage::HubAdvertisement(advertisement.clone()),
+                )
+                .await
+                .is_ok()
+                {
+                    delivered = true;
+                }
+            }
+            if delivered {
+                if let Some(controller) = self.hub.as_ref() {
+                    controller.lock().acknowledge_delivery();
+                }
+            }
+        }
+        if let Some((target, request)) = self
+            .hub
+            .as_ref()
+            .and_then(|controller| controller.lock().prepare_discovery())
+        {
+            let target_id = target.to_string();
+            let mut owner = None;
+            self.peers.visit_owners(|candidate| {
+                if owner.is_none()
+                    && candidate.device_id() == target_id.as_str()
+                    && self.peers.has_usable_authenticated_current(&candidate)
+                {
+                    owner = Some(candidate);
+                }
+            });
+            if let Some(owner) = owner {
+                let bound = self
+                    .peers
+                    .with_current(&owner, |peer| {
+                        self.usable_tree_owner(&owner, peer)
+                            && self.hub.as_ref().is_some_and(|controller| {
+                                controller.lock().bind_discovery_request(&target, &owner)
+                            })
+                    })
+                    .unwrap_or(false);
+                if !bound {
+                    return;
+                }
+                let _ = super::send_to_peer_owner(
+                    self,
+                    &owner,
+                    &crate::protocol::MeshMessage::HubDiscoveryRequest(request),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Answer one exact-owner directory request with a sorted, bounded page
+    /// of currently authenticated/promoted peer identities. No address,
+    /// authority, forwarding, or recursive query state is exposed.
+    pub(crate) async fn handle_hub_discovery_request(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        request: crate::protocol::HubDiscoveryRequest,
+    ) {
+        let Some(controller) = self.hub.as_ref() else {
+            return;
+        };
+        let admitted = self
+            .peers
+            .with_current(owner, |peer| {
+                if !self.usable_tree_owner(owner, peer)
+                    || request.context_id() != self.mesh_context_id
+                {
+                    return false;
+                }
+                let mut controller = controller.lock();
+                controller.local_is_hub() && controller.accept_discovery_request()
+            })
+            .unwrap_or(false);
+        if !admitted {
+            return;
+        }
+        let max = usize::from(request.max_peers());
+        let retain = max
+            .checked_add(1)
+            .expect("protocol discovery page bound is small");
+        let after = request.after();
+        let mut peers = Vec::with_capacity(retain);
+        self.peers.visit_owners(|candidate| {
+            if !self.peers.has_usable_authenticated_current(&candidate)
+                || candidate.device_id() == self.identity.public_id()
+            {
+                return;
+            }
+            let Ok(peer) = DeviceId::from_canonical_str(candidate.device_id()) else {
+                return;
+            };
+            if after.is_some_and(|after| &peer <= after) {
+                return;
+            }
+            let position = match peers.binary_search(&peer) {
+                Ok(_) => return,
+                Err(position) => position,
+            };
+            if peers.len() == retain && peers.last().is_some_and(|existing| existing <= &peer) {
+                return;
+            }
+            if peers.len() == retain {
+                peers.pop();
+            }
+            peers.insert(position, peer);
+        });
+        let has_more = peers.len() > max;
+        let page = peers.into_iter().take(max).collect::<Vec<_>>();
+        let next_after = has_more.then(|| page[max - 1].clone());
+        let Ok(response) =
+            crate::protocol::HubDiscoveryResponse::for_request(&request, page, next_after)
+        else {
+            return;
+        };
+        let _ = super::send_to_peer_owner(
+            self,
+            owner,
+            &crate::protocol::MeshMessage::HubDiscoveryResponse(response),
+        )
+        .await;
+    }
+
+    /// Consume one response only for its exact outstanding request owner and
+    /// sequence. Returned identities become ordinary Sighted hints and never
+    /// create a session or modify hub configuration.
+    pub(crate) fn handle_hub_discovery_response(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        response: crate::protocol::HubDiscoveryResponse,
+    ) {
+        let Some(controller) = self.hub.as_ref() else {
+            return;
+        };
+        let Some(Some((peers, referrer))) = self.peers.with_current(owner, |peer| {
+            if !self.usable_tree_owner(owner, peer) {
+                return None;
+            }
+            let peers = controller
+                .lock()
+                .observe_discovery_response(owner, &response)?;
+            let referrer = DeviceId::from_canonical_str(owner.device_id()).ok()?;
+            Some((peers, referrer))
+        }) else {
+            return;
+        };
+        let Ok(observer) = DeviceId::from_canonical_str(self.identity.public_id()) else {
+            return;
+        };
+        for peer in peers {
+            if peer.to_string() == self.identity.public_id() {
+                continue;
+            }
+            super::note_sighted_without_dialing(self, &peer.to_string(), "hub exploration");
+            if let Some(graph) = self.local_observation.as_ref() {
+                let provenance = super::local_observation::ObservationProvenance {
+                    observer: super::local_observation::ObservationDeviceKey::from_device(
+                        &observer,
+                    ),
+                    referrer: Some(super::local_observation::ObservationDeviceKey::from_device(
+                        &referrer,
+                    )),
+                    subject: super::local_observation::ObservationDeviceKey::from_device(&peer),
+                };
+                let locator = super::local_observation::ObservationLocator::ViaPeer(
+                    super::local_observation::ObservationDeviceKey::from_device(&referrer),
+                );
+                // Receiving a valid directory page is only a referral
+                // sighting.  Do not manufacture a successful referred
+                // operation for a target that has not authenticated.
+                let _ = graph.lock().record_referral(provenance, locator);
+            }
+        }
+    }
+
+    fn tree_wire_rejection(
+        refusal: super::parenting::ParentingRefusal,
+    ) -> crate::protocol::HubTreeAttachRejection {
+        use crate::protocol::HubTreeAttachRejection as Wire;
+        match refusal {
+            super::parenting::ParentingRefusal::ContextMismatch => Wire::InvalidContext,
+            super::parenting::ParentingRefusal::ConfigurationMismatch => Wire::InvalidConfiguration,
+            super::parenting::ParentingRefusal::Capacity => Wire::RelationCapacity,
+            super::parenting::ParentingRefusal::UnsupportedRole => Wire::UnsupportedDepth,
+            super::parenting::ParentingRefusal::OwnerMismatch
+            | super::parenting::ParentingRefusal::InvalidOwner => Wire::OwnerMismatch,
+            super::parenting::ParentingRefusal::StaleRequest
+            | super::parenting::ParentingRefusal::PendingMismatch => Wire::StaleRequest,
+            _ => Wire::ParentUnavailable,
+        }
+    }
+
+    /// Recheck the complete promoted-owner usability predicate while the
+    /// registry's exact-owner mutation fence is held.  Callers must not split
+    /// this check from the synchronous relation/replay mutation.
+    fn usable_tree_owner(
+        &self,
+        owner: &PeerOwnerToken,
+        peer: &super::connection::PeerConnection,
+    ) -> bool {
+        let phase_admits = {
+            let data = peer.state.read();
+            matches!(
+                data.status,
+                super::connection::PeerStatus::Active | super::connection::PeerStatus::Shelved
+            )
+        };
+        let Ok(device) = DeviceId::from_canonical_str(owner.device_id()) else {
+            return false;
+        };
+        phase_admits
+            && peer.holds_promoted_session()
+            && peer.has_usable_session_for_recovery()
+            && self.peers.routed_origin_policy_admits(&device)
+    }
+
+    fn tree_parent_rejection(
+        rejection: crate::protocol::HubTreeAttachRejection,
+    ) -> super::parenting::ParentAttachRejection {
+        use super::parenting::ParentAttachRejection as Parent;
+        use crate::protocol::HubTreeAttachRejection as Wire;
+        match rejection {
+            Wire::InvalidContext => Parent::ContextMismatch,
+            Wire::InvalidConfiguration => Parent::ConfigurationMismatch,
+            Wire::RelationCapacity => Parent::Capacity,
+            Wire::UnsupportedDepth => Parent::UnsupportedRole,
+            Wire::OwnerMismatch => Parent::NotCurrentOwner,
+            Wire::StaleRequest => Parent::StaleRequest,
+            Wire::ParentUnavailable | Wire::AlreadyAttached => Parent::Capacity,
+        }
+    }
+
+    fn tree_parent_target(&self) -> Option<DeviceId> {
+        let role = self.parenting_role?;
+        let topology = self.topology.read();
+        let TopologyMode::HubTree { root, hubs, .. } = &*topology else {
+            return None;
+        };
+        match role {
+            super::parenting::ParentingRole::Root => None,
+            super::parenting::ParentingRole::Hub(1) => DeviceId::from_canonical_str(root).ok(),
+            super::parenting::ParentingRole::Leaf => {
+                let after = self
+                    .parenting_target_after
+                    .lock()
+                    .as_ref()
+                    .map(ToString::to_string);
+                let candidate = crate::topology::tree::next_parent_candidate(
+                    root,
+                    hubs,
+                    self.identity.public_id(),
+                    after.as_deref(),
+                )?;
+                let candidate = DeviceId::from_canonical_str(candidate).ok()?;
+                *self.parenting_target_after.lock() = Some(candidate.clone());
+                Some(candidate)
+            }
+            super::parenting::ParentingRole::Hub(_) => None,
+        }
+    }
+
+    fn tree_child_role(&self, child: &DeviceId) -> Option<super::parenting::ParentingRole> {
+        let role = self.parenting_role?;
+        let topology = self.topology.read();
+        let TopologyMode::HubTree { root, .. } = &*topology else {
+            return None;
+        };
+        let root = DeviceId::from_canonical_str(root).ok()?;
+        match role {
+            super::parenting::ParentingRole::Root
+                if self.parenting_hubs.iter().any(|hub| hub == child) =>
+            {
+                Some(super::parenting::ParentingRole::Hub(1))
+            }
+            super::parenting::ParentingRole::Hub(1)
+                if child != &root && !self.parenting_hubs.iter().any(|hub| hub == child) =>
+            {
+                Some(super::parenting::ParentingRole::Leaf)
+            }
+            _ => None,
+        }
+    }
+
+    /// One bounded HubTree maintenance pass.  A non-root node keeps at most
+    /// one outstanding primary registration, and all transport work happens
+    /// after the parenting mutex is released.
+    pub(crate) async fn poll_parenting(self: &Arc<Self>) {
+        let Some(parenting) = self.parenting.as_ref() else {
+            return;
+        };
+        let _ = parenting.lock().maintain_now();
+        if self
+            .parenting_role
+            .is_some_and(|role| !matches!(role, super::parenting::ParentingRole::Root))
+            && parenting
+                .lock()
+                .primary_parent_at_now()
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return;
+        }
+        // Parent attempts have their own hard minimum and jitter. Consume
+        // the paced opportunity before selecting a candidate or starting
+        // any owner-bound work; replies cannot accelerate this clock.
+        let attempt_due = self.hub.as_ref().is_some_and(|controller| {
+            matches!(controller.lock().prepare_parent_attempt(), Ok(true))
+        });
+        if !attempt_due {
+            return;
+        }
+        let Some(target) = self.tree_parent_target() else {
+            return;
+        };
+        let pending_owner_is_current = {
+            let pending = self.parenting_pending.lock();
+            pending
+                .as_ref()
+                .is_none_or(|pending| self.peers.has_usable_authenticated_current(&pending.owner))
+        };
+        if !pending_owner_is_current {
+            let pending = self.parenting_pending.lock().take();
+            if let Some(pending) = pending {
+                let _ = parenting
+                    .lock()
+                    .cancel_child_attach(&pending.witness, pending.ticket);
+            }
+            return;
+        }
+        let Some(owner) = self.peers.owner(&target.to_string()) else {
+            return;
+        };
+        let Some(local) = self.parenting_local else {
+            return;
+        };
+        let Some(sequence) = next_non_wrapping(&self.parenting_next_sequence) else {
+            return;
+        };
+        let Some(_) = self.parenting_root else {
+            return;
+        };
+        let Some(digest) = self.parenting_digest else {
+            return;
+        };
+        let Ok(local_device) = DeviceId::from_canonical_str(self.identity.public_id()) else {
+            return;
+        };
+        let child_role = self
+            .parenting_role
+            .unwrap_or(super::parenting::ParentingRole::Leaf);
+        let root = {
+            let topology = self.topology.read();
+            let TopologyMode::HubTree { root, .. } = &*topology else {
+                return;
+            };
+            let Ok(root) = DeviceId::from_canonical_str(root) else {
+                return;
+            };
+            root
+        };
+        let parent_role = if target == root {
+            super::parenting::ParentingRole::Root
+        } else {
+            super::parenting::ParentingRole::Hub(1)
+        };
+        let Ok(request) = super::parenting::ParentAttachRequest::new(
+            *self.mesh_context_id.as_bytes(),
+            digest,
+            sequence,
+            local,
+            super::parenting::ParentDeviceKey::from_device(&target),
+            child_role,
+            parent_role,
+            super::parenting::ParentingRelationKind::Primary,
+        ) else {
+            return;
+        };
+        let Some(Some((witness, ticket))) = self.peers.with_current(&owner, |peer| {
+            if !self.usable_tree_owner(&owner, peer) {
+                return None;
+            }
+            let witness = super::parenting::ParentOwnerWitness::from_owner(&owner).ok()?;
+            let ticket = parenting
+                .lock()
+                .begin_child_attach(&witness, request)
+                .ok()?;
+            Some((witness, ticket))
+        }) else {
+            return;
+        };
+        let Ok(wire_request) = crate::protocol::HubTreeAttachRequest::new(
+            self.mesh_context_id,
+            digest,
+            sequence,
+            local_device,
+            target.clone(),
+        ) else {
+            let _ = parenting.lock().cancel_child_attach(&witness, ticket);
+            return;
+        };
+        *self.parenting_pending.lock() = Some(PendingParentAttach {
+            owner: owner.clone(),
+            witness,
+            ticket,
+            request,
+            wire_request: wire_request.clone(),
+        });
+        if super::send_to_peer_owner(
+            self,
+            &owner,
+            &crate::protocol::MeshMessage::HubTreeAttachRequest(wire_request),
+        )
+        .await
+        .is_err()
+        {
+            if let Some(pending) = self.parenting_pending.lock().take() {
+                let _ = parenting
+                    .lock()
+                    .cancel_child_attach(&pending.witness, pending.ticket);
+            }
+        }
+    }
+
+    pub(crate) async fn handle_hub_tree_attach_request(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        request: crate::protocol::HubTreeAttachRequest,
+    ) {
+        let Some(parenting) = self.parenting.as_ref() else {
+            return;
+        };
+        let Some(response) = self.peers.with_current(owner, |peer| {
+            let Ok(owner_device) = DeviceId::from_canonical_str(owner.device_id()) else {
+                return None;
+            };
+            if !self.usable_tree_owner(owner, peer)
+                || &owner_device != request.child()
+                || request.context_id() != self.mesh_context_id
+                || self.parenting_digest != Some(request.configuration_digest())
+            {
+                return None;
+            }
+            let Some(child_role) = self.tree_child_role(request.child()) else {
+                return Some(crate::protocol::HubTreeAttachResponse::rejected(
+                    &request,
+                    crate::protocol::HubTreeAttachRejection::UnsupportedDepth,
+                ));
+            };
+            let Some(local) = self.parenting_local else {
+                return None;
+            };
+            let Ok(local_device) = DeviceId::from_canonical_str(self.identity.public_id()) else {
+                return None;
+            };
+            if request.parent() != &local_device {
+                return None;
+            }
+            let Some(parent_role) = self.parenting_role else {
+                return None;
+            };
+            let Ok(witness) = super::parenting::ParentOwnerWitness::from_owner(owner) else {
+                return None;
+            };
+            let Ok(internal) = super::parenting::ParentAttachRequest::new(
+                *self.mesh_context_id.as_bytes(),
+                request.configuration_digest(),
+                request.request_sequence(),
+                super::parenting::ParentDeviceKey::from_device(request.child()),
+                local,
+                child_role,
+                parent_role,
+                super::parenting::ParentingRelationKind::Primary,
+            ) else {
+                return None;
+            };
+            let result = parenting.lock().accept_request(&witness, internal);
+            match result {
+                Ok(super::parenting::ParentAttachResponse::Accepted {
+                    relation_generation,
+                    ..
+                }) => {
+                    crate::protocol::HubTreeAttachResponse::accepted(&request, relation_generation)
+                        .ok()
+                }
+                Ok(super::parenting::ParentAttachResponse::Rejected { reason, .. }) => {
+                    use super::parenting::ParentAttachRejection as Parent;
+                    use crate::protocol::HubTreeAttachRejection as Wire;
+                    let reason = match reason {
+                        Parent::UnsupportedRole => Wire::UnsupportedDepth,
+                        Parent::NotCurrentOwner => Wire::OwnerMismatch,
+                        Parent::Capacity => Wire::RelationCapacity,
+                        Parent::StaleRequest => Wire::StaleRequest,
+                        Parent::ContextMismatch => Wire::InvalidContext,
+                        Parent::ConfigurationMismatch => Wire::InvalidConfiguration,
+                    };
+                    Some(crate::protocol::HubTreeAttachResponse::rejected(
+                        &request, reason,
+                    ))
+                }
+                Err(refusal) => Some(crate::protocol::HubTreeAttachResponse::rejected(
+                    &request,
+                    Self::tree_wire_rejection(refusal),
+                )),
+            }
+        }) else {
+            return;
+        };
+        if let Some(response) = response {
+            let _ = super::send_to_peer_owner(
+                self,
+                owner,
+                &crate::protocol::MeshMessage::HubTreeAttachResponse(response),
+            )
+            .await;
+        }
+    }
+
+    pub(crate) fn handle_hub_tree_attach_response(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        response: crate::protocol::HubTreeAttachResponse,
+    ) {
+        let Some(Some(())) = self.peers.with_current(owner, |peer| {
+            let Ok(owner_device) = DeviceId::from_canonical_str(owner.device_id()) else {
+                return None;
+            };
+            if !self.usable_tree_owner(owner, peer) || &owner_device != response.parent() {
+                return None;
+            }
+            let matches = self
+                .parenting_pending
+                .lock()
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.owner.binding_coordinate() == owner.binding_coordinate()
+                        && pending.wire_request.context_id() == response.context_id()
+                        && pending.wire_request.configuration_digest()
+                            == response.configuration_digest()
+                        && pending.wire_request.request_sequence() == response.request_sequence()
+                        && pending.wire_request.child() == response.child()
+                        && pending.wire_request.parent() == response.parent()
+                });
+            if !matches {
+                return None;
+            }
+            let Some(pending) = self.parenting_pending.lock().take() else {
+                return None;
+            };
+            let internal = match response.relation_generation() {
+                Some(generation) => super::parenting::ParentAttachResponse::Accepted {
+                    request: pending.request,
+                    relation_generation: generation,
+                },
+                None => super::parenting::ParentAttachResponse::Rejected {
+                    request: pending.request,
+                    reason: Self::tree_parent_rejection(
+                        response
+                            .rejection()
+                            .unwrap_or(crate::protocol::HubTreeAttachRejection::StaleRequest),
+                    ),
+                },
+            };
+            if let Some(parenting) = self.parenting.as_ref() {
+                if parenting
+                    .lock()
+                    .adopt_response(&pending.witness, &pending.ticket, internal)
+                    .is_err()
+                {
+                    let _ = parenting
+                        .lock()
+                        .cancel_child_attach(&pending.witness, pending.ticket);
+                }
+            }
+            Some(())
+        }) else {
+            return;
+        };
+    }
+
+    pub(crate) fn tree_allows_peer(&self, peer: &DeviceId) -> bool {
+        let Some(parenting) = self.parenting.as_ref() else {
+            return false;
+        };
+        parenting
+            .lock()
+            .allows_peer(super::parenting::ParentDeviceKey::from_device(peer))
+    }
+
+    /// Return the accepted primary parent only while its exact promoted
+    /// session remains usable.  This is a routing preference, never an
+    /// authorization bypass: route admission and the send boundary each keep
+    /// their existing owner/session fences, and an absent parent leaves all
+    /// ordinary direct or alternate candidates available.
+    pub(crate) fn tree_preferred_parent_for_route(&self) -> Option<String> {
+        let relation = {
+            let mut parenting = self.parenting.as_ref()?.lock();
+            parenting.primary_parent_at_now().ok().flatten()?
+        };
+        let parent = DeviceId::from_public_key_bytes(relation.parent.as_bytes()).ok()?;
+        let owner = self.peers.owner(&parent.base32())?;
+        let coordinate = owner.binding_coordinate();
+        (coordinate.binding_namespace == relation.owner
+            && coordinate.binding_epoch == relation.owner_epoch
+            && self.peers.has_usable_authenticated_current(&owner))
+        .then(|| owner.device_id().to_owned())
+    }
+
+    /// Read the bounded local parenting table without exposing authority or
+    /// session state.  The handle-only transport-lab facade converts this
+    /// tuple into its public fixed snapshot type.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn parenting_snapshot_for_lab(
+        &self,
+    ) -> Option<(Option<[u8; 32]>, usize, usize, u64)> {
+        self.parenting.as_ref().map(|parenting| {
+            let mut parenting = parenting.lock();
+            let snapshot = parenting.snapshot_for_lab();
+            (
+                snapshot.primary_parent,
+                snapshot.accepted_children,
+                snapshot.pending,
+                snapshot.generation,
+            )
+        })
+    }
+
+    /// Advance only this network's transport-lab parenting clock. The
+    /// production monotonic clock remains the source used by relation expiry;
+    /// no wall-clock, scheduler, authentication, or peer clock is modified.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn advance_parenting_clock_for_lab(&self, delta_ms: u64) -> Result<()> {
+        let Some(parenting) = self.parenting.as_ref() else {
+            return Err(Error::Network(
+                "HubTree parenting clock is unavailable".into(),
+            ));
+        };
+        parenting
+            .lock()
+            .advance_clock(delta_ms)
+            .map_err(|error| Error::Network(format!("HubTree parenting clock: {error}")))
+    }
+
+    /// Advance this network's parenting clock and take the effective relation
+    /// snapshot under one parenting lock.  This keeps a transport-lab expiry
+    /// observation ahead of the scheduler's next paced reattachment attempt;
+    /// it does not alter any production clock or routing authority.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn advance_parenting_clock_and_snapshot_for_lab(
+        &self,
+        delta_ms: u64,
+    ) -> Result<Option<(Option<[u8; 32]>, usize, usize, u64)>> {
+        let Some(parenting) = self.parenting.as_ref() else {
+            return Err(Error::Network(
+                "HubTree parenting clock is unavailable".into(),
+            ));
+        };
+        let mut parenting = parenting.lock();
+        parenting
+            .advance_clock(delta_ms)
+            .map_err(|error| Error::Network(format!("HubTree parenting clock: {error}")))?;
+        let snapshot = parenting.snapshot_for_lab();
+        Ok(Some((
+            snapshot.primary_parent,
+            snapshot.accepted_children,
+            snapshot.pending,
+            snapshot.generation,
+        )))
+    }
+
+    /// Return aggregate discovery progress from the exact HubController.  The
+    /// controller keeps cursor identities private; this seam exposes only
+    /// bounded counters and the last page shape for transport-lab evidence.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn hub_discovery_diagnostics_for_lab(
+        &self,
+    ) -> Option<super::hub::HubDiscoveryDiagnostics> {
+        self.hub
+            .as_ref()
+            .map(|controller| controller.lock().discovery_diagnostics())
+    }
+
+    pub(crate) fn retire_parenting_owner(&self, owner: &PeerOwnerToken) {
+        if let (Some(parenting), Ok(witness)) = (
+            self.parenting.as_ref(),
+            super::parenting::ParentOwnerWitness::from_owner(owner),
+        ) {
+            let _ = parenting.lock().retire_owner(&witness);
+        }
+        // Retire local diagnostic sightings only while this captured owner is
+        // still the installed coordinate (or has no successor).  A displaced
+        // owner must not erase a replacement's same-device aggregate; the
+        // observation ticket fence handles stale callbacks after this guard.
+        let captured_owner_is_current = self
+            .peers
+            .owner(owner.device_id())
+            .is_none_or(|current| current.binding_coordinate() == owner.binding_coordinate());
+        if captured_owner_is_current {
+            if let (Some(graph), Ok(peer)) = (
+                self.local_observation.as_ref(),
+                crate::semantic::DeviceId::from_canonical_str(owner.device_id()),
+            ) {
+                let _ = graph.lock().retire_peer(
+                    super::local_observation::ObservationDeviceKey::from_device(&peer),
+                );
+            }
+        }
+    }
+
+    /// Record a successful current authenticated pong in the optional local
+    /// diagnostic graph. Every failure is intentionally ignored so this cache
+    /// can never block or alter the mesh path.
+    pub(crate) fn observe_authenticated_peer(&self, owner: &PeerOwnerToken) {
+        if !self.peers.has_usable_authenticated_current(owner) {
+            return;
+        }
+        let Ok(observer) = crate::semantic::DeviceId::from_canonical_str(self.identity.public_id())
+        else {
+            return;
+        };
+        let Ok(subject) = crate::semantic::DeviceId::from_canonical_str(owner.device_id()) else {
+            return;
+        };
+        let Some(graph) = self.local_observation.as_ref() else {
+            return;
+        };
+        let provenance = super::local_observation::ObservationProvenance {
+            observer: super::local_observation::ObservationDeviceKey::from_device(&observer),
+            referrer: None,
+            subject: super::local_observation::ObservationDeviceKey::from_device(&subject),
+        };
+        let locator = super::local_observation::ObservationLocator::ViaPeer(
+            super::local_observation::ObservationDeviceKey::from_device(&subject),
+        );
+        let ticket = graph.lock().record_sighting(
+            provenance,
+            locator,
+            super::local_observation::ObservationSighting::Authenticated,
+        );
+        if let Ok(ticket) = ticket {
+            // The pong reached this exact current authenticated owner, so this
+            // is a genuine successful operation outcome rather than a second
+            // synthetic sighting.  Any stale/retired refusal remains advisory.
+            let _ = graph.lock().record_authenticated_outcome(
+                ticket,
+                super::local_observation::ObservationOutcome::Succeeded,
+            );
+        }
+    }
+
+    /// Apply a HubAdvertisement only after the exact current authenticated
+    /// owner fence. The advisory result is deliberately not routed into
+    /// topology, authorization, or configuration.
+    pub(crate) fn observe_hub_advertisement(
+        &self,
+        owner: &PeerOwnerToken,
+        advertisement: &crate::protocol::HubAdvertisement,
+    ) -> bool {
+        let Some(controller) = self.hub.as_ref() else {
+            return false;
+        };
+        self.peers
+            .with_current(owner, |peer| {
+                self.usable_tree_owner(owner, peer)
+                    && controller
+                        .lock()
+                        .observe_advertisement(owner, advertisement)
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn maintain_local_observation(&self) {
+        if let Some(graph) = self.local_observation.as_ref() {
+            let _ = graph.lock().maintain_now();
+        }
+    }
+
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
     pub(crate) async fn shutdown(self: &Arc<Self>) {
+        self.log_shutdown_phase("begin");
+        if let (Some(parenting), Some(pending)) = (
+            self.parenting.as_ref(),
+            self.parenting_pending.lock().take(),
+        ) {
+            let _ = parenting
+                .lock()
+                .cancel_child_attach(&pending.witness, pending.ticket);
+        }
         // Drain public endpoint abandonments while peer owners and the relay
         // carrier are still available for exact Close delivery/settlement.
+        self.log_shutdown_phase("pre-shutdown-relay-abandonment-begin");
         self.cancel_all_closed_relay_endpoints();
         self.cancel_all_unpulled_closed_relay();
         self.drain_closed_relay_abandonments().await;
+        self.log_shutdown_phase("pre-shutdown-relay-abandonment-drained");
+        self.log_shutdown_phase("before-request-shutdown");
         self.request_shutdown();
+        self.log_shutdown_phase("after-request-shutdown");
         self.await_shutdown_mutations().await;
+        self.log_shutdown_phase("mutations-drained");
         self.settle_stale_closed_relay_owners();
         self.cancel_all_closed_relay_pending();
+        self.log_shutdown_phase("relay-expiry-begin");
         loop {
             let extracted = {
                 let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
@@ -6425,13 +7677,19 @@ impl NetworkState {
             }
             reservation.complete();
         }
+        self.log_shutdown_phase("relay-expiry-drained");
         if let Some(root) = self.closed_relay_root() {
             root.allocations.lock().request_close_all();
         }
+        self.log_shutdown_phase("relay-checkout-begin");
         self.wait_closed_relay_checkouts().await;
+        self.log_shutdown_phase("relay-checkout-drained");
         self.cancel_all_closed_relay_endpoints();
         self.cancel_all_unpulled_closed_relay();
+        self.log_shutdown_phase("relay-abandonment-begin");
         self.drain_closed_relay_abandonments().await;
+        self.log_shutdown_phase("relay-abandonment-drained");
+        self.log_shutdown_phase("relay-drained");
         self.settle_all_closed_relay();
         if let Some(root) = self.closed_relay_root() {
             root.closing.lock().clear();
@@ -6444,6 +7702,7 @@ impl NetworkState {
         // finished releasing its exact de-duplication custody.  The field is
         // cleared only after this is the last shutdown consumer of it.
         let runtime = self.signaling_runtime();
+        self.log_shutdown_phase("peer-retire-begin");
         let retired = self.peers.retire_all();
         for peer in &retired {
             self.settle_attempt(
@@ -6459,11 +7718,17 @@ impl NetworkState {
                 }
             }
         }
+        self.log_shutdown_phase("peer-retire-drained");
+        self.log_shutdown_phase("replaced-close-begin");
         self.peers.await_replaced_closes().await;
+        self.log_shutdown_phase("replaced-close-drained");
+        self.log_shutdown_phase("shutdown-task-begin");
         self.await_shutdown_tasks().await;
+        self.log_shutdown_phase("shutdown-tasks-drained");
         self.peer_event_pump_shutdown_started
             .store(true, Ordering::Release);
         self.peer_event_pump_shutdown_waiting.notify_waiters();
+        self.log_shutdown_phase("event-pump-begin");
         let event_pumps = loop {
             let notified = self.peer_event_pump_ready.notified();
             let drained = {
@@ -6485,6 +7750,7 @@ impl NetworkState {
                 tracing::warn!(%error, "peer event pump failed during shutdown");
             }
         }
+        self.log_shutdown_phase("event-pump-drained");
         drop(retired);
         drop(runtime);
         self.signaling_runtime.write().take();
@@ -6520,6 +7786,9 @@ impl NetworkState {
             drop(peer);
         }
         self.application_gateway.close();
+        if let Some(graph) = self.local_observation.as_ref() {
+            let _ = graph.lock().retire_owner();
+        }
         // Join the same synchronous publication fence used by durable graph
         // and proof work before releasing the owner.  The shutdown flag stops
         // new work immediately; this second fence lets one already-admitted
@@ -6562,6 +7831,12 @@ impl NetworkState {
                 tracing::warn!(%error, "durable semantic owner release failed during shutdown");
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn peer_event_pump_counts_for_test(&self) -> (usize, usize) {
+        let pumps = self.peer_event_pumps.lock();
+        (pumps.pending_registrations, pumps.handles.len())
     }
 
     /// Begin registering one production peer-event pump.  Shutdown closes the

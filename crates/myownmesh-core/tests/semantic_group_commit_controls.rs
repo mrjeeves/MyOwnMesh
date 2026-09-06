@@ -11,9 +11,10 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
-    TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
+    SignalingConfig, TopologyMode, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
+use myownmesh_core::engine::transport_lab::SemanticCommitFaultForLab;
 use myownmesh_core::semantic::{
     DeviceId, FactBody, FactContent, FactId, SemanticFactPage, SemanticFactPageRequest,
     SemanticStateIdentity, SignedFact,
@@ -91,6 +92,14 @@ async fn fixture(label: &str) -> Fixture {
 }
 
 fn connector_policy() -> WebRtcConnectorCapablePolicy {
+    let semantic_policy = SemanticPolicyConfig::default();
+    let semantic_storage_bytes = semantic_policy
+        .checked_storage_envelope(
+            SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+            semantic_policy.storage_workload(),
+        )
+        .expect("finite group semantic storage envelope")
+        .total_bytes;
     let resources = TEST_RESOURCE_PROVIDER
         .get_or_init(|| {
             let requested =
@@ -98,8 +107,7 @@ fn connector_policy() -> WebRtcConnectorCapablePolicy {
                     (
                         class,
                         if class == ResourceClass::StorageBytes {
-                            myownmesh_core::config::SemanticPolicyConfig::default()
-                                .max_database_bytes
+                            semantic_storage_bytes
                         } else {
                             1_000_000_000
                         },
@@ -130,6 +138,9 @@ fn closed_config(label: &str) -> NetworkConfig {
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         routing_policy: RoutingPolicyConfig::default(),
+        hub: None,
+        local_observations: None,
+        tree: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
@@ -400,6 +411,205 @@ async fn bounded_envelope_refusal_preserves_identity_and_provider_baseline() {
         "envelope refusal releases all provider-backed page custody"
     );
     fixture.network.leave().await.expect("refusal shutdown");
+}
+
+#[tokio::test]
+async fn precommit_failure_rolls_back_nonempty_group_and_consumes_one_shot() {
+    let fixture = fixture("group-precommit-failure").await;
+    let before = fixture
+        .network
+        .semantic_state_identity()
+        .expect("precommit baseline identity");
+    let before_facts = all_facts(&fixture.network);
+    let resources = fixture.mesh.resource_report();
+
+    fixture.network.reset_semantic_admission_profile_for_lab();
+    fixture
+        .network
+        .arm_semantic_commit_fault_for_lab(SemanticCommitFaultForLab::BeforeCommit)
+        .expect("arm exact owner precommit fault");
+    assert!(
+        fixture
+            .network
+            .arm_semantic_commit_fault_for_lab(SemanticCommitFaultForLab::BeforeCommit)
+            .is_err(),
+        "a second one-shot arm must be refused while the first remains pending"
+    );
+
+    // An envelope refusal happens before the durable owner and must not
+    // consume the pending fault.
+    assert!(
+        fixture
+            .network
+            .import_semantic_fact_page(page(before.context_id(), &[]))
+            .await
+            .is_err(),
+        "empty page is refused before durable admission"
+    );
+    assert_same_identity(
+        &before,
+        &fixture
+            .network
+            .semantic_state_identity()
+            .expect("post-envelope identity"),
+    );
+
+    let target = Identity::ephemeral();
+    assert!(
+        fixture
+            .network
+            .propose_role_grant(
+                target.public_id(),
+                myownmesh_core::semantic::Role::Member,
+                None,
+            )
+            .await
+            .is_err(),
+        "the real public ingress reaches and refuses after SQL apply"
+    );
+    let profile = fixture.network.semantic_admission_profile_for_lab();
+    assert!(
+        profile.sql_apply.count > 0,
+        "nonempty fault control reached actual semantic SQL apply"
+    );
+    assert_eq!(
+        profile.commit_wal_terminal.count, 0,
+        "definite precommit failure never crosses SQLite COMMIT"
+    );
+    assert_eq!(
+        profile.projection_roster_publish.count, 0,
+        "definite durable failure publishes no projection"
+    );
+    assert_eq!(
+        profile.post_commit_broadcast.count, 0,
+        "definite durable failure broadcasts no semantic delta"
+    );
+    assert_same_identity(
+        &before,
+        &fixture
+            .network
+            .semantic_state_identity()
+            .expect("precommit rollback identity"),
+    );
+    assert_eq!(
+        all_facts(&fixture.network),
+        before_facts,
+        "precommit rollback leaves the exact exported graph unchanged"
+    );
+    assert_eq!(
+        fixture.mesh.resource_report(),
+        resources,
+        "precommit rollback releases all page and semantic custody"
+    );
+
+    fixture
+        .network
+        .arm_semantic_commit_fault_for_lab(SemanticCommitFaultForLab::BeforeCommit)
+        .expect("the consumed one-shot can be rearmed after the real commit boundary");
+    fixture.network.leave().await.expect("precommit shutdown");
+}
+
+#[tokio::test]
+async fn ambiguous_commit_reconciles_and_reopens_exact_group_state() {
+    let fixture = fixture("group-ambiguous-commit").await;
+    let before = fixture
+        .network
+        .semantic_state_identity()
+        .expect("ambiguous baseline identity");
+    let before_facts = all_facts(&fixture.network);
+    let resources = fixture.mesh.resource_report();
+
+    fixture.network.reset_semantic_admission_profile_for_lab();
+    fixture
+        .network
+        .arm_semantic_commit_fault_for_lab(SemanticCommitFaultForLab::CommitOutcomeUnknown)
+        .expect("arm exact owner ambiguous commit fault");
+    let target = Identity::ephemeral();
+    let target_device = DeviceId::from_canonical_str(target.public_id()).expect("target device");
+    assert!(
+        fixture
+            .network
+            .propose_role_grant(
+                target.public_id(),
+                myownmesh_core::semantic::Role::Member,
+                None,
+            )
+            .await
+            .is_err(),
+        "lost worker reply is surfaced as an uncertain public outcome"
+    );
+    let profile = fixture.network.semantic_admission_profile_for_lab();
+    assert!(
+        profile.sql_apply.count > 0,
+        "ambiguous control reached actual semantic SQL apply"
+    );
+    assert_eq!(
+        profile.commit_wal_terminal.count, 1,
+        "ambiguous control crossed the real SQLite COMMIT boundary"
+    );
+    assert_eq!(
+        profile.projection_roster_publish.count, 0,
+        "uncertain caller result does not publish before reconciliation"
+    );
+    assert_eq!(
+        profile.post_commit_broadcast.count, 0,
+        "uncertain caller result does not broadcast before reconciliation"
+    );
+
+    let committed = fixture
+        .network
+        .semantic_state_identity()
+        .expect("reconciled live identity");
+    assert_ne!(
+        committed, before,
+        "reconciliation observes the actual committed semantic mutation"
+    );
+    let committed_facts = all_facts(&fixture.network);
+    assert_eq!(
+        committed_facts.len(),
+        before_facts.len() + 1,
+        "exactly the nonempty transaction's fact was durably committed"
+    );
+    assert!(
+        committed_facts.iter().any(|fact| matches!(
+            &fact.content.body,
+            FactBody::RoleGrant { target: current, .. } if current == &target_device
+        )),
+        "reconciliation retained the exact public-ingress target fact"
+    );
+    for fact in &before_facts {
+        assert!(
+            committed_facts.iter().any(|current| current == fact),
+            "reconciliation retains every pre-existing exported fact"
+        );
+    }
+    assert_eq!(
+        fixture.mesh.resource_report(),
+        resources,
+        "ambiguous reconciliation leaves provider custody at the live-network baseline"
+    );
+
+    let config = closed_config("group-ambiguous-commit");
+    fixture
+        .network
+        .leave()
+        .await
+        .expect("ambiguous pre-reopen shutdown");
+    let reopened = fixture
+        .mesh
+        .join(config)
+        .await
+        .expect("reopen committed group");
+    let restored = reopened
+        .semantic_state_identity()
+        .expect("reopened reconciled identity");
+    assert_same_identity(&committed, &restored);
+    assert_eq!(
+        all_facts(&reopened),
+        committed_facts,
+        "reopen restores the exact reconciled graph/store transcript"
+    );
+    reopened.leave().await.expect("ambiguous reopen shutdown");
 }
 
 #[tokio::test]

@@ -54,6 +54,11 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
         | MeshMessage::ClosedRelayData(_)
+        | MeshMessage::HubAdvertisement(_)
+        | MeshMessage::HubDiscoveryRequest(_)
+        | MeshMessage::HubDiscoveryResponse(_)
+        | MeshMessage::HubTreeAttachRequest(_)
+        | MeshMessage::HubTreeAttachResponse(_)
         | MeshMessage::RoutedApplication(_)
         | MeshMessage::RpcRequest(_)
         | MeshMessage::RpcResponse(_)

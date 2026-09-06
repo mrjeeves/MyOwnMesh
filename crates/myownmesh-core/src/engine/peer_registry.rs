@@ -1782,6 +1782,28 @@ impl PeerRegistry {
             .collect()
     }
 
+    /// Visit current installation tokens without retaining a whole-registry
+    /// snapshot. Consumers may keep a bounded page of selected tokens; this
+    /// method itself retains only one temporary token per iteration.
+    ///
+    /// This remains an O(registry size) scan, not an indexed page lookup.
+    /// Selection is not authorization: callers must recheck the exact owner
+    /// through the normal session gate before acting on a retained token.
+    /// The synchronous visitor must not mutate this registry or await work.
+    pub(super) fn visit_owners(&self, mut visit: impl FnMut(PeerOwnerToken)) {
+        for entry in self.peers.iter() {
+            let owner = PeerOwnerToken {
+                peer: Arc::clone(&entry.value().peer),
+                installation: Arc::clone(&entry.value().installation),
+                binding_namespace: self.binding_namespace,
+                binding_epoch: entry.value().binding_epoch,
+                worker: None,
+            };
+            drop(entry);
+            visit(owner);
+        }
+    }
+
     pub(super) fn contains_key(&self, device_id: &str) -> bool {
         self.peers.contains_key(device_id)
     }
