@@ -3412,10 +3412,20 @@ impl NetworkState {
         }
         let dependency_roots = crate::semantic::causal::dependencies(&fact);
         let needs_cold_history = dependency_roots.iter().any(|id| live.get(id).is_none());
-        let causal_history = if !needs_cold_history {
+        let mut history_roots = live
+            .selector_provenance_history_roots(std::slice::from_ref(&fact))
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if needs_cold_history {
+            history_roots.extend(dependency_roots);
+        }
+        // A new typed selector can require retired ancestry even when all of
+        // its immediate dependencies are resident. Resolve both needs under
+        // the same publication/owner fence before opening the journal.
+        let causal_history = if history_roots.is_empty() {
             Vec::new()
         } else {
-            self.admitted_semantic_causal_history(dependency_roots)?
+            self.admitted_semantic_causal_history(history_roots.into_iter().collect())?
         };
         let expected_base_projection = live.projection_commitment_root();
         #[cfg(feature = "transport-lab")]
@@ -3655,7 +3665,11 @@ impl NetworkState {
         let dependency_roots = candidates
             .iter()
             .flat_map(crate::semantic::causal::dependencies)
-            .filter(|id| live.get(id).is_none() && !candidate_ids.contains(id))
+            .filter(|id| live.get(id).is_none())
+            .chain(live.selector_provenance_history_roots(&candidates))
+            // In-batch facts are supplied by the journal's candidate overlay,
+            // not by the already-admitted durable history snapshot.
+            .filter(|id| !candidate_ids.contains(id))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();

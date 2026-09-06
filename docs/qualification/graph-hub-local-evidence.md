@@ -1,12 +1,644 @@
 # Graph / Hub candidate: local verification record
 
-This is a **local candidate verification record**, not release approval or a
-final exact-head audit. The working branch is
-`macro/02-authority-durability-relay`, based on
-`bf08d2c378a5fb3c20a8099488ff13cac8a16a78`. PR #7 remains open, draft, unmerged,
-and on HOLD. Independent final audit and pushed-head evidence are pending.
+This is a **local verification and audit record**, not release approval.
+The working branch is `macro/02-authority-durability-relay`. PR #7 remains
+open, draft, unmerged, and on HOLD.
 
-## Current local result: 153 selections, 153 pass / 0 fail
+## Current disposition: candidate175 verified; exact-pushed-head audit pending
+
+The corrected candidate completed all175 selected checks in run
+`9d5d46d1-cb5d-4001-86c6-a4c703befe29` at 2026-09-06 18:47:43 UTC,
+exit0. Locked all-target compilation passed in550.258 seconds, with parsed
+Cargo `build-finished: success=true` and47 test executables. Every native
+cell ran exactly one test, passed one, failed zero and ignored zero.
+The report is
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-winner-impact-contract-corrected.json`,
+SHA256 `0EFA5A22206049AD5B17740BF13E1B9BC960D51F186838618816A181B2DC0413`.
+
+Manager and independent verifier Payne rehashed all612 recorded source files
+and all47 executables: zero mismatches. All351 source checkpoints and175
+before/after executable hashes agree. Canonical source digest:
+`e396d54eb0f56c6287f65c1f30fc4c24a70e93d1c3a73c24f61f535e633635de`;
+canonical selector manifest digest:
+`39a89f4cca8eb2ee5a0dca0fea154f687c4ec63e50aa016b25d156b955e7315e`.
+All175 required/manifest/executed selector tuples match. No capture is
+truncated, no callback error or unknown terminal outcome occurred, and no
+compiler error or Cargo JSON parse error was observed. This is tested dirty
+candidate evidence recorded at parent HEAD `f70689e1d64883458ad204d8d0b9f9b76bee9666`,
+not yet an immutable published-head result.
+
+Executed closure includes gate175 (9.949 seconds): final competing-selector
+winner, exact Role/Membership delta entries, independent signed ancestry
+heads, both selector orders, single/aggregate hot/cold commit/rollback/Drop.
+The formerly timed-out gate160 completes all720 orders in126.228 seconds
+under the measured240-second envelope. Cold lifecycle155 passes22.485 seconds;
+provenance170, canonical snapshot171, tamper fallback172, pristine restore173
+and candidate-relative NoOp174 all pass. No assertion or permutation was
+removed to obtain these results.
+
+Actual native hub/relay checks also pass:137 opaque relay3.006 seconds;
+138 production LocalBroker relay1.069;139 no-parent/alternate/no-exit routing
+1.172;140 real parenting, bidirectional four-hop payload, bounded discovery,
+replacement and expiry3.980;141 connected full-prefix fallback2.326.
+The adjacency control checks all20 directed pairs at both payload boundaries.
+Alternate direct installation in139 is explicit, not automatic unreliable-hub
+learning. Exact provider conservation is asserted by relay/component tests;
+mesh report baselines are not relabelled as external OS accounting.
+
+Independent verification stages are complete: Payne
+(`manager:a4dac58e-6041-407a-b500-cdfdd84b5fb9`) reports bounded
+SOURCE/RUNTIME/CUSTODY PASS; Church
+(`manager:fbda62d0-0616-4075-ac6c-efdabf001e73`) reports bounded actual
+HubTree/relay/lifetime PASS. Neither implemented the surfaces they verified.
+Their completed task updates encountered the recorded app projection/update
+fault; these are actual completed handoffs, not pending implementation.
+
+Publication integrates the exact nine-file correction, then binds a clean
+pushed-head175 run and Turing's separate final audit to that new commit.
+Until those finish, this is not final unit acceptance. Historical `f70689e`
+audit BLOCK and CI34020595984 failure remain correctly attributed below.
+No hosted-green, multi-machine/NAT/scale, OS-memory or automatic recovery
+claim is added. Withholding's usability/reliability effect is distinct from
+a demonstrated authorization violation; no new withholding audit is opened.
+PR7 stays OPEN, draft, unmerged and on HOLD throughout publication.
+
+## Historical correction evidence
+
+### Selector-winner run setup correction: zero compilation or runtime
+
+Run `fa4a7cbb-42fe-439c-8e15-ee140da0b784` stopped after0.997 seconds
+with `stale_source`, exit2. Its fatal error is exactly: acceptance contract
+does not match its manager-supplied hash. Build is null, binary list and cell
+list are empty: **zero compilation and zero runtime checks occurred**.
+Wrapper stdout129/stderr0 are complete and untruncated. Retained report
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-winner-impact.json`
+has SHA256 `EB6EB7B6BADF844D126FE93E9E174AC1ACA17D8DF863C6AF92835EBAA6FF342D`.
+
+Manager updated the acceptance contract but left its old444A8550 hash in
+the manifest. The current contract independently hashes to
+`3C60B328A6B0C7696063F84437209484428AEEF5D5B5B6A52B2DB2563E8D05D5`.
+Correct only that recorded hash; no Rust, selector, assertion, deadline or
+authority change. Validate the actual file hash as well as manifest shape
+before restarting on a separate report:
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-winner-impact-contract-corrected.json`.
+The previous schema-only validation did not establish external file custody.
+This is manager setup bookkeeping, not another behavior failure or a passing
+qualification. All implementers remain complete/frozen.
+
+### Selector-winner impact candidate integrated for whole175 verification
+
+Shannon completed the sole causal-file correction and existing175 control
+extension under `manager:c874481d-4941-42ec-8eda-94c8dde2441f`.
+Unformatted handoff SHA256 was
+`06528F32D9C17CBE68953ABC51E26B697FADC94160F12EDD7ED04A18BA40D05C`.
+Manager inspected the helper extraction, shared pre/post-mutation impact
+path, exact delta assertions, both selector orders and hot/cold single and
+aggregate commit/rollback/Drop. The new exceptional helper unions declared
+seeds, existing subject participants and matching borrowed staged rows before
+the existing descendant walk. Ordinary nonlinear conditions and ordinary
+Role Resolution behavior are preserved; no authority/relevance/NoOp, retained
+map, cap or API change is included.
+
+Scoped rustfmt run `68468141-5398-49dc-8725-923a49f21ff4` passed exit0
+with empty, complete logs. Formatted causal SHA256:
+`CD39C7C2E3020A082EE14521F53A0EE24993B15C5CA21BDE61A46C7266827770`.
+Manager rehashed the prior report's612 source files: only causal.rs and the
+three manager-owned qualification documents/manifest differ. Projection and
+durability integration files, all other production files and the harness
+remain unchanged. Source inspection and formatting are not compiler or runtime
+acceptance.
+
+The next serialized gate retains all175 exact selectors and existing warm
+cache with CARGO_BUILD_JOBS=1; only gate160 has the measured240-second envelope.
+It writes the separate report
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-winner-impact.json`.
+Shannon is complete/frozen, all other workers remain idle, and manager owns
+whole-matrix execution and custody. No source/docs/test edits or additional
+implementation lanes are released during that run. Independent verification
+and Turing's exact-pushed-head audit remain required after a successful gate.
+
+### Whole175 follow-through: complete720 diagnostic pass; one impact repair active
+
+Diagnostic run `38bf0eea-e10d-4048-aa6d-f43e0cebc471` completed successfully
+at 2026-09-06 18:10:44 UTC: exit0, one passed, zero failed/ignored, native
+149.84 seconds (149.901 seconds durable elapsed). Manager read all three
+cursor-paged log segments: stdout203/stderr165866 bytes, complete and
+untruncated. All720 start records and all720 completion records are contiguous
+and ordered; every completed schedule ends with ten admitted facts and no
+refused bodies remaining. Final phase totals in seconds are snapshot14.680,
+admit45.241, retry29.368, redelivery3.413, and final checks35.729, with call
+counts4320/4320/5148/216/720. These partial phase timings do not account for
+every overhead and are not a performance benchmark.
+
+Current causal, integration fixture, core rlib, diagnostic source and binary
+were rehashed after the run and match their pre-run identities. Diagnostic
+binary SHA256 is
+`6A6B760BE487A9A0140D45712DBF1BD9A5F6F319DD4B7F9BE5677A54B556E5DF`.
+The compact retained evidence is
+`target/qualification-evidence/projection-progress-diagnostic-full175-evidence.json`,
+SHA256 `C8EAB40E480B476C02AD4F10D412FDEB63743C9AC8FA5A39CCFB2861D9B469E0`.
+This proves completion of the unchanged 720-order workload with all assertions;
+it does not retroactively turn the original matrix timeout into a pass.
+
+The measured149.84-second workload explains why120 seconds was insufficient.
+Manager changes ONLY gate160's deadline to240 seconds (about90 seconds above
+the measured complete run). No schedules, assertions, resource caps, stack,
+jobs or other deadlines change. Both integration fixture files stay frozen;
+there is no speculative test-driver optimization or automatic retry.
+
+The sole remaining demonstrated production defect is gate175's final
+winner-of-competing-selectors impact omission, described below. Shannon owns
+exclusive `semantic/causal.rs` correction and the exact direct/single/aggregate,
+hot/cold ownership controls under assignment
+`manager:c874481d-4941-42ec-8eda-94c8dde2441f` (implementation in progress).
+Manager owns the contract, manifest, evidence and subsequent integration.
+Payne/Curry diagnoses are complete; Tarjan's durable fixture remains frozen.
+One coupled production file is the useful implementation lane; extra owners
+would overlap it. After one coherent source freeze: serialized whole175
+verification, independent verification, publication/exact-head audit by
+Turing, then operator HOLD. No new whole-matrix run is active yet.
+
+### Latest whole175 runtime: 173 pass, one projection mismatch, one timeout
+
+Run `3a413fc1-411e-4082-953e-3ed78abc5cc8` terminated with exit1 at
+2026-09-06 17:56:54 UTC. The unchanged 175-cell manifest genuinely executed:
+**173 passed, two did not pass**. The warm-cache all-target build passed in
+10.666 seconds, with Cargo `build-finished: success=true` and 47 test
+executables. This supersedes the compile-only attempt below, not the final
+audit BLOCK or PR HOLD.
+
+Report:
+`target/qualification-evidence/graph-hub-wave1-full-matrix-historical-membership-compile-corrected.json`,
+SHA256 `2AAF9ADF0744775D93557988207D26A2069956164B6D6C2348F9D3AF206A51FE`.
+Manager rehashed all 612 source files and 47 executables, reconciled all
+351 source checkpoints and all 175 before/after binary hashes: no mismatch.
+Source digest is
+`c7350a8d4f53a39043ffd4cb3555d5cc06890156bc609a224d0bc3d31454d5a6`.
+HEAD/ref remain `f70689e1d64883458ad204d8d0b9f9b76bee9666` /
+`macro/02-authority-durability-relay`; this is the dirty corrected candidate,
+not a new published commit. Build and cell logs are complete, untruncated,
+and without callback errors. There are 174 normal exits and one known timeout,
+not an unknown terminal outcome.
+
+| Gate | Exact terminal evidence and remaining question |
+| --- | --- |
+| 175 | `historical_membership_exclusion_survives_later_selectors_and_cold_journals`: exit101 after 6.572 seconds, one assertion failure at causal.rs:9689 comparing cached projection with fresh reduction. Cached Membership(C) is a two-fact conflict and Role(C) is absent; full reduction has the same one fact as both Membership(C) and Role(C). This is a cell-content difference, not only commitment representation. The helper has multiple callers; exact failing stage and impact/preimage implications are under read-only diagnosis. |
+| 160 | `self_authored_membership_resolution_is_order_independent_after_role_regrant`: terminal timeout after 120.356 seconds, post-kill exit1. Complete stdout contains only running-one/test-start; stderr is empty. No native assertion failure or completed permutation count was observed. Finite 720-schedule work versus a stuck operation must be distinguished before changing any acceptance deadline. |
+
+Executed passes now include the extended real durable membership lifecycle
+155 (19.315 seconds), both-peer session lifecycle 154 (2.195), distinct-owner
+later-selector continuation 161 (2.985), truthful incomplete/stale controls
+162/166, and prior ineligible-refusal permutations 158. Provenance/cold
+rollback 170, same-snapshot canonical closure 171, checksum-valid tamper
+fallback 172, pristine checkpoint 173, and candidate-relative NoOp
+journal/hydration 174 also passed. These results do not qualify failed 175
+or unfinished 160, and are not independent verification or release approval.
+
+Manager coordination plan: terminal custody inspection complete; complete
+two-failure diagnosis in progress; no Rust edits or blind reruns. Payne owns
+read-only gate175 diagnosis (`manager:a986fd45-f036-4c7f-9a4f-d0653b8e9a8e`),
+Curry owns read-only gate160 timeout diagnosis
+(`manager:78181a58-f98c-4ad3-b313-935bf2da8b64`). Shannon's causal and Tarjan's
+durability implementations remain complete/frozen. Manager owns the evidence
+ledger and any justified unchanged-library diagnostic. Two independent
+failure groups are useful now; extra implementation lanes would duplicate work.
+Both diagnoses have now completed. Payne proved the failure is the final
+winner-of-competing-selectors sub-control: V is the only fixture fact that
+can supply both the observed role and membership values. The preceding main
+historical-membership, hot/cold journal/aggregate, and provenance controls
+therefore completed before the final failure. The helper's assertions after
+the failing cache comparison remain unexecuted at that final boundary.
+Manager inspected the same source path: typed resolution seeds the reverse
+impact walk with cell-less selector predecessors, omitting their earlier
+M/V branch cells. Full reduction and relevant-selector decisions are correct;
+the common impact family used by preimages, updates and deltas is incomplete.
+The bounded correction must cover those subject participants at every ownership
+boundary, retaining the exact final winner and all prior controls.
+
+Curry established bounded 720-order driver loops, but source alone does not
+measure their cost. Manager prepared an ignored diagnostic copy of the CURRENT
+integration target, adding only per-order progress and cumulative timing for
+snapshot, admit, retry, redelivery and final checks. All signed bodies,
+assertions and 720 schedules are unchanged. Diagnostic build
+`312b35b8-c98a-459c-a5c7-05dd172db65f` passed in 8.902 seconds with empty,
+complete logs. It links the unchanged Cargo-built core rlib
+`0681AD337900280BCC4D621964C9A66383B9A348047103D5B3CCDD8282D4753D`.
+Diagnostic source
+`target/qualification-evidence/projection-progress-diagnostic-full175.rs`
+has SHA256 `AEA52F5A0C9B2B550E6DA79558A877405F4B3FBD4BABAD888C77F842EF958D26`.
+One finite 240-second diagnostic envelope allows observation of the complete
+workload or the last progressing order, not acceptance at a relaxed timeout.
+The committed selector deadline remains 120 seconds. No production repair
+or further whole-matrix run is released before this discriminator completes.
+
+Shannon and Tarjan remain frozen; Payne and Curry are now complete/idle.
+The app's task projection still exposes stale entries; both exact same-ID
+completion updates were again refused as not assigned. Actual completed
+outcomes are recorded here without duplicate completion tasks.
+
+### Whole175 compile-only failure and exact fixture correction
+
+Run `f147876f-6a33-4851-9277-ca40260212e4` completed at
+2026-09-06 17:41:26 UTC with `build_failed`. Cargo exited101 normally after
+561.725 seconds, with `build-finished: false`; it did not time out.
+**Zero runtime cells executed.** Cargo emitted 46 test-executable artifacts,
+but there is no complete all-target compilation or behavioral acceptance.
+The retained report is
+`target/qualification-evidence/graph-hub-wave1-full-matrix-historical-membership.json`,
+SHA256 `98D9285EFDEE0FF6DC6664BA65D7EF65593073E473462BC9E12DDDC0DAA9D77D`.
+Build stdout/stderr (376813/31616 bytes) and wrapper logs are complete and
+untruncated, without capture errors. All612 recorded source files rehash
+correctly; source start and after-build digest both equal
+`d9cf976667930953b66313485f1d46314ad3b2cb07eda27c9eed253d0fc5a4c4`.
+
+The compiler reports two E0382 errors in projection integration tests:
+the new assertions read `membership_continuation.id` after that SignedFact
+was moved into the candidates array (lines1164 and1457). A bounded census
+found the same post-move access at1563. Manager replaced exactly these three
+references with the already captured Copy `membership_continuation_id`.
+No fact is cloned or re-signed; assertion expectations and production remain
+unchanged. This is a compile correction, not a new semantic repair or test pass.
+
+Scoped format `4513e9c9-4104-443a-88c5-03d510514a7f` passed with empty,
+complete logs. Projection integration SHA256 is now
+`645397FDE9E20E665A539F61CB837705264E933546EC48256886493372A279AA`.
+Causal `8F633E96...` and durability `E029BAA9...` remain unchanged. The same
+175-cell manifest, resources, stack settings and deadlines are retained.
+The next run uses the existing warm build cache and a separate report:
+`target/qualification-evidence/graph-hub-wave1-full-matrix-historical-membership-compile-corrected.json`.
+Independent runtime verification and final audit remain pending.
+
+### Prior runtime candidate: 168/174; historical membership revival reproduced
+
+Run `4ea317ef-60b7-445e-8d41-7a4591eba664` completed on
+2026-09-06 at 17:03:45 UTC. Locked workspace/all-target compilation passed
+in 511.476 seconds (`build-finished: success`, 47 test executables, zero
+compiler errors). All 174 exact cells executed: **168 passed, six failed**.
+Report `target/qualification-evidence/graph-hub-wave1-full-matrix-candidate-noop.json`
+has SHA256 `5DC6B72593F79EA05F8EF89901C405012E5EC151A0B1B87CDE30FA2DF9DDBFC2`.
+Manager rehashed all 612 recorded source files and 47 binaries, reconciled
+all 349 source checkpoints and all before/after cell hashes: zero mismatches.
+Build and runtime captures are complete, with no truncation, capture errors
+or unknown terminal outcomes. Source digest:
+`4e4b871a98ba5f7a6a53c13548dc204bc134386212f4aaa607db5b9b7e686cc8`.
+
+Executed passes include concurrent candidate-relative NoOp journal/hydration
+control 174 (11.309 seconds), all 720 authority arrival permutations in 157
+(90.908 seconds), recursive resolution 165, concurrent tier 168, second-order
+payload 159, both HubTree controls 140/141, both real relay controls, and all
+selected cold/store lifecycle gates 155 and 170–173. These are bounded runtime
+results, not whole-unit acceptance or a final independent audit.
+
+The complete six-failure assessment is now:
+
+| Gate | Observed boundary and disposition |
+| --- | --- |
+| 154 | U session expected true from controller role alone; selected-R leaves the remote's only grant suppressed. Fixture must assert both peers' role, lineage and membership prerequisites at every stage. |
+| 158 | Exact `QuarantineSignerNotEligible` for O before G in schedule `[1,0,2]`; remaining fixture driver needs explicit dependency-bound redelivery, retaining the no-mutation refusal. |
+| 160 | Old rejected membership M becomes the projected value after the new Q/R authority fork. Runtime-confirmed production defect. |
+| 161 | Old rejected M becomes the projected value after later T2 selects R and U2 regrants authority. Same coupled production defect. |
+| 162 | Candidate with only one causal head returns `NoOp("resolution has no live conflict")` before incomplete-resolution validation. Preserve this negative and construct a genuinely conflicted incomplete control. |
+| 166 | Purported independent successor revoke was authored after admitting the successor grant. Fixture must author both from the same unchanged baseline before asserting conflict/stale-head refusal. |
+
+Two diagnostic copies linked the unchanged full174 Cargo-built core rlib
+`D5D8EBA9A96531D8A1A8D8E773D089DA4D3636091211451FB73C4F584CDBC2BD`.
+No production or signed-body changes were made for these reproductions.
+Gate162 diagnostic build `6b55a04a-a2de-42f6-9da1-68a9f5e43cbc` passed;
+test `d6dad88d-8198-46f1-8027-5eb7061cc4a6` ran one and failed one, exit101,
+with the exact NoOp above and complete 275/339-byte stdout/stderr.
+
+Membership diagnostic build `9ce7af4f-28ae-4a34-a783-0fc0df278836` passed
+in 6.343 seconds. The first diagnostic-only compile attempt `75ddb546...`
+failed on tuple syntax for a struct variant; correcting that helper did not
+change production. Test `0dcba933-f1c5-452b-969f-93eb4450d0f8` ran two and
+failed two, exit101, native runtime 0.97 seconds, complete 484/2741-byte
+stdout/stderr. It prints the exact identities:
+
+- 160: cached and fresh-full membership both select old M `dubnmvd...`;
+  independent signed-dependency ancestry gives sole maximal raw head Q
+  `jabcjn...`, not M.
+- 161: cached and fresh-full both select old M `tjp7s7...`; independent
+  signed-dependency ancestry gives sole maximal raw head Q `4bh4dt...`.
+
+The fresh projection reducer uses maintained cell indexes, so its agreement
+with the cached projection does not refute this bug. Source review identifies
+two coupled gaps: direct-only maximal-head removal retains indirectly
+dominated M; historical typed-selector exclusions are skipped at a later
+unresolved fork and are not composed into a later selected branch's ancestry.
+The diagnostic establishes membership projection revival, not an observed
+unauthorized network session. Full diagnostic custody, arguments and logs are
+retained in `target/qualification-evidence/projection-diagnostics-full174-evidence.json`.
+Membership diagnostic executable before/after SHA256:
+`CCCA57F70C22C7BC21379F647B2D8A74B2A5339A1F491069E89A223E21B6EF49`.
+
+One coherent correction has completed source integration; none is yet
+compiled or qualified:
+
+- Shannon (`manager:159c867f-bedb-4d40-b1a6-2443db0a2f1a`), causal.rs only:
+  frozen implementation `B2B9BCC3...` shares signed indirect-head domination
+  between mutation and preflight pricing; relevant earlier typed restrictions
+  remain enforced during later forks and selected continuations. Canonical
+  restore and cold hydration use the same context-completeness contract.
+  New gate175 covers private authority/raw-index checks, independent ancestry,
+  pricing, hot/cold single/aggregate commit/rollback/Drop and checkpoint omission.
+- Curry (`manager:213df0f0-765c-4f22-b9bf-1e3944c10ebf`), projection integration
+  test only: frozen implementation `A898707A...` closes all four fixture
+  preconditions and adds the independent ancestry oracle to the same signed
+  M/Q sequences. Manager added explicit unchanged-ID/full-projection checks
+  around the retained one-head NoOp negative. No weaker losing-M assertions.
+- Tarjan (`manager:e66156c6-a6c5-451d-a3b3-3a9fd4a99dd8`), authority durability
+  test only: implementation handed off at SHA256
+  `BE4AA266FC2360DDC7C790C0DAA90C71C00F498C9899D23196910C2B09B05B33`.
+  Manager checked the bounded source extension: existing gate155 retains its
+  four scenarios and one Mesh/provider, then adds the two-selector membership
+  transcript (16 rows before reopen, 17 afterward). Both M/V and Q/R are
+  authored from shared unchanged baselines; Q does not directly cite old M.
+  It checks independent signed-ancestry maxima, exact live/export/projection
+  identities, the two-endpoint session predicate and roster at every admission.
+  Named F2 must first be hot, later absent from the complete hot observation
+  but present in SQLite export, then support an actual post-reopen write.
+  Both consumed leaves must restore exact provider custody. The original
+  13-row helper bounds remain; only the new extension uses explicit17.
+  No new selector, store/state API, provider grant or timeout is needed.
+  This is source integration only; expanded gate155 has not run.
+
+Scoped rustfmt run `52e085f7-47e4-4448-9d3b-4db238d20ad0` passed with empty,
+complete logs. Final candidate source hashes after formatting/integration:
+
+| File beneath crates/myownmesh-core | SHA256 |
+| --- | --- |
+| src/semantic/causal.rs | `8F633E967D42218819C0FC2C3B334A39B33D4344EBAE3C6E3D033A70E9B0F676` |
+| tests/semantic_projection_controls.rs | `B4A53BF7011A7F7D287E4436389E56098B6E662035E13925F222E8722BD00F9E` |
+| tests/semantic_authority_selection_durability.rs | `E029BAA99619EC91858D8145313C476CD90693DABB3209C5C8A82605F6289B4B` |
+
+The manifest now retains all174 prior cells and adds exact gate175,
+`semantic::causal::tests::historical_membership_exclusion_survives_later_selectors_and_cold_journals`,
+first so the coupled behavior runs immediately after compilation. Gate155
+retains its name and existing 180-second bound with the extended transcript.
+The next whole175 result will be retained separately as
+`target/qualification-evidence/graph-hub-wave1-full-matrix-historical-membership.json`.
+Existing warm target cache, CARGO_BUILD_JOBS=1, 1800-second build bound and
+all prior cell budgets remain unchanged. No result is claimed before execution.
+
+Manager owns integration, contract/manifest/evidence and serialized execution.
+Payne and Curry's read-only diagnoses are complete. Same-ID task completion
+updates still encounter the app's ownership mismatch; no duplicate completion
+tasks were created. Independent verification and Turing's exact-pushed-head
+audit remain required after successful execution. No HOLD or CI disposition
+has changed.
+
+### Historical full173 result and subsequent candidate-NoOp batch
+
+The subsequent persistent-selector correction is still unqualified. Its
+complete run `45cfe48d-8e77-4e92-b20f-95bcfb38cc01` finished at
+2026-09-06 16:08:38 UTC: locked workspace/all-target compilation passed in
+1382.275 seconds, with `build-finished: success`, 47 test executables and no
+compiler errors. All 173 exact selections executed: **163 passed, 10 failed**.
+Report:
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-provenance-manifest-corrected.json`
+(SHA256 `629A144596932C75653ECA7612330D5141DF5DAFDDDDFB1A6E4878A16C166EF0`).
+Manager verified all 347 source checkpoints, rehashed all 612 recorded source
+files and 47 executables, and checked every before/after cell binary hash:
+zero mismatches. All build/cell output is complete and untruncated, with no
+callback-capture errors or unknown terminal outcomes. This is real runtime
+evidence, not the earlier manifest-validation refusal.
+
+New boundary results are executed PASS: actual selected-branch cold
+compaction/reopen/hydration (gate 155, 14.19 seconds), causal continuation /
+competing selectors / cold restore / rollback (170, 1.88 seconds), canonical
+same-snapshot signed closure (171, 0.22 seconds), checksum-valid tamper
+refusal plus canonical fallback (172, 1.74 seconds), and positive clean
+checkpoint restore without ordered admission replay (173, 0.20 seconds).
+Each ran exactly one test with exit 0. These bounded passes do not override
+the ten remaining failures or constitute independent final audit approval.
+
+The complete failure set has been reconciled from three read-only diagnoses
+and one manager-owned diagnostic. The latter copies the integration target,
+changes only admission/retry assertion diagnostics (each result evaluated
+once), and links the unchanged Cargo-built library. No production rebuild,
+signed-body change or expected-outcome change was needed.
+
+Diagnostic build `36a5e97c-f5f8-4d5b-90fc-bead91d3a751` succeeded in
+9.65 seconds with empty complete logs. Test
+`cebcff8e-972b-41b2-aa93-d6bd7e971c17` ran exactly the three hidden-error
+selectors: 0 passed, 3 failed, exit 101, 2.05 seconds native runtime, complete
+598/4106-byte stdout/stderr. Exact results:
+
+- 154: schedule T/R/O/M/G rejects controller O before its grant with
+  `QuarantineSignerNotEligible`.
+- 157: permutation G/O/R/Q/F/N rejects F before regrant N with the same
+  ineligible-signer refusal. The fixture incorrectly expected quarantine.
+- 159: order O/M/E/R/Q rejects independent Owner-authored R with
+  `NoOp("role revoke targets an absent role")`. R's signed causal history
+  has the controller grant and no M/E; this is receiver-arrival-relative
+  no-op detection, not an intrinsically redundant revoke.
+
+Retained diagnostic source:
+`target/qualification-evidence/projection-admission-diagnostic-full173.rs`,
+SHA256 `4D416198C4DBE88DCF69EDB4F9F06600B2BB9633570B4DCB000A5DF9488D476C`.
+Executable before/after SHA256:
+`F297800A422F2393070B119A4EEDD3BA1F978AE39B873986C9AF3D715AE2D5DD`.
+The core rlib before/after SHA256 is
+`607C500002B75F23BB9753522974B7E973B6AEEBD6198FA92BD688A670BB29E9`.
+The diagnostic evidence JSON alongside it records dependency hashes, exact
+arguments and complete logs. This evidence diagnoses failures, not acceptance.
+
+Payne's source review separates gates 165/168 (valid concurrent ordinary
+Resolution/RoleGrant rejected using receiver-current state) from obsolete
+fixture positives in 160/161 (ordinary selection of a typed-losing historical
+membership row). Gate 158's empty membership cell truthfully takes NoOp
+precedence. Gate 166's purported competing grant is a redundant causal
+successor; its intended stale-head negative needs a real current conflict.
+
+Erdos established that `peer()` includes discovery-only Sighted entries.
+The observed gate 140 registry-presence failure is not evidence of a native
+shortcut. The retained log does not identify the precise referral or peer
+authentication fields. The correction will check authenticated/current
+native-worker adjacency at both payload boundaries, not mere registry
+absence, without changing production routing.
+
+One grouped implementation batch is now active:
+
+- Shannon, assignment `manager:7714215c-264c-4161-abe5-b24e7ac2b142`:
+  causal.rs implementation complete, manager-source-inspected at SHA256
+  `029CB1ECEC53A71568D4D155256E5F811C19C177F31F0F7732417A9D7E194791`.
+  The production helper now evaluates intrinsic NoOp in candidate history
+  for RoleGrant, RoleRevoke and ordinary Resolution; both callers still
+  classify missing dependencies before invoking it. Existing authorization
+  and ineligible-signer refusal paths are unchanged. New exact gate 174,
+  `candidate_relative_noops_preserve_concurrent_role_operations_across_journals`,
+  covers same-body concurrent pairs, intrinsic refusals, both orders,
+  full-projection oracles, single/aggregate journals and retired history.
+  This is source integration, not compile/runtime PASS.
+- Curry, assignment `manager:a1ba44cd-d936-4303-b60e-66e33a7f5f17`:
+  complete projection-fixture source handed off at SHA256
+  `0D78F41EA2C4F16A085686D5E36088CEBD41889F7267D0C792EB9995C755388B`.
+  Both obsolete historical Q selectors are now exact negative controls;
+  positive membership continuations are newly authored after regrant.
+  Redelivery checks canonical dependencies, not just generic parent fields.
+  Manager integration corrected one missing borrow and bounded settling
+  of eligible quarantined prerequisites before dependency-complete
+  redelivery, at all four fixture drivers. This is test scheduling, not
+  production retention or authorization. All 15 selectors remain.
+- Erdos, assignment `manager:11ad0f69-218f-455f-b903-6b8256da67c3`:
+  HubTree source correction complete and manager-inspected; all 20 directed
+  pairs checked at both payload boundaries, with every witness dropped
+  locally. SHA256
+  `A95B073BB93C684AB2E9571463D297E79F5D361EF5DAA05ECC5BB52E05A63E23`.
+  Compilation and runtime remain unverified for this change.
+- Manager: all three source handoffs integrated; the 174-selector matrix is
+  prepared for one frozen serialized build/runtime run after scoped format
+  and actual harness-manifest validation. No corrected runtime result yet.
+  Payne's diagnosis
+  is complete; independent verification and Turing's final audit remain
+  later gates, not implementation roles.
+
+Grouped format `743d10ea-e61b-40b4-b86c-53850409e1e5` and the final
+manager fixture format `0edd72cc-a620-46fd-b00a-5ae5528b754a` both
+succeeded with empty complete logs. Actual harness validation
+`d817428a-daea-45d8-88a7-776f4df31559` succeeded with 174 cells.
+Final pre-build source hashes:
+
+- causal.rs: `6680CB021571F68425AE28373EFC8F58EB206276A32AD3E21D66FC567A9438CC`.
+- projection controls: `8EE9BCD6BF05F462E8C2595C85AE0F12A772084AD12A0C9AD0866C8F829FC299`.
+- HubTree test: `A95B073BB93C684AB2E9571463D297E79F5D361EF5DAA05ECC5BB52E05A63E23`.
+
+The next report is create-new
+`target/qualification-evidence/graph-hub-wave1-full-matrix-candidate-noop.json`.
+Its build retains one job, the finite 1800-second envelope and the existing
+warm target cache; no cold-build performance claim follows. Source, tests
+and documents are frozen during execution. The report, not this pre-run
+record, determines the eventual result.
+
+The provider task projection is stale and same-ID completion updates for
+the completed diagnosis assignments were rejected as not manager-owned.
+Actual transitions and exact new assignment IDs are recorded here; no
+duplicate completion tasks were manufactured. There is no exposed own-plan
+updater, so manager integration remains explicitly in progress in this
+record. This is not unit completion. PR #7 remains draft and on HOLD.
+
+Turing's independent final audit of pushed head
+`f70689e1d64883458ad204d8d0b9f9b76bee9666` found a HIGH persistent typed
+authority-selection defect. The selected branch is recovered only from an
+immediate dependency of the current authority head. A valid resolution,
+regrant, then ordinary future authority use can therefore forget the
+selection. The audit also identified the related one-layer cold-retention
+gap. The unit is not complete; the prepared local-PASS publication draft
+must not be used as completion evidence.
+
+Manager diagnostic run `257ed24d-0c2f-425c-9e0c-267b12a85ff9` reproduces
+selection loss against the unchanged built library from this head. All six
+signed G/O/R/T/U/F operations were admitted as `Inserted`. Selection was
+present after T and U, then `None` after F. The exact test ran once and failed
+in 0.11 seconds, exit 101, with complete untruncated 258/707-byte stdout/stderr.
+The probe's old-target role remained `None`; this run does not itself prove
+permission revival, full-projection divergence, or cold/reopen loss.
+
+The standalone diagnostic is retained at
+`target/qualification-evidence/authority-selection-probe-f70689e.rs`
+(SHA256 `CB9B65D1E727A3E99E58EFD4C87CD131EBDE2E2E8F0BE7950825D925E10D8A6C`).
+Its executable SHA256 is
+`15D4525676A15B4A370A60446907B9D26561842628D4D0DA1AAD96AACE9CE53F`;
+it links the already-built core library, SHA256
+`9CBAEB4567A153FFC4D3BF0DF412BFC4B406DF27580FBE13022EEEDB258E5056`.
+Build `3c3e0476-69a3-4e8c-9e71-0b58cf4fe20b` passed using the native library
+paths recorded by Cargo. Its predecessor stopped at a missing native search
+path and supplied no runtime evidence.
+
+The existing omitted selector
+`authority_lineage_selection_round_trips_and_regrant_is_future_only`
+failed earlier in run `83eaeff4-04e9-42e8-a8fc-53a0fa35c870`: an empty-cell
+ordinary Resolution returned `NoOp("resolution has no live conflict")`, not
+the fixture's expected `IncompleteResolution`. It never reached the reported
+defect. Its replay also requires correcting positional assumptions about
+FactId-sorted export order. These are grouped test repairs, not authorization
+changes or a substitute for the positive-path reproduction above.
+
+Clean-head run `dada4d7d-8c7f-4780-9813-fa9aa9f1edba` did pass all 153
+selected tests with 46 compiled test executables. Its report is
+`target/qualification-evidence/graph-hub-f70689e-full153.json`, SHA256
+`9F4C6D08C1C8994516EDD4A769DD393E6C63F0AEA950663574CE67AE85C0D6C2`.
+That selection omitted the existing lifecycle test and does not override the
+final audit BLOCK. Exact-head CI workflow `34020595984` separately failed:
+three GUI protocol census jobs, Direct/native warning-denied compilation,
+and Avahi warning-denied compilation; both daemon cross-builds passed.
+Neither failed native backend job reached its runtime gate.
+
+The current same-unit correction assigns causal persistence/cold ownership to
+Shannon, complete hot/wire lifecycle controls to Curry, and actual durable
+compaction/checkpoint/reopen controls to Tarjan on disjoint files. Manager
+owns integration and serialized verification. Independent verification and
+Turing's new exact-pushed-head audit remain required before completion.
+
+The prepared manifest now contains 173 exact cells: the prior 153 plus all 15
+`semantic_projection_controls` tests and the real durable authority-selection
+lifecycle control, the new causal provenance/rollback control, and three
+store checkpoint/ancestry controls. The
+previously omitted lifecycle runs first, followed by the durable and causal
+controls, after the all-target compiler gate. This manifest is
+prepared, not executed. Manager integration corrected the hot fixture's
+cached-only oracle and selected-operation role expectation, and returned
+the causal duplicate-field/loser-fence/accounting issues and the durability
+fixture's missing future operations/live oracle together to their owners.
+Run `40213c9f-6099-4509-9e84-5033573aa6bc` stopped at manifest validation
+with `harness_error`, exit 2, before any Cargo build or runtime cell. The
+manager's 16 added integration selections used Cargo's target-kind spelling
+`test` instead of this harness schema's `integration`, in both the required
+list and cells. All 32 field occurrences are corrected together. This is a
+manager-owned qualification setup error, not production failure evidence.
+
+The earlier pair-only `(frontier, selected)` prototype was source-blocked: once
+selector ancestry is cold, it cannot prove continuation eligibility, and
+trusting arbitrary frontier ancestors includes the losing branch. The manager
+has selected a bounded per-live-row typed-provenance design with canonical
+store validation on restore. Shannon owns causal metadata/rollback/rebuild;
+Tarjan owns the store resolver and the revised 13-fact real durable lifecycle
+test. Shannon has replaced the pair prototype and frozen causal source at
+`CB9DB29DFF792CBE32B661C4D3757C1D7276EC3A6F7859136D688C5B0EB3751B`.
+This is an uncompiled implementation handoff, not an independent source or
+runtime PASS. No partial source handoff is treated as a passing implementation. The
+full-reduction lab accessor is used by both integration oracles; ordinary
+default-feature replay coverage remains separate from that lab-only oracle.
+
+The causal/store interface is now agreed: checkpoint restore resolves roots
+derived from resident signed facts, independently of serialized provenance,
+and validates signed closure in one SQLite read snapshot. Shannon's agreed
+restore/root interfaces and final metadata shape are landed. Tarjan has
+completed dependent checksum-valid forgery and omission controls plus the
+positive validated-checkpoint path. His unformatted store handoff hash is
+`3A0FC669510C7C4DDE30DCEB120FEEFDCD91CCD1A71A4F91F4CDF996F8B5D806`;
+the durable lifecycle fixture hash is
+`A121A5B289291949E65D134A0D18E232A221087A2604AE46F362E12108E81389`.
+All three implementation owners are frozen and idle. Manager integration
+confirmed the agreed same-snapshot resolver and preserved generic ingress
+lookup semantics; independent verification remains after execution.
+Manager has wired additional selector-provenance roots into both production
+single and aggregate history lookups under their existing publication/owner
+fences. In-batch IDs remain overlay-owned; ordinary unknown-parent quarantine
+is unchanged. This adapter is source-integrated, not compiled or runtime
+verified. The expanded manifest includes the final store controls. Scoped
+formatting and the serialized all-target build/full matrix are the next
+gate; no new implementation lanes are opened during execution. Typed
+AuthorityLineageResolution no-op checks are candidate-relative so genuine
+competing selectors can both be admitted and remain fail-closed; ordinary
+role and payload no-op rules are unchanged. This behavior is in the frozen
+causal control and still requires runtime evidence.
+
+Scoped formatting run `b5160423-0099-46b4-818b-c43f60f24e7d` completed
+successfully with exit 0 and complete empty stdout/stderr. It formatted only
+the five changed Rust files. The prepared execution uses the retained cache,
+`CARGO_BUILD_JOBS=1`, the existing 1800-second build budget and unchanged
+per-cell bounds. Its report path is
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-provenance.json`
+retains the manifest refusal above. The corrected manifest is checked with
+the unchanged harness's own `validate_spec` before the next full run; the
+Rust source and all 173 selector names, counts and timeouts are unchanged.
+Validation run `e976da05-6c8f-41ba-aabe-8b245380091e` passed with exit 0,
+complete 128-byte stdout and empty stderr, accepting all 173 cells through
+the actual harness validator. The corrected full-run report will be
+`target/qualification-evidence/graph-hub-wave1-full-matrix-selector-provenance-manifest-corrected.json`.
+
+## Previous prepublication result: 153 selections, 153 pass / 0 fail
 
 Run `9cf2e327-8ff4-4211-a08f-1953edbbaf8f` completed successfully at
 2026-09-06 07:47:09 UTC. The locked, single-job workspace/all-target test build
@@ -54,7 +686,8 @@ The E2E parenting snapshot generation is a table allocation cursor; exact
 accepted remote relation generation is covered only by component controls.
 Directory scans remain O(N), and transactional retry allowance is not a total
 CPU bound. The sections below preserve superseded results and diagnoses;
-their pending/failing statements are historical, not the current disposition.
+their pending/failing statements are historical. The current disposition is
+the final audit BLOCK recorded above.
 
 ## Previous verification attempt: 153-selection build failed, zero runtime tests
 

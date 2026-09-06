@@ -217,6 +217,55 @@ fn choose_leaf_outside_prefix(
     panic!("identity pool did not produce an out-of-prefix HubTree parent");
 }
 
+/// Observe every directed endpoint pair in the fixed R/H1/H2/L1/L2 fixture.
+/// These are boundary snapshots, not a history of connections between them;
+/// the four explicitly installed links also constrain the payload path.
+fn assert_four_hop_adjacency(
+    phase: &str,
+    nodes: &[(&str, &str, &myownmesh_core::JoinedNetwork); 5],
+) {
+    // Node order is R, H1, H2, L1, L2. Both directions must exist on each
+    // intended link; every other off-diagonal pair must lack a shortcut.
+    const ALLOWED: [[bool; 5]; 5] = [
+        [false, true, true, false, false],
+        [true, false, false, true, false],
+        [true, false, false, false, true],
+        [false, true, false, false, false],
+        [false, false, true, false, false],
+    ];
+    for (local_index, &(local_role, local_id, network)) in nodes.iter().enumerate() {
+        for (remote_index, &(remote_role, remote_id, _)) in nodes.iter().enumerate() {
+            if local_index == remote_index {
+                continue;
+            }
+            let peer = network.peer(remote_id);
+            let authenticated = peer.as_ref().is_some_and(|info| info.authenticated);
+            let witness = network.capture_transport_channel_for_lab(remote_id);
+            let has_selected_worker = witness.is_some();
+            if ALLOWED[local_index][remote_index] {
+                assert!(
+                    authenticated && has_selected_worker,
+                    "phase={phase} local={local_role}:{local_id} remote={remote_role}:{remote_id}: \
+                     intended link requires authentication and an exact current selected worker; \
+                     selected_worker={has_selected_worker} PeerInfo={peer:?}"
+                );
+            } else {
+                // Discovery may legitimately retain an unauthenticated
+                // Sighted row. Registry presence alone is not a transport.
+                assert!(
+                    !authenticated && !has_selected_worker,
+                    "phase={phase} local={local_role}:{local_id} remote={remote_role}:{remote_id}: \
+                     unexpected authenticated peer or selected worker outside the four-hop path; \
+                     selected_worker={has_selected_worker} PeerInfo={peer:?}"
+                );
+            }
+            // Exact witnesses retain worker custody: release each one within
+            // this observation, before any later teardown or provider check.
+            drop(witness);
+        }
+    }
+}
+
 async fn wait_for_parent(
     network: &myownmesh_core::JoinedNetwork,
     expected_parent: [u8; 32],
@@ -752,10 +801,14 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
             .accepted_children,
         2
     );
-    assert!(l1.peer(&root_id).is_none());
-    assert!(l1.peer(&h2_id).is_none());
-    assert!(l2.peer(&root_id).is_none());
-    assert!(l2.peer(&h1_id).is_none());
+    let path_nodes = [
+        ("R", root_id.as_str(), &root),
+        ("H1", h1_id.as_str(), &h1),
+        ("H2", h2_id.as_str(), &h2),
+        ("L1", l1_id.as_str(), &l1),
+        ("L2", l2_id.as_str(), &l2),
+    ];
+    assert_four_hop_adjacency("before bidirectional payload", &path_nodes);
 
     let l2_channel = l2.channel::<String>(CHANNEL_NAME);
     let mut l2_subscription = l2_channel.subscribe().expect("L2 subscription is funded");
@@ -797,6 +850,7 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
             .is_err(),
         "reverse four-hop payload is delivered exactly once"
     );
+    assert_four_hop_adjacency("after bidirectional payload", &path_nodes);
 
     // H1's one-child service is full.  The sixth leaf is connected only to
     // H1, so the production attach request must be refused rather than

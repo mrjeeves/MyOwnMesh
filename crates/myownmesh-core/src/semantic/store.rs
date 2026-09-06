@@ -1937,6 +1937,90 @@ impl DurableSemanticStore {
             .collect()
     }
 
+    /// Resolve checkpoint provenance from canonical admitted rows. The SQL
+    /// dependency index accelerates traversal; signed dependencies, not that
+    /// index or the checkpoint checksum, establish closure completeness.
+    fn checkpoint_causal_history_in_snapshot(
+        &self,
+        connection: &Connection,
+        roots: &[FactId],
+    ) -> Result<Vec<SignedFact>, DurableStoreError> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        if u64::try_from(roots.len())
+            .ok()
+            .is_none_or(|count| count > self.policy.max_proof_links)
+        {
+            return Err(DurableStoreError::LimitExceeded(
+                "checkpoint ancestry roots",
+            ));
+        }
+        let history = self.admitted_causal_history_in_snapshot(connection, roots)?;
+        // No additional history-sized index: these exact lookups and edge
+        // comparisons run inside the caller's one SQLite read snapshot.
+        let mut root_statement = connection
+            .prepare("SELECT status FROM facts WHERE fact_id=?")
+            .map_err(DurableStoreError::Sqlite)?;
+        for root in roots {
+            let status: Option<String> = root_statement
+                .query_row(params![root.as_bytes().as_slice()], |row| row.get(0))
+                .optional()
+                .map_err(DurableStoreError::Sqlite)?;
+            if status.as_deref() != Some("admitted") {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "checkpoint ancestry root is not admitted".into(),
+                });
+            }
+        }
+        let mut dependency_statement = connection
+            .prepare(
+                "SELECT d.dep_id,f.status FROM dependencies d
+                 LEFT JOIN facts f ON f.fact_id=d.dep_id
+                 WHERE d.fact_id=? ORDER BY d.dep_id",
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        for fact in &history {
+            fact.verify().map_err(|error| DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: format!("invalid checkpoint ancestry signature: {error}"),
+            })?;
+            let expected = canonical_dependencies(fact);
+            let mut rows = dependency_statement
+                .query(params![fact.id.as_bytes().as_slice()])
+                .map_err(DurableStoreError::Sqlite)?;
+            for dependency in &expected {
+                let row = rows
+                    .next()
+                    .map_err(DurableStoreError::Sqlite)?
+                    .ok_or_else(|| DurableStoreError::Corrupt {
+                        path: self.path.clone(),
+                        reason: "checkpoint ancestry omits a signed dependency".into(),
+                    })?;
+                let indexed: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
+                let status: Option<String> = row.get(1).map_err(DurableStoreError::Sqlite)?;
+                if indexed.as_slice() != dependency.as_bytes().as_slice()
+                    || status.as_deref() != Some("admitted")
+                {
+                    return Err(DurableStoreError::Corrupt {
+                        path: self.path.clone(),
+                        reason:
+                            "checkpoint ancestry dependency differs from admitted signed history"
+                                .into(),
+                    });
+                }
+            }
+            if rows.next().map_err(DurableStoreError::Sqlite)?.is_some() {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "checkpoint ancestry has an extra indexed dependency".into(),
+                });
+            }
+        }
+        Ok(history)
+    }
+
     fn provisional_in_snapshot(
         &self,
         connection: &Connection,
@@ -5467,6 +5551,18 @@ impl DurableSemanticStore {
         connection: &SemanticSqliteConnection,
         bootstrap: &VerifiedBootstrap,
     ) -> Result<Option<RestoredSemanticState>, DurableStoreError> {
+        connection
+            .with_read_snapshot(|connection| {
+                Ok(self.restore_live_checkpoint_in_snapshot(connection, bootstrap))
+            })
+            .map_err(DurableStoreError::Sqlite)?
+    }
+
+    fn restore_live_checkpoint_in_snapshot(
+        &self,
+        connection: &Connection,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<Option<RestoredSemanticState>, DurableStoreError> {
         let encoded: Option<Vec<u8>> = connection
             .query_row(
                 "SELECT value FROM meta WHERE key=?",
@@ -5532,7 +5628,7 @@ impl DurableSemanticStore {
                 reason: "live checkpoint checksum mismatch".into(),
             });
         }
-        let stored_usage = self.read_semantic_usage(connection)?;
+        let stored_usage = self.read_semantic_usage_raw(connection)?;
         if checkpoint.generation != stored_usage.generation {
             // A process stopped between a semantic commit and its clean
             // checkpoint. The cache is merely stale; replay remains the
@@ -5553,11 +5649,19 @@ impl DurableSemanticStore {
                     path: self.path.clone(),
                     reason: "invalid projection commitment".into(),
                 })?;
-        let graph = FactGraph::from_live_checkpoint(bootstrap, self.policy, checkpoint.graph)
-            .map_err(|reason| DurableStoreError::Corrupt {
-                path: self.path.clone(),
-                reason,
-            })?;
+        let graph = FactGraph::from_live_checkpoint_with_history(
+            bootstrap,
+            self.policy,
+            checkpoint.graph,
+            |roots| {
+                self.checkpoint_causal_history_in_snapshot(connection, roots)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(|reason| DurableStoreError::Corrupt {
+            path: self.path.clone(),
+            reason,
+        })?;
         let counters = graph.durable_usage_counters();
         if counters
             != (
@@ -8560,6 +8664,14 @@ mod tests {
         owner.release().expect("release checkpoint owner");
         drop(owner);
 
+        let checkpoint_connection = store.open_database(false).expect("checkpoint reader");
+        let accelerated = store
+            .restore_live_checkpoint(&checkpoint_connection, &bootstrap)
+            .expect("validate pristine checkpoint")
+            .expect("pristine checkpoint uses the acceleration path");
+        assert_eq!(accelerated.graph().projection(), graph.projection());
+        drop(checkpoint_connection);
+
         ORDERED_RESTORE_ROWS.store(0, Ordering::Relaxed);
         let reopened = store.open_writable().expect("reopen checkpoint owner");
         let restored = reopened.restore(&bootstrap).expect("restore checkpoint");
@@ -8567,9 +8679,423 @@ mod tests {
         assert_eq!(
             ORDERED_RESTORE_ROWS.load(Ordering::Relaxed),
             0,
-            "a current clean checkpoint must not enumerate historical rows"
+            "a current clean checkpoint must not use ordered history replay"
         );
         reopened.release().expect("release reopened owner");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_ancestry_resolver_checks_signed_closure_in_one_snapshot() {
+        let root = root();
+        let bootstrap = closed("checkpoint-ancestry", 171, [171; 32]);
+        let signer = key(171);
+        let author = DeviceId::from_public_key_bytes(*signer.verifying_key().as_bytes()).unwrap();
+        let target = DeviceId::from_public_key_bytes(*key(172).verifying_key().as_bytes()).unwrap();
+        let parent = root_fact_for_target(&bootstrap, &signer, target.clone());
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        assert_eq!(
+            graph.admit(parent.clone()),
+            Ok(super::super::Admission::Inserted)
+        );
+        let body = FactBody::RoleRevoke { target };
+        let witness = graph.authoring_witness(&body, &author);
+        let child = SignedFact::sign(
+            FactContent::from_authoring_witness(&graph, body, &witness, std::iter::empty()),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(canonical_dependencies(&child), vec![parent.id]);
+        assert_eq!(
+            graph.admit(child.clone()),
+            Ok(super::super::Admission::Inserted)
+        );
+        let store = DurableSemanticStore::new(&root, "ancestry-slot");
+        store.commit(&graph, Vec::new()).unwrap();
+        let connection = store.open_database(false).unwrap();
+        let writer = Connection::open(store.path()).unwrap();
+        let resolve = |roots: &[FactId]| {
+            connection
+                .with_read_snapshot(|sql| {
+                    Ok(store.checkpoint_causal_history_in_snapshot(sql, roots))
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            resolve(&[child.id]).unwrap(),
+            vec![parent.clone(), child.clone()]
+        );
+        assert!(resolve(&[]).unwrap().is_empty());
+        assert!(matches!(
+            resolve(&[FactId::from_bytes([0xee; 32])]),
+            Err(DurableStoreError::Corrupt { .. })
+        ));
+
+        for row_limit in [true, false] {
+            let mut policy = SemanticPolicyConfig::default();
+            if row_limit {
+                policy.max_proof_links = 1;
+            } else {
+                policy.max_proof_bytes = 1;
+            }
+            let limited = DurableSemanticStore::with_policy(&root, "ancestry-slot", policy);
+            let result = connection
+                .with_read_snapshot(|sql| {
+                    Ok(limited.checkpoint_causal_history_in_snapshot(sql, &[child.id]))
+                })
+                .unwrap();
+            assert!(matches!(result, Err(DurableStoreError::LimitExceeded(_))));
+        }
+
+        // Pin the canonical snapshot, then commit an index omission on a
+        // second WAL connection. Validation must see one coherent version.
+        let pinned = connection
+            .with_read_snapshot(|sql| {
+                let _: i64 = sql.query_row("SELECT COUNT(*) FROM facts", [], |row| row.get(0))?;
+                writer.execute(
+                    "DELETE FROM dependencies WHERE fact_id=?",
+                    params![child.id.as_bytes().as_slice()],
+                )?;
+                Ok(store.checkpoint_causal_history_in_snapshot(sql, &[child.id]))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned, vec![parent.clone(), child.clone()]);
+        assert!(
+            matches!(resolve(&[child.id]), Err(DurableStoreError::Corrupt { reason, .. })
+            if reason == "checkpoint ancestry omits a signed dependency")
+        );
+        writer
+            .execute(
+                "INSERT INTO dependencies(fact_id,dep_id) VALUES(?,?)",
+                params![
+                    child.id.as_bytes().as_slice(),
+                    parent.id.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+
+        // An extra edge cannot manufacture ancestry, even to another valid
+        // admitted row. UNION traversal terminates this deliberately cyclic index.
+        writer
+            .execute(
+                "INSERT INTO dependencies(fact_id,dep_id) VALUES(?,?)",
+                params![
+                    parent.id.as_bytes().as_slice(),
+                    child.id.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(
+            matches!(resolve(&[child.id]), Err(DurableStoreError::Corrupt { reason, .. })
+            if reason == "checkpoint ancestry has an extra indexed dependency")
+        );
+        writer
+            .execute(
+                "DELETE FROM dependencies WHERE fact_id=?",
+                params![parent.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+
+        writer
+            .execute(
+                "UPDATE facts SET status='quarantined' WHERE fact_id=?",
+                params![parent.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert!(matches!(
+            resolve(&[child.id]),
+            Err(DurableStoreError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            resolve(&[parent.id]),
+            Err(DurableStoreError::Corrupt { .. })
+        ));
+        writer
+            .execute(
+                "UPDATE facts SET status='admitted' WHERE fact_id=?",
+                params![parent.id.as_bytes().as_slice()],
+            )
+            .unwrap();
+
+        let mut forged = child.clone();
+        forged.signature = parent.signature.clone();
+        writer
+            .execute(
+                "UPDATE facts SET encoded=? WHERE fact_id=?",
+                params![
+                    store.encode_stored_fact(&forged).unwrap(),
+                    child.id.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(
+            matches!(resolve(&[child.id]), Err(DurableStoreError::Corrupt { reason, .. })
+            if reason.starts_with("invalid checkpoint ancestry signature:"))
+        );
+        writer
+            .execute(
+                "UPDATE facts SET encoded=? WHERE fact_id=?",
+                params![
+                    store.encode_stored_fact(&child).unwrap(),
+                    child.id.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        assert_eq!(resolve(&[child.id]).unwrap(), vec![parent, child]);
+        drop(writer);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selector_checkpoint_valid_checksum_tampering_falls_back_to_canonical_history() {
+        fn sign(graph: &FactGraph, signer: &SigningKey, body: FactBody) -> SignedFact {
+            let author =
+                DeviceId::from_public_key_bytes(*signer.verifying_key().as_bytes()).unwrap();
+            let witness = graph.authoring_witness(&body, &author);
+            SignedFact::sign(
+                FactContent::from_authoring_witness(graph, body, &witness, std::iter::empty()),
+                signer,
+            )
+            .unwrap()
+        }
+        fn insert(graph: &mut FactGraph, fact: SignedFact) -> FactId {
+            let id = fact.id;
+            assert_eq!(graph.admit(fact), Ok(super::super::Admission::Inserted));
+            id
+        }
+        let root = root();
+        let bootstrap = closed("checkpoint-selector", 173, [173; 32]);
+        let signer = key(173);
+        let controller_key = key(174);
+        let controller =
+            DeviceId::from_public_key_bytes(*controller_key.verifying_key().as_bytes()).unwrap();
+        let old_target =
+            DeviceId::from_public_key_bytes(*key(175).verifying_key().as_bytes()).unwrap();
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let grant = sign(
+            &graph,
+            &signer,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: super::super::Role::Controller,
+            },
+        );
+        insert(&mut graph, grant);
+        let membership = sign(
+            &graph,
+            &signer,
+            FactBody::MembershipAdmit {
+                target: controller.clone(),
+            },
+        );
+        insert(&mut graph, membership);
+        let operation = sign(
+            &graph,
+            &controller_key,
+            FactBody::RoleGrant {
+                target: old_target.clone(),
+                role: super::super::Role::Member,
+            },
+        );
+        let revoke = sign(
+            &graph,
+            &signer,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+        );
+        let operation_id = insert(&mut graph, operation);
+        let selected = insert(&mut graph, revoke);
+        let mut heads = vec![operation_id, selected];
+        heads.sort();
+        assert_eq!(graph.authority_use_heads(&controller), heads);
+        let selector = sign(
+            &graph,
+            &signer,
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
+                cited_heads: heads,
+                selected_head: selected,
+            },
+        );
+        let selector_id = insert(&mut graph, selector);
+        let regrant = sign(
+            &graph,
+            &signer,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: super::super::Role::Owner,
+            },
+        );
+        insert(&mut graph, regrant);
+        let mut future_ids = Vec::new();
+        for seed in [176, 177] {
+            let target =
+                DeviceId::from_public_key_bytes(*key(seed).verifying_key().as_bytes()).unwrap();
+            let future = sign(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target,
+                    role: super::super::Role::Member,
+                },
+            );
+            assert!(!future.content.parents.contains(&selector_id));
+            future_ids.push(insert(&mut graph, future));
+        }
+        assert_eq!(graph.len(), 8);
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            Some(selected)
+        );
+        assert_eq!(graph.evaluator().effective_role(&old_target), None);
+        let projection = graph.projection();
+        let full = super::super::Projection::from_graph(&graph);
+        assert_eq!(projection, full);
+
+        let store = DurableSemanticStore::new(&root, "selector-slot");
+        let owner = store.open_writable().unwrap();
+        owner.commit(&graph, Vec::new()).unwrap();
+        owner.persist_live_checkpoint(&graph, &[]).unwrap();
+        owner.release().unwrap();
+        drop(owner);
+        let connection = store.open_database(false).unwrap();
+        let pristine = store
+            .restore_live_checkpoint(&connection, &bootstrap)
+            .unwrap()
+            .expect("a valid selector checkpoint must not unconditionally fall back");
+        assert_eq!(pristine.graph().projection(), full);
+        let encoded: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key=?",
+                params![LIVE_CHECKPOINT_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let canonical = store
+            .load_snapshot_connection(&connection, store.path())
+            .unwrap();
+
+        for mutation in ["selected", "post_selector", "omitted"] {
+            let mut value = original.clone();
+            let provenance = value["graph"]["authority_provenance"]
+                .as_array_mut()
+                .unwrap();
+            assert!(
+                !provenance.is_empty(),
+                "the omission control must remove actual metadata"
+            );
+            if mutation == "omitted" {
+                // Preserve the original recorded residency: this exercises
+                // store fallback for a checksum-valid omitted cache. The
+                // causal module separately tests a budget-balanced omission
+                // against required canonical selector coverage.
+                provenance.clear();
+            } else {
+                let row = provenance
+                    .iter_mut()
+                    .find(|row| row[0] == serde_json::to_value(future_ids[0]).unwrap())
+                    .unwrap();
+                let relation = row[1]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|entry| entry[0] == serde_json::to_value(selector_id).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    relation[1]["selected"],
+                    serde_json::to_value(selected).unwrap()
+                );
+                assert_eq!(relation[1]["post_selector"], serde_json::json!(true));
+                assert_eq!(relation[1]["selected_before"], serde_json::json!(true));
+                if mutation == "selected" {
+                    relation[1]["selected"] = serde_json::to_value(operation_id).unwrap();
+                } else {
+                    // Same nodes/byte charge and valid typed selector. Only
+                    // canonical reachability can reject this false relation.
+                    relation[1]["post_selector"] = serde_json::json!(false);
+                }
+            }
+            let mut tampered: DurableLiveCheckpoint = serde_json::from_value(value).unwrap();
+            let checksum: [u8; 32] = Sha256::digest(
+                serde_json::to_vec(&(tampered.generation, &tampered.graph, &tampered.provisional))
+                    .unwrap(),
+            )
+            .into();
+            tampered.checksum = checksum;
+            let tampered = serde_json::to_vec(&tampered).unwrap();
+            assert_ne!(tampered, encoded);
+            connection
+                .inner
+                .execute(
+                    "UPDATE meta SET value=? WHERE key=?",
+                    params![tampered, LIVE_CHECKPOINT_KEY],
+                )
+                .unwrap();
+            let reason = match store.restore_live_checkpoint(&connection, &bootstrap) {
+                Err(DurableStoreError::Corrupt { reason, .. }) => reason,
+                other => panic!("{mutation} checkpoint was not refused as corrupt: {other:?}"),
+            };
+            assert_ne!(reason, "live checkpoint checksum mismatch");
+            let expected_reason = match mutation {
+                "selected" => "checkpoint provenance lacks signed typed witnesses",
+                "post_selector" => "checkpoint provenance differs from canonical ancestry",
+                "omitted" => "checkpoint derived-index residency mismatch",
+                _ => unreachable!(),
+            };
+            assert_eq!(reason, expected_reason);
+            // No uncertain write/retry: this is the existing validating read
+            // fallback over unchanged canonical signed SQLite rows.
+            let restored = store
+                .restore_from_connection(&connection, &bootstrap)
+                .unwrap();
+            assert_eq!(
+                restored
+                    .graph()
+                    .authority_lineage(&controller)
+                    .selected_branch(),
+                Some(selected)
+            );
+            assert_eq!(
+                restored.graph().evaluator().effective_role(&old_target),
+                None
+            );
+            assert_eq!(restored.graph().projection(), full);
+            assert_eq!(super::super::Projection::from_graph(restored.graph()), full);
+            assert_eq!(
+                restored.graph().durable_usage_counters(),
+                graph.durable_usage_counters()
+            );
+            assert_eq!(restored.provisional_custody(), &[]);
+            let unchanged = store
+                .load_snapshot_connection(&connection, store.path())
+                .unwrap();
+            assert_eq!(unchanged.context_id, canonical.context_id);
+            assert_eq!(unchanged.facts, canonical.facts);
+            assert_eq!(unchanged.quarantined, canonical.quarantined);
+            assert_eq!(unchanged.admission_ordered, canonical.admission_ordered);
+            assert_eq!(
+                unchanged.projection_commitment,
+                canonical.projection_commitment
+            );
+            assert_eq!(unchanged.provisional, canonical.provisional);
+            assert_eq!(unchanged.proofs, canonical.proofs);
+        }
+        connection
+            .inner
+            .execute(
+                "UPDATE meta SET value=? WHERE key=?",
+                params![encoded, LIVE_CHECKPOINT_KEY],
+            )
+            .unwrap();
+        assert!(store
+            .restore_live_checkpoint(&connection, &bootstrap)
+            .unwrap()
+            .is_some());
+        drop(connection);
         let _ = std::fs::remove_dir_all(root);
     }
 

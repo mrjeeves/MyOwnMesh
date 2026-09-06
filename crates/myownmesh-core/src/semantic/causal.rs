@@ -267,6 +267,20 @@ impl AuthoringWitness {
     }
 }
 
+/// Read-only relations proved from admitted signed ancestry. All equalities
+/// are inclusive; in particular a losing cited head is not post-selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoritySelectorRelation {
+    selected: FactId,
+    post_selector: bool,
+    selected_before: bool,
+    before_selected: bool,
+}
+
+type AuthorityProvenanceRow = BTreeMap<FactId, AuthoritySelectorRelation>;
+type AuthorityProvenance = BTreeMap<FactId, AuthorityProvenanceRow>;
+
 /// An arrival-order-independent set of verified canonical facts.
 #[derive(Debug)]
 pub struct FactGraph {
@@ -317,6 +331,10 @@ pub struct FactGraph {
     /// a rare resolution does not prewalk unrelated hot facts.
     authority_facts_index: BTreeMap<DeviceId, BTreeSet<FactId>>,
     authority_selector_index: BTreeMap<DeviceId, BTreeSet<(FactId, FactId)>>,
+    /// Sparse per-retained-row selector reachability, derived while canonical
+    /// ancestry is available. Selector and selected IDs name retained signed
+    /// witnesses; no arbitrary ancestor of a current head confers authority.
+    authority_provenance: AuthorityProvenance,
     /// Test-only mirror of dependencies already present in each signed fact.
     /// Retaining a second graph-sized copy in production wastes memory.
     #[cfg(test)]
@@ -341,7 +359,7 @@ pub struct FactGraph {
 /// Exact bounded continuation state persisted at a clean publication fence.
 /// Historical signed bodies remain in SQLite; this record contains only the
 /// live authority state that the next process needs before accepting work.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LiveFactGraphCheckpoint {
     version: u16,
@@ -363,6 +381,8 @@ pub(crate) struct LiveFactGraphCheckpoint {
     cell_heads: Vec<(ExclusiveCell, Vec<FactId>)>,
     authority_heads: Vec<(DeviceId, Vec<FactId>)>,
     authority_selectors: Vec<(DeviceId, Vec<(FactId, FactId)>)>,
+    #[serde(default)]
+    authority_provenance: Vec<(FactId, Vec<(FactId, AuthoritySelectorRelation)>)>,
     cells: Vec<ExclusiveCell>,
     stand_down_heads: Vec<(DeviceId, Vec<FactId>)>,
     facts_revision: u64,
@@ -400,6 +420,7 @@ impl Clone for FactGraph {
             authority_dependents_index: self.authority_dependents_index.clone(),
             authority_facts_index: self.authority_facts_index.clone(),
             authority_selector_index: self.authority_selector_index.clone(),
+            authority_provenance: self.authority_provenance.clone(),
             #[cfg(test)]
             dependency_index: self.dependency_index.clone(),
             cells_index: self.cells_index.clone(),
@@ -436,18 +457,43 @@ fn insert_maximal_head(
     heads: &mut BTreeSet<FactId>,
     candidate: FactId,
 ) {
-    // Current V4 authoring carries every affected maximal predecessor as a
-    // direct signed dependency.  Head maintenance therefore touches only the
-    // declared edge set; walking the complete causal chain here would turn a
-    // sequential ledger into O(N^2). A topological restore uses the same
-    // dependency-complete ordering, so an older candidate cannot arrive after
-    // one of its descendants has already become a head.
     let Some(fact) = facts.get(&candidate) else {
         return;
     };
     let direct_dependencies = dependencies(fact);
-    heads.retain(|head| !direct_dependencies.contains(head));
+    heads.retain(|head| !signed_head_is_dominated(facts, &direct_dependencies, head));
     heads.insert(candidate);
+}
+
+fn signed_head_is_dominated(
+    facts: &BTreeMap<FactId, SignedFact>,
+    direct_dependencies: &[FactId],
+    head: &FactId,
+) -> bool {
+    // Normal current-head authoring removes heads by the direct edge alone.
+    // Projected authoring may omit a raw head hidden by a typed selector;
+    // only those unmatched heads need the exceptional signed-ancestry walk.
+    // The same predicate prices the exact removal before mutation. Missing
+    // ingress parents are not errors here: quarantine is classified by cost,
+    // and admission validates/loads the candidate's required causal history.
+    if direct_dependencies.contains(head) {
+        return true;
+    }
+    let mut pending = direct_dependencies.to_vec();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(fact) = facts.get(&id) {
+            let parents = dependencies(fact);
+            if parents.contains(head) {
+                return true;
+            }
+            pending.extend(parents);
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +693,9 @@ impl AdmissionPreflight {
 
 #[derive(Debug)]
 struct GraphRollback {
+    authority_provenance: BTreeMap<FactId, Option<AuthorityProvenanceRow>>,
+    authority_heads: BTreeMap<DeviceId, Option<BTreeSet<FactId>>>,
+    cell_heads: BTreeMap<ExclusiveCell, Option<BTreeSet<FactId>>>,
     facts: BTreeMap<FactId, Option<SignedFact>>,
     quarantined: BTreeMap<FactId, Option<SignedFact>>,
     quarantine_missing: BTreeMap<FactId, Option<BTreeSet<FactId>>>,
@@ -702,6 +751,9 @@ impl GraphRollback {
             indexed_revision: graph.indexed_revision,
             cold_history_since_retirement: graph.cold_history_since_retirement,
             staged_cold_pending: graph.staged_cold_pending,
+            authority_provenance: BTreeMap::new(),
+            authority_heads: BTreeMap::new(),
+            cell_heads: BTreeMap::new(),
             projection_cache_fence: graph
                 .projection_cache
                 .lock()
@@ -749,6 +801,7 @@ impl GraphRollback {
     fn capture_admission(&mut self, graph: &FactGraph, fact: &SignedFact) {
         self.capture_fact(graph, fact.id);
         self.capture_author(graph, &fact.content.author);
+        self.capture_provenance_admission(graph, fact);
         self.capture_dependency(graph, fact.id);
         for dependency in dependencies(fact) {
             self.capture_dependency(graph, dependency);
@@ -768,6 +821,9 @@ impl GraphRollback {
         self.ready_quarantine
             .entry(id)
             .or_insert_with(|| graph.ready_quarantine.contains(&id));
+        if let Some(fact) = graph.facts.get(&id).or_else(|| graph.quarantined.get(&id)) {
+            self.capture_provenance_admission(graph, fact);
+        }
     }
 
     /// Mark rows attached by a cold-history overlay as absent in the
@@ -847,6 +903,38 @@ impl GraphRollback {
         self.retained_by_author
             .entry(author.clone())
             .or_insert_with(|| graph.retained_by_author.get(author).copied());
+    }
+
+    fn capture_provenance_admission(&mut self, graph: &FactGraph, fact: &SignedFact) {
+        self.authority_provenance
+            .entry(fact.id)
+            .or_insert_with(|| graph.authority_provenance.get(&fact.id).cloned());
+        if graph.staged_cold_pending != 0
+            || matches!(
+                fact.content.body,
+                FactBody::AuthorityLineageResolution { .. }
+            )
+        {
+            for id in graph.facts.keys() {
+                self.authority_provenance
+                    .entry(*id)
+                    .or_insert_with(|| graph.authority_provenance.get(id).cloned());
+            }
+        }
+        for subject in fact
+            .content
+            .body
+            .authority_use_subjects(&fact.content.author)
+        {
+            self.authority_heads
+                .entry(subject.clone())
+                .or_insert_with(|| graph.authority_heads_index.get(&subject).cloned());
+        }
+        for cell in fact.content.body.exclusive_cells() {
+            self.cell_heads
+                .entry(cell.clone())
+                .or_insert_with(|| graph.cell_heads_index.get(&cell).cloned());
+        }
     }
 
     fn restore(self, graph: &mut FactGraph) {
@@ -937,6 +1025,36 @@ impl GraphRollback {
         }
         graph.generation = self.generation;
         graph.facts_revision = self.facts_revision;
+        for (id, value) in self.authority_provenance {
+            match value {
+                Some(row) => {
+                    graph.authority_provenance.insert(id, row);
+                }
+                None => {
+                    graph.authority_provenance.remove(&id);
+                }
+            }
+        }
+        for (subject, value) in self.authority_heads {
+            match value {
+                Some(heads) => {
+                    graph.authority_heads_index.insert(subject, heads);
+                }
+                None => {
+                    graph.authority_heads_index.remove(&subject);
+                }
+            }
+        }
+        for (cell, value) in self.cell_heads {
+            match value {
+                Some(heads) => {
+                    graph.cell_heads_index.insert(cell, heads);
+                }
+                None => {
+                    graph.cell_heads_index.remove(&cell);
+                }
+            }
+        }
         graph.rebuild_indexes();
         // Rebuilding indexes derives a dependency order, which is suitable
         // for loader repair but is not the journal's exact pre-mutation
@@ -1109,7 +1227,6 @@ impl<'graph> AggregateAdmissionJournal<'graph> {
     pub(crate) fn commit(mut self) {
         self.rollback.take();
         let hydrated_cold_history = !self.staged_cold.is_empty();
-        self.graph.remove_staged_cold(&self.staged_cold);
         self.staged_cold.clear();
         if hydrated_cold_history {
             self.graph.retire_cold_history();
@@ -1248,6 +1365,7 @@ impl FactGraph {
             authority_dependents_index: BTreeMap::new(),
             authority_facts_index: BTreeMap::new(),
             authority_selector_index: BTreeMap::new(),
+            authority_provenance: BTreeMap::new(),
             #[cfg(test)]
             dependency_index: BTreeMap::new(),
             cells_index: BTreeSet::new(),
@@ -1364,6 +1482,18 @@ impl FactGraph {
                 .iter()
                 .map(|(subject, selectors)| (subject.clone(), selectors.iter().copied().collect()))
                 .collect(),
+            authority_provenance: self
+                .authority_provenance
+                .iter()
+                .map(|(fact, row)| {
+                    (
+                        *fact,
+                        row.iter()
+                            .map(|(selector, relation)| (*selector, *relation))
+                            .collect(),
+                    )
+                })
+                .collect(),
             cells: self.cells_index.iter().cloned().collect(),
             stand_down_heads: self
                 .stand_down_index
@@ -1391,6 +1521,191 @@ impl FactGraph {
     }
 
     pub(crate) fn from_live_checkpoint(
+        bootstrap: &VerifiedBootstrap,
+        policy: crate::config::SemanticPolicyConfig,
+        checkpoint: LiveFactGraphCheckpoint,
+    ) -> Result<Self, String> {
+        let history = checkpoint.facts.clone();
+        Self::from_live_checkpoint_with_history(bootstrap, policy, checkpoint, move |_| {
+            Ok(history.clone())
+        })
+    }
+
+    pub(crate) fn from_live_checkpoint_with_history<F>(
+        bootstrap: &VerifiedBootstrap,
+        policy: crate::config::SemanticPolicyConfig,
+        checkpoint: LiveFactGraphCheckpoint,
+        mut resolve: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(&[FactId]) -> Result<Vec<SignedFact>, String>,
+    {
+        // Roots come from signed live rows, never the claimed cache coverage.
+        let roots = checkpoint
+            .facts
+            .iter()
+            .map(|fact| fact.id)
+            .collect::<Vec<_>>();
+        let history = resolve(&roots)?;
+        let mut canonical = Self::from_bootstrap_with_policy(bootstrap, policy);
+        for fact in history {
+            fact.verify().map_err(|error| error.to_string())?;
+            if fact.content.mesh_context != bootstrap.context_id() {
+                return Err("canonical provenance context mismatch".into());
+            }
+            let id = fact.id;
+            if canonical.facts.insert(id, fact).is_some() {
+                return Err("duplicate canonical provenance row".into());
+            }
+        }
+        for fact in canonical.facts.values() {
+            if dependencies(fact)
+                .iter()
+                .any(|id| !canonical.facts.contains_key(id))
+            {
+                return Err("canonical provenance dependency closure is incomplete".into());
+            }
+        }
+        for fact in &checkpoint.facts {
+            if canonical.facts.get(&fact.id) != Some(fact) {
+                return Err("checkpoint signed row differs from canonical history".into());
+            }
+        }
+        let graph = Self::decode_live_checkpoint(bootstrap, policy, checkpoint)?;
+        // Cache coverage cannot be hidden by also dropping a live-head index
+        // entry. Every canonical authority/cell use must reach a declared
+        // maximal head, and no declared head may dominate another.
+        for fact in canonical.facts.values() {
+            for subject in Self::indexed_authority_subjects(fact) {
+                if !graph
+                    .authority_heads_index
+                    .get(&subject)
+                    .is_some_and(|heads| {
+                        heads
+                            .iter()
+                            .any(|head| fact.id == *head || canonical.is_ancestor(&fact.id, head))
+                    })
+                {
+                    return Err("checkpoint authority-head coverage is incomplete".into());
+                }
+            }
+            for cell in fact.content.body.exclusive_cells() {
+                if !graph.cell_heads_index.get(&cell).is_some_and(|heads| {
+                    heads
+                        .iter()
+                        .any(|head| fact.id == *head || canonical.is_ancestor(&fact.id, head))
+                }) {
+                    return Err("checkpoint cell-head coverage is incomplete".into());
+                }
+            }
+        }
+        for (subject, heads) in &graph.authority_heads_index {
+            for head in heads {
+                if !canonical
+                    .facts
+                    .get(head)
+                    .is_some_and(|fact| Self::indexed_authority_subjects(fact).contains(subject))
+                    || heads
+                        .iter()
+                        .any(|other| head != other && canonical.is_ancestor(head, other))
+                {
+                    return Err("checkpoint authority head is not canonical maximal use".into());
+                }
+            }
+        }
+        for (cell, heads) in &graph.cell_heads_index {
+            for head in heads {
+                if !canonical
+                    .facts
+                    .get(head)
+                    .is_some_and(|fact| fact.content.body.exclusive_cells().contains(cell))
+                    || heads
+                        .iter()
+                        .any(|other| head != other && canonical.is_ancestor(head, other))
+                {
+                    return Err("checkpoint cell head is not canonical maximal use".into());
+                }
+            }
+        }
+        let contexts = graph
+            .authority_provenance
+            .values()
+            .flat_map(|row| row.keys().copied())
+            .collect::<BTreeSet<_>>();
+        // Verify every required predecessor context from canonical ancestry,
+        // not just maxima: a later selector cannot erase an older exclusion
+        // merely by citing a descendant of that selector's losing edge.
+        // Do this without constructing
+        // a second history-sized derived index. Scratch is one bounded closure
+        // at a time; only the existing live cache is retained after validation.
+        for id in graph.provenance_live_roots() {
+            let mut ancestors = canonical
+                .complete_ancestors(id, None)
+                .map_err(|error| error.to_string())?;
+            ancestors.insert(id);
+            let mut by_subject = BTreeMap::<DeviceId, Vec<FactId>>::new();
+            for ancestor in ancestors {
+                if let Some(fact) = canonical.facts.get(&ancestor) {
+                    if let FactBody::AuthorityLineageResolution { subject, .. } = &fact.content.body
+                    {
+                        by_subject
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(ancestor);
+                    }
+                }
+            }
+            for selectors in by_subject.values() {
+                for selector in selectors {
+                    if !contexts.contains(selector) {
+                        return Err("checkpoint omits required selector provenance".into());
+                    }
+                }
+            }
+        }
+        for id in graph.facts.keys() {
+            let mut ancestors = canonical
+                .complete_ancestors(*id, None)
+                .map_err(|error| error.to_string())?;
+            ancestors.insert(*id);
+            for selector in &contexts {
+                let Some(SignedFact { content, .. }) = canonical.facts.get(selector) else {
+                    return Err("canonical selector is missing".into());
+                };
+                let FactBody::AuthorityLineageResolution { selected_head, .. } = &content.body
+                else {
+                    return Err("canonical selector is not typed".into());
+                };
+                let before_selected = *id == *selected_head
+                    || canonical
+                        .complete_ancestors(*selected_head, None)
+                        .map_err(|error| error.to_string())?
+                        .contains(id);
+                let expected = AuthoritySelectorRelation {
+                    selected: *selected_head,
+                    post_selector: ancestors.contains(selector),
+                    selected_before: ancestors.contains(selected_head),
+                    before_selected,
+                };
+                let expected = (expected.post_selector
+                    || expected.selected_before
+                    || expected.before_selected)
+                    .then_some(expected);
+                if graph
+                    .authority_provenance
+                    .get(id)
+                    .and_then(|row| row.get(selector))
+                    .copied()
+                    != expected
+                {
+                    return Err("checkpoint provenance differs from canonical ancestry".into());
+                }
+            }
+        }
+        Ok(graph)
+    }
+
+    fn decode_live_checkpoint(
         bootstrap: &VerifiedBootstrap,
         policy: crate::config::SemanticPolicyConfig,
         checkpoint: LiveFactGraphCheckpoint,
@@ -1488,6 +1803,24 @@ impl FactGraph {
             .ok_or_else(|| "invalid checkpoint authority heads".to_string())?;
         let authority_selector_index = set_map(checkpoint.authority_selectors)
             .ok_or_else(|| "invalid checkpoint authority selectors".to_string())?;
+        let mut authority_provenance = BTreeMap::new();
+        for (id, entries) in checkpoint.authority_provenance {
+            let row = unique_map(entries)
+                .ok_or_else(|| "duplicate checkpoint selector provenance".to_string())?;
+            if row.is_empty() || !facts.contains_key(&id) || authority_provenance.contains_key(&id)
+            {
+                return Err("invalid checkpoint provenance row coverage".into());
+            }
+            for (selector, relation) in &row {
+                if !(relation.post_selector || relation.selected_before || relation.before_selected)
+                    || !facts.contains_key(&relation.selected)
+                    || !facts.get(selector).is_some_and(|fact| matches!(&fact.content.body,
+                        FactBody::AuthorityLineageResolution { selected_head, cited_heads, .. }
+                        if *selected_head == relation.selected && cited_heads.contains(selected_head)))
+                { return Err("checkpoint provenance lacks signed typed witnesses".into()); }
+            }
+            authority_provenance.insert(id, row);
+        }
         let cells_index =
             unique_set(checkpoint.cells).ok_or_else(|| "duplicate checkpoint cell".to_string())?;
         let stand_down_index = set_map(checkpoint.stand_down_heads)
@@ -1548,6 +1881,7 @@ impl FactGraph {
             authority_dependents_index: BTreeMap::new(),
             authority_facts_index: BTreeMap::new(),
             authority_selector_index,
+            authority_provenance,
             #[cfg(test)]
             dependency_index: BTreeMap::new(),
             cells_index,
@@ -1561,6 +1895,7 @@ impl FactGraph {
             staged_cold_pending: 0,
             projection_cache: Arc::new(Mutex::new(Some((checkpoint.generation, projection)))),
         };
+
         graph.rebuild_authority_facts_index();
         let derived_index_bytes = graph
             .logical_index_residency_bytes()
@@ -1583,6 +1918,21 @@ impl FactGraph {
     /// the normal continuation path; cold proof material and anti-entropy are
     /// resolved by the durable owner instead of turning the process heap into
     /// a second database.
+    fn provenance_live_roots(&self) -> BTreeSet<FactId> {
+        let mut roots = BTreeSet::new();
+        roots.extend(self.cell_heads_index.values().flatten().copied());
+        roots.extend(self.authority_heads_index.values().flatten().copied());
+        roots.extend(self.stand_down_index.values().flatten().copied());
+        roots.extend(
+            self.quarantine_missing
+                .values()
+                .flatten()
+                .copied()
+                .filter(|id| self.facts.contains_key(id)),
+        );
+        roots
+    }
+
     pub(crate) fn retire_cold_history(&mut self) {
         if self.staged_cold_pending == 0
             && (self.cold_history_since_retirement as u64)
@@ -1606,8 +1956,38 @@ impl FactGraph {
                 retained.insert(stand_down.proof);
             }
         }
+
         for missing in self.quarantine_missing.values() {
             retained.extend(missing.iter().copied());
+        }
+
+        // Context roots are live authority/projection rows, not auxiliary
+        // selector witnesses. Otherwise retaining a selector's old selected
+        // witness would recursively pin every obsolete selector forever.
+        let mut active_selectors = BTreeSet::new();
+        for id in &retained {
+            let subjects = self
+                .authority_provenance
+                .get(id)
+                .into_iter()
+                .flatten()
+                .filter_map(|(selector, _)| self.facts.get(selector))
+                .filter_map(|fact| match &fact.content.body {
+                    FactBody::AuthorityLineageResolution { subject, .. } => Some(subject.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            for subject in subjects {
+                active_selectors.extend(self.ancestral_typed_selectors(&subject, &[*id]));
+            }
+        }
+        for selector in &active_selectors {
+            retained.insert(*selector);
+            if let Some(SignedFact { content, .. }) = self.facts.get(selector) {
+                if let FactBody::AuthorityLineageResolution { selected_head, .. } = &content.body {
+                    retained.insert(*selected_head);
+                }
+            }
         }
 
         // Keep the direct signed witness layer needed to validate the next
@@ -1619,6 +1999,16 @@ impl FactGraph {
             .flat_map(dependencies)
             .collect::<BTreeSet<_>>();
         retained.extend(direct_witnesses);
+        if self.facts.keys().all(|id| retained.contains(id)) {
+            // A still-complete resident graph needs no context retirement.
+            // Keep its complete provenance even when all bodies happen to be
+            // live heads or direct witnesses at this threshold.
+            active_selectors.extend(
+                self.authority_provenance
+                    .values()
+                    .flat_map(|row| row.keys().copied()),
+            );
+        }
 
         self.facts.retain(|id, _| retained.contains(id));
         self.admission_order.retain(|id| retained.contains(id));
@@ -1629,13 +2019,25 @@ impl FactGraph {
             ids.retain(|id| retained.contains(id));
             !ids.is_empty()
         });
-        self.authority_selector_index.retain(|_, selectors| {
-            // The selector row, not the selected fact, owns this cached pair.
-            // Keeping every historical selector merely because many of them
-            // chose the same still-live branch would reintroduce linear heap
-            // growth under repeated lineage resolution.
-            selectors.retain(|(id, _)| retained.contains(id));
-            !selectors.is_empty()
+        self.authority_selector_index.clear();
+        for selector in &active_selectors {
+            if let Some(fact) = self.facts.get(selector) {
+                if let FactBody::AuthorityLineageResolution {
+                    subject,
+                    selected_head,
+                    ..
+                } = &fact.content.body
+                {
+                    self.authority_selector_index
+                        .entry(subject.clone())
+                        .or_default()
+                        .insert((*selector, *selected_head));
+                }
+            }
+        }
+        self.authority_provenance.retain(|id, row| {
+            row.retain(|selector, _| active_selectors.contains(selector));
+            retained.contains(id) && !row.is_empty()
         });
         self.derived_index_bytes = self
             .logical_index_residency_bytes()
@@ -1782,6 +2184,23 @@ impl FactGraph {
     /// compaction may populate the durable map directly; those paths never
     /// get to make an index authoritative without this repair step.
     pub(crate) fn rebuild_indexes(&mut self) {
+        let preserve_cold = self.admitted_fact_count > self.facts.len() as u64;
+        let prior_provenance = std::mem::take(&mut self.authority_provenance);
+        let prior_selectors = if preserve_cold {
+            Some(std::mem::take(&mut self.authority_selector_index))
+        } else {
+            None
+        };
+        let prior_authority_heads = if preserve_cold {
+            Some(std::mem::take(&mut self.authority_heads_index))
+        } else {
+            None
+        };
+        let prior_cell_heads = if preserve_cold {
+            Some(std::mem::take(&mut self.cell_heads_index))
+        } else {
+            None
+        };
         #[cfg(test)]
         INDEX_REBUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         self.cell_heads_index.clear();
@@ -1849,6 +2268,40 @@ impl FactGraph {
         self.admission_order = ordered.clone();
         for id in ordered {
             self.index_fact_heads(id);
+        }
+        if preserve_cold {
+            self.authority_provenance = prior_provenance;
+            self.authority_provenance
+                .retain(|id, _| self.facts.contains_key(id));
+            self.authority_heads_index = prior_authority_heads.expect("cold heads moved once");
+            self.cell_heads_index = prior_cell_heads.expect("cold cells moved once");
+            self.authority_selector_index =
+                prior_selectors.expect("cold selector index moved once");
+            self.authority_selector_index.retain(|_, selectors| {
+                selectors.retain(|(id, _)| self.facts.contains_key(id));
+                !selectors.is_empty()
+            });
+        } else {
+            // Complete direct-loader graphs reconstruct provenance solely from
+            // signed ancestry. No preexisting cache can bless a changed body.
+            let selectors = self
+                .facts
+                .iter()
+                .filter_map(|(id, fact)| {
+                    matches!(
+                        fact.content.body,
+                        FactBody::AuthorityLineageResolution { .. }
+                    )
+                    .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            for selector in selectors {
+                if let Some(fact) = self.facts.get(&selector) {
+                    if let Ok(provenance) = self.planned_provenance(fact) {
+                        self.authority_provenance.extend(provenance);
+                    }
+                }
+            }
         }
         self.indexed_fact_count = self.facts.len();
         self.indexed_revision = self.facts_revision;
@@ -2468,7 +2921,22 @@ impl FactGraph {
         // not merely the latest head: an A->B->C history can have B outside
         // the reverse descendants of C while still losing authority at the
         // new fork. Staged rows are borrowed into the same exceptional sweep.
-        let mut participating = heads;
+        self.authority_participant_impact_with_staged(subject, heads, staged_cold)
+    }
+
+    fn authority_participant_impact_with_staged(
+        &self,
+        subject: &DeviceId,
+        seeds: impl IntoIterator<Item = FactId>,
+        staged_cold: &[FactId],
+    ) -> (BTreeSet<ExclusiveCell>, BTreeSet<DeviceId>) {
+        // An exceptional selection can change ancestor propositions as well
+        // as descendants. In particular, selecting between cell-less typed
+        // selectors must revisit their older membership/role participants.
+        // Seed the existing walk from the bounded subject index and borrowed
+        // canonical overlay, even if the selectors are not resident yet
+        // (aggregate preplanning). No new retained reverse index is needed.
+        let mut participating = seeds.into_iter().collect::<BTreeSet<_>>();
         participating.extend(
             self.authority_facts_index
                 .get(subject)
@@ -2492,6 +2960,299 @@ impl FactGraph {
         fact: &SignedFact,
     ) -> (BTreeSet<ExclusiveCell>, BTreeSet<DeviceId>) {
         self.projection_impact_for_fact_with_staged(fact, &[])
+    }
+
+    fn provenance_row_bytes(&self, row: &AuthorityProvenanceRow) -> Result<u64, SemanticError> {
+        self.checked_entry_bytes(
+            self.checked_size::<(FactId, AuthorityProvenanceRow)>()?,
+            0,
+            row.len(),
+            self.checked_size::<(FactId, AuthoritySelectorRelation)>()?,
+        )
+    }
+
+    fn planned_provenance(&self, fact: &SignedFact) -> Result<AuthorityProvenance, SemanticError> {
+        let mut changes = BTreeMap::new();
+        // A quarantined candidate owns no admitted provenance yet. Its
+        // eventual promotion is costed again against the complete parents.
+        if dependencies(fact)
+            .iter()
+            .any(|id| !self.facts.contains_key(id))
+        {
+            return Ok(changes);
+        }
+        let mut planned_bytes = 0;
+        let mut row = self
+            .authority_provenance
+            .get(&fact.id)
+            .cloned()
+            .unwrap_or_default();
+        for parent in &fact.content.parents {
+            if let Some(provenance) = self.authority_provenance.get(parent) {
+                for (selector, relation) in provenance {
+                    if relation.post_selector || relation.selected_before {
+                        let entry = row.entry(*selector).or_insert(AuthoritySelectorRelation {
+                            selected: relation.selected,
+                            post_selector: false,
+                            selected_before: false,
+                            before_selected: false,
+                        });
+                        entry.post_selector |= relation.post_selector;
+                        entry.selected_before |= relation.selected_before;
+                    }
+                }
+            }
+        }
+        if !row.is_empty() {
+            planned_bytes = self.provenance_row_bytes(&row)?;
+            self.check_capacity(
+                super::SemanticCapacityDimension::AdmittedBytes,
+                planned_bytes,
+                self.policy_limits.max_database_bytes,
+            )?;
+            changes.insert(fact.id, row);
+        }
+        let mut contexts = BTreeMap::new();
+        if let FactBody::AuthorityLineageResolution { selected_head, .. } = &fact.content.body {
+            contexts.insert(fact.id, *selected_head);
+        }
+        if self.staged_cold_pending != 0 {
+            for id in self.complete_ancestors(fact.id, Some(fact))? {
+                if let Some(stored) = self.facts.get(&id) {
+                    if let FactBody::AuthorityLineageResolution { selected_head, .. } =
+                        &stored.content.body
+                    {
+                        contexts.insert(id, *selected_head);
+                    }
+                }
+            }
+            for (selector, selected) in self.authority_selector_index.values().flatten() {
+                contexts.insert(*selector, *selected);
+            }
+        }
+        for (selector, selected) in contexts {
+            // Newly introduced/reintroduced anchors are computed over the
+            // bounded canonical overlay, not guessed across a missing edge.
+            let selected_ancestors = self.complete_ancestors(selected, Some(fact))?;
+            let ids = if selector == fact.id || self.staged_cold_pending != 0 {
+                self.facts
+                    .keys()
+                    .copied()
+                    .chain(std::iter::once(fact.id))
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::from([fact.id])
+            };
+            for id in ids {
+                let ancestors = self.complete_ancestors(id, Some(fact))?;
+                let relation = AuthoritySelectorRelation {
+                    selected,
+                    post_selector: id == selector || ancestors.contains(&selector),
+                    selected_before: id == selected || ancestors.contains(&selected),
+                    before_selected: id == selected || selected_ancestors.contains(&id),
+                };
+                if relation.post_selector || relation.selected_before || relation.before_selected {
+                    let prior = changes
+                        .get(&id)
+                        .or_else(|| self.authority_provenance.get(&id));
+                    let base = if changes.contains_key(&id) {
+                        0
+                    } else {
+                        match prior {
+                            Some(row) => self.provenance_row_bytes(row)?,
+                            None => self.checked_size::<(FactId, AuthorityProvenanceRow)>()?,
+                        }
+                    };
+                    let added = if prior.is_some_and(|row| row.contains_key(&selector)) {
+                        0
+                    } else {
+                        self.checked_size::<(FactId, AuthoritySelectorRelation)>()?
+                    };
+                    let next = self
+                        .checked_add_bytes(planned_bytes, self.checked_add_bytes(base, added)?)?;
+                    self.check_capacity(
+                        super::SemanticCapacityDimension::AdmittedBytes,
+                        next,
+                        self.policy_limits.max_database_bytes,
+                    )?;
+                    let entry = changes.entry(id).or_insert_with(|| {
+                        self.authority_provenance
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+                    entry.insert(selector, relation);
+                    planned_bytes = next;
+                }
+            }
+        }
+        let mut bytes = 0;
+        for row in changes.values() {
+            bytes = self.checked_add_bytes(bytes, self.provenance_row_bytes(row)?)?;
+            self.check_capacity(
+                super::SemanticCapacityDimension::AdmittedBytes,
+                bytes,
+                self.policy_limits.max_database_bytes,
+            )?;
+        }
+        Ok(changes)
+    }
+
+    fn rebuild_provenance_checked(&mut self) -> Result<(), SemanticError> {
+        let selectors = self
+            .facts
+            .iter()
+            .filter_map(|(id, fact)| {
+                matches!(
+                    fact.content.body,
+                    FactBody::AuthorityLineageResolution { .. }
+                )
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for selector in selectors {
+            let fact = self
+                .facts
+                .get(&selector)
+                .expect("collected selector remains owned");
+            let changes = self.planned_provenance(fact)?;
+            self.authority_provenance.extend(changes);
+        }
+        self.derived_index_bytes = self.logical_index_residency_bytes()?;
+        Ok(())
+    }
+
+    fn cold_provenance_index_reserve(&self, fact: &SignedFact) -> Result<u64, SemanticError> {
+        if self.staged_cold_pending == 0 {
+            return Ok(0);
+        }
+        let plan = self.planned_provenance(fact)?;
+        let mut retained = self.provenance_live_roots();
+        retained.insert(fact.id);
+        for row in plan.values() {
+            for (selector, relation) in row {
+                retained.insert(*selector);
+                retained.insert(relation.selected);
+            }
+        }
+        let witnesses = retained
+            .iter()
+            .filter_map(|id| {
+                if *id == fact.id {
+                    Some(fact)
+                } else {
+                    self.facts.get(id)
+                }
+            })
+            .flat_map(dependencies)
+            .collect::<BTreeSet<_>>();
+        retained.extend(witnesses);
+        let mut new_subjects = BTreeSet::new();
+        let mut bytes = 0;
+        let contexts = plan
+            .values()
+            .flat_map(|row| row.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let mut selector_subjects = BTreeSet::new();
+        for selector in contexts {
+            if selector == fact.id {
+                continue;
+            }
+            let Some(stored) = self.facts.get(&selector) else {
+                continue;
+            };
+            if let FactBody::AuthorityLineageResolution {
+                subject,
+                selected_head,
+                ..
+            } = &stored.content.body
+            {
+                if !self
+                    .authority_selector_index
+                    .get(subject)
+                    .is_some_and(|ids| ids.contains(&(selector, *selected_head)))
+                {
+                    bytes =
+                        self.checked_add_bytes(bytes, self.checked_size::<(FactId, FactId)>()?)?;
+                    if !self.authority_selector_index.contains_key(subject)
+                        && selector_subjects.insert(subject.clone())
+                    {
+                        bytes = self.checked_add_bytes(
+                            bytes,
+                            self.checked_add_bytes(
+                                self.checked_size::<(DeviceId, BTreeSet<(FactId, FactId)>)>()?,
+                                self.device_dynamic_bytes(subject)?,
+                            )?,
+                        )?;
+                    }
+                }
+            }
+        }
+        for id in retained {
+            if id == fact.id {
+                continue;
+            } // ordinary candidate cost already owns these entries
+            let Some(stored) = self.facts.get(&id) else {
+                continue;
+            };
+            for subject in Self::indexed_authority_subjects(stored) {
+                if self
+                    .authority_facts_index
+                    .get(&subject)
+                    .is_some_and(|ids| ids.contains(&id))
+                {
+                    continue;
+                }
+                bytes = self.checked_add_bytes(bytes, self.checked_size::<FactId>()?)?;
+                if !self.authority_facts_index.contains_key(&subject)
+                    && new_subjects.insert(subject.clone())
+                {
+                    bytes = self.checked_add_bytes(
+                        bytes,
+                        self.checked_add_bytes(
+                            self.checked_size::<(DeviceId, BTreeSet<FactId>)>()?,
+                            self.device_dynamic_bytes(&subject)?,
+                        )?,
+                    )?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    fn complete_ancestors(
+        &self,
+        id: FactId,
+        candidate: Option<&SignedFact>,
+    ) -> Result<BTreeSet<FactId>, SemanticError> {
+        let mut pending = vec![id];
+        let mut seen = BTreeSet::new();
+        while let Some(next) = pending.pop() {
+            if !seen.insert(next) {
+                continue;
+            }
+            let fact = candidate
+                .filter(|fact| fact.id == next)
+                .or_else(|| self.facts.get(&next))
+                .ok_or(SemanticError::MissingParent(next))?;
+            pending.extend(fact.content.parents.iter().copied());
+        }
+        seen.remove(&id);
+        Ok(seen)
+    }
+
+    fn provenance_residency_delta(
+        &self,
+        fact: &SignedFact,
+    ) -> Result<IndexResidencyDelta, SemanticError> {
+        let mut delta = IndexResidencyDelta::default();
+        for (id, row) in self.planned_provenance(fact)? {
+            if let Some(previous) = self.authority_provenance.get(&id) {
+                self.remove_index_residency(&mut delta, self.provenance_row_bytes(previous)?)?;
+            }
+            self.add_index_residency(&mut delta, self.provenance_row_bytes(&row)?)?;
+        }
+        Ok(delta)
     }
 
     fn projection_impact_for_fact_with_staged(
@@ -2527,8 +3288,14 @@ impl FactGraph {
                     .find(|authority_use| authority_use.subject == subject)
                     .into_iter()
                     .flat_map(|authority_use| authority_use.predecessors.iter().copied());
-                let (branch_cells, branch_subjects) =
-                    self.authority_branch_impact_with_staged(&subject, seeds, staged_cold);
+                let (branch_cells, branch_subjects) = if matches!(
+                    fact.content.body,
+                    FactBody::AuthorityLineageResolution { .. }
+                ) {
+                    self.authority_participant_impact_with_staged(&subject, seeds, staged_cold)
+                } else {
+                    self.authority_branch_impact_with_staged(&subject, seeds, staged_cold)
+                };
                 cells.extend(branch_cells);
                 subjects.extend(branch_subjects);
             } else if !Self::is_payload_local_resolution(
@@ -2667,6 +3434,9 @@ impl FactGraph {
             )?;
             total = self.checked_add_bytes(total, entry)?;
         }
+        for row in self.authority_provenance.values() {
+            total = self.checked_add_bytes(total, self.provenance_row_bytes(row)?)?;
+        }
         for cell in &self.cells_index {
             let entry = self.checked_add_bytes(
                 self.checked_size::<ExclusiveCell>()?,
@@ -2722,7 +3492,7 @@ impl FactGraph {
         let removed_heads = heads
             .into_iter()
             .flatten()
-            .filter(|head| direct_dependencies.contains(head))
+            .filter(|head| signed_head_is_dominated(&self.facts, direct_dependencies, head))
             .count();
         let removed_bytes = self.checked_mul_bytes(
             self.checked_len(removed_heads)?,
@@ -2815,6 +3585,9 @@ impl FactGraph {
                 self.add_index_residency(&mut delta, self.checked_size::<(FactId, FactId)>()?)?;
             }
         }
+        let provenance = self.provenance_residency_delta(fact)?;
+        self.add_index_residency(&mut delta, provenance.added)?;
+        self.remove_index_residency(&mut delta, provenance.removed)?;
 
         let stand_down_target = match &fact.content.body {
             FactBody::EvictionProof { target, .. }
@@ -2953,6 +3726,20 @@ impl FactGraph {
                 )?,
             )?;
         }
+        // Conservative reservation includes the complete positive replacement
+        // delta; exact commit accounting releases the superseded sparse rows.
+        let provenance = self.provenance_residency_delta(fact)?;
+        total = self.checked_add_bytes(
+            total,
+            provenance
+                .added
+                .checked_sub(provenance.removed)
+                .unwrap_or(0),
+        )?;
+        // Canonical body bytes are already admitted-owned; reserve the exact
+        // additional subject-index entries for cold witnesses before commit
+        // can retain them. Retirement may release more, never charge more.
+        total = self.checked_add_bytes(total, self.cold_provenance_index_reserve(fact)?)?;
         if let FactBody::EvictionProof { target, .. }
         | FactBody::SelfStandDown {
             device_id: target, ..
@@ -3361,7 +4148,7 @@ impl FactGraph {
         }
         let cost = self.fact_cost_with_history(fact, history)?;
         if cost.missing.is_empty() {
-            if let Some(operation) = self.semantic_noop(&fact.content.body) {
+            if let Some(operation) = self.semantic_noop_for_candidate(fact, history)? {
                 return Err(SemanticError::NoOp(operation));
             }
             for parent in &fact.content.parents {
@@ -3876,6 +4663,7 @@ impl FactGraph {
             previous_projection.sparse_entries(&potential_cells, &potential_subjects);
         rollback.capture_projection_sparse(&previous_cells, &previous_stand_down);
         rollback.capture_fact(self, fact_id);
+        rollback.capture_provenance_admission(self, &fact);
         rollback.capture_author(self, &fact.content.author);
         if cost.missing.is_empty() {
             rollback.capture_dependency(self, fact_id);
@@ -4331,7 +5119,7 @@ impl FactGraph {
             }
             let cost = self.fact_cost_with_history(&fact, history)?;
             if cost.missing.is_empty() {
-                if let Some(operation) = self.semantic_noop(&fact.content.body) {
+                if let Some(operation) = self.semantic_noop_for_candidate(&fact, history)? {
                     return Err(SemanticError::NoOp(operation));
                 }
                 for parent in &fact.content.parents {
@@ -4451,6 +5239,7 @@ impl FactGraph {
             _ => {}
         }
         let exact_index_delta = self.exact_index_residency_delta(&fact)?;
+        let provenance = self.planned_provenance(&fact)?;
         self.reserve_admitted(&fact, &cost, retained_reserved)?;
         let fact_id = fact.id;
         let author = fact.content.author.clone();
@@ -4479,6 +5268,7 @@ impl FactGraph {
             .generation
             .checked_add(1)
             .expect("FactGraph projection generation exhausted");
+        self.authority_provenance.extend(provenance);
         self.index_fact(fact_id);
         self.indexed_fact_count = self.facts.len();
         self.indexed_revision = self.facts_revision;
@@ -4533,6 +5323,30 @@ impl FactGraph {
             return Err(SemanticError::DomainMismatch);
         }
         Ok(())
+    }
+
+    fn semantic_noop_for_candidate(
+        &self,
+        fact: &SignedFact,
+        history: Option<&FactGraph>,
+    ) -> Result<Option<&'static str>, SemanticError> {
+        if matches!(
+            fact.content.body,
+            FactBody::RoleGrant { .. }
+                | FactBody::RoleRevoke { .. }
+                | FactBody::Resolution { .. }
+                | FactBody::AuthorityLineageResolution { .. }
+        ) {
+            // Redundancy is intrinsic to this signed operation's causal past,
+            // not to a receiver's concurrent arrival order. Both callers have
+            // already classified missing dependencies before reaching here.
+            // causal_past borrows the normal complete-current-head role path;
+            // it does not clone the live graph for each admission.
+            let causal = history.unwrap_or(self).causal_past(fact)?;
+            Ok(causal.graph().semantic_noop(&fact.content.body))
+        } else {
+            Ok(self.semantic_noop(&fact.content.body))
+        }
     }
 
     fn semantic_noop(&self, body: &FactBody) -> Option<&'static str> {
@@ -4872,6 +5686,7 @@ impl FactGraph {
             authority_dependents_index: BTreeMap::new(),
             authority_facts_index: BTreeMap::new(),
             authority_selector_index: BTreeMap::new(),
+            authority_provenance: BTreeMap::new(),
             #[cfg(test)]
             dependency_index: BTreeMap::new(),
             cells_index: BTreeSet::new(),
@@ -4886,6 +5701,9 @@ impl FactGraph {
             projection_cache: Arc::new(Mutex::new(None)),
         };
         causal.rebuild_indexes();
+        // A provenance capacity failure is transactional, never an apparent
+        // authorization denial that retry could terminally discard.
+        causal.rebuild_provenance_checked()?;
         Ok(CausalAdmissionGraph::Scoped(causal))
     }
 
@@ -5186,6 +6004,17 @@ impl FactGraph {
                 &subject,
             );
             let lineage = self.authority_lineage(&subject);
+            if !payload_local && !self.selector_provenance_complete(&subject) {
+                return false;
+            }
+            if !payload_local
+                && self
+                    .maximal_typed_selectors(&subject, lineage.heads())
+                    .len()
+                    > 1
+            {
+                return false;
+            }
             if !payload_local && !lineage.is_singular() {
                 let common_ancestor = lineage
                     .heads()
@@ -5212,14 +6041,17 @@ impl FactGraph {
                 return false;
             }
             if !payload_local {
-                if let Some(selected_branch) = lineage.selected_branch() {
-                    if fact.id != selected_branch
-                        && !self.is_ancestor(&selected_branch, &fact.id)
-                        && !self.is_ancestor(&fact.id, &selected_branch)
-                    {
-                        // A typed resolution permanently selects one cited branch.
-                        // Its losing sibling cannot regain authority merely because a
-                        // later fact carries a syntactically current predecessor set.
+                let Some(selectors) = self.relevant_typed_selectors(&subject, lineage.heads())
+                else {
+                    return false;
+                };
+                for selector in selectors {
+                    if !self.selector_permits_fact(selector, fact.id) {
+                        // Public selected_branch is intentionally None during
+                        // an unresolved ordinary fork. It is NOT proof that
+                        // earlier typed exclusions disappeared. Compose all
+                        // still-relevant selectors: raw ancestry through an
+                        // old losing edge cannot resurrect that signed row.
                         return false;
                     }
                 }
@@ -5232,28 +6064,133 @@ impl FactGraph {
     /// Ordinary same-cell resolutions never establish this persistent
     /// relation; their projection is handled by the exclusive cell itself.
     fn selected_authority_branch(&self, subject: &DeviceId, heads: &[FactId]) -> Option<FactId> {
-        let [head] = heads else {
+        if heads.len() != 1 {
+            return None;
+        }
+        let selectors = self.maximal_typed_selectors(subject, heads);
+        let [selector] = selectors.as_slice() else {
             return None;
         };
-        let selectors = self
-            .authority_selector_index
+        let FactBody::AuthorityLineageResolution { selected_head, .. } =
+            &self.facts.get(selector)?.content.body
+        else {
+            return None;
+        };
+        Some(*selected_head)
+    }
+
+    fn selector_provenance_complete(&self, subject: &DeviceId) -> bool {
+        self.authority_selector_index
             .get(subject)
             .into_iter()
-            .flat_map(|values| values.iter().copied())
-            .filter(|(id, _)| *id == *head || self.direct_dependency(head, id))
-            .collect::<Vec<_>>();
-        let maximal = selectors
+            .flatten()
+            .all(|(selector, selected)| {
+                self.authority_provenance
+                    .get(selector)
+                    .and_then(|row| row.get(selector))
+                    .is_some_and(|relation| {
+                        relation.post_selector && relation.selected == *selected
+                    })
+            })
+    }
+
+    fn ancestral_typed_selectors(&self, subject: &DeviceId, heads: &[FactId]) -> BTreeSet<FactId> {
+        let mut candidates = BTreeSet::new();
+        for head in heads {
+            for (selector, relation) in self.authority_provenance.get(head).into_iter().flatten() {
+                if relation.post_selector && self.facts.get(selector).is_some_and(|fact| {
+                    matches!(&fact.content.body, FactBody::AuthorityLineageResolution { subject: selected_subject, selected_head, .. }
+                        if selected_subject == subject && *selected_head == relation.selected)
+                }) { candidates.insert(*selector); }
+            }
+        }
+        candidates
+    }
+
+    fn maximal_typed_selectors(&self, subject: &DeviceId, heads: &[FactId]) -> Vec<FactId> {
+        let candidates = self.ancestral_typed_selectors(subject, heads);
+        candidates
             .iter()
-            .filter(|(candidate, _)| {
-                !selectors.iter().any(|(other, _)| {
-                    candidate != other && self.direct_dependency(other, candidate)
+            .copied()
+            .filter(|candidate| {
+                !candidates.iter().any(|other| {
+                    candidate != other
+                        && self
+                            .authority_provenance
+                            .get(other)
+                            .and_then(|row| row.get(candidate))
+                            .is_some_and(|relation| relation.post_selector)
                 })
             })
-            .collect::<Vec<_>>();
-        let [(_, selected)] = maximal.as_slice() else {
-            return None;
+            .collect()
+    }
+
+    fn selector_permits_fact(&self, selector: FactId, fact: FactId) -> bool {
+        let Some(SignedFact { content, .. }) = self.facts.get(&selector) else {
+            return false;
         };
-        Some(*selected)
+        let FactBody::AuthorityLineageResolution { selected_head, .. } = &content.body else {
+            return false;
+        };
+        self.authority_provenance
+            .get(&fact)
+            .and_then(|row| row.get(&selector))
+            .is_some_and(|relation| {
+                relation.selected == *selected_head
+                    && (relation.post_selector
+                        || relation.selected_before
+                        || relation.before_selected)
+            })
+    }
+
+    fn relevant_typed_selectors(
+        &self,
+        subject: &DeviceId,
+        heads: &[FactId],
+    ) -> Option<Vec<FactId>> {
+        // Relations remain raw, canonically validated reachability facts.
+        // Evaluate context relevance newest-first. A selector on the losing
+        // branch of a later selector must not veto its selected competitor;
+        // an earlier selector common to both later branches still applies.
+        // Scratch is bounded by this subject's retained charged contexts,
+        // never by all fact bodies or a cloned projection.
+        let mut pending = self.ancestral_typed_selectors(subject, heads);
+        let mut relevant = Vec::new();
+        while !pending.is_empty() {
+            let maxima = pending
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !pending.iter().any(|other| {
+                        candidate != other
+                            && self
+                                .authority_provenance
+                                .get(other)
+                                .and_then(|row| row.get(candidate))
+                                .is_some_and(|relation| relation.post_selector)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if maxima.is_empty() {
+                // Canonical signed history is acyclic. A damaged in-memory
+                // summary must not erase its exclusions on a cycle.
+                return None;
+            }
+            let permitted = maxima
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    relevant
+                        .iter()
+                        .all(|later| self.selector_permits_fact(*later, *candidate))
+                })
+                .collect::<Vec<_>>();
+            for selector in maxima {
+                pending.remove(&selector);
+            }
+            relevant.extend(permitted);
+        }
+        Some(relevant)
     }
 
     fn authority_use_heads_from_parents(
@@ -5361,6 +6298,106 @@ impl FactGraph {
             }
         }
         false
+    }
+
+    /// Canonical roots needed before a cold/new-selector operation can
+    /// introduce new reachability anchors. The publication owner resolves
+    /// these once under its existing bounded SQLite history contract.
+    pub(crate) fn selector_provenance_history_roots(
+        &self,
+        candidates: &[SignedFact],
+    ) -> Vec<FactId> {
+        if self.admitted_fact_count <= self.facts.len() as u64 {
+            return Vec::new();
+        }
+        let mut pending = self.ready_quarantine.iter().copied().collect::<Vec<_>>();
+        pending.extend(candidates.iter().map(|fact| fact.id));
+        let mut seen = BTreeSet::new();
+        let mut selector = candidates.iter().any(|fact| {
+            matches!(
+                fact.content.body,
+                FactBody::AuthorityLineageResolution { .. }
+            )
+        });
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            selector |= self.quarantined.get(&id).is_some_and(|fact| {
+                matches!(
+                    fact.content.body,
+                    FactBody::AuthorityLineageResolution { .. }
+                )
+            });
+            pending.extend(
+                self.waiting_by_dependency
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        let cold_relation = candidates
+            .iter()
+            .chain(seen.iter().filter_map(|id| self.quarantined.get(id)))
+            .any(|fact| {
+                let direct = dependencies(fact);
+                let hidden_head = fact.content.body.exclusive_cells().iter().any(|cell| {
+                    self.cell_heads_index
+                        .get(cell)
+                        .into_iter()
+                        .flatten()
+                        .any(|head| !direct.contains(head))
+                }) || Self::indexed_authority_subjects(fact).iter().any(
+                    |subject| {
+                        self.authority_heads_index
+                            .get(subject)
+                            .into_iter()
+                            .flatten()
+                            .any(|head| !direct.contains(head))
+                    },
+                );
+                let witness = self.authoring_witness(&fact.content.body, &fact.content.author);
+                hidden_head
+                    || (!self.authority_provenance.is_empty()
+                        && (!self.current_heads_are_complete(fact)
+                            || dependencies(fact)
+                                .iter()
+                                .any(|id| !self.facts.contains_key(id))
+                            || fact
+                                .content
+                                .parents
+                                .iter()
+                                .any(|id| !witness.parents.contains(id))))
+            });
+        if !selector && !cold_relation {
+            return Vec::new();
+        }
+        let mut roots = self.facts.keys().copied().collect::<BTreeSet<_>>();
+        for fact in candidates {
+            roots.extend(dependencies(fact));
+        }
+        for id in seen {
+            if let Some(fact) = self.quarantined.get(&id) {
+                roots.extend(dependencies(fact));
+            }
+        }
+        for fact in candidates {
+            roots.remove(&fact.id);
+        }
+        roots
+            .into_iter()
+            .filter(|id| !self.quarantined.contains_key(id))
+            .collect()
+    }
+
+    /// Recompute the complete resident graph projection for differential lab
+    /// controls, without reading or updating the incremental cache.
+    #[cfg(feature = "transport-lab")]
+    pub fn full_projection_for_lab(&self) -> (Projection, [u8; 32]) {
+        let projection = Projection::from_graph(self);
+        let root = projection.commitment_root();
+        (projection, root)
     }
 
     pub fn projection(&self) -> Projection {
@@ -5571,6 +6608,9 @@ impl<'a> SemanticEvaluator<'a> {
     /// relation is forked; the typed relation must be empty (bootstrap) or
     /// singular first.
     pub fn effective_authorized_role(&self, subject: &DeviceId) -> Option<Role> {
+        if !self.graph.selector_provenance_complete(subject) {
+            return None;
+        }
         self.graph
             .authority_lineage(subject)
             .is_singular()
@@ -5698,6 +6738,9 @@ impl<'a> SemanticEvaluator<'a> {
     }
 
     fn has_tier(&self, signer: &DeviceId, required: Role) -> bool {
+        if !self.graph.selector_provenance_complete(signer) {
+            return false;
+        }
         let Some(actual) = self.effective_role(signer) else {
             return false;
         };
@@ -7130,6 +8173,315 @@ mod tests {
     }
 
     #[test]
+    fn selector_provenance_continuations_cold_restore_and_rollback() {
+        let (bootstrap, root_key) = closed(171);
+        let controller_key = key(172);
+        let controller = device(&controller_key);
+        let old_target = device(&key(173));
+        let first_target = device(&key(174));
+        let second_target = device(&key(175));
+        let mut seed = FactGraph::from_bootstrap(&bootstrap);
+        let grant = witnessed_fact(
+            &seed,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+        );
+        assert_eq!(seed.admit(grant.clone()).unwrap(), Admission::Inserted);
+        let operation = witnessed_fact(
+            &seed,
+            &controller_key,
+            FactBody::RoleGrant {
+                target: old_target.clone(),
+                role: Role::Member,
+            },
+        );
+        let revoke = witnessed_fact(
+            &seed,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+        );
+        let mut expected_transcript: Option<Vec<FactId>> = None;
+        for order in [
+            [operation.clone(), revoke.clone()],
+            [revoke.clone(), operation.clone()],
+        ] {
+            let mut graph = seed.clone();
+            for fact in order {
+                assert_eq!(graph.admit(fact).unwrap(), Admission::Inserted);
+            }
+            let mut cited = vec![operation.id, revoke.id];
+            cited.sort();
+            let selector = witnessed_fact(
+                &graph,
+                &root_key,
+                FactBody::AuthorityLineageResolution {
+                    subject: controller.clone(),
+                    cited_heads: cited,
+                    selected_head: revoke.id,
+                },
+            );
+            let competing_selector = witnessed_fact(
+                &graph,
+                &root_key,
+                FactBody::AuthorityLineageResolution {
+                    subject: controller.clone(),
+                    cited_heads: vec![operation.id, revoke.id]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    selected_head: operation.id,
+                },
+            );
+            assert_eq!(graph.admit(selector.clone()).unwrap(), Admission::Inserted);
+            assert_eq!(graph.projection(), Projection::from_graph(&graph));
+            {
+                let mut competing = graph.clone();
+                assert_eq!(
+                    competing.admit(competing_selector).unwrap(),
+                    Admission::Inserted
+                );
+                assert_eq!(
+                    competing.authority_lineage(&controller).selected_branch(),
+                    None
+                );
+                assert!(competing.authority_lineage(&controller).is_conflicted());
+                assert_eq!(
+                    competing
+                        .maximal_typed_selectors(
+                            &controller,
+                            competing.authority_lineage(&controller).heads()
+                        )
+                        .len(),
+                    2
+                );
+                assert!(!competing.fact_is_authoritative(&operation.id));
+                assert_eq!(competing.projection(), Projection::from_graph(&competing));
+            }
+            let regrant = witnessed_fact(
+                &graph,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: controller.clone(),
+                    role: Role::Owner,
+                },
+            );
+            assert_eq!(graph.admit(regrant).unwrap(), Admission::Inserted);
+            assert_eq!(graph.projection(), Projection::from_graph(&graph));
+            let first = witnessed_fact(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target: first_target.clone(),
+                    role: Role::Member,
+                },
+            );
+            assert_eq!(graph.admit(first).unwrap(), Admission::Inserted);
+            assert_eq!(graph.projection(), Projection::from_graph(&graph));
+            let second = witnessed_fact(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target: second_target.clone(),
+                    role: Role::Member,
+                },
+            );
+            let second_id = second.id;
+            assert_eq!(graph.admit(second).unwrap(), Admission::Inserted);
+            for index in 0..8 {
+                assert_eq!(
+                    graph.authority_lineage(&controller).selected_branch(),
+                    Some(revoke.id)
+                );
+                assert!(!graph.fact_is_authoritative(&operation.id));
+                assert_eq!(graph.evaluator().effective_role(&old_target), None);
+                let full = Projection::from_graph(&graph);
+                assert_eq!(graph.projection(), full);
+                assert_eq!(graph.projection_commitment_root(), full.commitment_root());
+                let fact = witnessed_fact(
+                    &graph,
+                    &controller_key,
+                    FactBody::RoleGrant {
+                        target: second_target.clone(),
+                        role: if index % 2 == 0 {
+                            Role::Controller
+                        } else {
+                            Role::Member
+                        },
+                    },
+                );
+                assert_eq!(graph.admit(fact).unwrap(), Admission::Inserted);
+            }
+            let canonical_history = graph.facts.values().cloned().collect::<Vec<_>>();
+            let transcript = canonical_history
+                .iter()
+                .map(|fact| fact.id)
+                .collect::<Vec<_>>();
+            if let Some(expected) = &expected_transcript {
+                assert_eq!(&transcript, expected);
+            } else {
+                expected_transcript = Some(transcript);
+            }
+            graph.cold_history_since_retirement =
+                graph.policy_limits.max_hot_history_facts as usize;
+            graph.retire_cold_history();
+            assert!(
+                !graph.facts.contains_key(&second_id),
+                "actual intermediate body retired"
+            );
+            assert!(
+                graph.facts.contains_key(&selector.id),
+                "actual signed selector retained"
+            );
+            assert!(
+                graph.facts.contains_key(&revoke.id),
+                "actual selected branch witness retained"
+            );
+            assert_eq!(graph.projection(), Projection::from_graph(&graph));
+            assert_eq!(
+                graph.logical_index_residency_bytes().unwrap(),
+                graph.derived_index_bytes
+            );
+            let checkpoint = graph.live_checkpoint();
+            let restored = FactGraph::from_live_checkpoint_with_history(
+                &bootstrap,
+                crate::config::SemanticPolicyConfig::default(),
+                checkpoint.clone(),
+                |_| Ok(canonical_history.clone()),
+            )
+            .expect("pristine cold provenance validated without admission replay");
+            assert_eq!(
+                restored.authority_lineage(&controller).selected_branch(),
+                Some(revoke.id)
+            );
+            assert_eq!(restored.projection(), Projection::from_graph(&restored));
+            let mut omitted = checkpoint.clone();
+            let omitted_bytes = graph
+                .authority_provenance
+                .values()
+                .map(|row| graph.provenance_row_bytes(row).unwrap())
+                .sum::<u64>();
+            omitted.authority_provenance.clear();
+            omitted.derived_index_bytes = omitted
+                .derived_index_bytes
+                .checked_sub(omitted_bytes)
+                .unwrap();
+            assert!(
+                FactGraph::from_live_checkpoint_with_history(
+                    &bootstrap,
+                    crate::config::SemanticPolicyConfig::default(),
+                    omitted,
+                    |_| Ok(canonical_history.clone()),
+                )
+                .is_err(),
+                "omitted required provenance is not selector-free"
+            );
+            let mut false_post = checkpoint.clone();
+            let false_relation = AuthoritySelectorRelation {
+                selected: revoke.id,
+                post_selector: true,
+                selected_before: false,
+                before_selected: false,
+            };
+            assert!(!graph
+                .authority_provenance
+                .get(&operation.id)
+                .is_some_and(|row| row.contains_key(&selector.id)));
+            let mut false_row = graph
+                .authority_provenance
+                .get(&operation.id)
+                .cloned()
+                .unwrap_or_default();
+            let prior_bytes = if false_row.is_empty() {
+                0
+            } else {
+                graph.provenance_row_bytes(&false_row).unwrap()
+            };
+            false_row.insert(selector.id, false_relation);
+            false_post
+                .authority_provenance
+                .retain(|(id, _)| *id != operation.id);
+            false_post.authority_provenance.push((
+                operation.id,
+                false_row
+                    .iter()
+                    .map(|(id, relation)| (*id, *relation))
+                    .collect(),
+            ));
+            false_post.derived_index_bytes = false_post
+                .derived_index_bytes
+                .checked_sub(prior_bytes)
+                .unwrap()
+                .checked_add(graph.provenance_row_bytes(&false_row).unwrap())
+                .unwrap();
+            assert!(
+                FactGraph::from_live_checkpoint_with_history(
+                    &bootstrap,
+                    crate::config::SemanticPolicyConfig::default(),
+                    false_post,
+                    |_| Ok(canonical_history.clone()),
+                )
+                .is_err(),
+                "a losing-parent edge is not post-selector provenance even with exact accounting"
+            );
+            let mut substituted = checkpoint;
+            for (_, row) in &mut substituted.authority_provenance {
+                for (_, relation) in row {
+                    if relation.selected == revoke.id {
+                        relation.selected = operation.id;
+                    }
+                }
+            }
+            assert!(
+                FactGraph::from_live_checkpoint_with_history(
+                    &bootstrap,
+                    crate::config::SemanticPolicyConfig::default(),
+                    substituted,
+                    |_| Ok(canonical_history.clone()),
+                )
+                .is_err(),
+                "selected losing-row substitution refuses"
+            );
+            let next = witnessed_fact(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target: second_target.clone(),
+                    role: Role::Controller,
+                },
+            );
+            let baseline = graph_snapshot(&graph);
+            {
+                let journal = graph.admit_journaled(next.clone()).unwrap();
+                assert_eq!(journal.admission(), &Admission::Inserted);
+                assert_eq!(
+                    journal.graph().projection(),
+                    Projection::from_graph(journal.graph())
+                );
+                assert_ne!(
+                    journal.graph().authority_provenance,
+                    baseline.authority_provenance
+                );
+            }
+            assert_graph_state_eq(&graph, &baseline);
+            graph.admit_journaled(next.clone()).unwrap().rollback();
+            assert_graph_state_eq(&graph, &baseline);
+            graph.admit_journaled(next).unwrap().commit();
+            assert_eq!(
+                graph.authority_lineage(&controller).selected_branch(),
+                Some(revoke.id)
+            );
+            assert!(!graph.fact_is_authoritative(&operation.id));
+            assert_eq!(graph.projection(), Projection::from_graph(&graph));
+        }
+    }
+
+    #[test]
     fn self_authored_membership_keeps_a_role_authority_fork_explicit() {
         let (bootstrap, root_key) = closed(86);
         let controller_key = key(87);
@@ -7328,6 +8680,136 @@ mod tests {
             graph.evaluator().effective_membership(&controller),
             None,
             "later Role resolution/regrant cannot revive the losing payload"
+        );
+
+        // Continue two ordinary authority-use steps beyond the typed
+        // selector. These rows are the public-shaped T->U->F1->F2 case: the
+        // active frontier must carry the selected branch even when the typed
+        // selector itself is no longer a direct parent.
+        let continuation_revoke = witnessed_fact(
+            &graph,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+        );
+        graph
+            .admit(continuation_revoke)
+            .expect("first ordinary continuation admits");
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            Some(late_revoke_id)
+        );
+        let continuation_grant = witnessed_fact(
+            &graph,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Owner,
+            },
+        );
+        let continuation_grant_id = continuation_grant.id;
+        graph
+            .admit(continuation_grant)
+            .expect("second ordinary continuation admits");
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            Some(late_revoke_id)
+        );
+        assert!(graph.fact_is_authoritative(&continuation_grant_id));
+        assert_eq!(graph.projection(), Projection::from_graph(&graph));
+
+        // A cache checksum is not a proof that a branch was selected. A
+        // resident but losing signed row must not be substitutable for the
+        // selected ID in the derived frontier summary.
+        let valid_checkpoint = graph.live_checkpoint();
+        FactGraph::from_live_checkpoint(
+            &bootstrap,
+            crate::config::SemanticPolicyConfig::default(),
+            valid_checkpoint.clone(),
+        )
+        .expect("complete resident typed-selector ancestry validates");
+        let mut forged_checkpoint = valid_checkpoint.clone();
+        let (_, row) = forged_checkpoint
+            .authority_provenance
+            .iter_mut()
+            .find(|(id, _)| *id == continuation_grant_id)
+            .expect("continuation has provenance");
+        let (_, relation) = row
+            .iter_mut()
+            .find(|(_, relation)| relation.selected == late_revoke_id)
+            .expect("controller selection has a persisted provenance relation");
+        relation.selected = self_membership_id;
+        assert!(
+            FactGraph::from_live_checkpoint(
+                &bootstrap,
+                crate::config::SemanticPolicyConfig::default(),
+                forged_checkpoint,
+            )
+            .is_err(),
+            "resident losing row is not typed-selector provenance"
+        );
+        assert_eq!(
+            graph.logical_index_residency_bytes().unwrap(),
+            graph.derived_index_bytes
+        );
+
+        // A journaled continuation changes the compact frontier and must put
+        // it back exactly on both Drop and explicit rollback.
+        let rollback_candidate = witnessed_fact(
+            &graph,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+        );
+        let before_continuation = graph_snapshot(&graph);
+        let preflight = graph
+            .preflight_admission(&rollback_candidate)
+            .expect("frontier continuation preflights");
+        let journal = graph
+            .apply_preflight_journaled(rollback_candidate.clone(), preflight)
+            .expect("frontier continuation journals");
+        assert_ne!(
+            journal.graph().authority_provenance,
+            before_continuation.authority_provenance,
+            "journal mutates the compact selector frontier"
+        );
+        drop(journal);
+        assert_graph_state_eq(&graph, &before_continuation);
+        let preflight = graph
+            .preflight_admission(&rollback_candidate)
+            .expect("frontier continuation re-preflights");
+        let journal = graph
+            .apply_preflight_journaled(rollback_candidate, preflight)
+            .expect("frontier continuation re-journals");
+        journal.rollback();
+        assert_graph_state_eq(&graph, &before_continuation);
+
+        // Retirement keeps signed selector/selected witnesses, not the
+        // ordinary continuation chain. Restore independently checks the
+        // derived relations against this same complete signed history.
+        let canonical_history = graph.facts.values().cloned().collect::<Vec<_>>();
+        graph.cold_history_since_retirement =
+            usize::try_from(graph.policy_limits.max_hot_history_facts).unwrap_or(usize::MAX);
+        graph.retire_cold_history();
+        let checkpoint = graph.live_checkpoint();
+        let restored = FactGraph::from_live_checkpoint_with_history(
+            &bootstrap,
+            crate::config::SemanticPolicyConfig::default(),
+            checkpoint,
+            |_| Ok(canonical_history.clone()),
+        )
+        .expect("selector provenance validates across the cold boundary");
+        assert_eq!(
+            restored.authority_lineage(&controller).selected_branch(),
+            Some(late_revoke_id)
+        );
+        assert!(restored.fact_is_authoritative(&continuation_grant_id));
+        assert_eq!(restored.projection(), Projection::from_graph(&restored));
+        assert_eq!(
+            restored.projection_commitment_root(),
+            graph.projection_commitment_root()
         );
     }
 
@@ -8150,6 +9632,1253 @@ mod tests {
             Err(SemanticError::QuarantineSignerNotEligible)
         );
         assert_eq!(graph.quarantined().count(), 0);
+    }
+
+    fn signed_membership_maxima(
+        facts: &BTreeMap<FactId, SignedFact>,
+        subject: &DeviceId,
+    ) -> BTreeSet<FactId> {
+        // Independent oracle: no maintained heads, selector summaries,
+        // graph.is_ancestor, or production head-removal predicate.
+        let cell = ExclusiveCell::membership(subject.clone());
+        let members = facts
+            .values()
+            .filter(|fact| fact.content.body.exclusive_cells().contains(&cell))
+            .map(|fact| fact.id)
+            .collect::<BTreeSet<_>>();
+        members
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !members
+                    .iter()
+                    .filter(|other| *other != candidate)
+                    .any(|other| {
+                        let mut pending = dependencies(facts.get(other).unwrap());
+                        let mut seen = BTreeSet::new();
+                        while let Some(id) = pending.pop() {
+                            if id == *candidate {
+                                return true;
+                            }
+                            if seen.insert(id) {
+                                pending.extend(dependencies(
+                                    facts
+                                        .get(&id)
+                                        .expect("oracle owns complete signed ancestry"),
+                                ));
+                            }
+                        }
+                        false
+                    })
+            })
+            .collect()
+    }
+
+    fn assert_historical_membership_boundary(
+        graph: &FactGraph,
+        complete: &FactGraph,
+        subject: &DeviceId,
+        old_membership: FactId,
+        fresh_membership: FactId,
+        expected_value: Option<FactId>,
+        fresh_authoritative: bool,
+    ) {
+        let cell = ExclusiveCell::membership(subject.clone());
+        let raw = signed_membership_maxima(&complete.facts, subject);
+        assert_eq!(
+            graph
+                .raw_cell_heads(&cell)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            raw
+        );
+        assert!(
+            graph.get(&old_membership).is_some(),
+            "old signed loser remains a retained selector witness"
+        );
+        assert!(!graph.fact_is_authoritative(&old_membership));
+        if complete.get(&fresh_membership).is_some() {
+            assert!(graph.get(&fresh_membership).is_some());
+            assert_eq!(
+                graph.fact_is_authoritative(&fresh_membership),
+                fresh_authoritative
+            );
+            assert_eq!(raw, BTreeSet::from([fresh_membership]));
+        }
+        let full = Projection::from_graph(complete);
+        assert_eq!(full.value(&cell), expected_value);
+        assert_eq!(graph.projection(), full);
+        assert_eq!(Projection::from_graph(graph), full);
+        assert_eq!(graph.projection_commitment_root(), full.commitment_root());
+        assert_eq!(
+            graph.derived_index_bytes,
+            graph.logical_index_residency_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn historical_membership_exclusion_survives_later_selectors_and_cold_journals() {
+        let (bootstrap, root_key) = closed(184);
+        let controller_key = key(185);
+        let other_owner_key = key(186);
+        let controller = device(&controller_key);
+        let mut policy = SemanticAdmissionPolicy::default();
+        policy.max_hot_history_facts = 4;
+        let mut seed = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
+        for ordinal in 0..8 {
+            let precursor = witnessed_fact(
+                &seed,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(&key(187)),
+                    role: if ordinal % 2 == 0 {
+                        Role::Member
+                    } else {
+                        Role::Controller
+                    },
+                },
+            );
+            assert_eq!(seed.admit(precursor), Ok(Admission::Inserted));
+        }
+        let owner = witnessed_fact(
+            &seed,
+            &root_key,
+            FactBody::RoleGrant {
+                target: device(&other_owner_key),
+                role: Role::Owner,
+            },
+        );
+        assert_eq!(seed.admit(owner), Ok(Admission::Inserted));
+        let grant = witnessed_fact(
+            &seed,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+        );
+        assert_eq!(seed.admit(grant), Ok(Admission::Inserted));
+        let m = witnessed_fact(
+            &seed,
+            &controller_key,
+            FactBody::MembershipAdmit {
+                target: controller.clone(),
+            },
+        );
+        let v = witnessed_fact(
+            &seed,
+            &root_key,
+            FactBody::Evict {
+                target: controller.clone(),
+            },
+        );
+        let mut fork = seed.clone();
+        assert_eq!(fork.admit(m.clone()), Ok(Admission::Inserted));
+        assert_eq!(fork.admit(v.clone()), Ok(Admission::Inserted));
+        let cited = vec![m.id, v.id]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let s = witnessed_fact(
+            &fork,
+            &root_key,
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
+                cited_heads: cited.clone(),
+                selected_head: v.id,
+            },
+        );
+        let alternative = witnessed_fact(
+            &fork,
+            &other_owner_key,
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
+                cited_heads: cited,
+                selected_head: m.id,
+            },
+        );
+        let mut selected = fork.clone();
+        assert_eq!(selected.admit(s.clone()), Ok(Admission::Inserted));
+        let n = witnessed_fact(
+            &selected,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Owner,
+            },
+        );
+        assert_eq!(selected.admit(n.clone()), Ok(Admission::Inserted));
+        let q = witnessed_fact(
+            &selected,
+            &controller_key,
+            FactBody::MembershipAdmit {
+                target: controller.clone(),
+            },
+        );
+        let r = witnessed_fact(
+            &selected,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+        );
+        assert!(
+            !dependencies(&q).contains(&m.id),
+            "same public witness hides the losing raw M head"
+        );
+        assert!(dependencies(&q).contains(&v.id));
+        assert!(dependencies(&q).contains(&n.id));
+        assert_historical_membership_boundary(
+            &selected,
+            &selected,
+            &controller,
+            m.id,
+            q.id,
+            Some(v.id),
+            false,
+        );
+
+        let mut after_q = selected.clone();
+        let old_bytes = after_q.derived_index_bytes;
+        let priced = after_q.exact_index_residency_delta(&q).unwrap();
+        let predicted = after_q
+            .apply_index_residency_delta(old_bytes, priced)
+            .unwrap();
+        assert_eq!(after_q.admit(q.clone()), Ok(Admission::Inserted));
+        assert_eq!(
+            after_q.derived_index_bytes, predicted,
+            "hidden-head removal is priced before mutation"
+        );
+        assert_historical_membership_boundary(
+            &after_q,
+            &after_q,
+            &controller,
+            m.id,
+            q.id,
+            Some(q.id),
+            true,
+        );
+        let mut after_r = after_q.clone();
+        assert_eq!(after_r.admit(r.clone()), Ok(Admission::Inserted));
+        assert_historical_membership_boundary(
+            &after_r,
+            &after_r,
+            &controller,
+            m.id,
+            q.id,
+            None,
+            false,
+        );
+        let t2 = witnessed_fact(
+            &after_r,
+            &root_key,
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
+                cited_heads: vec![q.id, r.id]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                selected_head: r.id,
+            },
+        );
+        let mut after_t2 = after_r.clone();
+        assert_eq!(after_t2.admit(t2.clone()), Ok(Admission::Inserted));
+        assert_historical_membership_boundary(
+            &after_t2,
+            &after_t2,
+            &controller,
+            m.id,
+            q.id,
+            None,
+            false,
+        );
+        let u2 = witnessed_fact(
+            &after_t2,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Owner,
+            },
+        );
+        let mut after_u2 = after_t2.clone();
+        assert_eq!(after_u2.admit(u2.clone()), Ok(Admission::Inserted));
+        assert_historical_membership_boundary(
+            &after_u2,
+            &after_u2,
+            &controller,
+            m.id,
+            q.id,
+            None,
+            false,
+        );
+        let future = witnessed_fact(
+            &after_u2,
+            &controller_key,
+            FactBody::RoleGrant {
+                target: device(&key(188)),
+                role: Role::Member,
+            },
+        );
+        let mut final_graph = after_u2.clone();
+        assert_eq!(final_graph.admit(future.clone()), Ok(Admission::Inserted));
+        assert_historical_membership_boundary(
+            &final_graph,
+            &final_graph,
+            &controller,
+            m.id,
+            q.id,
+            None,
+            false,
+        );
+
+        // Both M/V and Q/R schedules use these exact signed bodies. The
+        // independent raw oracle must agree before any checkpoint is made.
+        for reverse_old in [false, true] {
+            for reverse_new in [false, true] {
+                let mut graph = seed.clone();
+                for fact in if reverse_old {
+                    [v.clone(), m.clone()]
+                } else {
+                    [m.clone(), v.clone()]
+                } {
+                    assert_eq!(graph.admit(fact), Ok(Admission::Inserted));
+                }
+                assert_eq!(graph.admit(s.clone()), Ok(Admission::Inserted));
+                assert_eq!(graph.admit(n.clone()), Ok(Admission::Inserted));
+                assert_historical_membership_boundary(
+                    &graph,
+                    &selected,
+                    &controller,
+                    m.id,
+                    q.id,
+                    Some(v.id),
+                    false,
+                );
+                for fact in if reverse_new {
+                    [r.clone(), q.clone()]
+                } else {
+                    [q.clone(), r.clone()]
+                } {
+                    assert_eq!(graph.admit(fact), Ok(Admission::Inserted));
+                }
+                assert_historical_membership_boundary(
+                    &graph,
+                    &after_r,
+                    &controller,
+                    m.id,
+                    q.id,
+                    None,
+                    false,
+                );
+                for (fact, complete) in
+                    [(&t2, &after_t2), (&u2, &after_u2), (&future, &final_graph)]
+                {
+                    assert_eq!(graph.admit(fact.clone()), Ok(Admission::Inserted));
+                    assert_historical_membership_boundary(
+                        &graph,
+                        complete,
+                        &controller,
+                        m.id,
+                        q.id,
+                        None,
+                        false,
+                    );
+                }
+                assert_eq!(graph.facts, final_graph.facts);
+            }
+        }
+
+        for (base, candidate, complete, value, q_allowed) in [
+            (&selected, &q, &after_q, Some(q.id), true),
+            (&after_q, &r, &after_r, None, false),
+            (&after_r, &t2, &after_t2, None, false),
+            (&after_t2, &u2, &after_u2, None, false),
+            (&after_u2, &future, &final_graph, None, false),
+        ] {
+            let mut rebuilt = complete.clone();
+            rebuilt.rebuild_indexes();
+            assert_historical_membership_boundary(
+                &rebuilt,
+                complete,
+                &controller,
+                m.id,
+                q.id,
+                value,
+                q_allowed,
+            );
+            assert_eq!(rebuilt.authority_provenance, complete.authority_provenance);
+            for cold in [false, true] {
+                let history = base.facts.values().cloned().collect::<Vec<_>>();
+                let mut graph = base.clone();
+                if cold {
+                    graph.retire_cold_history();
+                    assert!(graph.facts.len() < history.len());
+                }
+                graph.projection();
+                let before = graph_snapshot(&graph);
+                for terminal in 0..3 {
+                    let journal = if cold {
+                        graph.admit_journaled_with_history(candidate.clone(), history.clone())
+                    } else {
+                        graph.admit_journaled(candidate.clone())
+                    }
+                    .expect("same signed transition journals");
+                    assert_eq!(journal.admission(), &Admission::Inserted);
+                    assert_eq!(journal.delta().rows().len(), 1);
+                    assert_eq!(journal.delta().rows()[0].fact().id, candidate.id);
+                    assert!(journal.delta().removed().is_empty());
+                    assert_historical_membership_boundary(
+                        journal.graph(),
+                        complete,
+                        &controller,
+                        m.id,
+                        q.id,
+                        value,
+                        q_allowed,
+                    );
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&graph, &before);
+                    }
+                }
+                assert_historical_membership_boundary(
+                    &graph,
+                    complete,
+                    &controller,
+                    m.id,
+                    q.id,
+                    value,
+                    q_allowed,
+                );
+                if cold {
+                    let canonical = complete.facts.values().cloned().collect::<Vec<_>>();
+                    let restored = FactGraph::from_live_checkpoint_with_history(
+                        &bootstrap,
+                        crate::config::SemanticPolicyConfig {
+                            max_hot_history_facts: 4,
+                            ..Default::default()
+                        },
+                        graph.live_checkpoint(),
+                        |_| Ok(canonical.clone()),
+                    )
+                    .expect("pristine cold provenance validates against complete signed history");
+                    assert_historical_membership_boundary(
+                        &restored,
+                        complete,
+                        &controller,
+                        m.id,
+                        q.id,
+                        value,
+                        q_allowed,
+                    );
+                }
+            }
+        }
+        for cold in [false, true] {
+            let mut graph = selected.clone();
+            let history = graph.facts.values().cloned().collect::<Vec<_>>();
+            if cold {
+                graph.retire_cold_history();
+                assert!(graph.facts.len() < history.len());
+            }
+            graph.projection();
+            let before = graph_snapshot(&graph);
+            for terminal in 0..3 {
+                let inputs = vec![q.clone(), r.clone(), t2.clone(), u2.clone(), future.clone()];
+                let journal = graph
+                    .admit_journaled_batch_with_history(
+                        inputs.clone(),
+                        if cold { history.clone() } else { Vec::new() },
+                    )
+                    .expect("whole two-selector lifecycle fits one bounded group");
+                assert_eq!(journal.results().len(), inputs.len());
+                for (result, input) in journal.results().iter().zip(&inputs) {
+                    assert!(
+                        matches!(result.outcome(), AggregateAdmissionOutcome::Inserted { fact_id } if *fact_id == input.id)
+                    );
+                }
+                assert_eq!(journal.delta().rows().len(), inputs.len());
+                assert!(journal
+                    .delta()
+                    .rows()
+                    .iter()
+                    .all(|row| row.status() == SemanticFactStatus::Admitted));
+                assert!(journal.delta().removed().is_empty());
+                assert_historical_membership_boundary(
+                    journal.graph(),
+                    &final_graph,
+                    &controller,
+                    m.id,
+                    q.id,
+                    None,
+                    false,
+                );
+                match terminal {
+                    0 => journal.rollback(),
+                    1 => drop(journal),
+                    _ => journal.commit(),
+                }
+                if terminal < 2 {
+                    assert_graph_state_eq(&graph, &before);
+                }
+            }
+            assert_historical_membership_boundary(
+                &graph,
+                &final_graph,
+                &controller,
+                m.id,
+                q.id,
+                None,
+                false,
+            );
+        }
+
+        // Balance the serialized index charge as well as omitting old S, so
+        // this rejection tests canonical predecessor-context completeness,
+        // not merely the earlier structural byte-accounting guard.
+        let mut omitted = after_u2.clone();
+        omitted.authority_provenance.retain(|_, row| {
+            row.remove(&s.id);
+            !row.is_empty()
+        });
+        assert!(omitted
+            .authority_selector_index
+            .get_mut(&controller)
+            .unwrap()
+            .remove(&(s.id, v.id)));
+        omitted.derived_index_bytes = omitted.logical_index_residency_bytes().unwrap();
+        let canonical = after_u2.facts.values().cloned().collect::<Vec<_>>();
+        let result = FactGraph::from_live_checkpoint_with_history(
+            &bootstrap,
+            crate::config::SemanticPolicyConfig {
+                max_hot_history_facts: 4,
+                ..Default::default()
+            },
+            omitted.live_checkpoint(),
+            |_| Ok(canonical.clone()),
+        );
+        assert!(
+            matches!(result, Err(error) if error == "checkpoint omits required selector provenance")
+        );
+
+        // A later selector can choose between competing selector bodies.
+        // The losing selector's exclusion must NOT veto the selected one.
+        let mut competitors = fork.clone();
+        assert_eq!(competitors.admit(s.clone()), Ok(Admission::Inserted));
+        assert_eq!(
+            competitors.admit(alternative.clone()),
+            Ok(Admission::Inserted)
+        );
+        assert_eq!(
+            competitors
+                .maximal_typed_selectors(
+                    &controller,
+                    competitors.authority_lineage(&controller).heads()
+                )
+                .len(),
+            2
+        );
+        let winner = witnessed_fact(
+            &competitors,
+            &root_key,
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
+                cited_heads: vec![s.id, alternative.id]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                selected_head: s.id,
+            },
+        );
+        let role_cell = ExclusiveCell::role(controller.clone());
+        let membership_cell = ExclusiveCell::membership(controller.clone());
+        let before_winner_projection = Projection::from_graph(&competitors);
+        assert_eq!(competitors.projection(), before_winner_projection);
+        assert_eq!(before_winner_projection.value(&role_cell), None);
+        assert!(
+            matches!(before_winner_projection.membership_cell(&controller),
+            Some(super::super::CellProjection::Conflict(ids))
+                if ids.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([m.id, v.id]))
+        );
+        let (impact_cells, impact_subjects) = competitors.projection_impact_for_fact(&winner);
+        assert!(impact_cells.contains(&role_cell));
+        assert!(impact_cells.contains(&membership_cell));
+        assert!(impact_subjects.contains(&controller));
+        let before_winner = graph_snapshot(&competitors);
+        assert_eq!(competitors.admit(winner.clone()), Ok(Admission::Inserted));
+        let relevant = competitors
+            .relevant_typed_selectors(
+                &controller,
+                competitors.authority_lineage(&controller).heads(),
+            )
+            .expect("signed selector ancestry is acyclic");
+        assert!(relevant.contains(&s.id));
+        assert!(relevant.contains(&winner.id));
+        assert!(!relevant.contains(&alternative.id));
+        assert_historical_membership_boundary(
+            &competitors,
+            &competitors,
+            &controller,
+            m.id,
+            q.id,
+            Some(v.id),
+            false,
+        );
+        let final_projection = Projection::from_graph(&competitors);
+        assert_eq!(final_projection.value(&role_cell), Some(v.id));
+        assert_eq!(final_projection.value(&membership_cell), Some(v.id));
+        let expected_cells = BTreeMap::from([
+            (
+                role_cell.clone(),
+                Some(super::super::CellProjection::Value(v.id)),
+            ),
+            (
+                membership_cell.clone(),
+                Some(super::super::CellProjection::Value(v.id)),
+            ),
+        ]);
+        // Winner changes exactly these two entries, not unrelated roles.
+        let assert_delta = |delta: &super::super::projection::ProjectionDelta,
+                            base: &Projection| {
+            assert_eq!(delta.cells(), &expected_cells);
+            assert!(delta.stand_down().is_empty());
+            assert_eq!(delta.base_commitment(), base.commitment_root());
+            assert_eq!(delta.commitment(), final_projection.commitment_root());
+        };
+        for reverse in [false, true] {
+            let selectors = if reverse {
+                vec![alternative.clone(), s.clone()]
+            } else {
+                vec![s.clone(), alternative.clone()]
+            };
+            let mut direct = fork.clone();
+            for selector in &selectors {
+                assert_eq!(direct.admit(selector.clone()), Ok(Admission::Inserted));
+                assert_eq!(direct.projection(), Projection::from_graph(&direct));
+            }
+            assert_eq!(direct.projection(), before_winner_projection);
+            assert_eq!(direct.admit(winner.clone()), Ok(Admission::Inserted));
+            assert_eq!(direct.facts, competitors.facts);
+            assert_historical_membership_boundary(
+                &direct,
+                &competitors,
+                &controller,
+                m.id,
+                q.id,
+                Some(v.id),
+                false,
+            );
+
+            let mut ordered_before = fork.clone();
+            for selector in &selectors {
+                assert_eq!(
+                    ordered_before.admit(selector.clone()),
+                    Ok(Admission::Inserted)
+                );
+            }
+            assert_eq!(ordered_before.facts, before_winner.facts);
+            for cold in [false, true] {
+                let history = ordered_before.facts.values().cloned().collect::<Vec<_>>();
+                let mut single = ordered_before.clone();
+                if cold {
+                    single.retire_cold_history();
+                    assert!(single.facts.len() < history.len());
+                }
+                assert_eq!(single.projection(), before_winner_projection);
+                let baseline = graph_snapshot(&single);
+                for terminal in 0..3 {
+                    let journal = if cold {
+                        single.admit_journaled_with_history(winner.clone(), history.clone())
+                    } else {
+                        single.admit_journaled(winner.clone())
+                    }
+                    .expect("winner single transaction has complete ancestor impact");
+                    assert_eq!(journal.admission(), &Admission::Inserted);
+                    assert_eq!(journal.delta().rows().len(), 1);
+                    assert_eq!(journal.delta().rows()[0].fact().id, winner.id);
+                    assert_eq!(
+                        journal.delta().rows()[0].status(),
+                        SemanticFactStatus::Admitted
+                    );
+                    assert!(journal.delta().promoted().is_empty());
+                    assert!(journal.delta().removed().is_empty());
+                    assert!(journal.delta().affected_cells().contains(&role_cell));
+                    assert!(journal.delta().affected_cells().contains(&membership_cell));
+                    let delta = journal
+                        .delta()
+                        .projection_delta()
+                        .expect("winner publishes both changed cell entries");
+                    assert_delta(delta, &before_winner_projection);
+                    assert_eq!(delta.base_generation(), baseline.generation);
+                    assert_eq!(delta.generation(), journal.graph().generation);
+                    assert_historical_membership_boundary(
+                        journal.graph(),
+                        &competitors,
+                        &controller,
+                        m.id,
+                        q.id,
+                        Some(v.id),
+                        false,
+                    );
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&single, &baseline);
+                    }
+                }
+                assert_historical_membership_boundary(
+                    &single,
+                    &competitors,
+                    &controller,
+                    m.id,
+                    q.id,
+                    Some(v.id),
+                    false,
+                );
+                assert_eq!(single.len(), competitors.len());
+
+                // All three typed selectors are absent during outer
+                // preplanning. The common M/V participants already exist.
+                let mut aggregate = fork.clone();
+                let history = aggregate.facts.values().cloned().collect::<Vec<_>>();
+                if cold {
+                    aggregate.retire_cold_history();
+                    assert!(aggregate.facts.len() < history.len());
+                }
+                let aggregate_projection = aggregate.projection();
+                let baseline = graph_snapshot(&aggregate);
+                for terminal in 0..3 {
+                    let mut inputs = selectors.clone();
+                    inputs.push(winner.clone());
+                    let journal = aggregate
+                        .admit_journaled_batch_with_history(
+                            inputs.clone(),
+                            if cold { history.clone() } else { Vec::new() },
+                        )
+                        .expect(
+                            "selector batch captures ancestor preimages before its first input",
+                        );
+                    assert_eq!(journal.results().len(), 3);
+                    for (result, input) in journal.results().iter().zip(&inputs) {
+                        assert!(
+                            matches!(result.outcome(), AggregateAdmissionOutcome::Inserted { fact_id } if *fact_id == input.id)
+                        );
+                    }
+                    assert_eq!(journal.delta().rows().len(), 3);
+                    assert_eq!(
+                        journal
+                            .delta()
+                            .rows()
+                            .iter()
+                            .map(|row| row.fact().id)
+                            .collect::<BTreeSet<_>>(),
+                        inputs.iter().map(|fact| fact.id).collect::<BTreeSet<_>>()
+                    );
+                    assert!(journal
+                        .delta()
+                        .rows()
+                        .iter()
+                        .all(|row| row.status() == SemanticFactStatus::Admitted));
+                    assert!(journal.delta().promoted().is_empty());
+                    assert!(journal.delta().removed().is_empty());
+                    // Per-input records attribute sparse cell changes while
+                    // the group defers commitment rebuilding. Only the
+                    // normalized aggregate is a durable root boundary.
+                    let item_delta = journal.results()[2]
+                        .delta()
+                        .projection_delta()
+                        .expect("winner per-input delta");
+                    assert_eq!(item_delta.cells(), &expected_cells);
+                    assert!(item_delta.stand_down().is_empty());
+                    assert_eq!(item_delta.base_generation(), baseline.generation + 2);
+                    assert_eq!(item_delta.generation(), baseline.generation + 3);
+                    let delta = journal
+                        .delta()
+                        .projection_delta()
+                        .expect("normalized aggregate projection delta");
+                    assert_delta(delta, &aggregate_projection);
+                    assert_eq!(delta.base_generation(), baseline.generation);
+                    assert_eq!(delta.generation(), journal.graph().generation);
+                    assert_historical_membership_boundary(
+                        journal.graph(),
+                        &competitors,
+                        &controller,
+                        m.id,
+                        q.id,
+                        Some(v.id),
+                        false,
+                    );
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&aggregate, &baseline);
+                    }
+                }
+                assert_historical_membership_boundary(
+                    &aggregate,
+                    &competitors,
+                    &controller,
+                    m.id,
+                    q.id,
+                    Some(v.id),
+                    false,
+                );
+                assert_eq!(aggregate.len(), competitors.len());
+            }
+        }
+    }
+
+    fn assert_candidate_noop_projection(graph: &FactGraph, expected: &Projection) {
+        let full = Projection::from_graph(graph);
+        assert_eq!(&full, expected);
+        assert_eq!(graph.projection(), full);
+        assert_eq!(graph.projection_commitment_root(), full.commitment_root());
+    }
+
+    fn assert_intrinsic_noop_unchanged(
+        base: &FactGraph,
+        candidate: &SignedFact,
+        operation: &'static str,
+    ) {
+        candidate
+            .verify()
+            .expect("intrinsic refusal has a genuine signature");
+        let mut graph = base.clone();
+        graph.projection();
+        let before = graph_snapshot(&graph);
+        assert!(matches!(graph.preflight_admission(candidate),
+            Err(SemanticError::NoOp(reason)) if reason == operation));
+        assert_graph_state_eq(&graph, &before);
+        assert_eq!(
+            graph.admit(candidate.clone()),
+            Err(SemanticError::NoOp(operation))
+        );
+        assert_graph_state_eq(&graph, &before);
+        assert!(matches!(graph.admit_journaled(candidate.clone()),
+            Err(SemanticError::NoOp(reason)) if reason == operation));
+        assert_graph_state_eq(&graph, &before);
+        let journal = graph
+            .admit_journaled_batch(vec![candidate.clone()])
+            .expect("input-local intrinsic refusal is attributed, not retained");
+        assert!(matches!(journal.results()[0].outcome(),
+            AggregateAdmissionOutcome::Refused { fact_id, error: SemanticError::NoOp(reason) }
+                if *fact_id == candidate.id && *reason == operation));
+        assert!(journal.delta().rows().is_empty());
+        assert!(journal.delta().promoted().is_empty());
+        assert!(journal.delta().removed().is_empty());
+        journal.commit();
+        assert_graph_state_eq(&graph, &before);
+
+        let history = base.facts.values().cloned().collect::<Vec<_>>();
+        graph.retire_cold_history();
+        assert!(
+            graph.facts.len() < history.len(),
+            "refusal really attaches retired history"
+        );
+        let cold_before = graph_snapshot(&graph);
+        assert!(
+            matches!(graph.admit_journaled_with_history(candidate.clone(), history),
+            Err(SemanticError::NoOp(reason)) if reason == operation)
+        );
+        assert_graph_state_eq(&graph, &cold_before);
+    }
+
+    #[test]
+    fn candidate_relative_noops_preserve_concurrent_role_operations_across_journals() {
+        // The very same signed bodies exercise grant/grant, revoke/revoke,
+        // and competing ordinary resolutions. Their common support is also
+        // delivered late, so the shared helper is exercised by ready retry.
+        let (bootstrap, root_key) = closed(201);
+        let left_key = key(202);
+        let right_key = key(203);
+        let target = device(&key(204));
+        let mut policy = SemanticAdmissionPolicy::default();
+        policy.max_hot_history_facts = 4;
+        let mut eligible = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
+        for ordinal in 0..8 {
+            let support = witnessed_fact(
+                &eligible,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(&key(205)),
+                    role: if ordinal % 2 == 0 {
+                        Role::Member
+                    } else {
+                        Role::Controller
+                    },
+                },
+            );
+            assert_eq!(eligible.admit(support), Ok(Admission::Inserted));
+        }
+        for signer in [&left_key, &right_key] {
+            let support = witnessed_fact(
+                &eligible,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(signer),
+                    role: Role::Controller,
+                },
+            );
+            assert_eq!(eligible.admit(support), Ok(Admission::Inserted));
+        }
+        for kind in 0..3 {
+            let mut base = eligible.clone();
+            let supports = if kind == 2 {
+                let left = witnessed_fact(
+                    &base,
+                    &left_key,
+                    FactBody::RoleGrant {
+                        target: target.clone(),
+                        role: Role::Member,
+                    },
+                );
+                let right = witnessed_fact(
+                    &base,
+                    &right_key,
+                    FactBody::RoleGrant {
+                        target: target.clone(),
+                        role: Role::Controller,
+                    },
+                );
+                vec![left, right]
+            } else {
+                vec![witnessed_fact(
+                    &base,
+                    &root_key,
+                    FactBody::RoleGrant {
+                        target: if kind == 0 {
+                            device(&key(206))
+                        } else {
+                            target.clone()
+                        },
+                        role: Role::Member,
+                    },
+                )]
+            };
+            for support in &supports {
+                support
+                    .verify()
+                    .expect("same dependency-ordered signed support verifies");
+                assert_eq!(base.admit(support.clone()), Ok(Admission::Inserted));
+            }
+            let heads = base.raw_cell_heads(&ExclusiveCell::role(target.clone()));
+            if kind == 2 {
+                assert_eq!(heads.len(), 2);
+                assert!(base
+                    .evaluator()
+                    .is_conflicted(&ExclusiveCell::role(target.clone())));
+            }
+            let mut pair = Vec::new();
+            for (ordinal, signer) in [&left_key, &right_key].into_iter().enumerate() {
+                let body = match kind {
+                    0 => FactBody::RoleGrant {
+                        target: target.clone(),
+                        role: Role::Member,
+                    },
+                    1 => FactBody::RoleRevoke {
+                        target: target.clone(),
+                    },
+                    _ => FactBody::Resolution {
+                        cell: ExclusiveCell::role(target.clone()),
+                        cited_heads: heads.clone(),
+                        selected_head: heads[ordinal],
+                    },
+                };
+                let witness = base.authoring_witness(&body, &device(signer));
+                let signed = SignedFact::sign(
+                    super::super::FactContent::from_authoring_witness(
+                        &base,
+                        body,
+                        &witness,
+                        supports.iter().map(|fact| fact.id),
+                    ),
+                    signer,
+                )
+                .expect("complete canonical witness signs");
+                signed.verify().expect("concurrent operation verifies");
+                let mut independent = base.clone();
+                assert_eq!(
+                    independent.admit(signed.clone()),
+                    Ok(Admission::Inserted),
+                    "kind={kind} independently valid candidate={ordinal}"
+                );
+                assert_candidate_noop_projection(
+                    &independent,
+                    &Projection::from_graph(&independent),
+                );
+                pair.push(signed);
+            }
+            assert_ne!(pair[0].id, pair[1].id);
+            let mut expected_ids = base.facts.keys().copied().collect::<BTreeSet<_>>();
+            expected_ids.extend(pair.iter().map(|fact| fact.id));
+            let mut reference = base.clone();
+            for candidate in &pair {
+                assert_eq!(reference.admit(candidate.clone()), Ok(Admission::Inserted));
+                assert_candidate_noop_projection(&reference, &Projection::from_graph(&reference));
+            }
+            let expected = Projection::from_graph(&reference);
+            for reverse in [false, true] {
+                let order = if reverse {
+                    vec![pair[1].clone(), pair[0].clone()]
+                } else {
+                    pair.clone()
+                };
+                let mut direct = base.clone();
+                for candidate in &order {
+                    assert_eq!(
+                        direct.preflight_admission(candidate).unwrap().admission(),
+                        &Admission::Inserted
+                    );
+                    assert_eq!(direct.admit(candidate.clone()), Ok(Admission::Inserted));
+                    assert_candidate_noop_projection(&direct, &Projection::from_graph(&direct));
+                }
+                assert_eq!(
+                    direct.facts.keys().copied().collect::<BTreeSet<_>>(),
+                    expected_ids
+                );
+                assert_candidate_noop_projection(&direct, &expected);
+
+                let mut single = base.clone();
+                assert_eq!(single.admit(order[0].clone()), Ok(Admission::Inserted));
+                single.projection();
+                let before = graph_snapshot(&single);
+                for terminal in 0..3 {
+                    let journal = single
+                        .admit_journaled(order[1].clone())
+                        .expect("concurrent single input admits");
+                    assert_eq!(journal.admission(), &Admission::Inserted);
+                    assert_eq!(journal.delta().rows().len(), 1);
+                    assert_eq!(journal.delta().rows()[0].fact().id, order[1].id);
+                    assert_candidate_noop_projection(journal.graph(), &expected);
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&single, &before);
+                    }
+                }
+                assert_eq!(single.facts, direct.facts);
+
+                let mut cold_single = before.clone();
+                let history = cold_single.facts.values().cloned().collect::<Vec<_>>();
+                cold_single.retire_cold_history();
+                assert!(cold_single.facts.len() < history.len());
+                let cold_before = graph_snapshot(&cold_single);
+                for terminal in 0..3 {
+                    let journal = cold_single
+                        .admit_journaled_with_history(order[1].clone(), history.clone())
+                        .expect("same concurrent second input admits with retired causal history");
+                    assert_eq!(journal.admission(), &Admission::Inserted);
+                    assert_eq!(journal.delta().rows().len(), 1);
+                    assert_eq!(journal.delta().rows()[0].fact().id, order[1].id);
+                    assert_candidate_noop_projection(journal.graph(), &expected);
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&cold_single, &cold_before);
+                    }
+                }
+                assert_eq!(cold_single.len(), direct.len());
+                assert_eq!(cold_single.projection(), expected);
+                assert_eq!(
+                    cold_single.projection_commitment_root(),
+                    expected.commitment_root()
+                );
+
+                for hydrated in [false, true] {
+                    let history = base.facts.values().cloned().collect::<Vec<_>>();
+                    let mut aggregate = base.clone();
+                    if hydrated {
+                        aggregate.retire_cold_history();
+                        assert!(aggregate.facts.len() < history.len());
+                    }
+                    aggregate.projection();
+                    let before = graph_snapshot(&aggregate);
+                    for terminal in 0..3 {
+                        let journal = if hydrated {
+                            aggregate
+                                .admit_journaled_batch_with_history(order.clone(), history.clone())
+                        } else {
+                            aggregate.admit_journaled_batch(order.clone())
+                        }
+                        .expect("same concurrent inputs admit atomically");
+                        for (result, candidate) in journal.results().iter().zip(&order) {
+                            assert!(
+                                matches!(result.outcome(), AggregateAdmissionOutcome::Inserted { fact_id }
+                                if *fact_id == candidate.id)
+                            );
+                        }
+                        assert_eq!(journal.results().len(), 2);
+                        assert_eq!(journal.delta().rows().len(), 2);
+                        assert!(journal
+                            .delta()
+                            .rows()
+                            .iter()
+                            .all(|row| row.status() == SemanticFactStatus::Admitted));
+                        assert_eq!(
+                            journal
+                                .delta()
+                                .rows()
+                                .iter()
+                                .map(|row| row.fact().id)
+                                .collect::<BTreeSet<_>>(),
+                            order.iter().map(|fact| fact.id).collect::<BTreeSet<_>>()
+                        );
+                        assert!(journal.delta().promoted().is_empty());
+                        assert!(journal.delta().removed().is_empty());
+                        assert_candidate_noop_projection(journal.graph(), &expected);
+                        match terminal {
+                            0 => journal.rollback(),
+                            1 => drop(journal),
+                            _ => journal.commit(),
+                        }
+                        if terminal < 2 {
+                            assert_graph_state_eq(&aggregate, &before);
+                        }
+                    }
+                    assert_eq!(aggregate.len(), direct.len());
+                    assert_eq!(aggregate.projection(), expected);
+                    assert_eq!(
+                        aggregate.projection_commitment_root(),
+                        expected.commitment_root()
+                    );
+                }
+
+                let mut waiting = eligible.clone();
+                for candidate in &order {
+                    let missing = dependencies(candidate)
+                        .into_iter()
+                        .filter(|id| !waiting.facts.contains_key(id))
+                        .collect::<BTreeSet<_>>();
+                    assert!(!missing.is_empty());
+                    assert!(
+                        matches!(waiting.admit(candidate.clone()), Ok(Admission::Quarantined { missing: actual })
+                        if actual.iter().copied().collect::<BTreeSet<_>>() == missing)
+                    );
+                }
+                let mut retry_single = waiting.clone();
+                for support in &supports[..supports.len() - 1] {
+                    assert_eq!(retry_single.admit(support.clone()), Ok(Admission::Inserted));
+                }
+                retry_single.projection();
+                let retry_before = graph_snapshot(&retry_single);
+                for terminal in 0..3 {
+                    let journal = retry_single
+                        .admit_journaled(supports.last().unwrap().clone())
+                        .expect("late support retries both concurrent operations");
+                    assert_eq!(journal.admission(), &Admission::Inserted);
+                    assert_eq!(
+                        journal
+                            .delta()
+                            .promoted()
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>(),
+                        pair.iter().map(|fact| fact.id).collect::<BTreeSet<_>>()
+                    );
+                    assert!(journal.delta().removed().is_empty());
+                    assert_candidate_noop_projection(journal.graph(), &expected);
+                    match terminal {
+                        0 => journal.rollback(),
+                        1 => drop(journal),
+                        _ => journal.commit(),
+                    }
+                    if terminal < 2 {
+                        assert_graph_state_eq(&retry_single, &retry_before);
+                    }
+                }
+                assert_eq!(retry_single.facts, direct.facts);
+
+                let mut retry_aggregate = waiting.clone();
+                let journal = retry_aggregate
+                    .admit_journaled_batch(supports.clone())
+                    .expect("aggregate support delivery attributes both ready promotions");
+                assert_eq!(
+                    journal
+                        .delta()
+                        .promoted()
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>(),
+                    pair.iter().map(|fact| fact.id).collect::<BTreeSet<_>>()
+                );
+                assert!(journal.delta().removed().is_empty());
+                assert_candidate_noop_projection(journal.graph(), &expected);
+                journal.commit();
+                assert_eq!(retry_aggregate.facts, direct.facts);
+                for support in &supports {
+                    assert_eq!(waiting.admit(support.clone()), Ok(Admission::Inserted));
+                }
+                assert_eq!(
+                    waiting
+                        .retry_quarantined()
+                        .unwrap()
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                    pair.iter().map(|fact| fact.id).collect::<BTreeSet<_>>()
+                );
+                assert!(waiting.quarantined.is_empty());
+                assert_eq!(waiting.facts, direct.facts);
+                assert_candidate_noop_projection(&waiting, &expected);
+            }
+
+            let mut intrinsic_base = base.clone();
+            assert_eq!(
+                intrinsic_base.admit(pair[0].clone()),
+                Ok(Admission::Inserted)
+            );
+            let redundant =
+                witnessed_fact(&intrinsic_base, &right_key, pair[0].content.body.clone());
+            assert_ne!(redundant.id, pair[0].id);
+            assert_intrinsic_noop_unchanged(
+                &intrinsic_base,
+                &redundant,
+                match kind {
+                    0 => "role grant already effective",
+                    1 => "role revoke targets an absent role",
+                    _ => "resolution has no live conflict",
+                },
+            );
+            if kind == 2 {
+                let typed = witnessed_fact(
+                    &base,
+                    &root_key,
+                    FactBody::AuthorityLineageResolution {
+                        subject: target.clone(),
+                        cited_heads: heads.clone(),
+                        selected_head: heads[0],
+                    },
+                );
+                assert_eq!(base.admit(typed), Ok(Admission::Inserted));
+                assert!(!base
+                    .evaluator()
+                    .is_conflicted(&ExclusiveCell::role(target.clone())));
+                let suppressed = witnessed_fact(&base, &right_key, pair[0].content.body.clone());
+                assert_intrinsic_noop_unchanged(
+                    &base,
+                    &suppressed,
+                    "resolution has no live conflict",
+                );
+            }
+        }
     }
 
     #[test]
@@ -9113,6 +11842,7 @@ mod tests {
             actual.authority_selector_index,
             expected.authority_selector_index
         );
+        assert_eq!(actual.authority_provenance, expected.authority_provenance);
         assert_eq!(actual.dependency_index, expected.dependency_index);
         assert_eq!(actual.cells_index, expected.cells_index);
         assert_eq!(actual.stand_down_index, expected.stand_down_index);

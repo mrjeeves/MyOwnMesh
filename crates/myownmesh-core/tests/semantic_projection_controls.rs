@@ -5,6 +5,7 @@
 use ed25519_dalek::SigningKey;
 
 use myownmesh_core::protocol::FactPageMessage;
+use myownmesh_core::semantic::causal::dependencies;
 use myownmesh_core::semantic::{
     Admission, AttestationDecision, CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent,
     FactGraph, FactId, Role, SignedFact, VerifiedBootstrap,
@@ -64,6 +65,12 @@ fn authored_with_sorted_support(
     content.parents.sort();
     content.parents.dedup();
     SignedFact::sign(content, key).expect("projection redundant-support fact signs")
+}
+
+fn dependencies_present(graph: &FactGraph, fact: &SignedFact) -> bool {
+    dependencies(fact)
+        .into_iter()
+        .all(|dependency| graph.get(&dependency).is_some())
 }
 
 #[test]
@@ -231,15 +238,97 @@ fn finite_authority_fork_projection_converges_for_every_arrival_permutation() {
 
     for permutation in orders {
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let first_operation = permutation
+            .iter()
+            .position(|index| *index == 1)
+            .expect("O is in every finite authority schedule");
+        let first_grant = permutation
+            .iter()
+            .position(|index| *index == 0)
+            .expect("G is in every finite authority schedule");
+        let must_refuse_pregrant = first_operation < first_grant;
+        let mut refused_first_delivery = false;
+        let mut refused = Vec::new();
         for index in permutation {
-            assert!(matches!(
-                graph.admit(candidates[index].clone()),
-                Ok(Admission::Inserted | Admission::Quarantined { .. })
-            ));
+            let before_ids = graph
+                .ids()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let before_projection = graph.full_projection_for_lab().0;
+            let result = graph.admit(candidates[index].clone());
+            match result {
+                Ok(Admission::Inserted | Admission::Quarantined { .. }) => {}
+                Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                    if index == 1 {
+                        refused_first_delivery = true;
+                    }
+                    assert_eq!(
+                        before_ids,
+                        graph.ids().copied().collect::<std::collections::BTreeSet<_>>(),
+                        "pre-grant refusal retains no signed body: schedule={permutation:?} index={index} id={:?}",
+                        candidates[index].id
+                    );
+                    assert_eq!(
+                        before_projection,
+                        graph.full_projection_for_lab().0,
+                        "pre-grant refusal preserves full projection: schedule={permutation:?} index={index}"
+                    );
+                    refused.push(index);
+                }
+                other => panic!(
+                    "finite authority admission variant: schedule={permutation:?} index={index} id={:?} result={other:?}",
+                    candidates[index].id
+                ),
+            }
+
+            // A refused ineligible signer is not a quarantined waiter. Once
+            // its signed grant is actually admitted, redeliver that exact
+            // body once through the same public admission path.
+            // Settle eligible waiters before checking refused bodies: a required
+            // grant can itself have arrived before its own dependencies.
+            for _ in 0..=candidates.len() {
+                let before_progress = (graph.ids().count(), refused.len());
+                graph.retry_quarantined().unwrap_or_else(|error| {
+                    panic!("selector=finite_authority schedule={permutation:?} settling error={error:?}")
+                });
+                let mut still_refused = Vec::new();
+                for refused_index in refused.drain(..) {
+                    if !dependencies_present(&graph, &candidates[refused_index]) {
+                        still_refused.push(refused_index);
+                        continue;
+                    }
+                    let result = graph.admit(candidates[refused_index].clone());
+                    match result {
+                        Ok(Admission::Inserted | Admission::Quarantined { .. } | Admission::AlreadyPresent) => {}
+                        Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                            still_refused.push(refused_index)
+                        }
+                        other => panic!(
+                            "finite authority redelivery variant: schedule={permutation:?} index={refused_index} id={:?} result={other:?}",
+                            candidates[refused_index].id
+                        ),
+                    }
+                }
+                refused = still_refused;
+                if (graph.ids().count(), refused.len()) == before_progress {
+                    break;
+                }
+            }
         }
-        graph
-            .retry_quarantined()
-            .expect("all finite causal dependencies eventually resolve");
+        assert_eq!(
+            refused.len(),
+            0,
+            "all refused signed bodies redeliver after their dependencies: schedule={permutation:?}"
+        );
+        if must_refuse_pregrant {
+            assert!(
+                refused_first_delivery,
+                "pre-grant O remains a nonvacuous exact refusal: schedule={permutation:?}"
+            );
+        }
+        if let Err(error) = graph.retry_quarantined() {
+            panic!("finite authority retry variant: schedule={permutation:?} result={error:?}");
+        }
         assert!(graph.quarantined().next().is_none());
         assert_eq!(graph.ids().count(), candidates.len());
         assert_eq!(
@@ -267,6 +356,65 @@ fn finite_authority_fork_projection_converges_for_every_arrival_permutation() {
             expected = Some(graph.projection());
         }
     }
+}
+
+fn independently_maximal_cell_heads(graph: &FactGraph, cell: &ExclusiveCell) -> Vec<FactId> {
+    fn is_ancestor(graph: &FactGraph, older: FactId, newer: FactId) -> bool {
+        let mut pending = vec![newer];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if id == older {
+                return true;
+            }
+            if seen.insert(id) {
+                let fact = graph
+                    .get(&id)
+                    .expect("signed ancestry oracle requires complete admitted facts");
+                pending.extend(dependencies(fact));
+            }
+        }
+        false
+    }
+
+    let candidates = graph
+        .ids()
+        .copied()
+        .filter(|id| {
+            graph
+                .get(id)
+                .expect("cell-head oracle fact exists")
+                .content
+                .body
+                .exclusive_cells()
+                .contains(cell)
+        })
+        .collect::<Vec<_>>();
+    let mut maximal = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates
+                .iter()
+                .any(|other| candidate != other && is_ancestor(graph, *candidate, *other))
+        })
+        .collect::<Vec<_>>();
+    maximal.sort();
+    maximal
+}
+
+fn assert_independent_cell_heads(
+    graph: &FactGraph,
+    cell: &ExclusiveCell,
+    expected: &[FactId],
+    label: &str,
+) {
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(
+        independently_maximal_cell_heads(graph, cell),
+        expected,
+        "{label} independently derived signed-ancestry cell heads"
+    );
 }
 
 #[test]
@@ -355,12 +503,57 @@ fn cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order()
     let mut expected = None;
     for permutation in orders {
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let mut refused = Vec::new();
         for index in permutation {
-            assert!(matches!(
-                graph.admit(candidates[index].clone()),
-                Ok(Admission::Inserted | Admission::Quarantined { .. })
-            ));
+            let before_ids = graph
+                .ids()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let before_projection = graph.full_projection_for_lab().0;
+            let result = graph.admit(candidates[index].clone());
+            match result {
+                Ok(Admission::Inserted | Admission::Quarantined { .. }) => {}
+                Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                    assert_eq!(
+                        before_ids,
+                        graph.ids().copied().collect::<std::collections::BTreeSet<_>>(),
+                        "selector=cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order permutation={permutation:?} index={index} refusal retains identities"
+                    );
+                    assert_eq!(
+                        before_projection,
+                        graph.full_projection_for_lab().0,
+                        "selector=cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order permutation={permutation:?} index={index} refusal retains projection"
+                    );
+                    refused.push(index);
+                }
+                other => panic!(
+                    "selector=cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order permutation={permutation:?} index={index} id={:?} result={other:?}",
+                    candidates[index].id
+                ),
+            }
+            let mut still_refused = Vec::new();
+            for refused_index in refused.drain(..) {
+                if !dependencies_present(&graph, &candidates[refused_index]) {
+                    still_refused.push(refused_index);
+                    continue;
+                }
+                let result = graph.admit(candidates[refused_index].clone());
+                match result {
+                    Ok(Admission::Inserted | Admission::Quarantined { .. } | Admission::AlreadyPresent) => {}
+                    Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                        still_refused.push(refused_index)
+                    }
+                    other => panic!(
+                        "selector=cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order permutation={permutation:?} index={refused_index} redelivery result={other:?}"
+                    ),
+                }
+            }
+            refused = still_refused;
         }
+        assert!(
+            refused.is_empty(),
+            "selector=cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order permutation={permutation:?} refused signed bodies remain"
+        );
         graph
             .retry_quarantined()
             .expect("G/O/R dependencies eventually resolve");
@@ -371,15 +564,30 @@ fn cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order()
         // fact is present. Rejection here is intentionally distinct from a
         // missing-parent quarantine: a complete AuthorityUse fork still
         // cannot be resolved through Membership(C).
+        let before_payload_ids = graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let before_payload_projection = graph.full_projection_for_lab().0;
         assert_eq!(
             graph.admit(membership_resolution.clone()),
-            Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
-            "Membership(C) payload resolution is rejected after the fork is complete"
+            Err(myownmesh_core::semantic::SemanticError::NoOp(
+                "resolution has no live conflict",
+            )),
+            "empty Membership(C) payload resolution is a truthful NoOp"
         );
         assert_eq!(
-            graph.ids().count(),
-            3,
+            graph
+                .ids()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            before_payload_ids,
             "rejected cross-cell payload does not enter the canonical graph"
+        );
+        assert_eq!(
+            graph.full_projection_for_lab().0,
+            before_payload_projection,
+            "rejected cross-cell payload does not mutate the full projection"
         );
         assert_eq!(
             graph.authority_lineage(&controller).heads().len(),
@@ -543,16 +751,18 @@ fn second_order_payload_fork_converges_without_authority_join() {
     for permutation in orders {
         let mut graph = base.clone();
         for index in permutation {
-            assert!(matches!(
-                graph.admit(candidates[index].clone()),
-                Ok(Admission::Inserted | Admission::Quarantined { .. })
-            ));
+            let result = graph.admit(candidates[index].clone());
+            assert!(
+                matches!(&result, Ok(Admission::Inserted | Admission::Quarantined { .. })),
+                "selector=second_order_payload_fork_converges_without_authority_join permutation={permutation:?} index={index} id={:?} result={result:?}",
+                candidates[index].id
+            );
         }
         let retry = graph.retry_quarantined();
         assert!(matches!(
-            retry,
+            &retry,
             Ok(_) | Err(myownmesh_core::semantic::SemanticError::IncompleteResolution)
-        ));
+        ), "selector=second_order_payload_fork_converges_without_authority_join permutation={permutation:?} retry={retry:?}");
         assert!(graph.quarantined().next().is_none());
         let q_admitted = graph.get(&candidates[4].id).is_some();
         if let Some(previous) = expected_q_admitted {
@@ -635,6 +845,13 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
         .expect("M membership head admits");
     fork.admit(eviction_v.clone())
         .expect("V eviction head admits");
+    let membership_cell = ExclusiveCell::membership(controller.clone());
+    assert_independent_cell_heads(
+        &fork,
+        &membership_cell,
+        &[membership_m.id, eviction_v.id],
+        "gate160 before Q",
+    );
     let mut authority_heads = fork.authority_use_heads(&controller);
     authority_heads.sort();
     let mut expected_authority_heads = vec![membership_m.id, eviction_v.id];
@@ -669,13 +886,56 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
 
     let mut payload_heads = vec![membership_m.id, eviction_v.id];
     payload_heads.sort();
-    let q = authored(
+    let old_q = authored(
         &post_n,
         &controller_key,
         FactBody::Resolution {
-            cell: ExclusiveCell::membership(controller.clone()),
+            cell: membership_cell.clone(),
             cited_heads: payload_heads,
             selected_head: membership_m.id,
+        },
+        Vec::new(),
+    );
+    let old_q_before_ids = post_n
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let old_q_before_projection = post_n.full_projection_for_lab().0;
+    let mut old_q_graph = post_n.clone();
+    let old_q_result = old_q_graph.admit(old_q.clone());
+    assert_eq!(
+        old_q_result,
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "resolution has no live conflict",
+        )),
+        "old Q remains a typed-loser negative after S/N; it cannot resurrect M"
+    );
+    assert_eq!(
+        old_q_graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        old_q_before_ids,
+        "old Q NoOp retains exact graph identities"
+    );
+    assert_eq!(
+        old_q_graph.full_projection_for_lab().0,
+        old_q_before_projection,
+        "old Q NoOp retains the full projection"
+    );
+    assert_independent_cell_heads(
+        &old_q_graph,
+        &membership_cell,
+        &[membership_m.id, eviction_v.id],
+        "gate160 after rejected Q",
+    );
+    // This is a genuinely new self-authored continuation after the typed
+    // loser selection and Owner regrant; it is not a resurrection of M.
+    let membership_continuation = authored(
+        &post_n,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
         },
         Vec::new(),
     );
@@ -687,19 +947,31 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
         },
         Vec::new(),
     );
-    let q_id = q.id;
+    let membership_continuation_id = membership_continuation.id;
     let r_id = r.id;
     let mut settled = post_n.clone();
     settled
-        .admit(q.clone())
-        .expect("Q membership resolution admits");
+        .admit(membership_continuation.clone())
+        .expect("new self-authored membership continuation admits");
+    assert_independent_cell_heads(
+        &settled,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate160 after fresh Q",
+    );
     settled.admit(r.clone()).expect("R role revoke admits");
+    assert_independent_cell_heads(
+        &settled,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate160 after R",
+    );
     let role_resolution = authored(
         &settled,
         &root_key,
         FactBody::AuthorityLineageResolution {
             subject: controller.clone(),
-            cited_heads: vec![q_id, r_id],
+            cited_heads: vec![membership_continuation_id, r_id],
             selected_head: r_id,
         },
         Vec::new(),
@@ -708,6 +980,12 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
     after_selection
         .admit(role_resolution.clone())
         .expect("typed Role(C) resolution over Q/R admits");
+    assert_independent_cell_heads(
+        &after_selection,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate160 after T2",
+    );
     let regrant_after_selection = authored(
         &after_selection,
         &root_key,
@@ -720,6 +998,12 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
     after_selection
         .admit(regrant_after_selection.clone())
         .expect("post-selection Owner regrant admits");
+    assert_independent_cell_heads(
+        &after_selection,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate160 after U2",
+    );
     let future = authored(
         &after_selection,
         &controller_key,
@@ -729,7 +1013,14 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
         },
         Vec::new(),
     );
-    let candidates = [membership_m, eviction_v, role_selection, regrant, q, r];
+    let candidates = [
+        membership_m,
+        eviction_v,
+        role_selection,
+        regrant,
+        membership_continuation,
+        r,
+    ];
     let mut expected_projection = None;
     let mut order = [0usize, 1, 2, 3, 4, 5];
     let mut orders = Vec::new();
@@ -748,22 +1039,84 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
     assert_eq!(
         orders.len(),
         720,
-        "all M/V/S/N/Q/R arrival orders are exercised"
+        "all M/V/S/N/C/R arrival orders are exercised"
     );
 
     for permutation in orders {
         let mut graph = source.clone();
+        let mut refused = Vec::new();
         for index in permutation {
-            assert!(matches!(
-                graph.admit(candidates[index].clone()),
-                Ok(Admission::Inserted | Admission::Quarantined { .. })
-            ));
+            let before_ids = graph
+                .ids()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let before_projection = graph.full_projection_for_lab().0;
+            let result = graph.admit(candidates[index].clone());
+            match result {
+                Ok(Admission::Inserted | Admission::Quarantined { .. }) => {}
+                Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                    assert_eq!(
+                        before_ids,
+                        graph.ids().copied().collect::<std::collections::BTreeSet<_>>(),
+                        "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} index={index} refusal retains identities"
+                    );
+                    assert_eq!(
+                        before_projection,
+                        graph.full_projection_for_lab().0,
+                        "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} index={index} refusal retains projection"
+                    );
+                    refused.push(index);
+                }
+                other => panic!(
+                    "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} index={index} id={:?} result={other:?}",
+                    candidates[index].id
+                ),
+            }
+            // Settle eligible waiters before checking refused bodies: a required
+            // grant can itself have arrived before its own dependencies.
+            for _ in 0..=candidates.len() {
+                let before_progress = (graph.ids().count(), refused.len());
+                graph.retry_quarantined().unwrap_or_else(|error| {
+                    panic!("selector=self_authored_membership schedule={permutation:?} settling error={error:?}")
+                });
+                let mut still_refused = Vec::new();
+                for refused_index in refused.drain(..) {
+                    if !dependencies_present(&graph, &candidates[refused_index]) {
+                        still_refused.push(refused_index);
+                        continue;
+                    }
+                    let result = graph.admit(candidates[refused_index].clone());
+                    match result {
+                        Ok(Admission::Inserted | Admission::Quarantined { .. } | Admission::AlreadyPresent) => {}
+                        Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                            still_refused.push(refused_index)
+                        }
+                        other => panic!(
+                            "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} index={refused_index} redelivery result={other:?}"
+                        ),
+                    }
+                }
+                refused = still_refused;
+                if (graph.ids().count(), refused.len()) == before_progress {
+                    break;
+                }
+            }
         }
-        graph
-            .retry_quarantined()
-            .expect("all M/V/S/N/Q/R dependencies eventually resolve");
+        assert!(
+            refused.is_empty(),
+            "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} refused signed bodies remain"
+        );
+        if let Err(error) = graph.retry_quarantined() {
+            panic!(
+                "selector=self_authored_membership_resolution_is_order_independent_after_role_regrant permutation={permutation:?} retry={error:?}"
+            );
+        }
         assert!(graph.quarantined().next().is_none());
         assert_eq!(graph.ids().count(), source.len() + candidates.len());
+        assert!(
+            graph.get(&membership_continuation_id).is_some(),
+            "new self-authored membership continuation is admitted rather than resurrecting M"
+        );
         assert_eq!(
             graph.evaluator().effective_membership(&controller),
             None,
@@ -781,7 +1134,7 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
         );
         let mut authority_heads = graph.authority_use_heads(&controller);
         authority_heads.sort();
-        let mut expected_authority_heads = vec![q_id, r_id];
+        let mut expected_authority_heads = vec![membership_continuation_id, r_id];
         expected_authority_heads.sort();
         assert_eq!(authority_heads, expected_authority_heads);
         assert_eq!(
@@ -789,7 +1142,7 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
                 .projection()
                 .value(&ExclusiveCell::membership(controller.clone())),
             None,
-            "Q cannot become the effective Membership(C) projection"
+            "the new continuation remains suppressed by the selected Role(C) branch"
         );
         graph
             .admit(role_resolution.clone())
@@ -805,6 +1158,12 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
         graph
             .admit(future.clone())
             .expect("post-regrant controller operation admits");
+        assert_independent_cell_heads(
+            &graph,
+            &membership_cell,
+            &[membership_continuation_id],
+            "gate160 future",
+        );
         assert_eq!(
             graph.evaluator().effective_role(&controller),
             Some(Role::Owner),
@@ -916,18 +1275,63 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     );
     fork.admit(grant_owner_a.clone())
         .expect("distinct Owner A grant admits");
+    let membership_cell = ExclusiveCell::membership(controller.clone());
+    assert_independent_cell_heads(&fork, &membership_cell, &[m.id, v.id], "gate161 before Q");
 
-    // Q/R is the post-regrant fork.  Q is a payload selector for M, while R
-    // is a role revoke.  They must not gain authority merely by arrival order.
+    // The historical Q payload selector is intentionally retained as a
+    // negative: after T0 selects V, it cannot resurrect the losing M branch.
+    // The positive payload continuation is a genuinely new self-authored
+    // MembershipAdmit after the regrant. R remains the concurrent role fork.
     let mut payload_heads = vec![m.id, v.id];
     payload_heads.sort();
-    let q = authored(
+    let old_q = authored(
         &fork,
         &controller_key,
         FactBody::Resolution {
             cell: ExclusiveCell::membership(controller.clone()),
             cited_heads: payload_heads,
             selected_head: m.id,
+        },
+        Vec::new(),
+    );
+    let old_q_before_ids = fork
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let old_q_before_projection = fork.full_projection_for_lab().0;
+    let mut old_q_graph = fork.clone();
+    let old_q_result = old_q_graph.admit(old_q.clone());
+    assert_eq!(
+        old_q_result,
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "resolution has no live conflict",
+        )),
+        "old Q remains a typed-loser negative and cannot resurrect M"
+    );
+    assert_eq!(
+        old_q_graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        old_q_before_ids,
+        "old Q refusal retains exact graph identities"
+    );
+    assert_eq!(
+        old_q_graph.full_projection_for_lab().0,
+        old_q_before_projection,
+        "old Q refusal retains the full projection"
+    );
+    assert_independent_cell_heads(
+        &old_q_graph,
+        &membership_cell,
+        &[m.id, v.id],
+        "gate161 after rejected Q",
+    );
+    let membership_continuation = authored(
+        &fork,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
         },
         Vec::new(),
     );
@@ -940,11 +1344,25 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
         Vec::new(),
     );
     let mut settled = fork.clone();
-    settled.admit(q.clone()).expect("Q payload selector admits");
+    settled
+        .admit(membership_continuation.clone())
+        .expect("new self-authored Membership(C) continuation admits");
+    assert_independent_cell_heads(
+        &settled,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate161 after fresh Q",
+    );
     settled.admit(r.clone()).expect("R role fork head admits");
+    assert_independent_cell_heads(
+        &settled,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate161 after R",
+    );
     let mut qr_heads = settled.authority_use_heads(&controller);
     qr_heads.sort();
-    let mut expected_qr_heads = vec![q.id, r.id];
+    let mut expected_qr_heads = vec![membership_continuation.id, r.id];
     expected_qr_heads.sort();
     assert_eq!(qr_heads, expected_qr_heads);
 
@@ -986,6 +1404,12 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     after_t2
         .admit(t2.clone())
         .expect("T2 Owner A selector admits");
+    assert_independent_cell_heads(
+        &after_t2,
+        &membership_cell,
+        &[membership_continuation.id],
+        "gate161 after T2",
+    );
     let u2 = authored(
         &after_t2,
         &root_key,
@@ -1001,19 +1425,38 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     );
 
     let r_id = r.id;
-    let candidates = [m, v, t0, regrant, grant_owner_a, q, r, t2, u2];
+    let membership_continuation_id = membership_continuation.id;
+    let candidates = [
+        m,
+        v,
+        t0,
+        regrant,
+        grant_owner_a,
+        membership_continuation,
+        r,
+        t2,
+        u2,
+    ];
     let old_traversal_order = [0usize, 1, 2, 3, 4, 5, 6, 7, 8];
     let mut reference = source.clone();
     for index in old_traversal_order {
-        assert!(matches!(
-            reference.admit(candidates[index].clone()),
-            Ok(Admission::Inserted | Admission::Quarantined { .. })
-        ));
+        let result = reference.admit(candidates[index].clone());
+        assert!(
+            matches!(&result, Ok(Admission::Inserted | Admission::Quarantined { .. })),
+            "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor reference_order={old_traversal_order:?} index={index} id={:?} result={result:?}",
+            candidates[index].id
+        );
     }
     reference
         .retry_quarantined()
         .expect("old traversal-order counterfactual settles");
     assert!(reference.quarantined().next().is_none());
+    assert_independent_cell_heads(
+        &reference,
+        &membership_cell,
+        &[membership_continuation_id],
+        "gate161 after U2",
+    );
     assert_eq!(
         reference.authority_lineage(&controller).selected_branch(),
         Some(r_id),
@@ -1022,7 +1465,7 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     assert_eq!(
         reference.evaluator().effective_membership(&controller),
         None,
-        "Q/M is suppressed in the fixed traversal counterfactual"
+        "the fresh continuation/M branch is suppressed in the fixed traversal counterfactual"
     );
     let reference_projection = reference.projection();
 
@@ -1046,17 +1489,85 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
 
     for schedule in schedules {
         let mut graph = source.clone();
+        let mut refused = Vec::new();
         for index in schedule {
-            assert!(matches!(
-                graph.admit(candidates[index].clone()),
-                Ok(Admission::Inserted | Admission::Quarantined { .. })
-            ));
+            let before_ids = graph
+                .ids()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            let before_projection = graph.full_projection_for_lab().0;
+            let result = graph.admit(candidates[index].clone());
+            match result {
+                Ok(Admission::Inserted | Admission::Quarantined { .. }) => {}
+                Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                    assert_eq!(
+                        before_ids,
+                        graph.ids().copied().collect::<std::collections::BTreeSet<_>>(),
+                        "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} index={index} refusal retains identities"
+                    );
+                    assert_eq!(
+                        before_projection,
+                        graph.full_projection_for_lab().0,
+                        "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} index={index} refusal retains projection"
+                    );
+                    refused.push(index);
+                }
+                other => panic!(
+                    "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} index={index} id={:?} result={other:?}",
+                    candidates[index].id
+                ),
+            }
+            // Settle eligible waiters before checking refused bodies: a required
+            // grant can itself have arrived before its own dependencies.
+            for _ in 0..=candidates.len() {
+                let before_progress = (graph.ids().count(), refused.len());
+                graph.retry_quarantined().unwrap_or_else(|error| {
+                    panic!("selector=stale_selector schedule={schedule:?} settling error={error:?}")
+                });
+                let mut still_refused = Vec::new();
+                for refused_index in refused.drain(..) {
+                    if !dependencies_present(&graph, &candidates[refused_index]) {
+                        still_refused.push(refused_index);
+                        continue;
+                    }
+                    let result = graph.admit(candidates[refused_index].clone());
+                    match result {
+                        Ok(Admission::Inserted | Admission::Quarantined { .. } | Admission::AlreadyPresent) => {}
+                        Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                            still_refused.push(refused_index)
+                        }
+                        other => panic!(
+                            "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} index={refused_index} redelivery result={other:?}"
+                        ),
+                    }
+                }
+                refused = still_refused;
+                if (graph.ids().count(), refused.len()) == before_progress {
+                    break;
+                }
+            }
         }
-        graph
-            .retry_quarantined()
-            .expect("quarantined dependencies converge to one projection");
+        assert!(
+            refused.is_empty(),
+            "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} refused signed bodies remain"
+        );
+        if let Err(error) = graph.retry_quarantined() {
+            panic!(
+                "selector=stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor schedule={schedule:?} retry={error:?}"
+            );
+        }
         assert!(graph.quarantined().next().is_none());
+        assert_independent_cell_heads(
+            &graph,
+            &membership_cell,
+            &[membership_continuation_id],
+            "gate161 future",
+        );
         assert_eq!(graph.ids().count(), source.len() + candidates.len());
+        assert!(
+            graph.get(&membership_continuation_id).is_some(),
+            "fresh Membership(C) continuation is admitted; historical Q is not resurrected"
+        );
         assert_eq!(graph.projection(), reference_projection);
         assert_eq!(
             graph.authority_lineage(&controller).selected_branch(),
@@ -1068,7 +1579,7 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
                 .projection()
                 .value(&ExclusiveCell::membership(controller.clone())),
             None,
-            "public projection does not select Q/M"
+            "public projection does not select the losing Membership(C) branch"
         );
         assert_eq!(
             graph.evaluator().effective_role(&controller),
@@ -1162,10 +1673,61 @@ fn incomparable_heads_fail_closed_until_full_head_resolution() {
         },
         vec![heads[0]],
     );
-    assert!(matches!(
-        graph.admit(incomplete),
-        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution)
-    ));
+    let one_head_before_ids = graph
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let one_head_before_projection = graph.full_projection_for_lab();
+    let one_head_result = graph.admit(incomplete);
+    assert_eq!(
+        one_head_result,
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "resolution has no live conflict",
+        )),
+        "one-head resolution with one-head causal history is an intrinsic candidate-relative NoOp"
+    );
+    assert_eq!(
+        graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        one_head_before_ids
+    );
+    assert_eq!(graph.full_projection_for_lab(), one_head_before_projection);
+    let malformed = authored(
+        &graph,
+        &root_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: vec![heads[0]],
+            selected_head: heads[0],
+        },
+        heads.clone(),
+    );
+    let malformed_before_ids = graph
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let malformed_before_projection = graph.full_projection_for_lab().0;
+    let malformed_result = graph.admit(malformed);
+    assert_eq!(
+        malformed_result,
+        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+        "two-head causal history reaches the isolated malformed cited-head validator"
+    );
+    assert_eq!(
+        graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        malformed_before_ids,
+        "malformed resolution refusal retains exact admitted identities"
+    );
+    assert_eq!(
+        graph.full_projection_for_lab().0,
+        malformed_before_projection,
+        "malformed resolution refusal retains the full projection"
+    );
 
     let resolution = authored(
         &graph,
@@ -1409,8 +1971,17 @@ fn recursive_resolution_selects_a_terminal_head() {
         },
         Vec::new(),
     );
+    let mut successor_reference = successor_base.clone();
+    successor_reference
+        .admit(third.clone())
+        .expect("independent successor baseline admits the concurrent resolution");
+    assert_eq!(
+        successor_reference.full_projection_for_lab().0,
+        successor_reference.projection(),
+        "independent successor baseline remains incrementally/full equivalent"
+    );
     graph
-        .admit(third)
+        .admit(third.clone())
         .expect("independent successor carries an explicit signer selection");
     let mut nested_heads = graph.cell_heads(&cell);
     nested_heads.sort();
@@ -1428,6 +1999,11 @@ fn recursive_resolution_selects_a_terminal_head() {
         .admit(nested_resolution)
         .expect("recursive complete resolution admits");
     assert_eq!(graph.projection().value(&cell), Some(first.id));
+    assert_eq!(
+        graph.full_projection_for_lab().0,
+        graph.projection(),
+        "recursive terminal selection matches the fresh full projection"
+    );
 }
 
 #[test]
@@ -1509,7 +2085,9 @@ fn stale_recursive_resolution_fails_closed() {
         vec![resolver_grant.id],
     );
     graph.admit(resolution).expect("complete resolution admits");
-    let third = authored(
+    // A duplicate Member grant is still a genuine redundant-grant negative;
+    // it must not be used as the stale-head witness.
+    let redundant_grant = authored(
         &graph,
         &first_controller_key,
         FactBody::RoleGrant {
@@ -1518,14 +2096,62 @@ fn stale_recursive_resolution_fails_closed() {
         },
         Vec::new(),
     );
-    let third_id = third.id;
-    graph.admit(third).expect("new competing branch admits");
+    let redundant_before_ids = graph
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let redundant_before_projection = graph.full_projection_for_lab().0;
+    assert_eq!(
+        graph.admit(redundant_grant),
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "role grant already effective",
+        )),
+        "redundant post-resolution Member grant remains a truthful negative"
+    );
+    assert_eq!(
+        graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        redundant_before_ids,
+        "redundant grant does not mutate admitted identities"
+    );
+    assert_eq!(
+        graph.full_projection_for_lab().0,
+        redundant_before_projection,
+        "redundant grant does not mutate the full projection"
+    );
+    // The stale selector is tested against two real, independent successors:
+    // a Controller grant and a revoke from the same resolved Member baseline.
+    let successor_base = graph.clone();
+    let successor_grant = authored(
+        &successor_base,
+        &first_controller_key,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    let successor_revoke = authored(
+        &successor_base,
+        &second_controller_key,
+        FactBody::RoleRevoke {
+            target: subject.clone(),
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(successor_grant)
+        .expect("independent Controller successor admits");
+    graph
+        .admit(successor_revoke)
+        .expect("independent revoke successor admits");
 
     let mut stale_heads = vec![first.id, second.id];
     stale_heads.sort();
-    // Carry the later branch into the candidate causal past while retaining
-    // the obsolete cited-head set.  Without this parent, candidate-relative
-    // resolution correctly cannot observe `third` and the fixture is valid.
+    // Carry both current successors into the candidate causal past through
+    // the authoring witness while retaining the obsolete cited-head set.
     let stale = authored(
         &graph,
         &resolver_key,
@@ -1537,16 +2163,35 @@ fn stale_recursive_resolution_fails_closed() {
         vec![resolver_grant.id],
     );
     let live_value = graph.projection().value(&cell);
-    assert_eq!(live_value, Some(third_id));
+    assert_eq!(
+        live_value, None,
+        "independent successors leave a real conflict"
+    );
+    assert!(graph.projection().is_conflicted(&cell));
+    let before_stale_ids = graph
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let before_stale_projection = graph.full_projection_for_lab().0;
     assert_eq!(
         graph.admit(stale),
         Err(myownmesh_core::semantic::SemanticError::ResolutionNotCurrent)
     );
     assert_eq!(graph.projection().value(&cell), live_value);
     assert_eq!(
-        graph.evaluator().effective_role(&subject),
-        Some(Role::Member)
+        graph
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        before_stale_ids,
+        "stale selector refuses without graph mutation"
     );
+    assert_eq!(
+        graph.full_projection_for_lab().0,
+        before_stale_projection,
+        "stale selector refuses without projection mutation"
+    );
+    assert_eq!(graph.evaluator().effective_role(&subject), None);
 }
 
 #[test]
@@ -1862,14 +2507,29 @@ fn authoring_witness_supports_controller_to_member_demotion() {
 
 #[test]
 fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
+    // The qualification matrix enables transport-lab and uses the independent
+    // full reducer. Keep the pre-existing default-feature replay comparison
+    // available without exporting the internal reducer as a production API.
+    fn reference_projection(graph: &FactGraph) -> myownmesh_core::semantic::Projection {
+        #[cfg(feature = "transport-lab")]
+        {
+            graph.full_projection_for_lab().0
+        }
+        #[cfg(not(feature = "transport-lab"))]
+        {
+            graph.projection()
+        }
+    }
     let root_key = key(230);
     let controller_key = key(231);
     let remote_key = key(232);
     let future_key = key(233);
+    let future_followup_key = key(234);
     let bootstrap = bootstrap(230, 230);
     let controller = author(&controller_key);
     let remote = author(&remote_key);
     let future_target = author(&future_key);
+    let future_followup_target = author(&future_followup_key);
     let role_cell = ExclusiveCell::role(controller.clone());
 
     let mut seed = FactGraph::from_bootstrap(&bootstrap);
@@ -1941,10 +2601,30 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
         },
         Vec::new(),
     );
+    let cross_cell_before_ids = negative_fork
+        .ids()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let cross_cell_before_projection = negative_fork.full_projection_for_lab().0;
     assert_eq!(
         negative_fork.admit(cross_cell),
-        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "resolution has no live conflict",
+        )),
         "only a typed AuthorityLineageResolution for C can select the AuthorityUse(C) fork"
+    );
+    assert_eq!(
+        negative_fork
+            .ids()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        cross_cell_before_ids,
+        "empty-cell cross-cell NoOp retains exact admitted identities"
+    );
+    assert_eq!(
+        negative_fork.full_projection_for_lab().0,
+        cross_cell_before_projection,
+        "empty-cell cross-cell NoOp retains full projection"
     );
     let ordinary_role_selection = authored(
         &negative_fork,
@@ -1958,7 +2638,9 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
     );
     assert_eq!(
         negative_fork.admit(ordinary_role_selection),
-        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+        Err(myownmesh_core::semantic::SemanticError::NoOp(
+            "resolution has no live conflict",
+        )),
         "ordinary Role(C) resolution cannot select the cross-cell O lineage"
     );
     assert_eq!(
@@ -2089,6 +2771,28 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
                 Vec::new(),
             )
         };
+        // Extend the production authoring chain explicitly as T -> U -> F1
+        // -> F2: each later fact is witnessed only after its predecessor is
+        // admitted, so replay cannot manufacture a future-authority edge.
+        let future_followup = {
+            let mut graph = pre_resolution.clone();
+            graph
+                .admit(resolution.clone())
+                .expect("resolution admits for follow-up witness");
+            graph.admit(regrant.clone()).expect("regrant admits");
+            graph
+                .admit(future.clone())
+                .expect("first future operation admits for follow-up witness");
+            authored(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target: future_followup_target.clone(),
+                    role: Role::Member,
+                },
+                Vec::new(),
+            )
+        };
         let mut candidates = vec![
             controller_grant.clone(),
             membership.clone(),
@@ -2097,6 +2801,7 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
             resolution.clone(),
             regrant.clone(),
             future.clone(),
+            future_followup.clone(),
         ];
         candidates.sort_by_key(|fact| fact.id);
         let page = FactPageMessage::new(bootstrap.context_id(), candidates, None, true)
@@ -2104,122 +2809,354 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
         let wire = serde_json::to_vec(&page).expect("durable semantic page serializes");
         let decoded: FactPageMessage =
             serde_json::from_slice(&wire).expect("durable semantic page restores");
-        assert_eq!(decoded.facts.len(), 7);
-
-        let schedules = [
-            [0usize, 1, 2, 3, 4],
-            [4, 3, 2, 1, 0],
-            [2, 0, 4, 1, 3],
-            [3, 1, 0, 4, 2],
-        ];
-        let mut expected_base_projection = None;
-        let mut expected_regrant_projection = None;
-        let mut expected_projection = None;
-        for schedule in schedules {
-            let mut restarted = FactGraph::from_bootstrap(&bootstrap);
-            for index in schedule {
-                assert!(matches!(
-                    restarted.admit(decoded.facts[index].clone()),
-                    Ok(Admission::Inserted | Admission::Quarantined { .. })
-                ));
-            }
-            restarted
-                .retry_quarantined()
-                .expect("restarted graph admits every durable dependency");
-            assert!(restarted.quarantined().next().is_none());
-            assert_eq!(restarted.ids().count(), 5);
+        assert_eq!(decoded.facts.len(), 8);
+        let expected_wire_ids: std::collections::BTreeSet<_> = [
+            controller_grant.id,
+            membership.id,
+            operation.id,
+            revoke.id,
+            resolution.id,
+            regrant.id,
+            future.id,
+            future_followup.id,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            decoded
+                .facts
+                .iter()
+                .map(|fact| fact.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_wire_ids,
+            "durable replay preserves the exact canonical fact identity set"
+        );
+        let fact_by_id = |id: FactId| {
+            decoded
+                .facts
+                .iter()
+                .find(|fact| fact.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("wire page omitted canonical fact {id}"))
+        };
+        for original in [
+            &controller_grant,
+            &membership,
+            &operation,
+            &revoke,
+            &resolution,
+            &regrant,
+            &future,
+            &future_followup,
+        ] {
             assert_eq!(
-                restarted.evaluator().effective_role(&controller),
-                expected_role,
-                "selected O/R branch controls C's role"
+                fact_by_id(original.id),
+                original.clone(),
+                "wire replay preserves the signed canonical body for {}",
+                original.id
+            );
+        }
+
+        // Build fresh reference graphs in explicit causal order. The wire
+        // page is sorted by FactId for transport, so replay must resolve each
+        // named transcript fact by identity rather than by serialized slot.
+        let mut reference = FactGraph::from_bootstrap(&bootstrap);
+        for fact in [
+            controller_grant.clone(),
+            membership.clone(),
+            operation.clone(),
+            revoke.clone(),
+            resolution.clone(),
+        ] {
+            reference
+                .admit(fact)
+                .expect("reference T transcript admits");
+        }
+        let reference_t_projection = reference_projection(&reference);
+        let reference_t_ids: std::collections::BTreeSet<FactId> =
+            reference.ids().copied().collect();
+        reference
+            .admit(regrant.clone())
+            .expect("reference U regrant admits");
+        let reference_u_projection = reference_projection(&reference);
+        let reference_u_ids: std::collections::BTreeSet<FactId> =
+            reference.ids().copied().collect();
+        reference
+            .admit(future.clone())
+            .expect("reference F1 admits");
+        let reference_f1_projection = reference_projection(&reference);
+        let reference_f1_ids: std::collections::BTreeSet<FactId> =
+            reference.ids().copied().collect();
+        reference
+            .admit(future_followup.clone())
+            .expect("reference F2 admits");
+        let reference_f2_projection = reference_projection(&reference);
+        let reference_f2_ids: std::collections::BTreeSet<FactId> =
+            reference.ids().copied().collect();
+        let expected_remote_role = (selected == operation.id).then_some(Role::Member);
+        let expected_ids = |graph: &FactGraph| -> std::collections::BTreeSet<FactId> {
+            graph.ids().copied().collect()
+        };
+        let assert_stage = |graph: &FactGraph,
+                            label: &str,
+                            projection: &myownmesh_core::semantic::Projection,
+                            expected_controller_role: Option<Role>,
+                            expected_future_role: Option<Role>,
+                            ids: &std::collections::BTreeSet<FactId>| {
+            assert_eq!(graph.projection(), *projection, "{label} projection parity");
+            #[cfg(feature = "transport-lab")]
+            assert_eq!(
+                graph.projection(),
+                graph.full_projection_for_lab().0,
+                "{label} incremental projection equals fresh full recomputation"
             );
             assert_eq!(
-                restarted.evaluator().effective_membership(&controller),
+                &expected_ids(graph),
+                ids,
+                "{label} exact admitted identity set"
+            );
+            assert_eq!(
+                graph.evaluator().effective_role(&controller),
+                expected_controller_role,
+                "{label} controller role"
+            );
+            assert_eq!(
+                graph.evaluator().effective_membership(&controller),
                 Some(true),
-                "role selection does not rewrite the independent membership cell"
+                "{label} role selection leaves membership independent"
+            );
+            assert_eq!(
+                graph.evaluator().effective_role(&remote),
+                expected_remote_role,
+                "{label} selected branch controls the losing target"
+            );
+            assert_eq!(
+                graph.evaluator().effective_role(&future_target),
+                expected_future_role,
+                "{label} future F1 role"
+            );
+            let controller_lineage = graph.authority_lineage(&controller);
+            let remote_lineage = graph.authority_lineage(&remote);
+            let controller_membership = graph.evaluator().effective_membership(&controller);
+            let remote_membership = graph.evaluator().effective_membership(&remote);
+            assert!(
+                controller_lineage.is_singular(),
+                "{label} controller AuthorityLineage must be singular: {controller_lineage:?}"
+            );
+            assert!(
+                remote_lineage.is_singular(),
+                "{label} remote AuthorityLineage must be singular: {remote_lineage:?}"
+            );
+            assert!(
+                controller_membership.is_none_or(|joined| joined),
+                "{label} controller membership prerequisite: {controller_membership:?}"
+            );
+            assert!(
+                remote_membership.is_none_or(|joined| joined),
+                "{label} remote membership prerequisite: {remote_membership:?}"
+            );
+            let expected_session = expected_controller_role.is_some()
+                && expected_remote_role.is_some()
+                && controller_lineage.is_singular()
+                && remote_lineage.is_singular()
+                && controller_membership.is_none_or(|joined| joined)
+                && remote_membership.is_none_or(|joined| joined);
+            assert_eq!(
+                graph
+                    .evaluator()
+                    .admits_closed_session(&controller, &remote),
+                expected_session,
+                "{label} closed-session admission requires both peers' role, membership, and singular lineage"
+            );
+            assert_eq!(
+                graph.authority_lineage(&controller).selected_branch(),
+                Some(selected),
+                "{label} typed selector persists"
+            );
+            assert_ne!(
+                graph.authority_lineage(&controller).selected_branch(),
+                Some(losing),
+                "{label} losing AuthorityUse branch remains suppressed"
+            );
+        };
+
+        let schedules = [
+            [
+                controller_grant.id,
+                membership.id,
+                operation.id,
+                revoke.id,
+                resolution.id,
+            ],
+            [
+                resolution.id,
+                revoke.id,
+                operation.id,
+                membership.id,
+                controller_grant.id,
+            ],
+            [
+                operation.id,
+                controller_grant.id,
+                resolution.id,
+                revoke.id,
+                membership.id,
+            ],
+            [
+                revoke.id,
+                membership.id,
+                controller_grant.id,
+                operation.id,
+                resolution.id,
+            ],
+        ];
+        for schedule in schedules {
+            let mut restarted = FactGraph::from_bootstrap(&bootstrap);
+            let mut refused = Vec::new();
+            let mut saw_pregrant_refusal = false;
+            for id in schedule {
+                let fact = fact_by_id(id);
+                let before_ids = restarted
+                    .ids()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let before_projection = reference_projection(&restarted);
+                let result = restarted.admit(fact.clone());
+                match result {
+                    Ok(Admission::Inserted | Admission::Quarantined { .. }) => {}
+                    Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                        assert_eq!(
+                            before_ids,
+                            restarted.ids().copied().collect::<std::collections::BTreeSet<_>>(),
+                            "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} id={id} pre-grant refusal retains no signed body"
+                        );
+                        assert_eq!(
+                            before_projection,
+                            reference_projection(&restarted),
+                            "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} id={id} pre-grant refusal preserves projection"
+                        );
+                        if id == operation.id {
+                            saw_pregrant_refusal = true;
+                        }
+                        refused.push(id);
+                    }
+                    other => panic!(
+                        "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} id={id} first-delivery result={other:?}"
+                    ),
+                }
+
+                // Settle eligible waiters before checking refused bodies: a required
+                // grant can itself have arrived before its own dependencies.
+                for _ in 0..=schedule.len() {
+                    let before_progress = (restarted.ids().count(), refused.len());
+                    restarted.retry_quarantined().unwrap_or_else(|error| {
+                        panic!("selector=authority_lineage schedule={schedule:?} settling error={error:?}")
+                    });
+                    let mut still_refused = Vec::new();
+                    for refused_id in refused.drain(..) {
+                        let refused_fact = fact_by_id(refused_id);
+                        if !dependencies_present(&restarted, &refused_fact) {
+                            still_refused.push(refused_id);
+                            continue;
+                        }
+                        let result = restarted.admit(refused_fact);
+                        match result {
+                            Ok(Admission::Inserted | Admission::Quarantined { .. } | Admission::AlreadyPresent) => {}
+                            Err(myownmesh_core::semantic::SemanticError::QuarantineSignerNotEligible) => {
+                                still_refused.push(refused_id)
+                            }
+                            other => panic!(
+                                "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} id={refused_id} redelivery result={other:?}"
+                            ),
+                        }
+                    }
+                    refused = still_refused;
+                    if (restarted.ids().count(), refused.len()) == before_progress {
+                        break;
+                    }
+                }
+            }
+            let operation_position = schedule
+                .iter()
+                .position(|id| *id == operation.id)
+                .expect("operation is in every authority-lineage schedule");
+            let grant_position = schedule
+                .iter()
+                .position(|id| *id == controller_grant.id)
+                .expect("grant is in every authority-lineage schedule");
+            assert_eq!(
+                saw_pregrant_refusal,
+                operation_position < grant_position,
+                "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} exact pre-grant refusal boundary"
+            );
+            assert!(
+                refused.is_empty(),
+                "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} refused signed bodies remain after dependencies"
+            );
+            if let Err(error) = restarted.retry_quarantined() {
+                panic!(
+                    "selector=authority_lineage_selection_round_trips_and_regrant_is_future_only schedule={schedule:?} retry={error:?}"
+                );
+            }
+            assert!(restarted.quarantined().next().is_none());
+            assert_stage(
+                &restarted,
+                "T typed selection",
+                &reference_t_projection,
+                expected_role,
+                None,
+                &reference_t_ids,
+            );
+            restarted
+                .admit(fact_by_id(regrant.id))
+                .expect("causal U Owner regrant admits after restart");
+            assert_stage(
+                &restarted,
+                "U future authority",
+                &reference_u_projection,
+                Some(Role::Owner),
+                None,
+                &reference_u_ids,
+            );
+            assert_eq!(
+                restarted.projection().value(&role_cell),
+                Some(regrant.id),
+                "U regrant is the effective role-cell head"
+            );
+            restarted
+                .admit(fact_by_id(future.id))
+                .expect("causal F1 operation admits under U");
+            assert_stage(
+                &restarted,
+                "F1 future operation",
+                &reference_f1_projection,
+                Some(Role::Owner),
+                Some(Role::Member),
+                &reference_f1_ids,
+            );
+            restarted
+                .admit(fact_by_id(future_followup.id))
+                .expect("causal F2 operation admits under F1");
+            assert_stage(
+                &restarted,
+                "F2 future continuation",
+                &reference_f2_projection,
+                Some(Role::Owner),
+                Some(Role::Member),
+                &reference_f2_ids,
             );
             assert_eq!(
                 restarted
                     .evaluator()
-                    .admits_closed_session(&controller, &remote),
-                expected_role.is_some(),
-                "Closed session admission follows role plus membership projection"
-            );
-            assert_eq!(
-                restarted.authority_lineage(&controller).selected_branch(),
-                Some(selected),
-                "the typed selector remains attached after durable arrival"
-            );
-            assert!(
-                restarted
-                    .authority_lineage(&controller)
-                    .selected_branch()
-                    .is_some_and(|branch| branch != losing),
-                "the losing AuthorityUse branch stays inactive"
-            );
-            let base_projection = restarted.projection();
-            if let Some(previous) = &expected_base_projection {
-                assert_eq!(base_projection, *previous);
-            } else {
-                expected_base_projection = Some(base_projection);
-            }
-
-            // The post-resolution regrant restores only future authority. It
-            // must not change the selected branch or make the losing branch
-            // effective merely because its FactId arrived earlier/later.
-            restarted
-                .admit(decoded.facts[5].clone())
-                .expect("causal Owner regrant admits after restart");
-            assert_eq!(restarted.ids().count(), 6);
-            assert_eq!(
-                restarted.evaluator().effective_role(&controller),
-                Some(Role::Owner),
-                "regrant restores current future authority at the boundary"
-            );
-            assert_eq!(
-                restarted.authority_lineage(&controller).selected_branch(),
-                Some(selected),
-                "regrant preserves the typed selector at the boundary"
+                    .effective_role(&future_followup_target),
+                Some(Role::Member),
+                "F2 remains a production-authored future continuation"
             );
             assert_eq!(
                 restarted.projection().value(&role_cell),
-                Some(decoded.facts[5].id),
-                "the decoded regrant becomes the effective role-cell head"
+                Some(regrant.id),
+                "F1/F2 cannot replace the selected branch's regrant cell"
             );
-            let regrant_projection = restarted.projection();
-            if let Some(previous) = &expected_regrant_projection {
-                assert_eq!(regrant_projection, *previous);
-            } else {
-                expected_regrant_projection = Some(regrant_projection);
-            }
-            restarted
-                .admit(decoded.facts[6].clone())
-                .expect("future operation admits under the regrant");
-            assert_eq!(restarted.ids().count(), 7);
-            assert_eq!(
-                restarted.evaluator().effective_role(&controller),
-                Some(Role::Owner),
-                "regrant restores current future authority"
-            );
-            assert_eq!(
-                restarted.evaluator().effective_role(&future_target),
-                Some(Role::Member)
-            );
-            assert_eq!(
-                restarted.authority_lineage(&controller).selected_branch(),
-                Some(selected),
-                "regrant preserves the typed selector lineage"
-            );
-            assert_eq!(
-                restarted.projection().value(&role_cell),
-                Some(decoded.facts[5].id),
-                "regrant is the effective role-cell head, not the losing branch"
-            );
-            if let Some(previous) = &expected_projection {
-                assert_eq!(restarted.projection(), *previous);
-            } else {
-                expected_projection = Some(restarted.projection());
-            }
         }
     }
 }

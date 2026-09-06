@@ -1,14 +1,146 @@
 {
   "schema_version": 1,
-  "expected_head": "bf08d2c378a5fb3c20a8099488ff13cac8a16a78",
+  "expected_head": "f70689e1d64883458ad204d8d0b9f9b76bee9666",
   "expected_ref": "macro/02-authority-durability-relay",
   "build_timeout_seconds": 1800,
   "max_output_bytes": 16777216,
   "acceptance_contract": {
     "path": "docs/qualification/graph-hub-acceptance-contract.md",
-    "sha256": "B17C74ED2AACE8E87C17B5319E3286BC455716B8D09BCBAA303B1D92AB4B393B"
+    "sha256": "3C60B328A6B0C7696063F84437209484428AEEF5D5B5B6A52B2DB2563E8D05D5"
   },
   "required_selectors": [
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::historical_membership_exclusion_survives_later_selectors_and_cold_journals"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authority_lineage_selection_round_trips_and_regrant_is_future_only"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_authority_selection_durability",
+      "selector": "selected_authority_branch_survives_compact_reopen_and_cold_hydration"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::selector_provenance_continuations_cold_restore_and_rollback"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::checkpoint_ancestry_resolver_checks_signed_closure_in_one_snapshot"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::selector_checkpoint_valid_checksum_tampering_falls_back_to_canonical_history"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::clean_live_checkpoint_restores_without_history_replay"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::candidate_relative_noops_preserve_concurrent_role_operations_across_journals"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "effective_membership_restoration_supersedes_stand_down_in_any_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "finite_authority_fork_projection_converges_for_every_arrival_permutation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "second_order_payload_fork_converges_without_authority_join"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "self_authored_membership_resolution_is_order_independent_after_role_regrant"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "incomparable_heads_fail_closed_until_full_head_resolution"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authority_use_resolution_only_keeps_the_selected_subject_branch_effective"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "conflict_projection_does_not_depend_on_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "recursive_resolution_selects_a_terminal_head"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "stale_recursive_resolution_fails_closed"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_tier"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "controller_can_resolve_member_revoke_using_its_candidate_causal_tier"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authoring_witness_supports_controller_to_member_demotion"
+    },
     {
       "package": "myownmesh-core",
       "target_kind": "lib",
@@ -929,6 +1061,380 @@
     }
   ],
   "cells": [
+    {
+      "id": "gate-175",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::historical_membership_exclusion_survives_later_selectors_and_cold_journals"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-154",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authority_lineage_selection_round_trips_and_regrant_is_future_only"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-155",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_authority_selection_durability",
+      "selectors": [
+        "selected_authority_branch_survives_compact_reopen_and_cold_hydration"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-170",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::selector_provenance_continuations_cold_restore_and_rollback"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-171",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::checkpoint_ancestry_resolver_checks_signed_closure_in_one_snapshot"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-172",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::selector_checkpoint_valid_checksum_tampering_falls_back_to_canonical_history"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-173",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::clean_live_checkpoint_restores_without_history_replay"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-174",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::candidate_relative_noops_preserve_concurrent_role_operations_across_journals"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-156",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "effective_membership_restoration_supersedes_stand_down_in_any_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-157",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "finite_authority_fork_projection_converges_for_every_arrival_permutation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-158",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-159",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "second_order_payload_fork_converges_without_authority_join"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-160",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "self_authored_membership_resolution_is_order_independent_after_role_regrant"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 240
+    },
+    {
+      "id": "gate-161",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-162",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "incomparable_heads_fail_closed_until_full_head_resolution"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-163",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authority_use_resolution_only_keeps_the_selected_subject_branch_effective"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-164",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "conflict_projection_does_not_depend_on_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-165",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "recursive_resolution_selects_a_terminal_head"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-166",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "stale_recursive_resolution_fails_closed"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-167",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_tier"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-168",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "controller_can_resolve_member_revoke_using_its_candidate_causal_tier"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-169",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authoring_witness_supports_controller_to_member_demotion"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
     {
       "id": "gate-001",
       "package": "myownmesh-core",
