@@ -38,6 +38,7 @@
 
 pub mod bridge;
 pub mod clients;
+pub mod media_queue;
 pub mod wire;
 
 #[allow(unused_imports)]

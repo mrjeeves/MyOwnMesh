@@ -119,7 +119,7 @@ pub struct ClientHandle {
     /// to it. `Some` means the media pumps route inbound H.264/Opus here as raw
     /// binary instead of base64 `video_inbound`/`audio_inbound` on the event
     /// socket. Cleared when the pipe disconnects.
-    pub media_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    pub media_tx: Arc<Mutex<Option<super::media_queue::Sender>>>,
 }
 
 impl ClientHandle {
@@ -130,7 +130,7 @@ impl ClientHandle {
     }
 
     /// Register this client's binary media-source pipe sender.
-    pub fn set_media_sink(&self, tx: mpsc::Sender<Vec<u8>>) {
+    pub fn set_media_sink(&self, tx: super::media_queue::Sender) {
         *self.media_tx.lock() = Some(tx);
     }
 
@@ -141,7 +141,7 @@ impl ClientHandle {
     }
 
     /// The current media-source sender, if a binary pipe is open.
-    pub fn media_sink(&self) -> Option<mpsc::Sender<Vec<u8>>> {
+    pub fn media_sink(&self) -> Option<super::media_queue::Sender> {
         self.media_tx.lock().clone()
     }
 }
