@@ -1027,9 +1027,10 @@ async fn buffered_video_ipc_burst_preserves_ready_consumer_and_stays_bounded_whe
         );
     }
 
-    let (tx, rx) = super::media_queue::channel(1);
+    let (tx, mut rx) = super::media_queue::channel(1);
     handoff_video_to_media_sink(&tx, None, false, false, &[99], &[1]).await;
     let (_, state) = handoff_video_to_media_sink(&tx, None, false, false, &[99], &[2]).await;
     assert_eq!(state, Some(MediaSinkVideoRecovery::NeedGap));
-    assert_eq!(rx.len(), 1);
+    assert_eq!(rx.try_recv().unwrap(), vec![1]);
+    assert!(rx.try_recv().is_err());
 }

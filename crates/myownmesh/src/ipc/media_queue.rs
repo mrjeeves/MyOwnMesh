@@ -156,11 +156,6 @@ impl Receiver {
         let mut item = self.0.try_recv()?;
         Ok(std::mem::take(&mut item.body))
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
 }
 
 #[cfg(test)]
