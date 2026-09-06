@@ -11,6 +11,7 @@ import {
   controllerStatus,
   endpointProbeDisposition,
   mergeControllerError,
+  stopOwnedChild,
 } from "../live-device-peer.mjs";
 
 function cleanPayload(extra = {}) {
@@ -97,6 +98,96 @@ test("endpoint preflight fails closed on Windows except exact absence", () => {
   assert.equal(endpointProbeDisposition("linux", { code: "ENOENT" }), "absent");
   assert.equal(endpointProbeDisposition("linux", { code: "ECONNREFUSED" }), "absent");
   assert.equal(endpointProbeDisposition("linux", { code: "EACCES" }), "refuse");
+});
+
+function runningChild() {
+  return { pid: 41, exitCode: null, signalCode: null };
+}
+
+test("owned child exits during the finite graceful phase", async () => {
+  const signals = [];
+  const waits = [];
+  const result = await stopOwnedChild(runningChild(), 10_000, {
+    platform: "linux",
+    monoMs: () => 0,
+    signalGroup: (pid, signal) => signals.push([pid, signal]),
+    waitForExit: async (_child, timeoutMs) => {
+      waits.push(timeoutMs);
+      return { exitCode: 0, signal: null };
+    },
+  });
+  assert.deepEqual(signals, [[41, "SIGINT"]]);
+  assert.deepEqual(waits, [8_000]);
+  assert.equal(result.mode, "graceful_sigint");
+  assert.deepEqual(result.phase_budget, {
+    total_ms: 10_000,
+    graceful_ms: 8_000,
+    forced_join_ms: 2_000,
+  });
+});
+
+test("non-exiting grace reserves time for forced process-group exit observation", async () => {
+  const signals = [];
+  const waits = [];
+  let now = 0;
+  const result = await stopOwnedChild(runningChild(), 10_000, {
+    platform: "linux",
+    monoMs: () => now,
+    signalGroup: (pid, signal) => signals.push([pid, signal]),
+    waitForExit: async (_child, timeoutMs) => {
+      waits.push(timeoutMs);
+      now += timeoutMs;
+      if (waits.length === 1) throw new ControllerError("grace expired");
+      return { exitCode: null, signal: "SIGKILL" };
+    },
+  });
+  assert.deepEqual(signals, [[41, "SIGINT"], [41, "SIGKILL"]]);
+  assert.deepEqual(waits, [8_000, 2_000]);
+  assert.equal(result.mode, "forced_sigkill");
+  assert.equal(result.signalSent, true);
+  assert.equal(result.signal, "SIGKILL");
+});
+
+test("unobserved forced exit remains a typed failure with phase evidence", async () => {
+  const signals = [];
+  let now = 0;
+  await assert.rejects(
+    stopOwnedChild(runningChild(), 10_000, {
+      platform: "linux",
+      monoMs: () => now,
+      signalGroup: (pid, signal) => signals.push([pid, signal]),
+      waitForExit: async (_child, timeoutMs) => {
+        now += timeoutMs;
+        throw new ControllerError("exit unobserved");
+      },
+    }),
+    (error) => {
+      assert.equal(error.result?.mode, "forced_sigkill_unconfirmed");
+      assert.equal(error.result?.signalSent, true);
+      assert.equal(error.result?.phase_budget?.forced_join_ms, 2_000);
+      return true;
+    },
+  );
+  assert.deepEqual(signals, [[41, "SIGINT"], [41, "SIGKILL"]]);
+});
+
+test("an expired shutdown deadline sends no signal and cannot claim exit", async () => {
+  const signals = [];
+  await assert.rejects(
+    stopOwnedChild(runningChild(), 100, {
+      platform: "linux",
+      monoMs: () => 100,
+      signalGroup: (pid, signal) => signals.push([pid, signal]),
+      waitForExit: async () => assert.fail("expired deadline must not wait"),
+    }),
+    (error) => {
+      assert.equal(error.code, "ETIMEDOUT");
+      assert.equal(error.result?.mode, "shutdown_deadline_expired");
+      assert.equal(error.result?.signalSent, false);
+      return true;
+    },
+  );
+  assert.deepEqual(signals, []);
 });
 
 test("listener registration is provisional and relay acceptance is not readiness", () => {

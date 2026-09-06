@@ -181,3 +181,81 @@ the complete 19-test capture, and the actual isolated startup/status/stop
 evidence. That finite preliminary publication check passed. The device case
 results and final live-unit audit are still pending; this is not release
 readiness or removal of PR HOLD.
+
+## First live observations at e3ef37e (partial; unit not qualified)
+
+The following are retained observations from September 6, 2026, not a
+completed performance comparison or a release claim. The whole controller
+batches failed; successful sub-workloads are identified separately.
+
+Linux release run `4c3e6499-1b82-40b4-b177-18cdcfee587b` passed at exact
+`e3ef37ecff396afaf118484c8189fc505153dc43`. Its native executable SHA-256 is
+`24b34be4e0c01a76b20718fa02bb37a5cf169e182bfbd47a101ecd14cc7ac19a`.
+The local Windows executable above has unchanged production Rust relative to
+this harness-only commit; it was not rebuilt at e3ef37e.
+
+| Executed observation | Result | Interpretation |
+| --- | --- | --- |
+| Windows desktop to separate Linux/WSL laptop, Silent/Open-policy FullMesh | Waited explicit connect returned active in 2,514.43 ms | One connection, not a distribution; both public pair observations included TURN |
+| Same connection, 16 sequential 1,024-byte echo bodies | 16/16 verified at sender and responder, zero loss/duplicate/mismatch/unknown counters; RTT min 42.924, nearest-rank median 43.369, max 45.054 ms | Local monotonic application echo including IPC, not one-way wire time |
+| Same workload, sequential verified body rate | 23,420.9 bytes/s | Stop-and-wait application goodput, not saturated bandwidth |
+| Closed Windows author stream, first 16 role changes | 196.373 ms total, 81.48 acknowledgements/s | Includes persistent IPC and fsynced measurement records |
+| Closed Windows author stream, next 100 role changes | 1,122.078 ms total, 89.12 acknowledgements/s; request median 7.115, p95 8.828, max 11.055 ms | One sequential stream, not independent trial percentiles or isolated signing/fsync cost |
+| Canonical export after both streams plus receiver enrollment | 117 unique admitted facts, zero unresolved; all 116 generated IDs present | Local storage confirmation; not receipt by the other device |
+
+First-pair runs are local `40dd0e23-667a-462f-b123-1e592cb77922` and Linux
+`0ff03af5-9243-4912-9d93-4f4ae75668d6`. Their retained JSONL hashes are
+`4D1E32605A91B87D32909EF1DD189FEF18F6D49A4D300F7BC500070ACD83CC97`
+and `7758557532BD375407988D36986AD1D29B386C7D55F9C1EEE97CEA1142FC8659`.
+Local copies and a compact observation record are under
+`target/qualification-evidence/live-device-inputs/`.
+
+The subsequent 100-by-8,192-byte workload stopped at its first send: the daemon
+returned `ok:false`, no send was acknowledged and the receiver saw no request.
+The harness discarded the exact refusal text and conservatively recorded
+`send_outcome_unknown`; it did not retry. Source inspection proves the current
+8,192-unit opaque residual grant cannot fund an 8,192-byte body plus its encoded
+command and ownership overhead, even before other use. It does not prove which
+refusal occurred first. This cell remains failed/unqualified, not zero network
+throughput or a retroactive expected-refusal PASS. The grant is not increased.
+Further positive warm comparisons use separately labeled admitted 1 KiB bodies.
+The optional larger-body performance cell requires a separately reviewed
+compatible complete budget; it must not silently change size or grant.
+
+The payload observer also expected a string recovery tier, whereas public
+`peers_list` returns a tagged object such as `{kind:"steady"}`. Its route
+observer therefore reported unavailable. Separately retained raw peer snapshots
+show both endpoints authenticated, active and bilaterally approved, with a relay
+candidate in each selected-pair observation. This remains observational ICE
+classification, not nomination proof or an application Hub/opaque-relay test.
+
+Closed runs are local `3bb5c819-0c40-4d3a-b66a-b4df6d875eaf` and Linux
+`034fb3f7-2c4a-4de3-8446-5f9434676fcc`. After bootstrap and five explicitly
+transferred enrollment pages, both canonical identities matched at 17 admitted
+facts and zero unresolved. This was assisted enrollment, not automatic sync.
+Closed auto-dial began before that transfer finished; a later explicit connect
+overlapped the transition and the connection did not remain usable. The explicit
+10-second wait failed. It is not a measurement of intrinsic Closed overhead.
+After the additional 100 local facts, the receiver still had 17; automatic
+replication and the planned Closed echo were not qualified.
+
+Local Closed JSONL SHA-256:
+`9CFA42C56E463166CAD5153B34BFB0381DFE3F2437CA321F34920987ACA4D24E`.
+Retained Linux Closed JSONL SHA-256:
+`5801E1FA4116FDB112B008539C4018DEB0173BCDB0EE13377F7E05FF38F66899`.
+The Linux control run lost its remote transport response around 304 seconds;
+the separately retrieved controller log records failed cleanup after SIGINT.
+The harness spent its entire shutdown allowance waiting for graceful exit and
+left essentially no observation window after SIGKILL. A later exact-PID check
+confirmed the owned daemon was gone, not a joined graceful-shutdown success.
+Windows owned-child stops were forced. No restart durability claim follows.
+
+Next execution constraints: use a short Unix socket path under a new private
+directory; keep remote controller cases within 240 seconds; enroll the Closed
+receiver with a minimal baseline before generating measured facts; observe
+existing auto-dial state rather than issuing an overlapping explicit connect.
+Two scripts-only corrections cover typed peer telemetry/sanitized refusal
+evidence and a reserved forced-exit observation interval within the existing
+10-second shutdown budget. No Rust or authority change is implied. Hosted CI,
+three-device hubs/opaque relay, a non-TURN native baseline, full Open/Closed
+comparison, 1,000-fact scale and final independent field audit remain unqualified.

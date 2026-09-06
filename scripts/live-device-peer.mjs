@@ -978,7 +978,12 @@ function waitForChildExit(child, timeoutMs) {
   );
 }
 
-async function stopOwnedChild(child, deadlineMs) {
+export async function stopOwnedChild(child, deadlineMs, hooks = {}) {
+  const clock = hooks.monoMs ?? monoMs;
+  const platform = hooks.platform ?? process.platform;
+  const waitForExit = hooks.waitForExit ?? waitForChildExit;
+  const signalGroup = hooks.signalGroup ?? ((pid, signal) => process.kill(-pid, signal));
+  const killChild = hooks.killChild ?? ((ownedChild) => ownedChild.kill());
   if (child.exitCode !== null || child.signalCode !== null) {
     return {
       mode: "already_exited",
@@ -997,10 +1002,21 @@ async function stopOwnedChild(child, deadlineMs) {
       signal: child.signalCode,
     };
   }
-  const bounded = Math.max(1, Math.min(LIMITS.shutdownMs, deadlineMs - monoMs()));
-  if (process.platform === "win32") {
-    const sent = child.kill();
-    const terminal = await waitForChildExit(child, bounded);
+  const remaining = Math.floor(Math.min(LIMITS.shutdownMs, deadlineMs - clock()));
+  if (remaining <= 0) {
+    const error = new ControllerError("owned daemon shutdown deadline already expired");
+    error.code = "ETIMEDOUT";
+    error.result = {
+      mode: "shutdown_deadline_expired",
+      graceful: false,
+      durability_claim: false,
+      signalSent: false,
+    };
+    throw error;
+  }
+  if (platform === "win32") {
+    const sent = killChild(child);
+    const terminal = await waitForExit(child, remaining);
     return {
       mode: "forced_owned_child",
       graceful: false,
@@ -1009,37 +1025,83 @@ async function stopOwnedChild(child, deadlineMs) {
       ...terminal,
     };
   }
+  const reservedForcedMs = Math.min(2_000, remaining);
+  const gracefulMs = Math.min(8_000, Math.max(0, remaining - reservedForcedMs));
+  const phaseBudget = {
+    total_ms: remaining,
+    graceful_ms: gracefulMs,
+    forced_join_ms: remaining - gracefulMs,
+  };
   let gracefulSent = false;
-  try {
-    process.kill(-child.pid, "SIGINT");
-    gracefulSent = true;
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
-  }
-  try {
-    return {
-      mode: "graceful_sigint",
-      graceful: true,
-      durability_claim: false,
-      signalSent: gracefulSent,
-      ...(await waitForChildExit(child, bounded)),
-    };
-  } catch {
-    let forcedSent = false;
+  if (gracefulMs > 0) {
     try {
-      process.kill(-child.pid, "SIGKILL");
-      forcedSent = true;
+      signalGroup(child.pid, "SIGINT");
+      gracefulSent = true;
     } catch (error) {
       if (error?.code !== "ESRCH") throw error;
     }
-    const terminal = await waitForChildExit(child, Math.max(1, deadlineMs - monoMs()));
+    try {
+      return {
+        mode: "graceful_sigint",
+        graceful: true,
+        durability_claim: false,
+        signalSent: gracefulSent,
+        phase_budget: phaseBudget,
+        ...(await waitForExit(child, gracefulMs)),
+      };
+    } catch {
+      // The finite grace phase expired. The reserved phase below is the only
+      // forced observation attempt; an unobserved exit remains a failure.
+    }
+  }
+  let forcedSent = false;
+  try {
+    signalGroup(child.pid, "SIGKILL");
+    forcedSent = true;
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+  const forcedRemaining = Math.floor(Math.min(phaseBudget.forced_join_ms, deadlineMs - clock()));
+  if (forcedRemaining <= 0) {
+    const error = new ControllerError("forced owned-daemon exit could not be observed before deadline");
+    error.code = "ETIMEDOUT";
+    error.result = {
+      mode: "forced_sigkill_unconfirmed",
+      graceful: false,
+      durability_claim: false,
+      gracefulSignalSent: gracefulSent,
+      signalSent: forcedSent,
+      phase_budget: phaseBudget,
+    };
+    throw error;
+  }
+  try {
+    const terminal = await waitForExit(child, forcedRemaining);
     return {
       mode: "forced_sigkill",
       graceful: false,
       durability_claim: false,
+      gracefulSignalSent: gracefulSent,
       signalSent: forcedSent,
+      phase_budget: phaseBudget,
       ...terminal,
     };
+  } catch (cause) {
+    const error = new ControllerError(
+      "forced owned-daemon exit was not confirmed",
+      "failed",
+      cause,
+    );
+    error.code = typeof cause?.code === "string" ? cause.code : "ETIMEDOUT";
+    error.result = {
+      mode: "forced_sigkill_unconfirmed",
+      graceful: false,
+      durability_claim: false,
+      gracefulSignalSent: gracefulSent,
+      signalSent: forcedSent,
+      phase_budget: phaseBudget,
+    };
+    throw error;
   }
 }
 

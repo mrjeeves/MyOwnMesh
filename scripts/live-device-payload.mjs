@@ -23,20 +23,47 @@ const MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 const MAX_LIFETIME_MS = 300_000;
 const KEY = /^[a-z2-7]{51}[aq]$/;
 const PACKET_KEYS = ['body', 'channel', 'kind', 'network', 'protocol', 'run_id', 'seq'];
+const TIERS = new Set(['steady', 'wake_probe', 'ice_watchdog', 'ice_restart', 'stop_start']);
+const RESOURCE_DIMENSIONS = new Set(['AccountedMemoryBytes', 'QueuedBytes', 'SocketOrHandle',
+  'NativeTransportObject', 'WorkerOrTask', 'CallbackOrScheduledWork', 'StorageBytes',
+  'StorageObject', 'RelayOrProviderAllocation', 'ParsingOrCpuWork', 'OpaqueDependencyResidual']);
+const FIXED_REFUSALS = new Set(['network has been torn down', 'transport: data channel not open',
+  'transport: peer send timed out']);
 
 class PayloadError extends Error {
-  constructor(stage, category) {
+  constructor(stage, category, diagnostic = undefined) {
     super(`${stage}: ${category}`);
     this.stage = stage;
     this.category = category;
+    this.diagnostic = diagnostic;
   }
 }
 
 function fail(stage, category) { throw new PayloadError(stage, category); }
 function failure(error, stage = 'payload') {
   return error instanceof PayloadError
-    ? { stage: error.stage, category: error.category }
+    ? { stage: error.stage, category: error.category,
+      ...(error.diagnostic === undefined ? {} : { daemon_diagnostic: error.diagnostic }) }
     : { stage, category: 'local_failure_details_redacted' };
+}
+function daemonDiagnostic(value) {
+  // Error strings can contain peer-controlled text or local capabilities.
+  // Only a complete, bounded, source-shaped grammar may escape redaction.
+  if (typeof value !== 'string') return { kind: 'redacted_nonstring_error' };
+  const bytes = Buffer.byteLength(value, 'utf8');
+  const redacted = { kind: 'redacted_error', utf8_bytes: bytes,
+    sha256: createHash('sha256').update(value).digest('hex') };
+  if (bytes > 1024) return redacted;
+  if (FIXED_REFUSALS.has(value)) return { kind: 'known_refusal', message: value };
+  // channels.rs ResourcePressure uses Debug, including ResourceScopeId's
+  // NonZeroU64 newtype. Display-shaped or appended free-form text is refused.
+  const match = /^application gateway resource pressure: Pressure\(ResourcePressure \{ scope_id: ResourceScopeId\(([1-9][0-9]{0,19})\), authority: (Cleanup|Admitted|Speculative), dimension: ([A-Za-z]+), requested: (0|[1-9][0-9]{0,19}), in_use: (0|[1-9][0-9]{0,19}), capacity: (0|[1-9][0-9]{0,19}) \}\)$/.exec(value);
+  if (!match || match[0] !== value || !RESOURCE_DIMENSIONS.has(match[3])) return redacted;
+  const scalars = [match[1], match[4], match[5], match[6]].map(Number);
+  // Reject an unrepresentable diagnostic rather than round any u64 identity.
+  if (!scalars.every(Number.isSafeInteger)) return redacted;
+  return { kind: 'resource_pressure', scope_id: scalars[0], authority: match[2],
+    dimension: match[3], requested: scalars[1], in_use: scalars[2], capacity: scalars[3] };
 }
 function integer(value, min, max, label) {
   if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -87,11 +114,18 @@ function remaining(ctx, c, cap = c.timeout_ms) {
 }
 async function rpc(ctx, c, request, stage, cap = c.timeout_ms) {
   const timeout = remaining(ctx, c, cap);
+  if (stage === 'channel_send' || stage === 'relay_send') {
+    c.last_send_encoding = { operation: request.op,
+      packet_json_bytes: stage === 'relay_send' ? request.payload.length
+        : Buffer.byteLength(JSON.stringify(request.payload), 'utf8'),
+      request_json_bytes: Buffer.byteLength(JSON.stringify(request), 'utf8'),
+      scope: 'last_send_attempt_local_JSON_UTF8_excludes_JSONL_delimiter_not_native_wire_or_resource_claim' };
+  }
   let reply;
   try { reply = await ctx.rpc(request, timeout); }
   catch { fail(stage, 'transport_outcome_unknown'); }
   if (!reply || typeof reply.ok !== 'boolean') fail(stage, 'invalid_reply_outcome_unknown');
-  if (!reply.ok) fail(stage, 'daemon_reported_failure');
+  if (!reply.ok) throw new PayloadError(stage, 'daemon_reported_failure', daemonDiagnostic(reply.error));
   return reply.data;
 }
 function packet(c, seq, kind) {
@@ -118,6 +152,7 @@ function summary(ctx, c, stats, outcome, extra = {}) {
   return { kind: 'payload_summary', action: c.action, run_id: c.run_id,
     network: c.network, channel: c.channel, peer: c.peer, samples: c.samples,
     body_bytes_per_sample: c.bytes, body_sha256: createHash('sha256').update(c.body).digest('hex'),
+    last_send_encoding: c.last_send_encoding ?? null,
     counts: { ...stats }, not_attempted: c.samples - stats.attempted,
     verified_body_bytes: stats.received * c.bytes, elapsed_ms: elapsed,
     sample_loop_elapsed_ms: sampleElapsed,
@@ -139,13 +174,14 @@ async function observePeers(ctx, c) {
     const peers = [];
     for (const value of data.peers.slice(0, 64)) {
       if (!KEY.test(value?.device_id ?? '') || typeof value.status !== 'string'
-          || value.status.length > 40 || typeof value.tier !== 'string'
-          || value.tier.length > 40 || typeof value.authenticated !== 'boolean') {
+          || value.status.length > 40 || value.tier === null || typeof value.tier !== 'object'
+          || Array.isArray(value.tier) || Object.keys(value.tier).length !== 1
+          || !TIERS.has(value.tier.kind) || typeof value.authenticated !== 'boolean') {
         fail('peers_list', 'unsupported_peer_shape');
       }
       // Deliberate allowlist: never retain labels, verification codes or
       // capabilities. Pair presence does not prove nomination or actual hops.
-      peers.push({ device_id: value.device_id, status: value.status, tier: value.tier,
+      peers.push({ device_id: value.device_id, status: value.status, tier: { kind: value.tier.kind },
         authenticated: value.authenticated, selected_pair_present: value.selected_pair != null });
     }
     return { available: true, total_rows: data.peers.length, truncated: data.peers.length > 64,
@@ -181,6 +217,7 @@ async function echoListen(ctx, c) {
   const seen = new Set();
   let stopped = false;
   let outcome = 'listening';
+  let errorRecord = null;
   let queued = null;
   let active = null;
   let ready = false;
@@ -201,6 +238,7 @@ async function echoListen(ctx, c) {
       stats.lost = stats.received - stats.sent;
       const result = summary(ctx, c, stats, outcome === 'listening' ? 'stopped' : outcome,
         { counter_scope: 'responder_received_requests_and_attempted_echo_replies',
+          failure: errorRecord,
           not_attempted: c.samples - stats.received,
           sequential_app_goodput_bytes_per_second: null,
           loss_scope: 'verified_requests_without_acknowledged_echo_send' });
@@ -218,8 +256,9 @@ async function echoListen(ctx, c) {
       try {
         await channelSend(ctx, c, packet(c, value.seq, 'echo'));
         stats.sent += 1;
-      } catch {
+      } catch (error) {
         stats.send_outcome_unknown += 1;
+        errorRecord = failure(error, 'echo_send');
         outcome = 'echo_send_outcome_unknown';
         stopped = true;
         break;
