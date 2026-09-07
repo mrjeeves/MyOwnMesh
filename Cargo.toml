@@ -11,6 +11,7 @@ exclude = [
     "vendor/turn-0.10.0",
     "vendor/webrtc-0.13.0",
     "vendor/webrtc-ice-0.13.0",
+    "vendor/webrtc-sctp-0.12.0",
 ]
 
 [workspace.package]
@@ -174,3 +175,4 @@ opt-level = 3
 turn = { path = "vendor/turn-0.10.0" }
 webrtc = { path = "vendor/webrtc-0.13.0" }
 webrtc-ice = { path = "vendor/webrtc-ice-0.13.0" }
+webrtc-sctp = { path = "vendor/webrtc-sctp-0.12.0" }
