@@ -9,16 +9,24 @@ struct GeneratorStreamInternal {
     end: u16,
     started: bool,
     last_consecutive: u16,
+    // Diagnostic branch only; snapshot once, not on the packet hot path.
+    legacy_history: bool,
 }
 
 impl GeneratorStreamInternal {
     fn new(log2_size_minus_6: u8) -> Self {
+        let legacy_history =
+            std::env::var("MYOWNMESH_DIAG_LEGACY_NACK_HISTORY").as_deref() == Ok("1");
+        if legacy_history {
+            log::warn!("diagnostic A/B: legacy NACK history writes enabled for this stream");
+        }
         GeneratorStreamInternal {
             packets: vec![0u64; 1 << log2_size_minus_6],
             size: 1 << (log2_size_minus_6 + 6),
             end: 0,
             started: false,
             last_consecutive: 0,
+            legacy_history,
         }
     }
 
@@ -61,7 +69,7 @@ impl GeneratorStreamInternal {
 
         // Repairs can outlive this tracker's history. They must still reach
         // the RTP consumer, but must not alias a newer missing packet's bit.
-        if self.end.wrapping_sub(seq) < self.size {
+        if self.legacy_history || self.end.wrapping_sub(seq) < self.size {
             self.set_received(seq);
         }
     }

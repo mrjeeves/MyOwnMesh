@@ -104,7 +104,14 @@ async fn check_repair(start: u16, separation: u16) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     generator.bind_rtcp_writer(Arc::new(Feedback(tx))).await;
     let first = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
-    assert_eq!(first.unwrap().unwrap(), vec![missing]);
+    let legacy = std::env::var("MYOWNMESH_DIAG_LEGACY_NACK_HISTORY").as_deref() == Ok("1");
+    if legacy && separation >= 512 {
+        // Explicit A/B mode must reproduce the old corruption. Run this in
+        // a separate process; never mutate the environment between tests.
+        assert!(first.is_err(), "legacy mode should reproduce the lost NACK");
+    } else {
+        assert_eq!(first.unwrap().unwrap(), vec![missing]);
+    }
     input.0.lock().push_back(missing);
     let (packet, _) = reader.read(&mut buf, &Attributes::new()).await.unwrap();
     assert_eq!(packet.header.sequence_number, missing);
