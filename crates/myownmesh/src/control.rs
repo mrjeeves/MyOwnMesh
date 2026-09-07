@@ -812,6 +812,8 @@ async fn run_media_track_pipe<R>(state: &Arc<ControlState>, mut reader: R) -> Re
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let detailed = tracing::enabled!(target: "myownmesh::video_timing", tracing::Level::DEBUG);
+    let mut last_slow_send = None::<std::time::Instant>;
     loop {
         let mut len_buf = [0u8; 4];
         // A clean EOF (client closed the pipe) ends the loop; a short read is
@@ -838,6 +840,7 @@ where
             continue;
         };
         let dur = std::time::Duration::from_micros(frame.duration_us);
+        let started = detailed.then(std::time::Instant::now);
         let result = match frame.kind {
             MEDIA_KIND_VIDEO => {
                 net.state()
@@ -854,6 +857,18 @@ where
                 continue;
             }
         };
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(100)
+                && last_slow_send.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+            {
+                last_slow_send = Some(std::time::Instant::now());
+                debug!(target: "myownmesh::video_timing", network = %frame.network,
+                    peer = %frame.peer, lane = frame.stream, kind = frame.kind,
+                    send_wait_ms = elapsed.as_millis() as u64, failed = result.is_err(),
+                    "media sender transport wait");
+            }
+        }
         if let Err(e) = result {
             debug!("media-track send failed: {e}");
         }
@@ -874,11 +889,16 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let detailed = tracing::enabled!(target: "myownmesh::video_timing", tracing::Level::DEBUG);
+    let mut window = std::time::Instant::now();
+    let (mut bodies, mut bytes) = (0u64, 0u64);
+    let (mut max_queue, mut max_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     loop {
         tokio::select! {
             biased;
-            body = rx.recv() => {
-                let Some(body) = body else { return Ok(()) };
+            body = rx.recv_timed() => {
+                let Some((body, queue_age)) = body else { return Ok(()) };
+                let started = detailed.then(std::time::Instant::now);
                 let len = (body.len() as u32).to_le_bytes();
                 if writer.write_all(&len).await.is_err() {
                     return Ok(());
@@ -888,6 +908,26 @@ where
                 }
                 if writer.flush().await.is_err() {
                     return Ok(());
+                }
+                if let Some(started) = started {
+                    let now = std::time::Instant::now();
+                    bodies += 1;
+                    bytes += body.len() as u64;
+                    max_queue = max_queue.max(queue_age);
+                    max_write = max_write.max(now.duration_since(started));
+                    if now.duration_since(window) >= std::time::Duration::from_secs(5) {
+                        debug!(target: "myownmesh::video_timing",
+                            window_ms = now.duration_since(window).as_millis() as u64,
+                            bodies, bytes,
+                            queue_age_max_ms = max_queue.as_millis() as u64,
+                            write_max_ms = max_write.as_millis() as u64,
+                            last_kind = body.first().copied(), last_lane = body.get(2).copied(),
+                            last_rtp_timestamp = body.get(3..7).map(|b| u32::from_le_bytes(b.try_into().expect("four bytes"))),
+                            "media IPC writer timing");
+                        window = now;
+                        (bodies, bytes) = (0, 0);
+                        (max_queue, max_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+                    }
                 }
             }
             // The client never writes after the handshake, so any completion of

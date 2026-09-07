@@ -43,6 +43,7 @@ struct Item {
     picture: Option<Picture>,
     bytes: usize,
     budget: Arc<Mutex<Budget>>,
+    enqueued: Option<std::time::Instant>,
 }
 
 impl Drop for Item {
@@ -125,6 +126,8 @@ impl Sender {
         // The unbounded primitive is private: every item reserves a finite
         // picture/byte budget before entering it, and releases it on all exits.
         let item = Item {
+            enqueued: tracing::enabled!(target: "myownmesh::video_timing", tracing::Level::DEBUG)
+                .then(std::time::Instant::now),
             bytes: body.len(),
             body,
             picture,
@@ -143,12 +146,30 @@ impl Sender {
     pub fn max_capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Only sampled when an existing overflow diagnostic is emitted.
+    pub(super) fn pressure(&self) -> (usize, usize, usize, usize) {
+        let budget = self.budget.lock();
+        (
+            budget.pictures.len(),
+            budget.other,
+            budget.items,
+            budget.bytes,
+        )
+    }
 }
 
 impl Receiver {
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.recv_timed().await.map(|(body, _)| body)
+    }
+
+    pub(crate) async fn recv_timed(&mut self) -> Option<(Vec<u8>, std::time::Duration)> {
         let mut item = self.0.recv().await?;
-        Some(std::mem::take(&mut item.body))
+        let age = item
+            .enqueued
+            .map_or(std::time::Duration::ZERO, |at| at.elapsed());
+        Some((std::mem::take(&mut item.body), age))
     }
 
     #[cfg(test)]
@@ -207,6 +228,27 @@ mod tests {
             tx.try_send(fragment("b", 0, 1)),
             Err(mpsc::error::TrySendError::Full(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn timed_receive_preserves_body_budget_and_reports_residence() {
+        let (tx, mut rx) = channel(2);
+        let body = fragment("peer", 0, 1);
+        tx.try_send(body.clone()).unwrap();
+        assert_eq!(tx.pressure(), (1, 0, 1, body.len()));
+        // Inject a synthetic enqueue age: no sleep or live pipe needed.
+        let mut item = rx.0.try_recv().unwrap();
+        item.enqueued = Some(std::time::Instant::now() - std::time::Duration::from_millis(25));
+        tx.tx
+            .send(item)
+            .unwrap_or_else(|_| panic!("receiver is open"));
+        let (received, age) = rx.recv_timed().await.unwrap();
+        assert_eq!(received, body);
+        assert!(age >= std::time::Duration::from_millis(25));
+        assert_eq!(tx.pressure(), (0, 0, 0, 0));
+        tx.try_send(body.clone()).unwrap();
+        assert_eq!(rx.recv().await.unwrap(), body, "untimed API is unchanged");
+        assert_eq!(tx.pressure(), (0, 0, 0, 0));
     }
 
     #[test]

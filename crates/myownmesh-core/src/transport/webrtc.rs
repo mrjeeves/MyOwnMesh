@@ -210,6 +210,9 @@ pub enum TransportEvent {
 /// first abandoned sample in a loss episode rather than tracing every packet.
 #[derive(Debug, Clone)]
 pub struct VideoRecoveryDiagnostic {
+    /// Local monotonic time; separates recovery detection from a delayed
+    /// engine event consumer. Never serialized onto the media wire.
+    pub observed_at: Instant,
     pub reason: &'static str,
     pub pending_samples: usize,
     pub pending_frames: usize,
@@ -764,13 +767,46 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
     let lane = lane_of_track_id(&track.id());
     let mut assembler = H264AuAssembler::default();
     let mut sequence = 0u64;
+    // Detailed logs only. One aggregate per five seconds, no packet dump or
+    // extra polling task. Read await includes both network and scheduling time.
+    let detailed = tracing::enabled!(target: "myownmesh_core::video_timing", tracing::Level::DEBUG);
+    let mut window = Instant::now();
+    let (mut packets, mut forward_skips, mut reordered, mut max_release) =
+        (0u64, 0u64, 0u64, 0usize);
+    let (mut max_read, mut max_handoff) = (Duration::ZERO, Duration::ZERO);
+    let mut previous_seq: Option<u16> = None;
     loop {
+        let read_started = detailed.then(Instant::now);
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
         };
+        let arrived = read_started.map(|start| {
+            let now = Instant::now();
+            max_read = max_read.max(now.duration_since(start));
+            packets += 1;
+            let seq = pkt.header.sequence_number;
+            if let Some(previous) = previous_seq {
+                let advance = seq.wrapping_sub(previous) as i16;
+                if advance > 1 {
+                    forward_skips += (advance - 1) as u64;
+                }
+                if advance <= 0 {
+                    reordered += 1;
+                }
+                if advance > 0 {
+                    previous_seq = Some(seq);
+                }
+            } else {
+                previous_seq = Some(seq);
+            }
+            now
+        });
         match assembler.push_events(&pkt) {
             Ok(events) => {
+                if detailed {
+                    max_release = max_release.max(events.len());
+                }
                 for event in events {
                     sequence = sequence.wrapping_add(1);
                     if sequence == 0 {
@@ -806,6 +842,24 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
             // the stream re-syncs on the next timestamp, and the
             // sender's periodic IDR bounds any visible damage.
             Err(e) => trace!("video depacketize: {e}"),
+        }
+        if let Some(arrived) = arrived {
+            let now = Instant::now();
+            max_handoff = max_handoff.max(now.duration_since(arrived));
+            if now.duration_since(window) >= Duration::from_secs(5) {
+                debug!(target: "myownmesh_core::video_timing",
+                    ssrc = track.ssrc(), lane, rtp_timestamp = pkt.header.timestamp,
+                    rtp_sequence = pkt.header.sequence_number,
+                    window_ms = now.duration_since(window).as_millis() as u64,
+                    packets, forward_skips, reordered, max_release,
+                    read_wait_max_ms = max_read.as_millis() as u64,
+                    handoff_max_ms = max_handoff.as_millis() as u64,
+                    pending_samples = assembler.pending.len(),
+                    "video RTP receive timing");
+                window = now;
+                (packets, forward_skips, reordered, max_release) = (0, 0, 0, 0);
+                (max_read, max_handoff) = (Duration::ZERO, Duration::ZERO);
+            }
         }
     }
 }
@@ -1125,6 +1179,7 @@ impl H264AuAssembler {
                 events.push(H264AssemblyEvent::Discontinuity {
                     rtp_timestamp: abandoned.timestamp,
                     diagnostic: VideoRecoveryDiagnostic {
+                        observed_at: now,
                         reason: abandon_reason.unwrap_or("retransmit_deadline"),
                         pending_samples,
                         pending_frames,

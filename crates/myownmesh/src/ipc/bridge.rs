@@ -291,8 +291,11 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                                 .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
                         {
                             last_sink_pressure_log = Some(std::time::Instant::now());
+                            let (pictures, other, items, bytes) = sink.pressure();
                             debug!(%network_key, from = %inbound.from, lane = inbound.sample.lane,
                                 sequence = inbound.sample.sequence,
+                                queued_pictures = pictures, queued_other = other,
+                                queued_samples = items, queued_bytes = bytes,
                                 "video daemon IPC queue overflow; ordering a discontinuity");
                         }
                         match next {
