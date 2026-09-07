@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
   ControllerError,
 } from "../live-device-peer.mjs";
 import {
+  AtomicJsonPublisher,
   GRANT_DIMENSIONS,
   ResourceSampler,
   boundedHostErrorEvidence,
@@ -22,6 +25,198 @@ import {
   settleDiagnosticCapture,
   validateManifest,
 } from "../run-live-device-scale-host.mjs";
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function atomicFailure(code = "EPERM", syscall = "rename") {
+  return Object.assign(new Error("private path omitted"), { code, syscall, errno: -4048 });
+}
+
+function atomicFs(renameActions = []) {
+  const files = new Map(), renames = [];
+  let nextId = 1n, clock = 1n;
+  const key = (value) => path.win32.resolve(value).toLowerCase();
+  const touch = (entry) => {
+    entry.mtimeNs = ++clock;
+    entry.ctimeNs = clock;
+  };
+  const snapshot = (entry) => ({
+    dev: 1n, ino: entry.id, size: BigInt(entry.bytes.length),
+    mtimeNs: entry.mtimeNs, ctimeNs: entry.ctimeNs, isFile: () => true,
+  });
+  const missing = () => Object.assign(new Error("missing"), { code: "ENOENT" });
+  const api = {
+    files,
+    renames,
+    unreadable: new Set(),
+    async open(file, flag) {
+      const name = key(file);
+      if (flag === "r") {
+        const entry = files.get(name);
+        if (!entry) throw missing();
+        if (api.unreadable.has(name)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+        return {
+          async stat() { return snapshot(entry); },
+          async read(buffer, offset, length, position) {
+            const available = Math.max(0, entry.bytes.length - position);
+            const count = Math.min(length, available);
+            entry.bytes.copy(buffer, offset, position, position + count);
+            return { bytesRead: count, buffer };
+          },
+          async close() {},
+        };
+      }
+      assert.equal(flag, "wx");
+      if (files.has(name)) throw Object.assign(new Error("exists"), { code: "EEXIST" });
+      const entry = { id: nextId++, bytes: Buffer.alloc(0), mtimeNs: ++clock, ctimeNs: clock };
+      files.set(name, entry);
+      return {
+        async stat() { return snapshot(entry); },
+        async writeFile(bytes) { entry.bytes = Buffer.from(bytes); touch(entry); },
+        async sync() {},
+        async close() {},
+      };
+    },
+    async stat(file) {
+      const entry = files.get(key(file));
+      if (!entry) throw missing();
+      return snapshot(entry);
+    },
+    async rename(source, destination) {
+      const sourceKey = key(source), destinationKey = key(destination);
+      const action = renameActions[renames.length];
+      renames.push({ source: sourceKey, destination: destinationKey });
+      if (typeof action === "function") return action({ api, sourceKey, destinationKey });
+      if (action instanceof Error) throw action;
+      const entry = files.get(sourceKey);
+      if (!entry) throw missing();
+      files.set(destinationKey, entry);
+      files.delete(sourceKey);
+    },
+    async unlink(file) {
+      if (!files.delete(key(file))) throw missing();
+    },
+    setJson(file, value) {
+      const name = key(file), entry = files.get(name) ?? {
+        id: nextId++, bytes: Buffer.alloc(0), mtimeNs: ++clock, ctimeNs: clock,
+      };
+      entry.bytes = Buffer.from(`${JSON.stringify(value)}\n`);
+      touch(entry);
+      files.set(name, entry);
+    },
+    json(file) { return JSON.parse(files.get(key(file)).bytes.toString("utf8")); },
+    touch(file) {
+      const entry = files.get(key(file));
+      if (!entry) throw missing();
+      touch(entry);
+    },
+    remove(file) { files.delete(key(file)); },
+    key,
+  };
+  return api;
+}
+
+function atomicPublisher(fs, overrides = {}) {
+  let now = 0;
+  const abort = overrides.abort ?? new AbortController();
+  const publisher = new AtomicJsonPublisher("C:\\evidence\\resource-manifest.json", "atomic-control", {
+    platform: overrides.platform ?? "win32",
+    open: overrides.open ?? fs.open, rename: fs.rename, stat: fs.stat, unlink: fs.unlink,
+    randomUUID: (() => { let value = 0; return () => `test-${++value}`; })(),
+    monoMs: () => now,
+    wait: overrides.wait ?? (async (ms) => { now += ms; }),
+    signal: abort.signal,
+    isClosed: overrides.isClosed ?? (() => false),
+    absoluteDeadlineMs: overrides.absoluteDeadlineMs ?? 10_000,
+    heartbeatMs: overrides.heartbeatMs ?? 100,
+    maxManifestAgeMs: overrides.maxManifestAgeMs ?? 1_000,
+    maxBytes: 64 * 1024,
+  });
+  return { publisher, abort, now: () => now, setNow: (value) => { now = value; } };
+}
+
+function atomicManifest(revision, phase = "startup") {
+  return { schema: "myownmesh-owned-resources/v1", runId: "atomic-control",
+    revision, phase, owners: [], files: [] };
+}
+
+async function heartbeatCloseControl(
+  heartbeatFailure = null,
+  signal = new AbortController().signal,
+  holdRevision = 4,
+) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "myownmesh-sampler-close-"));
+  const policyPath = path.join(root, "policy.json");
+  await writeFile(policyPath, JSON.stringify({
+    schema: "myownmesh-resource-policy/v1",
+    runId: "heartbeat-close-control",
+    sampleIntervalMs: 1_000,
+    maxSweepMs: 1_000,
+    maxManifestAgeMs: 5_000,
+    maxInputBytes: 64 * 1024,
+  }));
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.pid = 4242;
+  child.exitCode = null;
+  child.signalCode = null;
+  const releaseHeartbeat = deferred(), heartbeatStarted = deferred();
+  const writes = [];
+  let tick, violations = 0;
+  const sampler = new ResourceSampler({
+    files: [],
+    policyPath,
+    manifestPath: path.join(root, "resource-manifest.json"),
+    scriptPath: path.join(root, "live-device-resources.ps1"),
+    heartbeatMs: 500,
+  }, "heartbeat-close-control", signal, {
+    spawn: () => {
+      queueMicrotask(() => {
+        child.emit("spawn");
+        child.stdout.write(`${JSON.stringify({
+          kind: "sample", decision: "Freeze", complete: false,
+          reasons: ["owner_unconfirmed"], lastAcceptedRevision: 1,
+          processes: [{ ownerId: "host-controller", registrationState: "unconfirmed",
+            creationTimeUtcTicks: "638612345678901234" }],
+        })}\n`);
+      });
+      return child;
+    },
+    atomicWrite: async (_file, manifest) => {
+      writes.push(manifest);
+      if (manifest.revision === 2) {
+        queueMicrotask(() => child.stdout.write(`${JSON.stringify({
+          kind: "sample", decision: "Continue", complete: true, reasons: [],
+          lastAcceptedRevision: 2,
+          processes: [{ ownerId: "host-controller", registrationState: "confirmed",
+            creationTimeUtcTicks: "638612345678901234" }],
+        })}\n`));
+      }
+      if (manifest.revision === holdRevision) {
+        heartbeatStarted.resolve();
+        await releaseHeartbeat.promise;
+        if (heartbeatFailure) throw heartbeatFailure;
+      }
+    },
+    setInterval: (callback) => {
+      tick = callback;
+      return { unref() {} };
+    },
+    clearInterval: () => {},
+    onViolation: () => { violations += 1; },
+  });
+  await sampler.start();
+  return {
+    sampler, child, writes, heartbeatStarted, releaseHeartbeat,
+    tick: () => tick(),
+    violations: () => violations,
+  };
+}
 
 const grantText = (value = 1) => GRANT_DIMENSIONS.map((name) => `${name}=${value}`).join(",");
 
@@ -130,6 +325,337 @@ test("diagnostic capture refuses to extend an exhausted host deadline", async ()
     await settleDiagnosticCapture(Promise.resolve({ status: "complete" }), 10, () => 0),
     { status: "complete" },
   );
+});
+
+test("Windows manifest replacement retries the same synced temp and commits one revision", async () => {
+  const fs = atomicFs([undefined, atomicFailure(), undefined]);
+  const { publisher } = atomicPublisher(fs);
+  await publisher.publish(atomicManifest(1));
+  await publisher.publish(atomicManifest(2));
+  assert.equal(fs.renames.length, 3);
+  assert.equal(fs.renames[1].source, fs.renames[2].source);
+  assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 2);
+  assert.equal([...fs.files.keys()].some((name) => name.endsWith(".tmp")), false);
+});
+
+test("a Windows retry re-proves temp, target snapshot, and freshness after waiting", async (context) => {
+  await context.test("temp changed during wait", async () => {
+    const fs = atomicFs([undefined, atomicFailure(), undefined]);
+    let control;
+    control = atomicPublisher(fs, { wait: async (ms) => {
+      control.setNow(control.now() + ms);
+      const temporary = [...fs.files.keys()].find((entry) => entry.endsWith(".tmp"));
+      fs.setJson(temporary, atomicManifest(99));
+    } });
+    await control.publisher.publish(atomicManifest(1));
+    await assert.rejects(control.publisher.publish(atomicManifest(2)),
+      (error) => error instanceof ControllerError && error.kind === "outcome_unknown");
+    assert.equal(fs.renames.length, 2);
+    assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 1);
+    assert.equal([...fs.files.keys()].filter((entry) => entry.endsWith(".tmp")).length, 1);
+  });
+
+  await context.test("target snapshot changed during wait", async () => {
+    const fs = atomicFs([undefined, atomicFailure(), undefined]);
+    let control;
+    control = atomicPublisher(fs, { wait: async (ms) => {
+      control.setNow(control.now() + ms);
+      fs.touch("C:\\evidence\\resource-manifest.json");
+    } });
+    await control.publisher.publish(atomicManifest(1));
+    await assert.rejects(control.publisher.publish(atomicManifest(2)),
+      (error) => error instanceof ControllerError && error.kind === "outcome_unknown");
+    assert.equal(fs.renames.length, 2);
+    assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 1);
+  });
+
+  await context.test("target custody crosses freshness cutoff", async () => {
+    const fs = atomicFs([undefined, atomicFailure(), undefined]);
+    const target = fs.key("C:\\evidence\\resource-manifest.json");
+    let control, afterWait = false;
+    const openWithSlowTarget = async (file, flag, mode) => {
+      if (afterWait && flag === "r" && fs.key(file) === target) control.setNow(1_000);
+      return fs.open(file, flag, mode);
+    };
+    control = atomicPublisher(fs, {
+      open: openWithSlowTarget,
+      maxManifestAgeMs: 1_000,
+      wait: async () => { control.setNow(400); afterWait = true; },
+    });
+    await control.publisher.publish(atomicManifest(1));
+    await assert.rejects(control.publisher.publish(atomicManifest(2)),
+      (error) => error.code === "EPERM" && error.syscall === "rename");
+    assert.equal(fs.renames.length, 2);
+    assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 1);
+  });
+});
+
+test("manifest replacement stops at existing freshness and host bounds without extending time", async () => {
+  const fs = atomicFs([undefined, atomicFailure(), atomicFailure(), atomicFailure()]);
+  const control = atomicPublisher(fs, { heartbeatMs: 400, maxManifestAgeMs: 1_000 });
+  await control.publisher.publish(atomicManifest(1));
+  await assert.rejects(control.publisher.publish(atomicManifest(2)),
+    (error) => error.code === "EPERM" && error.syscall === "rename");
+  assert.equal(control.now(), 1_000);
+  assert.equal(fs.renames.length, 4);
+  assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 1);
+  assert.equal([...fs.files.keys()].some((name) => name.endsWith(".tmp")), false);
+
+  const deadlineFs = atomicFs([undefined, atomicFailure()]);
+  const deadline = atomicPublisher(deadlineFs, { absoluteDeadlineMs: 50,
+    wait: async () => { deadline.setNow(50); } });
+  await deadline.publisher.publish(atomicManifest(1));
+  await assert.rejects(deadline.publisher.publish(atomicManifest(2)),
+    (error) => error.code === "EPERM" && error.syscall === "rename");
+  assert.equal(deadlineFs.renames.length, 2);
+});
+
+test("abort stops replacement retry while an aborted teardown retains one bounded attempt", async () => {
+  const fs = atomicFs([undefined, atomicFailure(), undefined]);
+  let control;
+  control = atomicPublisher(fs, { wait: async () => { control.abort.abort(); } });
+  await control.publisher.publish(atomicManifest(1));
+  await assert.rejects(control.publisher.publish(atomicManifest(2)),
+    (error) => error.code === "EPERM" && error.syscall === "rename");
+  assert.equal(fs.renames.length, 2);
+  await control.publisher.publish(atomicManifest(3, "teardown"), { allowAbortedFirstAttempt: true });
+  assert.equal(fs.renames.length, 3);
+  assert.equal(fs.json("C:\\evidence\\resource-manifest.json").revision, 3);
+  control.publisher.stop();
+  await assert.rejects(control.publisher.publish(atomicManifest(4, "complete"), { allowAbortedFirstAttempt: true }),
+    (error) => error instanceof ControllerError && error.kind === "censored");
+  assert.equal(fs.renames.length, 3);
+});
+
+test("replacement custody contradictions become outcome_unknown and never retry", async (context) => {
+  const scenarios = {
+    target_changed({ api, destinationKey }) {
+      api.setJson(destinationKey, atomicManifest(99));
+      throw atomicFailure();
+    },
+    temp_lost({ api, sourceKey }) {
+      api.remove(sourceKey);
+      throw atomicFailure();
+    },
+    temp_changed({ api, sourceKey }) {
+      api.setJson(sourceKey, atomicManifest(99));
+      throw atomicFailure();
+    },
+    target_unreadable({ api, destinationKey }) {
+      api.unreadable.add(destinationKey);
+      throw atomicFailure();
+    },
+    target_became_intended({ api, sourceKey, destinationKey }) {
+      api.files.set(destinationKey, api.files.get(sourceKey));
+      api.files.delete(sourceKey);
+      throw atomicFailure();
+    },
+  };
+  for (const [name, action] of Object.entries(scenarios)) {
+    await context.test(name, async () => {
+      const fs = atomicFs([undefined, action]);
+      const { publisher } = atomicPublisher(fs);
+      await publisher.publish(atomicManifest(1));
+      await assert.rejects(publisher.publish(atomicManifest(2)),
+        (error) => error instanceof ControllerError && error.kind === "outcome_unknown");
+      assert.equal(fs.renames.length, 2);
+      if (name === "temp_changed") {
+        assert.equal([...fs.files.keys()].filter((entry) => entry.endsWith(".tmp")).length, 1);
+      }
+    });
+  }
+});
+
+test("initial, non-Windows, and non-EPERM replacement failures are one-shot", async (context) => {
+  await context.test("initial", async () => {
+    const fs = atomicFs([atomicFailure()]);
+    const { publisher } = atomicPublisher(fs);
+    await assert.rejects(publisher.publish(atomicManifest(1)), (error) => error.code === "EPERM");
+    assert.equal(fs.renames.length, 1);
+  });
+  await context.test("non-Windows", async () => {
+    const fs = atomicFs([undefined, atomicFailure()]);
+    const { publisher } = atomicPublisher(fs, { platform: "linux" });
+    await publisher.publish(atomicManifest(1));
+    await assert.rejects(publisher.publish(atomicManifest(2)), (error) => error.code === "EPERM");
+    assert.equal(fs.renames.length, 2);
+  });
+  await context.test("non-EPERM", async () => {
+    const fs = atomicFs([undefined, atomicFailure("EACCES")]);
+    const { publisher } = atomicPublisher(fs);
+    await publisher.publish(atomicManifest(1));
+    await assert.rejects(publisher.publish(atomicManifest(2)), (error) => error.code === "EACCES");
+    assert.equal(fs.renames.length, 2);
+  });
+});
+
+test("publisher outcome_unknown permanently fences later revisions", async () => {
+  const unknownAfterRename = ({ api, sourceKey, destinationKey }) => {
+    api.files.set(destinationKey, api.files.get(sourceKey));
+    api.files.delete(sourceKey);
+    throw atomicFailure();
+  };
+  const fs = atomicFs([unknownAfterRename]);
+  const { publisher } = atomicPublisher(fs);
+  let firstError;
+  await assert.rejects(publisher.publish(atomicManifest(1)), (error) => {
+    firstError = error;
+    return error instanceof ControllerError && error.kind === "outcome_unknown";
+  });
+  await assert.rejects(publisher.publish(atomicManifest(2, "teardown"), {
+    allowAbortedFirstAttempt: true,
+  }), (error) => error === firstError);
+  assert.equal(fs.renames.length, 1);
+});
+
+test("sampler publication is serialized, phase-stable, joined on close, and closed thereafter", async () => {
+  const calls = [], first = deferred(), third = deferred(), thirdStarted = deferred();
+  let active = 0, maximumActive = 0;
+  const sampler = new ResourceSampler({ files: [], manifestPath: "C:\\evidence\\resource-manifest.json" },
+    "serialization-control", new AbortController().signal, {
+      atomicWrite: async (_file, manifest) => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        calls.push(manifest);
+        if (calls.length === 1) await first.promise;
+        if (calls.length === 3) { thirdStarted.resolve(); await third.promise; }
+        active -= 1;
+      },
+    });
+  const warm = sampler.setPhase("warm");
+  const steady = sampler.setPhase("steady");
+  first.resolve();
+  await Promise.all([warm, steady]);
+  assert.deepEqual(calls.map((row) => [row.revision, row.phase]), [[1, "warm"], [2, "steady"]]);
+  assert.equal(maximumActive, 1);
+  const teardown = sampler.setPhase("teardown");
+  await thirdStarted.promise;
+  let closeSettled = false;
+  const close = sampler.close().then(() => { closeSettled = true; });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  third.resolve();
+  await Promise.all([teardown, close]);
+  assert.equal(closeSettled, true);
+  await assert.rejects(sampler.setPhase("complete"),
+    (error) => error instanceof ControllerError && error.kind === "censored"
+      && error.message === "resource sampler publication stopped for owned close");
+  assert.equal(calls.length, 3);
+});
+
+test("sampler drops queued work after abort but permits one serialized teardown publication", async () => {
+  const abort = new AbortController();
+  const firstStarted = deferred(), releaseFirst = deferred();
+  const calls = [];
+  const sampler = new ResourceSampler({ files: [], manifestPath: "C:\\evidence\\resource-manifest.json" },
+    "queued-abort-control", abort.signal, {
+      atomicWrite: async (_file, manifest) => {
+        calls.push(manifest);
+        if (calls.length === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+          throw atomicFailure();
+        }
+      },
+    });
+  const first = sampler.setPhase("warm");
+  await firstStarted.promise;
+  const queued = sampler.setPhase("steady");
+  abort.abort();
+  releaseFirst.resolve();
+  await assert.rejects(first, (error) => error.code === "EPERM");
+  await assert.rejects(queued,
+    (error) => error instanceof ControllerError && error.kind === "censored");
+  assert.deepEqual(calls.map((row) => [row.revision, row.phase]), [[1, "warm"]]);
+  await sampler.setPhase("teardown");
+  assert.deepEqual(calls.map((row) => [row.revision, row.phase]), [[1, "warm"], [2, "teardown"]]);
+  await sampler.close();
+});
+
+test("sampler outcome_unknown fences queued and teardown publications before caller abort", async () => {
+  const unknown = new ControllerError("atomic custody uncertain", "outcome_unknown");
+  const firstStarted = deferred(), releaseFirst = deferred();
+  const calls = [];
+  const sampler = new ResourceSampler({ files: [], manifestPath: "C:\\evidence\\resource-manifest.json" },
+    "queued-unknown-control", new AbortController().signal, {
+      atomicWrite: async (_file, manifest) => {
+        calls.push(manifest);
+        firstStarted.resolve();
+        await releaseFirst.promise;
+        throw unknown;
+      },
+    });
+  const first = sampler.setPhase("warm");
+  const firstCheck = assert.rejects(first, (error) => error === unknown);
+  await firstStarted.promise;
+  const queued = sampler.setPhase("steady");
+  const queuedCheck = assert.rejects(queued, (error) => error === unknown);
+  releaseFirst.resolve();
+  await Promise.all([firstCheck, queuedCheck]);
+  assert.deepEqual(calls.map((row) => [row.revision, row.phase]), [[1, "warm"]]);
+  await assert.rejects(sampler.setPhase("teardown"), (error) => error === unknown);
+  assert.equal(calls.length, 1);
+  await sampler.close();
+});
+
+test("normal close owns a queued heartbeat refusal without creating a sampler violation", async () => {
+  const control = await heartbeatCloseControl();
+  await control.sampler.setPhase("complete");
+  control.tick();
+  await control.heartbeatStarted.promise;
+  control.tick();
+  await control.sampler.acceptObservation({
+    kind: "terminal", success: true, observedRequiredExited: true,
+  });
+  control.child.exitCode = 0;
+  control.child.stdout.end();
+  const closing = control.sampler.close();
+  control.releaseHeartbeat.resolve();
+  await closing;
+  assert.deepEqual(control.writes.map((row) => row.revision), [1, 2, 3, 4]);
+  assert.equal(control.violations(), 0);
+});
+
+test("normal close retains genuine heartbeat failure and ambiguity", async (context) => {
+  for (const [name, failure] of [
+    ["failure", atomicFailure("EIO", "write")],
+    ["unknown", new ControllerError("heartbeat custody uncertain", "outcome_unknown")],
+  ]) {
+    await context.test(name, async () => {
+      const control = await heartbeatCloseControl(failure);
+      await control.sampler.setPhase("complete");
+      control.tick();
+      await control.heartbeatStarted.promise;
+      await control.sampler.acceptObservation({
+        kind: "terminal", success: true, observedRequiredExited: true,
+      });
+      control.child.exitCode = 0;
+      control.child.stdout.end();
+      const closing = control.sampler.close();
+      const closeCheck = assert.rejects(closing, (error) => error === failure);
+      control.releaseHeartbeat.resolve();
+      await closeCheck;
+      assert.deepEqual(control.writes.map((row) => row.revision), [1, 2, 3, 4]);
+      assert.equal(control.violations(), 1);
+    });
+  }
+});
+
+test("external work cancellation racing close is not treated as owned close cancellation", async () => {
+  const abort = new AbortController();
+  const control = await heartbeatCloseControl(null, abort.signal, 3);
+  control.tick();
+  await control.heartbeatStarted.promise;
+  control.tick();
+  abort.abort();
+  control.child.exitCode = 0;
+  control.child.stdout.end();
+  const closeCheck = assert.rejects(control.sampler.close(),
+    (error) => error instanceof ControllerError && error.kind === "censored");
+  control.releaseHeartbeat.resolve();
+  await closeCheck;
+  assert.deepEqual(control.writes.map((row) => row.revision), [1, 2, 3]);
+  assert.equal(control.violations(), 1);
 });
 
 test("a missing sampler heartbeat cancels held work at the declared freshness bound", async () => {
@@ -598,11 +1124,22 @@ test("one host owner starts its global-ten subset serially and completes phases 
     { sequence: 2, kind: "complete" },
   ]);
   const log = [];
+  const clock = () => 123;
+  let receivedSamplerHooks;
+  class CapturingSampler extends FakeSampler {
+    constructor(_config, _runId, _signal, hooks) {
+      super();
+      receivedSamplerHooks = hooks;
+    }
+  }
   const result = await runScaleHost(
     { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
-    { createPeerSession: fakeSessions(log), ResourceSampler: FakeSampler, emitLifecycle: async () => {} },
+    { monoMs: clock, createPeerSession: fakeSessions(log), ResourceSampler: CapturingSampler,
+      samplerHooks: { monoMs: () => 999, absoluteDeadlineMs: -1 }, emitLifecycle: async () => {} },
   );
   assert.deepEqual(result, { status: "complete", sessions: 4, commands: 1 });
+  assert.equal(receivedSamplerHooks.monoMs, clock);
+  assert.equal(receivedSamplerHooks.absoluteDeadlineMs, 60_123);
   assert.equal(log.filter((row) => row.startsWith("start:")).length, 4);
   assert.equal(log.filter((row) => row.startsWith("close:")).length, 4);
   const evidence = await readFile(files.outputPath, "utf8");

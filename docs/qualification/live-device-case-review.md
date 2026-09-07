@@ -601,3 +601,126 @@ Independent verification of the frozen `CBF73371...F56F8CB` host and
 blockers after reading both final runs in full. This permits preliminary
 harness publication only; it does not replace the separate case-input,
 deployment, actual network workload or final independent field-audit gates.
+
+### Windows sampler-heartbeat correction: preliminary qualification
+
+The current operator scope is a measured chart through 100 nodes; larger
+tests are deferred. This section records a harness correction, not a
+successful 50-node or 100-node measurement. PR #7 remains open, draft,
+unmerged and on HOLD. The existing release/CI block is not waived.
+
+#### Retained live failure and bounded diagnosis
+
+The first connected50 attempt used the previously qualified 50 identities
+and prepared configurations. All three trials terminated unsuccessfully:
+
+| Host | Durable run | Retained outcome |
+| --- | --- | --- |
+| Desktop | `c916bc4f-3515-4f81-ae70-5b8e9a6c9a6a` | Exit 1; sampler-manifest heartbeat `EPERM` / `rename` / -4048 after 619 ms, before any peer terminal. |
+| Home | `bc05686b-29a1-44bf-8a64-a8f0a15b15c6` | Remote control plane reported HTTP 400; separately retained native evidence records the same heartbeat failure after approximately 49 seconds and 21 peers. |
+| Laptop | `90843b4b-6537-4ce3-8c93-21cdfbab25dc` | Remote control plane reported HTTP 400; separately retained native evidence is censored after approximately 102 seconds and 15 peers. |
+
+An HTTP 400 control-plane response is not proof that no native work ran.
+These are failed/censored trials, not measured memory exhaustion, capacity
+limits or connected50 qualification. Their artifacts and used journals remain
+retained; no fresh trial may silently reuse them.
+
+Finite native file-replacement diagnostics reproduced Windows `EPERM` even
+with a reader opened with Read/Write/Delete sharing. Removing the manifest
+from diagnostic self-accounting did not eliminate the failure. These results
+do not identify the particular production handle or exclude an external
+scanner. The corrected reader-exposure probe
+`10dc89c1-8f9f-450d-81be-2e52a2547985` retained explicit stop acknowledgements,
+owned exits and the first-replacement failure for both sharing controls.
+
+#### Correction and unchanged boundaries
+
+The host now owns a serialized atomic manifest publisher. Only Windows
+`EPERM` from `rename`, following a prior successful publication, is eligible
+for bounded replacement retry. The publisher reuses the same uniquely
+created, written, synced and closed temporary file, bytes and revision.
+Before retrying it checks the intended temporary's identity/content and
+the prior target's identity/content/size/timestamps. It rechecks cancellation
+and time after awaited custody reads. Retry stops at the earlier of the
+existing manifest-freshness cutoff and the full host deadline; pacing uses
+the existing heartbeat interval. No grant, sampler policy, workload deadline
+or teardown reserve is increased.
+
+Initial publication, non-Windows failures and other error classes remain
+one-shot. Uncertain target or temporary custody latches `outcome_unknown`
+and fences already-queued, later and teardown publications. Cleanup is
+restricted to the exact owned temporary; changed or uncertain files are not
+silently removed. This is not a general filesystem or network/RPC retry.
+
+Normal sampler close marks only its own cancellation objects in a private
+WeakSet. A queued heartbeat refused by that owned close does not invent a
+violation. External cancellation and real prior/in-flight errors or unknown
+outcomes remain failures. Close still joins publication, collector and
+capture ownership. This does not guarantee recovery from sustained Windows
+contention or make pre-rename checks a continuous exclusive filesystem lease.
+
+#### Candidate controls and native evidence
+
+The candidate is based on published head
+`a0f42fc380feaf7eec35f1081e83142b5f1c1436`. Its two changed source files are:
+
+- Host SHA256: `C8FD37F848A2896E43C4D37B70CC159302FCF6BE8B7FFAD6ED50BC23D6F066DF`.
+- Maintained tests SHA256: `D502BCB7DBF09398D5309D44C80F2AE9A2DCA9F8514536D9A84BD5663487F36D`.
+
+Combined run `ba34eb5b-edc7-44c3-aca4-165187bc593a` passed 96/96 tests,
+exit 0, with 20878 stdout bytes, zero stderr, both streams read through EOF,
+and no failures, skips, cancellations or truncation. This includes 90
+maintained controls and six unchanged manager regression controls. The
+complete two-file candidate source manifest is
+`caa18b9f0173ad31d0eadc0c87efbf571c317938832e35e4d8d119100bd6ff48`.
+
+Native run `dc4d2e74-5716-4ce2-bfff-3eb6a1c3eadf` passed all six cells
+and the complete final probe terminal, exit 0, 3818/0 bytes through EOF:
+
+| Native boundary | Observation |
+| --- | --- |
+| Uncontended publisher | 61 successful replacements, revisions 1 through 61. |
+| Brief held shared-delete reader | Three real EPERM failures, then the exact same temporary became revision 2. |
+| Sustained reader | Ten failures; last rename attempt at 4901.0345 ms, before the 5010.768 ms freshness cutoff; old revision retained. |
+| Abort during contention | Two failures, then bounded stop with old revision retained. |
+| Full deadline during contention | Four failures; last rename attempt at 1836.55 ms, before the 2200 ms cutoff; old revision retained. |
+| Actual PowerShell sampler | 30 publications, 12 samples and a complete successful terminal; no first violation. |
+
+All four readers acknowledged explicit stop and exited without force; no
+temporary files remained in any cell. Cleanup/join finished 15.30 ms and
+12.64 ms after the sustained/full cutoffs respectively, without a rename
+attempt at or after those cutoffs.
+
+The actual sampler used one finite Node helper registered as a daemon-role
+owner solely to exercise creation pinning and required-exit accounting.
+No mesh daemon or network started. Two bootstrap owner-unconfirmed samples
+remain incomplete; the other ten are complete/Continue. The terminal records
+zero evidence failures and requiredExited=true, while its controller was
+still alive. The helper and collector exited; a manager read-only census
+subsequently found controller 55768, helper 29196 and collector 60520 absent.
+These small harness observations are not scale or durability evidence.
+
+Ignored native probe SHA256:
+`57B0EFD084F615FA270106B877BD0E747109747A16CDC82FC94800CF1B9100CB`.
+Retained artifacts are under
+`target/qualification-evidence/live-device-inputs/atomic-native-a962iO`:
+
+- `summary.json`: `47FBC892D2B179EFC433DB09EE09D05ECA600D77EE8B2E5A0B21039786119663`.
+- `actual_sampler/evidence.json`: `FE9C0A181B593A0CE06D741998192D526B3E6DFACFB1AC80F2FE36B175AA575D`.
+- `actual_sampler/result.jsonl`, 35754 bytes / 13 rows: `2625AC438659BECC1F849583082D4AA94D9BCD66D5BFECC8E1EDA999F2EF4432`.
+
+Ignored artifacts are bound by these explicit hashes, not by tracked Git
+cleanliness, and are not hosted attachments. The earlier incomplete native
+run `f69aa94e`, failing native run `375a6d33`, four-boundary reproduction
+`ad0f855e`, normal-close reproduction `30e7023a` and fixture failures remain
+in the local `pilot50-a0f42fc/c1/heartbeat-retry-boundary-findings.md` ledger.
+None is relabeled as passing.
+
+Diffie implemented the two-file correction. Payne independently read the
+final source, maintained and manager controls, both complete durable logs,
+six raw native cell artifacts and all sampler owner/phase/decision rows.
+His bounded SOURCE/CONTROL/native verdict is PASS; he made no implementation
+changes. This supports preliminary correction publication only. Exact
+pushed-head execution and Turing's independent audit are separate subsequent
+gates. Connected50 recovery, the chart through100, field paths, performance
+and graceful durability remain unqualified at this checkpoint.

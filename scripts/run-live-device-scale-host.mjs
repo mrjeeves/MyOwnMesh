@@ -495,19 +495,274 @@ export async function settleDiagnosticCapture(capture, deadlineMs, now = monoMs)
   });
 }
 
-async function writeAtomicJson(filePath, value) {
-  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  const handle = await open(temporary, "wx", 0o600);
-  let renamed = false;
-  try {
-    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
-    await handle.sync();
-    await handle.close();
-    await rename(temporary, filePath);
-    renamed = true;
-  } finally {
-    await handle.close().catch(() => {});
-    if (!renamed) await unlink(temporary).catch(() => {});
+function samePhysicalFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameAtomicSnapshot(left, right) {
+  return samePhysicalFile(left, right) && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function atomicUnknown(cause) {
+  return new ControllerError("atomic manifest replacement custody became uncertain", "outcome_unknown", cause);
+}
+
+const SAMPLER_CLOSE_CANCELLATIONS = new WeakSet();
+
+function samplerCloseCancellation(cause) {
+  const error = new ControllerError("resource sampler publication stopped for owned close", "censored", cause);
+  SAMPLER_CLOSE_CANCELLATIONS.add(error);
+  return error;
+}
+
+function isSamplerCloseCancellation(error) {
+  return error && typeof error === "object" && SAMPLER_CLOSE_CANCELLATIONS.has(error);
+}
+
+function retryWait(ms, signals) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const signal of signals) signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    timer.unref?.();
+    for (const signal of signals) {
+      if (signal?.aborted) return finish();
+      signal?.addEventListener("abort", finish, { once: true });
+    }
+  });
+}
+
+// The Windows retry is deliberately local to one already-synced temporary.
+// It is not a generic filesystem retry and never reserializes a revision.
+export class AtomicJsonPublisher {
+  constructor(filePath, runId, options = {}) {
+    this.filePath = filePath;
+    this.runId = runId;
+    this.platform = options.platform ?? process.platform;
+    this.open = options.open ?? open;
+    this.rename = options.rename ?? rename;
+    this.stat = options.stat ?? stat;
+    this.unlink = options.unlink ?? unlink;
+    this.uuid = options.randomUUID ?? randomUUID;
+    this.now = options.monoMs ?? monoMs;
+    this.wait = options.wait ?? retryWait;
+    this.signal = options.signal;
+    this.isClosed = options.isClosed ?? (() => false);
+    this.absoluteDeadlineMs = options.absoluteDeadlineMs ?? Number.POSITIVE_INFINITY;
+    if (this.absoluteDeadlineMs !== Number.POSITIVE_INFINITY
+      && (!Number.isFinite(this.absoluteDeadlineMs) || this.absoluteDeadlineMs < this.now())) {
+      throw new ControllerError("atomic manifest host deadline is invalid");
+    }
+    this.heartbeatMs = checkedInteger(options.heartbeatMs, "heartbeatMs", 1, 60_000);
+    this.maxManifestAgeMs = checkedInteger(options.maxManifestAgeMs, "maxManifestAgeMs", 1, 86_400_000);
+    this.maxBytes = checkedInteger(options.maxBytes, "maxInputBytes", 1, SCALE_LIMITS.manifestBytes);
+    this.stopController = new AbortController();
+    this.lastCommitted = null;
+    this.uncertain = null;
+  }
+
+  stop() {
+    this.stopController.abort();
+  }
+
+  #interruption(allowAborted, cause) {
+    if (!allowAborted && this.signal?.aborted) {
+      return new ControllerError("atomic manifest replacement was interrupted", "censored", cause);
+    }
+    if (this.stopController.signal.aborted || this.isClosed()) {
+      return samplerCloseCancellation(cause);
+    }
+    return null;
+  }
+
+  #checkActive(allowAborted) {
+    if (this.uncertain) throw this.uncertain;
+    const interruption = this.#interruption(allowAborted);
+    if (interruption) throw interruption;
+    if (this.now() >= this.absoluteDeadlineMs) {
+      throw new ControllerError("atomic manifest replacement reached the host deadline", "censored");
+    }
+  }
+
+  async #capture(filePath) {
+    let handle;
+    try { handle = await this.open(filePath, "r"); }
+    catch (error) {
+      if (error?.code === "ENOENT") return { status: "absent" };
+      throw atomicUnknown(error);
+    }
+    try {
+      const before = await handle.stat({ bigint: true });
+      if (!before.isFile() || before.size > BigInt(this.maxBytes)) throw atomicUnknown();
+      const buffer = Buffer.alloc(this.maxBytes + 1);
+      let count = 0;
+      for (;;) {
+        const result = await handle.read(buffer, count, buffer.length - count, count);
+        count += result.bytesRead;
+        if (result.bytesRead === 0 || count === buffer.length) break;
+      }
+      const after = await handle.stat({ bigint: true });
+      await handle.close();
+      handle = null;
+      const named = await this.stat(filePath, { bigint: true });
+      if (!after.isFile() || count > this.maxBytes || BigInt(count) !== after.size
+        || !sameAtomicSnapshot(before, after) || !sameAtomicSnapshot(after, named)) {
+        throw atomicUnknown();
+      }
+      const bytes = buffer.subarray(0, count);
+      return { status: "present", bytes, snapshot: named, sha256: sha256(bytes) };
+    } catch (error) {
+      if (error instanceof ControllerError && error.kind === "outcome_unknown") throw error;
+      throw atomicUnknown(error);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+  }
+
+  #validateManifest(capture, expected) {
+    if (capture.status !== "present" || capture.sha256 !== expected.sha256
+      || !capture.bytes.equals(expected.bytes)) throw atomicUnknown();
+    let parsed;
+    try { parsed = JSON.parse(capture.bytes.toString("utf8")); }
+    catch (error) { throw atomicUnknown(error); }
+    if (parsed?.schema !== "myownmesh-owned-resources/v1" || parsed.runId !== this.runId
+      || parsed.revision !== expected.revision) throw atomicUnknown();
+  }
+
+  async #verifyTemp(temporary, created, intended) {
+    const captured = await this.#capture(temporary);
+    this.#validateManifest(captured, intended);
+    if (!samePhysicalFile(captured.snapshot, created)) throw atomicUnknown();
+    return captured;
+  }
+
+  async #verifyTarget(expected) {
+    const captured = await this.#capture(this.filePath);
+    this.#validateManifest(captured, expected);
+    if (!sameAtomicSnapshot(captured.snapshot, expected.snapshot)) throw atomicUnknown();
+    return captured;
+  }
+
+  async #verifyRejected(temporary, created, intended) {
+    await this.#verifyTemp(temporary, created, intended);
+    if (this.lastCommitted) await this.#verifyTarget(this.lastCommitted);
+    else {
+      const target = await this.#capture(this.filePath);
+      if (target.status === "present" && target.sha256 === intended.sha256
+        && target.bytes.equals(intended.bytes)) throw atomicUnknown();
+    }
+  }
+
+  async #cleanup(temporary, created, intended, validateContent) {
+    let captured;
+    try { captured = await this.#capture(temporary); }
+    catch (error) { throw atomicUnknown(error); }
+    if (captured.status === "absent") return;
+    if (validateContent) this.#validateManifest(captured, intended);
+    if (!samePhysicalFile(captured.snapshot, created)) throw atomicUnknown();
+    try { await this.unlink(temporary); }
+    catch (error) { throw atomicUnknown(error); }
+  }
+
+  async publish(value, options = {}) {
+    const allowAbortedFirstAttempt = options.allowAbortedFirstAttempt === true;
+    this.#checkActive(allowAbortedFirstAttempt);
+    if (value?.schema !== "myownmesh-owned-resources/v1" || value.runId !== this.runId
+      || !Number.isSafeInteger(value.revision) || value.revision < 1
+      || (this.lastCommitted && value.revision <= this.lastCommitted.revision)) {
+      throw new ControllerError("atomic manifest revision is invalid");
+    }
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+    if (bytes.length > this.maxBytes) throw new ControllerError("atomic manifest exceeds maxInputBytes");
+    const intended = { bytes, sha256: sha256(bytes), revision: value.revision };
+    const temporary = `${this.filePath}.${process.pid}.${this.uuid()}.tmp`;
+    let handle, created, renamed = false, selectedError;
+    let closeAttempted = false, tempClosed = false, tempDurable = false;
+    try {
+      handle = await this.open(temporary, "wx", 0o600);
+      created = await handle.stat({ bigint: true });
+      if (!created.isFile()) throw atomicUnknown();
+      this.#checkActive(allowAbortedFirstAttempt);
+      await handle.writeFile(bytes);
+      this.#checkActive(allowAbortedFirstAttempt);
+      await handle.sync();
+      tempDurable = true;
+      this.#checkActive(allowAbortedFirstAttempt);
+      closeAttempted = true;
+      await handle.close();
+      tempClosed = true;
+      handle = null;
+      this.#checkActive(allowAbortedFirstAttempt);
+      await this.#verifyTemp(temporary, created, intended);
+      this.#checkActive(allowAbortedFirstAttempt);
+      const retryDeadline = this.lastCommitted
+        ? Math.min(this.absoluteDeadlineMs, this.lastCommitted.committedAt + this.maxManifestAgeMs)
+        : this.absoluteDeadlineMs;
+      let firstAttempt = true;
+      for (;;) {
+        this.#checkActive(firstAttempt && allowAbortedFirstAttempt);
+        await this.#verifyTemp(temporary, created, intended);
+        this.#checkActive(firstAttempt && allowAbortedFirstAttempt);
+        if (this.lastCommitted) await this.#verifyTarget(this.lastCommitted);
+        this.#checkActive(firstAttempt && allowAbortedFirstAttempt);
+        if (!firstAttempt && this.now() >= retryDeadline) throw selectedError;
+        try {
+          await this.rename(temporary, this.filePath);
+          renamed = true;
+          const committed = await this.#capture(this.filePath);
+          this.#validateManifest(committed, intended);
+          if (!samePhysicalFile(committed.snapshot, created)) throw atomicUnknown();
+          this.lastCommitted = { ...intended, snapshot: committed.snapshot, committedAt: this.now() };
+          return;
+        } catch (error) {
+          selectedError = error;
+          const retryable = this.platform === "win32" && error?.code === "EPERM"
+            && error?.syscall === "rename" && this.lastCommitted !== null;
+          if (!retryable) {
+            if (!renamed) await this.#verifyRejected(temporary, created, intended);
+            throw error;
+          }
+          await this.#verifyRejected(temporary, created, intended);
+          firstAttempt = false;
+          const beforeWaitInterruption = this.#interruption(false, error);
+          if (beforeWaitInterruption) throw beforeWaitInterruption;
+          const remaining = retryDeadline - this.now();
+          if (remaining <= 0) throw error;
+          await this.wait(Math.min(this.heartbeatMs, remaining), [this.signal, this.stopController.signal]);
+          const afterWaitInterruption = this.#interruption(false, error);
+          if (afterWaitInterruption) throw afterWaitInterruption;
+          if (this.now() >= retryDeadline) throw error;
+        }
+      }
+    } catch (error) {
+      selectedError = mergeControllerError(selectedError, error);
+    } finally {
+      if (handle && !closeAttempted) {
+        closeAttempted = true;
+        try {
+          await handle.close();
+          tempClosed = true;
+          handle = null;
+        } catch (error) {
+          selectedError = mergeControllerError(selectedError, atomicUnknown(error));
+        }
+      } else if (handle) {
+        selectedError = mergeControllerError(selectedError, atomicUnknown());
+      }
+      if (!renamed && created && tempClosed) {
+        try { await this.#cleanup(temporary, created, intended, tempDurable); }
+        catch (error) { selectedError = mergeControllerError(selectedError, error); }
+      }
+    }
+    if (selectedError?.kind === "outcome_unknown") this.uncertain ??= selectedError;
+    throw this.uncertain ?? selectedError;
   }
 }
 
@@ -554,8 +809,12 @@ export class ResourceSampler {
     this.runId = runId;
     this.signal = signal;
     this.spawn = hooks.spawn ?? spawn;
-    this.atomicWrite = hooks.atomicWrite ?? writeAtomicJson;
+    this.atomicWrite = hooks.atomicWrite;
+    this.publisherHooks = hooks.publisherHooks ?? {};
+    this.absoluteDeadlineMs = hooks.absoluteDeadlineMs ?? Number.POSITIVE_INFINITY;
     this.now = hooks.monoMs ?? monoMs;
+    this.scheduleHeartbeat = hooks.setInterval ?? setInterval;
+    this.cancelHeartbeat = hooks.clearInterval ?? clearInterval;
     this.onRecord = hooks.onRecord;
     this.onViolation = hooks.onViolation;
     this.owners = [];
@@ -566,6 +825,7 @@ export class ResourceSampler {
     this.outputBytes = 0;
     this.closed = false;
     this.publishChain = Promise.resolve();
+    this.publicationUncertainty = null;
     this.files = config.files.filter((file) => file.nodeAlias == null);
   }
 
@@ -580,6 +840,18 @@ export class ResourceSampler {
       throw new ControllerError("resource sampler policy identity does not match the host run");
     }
     this.freshnessMs = samplerFreshnessMs(policy);
+    if (!this.atomicWrite) {
+      this.publisher = new AtomicJsonPublisher(this.config.manifestPath, this.runId, {
+        ...this.publisherHooks,
+        signal: this.signal,
+        isClosed: () => this.closed,
+        absoluteDeadlineMs: this.absoluteDeadlineMs,
+        heartbeatMs: this.config.heartbeatMs,
+        maxManifestAgeMs: policy.maxManifestAgeMs,
+        maxBytes: policy.maxInputBytes,
+        monoMs: this.now,
+      });
+    }
     this.owners.push(samplerOwner("host-controller", "host", "controller", process.pid, false));
     await this.#publish();
     this.child = this.spawn(
@@ -625,15 +897,19 @@ export class ResourceSampler {
         this.#violate(error, "sampler_output");
       }
     })();
-    this.heartbeat = setInterval(() => {
-      this.#publish().catch((error) => this.#violate(error, "sampler_manifest_heartbeat"));
+    this.heartbeat = this.scheduleHeartbeat(() => {
+      this.#publish().catch((error) => {
+        if (!isSamplerCloseCancellation(error)) {
+          this.#violate(error, "sampler_manifest_heartbeat");
+        }
+      });
     }, this.config.heartbeatMs);
     this.heartbeat.unref?.();
     await this.#pinOwner("host-controller", () => !this.signal.aborted);
   }
 
   #violate(error, lifecycleStage = "resource_sampler") {
-    clearInterval(this.heartbeat);
+    this.cancelHeartbeat(this.heartbeat);
     clearTimeout(this.freshnessTimer);
     const violationEvidence = boundedHostErrorEvidence(error, lifecycleStage);
     this.firstViolation ??= violationEvidence;
@@ -682,18 +958,42 @@ export class ResourceSampler {
   }
 
   async #publish() {
-    this.publishChain = this.publishChain.then(async () => {
+    const phase = this.phase;
+    const owners = this.owners.map((owner) => ({ ...owner }));
+    const files = this.files.map((file) => ({ path: path.resolve(file.path), kind: file.kind }));
+    const prior = this.publishChain;
+    const recovered = prior.catch((error) => {
+      if (error?.kind === "outcome_unknown") this.publicationUncertainty ??= error;
+      if (this.publicationUncertainty) throw this.publicationUncertainty;
+    });
+    const operation = recovered.then(async () => {
+      if (this.publicationUncertainty) throw this.publicationUncertainty;
+      const allowAbortedFirstAttempt = phase === "teardown" || phase === "complete";
+      if (this.signal?.aborted && !allowAbortedFirstAttempt) {
+        throw new ControllerError("resource sampler publication was interrupted", "censored");
+      }
+      if (this.closed) throw samplerCloseCancellation();
+      if (this.now() >= this.absoluteDeadlineMs) {
+        throw new ControllerError("resource sampler publication reached the host deadline", "censored");
+      }
       const revision = ++this.revision;
       const manifest = {
         schema: "myownmesh-owned-resources/v1",
         runId: this.runId,
         revision,
-        phase: this.phase,
-        owners: this.owners.map((owner) => ({ ...owner })),
-        files: this.files.map((file) => ({ path: path.resolve(file.path), kind: file.kind })),
+        phase,
+        owners,
+        files,
       };
-      await this.atomicWrite(this.config.manifestPath, manifest);
+      if (this.atomicWrite) await this.atomicWrite(this.config.manifestPath, manifest);
+      else await this.publisher.publish(manifest, {
+        allowAbortedFirstAttempt,
+      });
       return revision;
+    });
+    this.publishChain = operation.catch((error) => {
+      if (error?.kind === "outcome_unknown") this.publicationUncertainty ??= error;
+      throw this.publicationUncertainty ?? error;
     });
     return this.publishChain;
   }
@@ -787,8 +1087,10 @@ export class ResourceSampler {
 
   async close() {
     this.closed = true;
-    clearInterval(this.heartbeat);
+    this.cancelHeartbeat(this.heartbeat);
     clearTimeout(this.freshnessTimer);
+    this.publisher?.stop();
+    await this.publishChain.catch(() => {});
     if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
       await stopOwnedChild(this.child, this.now() + PEER_LIMITS.shutdownMs).catch((error) => {
         this.failure ??= error;
@@ -989,6 +1291,8 @@ export async function runScaleHost(args, hooks = {}) {
       const Sampler = hooks.ResourceSampler ?? ResourceSampler;
       sampler = new Sampler(manifest.sampler, manifest.runId, abort.signal, {
         ...hooks.samplerHooks,
+        absoluteDeadlineMs: deadlineMs,
+        monoMs: clock,
         onRecord: (row) => record({ type: "resource_observation", record: row }),
         onViolation: (error, evidence, firstEvidence) => {
           if (!samplerCallbacksOpen) return;
