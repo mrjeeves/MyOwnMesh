@@ -742,6 +742,45 @@ export class JsonLineConnection {
   }
 }
 
+// One optional observer belongs to one RPC, never to the client or connection.
+// No request, reply, endpoint or error is passed to it. An observer failure is
+// diagnostic failure only: disable it without disturbing the operation.
+function rpcTiming(onTiming) {
+  if (typeof onTiming !== "function") return null;
+  let observer = onTiming;
+  let failed = false;
+  return {
+    get failed() { return failed; },
+    mark(phase) {
+      if (!observer) return;
+      try { observer(phase, monoMs()); }
+      catch { failed = true; observer = null; }
+    },
+    dispose() { observer = null; },
+  };
+}
+
+function timedRpcPromise(promise, timing) {
+  if (timing) {
+    Object.defineProperty(promise, "timingObserverFailed", {
+      get: () => timing.failed,
+    });
+  }
+  return promise;
+}
+
+// Both standalone and persistent PeerSession contexts use the same forwarding
+// rule. The cleanup predicate is evaluated per call, preserving its work-signal
+// bypass; the third context argument is only the optional synchronous observer.
+export function createRpcContextAdapter(client, workSignal, cleanupMode) {
+  return (request, timeoutMs, onTiming) => {
+    const signal = cleanupMode() ? undefined : workSignal;
+    return onTiming === undefined
+      ? client.rpc(request, timeoutMs, signal)
+      : client.rpc(request, timeoutMs, signal, onTiming);
+  };
+}
+
 export class RpcClient {
   constructor(endpoint, deadlineMs, signal) {
     this.endpoint = endpoint;
@@ -759,25 +798,33 @@ export class RpcClient {
     return this.connection;
   }
 
-  rpc(request, requestedMs, workSignal = undefined) {
+  rpc(request, requestedMs, workSignal = undefined, onTiming = undefined) {
+    const timing = rpcTiming(onTiming);
     if (request === null || Array.isArray(request) || typeof request !== "object") {
-      return Promise.reject(new ControllerError("rpc request must be an object"));
+      timing?.dispose();
+      return timedRpcPromise(Promise.reject(new ControllerError("rpc request must be an object")), timing);
     }
     if (this.pending >= LIMITS.queuedFrames) {
-      return Promise.reject(new ControllerError("RPC request queue exceeded the bound"));
+      timing?.dispose();
+      return timedRpcPromise(Promise.reject(new ControllerError("RPC request queue exceeded the bound")), timing);
     }
     this.pending += 1;
     const task = this.tail.then(
-      () => this.#rpcOne(request, requestedMs, workSignal),
-      () => this.#rpcOne(request, requestedMs, workSignal),
+      () => this.#rpcOne(request, requestedMs, workSignal, timing),
+      () => this.#rpcOne(request, requestedMs, workSignal, timing),
     );
     this.tail = task.catch(() => {});
-    return task.finally(() => {
+    // Publish queue order before invoking caller code. Even a reentrant
+    // diagnostic observer cannot insert another RPC ahead of this one.
+    timing?.mark("enqueued");
+    return timedRpcPromise(task.finally(() => {
       this.pending -= 1;
-    });
+      timing?.dispose();
+    }), timing);
   }
 
-  async #rpcOne(request, requestedMs, workSignal) {
+  async #rpcOne(request, requestedMs, workSignal, timing) {
+    timing?.mark("dequeued");
     const timeoutMs = remainingMs(this.deadlineMs, requestedMs);
     const signal = workSignal ?? this.signal;
     let sent = false;
@@ -785,9 +832,17 @@ export class RpcClient {
       const connection = this.connection && !this.connection.terminal
         ? this.connection
         : await this.#ensure(timeoutMs, signal);
+      timing?.mark("connection_ready");
       await connection.send(request, timeoutMs, signal);
       sent = true;
-      return await connection.nextFrame(timeoutMs, signal);
+      // Successful write-callback completion observed after send's await, not
+      // the callback invocation instant, remote receipt, or daemon execution.
+      timing?.mark("write_completion_observed");
+      const reply = await connection.nextFrame(timeoutMs, signal);
+      // Decoded reply observed by this RPC, not socket arrival/JSON.parse time:
+      // nextFrame may consume a reply buffered while the write was pending.
+      timing?.mark("reply_observed");
+      return reply;
     } catch (error) {
       this.connection?.close();
       this.connection = null;
@@ -1449,11 +1504,7 @@ class PeerSession {
     const commandStartedMs = monoMs();
     const session = this;
     const context = Object.freeze({
-      rpc: (request, timeoutMs) => this.rpc.rpc(
-        request,
-        timeoutMs,
-        this.cleanupMode ? undefined : this.workAbort.signal,
-      ),
+      rpc: createRpcContextAdapter(this.rpc, this.workAbort.signal, () => this.cleanupMode),
       requireOk,
       subscribe: (network, channel, onEvent) => this.events.subscribe(network, channel, onEvent),
       monoMs,
@@ -1888,11 +1939,7 @@ export async function runController(args) {
         mono_ms: commandStartedMs,
       });
       const context = Object.freeze({
-        rpc: (request, timeoutMs) => rpc.rpc(
-          request,
-          timeoutMs,
-          cleanupMode ? undefined : workAbort.signal,
-        ),
+        rpc: createRpcContextAdapter(rpc, workAbort.signal, () => cleanupMode),
         requireOk,
         subscribe: (network, channel, onEvent) => events.subscribe(network, channel, onEvent),
         monoMs,

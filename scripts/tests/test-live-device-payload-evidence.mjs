@@ -195,3 +195,273 @@ test('payload responder preserves pressure diagnostics through its owned termina
   } finally { await lifetime.cleanup(); }
   assert.equal(f.releases(), 1);
 });
+
+test('diagnostic flag is strict, generic-echo-only and invalid preflight has no IPC effects', async () => {
+  for (const diagnostic_timing of [null, 0, 1, 'true', {}, []]) {
+    const f = fixture();
+    f.ctx.rpc = f.ctx.subscribe = async () => assert.fail('invalid timing flag reached IPC');
+    await assert.rejects(runPayload(f.ctx, command({ diagnostic_timing })),
+      error => error.stage === 'preflight' && error.category === 'invalid_diagnostic_timing');
+    assert.equal(f.sends.length, 0);
+    assert.equal(f.releases(), 0);
+    assert.equal(f.emitted.length, 0);
+  }
+  for (const action of ['relay_echo_run', 'relay_echo_listen']) {
+    for (const diagnostic_timing of [false, true]) {
+      const f = fixture();
+      f.ctx.rpc = f.ctx.subscribe = async () => assert.fail('relay diagnostic preflight reached IPC');
+      await assert.rejects(runPayload(f.ctx, command({ action, diagnostic_timing })),
+        error => error.category === 'invalid_diagnostic_timing');
+      assert.equal(f.sends.length, 0);
+    }
+  }
+});
+
+test('diagnostics leave default summary, packets, order and counters unchanged and serialize only terminal numeric evidence', async () => {
+  const runs = [];
+  for (const flag of [undefined, false, true]) {
+    const f = fixture();
+    const c = command(flag === undefined ? {} : { diagnostic_timing: flag });
+    let emittedWhileOwned = false;
+    f.ctx.emit = async () => { if (f.releases() === 0) emittedWhileOwned = true; };
+    const result = await runPayload(f.ctx, c);
+    runs.push({ result, sends: f.sends });
+    assert.equal(emittedWhileOwned, false);
+    if (flag !== true) assert.equal(Object.hasOwn(result, 'diagnostic_timing'), false);
+    else {
+      const e = result.diagnostic_timing;
+      assert.equal(e.role, 'sender');
+      assert.equal(e.rows.length, c.samples);
+      for (const row of e.rows) {
+        assert.equal(row.length, e.columns.length);
+        assert(row.every(value => value === null || (Number.isFinite(value) && value >= 0)));
+        assert(Buffer.byteLength(JSON.stringify(row)) <= e.row_json_bytes_bound);
+      }
+      assert.equal(e.rows_json_bytes, Buffer.byteLength(JSON.stringify(e.rows)));
+      assert(Buffer.byteLength(JSON.stringify(e)) <= e.evidence_json_bytes_bound);
+      assert(!JSON.stringify(e).includes(f.sends[0].payload.body));
+      assert(!JSON.stringify(e).includes(PEER));
+    }
+  }
+  assert.deepEqual(runs[0].sends, runs[1].sends);
+  assert.deepEqual(runs[0].sends, runs[2].sends);
+  assert.deepEqual(runs[0].result.counts, runs[2].result.counts);
+  assert.deepEqual(Object.keys(runs[0].result), Object.keys(runs[1].result));
+});
+
+test('invalid and duplicate inbound evidence cannot allocate or overwrite a valid sender timing row', async () => {
+  const f = fixture();
+  let now = 100;
+  f.ctx.monoMs = () => now;
+  f.ctx.deadlineMs = 5000;
+  f.ctx.rpc = async request => {
+    if (request.op === 'peers_list') return ok({ peers: [] });
+    const event = { kind: 'channel_inbound', network: request.network,
+      channel: request.channel, from: PEER, payload: { ...request.payload, kind: 'echo' } };
+    for (const invalid of [
+      { ...event, from: 'c'.repeat(51) + 'a' },
+      { ...event, network: 'wrong' }, { ...event, channel: 'wrong' },
+      ...[{ run_id: 'wrong' }, { seq: 1 }, { body: 'secret' }].map(change =>
+        ({ ...event, payload: { ...event.payload, ...change } })),
+    ]) { now += 1; f.receive(invalid); }
+    now = 120; f.receive(event);
+    now = 150; f.receive(event);
+    return ok({ sent: true });
+  };
+  const result = await runPayload(f.ctx, command({ samples: 1, diagnostic_timing: true }));
+  assert.equal(result.counts.mismatch, 6);
+  assert.equal(result.counts.duplicate, 1);
+  assert.equal(result.counts.received, 1);
+  const e = result.diagnostic_timing;
+  assert.equal(e.rows.length, 1);
+  assert.equal(e.rows[0][e.columns.indexOf('echo_validated')], 20);
+  assert.equal(result.rtt_observations[0].rtt_ms, 20);
+  assert(!JSON.stringify(e).includes('secret'));
+});
+
+test('diagnostics honor the existing maximum sample bound and explicit terminal evidence byte budget', async () => {
+  const f = fixture();
+  // Synchronous mocked echo/ACK progress, no network and no real-time waiting.
+  f.ctx.monoMs = () => 100;
+  f.ctx.deadlineMs = 10000;
+  f.ctx.emit = async () => {};
+  const result = await runPayload(f.ctx, command({ samples: 10_000, bytes: 1, diagnostic_timing: true }));
+  const e = result.diagnostic_timing;
+  assert.equal(result.counts.received, 10_000);
+  assert.equal(e.rows.length, 10_000);
+  assert.equal(e.row_limit, 10_000);
+  assert.equal(e.evidence_json_bytes_bound, 5_132_050);
+  assert(Buffer.byteLength(JSON.stringify(e)) <= e.evidence_json_bytes_bound);
+  assert.deepEqual(e.rows.map(row => row[0]), Array.from({ length: 10_000 }, (_, i) => i));
+  const refused = fixture();
+  refused.ctx.rpc = refused.ctx.subscribe = async () => assert.fail('sample bound refusal reached IPC');
+  await assert.rejects(runPayload(refused.ctx, command({ samples: 10_001, bytes: 1,
+    diagnostic_timing: true })), error => error.category === 'invalid_samples');
+  assert.equal(refused.sends.length, 0);
+});
+
+test('per-call RPC phases partition local waits with honest observation labels and no measured-path emit', async () => {
+  const f = fixture();
+  let now = 100, retainedObserver, emitted = false;
+  f.ctx.monoMs = () => now;
+  f.ctx.deadlineMs = 5000;
+  f.ctx.emit = async () => { assert.equal(f.releases(), 1); emitted = true; };
+  f.ctx.rpc = (request, _timeout, observe) => {
+    if (request.op === 'peers_list') {
+      assert.equal(observe, undefined, 'no general-purpose RPC tracing');
+      return Promise.resolve(ok({ peers: [] }));
+    }
+    assert.equal(typeof observe, 'function');
+    retainedObserver = observe;
+    for (const [phase, at] of [['enqueued', 110], ['dequeued', 130], ['connection_ready', 140],
+      ['write_completion_observed', 150], ['reply_observed', 170]]) {
+      now = at; observe(phase, now);
+      assert.equal(emitted, false);
+    }
+    now = 190;
+    f.receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+      from: PEER, payload: { ...request.payload, kind: 'echo' } });
+    now = 200;
+    const promise = Promise.resolve(ok({ sent: true }));
+    Object.defineProperty(promise, 'timingObserverFailed', { get: () => false });
+    return promise;
+  };
+  const result = await runPayload(f.ctx, command({ samples: 1, diagnostic_timing: true }));
+  const e = result.diagnostic_timing;
+  const value = name => e.rows[0][e.columns.indexOf(name)];
+  assert.equal(result.outcome, 'complete');
+  assert.equal(result.rtt_observations[0].rtt_ms, 90);
+  assert.equal(value('rpc_call_begin'), 0);
+  assert.equal(value('rpc_enqueue'), 10);
+  assert.equal(value('rpc_dequeue') - value('rpc_enqueue'), 20);
+  assert.equal(value('rpc_connection_ready') - value('rpc_dequeue'), 10);
+  assert.equal(value('rpc_write_completion_observed') - value('rpc_connection_ready'), 10);
+  assert.equal(value('rpc_reply_observed') - value('rpc_write_completion_observed'), 20);
+  assert.equal(value('send_ack'), 100);
+  assert.equal(value('echo_validated'), 90);
+  assert.equal(value('rpc_observer_failed'), 0);
+  assert.equal(e.rpc_phase_breakdown_complete, true);
+  assert.match(e.rpc_scope, /not_callback_or_parse_instants/);
+  const terminal = JSON.stringify(e);
+  retainedObserver('reply_observed', 999);
+  retainedObserver('secret-capability-text', 999);
+  assert.equal(JSON.stringify(e), terminal, 'terminal callback cannot mutate retained evidence');
+});
+
+test('failed, missing, malformed or out-of-order RPC timing never qualifies a complete phase breakdown', async () => {
+  for (const mode of ['failed', 'unavailable', 'missing_phase', 'out_of_order', 'malformed', 'getter_throws']) {
+    const f = fixture();
+    let now = 100;
+    f.ctx.monoMs = () => now;
+    f.ctx.deadlineMs = 5000;
+    f.ctx.rpc = (request, _timeout, observe) => {
+      if (request.op === 'peers_list') return Promise.resolve(ok({ peers: [] }));
+      const phases = ['enqueued', 'dequeued', 'connection_ready', 'write_completion_observed', 'reply_observed'];
+      phases.forEach((phase, i) => {
+        if (mode === 'missing_phase' && phase === 'dequeued') return;
+        observe(phase, mode === 'out_of_order' && phase === 'dequeued' ? 105 : 110 + i * 10);
+      });
+      if (mode === 'malformed') {
+        // No coercion or copying of peer/controller supplied data into evidence.
+        observe('secret-capability', 100);
+        observe('enqueued', { toString() { throw new Error('private'); } });
+        observe('dequeued', NaN);
+        observe('connection_ready', Infinity);
+      }
+      now = 160;
+      f.receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+        from: PEER, payload: { ...request.payload, kind: 'echo' } });
+      const promise = Promise.resolve(ok({ sent: true }));
+      if (mode !== 'unavailable') Object.defineProperty(promise, 'timingObserverFailed', {
+        get: () => {
+          if (mode === 'getter_throws') throw new Error('private');
+          return mode === 'failed';
+        },
+      });
+      return promise;
+    };
+    const result = await runPayload(f.ctx, command({ samples: 1, diagnostic_timing: true }));
+    assert.equal(result.outcome, 'complete', 'diagnostic incompleteness is not a fabricated send failure');
+    assert.equal(result.counts.received, 1);
+    const e = result.diagnostic_timing;
+    assert.equal(e.rpc_phase_breakdown_complete, false, mode);
+    const flag = e.rows[0][e.columns.indexOf('rpc_observer_failed')];
+    assert.equal(flag, mode === 'unavailable' ? null
+      : ['failed', 'missing_phase', 'malformed', 'getter_throws'].includes(mode) ? 1 : 0);
+    assert(!JSON.stringify(e).includes('secret'));
+    assert(!JSON.stringify(e).includes('private'));
+  }
+});
+
+for (const order of ['ordered', 'swapped', 'duplicate']) {
+  test(`RPC timing requires callback order even at equal timestamps: ${order}`, async () => {
+    const f = fixture();
+    let now = 100, sends = 0;
+    f.ctx.monoMs = () => now;
+    f.ctx.deadlineMs = 5000;
+    f.ctx.rpc = (request, _timeout, observe) => {
+      if (request.op === 'peers_list') return Promise.resolve(ok({ peers: [] }));
+      sends += 1;
+      const phases = ['enqueued', 'dequeued', 'connection_ready',
+        'write_completion_observed', 'reply_observed'];
+      if (order === 'swapped') [phases[0], phases[1]] = [phases[1], phases[0]];
+      if (order === 'duplicate') phases.splice(1, 0, 'enqueued');
+      now += 10;
+      for (const phase of phases) observe(phase, now);
+      now += 50;
+      f.receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+        from: PEER, payload: { ...request.payload, kind: 'echo' } });
+      const promise = Promise.resolve(ok({ sent: true }));
+      Object.defineProperty(promise, 'timingObserverFailed', { get: () => false });
+      return promise;
+    };
+    const result = await runPayload(f.ctx, command({ samples: 2, diagnostic_timing: true }));
+    assert.equal(result.outcome, 'complete');
+    assert.equal(sends, 2, 'diagnostic failure neither retries nor suppresses the next sample');
+    assert.equal(result.counts.sent, 2);
+    assert.equal(result.counts.received, 2);
+    assert.equal(result.counts.lost, 0);
+    assert.equal(result.counts.send_outcome_unknown, 0);
+    assert.deepEqual(result.rtt_observations.map(row => row.rtt_ms), [60, 60]);
+    const e = result.diagnostic_timing;
+    assert.equal(e.rpc_phase_breakdown_complete, order === 'ordered');
+    assert.equal(e.rows.length, 2, 'phase order is tracked independently for each call');
+    for (const row of e.rows) {
+      assert.equal(row[e.columns.indexOf('rpc_observer_failed')], order === 'ordered' ? 0 : 1);
+      const times = ['rpc_enqueue', 'rpc_dequeue', 'rpc_connection_ready',
+        'rpc_write_completion_observed', 'rpc_reply_observed'].map(name => row[e.columns.indexOf(name)]);
+      assert(times.every(time => time === 10 + row[0] * 60),
+        'timestamps alone are identical for all three callback-order cases');
+    }
+  });
+}
+
+test('RPC observation failure flag is retained on unknown write while default calls have no observer', async () => {
+  for (const diagnostic_timing of [false, true]) {
+    const f = fixture();
+    let sends = 0;
+    f.ctx.monoMs = () => 100;
+    f.ctx.deadlineMs = 5000;
+    f.ctx.rpc = function(request, _timeout, observe) {
+      if (request.op === 'peers_list') return Promise.resolve(ok({ peers: [] }));
+      sends += 1;
+      assert.equal(arguments.length, diagnostic_timing ? 3 : 2);
+      if (observe) observe('enqueued', 100);
+      const promise = Promise.reject(new Error('private failed-write detail'));
+      if (observe) Object.defineProperty(promise, 'timingObserverFailed', { get: () => true });
+      return promise;
+    };
+    const result = await runPayload(f.ctx, command({ diagnostic_timing }));
+    assert.equal(sends, 1);
+    assert.equal(result.outcome, 'send_outcome_unknown');
+    assert.equal(result.counts.sent, 0);
+    if (diagnostic_timing) {
+      const e = result.diagnostic_timing;
+      assert.equal(e.rpc_phase_breakdown_complete, false);
+      assert.equal(e.rows[0][e.columns.indexOf('rpc_observer_failed')], 1);
+      assert.equal(e.rows[0][e.columns.indexOf('send_ack')], null);
+      assert.equal(e.rows[0][e.columns.indexOf('send_outcome_unknown')], 0);
+      assert(!JSON.stringify(e).includes('private'));
+    } else assert.equal(Object.hasOwn(result, 'diagnostic_timing'), false);
+  }
+});

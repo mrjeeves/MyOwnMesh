@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +18,7 @@ import {
   controllerStatus,
   createPeerSession,
   createPeerSessionTestHarness,
+  createRpcContextAdapter,
   endpointProbeDisposition,
   mergeControllerError,
   monoMs,
@@ -508,4 +509,162 @@ test("unknown terminal evidence dominates an earlier ordinary failure", () => {
     new ControllerError("write may have happened", "outcome_unknown"),
   );
   assert.equal(controllerStatus(composed), "outcome_unknown");
+});
+
+function deferredTimingControl() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function timingPipe() {
+  const socket = new EventEmitter();
+  const writes = [];
+  const arrivals = [deferredTimingControl(), deferredTimingControl()];
+  socket.write = (_encoded, callback) => {
+    writes.push(callback);
+    arrivals[writes.length - 1]?.resolve();
+    return true;
+  };
+  socket.destroy = () => socket.emit("close");
+  const connection = new JsonLineConnection(socket);
+  const client = new RpcClient("unused-test-endpoint", monoMs() + 5_000);
+  client.connection = connection;
+  return { client, connection, socket, writes, arrivals,
+    reply(value) { socket.emit("data", Buffer.from(`${JSON.stringify(value)}\n`)); } };
+}
+
+const RPC_TIMING_PHASES = ["enqueued", "dequeued", "connection_ready", "write_completion_observed", "reply_observed"];
+
+test("per-call RPC timings isolate two queued calls and distinguish held write from held reply", { timeout: 5_000 }, async () => {
+  const pipe = timingPipe(), a = [], b = [];
+  const aWritten = deferredTimingControl();
+  const first = pipe.client.rpc({ op: "first" }, 1_000, undefined, (phase, at) => {
+    a.push([phase, at]); if (phase === "write_completion_observed") aWritten.resolve();
+  });
+  const second = pipe.client.rpc({ op: "second" }, 1_000, undefined, (phase, at) => b.push([phase, at]));
+  try {
+    await pipe.arrivals[0].promise;
+    assert.deepEqual(a.map(row => row[0]), RPC_TIMING_PHASES.slice(0, 3));
+    assert.deepEqual(b.map(row => row[0]), ["enqueued"]);
+    pipe.writes[0](); await aWritten.promise;
+    assert.deepEqual(a.map(row => row[0]), RPC_TIMING_PHASES.slice(0, 4));
+    assert.deepEqual(b.map(row => row[0]), ["enqueued"]);
+    const firstReply = { ok: true, data: { value: 1 } };
+    pipe.reply(firstReply); assert.deepEqual(await first, firstReply);
+    await pipe.arrivals[1].promise;
+    assert.deepEqual(b.map(row => row[0]), RPC_TIMING_PHASES.slice(0, 3));
+    pipe.writes[1](); pipe.reply({ ok: true, data: { value: 2 } });
+    assert.equal((await second).data.value, 2);
+    for (const rows of [a, b]) {
+      assert.deepEqual(rows.map(row => row[0]), RPC_TIMING_PHASES);
+      rows.forEach((row, i) => {
+        assert.equal(row.length, 2); assert.ok(Number.isFinite(row[1]));
+        if (i) assert.ok(row[1] >= rows[i - 1][1]);
+      });
+    }
+    assert.ok(b[1][1] >= a[4][1]);
+    assert.equal(first.timingObserverFailed, false); assert.equal(second.timingObserverFailed, false);
+    assert.deepEqual(Object.getOwnPropertyNames(first), ["timingObserverFailed"]);
+    assert.deepEqual(Object.keys(pipe.client).sort(), ["connection", "deadlineMs", "endpoint", "pending", "signal", "tail"]);
+    assert.equal(pipe.client.pending, 0); assert.equal(pipe.connection.waiters.length, 0);
+    assert.equal(pipe.connection.frames.length, 0);
+  } finally { pipe.client.close(); }
+});
+
+test("RPC observer throws never discard a reply and disable only that call's notifications", { timeout: 5_000 }, async () => {
+  for (const failAt of RPC_TIMING_PHASES) {
+    const pipe = timingPipe(), phases = [];
+    const call = pipe.client.rpc({ op: "opaque-request" }, 1_000, undefined, (...args) => {
+      assert.equal(args.length, 2); assert.equal(typeof args[0], "string");
+      assert.ok(Number.isFinite(args[1])); phases.push(args[0]);
+      if (args[0] === failAt) throw new Error("not-exported-observer-error");
+    });
+    try {
+      await pipe.arrivals[0].promise; pipe.writes[0]();
+      pipe.reply({ ok: true, data: { opaqueReply: true } });
+      assert.deepEqual(await call, { ok: true, data: { opaqueReply: true } });
+      assert.deepEqual(phases, RPC_TIMING_PHASES.slice(0, RPC_TIMING_PHASES.indexOf(failAt) + 1));
+      assert.equal(call.timingObserverFailed, true);
+      assert.equal(Object.getOwnPropertyDescriptor(call, "timingObserverFailed").set, undefined);
+      assert.equal(pipe.client.pending, 0);
+      assert.equal(pipe.connection.frames.length, 0); assert.equal(pipe.connection.waiters.length, 0);
+      const nextPhases = [];
+      const next = pipe.client.rpc({ op: "next" }, 1_000, undefined, (phase) => nextPhases.push(phase));
+      await pipe.arrivals[1].promise; pipe.writes[1](); pipe.reply({ ok: true });
+      assert.deepEqual(await next, { ok: true });
+      assert.deepEqual(nextPhases, RPC_TIMING_PHASES);
+      assert.equal(next.timingObserverFailed, false);
+    } finally { pipe.client.close(); }
+  }
+});
+
+test("timed cancellation retains pre-write refusal versus post-write unknown and clears per-call custody", { timeout: 5_000 }, async () => {
+  for (const afterWrite of [false, true]) {
+    const pipe = timingPipe(), work = new AbortController(), phases = [];
+    if (!afterWrite) work.abort();
+    const call = pipe.client.rpc({ op: "cancel" }, 1_000, work.signal, (phase) => phases.push(phase));
+    try {
+      if (afterWrite) { await pipe.arrivals[0].promise; work.abort(); }
+      await assert.rejects(call, error => error.kind === (afterWrite ? "outcome_unknown" : "failed"));
+      assert.equal(pipe.writes.length, afterWrite ? 1 : 0);
+      assert.deepEqual(phases, RPC_TIMING_PHASES.slice(0, 3));
+      assert.equal(call.timingObserverFailed, false);
+      assert.equal(pipe.client.pending, 0); assert.equal(pipe.client.connection, null);
+      const count = phases.length;
+      if (afterWrite) pipe.writes[0]();
+      await Promise.resolve();
+      assert.equal(phases.length, count, "late write completion cannot notify a settled observer");
+    } finally { pipe.client.close(); }
+  }
+});
+
+test("default RPC emits no diagnostic properties and observer failure does not mask transport failure", { timeout: 5_000 }, async () => {
+  const pipe = timingPipe();
+  const call = pipe.client.rpc({ op: "ordinary" }, 1_000);
+  try {
+    assert.equal(Object.hasOwn(call, "timingObserverFailed"), false);
+    await pipe.arrivals[0].promise; pipe.writes[0](); pipe.reply({ ok: false, error: "ordinary-refusal" });
+    assert.deepEqual(await call, { ok: false, error: "ordinary-refusal" });
+    const work = new AbortController(); work.abort();
+    const failed = pipe.client.rpc({ op: "cancel" }, 1_000, work.signal, () => { throw new Error("observer"); });
+    await assert.rejects(failed, error => error.kind === "failed");
+    assert.equal(failed.timingObserverFailed, true);
+  } finally { pipe.client.close(); }
+});
+
+test("shared persistent and standalone RPC adapter preserves observer and cleanup signal positions", () => {
+  for (const owner of ["PeerSession", "standalone"]) {
+    const calls = [], work = new AbortController(); let cleanup = false;
+    const client = { rpc(...args) { calls.push(args); return Promise.resolve({ ok: true }); } };
+    const rpc = createRpcContextAdapter(client, work.signal, () => cleanup);
+    const request = { op: owner }, observer = () => {};
+    rpc(request, 123, observer); cleanup = true; rpc(request, 456, observer);
+    assert.deepEqual(calls.map(args => args.length), [4, 4]);
+    assert.equal(calls[0][0], request); assert.equal(calls[0][1], 123);
+    assert.equal(calls[0][2], work.signal); assert.equal(calls[0][3], observer);
+    assert.equal(calls[1][2], undefined); assert.equal(calls[1][3], observer);
+    rpc(request, 789);
+    assert.equal(calls[2].length, 3, "default adapter keeps its original argument shape");
+  }
+});
+
+test("both production context sites use the tested synchronous RPC forwarding adapter", async () => {
+  const source = await readFile(new URL("../live-device-peer.mjs", import.meta.url), "utf8");
+  assert.ok(source.includes("rpc: createRpcContextAdapter(this.rpc, this.workAbort.signal, () => this.cleanupMode)"));
+  assert.ok(source.includes("rpc: createRpcContextAdapter(rpc, workAbort.signal, () => cleanupMode)"));
+  assert.equal(source.match(/rpc: createRpcContextAdapter\(/g)?.length, 2);
+});
+
+test("buffered reply timing is RPC observation after write completion, not parser arrival", { timeout: 5_000 }, async () => {
+  const pipe = timingPipe(), phases = [];
+  const call = pipe.client.rpc({ op: "buffered" }, 1_000, undefined, (phase) => phases.push(phase));
+  try {
+    await pipe.arrivals[0].promise;
+    pipe.reply({ ok: true });
+    assert.equal(pipe.connection.frames.length, 1);
+    assert.deepEqual(phases, RPC_TIMING_PHASES.slice(0, 3));
+    pipe.writes[0](); assert.deepEqual(await call, { ok: true });
+    assert.deepEqual(phases, RPC_TIMING_PHASES);
+  } finally { pipe.client.close(); }
 });

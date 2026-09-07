@@ -81,6 +81,221 @@ test('unknown channel write is never retried', async () => {
   assert.equal(result.counts.send_outcome_unknown, 1);
 });
 
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+async function until(predicate) {
+  for (let n = 0; n < 100 && !predicate(); n += 1) await Promise.resolve();
+  assert(predicate(), 'bounded mocked phase must have been reached');
+}
+function timingValue(result, seq, phase) {
+  const evidence = result.diagnostic_timing;
+  return evidence.rows.find(row => row[0] === seq)[evidence.columns.indexOf(phase)];
+}
+
+for (const echoFirst of [false, true]) {
+  test(`diagnostic phases preserve RTT and next-sample gating with ${echoFirst ? 'echo' : 'ACK'} first`, async () => {
+    let now = 100, receive, firstRequest, emitted = 0;
+    const ack = deferred(), abort = new AbortController();
+    const sends = [];
+    const ctx = { monoMs: () => now, deadlineMs: 5000, signal: abort.signal,
+      subscribe: async (_n, _c, fn) => { receive = fn; return async () => {}; },
+      emit: async () => { emitted += 1; },
+      rpc: async request => {
+        if (request.op === 'peers_list') return ok({ peers: [] });
+        sends.push(request);
+        if (sends.length === 1) { firstRequest = request; return ack.promise; }
+        receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+          from: B, payload: { ...request.payload, kind: 'echo' } });
+        return ok({ sent: true });
+      } };
+    const running = runPayload(ctx, payload('echo_run', B, { samples: 2, diagnostic_timing: true }));
+    try {
+      await until(() => sends.length === 1);
+      const echo = () => receive({ kind: 'channel_inbound', network: firstRequest.network,
+        channel: firstRequest.channel, from: B, payload: { ...firstRequest.payload, kind: 'echo' } });
+      now = 140;
+      if (echoFirst) echo(); else ack.resolve(ok({ sent: true }));
+      // Let either callback/ACK settle, but neither alone can launch seq1.
+      for (let n = 0; n < 20; n += 1) await Promise.resolve();
+      assert.equal(sends.length, 1);
+      assert.equal(emitted, 0, 'no evidence I/O during the sample loop');
+      now = 180;
+      if (echoFirst) ack.resolve(ok({ sent: true })); else echo();
+      const result = await running;
+      assert.equal(result.outcome, 'complete');
+      assert.equal(sends.length, 2);
+      assert.equal(result.rtt_observations[0].rtt_ms, echoFirst ? 40 : 80);
+      assert.equal(timingValue(result, 0, 'attempt_begin'), 0);
+      assert.equal(timingValue(result, 0, 'send_ack'), echoFirst ? 80 : 40);
+      assert.equal(timingValue(result, 0, 'echo_validated'), echoFirst ? 40 : 80);
+      assert.equal(timingValue(result, 1, 'attempt_begin'), 80);
+      assert.equal(timingValue(result, 0, 'send_outcome_unknown'), null);
+    } finally { ack.resolve(ok({ sent: true })); abort.abort(); await running; }
+  });
+}
+
+test('receiver phase evidence exposes next request queued behind prior echo ACK and joins before capture', async () => {
+  let now = 100, receive, released = false;
+  const ack = deferred(), abort = new AbortController();
+  const sends = [];
+  const ctx = { monoMs: () => now, deadlineMs: 5000, signal: abort.signal,
+    subscribe: async (_n, _c, fn) => { receive = fn; return async () => { released = true; }; },
+    emit: async () => { assert.fail('receiver must not emit on its measured path'); },
+    rpc: async request => {
+      sends.push(request);
+      if (sends.length === 1) return ack.promise;
+      return ok({ sent: true });
+    } };
+  const c = payload('echo_listen', A, { samples: 2, diagnostic_timing: true });
+  const listener = await runPayload(ctx, c);
+  const arrive = seq => receive({ kind: 'channel_inbound', network: c.network, channel: c.channel,
+    from: A, payload: { protocol: 'myownmesh.live-payload.v1', network: c.network,
+      channel: c.channel, run_id: c.run_id, kind: 'request', seq,
+      body: '0123456789abcdef'.repeat(64) } });
+  try {
+    now = 110; arrive(0);
+    await until(() => sends.length === 1);
+    now = 130; arrive(1);
+    assert.equal(sends.length, 1);
+    now = 150; ack.resolve(ok({ sent: true }));
+    const result = await listener.done;
+    assert(released);
+    assert.equal(result.outcome, 'complete');
+    assert.equal(result.counts.received, 2);
+    assert.equal(result.counts.sent, 2);
+    assert.equal(timingValue(result, 1, 'callback_entry'), 30);
+    assert.equal(timingValue(result, 1, 'request_validated'), 30);
+    assert.equal(timingValue(result, 1, 'echo_send_begin'), 50);
+    assert.equal(timingValue(result, 0, 'send_ack'), 50);
+  } finally { ack.resolve(ok({ sent: true })); abort.abort(); await listener.cleanup(); }
+});
+
+test('verified echo followed by unknown ACK retains both phase facts without retry or success', async () => {
+  let now = 100, receive, writes = 0;
+  const ctx = { monoMs: () => now, deadlineMs: 5000, signal: new AbortController().signal,
+    subscribe: async (_n, _c, fn) => { receive = fn; return async () => {}; }, emit: async () => {},
+    rpc: async request => {
+      if (request.op === 'peers_list') return ok({ peers: [] });
+      writes += 1;
+      now = 120;
+      receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+        from: B, payload: { ...request.payload, kind: 'echo' } });
+      now = 140;
+      throw new Error('secret must never appear in phase evidence');
+    } };
+  const result = await runPayload(ctx, payload('echo_run', B, { diagnostic_timing: true }));
+  assert.equal(writes, 1);
+  assert.equal(result.outcome, 'send_outcome_unknown');
+  assert.equal(result.counts.received, 1);
+  assert.equal(result.counts.sent, 0);
+  assert.equal(result.counts.send_outcome_unknown, 1);
+  assert.equal(timingValue(result, 0, 'echo_validated'), 20);
+  assert.equal(timingValue(result, 0, 'send_ack'), null);
+  assert.equal(timingValue(result, 0, 'send_outcome_unknown'), 40);
+  assert(!JSON.stringify(result).includes('secret'));
+});
+
+test('receiver abort retains accepted queued timing without a late send and joins in-flight ACK', async () => {
+  let now = 100, receive, released = false;
+  const ack = deferred(), abort = new AbortController();
+  const sends = [];
+  const ctx = { monoMs: () => now, deadlineMs: 5000, signal: abort.signal,
+    subscribe: async (_n, _c, fn) => { receive = fn; return async () => { released = true; }; },
+    emit: async () => assert.fail('unexpected measured-path emission'),
+    rpc: request => { sends.push(request); return ack.promise; } };
+  const c = payload('echo_listen', A, { samples: 2, diagnostic_timing: true });
+  const listener = await runPayload(ctx, c);
+  const arrive = seq => receive({ kind: 'channel_inbound', network: c.network, channel: c.channel,
+    from: A, payload: { protocol: 'myownmesh.live-payload.v1', network: c.network, channel: c.channel,
+      run_id: c.run_id, kind: 'request', seq, body: '0123456789abcdef'.repeat(64) } });
+  try {
+    now = 110; arrive(0);
+    await until(() => sends.length === 1);
+    now = 120; arrive(1);
+    abort.abort();
+    let done = false;
+    listener.done.then(() => { done = true; });
+    await until(() => released);
+    assert.equal(done, false, 'active send is still owned, not falsely complete');
+    now = 140; ack.resolve(ok({ sent: true }));
+    const result = await listener.done;
+    assert.equal(result.outcome, 'cancelled');
+    assert.equal(sends.length, 1);
+    assert.equal(result.counts.received, 2);
+    assert.equal(result.counts.sent, 1);
+    assert.equal(result.diagnostic_timing.rows.length, 2);
+    assert.equal(timingValue(result, 1, 'callback_entry'), 20);
+    assert.equal(timingValue(result, 1, 'echo_send_begin'), null);
+    const frozen = JSON.stringify(result.diagnostic_timing);
+    arrive(1);
+    await listener.cleanup();
+    assert.equal(JSON.stringify(result.diagnostic_timing), frozen);
+  } finally { ack.resolve(ok({ sent: true })); abort.abort(); await listener.cleanup(); }
+});
+
+test('late echo and sender cancellation retain a partial timing row without qualifying the echo', async () => {
+  let now = 100, receive, sends = 0;
+  const abort = new AbortController();
+  const ctx = { monoMs: () => now, deadlineMs: 5000, signal: abort.signal,
+    subscribe: async (_n, _c, fn) => { receive = fn; return async () => {}; }, emit: async () => {},
+    rpc: async request => {
+      if (request.op === 'peers_list') return ok({ peers: [] });
+      sends += 1;
+      now = 1100; // Exact original 1000ms sample deadline, not an extended deadline.
+      receive({ kind: 'channel_inbound', network: request.network, channel: request.channel,
+        from: B, payload: { ...request.payload, kind: 'echo' } });
+      abort.abort();
+      return ok({ sent: true });
+    } };
+  const result = await runPayload(ctx, payload('echo_run', B, { diagnostic_timing: true }));
+  assert.equal(result.outcome, 'cancelled_or_deadline');
+  assert.equal(sends, 1);
+  assert.equal(result.counts.late, 1);
+  assert.equal(result.counts.received, 0);
+  assert.equal(result.diagnostic_timing.rows.length, 1);
+  assert.equal(timingValue(result, 0, 'echo_validated'), null);
+  assert.equal(timingValue(result, 0, 'send_ack'), 1000);
+});
+
+test('receiver invalid, duplicate and busy callbacks do not create timing rows or widen its queue', async () => {
+  let now = 100, receive;
+  const ack = deferred(), abort = new AbortController(), sends = [];
+  const ctx = { monoMs: () => now, deadlineMs: 5000, signal: abort.signal,
+    subscribe: async (_n, _c, fn) => { receive = fn; return async () => {}; }, emit: async () => {},
+    rpc: async request => {
+      sends.push(request);
+      return sends.length === 1 ? ack.promise : ok({ sent: true });
+    } };
+  const c = payload('echo_listen', A, { samples: 3, diagnostic_timing: true });
+  const listener = await runPayload(ctx, c);
+  const event = seq => ({ kind: 'channel_inbound', network: c.network, channel: c.channel,
+    from: A, payload: { protocol: 'myownmesh.live-payload.v1', network: c.network, channel: c.channel,
+      run_id: c.run_id, kind: 'request', seq, body: '0123456789abcdef'.repeat(64) } });
+  try {
+    now = 110;
+    receive({ ...event(0), from: D });
+    receive({ ...event(0), payload: { ...event(0).payload, body: 'private' } });
+    receive(event(0));
+    await until(() => sends.length === 1);
+    now = 120;
+    receive(event(0)); // Exact duplicate, no row rewrite.
+    receive(event(1)); // The single waiting slot.
+    receive(event(2)); // Busy drop, no retained row.
+    now = 130; ack.resolve(ok({ sent: true }));
+    await until(() => sends.length === 2);
+    const result = await listener.cleanup();
+    assert.equal(result.counts.mismatch, 2);
+    assert.equal(result.counts.duplicate, 1);
+    assert.equal(result.counts.busy_dropped, 1);
+    assert.deepEqual(result.diagnostic_timing.rows.map(row => row[0]), [0, 1]);
+    assert.equal(timingValue(result, 0, 'callback_entry'), 10);
+    assert.equal(timingValue(result, 1, 'echo_send_begin'), 30);
+  } finally { ack.resolve(ok({ sent: true })); abort.abort(); await listener.cleanup(); }
+});
+
 test('opaque relay controller carries full 1024-byte bodies and closes both owners', async () => {
   const queues = { a: [], b: [] }, waiters = new Map(), closed = [];
   let maximumFrame = 0;
