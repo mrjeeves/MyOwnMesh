@@ -24,14 +24,15 @@ const MAX_MEASURED_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Exact compact-JSON ceiling for either serialized event shape below.
 ///
 /// The longest data row uses an 80-byte run id, a 32-byte route id, a
-/// 20-digit owner epoch, six 11-digit (24-hour microsecond) durations and the
-/// fixed outer `MeshEvent::Diag` fields. The unit control serializes that
+/// 20-digit owner epoch, seven 11-digit (24-hour microsecond) timestamps or
+/// durations and the fixed outer `MeshEvent::Diag` fields. The unit control serializes that
 /// maximal shape and pins this ceiling. The event hub's framing is priced by
 /// its existing envelope limit rather than by this source-local ceiling.
 pub(crate) const MAX_SERIALIZED_EVENT_BYTES: usize = 1_536;
 
 static ACTIVE_RUN: RuntimeGate = RuntimeGate::new();
 static EMISSIONS: EmissionLimiter = EmissionLimiter::new();
+static MONOTONIC_ANCHOR: OnceLock<Instant> = OnceLock::new();
 
 #[cfg(test)]
 static TEST_NOW: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
@@ -176,17 +177,28 @@ impl NativeReceipt {
 pub(crate) fn capture_native_receipt() -> Option<NativeReceipt> {
     capture_native_receipt_with(
         &ACTIVE_RUN,
+        &MONOTONIC_ANCHOR,
         || std::env::var(RUN_ID_ENV).ok(),
         route_flow_now,
     )
 }
 
-fn capture_native_receipt_with<R, N>(gate: &RuntimeGate, read: R, now: N) -> Option<NativeReceipt>
+fn capture_native_receipt_with<R, N>(
+    gate: &RuntimeGate,
+    anchor: &OnceLock<Instant>,
+    read: R,
+    mut now: N,
+) -> Option<NativeReceipt>
 where
     R: FnOnce() -> Option<String>,
-    N: FnOnce() -> Instant,
+    N: FnMut() -> Instant,
 {
     gate.active_with(read)?;
+    // Latch the anchor before the callback stamp. Even if two native
+    // callbacks arrive concurrently, whichever initializes the anchor does so
+    // before either callback can retain a timestamp. The disabled path above
+    // still reaches neither clock nor anchor.
+    anchor.get_or_init(|| now());
     Some(NativeReceipt {
         callback_enter: now(),
         mailbox_attempt: None,
@@ -220,6 +232,11 @@ pub(crate) struct HandlerReceipt {
 
 pub(crate) fn capture_handler_receipt(native: Option<NativeReceipt>) -> Option<HandlerReceipt> {
     active_run_id()?;
+    // Origin rows have no native receipt, so establish the same process-wide
+    // origin before their handler stamp. Inbound rows normally find the anchor
+    // already latched by `capture_native_receipt`; this remains the safe
+    // fallback for a retained receipt supplied by another bounded seam.
+    MONOTONIC_ANCHOR.get_or_init(route_flow_now);
     Some(HandlerReceipt {
         native,
         handler_enter: route_flow_now(),
@@ -408,6 +425,7 @@ impl SelectedRouteFlow {
             checked_us(self.receipt.handler_enter, self.route_decision);
         let route_dispatch_us = dispatch_started.and_then(|start| checked_us(start, finished));
         let handler_total_us = checked_us(self.receipt.handler_enter, finished);
+        let disposition_finished_mono_us = monotonic_offset_us(&MONOTONIC_ANCHOR, finished);
         disposition_event(
             self.run_id,
             self.route_id,
@@ -423,9 +441,14 @@ impl SelectedRouteFlow {
             handler_to_route_decision_us,
             route_dispatch_us,
             handler_total_us,
+            disposition_finished_mono_us,
             outcome,
         )
     }
+}
+
+fn monotonic_offset_us(anchor: &OnceLock<Instant>, at: Instant) -> Option<u64> {
+    checked_us(*anchor.get()?, at)
 }
 
 fn checked_us(start: Instant, end: Instant) -> Option<u64> {
@@ -452,6 +475,7 @@ fn disposition_event(
     handler_to_route_decision_us: Option<u64>,
     route_dispatch_us: Option<u64>,
     handler_total_us: Option<u64>,
+    disposition_finished_mono_us: Option<u64>,
     outcome: RouteOutcome,
 ) -> MeshEvent {
     MeshEvent::Diag(DiagEntry {
@@ -463,7 +487,7 @@ fn disposition_event(
         category: "route_flow".to_string(),
         message: "routed disposition".to_string(),
         detail: serde_json::json!({
-            "schema": "myownmesh.route-flow/v1",
+            "schema": "myownmesh.route-flow/v2",
             "kind": "disposition",
             "run_id": run_id,
             "direction": direction.as_str(),
@@ -479,6 +503,12 @@ fn disposition_event(
             "handler_to_route_decision_us": handler_to_route_decision_us,
             "route_dispatch_us": route_dispatch_us,
             "handler_total_us": handler_total_us,
+            // This is an offset from one process-local monotonic anchor, not
+            // Unix time. Together with the existing contiguous durations it
+            // reconstructs callback entry, handler entry and dispatch start.
+            // Each integer duration truncation can add at most one microsecond
+            // of subtraction error (at most four across the ingress path).
+            "disposition_finished_mono_us": disposition_finished_mono_us,
             "outcome": outcome.as_str(),
         }),
     })
@@ -492,7 +522,7 @@ fn overflow_event() -> MeshEvent {
         category: "route_flow".to_string(),
         message: "route flow overflow".to_string(),
         detail: serde_json::json!({
-            "schema": "myownmesh.route-flow/v1",
+            "schema": "myownmesh.route-flow/v2",
             "kind": "overflow",
             "capacity": MAX_DATA_ROWS,
             "outcome": "outcome_unknown",
@@ -592,8 +622,10 @@ mod tests {
     fn production_capture_seam_checks_runtime_gate_before_clock() {
         let clock_calls = AtomicUsize::new(0);
         let disabled = RuntimeGate::new();
+        let disabled_anchor = OnceLock::new();
         assert!(capture_native_receipt_with(
             &disabled,
+            &disabled_anchor,
             || Some("contains.dot".to_string()),
             || {
                 clock_calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -602,10 +634,13 @@ mod tests {
         )
         .is_none());
         assert_eq!(clock_calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(disabled_anchor.get().is_none());
 
         let enabled = RuntimeGate::new();
+        let enabled_anchor = OnceLock::new();
         assert!(capture_native_receipt_with(
             &enabled,
+            &enabled_anchor,
             || Some("first-echo-route-cc6-c1".to_string()),
             || {
                 clock_calls.fetch_add(1, AtomicOrdering::SeqCst);
@@ -613,7 +648,22 @@ mod tests {
             },
         )
         .is_some());
-        assert_eq!(clock_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(clock_calls.load(AtomicOrdering::SeqCst), 2);
+        let first_anchor = *enabled_anchor
+            .get()
+            .expect("enabled capture latches anchor");
+        assert!(capture_native_receipt_with(
+            &enabled,
+            &enabled_anchor,
+            || panic!("the runtime gate is already initialized"),
+            || {
+                clock_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Instant::now()
+            },
+        )
+        .is_some());
+        assert_eq!(clock_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(enabled_anchor.get(), Some(&first_anchor));
     }
 
     #[test]
@@ -708,6 +758,7 @@ mod tests {
             Some(MAX_MEASURED_DURATION.as_micros() as u64),
             Some(MAX_MEASURED_DURATION.as_micros() as u64),
             Some(MAX_MEASURED_DURATION.as_micros() as u64),
+            Some(MAX_MEASURED_DURATION.as_micros() as u64),
             RouteOutcome::OutcomeUnknown,
         );
         let bytes = serde_json::to_vec(&event).unwrap();
@@ -716,12 +767,16 @@ mod tests {
         for forbidden in ["payload", "body", "channel", "peer", "sdp", "error"] {
             assert!(!text.contains(forbidden));
         }
+        assert!(text.contains("\"schema\":\"myownmesh.route-flow/v2\""));
+        assert!(text.contains("\"disposition_finished_mono_us\":86400000000"));
         assert!(text.contains("\"network_id\":\"route_flow_diagnostic\""));
     }
 
     #[test]
     fn held_handler_and_dispatch_durations_use_exact_same_process_intervals() {
         let start = Instant::now();
+        let anchor = *MONOTONIC_ANCHOR.get_or_init(|| start);
+        let finished = start + Duration::from_micros(90);
         let flow = SelectedRouteFlow {
             run_id: "first-echo-route-cc6-c1",
             route_id: [7; 16],
@@ -743,7 +798,7 @@ mod tests {
         };
         let event = flow.event(
             Some(start + Duration::from_micros(40)),
-            start + Duration::from_micros(90),
+            finished,
             RouteOutcome::Delivered,
         );
         let value = serde_json::to_value(event).unwrap();
@@ -764,6 +819,25 @@ mod tests {
                 Some(expected)
             );
         }
+        assert_eq!(
+            detail.get("schema").and_then(serde_json::Value::as_str),
+            Some("myownmesh.route-flow/v2")
+        );
+        let finished_offset = detail
+            .get("disposition_finished_mono_us")
+            .and_then(serde_json::Value::as_u64)
+            .expect("the exact finish has one bounded monotonic offset");
+        assert_eq!(finished_offset, checked_us(anchor, finished).unwrap());
+        let reconstructed_callback = finished_offset
+            .checked_sub(detail["handler_total_us"].as_u64().unwrap())
+            .and_then(|value| value.checked_sub(detail["dequeue_to_handler_us"].as_u64().unwrap()))
+            .and_then(|value| value.checked_sub(detail["insert_to_dequeue_us"].as_u64().unwrap()))
+            .and_then(|value| value.checked_sub(detail["callback_to_insert_us"].as_u64().unwrap()))
+            .expect("the contiguous spans reconstruct callback entry");
+        assert!(
+            reconstructed_callback.abs_diff(checked_us(anchor, start).unwrap()) <= 4,
+            "four truncated interval subtractions bound reconstruction error"
+        );
         assert_eq!(
             detail.get("outcome").and_then(serde_json::Value::as_str),
             Some("delivered")
@@ -794,16 +868,49 @@ mod tests {
         );
         assert!(detail.get("run_id").is_none());
         assert!(detail.get("route_id").is_none());
+        assert_eq!(
+            detail.get("schema").and_then(serde_json::Value::as_str),
+            Some("myownmesh.route-flow/v2")
+        );
     }
 
     #[test]
     fn missing_or_reversed_timestamps_are_null_not_zero() {
         let start = Instant::now();
+        let missing_anchor = OnceLock::new();
+        assert_eq!(monotonic_offset_us(&missing_anchor, start), None);
+        let reversed_anchor = OnceLock::new();
+        reversed_anchor
+            .set(start)
+            .expect("the reversed-offset anchor is empty");
+        assert_eq!(
+            monotonic_offset_us(&reversed_anchor, start - Duration::from_micros(1)),
+            None
+        );
         assert_eq!(checked_us(start, start + Duration::from_micros(5)), Some(5));
         assert_eq!(checked_us(start, start - Duration::from_micros(1)), None);
         assert_eq!(
             checked_us(
                 start,
+                start + MAX_MEASURED_DURATION + Duration::from_micros(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn finish_offsets_share_one_anchor_and_keep_the_twenty_four_hour_bound() {
+        let anchor = OnceLock::new();
+        let start = Instant::now();
+        anchor.set(start).expect("the local test anchor is empty");
+        let first = monotonic_offset_us(&anchor, start + Duration::from_micros(7)).unwrap();
+        let second = monotonic_offset_us(&anchor, start + Duration::from_micros(107)).unwrap();
+        assert_eq!(first, 7);
+        assert_eq!(second, 107);
+        assert_eq!(second - first, 100);
+        assert_eq!(
+            monotonic_offset_us(
+                &anchor,
                 start + MAX_MEASURED_DURATION + Duration::from_micros(1)
             ),
             None

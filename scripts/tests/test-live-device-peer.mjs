@@ -715,13 +715,58 @@ function routeEvent(detail, network = "route_flow_diagnostic") {
 }
 
 function routeRow(index, change = {}) {
-  return { schema: "myownmesh.route-flow/v1", kind: "disposition", run_id: ROUTE_COMMAND.run_label,
+  return { schema: "myownmesh.route-flow/v2", kind: "disposition", run_id: ROUTE_COMMAND.run_label,
     direction: index < 16 ? "request" : "reply", seq: index % 16,
     route_id: (index + 1).toString(16).padStart(32, "0"), role: "relay", hop_index: 2, remaining_ttl: 2,
     owner_epoch: "18446744073709551615", callback_to_insert_us: 0, insert_to_dequeue_us: 1,
     dequeue_to_handler_us: 2, handler_to_route_decision_us: 3, route_dispatch_us: 4, handler_total_us: 9,
-    outcome: "delivered", ...change };
+    disposition_finished_mono_us: index, outcome: "delivered", ...change };
 }
+
+test("route v2 rejects v1 and missing or invalid process-local monotonic fields", { timeout: 10_000 }, async () => {
+  const missing = routeRow(0);
+  delete missing.disposition_finished_mono_us;
+  const cases = [missing,
+    routeRow(0, { schema: "myownmesh.route-flow/v1" }),
+    { schema: "myownmesh.route-flow/v1", kind: "overflow", capacity: 64, outcome: "outcome_unknown" },
+    ...[null, -1, 0.5, 86400000001, Number.MAX_SAFE_INTEGER + 1, "1"]
+      .map(value => routeRow(0, { disposition_finished_mono_us: value }))];
+  for (const row of cases) {
+    await withRouteHub(async ({ hub, pump }) => {
+      const lifetime = await hub.listenRouteTrace(ROUTE_COMMAND);
+      await pump([routeEvent(row)]);
+      const result = await lifetime.done;
+      assert.equal(result.failure_code, "malformed_selected_diag");
+      assert.equal(result.complete, false); assert.deepEqual(result.rows, []);
+    });
+  }
+});
+
+test("route v2 retains monotonic endpoints and maximal encoded row fits unchanged 640 byte slot", { timeout: 5_000 }, async () => {
+  // Maximal accepted relay row: all bounded ASCII strings/numbers are at their
+  // widest. Destination's longer role loses 12 bytes to required null dispatch;
+  // origin also requires null ingress. No escaping expansion is possible here.
+  const run_label = "Z".repeat(80);
+  const maximal = routeRow(15, { run_id: run_label, hop_index: 255, remaining_ttl: 255,
+    callback_to_insert_us: Number.MAX_SAFE_INTEGER, insert_to_dequeue_us: Number.MAX_SAFE_INTEGER,
+    dequeue_to_handler_us: Number.MAX_SAFE_INTEGER, handler_to_route_decision_us: Number.MAX_SAFE_INTEGER,
+    route_dispatch_us: Number.MAX_SAFE_INTEGER, handler_total_us: Number.MAX_SAFE_INTEGER,
+    disposition_finished_mono_us: 86400000000, outcome: "outcome_unknown" });
+  assert.equal(Buffer.byteLength(JSON.stringify(maximal), "utf8"), 628);
+  assert.ok(Buffer.byteLength(JSON.stringify(maximal), "utf8") + 1 <= 640, "slot includes row separator");
+  assert.equal(64 * 640 + 2048, 43008, "existing summary reserve unchanged");
+  await withRouteHub(async ({ hub, pump }) => {
+    const lifetime = await hub.listenRouteTrace({ ...ROUTE_COMMAND, run_label });
+    const expected = Array.from({ length: 32 }, (_, index) => routeRow(index, {
+      run_id: run_label, disposition_finished_mono_us: index === 0 ? 0 : 86400000000 }));
+    await pump(expected.map(row => routeEvent(row)));
+    await lifetime.cleanup();
+    const result = await lifetime.done;
+    assert.equal(result.complete, true); assert.deepEqual(result.rows, expected);
+    assert.equal(result.rows[0].disposition_finished_mono_us, 0);
+    assert.equal(result.rows[31].disposition_finished_mono_us, 86400000000);
+  });
+});
 
 test("route actual EventHub collects exact 32 without extra RPC and joins only at cleanup", { timeout: 5_000 }, async () => {
   await withRouteHub(async ({ hub, pump, rpcCalls, subscriptions }) => {
@@ -746,7 +791,7 @@ test("route actual EventHub refuses malformed scalar growth, duplicate sets and 
   const cases = [
     [[routeEvent(routeRow(0)), routeEvent(routeRow(0))], "duplicate_route_role"],
     [[routeEvent(routeRow(0)), routeEvent(routeRow(0, { route_id: "f".repeat(32) }))], "duplicate_direction_seq"],
-    [[routeEvent({ schema: "myownmesh.route-flow/v1", kind: "overflow", capacity: 64, outcome: "outcome_unknown" })], "overflow"],
+    [[routeEvent({ schema: "myownmesh.route-flow/v2", kind: "overflow", capacity: 64, outcome: "outcome_unknown" })], "overflow"],
     // With seq constrained to 0..15, a 65-row cohort necessarily fails before
     // the 65th insertion (duplicate or malformed), never silently truncates.
     [Array.from({ length: 65 }, (_, index) => routeEvent(routeRow(index % 32))), "duplicate_route_role"],

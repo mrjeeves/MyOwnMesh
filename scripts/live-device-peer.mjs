@@ -884,11 +884,12 @@ function routeTraceConfig(command) {
     samples: 16, expected_rows: 32, max_rows: 64 };
 }
 
-const ROUTE_SCHEMA = "myownmesh.route-flow/v1";
+const ROUTE_SCHEMA = "myownmesh.route-flow/v2";
 const ROUTE_DURATIONS = Object.freeze(["callback_to_insert_us", "insert_to_dequeue_us",
   "dequeue_to_handler_us", "handler_to_route_decision_us", "route_dispatch_us", "handler_total_us"]);
 const ROUTE_FIELDS = Object.freeze(["schema", "kind", "run_id", "direction", "seq", "route_id",
-  "role", "hop_index", "remaining_ttl", "owner_epoch", ...ROUTE_DURATIONS, "outcome"]);
+  "role", "hop_index", "remaining_ttl", "owner_epoch", ...ROUTE_DURATIONS,
+  "disposition_finished_mono_us", "outcome"]);
 function exactRouteKeys(value, keys) {
   return value && typeof value === "object" && !Array.isArray(value) &&
     Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
@@ -910,6 +911,8 @@ function routeTraceRow(detail, config) {
       typeof detail.route_id !== "string" || !/^[0-9a-f]{32}$/.test(detail.route_id) ||
       !["origin", "relay", "destination"].includes(detail.role) ||
       ![detail.hop_index, detail.remaining_ttl].every(value => Number.isInteger(value) && value >= 0 && value <= 255) ||
+      !Number.isSafeInteger(detail.disposition_finished_mono_us) ||
+      detail.disposition_finished_mono_us < 0 || detail.disposition_finished_mono_us > 86400000000 ||
       !["delivered", "unavailable", "refused", "outcome_unknown"].includes(detail.outcome)) invalid();
   if (detail.owner_epoch !== null && (typeof detail.owner_epoch !== "string" ||
       !/^(0|[1-9][0-9]{0,19})$/.test(detail.owner_epoch) ||
