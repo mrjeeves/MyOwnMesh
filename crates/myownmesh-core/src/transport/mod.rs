@@ -16,6 +16,8 @@
 
 pub mod diag;
 pub mod ice;
+#[cfg(test)]
+mod nack_history_tests;
 mod rtp_replay;
 mod turn_stream;
 pub mod webrtc;

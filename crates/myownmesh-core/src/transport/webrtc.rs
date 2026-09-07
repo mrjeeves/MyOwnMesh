@@ -105,16 +105,16 @@ pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
 /// advance an early hole out of the history before its first NACK is emitted.
 /// AllMyStuff's access-unit sequence and key/GDR recovery still owns losses
 /// that age out of this deliberately finite transport window.
-const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 3; // 64 << 3 = 512 packets
-const NACK_REORDER_TAIL_PACKETS: u16 = 8;
-const NACK_INTERVAL: Duration = Duration::from_millis(20);
+pub(super) const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 3; // 64 << 3 = 512 packets
+pub(super) const NACK_REORDER_TAIL_PACKETS: u16 = 8;
+pub(super) const NACK_INTERVAL: Duration = Duration::from_millis(20);
 const NACK_RESPONDER_LOG2_SIZE: u8 = 13; // retain 8,192 sent packets
 /// NACK resends the original SSRC/sequence, not an RTX stream. The encrypted
 /// receive window must therefore admit an unseen repair anywhere in the
 /// sender's retained history. The default 64-packet SRTP window rejected
 /// valid repairs before they reached NACK tracking or H.264 assembly.
 /// This is a replay bitmap, not a media queue; duplicate rejection stays on.
-const SRTP_REPLAY_WINDOW_PACKETS: usize = 1 << NACK_RESPONDER_LOG2_SIZE;
+pub(super) const SRTP_REPLAY_WINDOW_PACKETS: usize = 1 << NACK_RESPONDER_LOG2_SIZE;
 
 #[cfg(test)]
 const NACK_GENERATOR_PACKETS: usize = 64 << NACK_GENERATOR_LOG2_SIZE_MINUS_6;
