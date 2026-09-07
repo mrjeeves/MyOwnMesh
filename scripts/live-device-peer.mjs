@@ -55,6 +55,7 @@ const PAYLOAD_ACTIONS = new Set([
 const STREAM_MODE_OPS = new Set(["events_subscribe", "trace_subscribe", "realtime_pipe"]);
 const SENSITIVE_KEY = /(?:capability|password|secret|token|mfa(?:_|$)|^code$|^handle$)/i;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const TEST_SESSION = Symbol("live-device-peer-test-session");
 
 export class ControllerError extends Error {
   constructor(message, kind = "failed", cause = undefined) {
@@ -154,6 +155,20 @@ function errorEvidence(error) {
   if (typeof error?.kind === "string") result.kind = error.kind;
   if (error?.result !== undefined) result.partial = sanitizeEvidence(error.result);
   return result;
+}
+
+function commandRecordEvidence(record) {
+  try {
+    return sanitizeEvidence(record);
+  } catch (error) {
+    return {
+      type: record?.type,
+      id: record?.id,
+      action: record?.action,
+      status: record?.status,
+      serialization_error: errorEvidence(error),
+    };
+  }
 }
 
 export function commandErrorStatus(error) {
@@ -564,6 +579,12 @@ export function controlEndpoint(home, config, platform = process.platform) {
 
 function connectSocket(endpoint, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const error = new ControllerError("controller deadline reached");
+      error.code = "ABORT_ERR";
+      reject(error);
+      return;
+    }
     const socket = net.createConnection(endpoint);
     let settled = false;
     const finish = (fn, value) => {
@@ -695,6 +716,9 @@ export class JsonLineConnection {
     }
     let attempted = false;
     try {
+      if (signal?.aborted) {
+        throw new ControllerError("IPC write cancelled before it was attempted", "failed");
+      }
       attempted = true;
       await withTimeout(
         new Promise((resolve, reject) => {
@@ -706,7 +730,7 @@ export class JsonLineConnection {
       );
     } catch (error) {
       throw new ControllerError(
-        "IPC write outcome is unknown",
+        attempted ? "IPC write outcome is unknown" : "IPC write failed before it was attempted",
         attempted ? "outcome_unknown" : "failed",
         error,
       );
@@ -718,7 +742,7 @@ export class JsonLineConnection {
   }
 }
 
-class RpcClient {
+export class RpcClient {
   constructor(endpoint, deadlineMs, signal) {
     this.endpoint = endpoint;
     this.deadlineMs = deadlineMs;
@@ -728,14 +752,14 @@ class RpcClient {
     this.pending = 0;
   }
 
-  async #ensure(timeoutMs) {
+  async #ensure(timeoutMs, signal = this.signal) {
     if (this.connection && !this.connection.terminal) return this.connection;
-    const socket = await connectSocket(this.endpoint, timeoutMs, this.signal);
+    const socket = await connectSocket(this.endpoint, timeoutMs, signal);
     this.connection = new JsonLineConnection(socket);
     return this.connection;
   }
 
-  rpc(request, requestedMs) {
+  rpc(request, requestedMs, workSignal = undefined) {
     if (request === null || Array.isArray(request) || typeof request !== "object") {
       return Promise.reject(new ControllerError("rpc request must be an object"));
     }
@@ -744,8 +768,8 @@ class RpcClient {
     }
     this.pending += 1;
     const task = this.tail.then(
-      () => this.#rpcOne(request, requestedMs),
-      () => this.#rpcOne(request, requestedMs),
+      () => this.#rpcOne(request, requestedMs, workSignal),
+      () => this.#rpcOne(request, requestedMs, workSignal),
     );
     this.tail = task.catch(() => {});
     return task.finally(() => {
@@ -753,14 +777,17 @@ class RpcClient {
     });
   }
 
-  async #rpcOne(request, requestedMs) {
+  async #rpcOne(request, requestedMs, workSignal) {
     const timeoutMs = remainingMs(this.deadlineMs, requestedMs);
+    const signal = workSignal ?? this.signal;
     let sent = false;
     try {
-      const connection = await this.#ensure(timeoutMs);
-      await connection.send(request, timeoutMs, this.signal);
+      const connection = this.connection && !this.connection.terminal
+        ? this.connection
+        : await this.#ensure(timeoutMs, signal);
+      await connection.send(request, timeoutMs, signal);
       sent = true;
-      return await connection.nextFrame(timeoutMs, this.signal);
+      return await connection.nextFrame(timeoutMs, signal);
     } catch (error) {
       this.connection?.close();
       this.connection = null;
@@ -867,6 +894,7 @@ class EventHub {
         channel,
       },
       LIMITS.rpcMs,
+      this.signal,
     );
     requireOk(reply);
     this.subscriptions.set(key, { network, channel, onEvent });
@@ -1219,6 +1247,510 @@ async function drainLifetimes(lifetimes, deadlineMs, writer) {
   if (aggregateError) throw aggregateError;
 }
 
+function validateDirectCommand(command) {
+  if (command === null || Array.isArray(command) || typeof command !== "object") {
+    throw new ControllerError("command must be one JSON object");
+  }
+  const encoded = Buffer.from(JSON.stringify(command), "utf8");
+  if (encoded.length > LIMITS.commandBytes) {
+    throw new ControllerError(`command input exceeds ${LIMITS.commandBytes} bytes`);
+  }
+  if (
+    typeof command.id !== "string" ||
+    command.id.length === 0 ||
+    Buffer.byteLength(command.id, "utf8") > LIMITS.commandIdBytes ||
+    /[\u0000-\u001f]/.test(command.id)
+  ) {
+    throw new ControllerError("command id is missing or invalid");
+  }
+  if (
+    typeof command.action !== "string" ||
+    command.action.length === 0 ||
+    Buffer.byteLength(command.action, "utf8") > 64 ||
+    /[\u0000-\u001f]/.test(command.action)
+  ) {
+    throw new ControllerError("command action is missing or invalid");
+  }
+  return { command, digest: createHash("sha256").update(encoded).digest("hex") };
+}
+
+class PeerSession {
+  constructor(args, options, testState = undefined) {
+    this.args = args;
+    this.options = options;
+    this.startedMs = monoMs();
+    this.deadlineMs = this.startedMs + args.durationMs;
+    this.workAbort = new AbortController();
+    this.transportAbort = new AbortController();
+    this.lifetimes = [];
+    this.seen = new Set();
+    this.commandCount = 0;
+    this.commandFailures = 0;
+    this.executing = false;
+    this.activeExecution = null;
+    this.cleanupMode = false;
+    this.closed = false;
+    this.terminalError = undefined;
+    this.externalAbort = () => this.workAbort.abort();
+    options.signal?.addEventListener("abort", this.externalAbort, { once: true });
+    if (options.signal?.aborted) this.externalAbort();
+    this.timer = setTimeout(() => this.workAbort.abort(), args.durationMs);
+    this.timer.unref?.();
+    if (testState?.token === TEST_SESSION) {
+      this.writer = testState.writer;
+      this.child = testState.child;
+      this.rpc = {
+        deadlineMs: this.deadlineMs,
+        rpc: testState.rpc,
+        close: testState.closeRpc ?? (() => {}),
+      };
+      this.events = {
+        subscribe: testState.subscribe ?? (async () => {
+          throw new ControllerError("test session did not provide subscribe");
+        }),
+        close: testState.closeEvents ?? (async () => {}),
+      };
+      this.ready = Promise.resolve(testState.ready ?? {});
+    } else {
+      this.ready = this.#start();
+    }
+  }
+
+  async #record(record) {
+    const safe = sanitizeEvidence(record);
+    await this.writer.append(safe);
+    if (this.options.onRecord) await this.options.onRecord(safe);
+  }
+
+  async #start() {
+    try {
+      this.writer = await JsonlWriter.create(this.args.output);
+      const prepared = await prepareInputs(this.args);
+      this.prepared = prepared;
+      const endpoint = controlEndpoint(prepared.actualHome, prepared.config);
+      this.endpoint = endpoint;
+      const preflightProbe = await probeEndpoint(endpoint, 500);
+      if (preflightProbe.reachable) {
+        throw new ControllerError("a daemon is already reachable at the production control endpoint");
+      }
+      if (endpointProbeDisposition(process.platform, preflightProbe.error) !== "absent") {
+        throw endpointFailureMessage(
+          "control endpoint preflight could not prove the endpoint absent",
+          preflightProbe.error,
+        );
+      }
+      const launched = spawnDaemon(this.args, prepared);
+      this.child = launched.child;
+      await withTimeout(
+        launched.started,
+        remainingMs(this.deadlineMs, LIMITS.readyMs),
+        "daemon process did not start",
+        this.workAbort.signal,
+      );
+      const spawnedWallTime = new Date().toISOString();
+      let processIdentity = null;
+      if (this.options.identifyProcess) {
+        processIdentity = await this.options.identifyProcess(
+          this.child.pid,
+          remainingMs(this.deadlineMs, LIMITS.readyMs),
+        );
+      }
+      await this.#record({
+        type: "controller_start",
+        mono_ms: monoMs(),
+        wall_time: spawnedWallTime,
+        controller_pid: process.pid,
+        hostname: os.hostname(),
+        platform: process.platform,
+        arch: process.arch,
+        node: process.version,
+        binary: this.args.binary,
+        binary_sha256: prepared.binarySha256,
+        config_sha256: prepared.configSha256,
+        grant_sha256: prepared.grantSha256,
+        home: prepared.actualHome,
+        reuse_home: this.args.reuseHome,
+        endpoint,
+        pid: this.child.pid,
+        process_identity: processIdentity,
+        daemon_stdout: launched.stdoutPath,
+        daemon_stderr: launched.stderrPath,
+        deadline_ms: this.deadlineMs,
+      });
+      if ((await sha256File(this.args.binary)) !== prepared.binarySha256) {
+        throw new ControllerError("binary changed between preflight and process start");
+      }
+      await this.#record({
+        type: "binary_reverified",
+        mono_ms: monoMs(),
+        binary_sha256: prepared.binarySha256,
+        pid: this.child.pid,
+      });
+      await waitForDaemon(this.endpoint, this.child, this.deadlineMs, this.workAbort.signal);
+      this.rpc = new RpcClient(this.endpoint, this.deadlineMs, this.transportAbort.signal);
+      this.events = new EventHub(
+        this.endpoint,
+        this.rpc,
+        this.deadlineMs,
+        this.workAbort.signal,
+      );
+      const ready = {
+        controllerPid: process.pid,
+        daemonPid: this.child.pid,
+        daemonCreationIdentity: processIdentity,
+        endpoint: this.endpoint,
+        binarySha256: prepared.binarySha256,
+        configSha256: prepared.configSha256,
+        grantSha256: prepared.grantSha256,
+        home: prepared.actualHome,
+      };
+      await this.#record({ type: "daemon_ready", mono_ms: monoMs(), pid: this.child.pid });
+      return ready;
+    } catch (error) {
+      this.terminalError = mergeControllerError(this.terminalError, error);
+      if (this.writer) {
+        try {
+          await this.#record({
+            type: "controller_failure",
+            mono_ms: monoMs(),
+            status: controllerStatus(error),
+            error: errorEvidence(error),
+          });
+        } catch (captureError) {
+          this.terminalError = mergeControllerError(this.terminalError, captureError);
+        }
+      }
+      await this.#finish().catch(() => {});
+      throw error;
+    }
+  }
+
+  async execute(command) {
+    await this.ready;
+    if (this.closed) throw new ControllerError("peer session is closed");
+    if (this.terminalError?.kind === "outcome_unknown") {
+      throw new ControllerError("peer session has an unreconciled command outcome", "outcome_unknown");
+    }
+    if (this.executing) throw new ControllerError("peer session already has an in-flight command");
+    if (this.workAbort.signal.aborted || monoMs() >= this.deadlineMs) {
+      throw new ControllerError("peer session deadline reached", "censored");
+    }
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      throw new ControllerError("daemon exited before command execution");
+    }
+    const input = validateDirectCommand(command);
+    if (this.seen.has(command.id)) throw new ControllerError(`duplicate command id ${command.id}`);
+    this.commandCount += 1;
+    if (this.commandCount > LIMITS.commands) {
+      throw new ControllerError("command count exceeded the bound");
+    }
+    this.seen.add(command.id);
+    this.executing = true;
+    const commandStartedMs = monoMs();
+    const session = this;
+    const context = Object.freeze({
+      rpc: (request, timeoutMs) => this.rpc.rpc(
+        request,
+        timeoutMs,
+        this.cleanupMode ? undefined : this.workAbort.signal,
+      ),
+      requireOk,
+      subscribe: (network, channel, onEvent) => this.events.subscribe(network, channel, onEvent),
+      monoMs,
+      get deadlineMs() {
+        return session.rpc.deadlineMs;
+      },
+      emit: (record) =>
+        this.#record({ type: "module_event", id: command.id, mono_ms: monoMs(), record }),
+      signal: this.workAbort.signal,
+    });
+    let settleExecution;
+    const activeExecution = new Promise((resolve) => { settleExecution = resolve; });
+    this.activeExecution = activeExecution;
+    try {
+      try {
+        await this.#record({
+          type: "command_started",
+          id: command.id,
+          action: command.action,
+          command_sha256: input.digest,
+          mono_ms: commandStartedMs,
+        });
+      } catch (startCaptureError) {
+        this.commandFailures += 1;
+        this.terminalError = mergeControllerError(this.terminalError, startCaptureError);
+        const record = {
+          type: "command_result",
+          id: command.id,
+          action: command.action,
+          status: commandErrorStatus(startCaptureError),
+          mono_ms: monoMs(),
+          elapsed_ms: monoMs() - commandStartedMs,
+          error: errorEvidence(startCaptureError),
+        };
+        try {
+          await this.#record(record);
+        } catch (resultCaptureError) {
+          const boundaryError = new ControllerError(
+            "command start and terminal capture failed",
+            commandErrorStatus(startCaptureError),
+            resultCaptureError,
+          );
+          boundaryError.result = {
+            command_record: commandRecordEvidence(record),
+            command_error: errorEvidence(startCaptureError),
+            capture_error: errorEvidence(resultCaptureError),
+          };
+          this.terminalError = mergeControllerError(this.terminalError, boundaryError);
+          throw boundaryError;
+        }
+        throw startCaptureError;
+      }
+
+      let outcome;
+      let actionError;
+      if (this.closed || this.workAbort.signal.aborted || monoMs() >= this.deadlineMs) {
+        actionError = new ControllerError("peer session closed before command dispatch", "censored");
+      } else {
+        try {
+          outcome = await executeCommand(command, context, this.lifetimes);
+        } catch (error) {
+          actionError = error;
+        }
+      }
+      const status = actionError
+        ? commandErrorStatus(actionError)
+        : classifyActionResult(command.action, outcome.result);
+      let statusCause = actionError;
+      if (failureStatus(status)) {
+        this.commandFailures += 1;
+        statusCause ??= new ControllerError(
+          `command ${command.id} returned ${status}`,
+          status,
+        );
+        this.terminalError = mergeControllerError(this.terminalError, statusCause);
+      }
+      const record = {
+        type: "command_result",
+        id: command.id,
+        action: command.action,
+        status,
+        mono_ms: monoMs(),
+        elapsed_ms: monoMs() - commandStartedMs,
+        ...(actionError ? { error: errorEvidence(actionError) } : { result: outcome.result }),
+      };
+      try {
+        await this.#record(record);
+      } catch (captureError) {
+        const boundaryError = new ControllerError(
+          "command terminal capture failed",
+          status === "outcome_unknown" ? "outcome_unknown" : "failed",
+          captureError,
+        );
+        boundaryError.result = {
+          command_record: commandRecordEvidence(record),
+          command_error: statusCause ? errorEvidence(statusCause) : null,
+          capture_error: errorEvidence(captureError),
+        };
+        this.terminalError = status === "outcome_unknown"
+          ? boundaryError
+          : mergeControllerError(this.terminalError, boundaryError);
+        throw boundaryError;
+      }
+      return record;
+    } finally {
+      this.executing = false;
+      settleExecution();
+      if (this.activeExecution === activeExecution) this.activeExecution = null;
+    }
+  }
+
+  daemonIsRunning() {
+    return Boolean(
+      this.child &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null,
+    );
+  }
+
+  terminateOwnedChildOnParentExit() {
+    if (!this.daemonIsRunning()) return false;
+    try {
+      return this.child.kill();
+    } catch {
+      return false;
+    }
+  }
+
+  async pinDaemonCreationIdentity(creationTimeUtcTicks) {
+    await this.ready;
+    if (!/^[1-9][0-9]{0,18}$/.test(creationTimeUtcTicks)) {
+      throw new ControllerError("daemon creation identity must be a positive decimal tick string");
+    }
+    if (!this.daemonIsRunning()) {
+      throw new ControllerError("owned daemon exited before its creation identity was pinned");
+    }
+    if (
+      this.daemonCreationIdentity !== undefined &&
+      this.daemonCreationIdentity !== creationTimeUtcTicks
+    ) {
+      throw new ControllerError("owned daemon creation identity cannot change");
+    }
+    this.daemonCreationIdentity = creationTimeUtcTicks;
+    await this.#record({
+      type: "daemon_identity_pinned",
+      mono_ms: monoMs(),
+      pid: this.child.pid,
+      creation_time_utc_ticks: creationTimeUtcTicks,
+    });
+    if (!this.daemonIsRunning()) {
+      throw new ControllerError("owned daemon exited while its creation identity was pinned");
+    }
+    return { pid: this.child.pid, creationTimeUtcTicks };
+  }
+
+  async close() {
+    await this.ready.catch(() => {});
+    return this.#finish();
+  }
+
+  async #finish() {
+    if (this.finishPromise) return this.finishPromise;
+    this.closed = true;
+    this.finishPromise = (async () => {
+      const cleanupDeadlineMs = monoMs() + LIMITS.shutdownMs;
+      if (this.rpc) this.rpc.deadlineMs = cleanupDeadlineMs;
+      this.workAbort.abort();
+      let activeJoined = this.activeExecution === null;
+      if (this.activeExecution) {
+        try {
+          await withTimeout(
+            this.activeExecution,
+            Math.max(1, cleanupDeadlineMs - monoMs()),
+            "active command did not reach a terminal record before cleanup",
+          );
+          activeJoined = true;
+        } catch (error) {
+          this.terminalError = mergeControllerError(
+            this.terminalError,
+            new ControllerError(
+              "active command outcome remained unknown at the cleanup boundary",
+              "outcome_unknown",
+              error,
+            ),
+          );
+        }
+      }
+      this.cleanupMode = activeJoined;
+      if (this.writer) {
+        await drainLifetimes(this.lifetimes, cleanupDeadlineMs, this.writer).catch((error) => {
+          this.terminalError = mergeControllerError(this.terminalError, error);
+        });
+      }
+      try {
+        if (this.events) {
+          await withTimeout(
+            this.events.close(),
+            Math.max(1, cleanupDeadlineMs - monoMs()),
+            "controller event stream cleanup timed out",
+          );
+        }
+      } catch (error) {
+        this.terminalError = mergeControllerError(this.terminalError, error);
+        if (this.writer) {
+          await this.#record({
+            type: "controller_stream_failure",
+            mono_ms: monoMs(),
+            error: errorEvidence(error),
+          }).catch((captureError) => {
+            this.terminalError = mergeControllerError(this.terminalError, captureError);
+          });
+        }
+      }
+      this.rpc?.close();
+      this.transportAbort.abort();
+      let childTerminal;
+      if (this.child) {
+        try {
+          childTerminal = await stopOwnedChild(this.child, monoMs() + LIMITS.shutdownMs);
+        } catch (error) {
+          childTerminal = { mode: "cleanup_failed", error: errorEvidence(error) };
+          this.terminalError = mergeControllerError(this.terminalError, error);
+        }
+      }
+      if (this.commandFailures > 0 && !this.terminalError) {
+        this.terminalError = new ControllerError(`${this.commandFailures} command(s) failed`);
+      }
+      if (this.options.signal?.aborted && !this.terminalError) {
+        this.terminalError = new ControllerError("peer session cancelled", "censored");
+      }
+      const terminal = {
+        type: "controller_terminal",
+        mono_ms: monoMs(),
+        elapsed_ms: monoMs() - this.startedMs,
+        status: controllerStatus(this.terminalError),
+        output_close_pending: true,
+        external_signal: this.options.signal?.aborted ? "AbortSignal" : null,
+        child: childTerminal,
+      };
+      if (this.writer) {
+        await this.#record(terminal).catch((captureError) => {
+          this.terminalError = mergeControllerError(this.terminalError, captureError);
+        });
+      }
+      clearTimeout(this.timer);
+      this.options.signal?.removeEventListener("abort", this.externalAbort);
+      if (this.writer) {
+        await this.writer.close().catch((closeError) => {
+          this.terminalError = mergeControllerError(this.terminalError, closeError);
+        });
+      }
+      if (this.terminalError) throw this.terminalError;
+      return terminal;
+    })();
+    return this.finishPromise;
+  }
+}
+
+/**
+ * Start one daemon identity without installing process-global signal handlers
+ * or polling a command file. The caller owns the returned session and must
+ * await `close()`; an external AbortSignal stops new work and is still followed
+ * by the same bounded owned-child cleanup.
+ */
+export function createPeerSession(args, options = {}) {
+  if (!args || typeof args !== "object") throw new ControllerError("peer session args are required");
+  if (!Number.isSafeInteger(args.durationMs) || args.durationMs <= 0 || args.durationMs > LIMITS.maxDurationMs) {
+    throw new ControllerError(
+      `durationMs must be an integer from 1 through ${LIMITS.maxDurationMs}`,
+    );
+  }
+  if (options.onRecord !== undefined && typeof options.onRecord !== "function") {
+    throw new ControllerError("onRecord must be a function");
+  }
+  if (options.identifyProcess !== undefined && typeof options.identifyProcess !== "function") {
+    throw new ControllerError("identifyProcess must be a function");
+  }
+  return new PeerSession(args, options);
+}
+
+// Exercises the exact PeerSession command/capture/close path without launching
+// a daemon. It deliberately exposes no filesystem, process-launch, or raw VFS
+// capability and is intended only for the maintained Node controls.
+export function createPeerSessionTestHarness({ rpc, writer, onRecord, durationMs = 5_000 }) {
+  if (typeof rpc !== "function" || typeof writer?.append !== "function" ||
+      typeof writer?.close !== "function") {
+    throw new ControllerError("test session requires rpc and a bounded writer");
+  }
+  const child = { pid: 1, exitCode: null, signalCode: null };
+  const session = new PeerSession(
+    { durationMs },
+    { onRecord },
+    { token: TEST_SESSION, rpc, writer, child },
+  );
+  return { session, child };
+}
+
 export async function runController(args) {
   const startedMs = monoMs();
   const deadlineMs = startedMs + args.durationMs;
@@ -1241,6 +1773,7 @@ export async function runController(args) {
   let child;
   let rpc;
   let events;
+  let cleanupMode = false;
   const lifetimes = [];
   let controllerError;
   try {
@@ -1355,7 +1888,11 @@ export async function runController(args) {
         mono_ms: commandStartedMs,
       });
       const context = Object.freeze({
-        rpc: (request, timeoutMs) => rpc.rpc(request, timeoutMs),
+        rpc: (request, timeoutMs) => rpc.rpc(
+          request,
+          timeoutMs,
+          cleanupMode ? undefined : workAbort.signal,
+        ),
         requireOk,
         subscribe: (network, channel, onEvent) => events.subscribe(network, channel, onEvent),
         monoMs,
@@ -1453,6 +1990,7 @@ export async function runController(args) {
   } finally {
     const cleanupDeadlineMs = monoMs() + LIMITS.shutdownMs;
     if (rpc) rpc.deadlineMs = cleanupDeadlineMs;
+    cleanupMode = true;
     workAbort.abort();
     await drainLifetimes(lifetimes, cleanupDeadlineMs, writer).catch((error) => {
       controllerError = mergeControllerError(controllerError, error);

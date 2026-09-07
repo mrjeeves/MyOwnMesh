@@ -1,18 +1,239 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   ControllerError,
+  JsonLineConnection,
   JsonlWriter,
+  RpcClient,
   classifyActionResult,
   classifyLifetimeResult,
   collectionDeadlineError,
   controlEndpoint,
   controllerStatus,
+  createPeerSession,
+  createPeerSessionTestHarness,
   endpointProbeDisposition,
   mergeControllerError,
+  monoMs,
   stopOwnedChild,
 } from "../live-device-peer.mjs";
+
+function memoryWriter() {
+  const rows = [];
+  let closed = false;
+  return {
+    rows,
+    get closed() { return closed; },
+    async append(row) {
+      if (closed) throw new Error("writer already closed");
+      rows.push(row);
+    },
+    async close() { closed = true; },
+  };
+}
+
+async function listen(server, endpoint) {
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(endpoint, () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
+  });
+}
+
+async function closeServer(server) {
+  await new Promise((resolve) => server.close(resolve));
+}
+
+test("work cancellation interrupts a real held RPC while cleanup keeps a separate bounded path", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "myownmesh-peer-rpc-"));
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\myownmesh-live-rpc-${process.pid}-${Date.now()}`
+    : path.join(root, "rpc.sock");
+  let requests = 0;
+  let receivedHeld;
+  const heldReceived = new Promise((resolve) => { receivedHeld = resolve; });
+  const server = net.createServer((socket) => {
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const request = JSON.parse(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        requests += 1;
+        if (request.op === "held") receivedHeld();
+        else socket.write(`${JSON.stringify({ ok: true, data: { op: request.op } })}\n`);
+      }
+    });
+  });
+  await listen(server, endpoint);
+  const transport = new AbortController();
+  const work = new AbortController();
+  const client = new RpcClient(endpoint, monoMs() + 5_000, transport.signal);
+  try {
+    const positive = await client.rpc({ op: "positive" }, 1_000, work.signal);
+    assert.deepEqual(positive, { ok: true, data: { op: "positive" } });
+    const pending = client.rpc({ op: "held" }, 5_000, work.signal);
+    await heldReceived;
+    work.abort();
+    await assert.rejects(
+      Promise.race([
+        pending,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("abort was not prompt")), 500)),
+      ]),
+      (error) => error?.kind === "outcome_unknown",
+    );
+    assert.equal(requests, 2);
+    const cleanup = await client.rpc({ op: "cleanup" }, 1_000);
+    assert.deepEqual(cleanup, { ok: true, data: { op: "cleanup" } });
+    assert.equal(requests, 3);
+  } finally {
+    client.close();
+    transport.abort();
+    await closeServer(server);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a cancellation during an attempted IPC write is unknown and is never retried", async () => {
+  const socket = new EventEmitter();
+  let writes = 0;
+  socket.write = () => {
+    writes += 1;
+    return true;
+  };
+  socket.destroy = () => socket.emit("close");
+  const connection = new JsonLineConnection(socket);
+  const work = new AbortController();
+  const pending = connection.send({ op: "write" }, 5_000, work.signal);
+  work.abort();
+  await assert.rejects(pending, (error) => error?.kind === "outcome_unknown");
+  assert.equal(writes, 1);
+  connection.close();
+});
+
+test("a cancelled queued write is refused before touching the socket", async () => {
+  const socket = new EventEmitter();
+  let writes = 0;
+  socket.write = () => { writes += 1; };
+  socket.destroy = () => socket.emit("close");
+  const connection = new JsonLineConnection(socket);
+  const work = new AbortController();
+  work.abort();
+  await assert.rejects(
+    connection.send({ op: "must-not-send" }, 5_000, work.signal),
+    (error) => error?.kind === "failed" && /before it was attempted/.test(error.message),
+  );
+  assert.equal(writes, 0);
+  connection.close();
+});
+
+test("returned and thrown unknown outcomes survive a failing result capture", async () => {
+  for (const mode of ["returned", "thrown"]) {
+    const writer = memoryWriter();
+    let rpcCalls = 0;
+    const { session, child } = createPeerSessionTestHarness({
+      writer,
+      rpc: async () => {
+        rpcCalls += 1;
+        if (mode === "thrown") {
+          throw new ControllerError("mutating request outcome is unknown", "outcome_unknown");
+        }
+        return { data: { malformed: true } };
+      },
+      onRecord: async (row) => {
+        if (row.type === "command_result") throw new Error("result capture failed");
+      },
+    });
+    await assert.rejects(
+      session.execute({ id: `capture-${mode}`, action: "rpc", request: { op: "mutate" } }),
+      (error) => {
+        assert.equal(error?.kind, "outcome_unknown");
+        assert.equal(error?.result?.command_record?.status, "outcome_unknown");
+        assert.match(error?.result?.capture_error?.message, /result capture failed/);
+        return true;
+      },
+    );
+    assert.equal(rpcCalls, 1);
+    assert.equal(writer.rows.some((row) => row.type === "command_result" &&
+      row.status === "outcome_unknown"), true);
+    child.exitCode = 0;
+    await assert.rejects(session.close(), (error) => error?.kind === "outcome_unknown");
+    assert.equal(writer.closed, true);
+  }
+});
+
+test("close owns held start capture and no released or rejected start dispatches late work", async () => {
+  for (const rejectStart of [false, true]) {
+    const writer = memoryWriter();
+    let rpcCalls = 0;
+    let enteredStart;
+    let releaseStart;
+    const startEntered = new Promise((resolve) => { enteredStart = resolve; });
+    const heldStart = new Promise((resolve, reject) => {
+      releaseStart = () => rejectStart ? reject(new Error("start capture rejected")) : resolve();
+    });
+    const { session, child } = createPeerSessionTestHarness({
+      writer,
+      rpc: async () => {
+        rpcCalls += 1;
+        return { ok: true, data: {} };
+      },
+      onRecord: async (row) => {
+        if (row.type === "command_started") {
+          enteredStart();
+          await heldStart;
+        }
+      },
+    });
+    const execution = session.execute({
+      id: `held-start-${rejectStart}`,
+      action: "rpc",
+      request: { op: "must-not-dispatch" },
+    });
+    await startEntered;
+    child.exitCode = 0;
+    let closeSettled = false;
+    const closeObserved = session.close().then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    ).finally(() => { closeSettled = true; });
+    await Promise.resolve();
+    assert.equal(closeSettled, false);
+    releaseStart();
+    if (rejectStart) {
+      await assert.rejects(execution, /start capture rejected/);
+    } else {
+      const record = await execution;
+      assert.equal(record.status, "failed");
+    }
+    const closed = await closeObserved;
+    assert.ok(closed.error);
+    assert.equal(controllerStatus(closed.error), rejectStart ? "failed" : "censored");
+    assert.equal(rpcCalls, 0);
+    assert.equal(writer.rows.some((row) => row.type === "command_result"), true);
+    assert.equal(writer.rows.at(-1).type, "controller_terminal");
+    assert.equal(writer.rows.at(-1).status, rejectStart ? "failed" : "censored");
+    assert.equal(writer.closed, true);
+  }
+});
+
+test("import-safe peer sessions refuse an unbounded lifetime before launch", () => {
+  assert.throws(
+    () => createPeerSession({ durationMs: 24 * 60 * 60 * 1000 + 1 }),
+    /durationMs must be an integer/,
+  );
+});
 
 function cleanPayload(extra = {}) {
   return {

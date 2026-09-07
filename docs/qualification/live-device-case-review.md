@@ -259,3 +259,194 @@ evidence and a reserved forced-exit observation interval within the existing
 10-second shutdown budget. No Rust or authority change is implied. Hosted CI,
 three-device hubs/opaque relay, a non-TURN native baseline, full Open/Closed
 comparison, 1,000-fact scale and final independent field audit remain unqualified.
+
+## Native direct observations and scale-controller gate (September 6–7)
+
+These later observations extend the preceding partial report; they do not turn
+its failed batches into passes. The operator requested a capacity-gated
+500-identity emulation across the three physical computers and a separate
+direct/STUN/TURN/application-hub/Closed-opaque-relay matrix. That unit is still
+unfinished. No connected 500-node result is claimed.
+
+### Native direct observations
+
+The matched production executable is SHA-256
+`51592459BDF32E9E9FD943BC42B24A3E9A8A9174D6254E994C78D03E364C1BDE`.
+Its feature-free Windows fingerprint excludes `transport-lab`; the remembered
+lab-only forced-TURN environment setting cannot affect that executable. Making
+TURN servers available is not a relay-only policy.
+
+| One-connection exploratory workload | Waited connect to active | Verified 1 KiB echoes | Median application RTT | p95 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Same-LAN native Windows, STUN/TURN disabled | 342.46 ms | 20/20 | 1.272 ms | 2.106 ms | 3.341 ms |
+| Same-LAN native Windows, STUN/TURN available | 129.77 ms | 20/20 | 1.001 ms | 2.210 ms | 47.708 ms |
+| Native Windows desktop to home | 1,401.30 ms | 100/100 | 25.026 ms | 28.113 ms | 228.249 ms |
+
+Same-LAN evidence is local run `ee85dfab-5d62-47b9-acc4-79990a07c2cd`
+and native laptop run `4b0ea484-986d-4fae-923e-7aad65fb2b90`. Both payload
+sub-workloads completed, but their overall collectors expired before the
+manager's stop command was consumed and remain censored/failure. The second
+network used warm processes. Both sides observed host/host in the available-ICE
+case. The operator reported allowing a laptop firewall rule; its timing was not
+recorded, so the earlier WSL failure does not isolate WSL/NAT as its cause. The
+agent made no firewall or network-mode changes.
+
+Home evidence is local `75188943-001f-4e78-b293-c96caf2b9c2c` and home
+`a9262ed4-da8a-40a3-8f7b-836ee15a6bf2`, both exit 0 with complete collectors.
+The retained JSONL hashes are respectively
+`E63AC14C0EE56EA75E5E839D0B4C1C81CE65FCF374C1B18E3F4E2AFC03F6BDDA` and
+`43D03D15C6E825923A9CACB329C84BE8A974012B0086B2156096CA099A18E977`.
+Both endpoints observed host/peer-reflexive, consistent with direct
+NAT-traversed connectivity, not a selected relay candidate. Public snapshots
+are observational and cannot attest the nominated socket or per-payload path.
+All RTTs use a sender-local monotonic clock and include IPC/application work.
+The outliers remain included. Repeated echoes on one connection are not
+independent connection trials, and these values establish no tight-tail SLO.
+Windows owned-child termination was forced; no graceful durability follows.
+
+### Capacity-gated emulation, not 500 physical devices
+
+The scale runner owns multiple independent native daemon sessions from one
+host controller, rather than one polling Node process per identity. The initial
+executable stages are 10, 50, 100, 250 and 500, advanced only after native
+capacity and correctness gates. Prepared identities are validated through
+`identity_show.data.pubkey`; `status.data.device_id` is a display observation,
+not the canonical topology key. All identity homes, pipes, configuration
+hashes, per-role limits and host placement remain explicit inputs.
+
+The planner uses supplied identities and the existing rendezvous selector.
+For Hubs R1 with 3/3/6/9/12 hubs, the expected steady edge counts are
+10/50/109/277/554; HubTree backup0 has 9/49/99/249/499. Actual adjacency must
+still be measured. A 500-node full mesh would have 124,750 pairs and is not the
+default scale case. Colocated logical edges are labeled separately from
+inter-host edges. Neither topology preference nor public snapshots exclude
+every transient shortcut.
+
+Each host admits the complete componentwise sum of all 11 provider dimensions
+against an explicit host ledger. Independently, the Windows sampler observes
+private committed bytes, current/peak working set, actual CPU intervals, host
+RAM/commit/disk headroom and registered artifact/log bytes. The original
+per-daemon grant is not silently enlarged. The sampled guard is cooperative,
+not an OS reservation or proof against transient OOM between samples. Missing
+or stale evidence prevents further launch/work; unknown writes are not retried.
+
+The earlier idle calibration, run `8fc1e848-2fc4-43bf-932c-424fac67c8cc`,
+sampled ten empty-network native daemons and ten separate Node controllers on
+the home machine: 11 observations over 13.3955 seconds. Last mean private
+memory was about 3.43 MiB per daemon versus 52.03 MiB per old controller.
+Seven controller lifetimes were censored and three completed; all 20 owned
+processes were subsequently absent. This motivated sharing a host controller,
+but idle values neither predict loaded hub cost nor authorize a 500-node
+placement. The retained native sampler file hash is
+`03201C5E60992E913D58C8FA4FB0465A04BDD69C6898411421AB99485921E818`.
+
+### Frozen harness verification, not field qualification
+
+The implementation owners are Diffie (peer/host lifecycle), Karp (topology
+planner), and Noether (Windows resource collector); none audits their own
+implementation. Payne independently closed the frozen planner/collector
+dependency gate. Integrated peer/host independent verification found two
+capture-boundary blockers, reproduced below. Turing's final whole-unit audit
+remains separate.
+
+Three integration defects were reproduced and retained: guard notification did
+not cancel an active command, display identity was used in place of canonical
+`pubkey`, and the real RPC client did not interrupt a pending reply on work
+abort. Runs `5a351caf-900e-42c1-8fd9-2cd1ed6df175` and
+`7df3bce9-1e80-45e5-a3fe-3adb1a13f383` preserve the failed guard controls.
+The correction carries per-call work cancellation through actual IPC, preserves
+a separate bounded cleanup path, joins active command capture before cleanup,
+and gathers every started batch outcome with unknown-outcome precedence.
+
+Frozen SHA-256 identities for the 54-control and native lifecycle gates below:
+
+| File | SHA-256 |
+| --- | --- |
+| `scripts/live-device-peer.mjs` | `81070D9C690BEC8CBF6B407B8F444CD2C9B0AD6FDE2AF7F51ABB358A1F21567C` |
+| `scripts/run-live-device-scale-host.mjs` | `3EF7C6E7AFF5F5F9B6F61344AF1615E6A2B646D4CC93A1619B8AA10C054987AA` |
+| `scripts/live-device-topology.mjs` | `CC0E99BC34BBC254DFC38B41BEDB68F86526734C5A4290B52D52F40B98BA61C3` |
+| `scripts/live-device-resources.ps1` | `9211374C94BB60719AED6702525A46A1F1E01C02968809B1A745A61EDC03F729` |
+
+Run `88fd356c-1bc8-4be5-9f5e-b756e49a1929` passed all 54 combined Node
+controls, no failures/cancellations/skips (11,758 stdout bytes, zero stderr).
+This includes private IPC and mock controls, not 54 real mesh cases. The earlier
+PowerShell run `4ff00ae1-b90c-478a-809a-74b3f66e8d4f` passed 18 injected
+resource controls; `c1d9e28d-1385-4d31-b5c1-2ff41a2d5213` exercised native
+host/disk/collector counters without owned-child sampling.
+
+Run `9526205f-fc07-481c-b4e1-78edf261fbcd` passed the formerly failing
+actual PeerSession/RpcClient check: one held request on private mock IPC,
+abort-to-terminal observation 4.6943 ms before a reply was released, no retry,
+`outcome_unknown` preserved, and owned native daemon exit observed. This is a
+cancellation observation, not mesh latency or an acceptance threshold.
+
+Run `bc64703e-82f6-4062-97f5-88396c138791` passed an actual empty-network
+native daemon plus Windows sampler lifecycle: exact controller and daemon
+creation-tick pinning, public status and canonical identity, six samples,
+zero evidence failures, followed by required daemon exit. Its sampler terminal
+reports `observedRequiredExited:true` and honestly `observedAllExited:false`
+because the host controller was still alive at its final sample. The run then
+exited 0; all three owned processes were checked absent. It does not test a
+connected topology, database footprint, or the complete scale-host CLI plan.
+
+All three latest runs used base `a9fdbc5c7b60ddfa37fc2f74a11cdc81a3ff8b34`
+and frozen eight-file source manifest
+`845315a84223ab756f0d988ae3d5a437380f8eef4aae34087f0755ce0b614d2c`.
+Their stdout/stderr were retained to EOF without truncation. Preliminary
+harness publication is for clean-checkout field execution only. Connected
+10-node configuration/guard integration, loaded capacity placement, larger
+stages, matched forced-TURN controls, application hubs/opaque relays, complete
+Open/Closed comparison and the final independent field audit remain required.
+
+Payne's subsequent integrated review blocks preliminary publication at this
+snapshot despite the positive gates above. In `PeerSession.execute`, an
+evidence-capture failure could replace an already-known unknown RPC outcome
+with an ordinary failure. The initial `command_started` capture also preceded
+installation of the active execution owner, allowing concurrent `close()` to
+finish while that capture was still pending. These are harness capture/lifetime
+issues, not a newly observed native daemon or network failure.
+
+Manager run `01e9a969-bd81-4ce4-b3c5-eb58dc8695b2` reproduced both boundaries
+through actual PeerSession execution with injected RPC/capture callbacks:
+returned-unknown and thrown-unknown each lost their unknown classification on
+capture failure; holding initial capture allowed close to report complete
+before capture release, followed by a late injected RPC invocation. All three
+empty-network owned native daemons exited. The run correctly failed its
+assertions (721 stdout bytes, 561 stderr bytes, both complete). This is one
+paired correction in the peer lifecycle implementation and tests; the host,
+planner and collector remain frozen. Publication and multi-node launch remain
+paused until correction, runtime verification and independent closure.
+
+The paired capture correction is now runtime-verified at peer SHA-256
+`D9B7E7A4CCBA73DF74E3C23022B9CA6137EDF939B11B8BF13D1BF1BFE88A5737`.
+It installs the execution owner before initial capture, rechecks cancellation
+before dispatch, and preserves known unknown outcomes before fallible result
+capture. The host, planner and resource collector hashes above are unchanged.
+Peer tests are now
+`B868C8FDA916AD5FB4DAEC135A2CB88C9973FAEF36B70BA9C766A1EDAC9D2EB6`.
+
+Run `a5f1c54f-7865-492d-b499-1fc0d1d45d29` passed all 56 combined Node
+controls, zero failed/cancelled/skipped, with 12,208 stdout bytes and zero
+stderr, complete to EOF. Its nine-file manifest is
+`122be53e1cb13336a02a18552fb5e5a15e8395b4c803dfbbb981d67788a59903`
+at base `a9fdbc5c7b60ddfa37fc2f74a11cdc81a3ff8b34`.
+Two preceding 55/56 runs remain retained: `384ee581-ad13-4df1-b65e-e68c62befab4`
+had a new test expecting a censored command status instead of the existing
+failed-command/censored-controller distinction; `818eede6-36fc-490c-a5cd-234a01f13850`
+then expected an explicit kind on a generic Error. Only test assertions were
+corrected. The final control checks the existing controller classifier and
+retained terminal status, waits for both resolved and rejected held capture,
+and still requires zero late RPC dispatch and joined writer closure.
+
+Actual PeerSession capture probe `176b1404-42e4-435e-b188-f5f9f7d7aa07`
+passed all three cases on the same corrected peer implementation: returned
+and thrown unknown outcomes survive failed result capture, and held initial
+capture prevents close from completing or dispatching late work. Its 791
+stdout bytes and zero stderr were complete. All three owned empty-network
+native daemons exited and were independently checked absent. RPC and capture
+callbacks were injected: this is lifecycle evidence, not a field network test.
+Payne independently closed both capture findings at these exact peer/test
+hashes after reading the final 56-control and three-case probe logs to EOF.
+The preliminary harness-publication gate passes; this is not the final field
+audit. The actual connected 10-node pilot, capacity-gated larger stages and
+full route matrix remain unqualified, and the operator's release HOLD remains.
