@@ -1213,6 +1213,8 @@ impl ConnectorLifecycleOwner {
             event: TransportEvent::DataChannelClosed,
             observation: None,
             callback_work: Some(work),
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt: None,
         })
     }
 
@@ -1245,6 +1247,8 @@ impl ConnectorLifecycleOwner {
             event,
             observation: None,
             callback_work: Some(callback_work),
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt: None,
         })
     }
 
@@ -1657,6 +1661,8 @@ mod provider_tests {
                 event: TransportEvent::LocalIceCandidate(None),
                 observation: None,
                 callback_work: Some(first_work),
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             })
             .unwrap_or_else(|_| panic!("first callback enters the mailbox"));
         assert!(matches!(
@@ -1673,6 +1679,8 @@ mod provider_tests {
                 event: TransportEvent::RenegotiationNeeded,
                 observation: None,
                 callback_work: Some(second_work),
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             })
             .expect_err("a closed mailbox refuses the exact value");
         assert_eq!(refused.kind(), CallbackMailboxInsertErrorKind::Closed);
@@ -1709,6 +1717,8 @@ mod provider_tests {
                 event: TransportEvent::LocalIceCandidate(None),
                 observation: None,
                 callback_work: Some(mailbox_work),
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             })
             .unwrap_or_else(|_| panic!("mailbox callback is queued"));
 

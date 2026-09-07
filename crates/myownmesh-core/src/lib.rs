@@ -146,6 +146,8 @@ pub mod protocol;
 pub mod realtime;
 pub mod resource;
 pub mod roster;
+#[cfg(feature = "route-flow-diagnostics")]
+pub(crate) mod route_flow;
 pub mod rpc;
 pub mod runtime;
 /// Canonical V4 durable semantic facts.  This is the authority-bearing

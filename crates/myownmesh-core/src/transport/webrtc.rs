@@ -1914,9 +1914,25 @@ pub struct WebRtcConnectorEvent {
     event: TransportEvent,
     _queue_observation: Option<ObservationLease>,
     _callback_work: Option<CallbackWorkLease>,
+    #[cfg(feature = "route-flow-diagnostics")]
+    route_flow_receipt: Option<crate::route_flow::NativeReceipt>,
 }
 
 impl WebRtcConnectorEvent {
+    /// Move the receipt with the accepted leases, only after the worker's
+    /// existing incarnation and real-time ownership checks have succeeded.
+    fn into_accepted(self) -> AcceptedWebRtcConnectorEvent {
+        AcceptedWebRtcConnectorEvent {
+            event: self.event,
+            resources: AcceptedWebRtcConnectorEventResources {
+                _queue_observation: self._queue_observation,
+                _callback_work: self._callback_work,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: self.route_flow_receipt,
+            },
+        }
+    }
+
     /// Whether this is the data-channel-open callback. **Controls only.**
     ///
     /// A control that must hand the *genuine* native open event to the
@@ -1943,6 +1959,17 @@ impl WebRtcConnectorEvent {
 pub(crate) struct AcceptedWebRtcConnectorEventResources {
     _queue_observation: Option<ObservationLease>,
     _callback_work: Option<CallbackWorkLease>,
+    #[cfg(feature = "route-flow-diagnostics")]
+    route_flow_receipt: Option<crate::route_flow::NativeReceipt>,
+}
+
+#[cfg(feature = "route-flow-diagnostics")]
+impl AcceptedWebRtcConnectorEventResources {
+    /// Observation only: the engine reads this after exact-worker admission.
+    /// The callback leases, not a copied receipt, retain the event's custody.
+    pub(crate) fn route_flow_receipt(&self) -> Option<crate::route_flow::NativeReceipt> {
+        self.route_flow_receipt
+    }
 }
 
 /// One stale-owner-checked callback and the resources that remain owned until
@@ -1962,6 +1989,11 @@ struct QueuedTransportEvent {
     event: TransportEvent,
     observation: Option<ObservationLease>,
     callback_work: Option<CallbackWorkLease>,
+    // callback.rs prices this inline field through size_of::<Self>(), and
+    // prices its executing counterpart through size_of::<WebRtcConnectorEvent>().
+    // It allocates nothing and is absent from no-feature layouts.
+    #[cfg(feature = "route-flow-diagnostics")]
+    route_flow_receipt: Option<crate::route_flow::NativeReceipt>,
 }
 
 impl QueuedTransportEvent {
@@ -2073,6 +2105,8 @@ impl ConnectorEventMailboxes {
                         event,
                         observation,
                         callback_work: Some(work),
+                        #[cfg(feature = "route-flow-diagnostics")]
+                        route_flow_receipt: None,
                     })
                     .map_err(|error| match error.kind() {
                         CallbackMailboxInsertErrorKind::Closed => {
@@ -2326,6 +2360,8 @@ impl ConnectorEventSink {
                 event,
                 observation,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             reservation,
         )
@@ -2334,6 +2370,150 @@ impl ConnectorEventSink {
     async fn emit_data_channel(&self, event: TransportEvent) -> bool {
         let endpoint_protocol = matches!(&event, TransportEvent::Message(_));
         let result = self.try_emit_data_channel(event).await;
+        self.finish_data_channel_insert(endpoint_protocol, result)
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    async fn emit_observed_message(
+        &self,
+        bytes: Bytes,
+        receipt: Option<crate::route_flow::NativeReceipt>,
+    ) -> bool {
+        let result = self
+            .emit_inner(TransportEvent::Message(bytes), true, receipt)
+            .await;
+        self.finish_data_channel_insert(true, result)
+    }
+
+    /// Enter a native Message callback synchronously. In particular, neither
+    /// the diagnostic clock nor native callback admission waits for first poll.
+    /// The returned future owns the admitted native work even if never polled.
+    fn begin_message_callback(
+        &self,
+        bytes: Bytes,
+        callback_observation: &Option<CallbackObservationLease>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<ConnectorCallbackInsertResult, CallbackProducerOverload>,
+    > + Send
+           + 'static {
+        #[cfg(feature = "route-flow-diagnostics")]
+        let route_flow_receipt = crate::route_flow::capture_native_receipt();
+        let _keep_callback_observation = callback_observation;
+        #[cfg(feature = "transport-lab")]
+        let message_kind = transport_lab_message_kind(&bytes);
+        #[cfg(feature = "transport-lab")]
+        transport_lab_message_marker("native-message-enter", message_kind);
+        let admitted = match self.begin_native_callback_operation_with_payload(
+            ConnectorCallbackClass::EndpointData,
+            bytes.len(),
+            0,
+        ) {
+            Ok(work) => Ok((self.clone(), work, bytes)),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "refusing native endpoint-data callback under resource pressure"
+                );
+                #[cfg(feature = "transport-lab")]
+                transport_lab_message_marker("native-message-refused", message_kind);
+                self.retire_after_callback_violation();
+                // Match native entry's early return: a refused payload must
+                // not become unfunded retention in an unpolled future.
+                drop(bytes);
+                Err(error)
+            }
+        };
+        async move {
+            let (tx, _callback_work, bytes) = admitted?;
+            let result = tx
+                .emit_inner(
+                    TransportEvent::Message(bytes),
+                    true,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    route_flow_receipt,
+                )
+                .await;
+            // Keep the native accepted-discard convention and its retirement
+            // side effects, but retain the precise disposition for controls.
+            let _accepted = tx.finish_data_channel_insert(true, result);
+            #[cfg(feature = "transport-lab")]
+            transport_lab_message_marker(
+                if _accepted {
+                    "native-message-mailbox-accepted"
+                } else {
+                    "native-message-mailbox-refused"
+                },
+                message_kind,
+            );
+            Ok(result)
+        }
+    }
+
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    fn enqueue_funded_message_for_test(
+        &self,
+        ownership: &ConnectorOwnership,
+        bytes: Bytes,
+    ) -> impl std::future::Future<Output = std::result::Result<(), FundedCallbackTestRefusal>>
+           + Send
+           + 'static {
+        // This guard supplies no authority; native and engine admission remain
+        // responsible for races after this exact connected-owner precondition.
+        let prepared = if !Arc::ptr_eq(&self.callback_gate, &ownership.incarnation)
+            || !ownership.incarnation.is_active()
+            || !matches!(
+                &*ownership.authority.lock(),
+                ConnectorAuthorityState::Connected
+            ) {
+            Err(FundedCallbackTestRefusal::NotConnected)
+        } else if self.resource_scope.is_none() {
+            Err(FundedCallbackTestRefusal::ObservationUnavailable)
+        } else {
+            Ok(self.begin_message_callback(bytes, &None))
+        };
+        async move {
+            match prepared?.await {
+                Ok(ConnectorCallbackInsertResult::Queued) => Ok(()),
+                Ok(_) => Err(FundedCallbackTestRefusal::NotQueued),
+                Err(_) => Err(FundedCallbackTestRefusal::NativeAdmission),
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    async fn enqueue_open_for_test(
+        &self,
+        ownership: &ConnectorOwnership,
+    ) -> std::result::Result<(), FundedCallbackTestRefusal> {
+        if !Arc::ptr_eq(&self.callback_gate, &ownership.incarnation)
+            || !ownership.incarnation.is_active()
+            || !matches!(
+                &*ownership.authority.lock(),
+                ConnectorAuthorityState::Connected
+            )
+        {
+            return Err(FundedCallbackTestRefusal::NotConnected);
+        }
+        if self.operation_fence.is_closed() {
+            return Err(FundedCallbackTestRefusal::NotQueued);
+        }
+        // Uses the original reserved lifecycle lease. No new Open capability
+        // is minted and no receiver commitment or authentication is performed.
+        let result = self
+            .emit_inner(TransportEvent::DataChannelOpen, true, None)
+            .await;
+        let _ = self.finish_data_channel_insert(false, result);
+        match result {
+            ConnectorCallbackInsertResult::Queued => Ok(()),
+            _ => Err(FundedCallbackTestRefusal::NotQueued),
+        }
+    }
+
+    fn finish_data_channel_insert(
+        &self,
+        endpoint_protocol: bool,
+        result: ConnectorCallbackInsertResult,
+    ) -> bool {
         if endpoint_protocol
             && matches!(
                 result,
@@ -2356,12 +2536,25 @@ impl ConnectorEventSink {
                 .lifecycle
                 .record_close(self.callback_gate.is_active());
         }
-        self.emit_inner(event, true).await
+        self.emit_inner(
+            event,
+            true,
+            #[cfg(feature = "route-flow-diagnostics")]
+            None,
+        )
+        .await
     }
 
     async fn emit(&self, event: TransportEvent) -> bool {
         let candidate_obligation = matches!(&event, TransportEvent::LocalIceCandidate(_));
-        let result = self.emit_inner(event, true).await;
+        let result = self
+            .emit_inner(
+                event,
+                true,
+                #[cfg(feature = "route-flow-diagnostics")]
+                None,
+            )
+            .await;
         if candidate_obligation
             && matches!(
                 result,
@@ -2404,6 +2597,9 @@ impl ConnectorEventSink {
         &self,
         event: TransportEvent,
         fence_operation: bool,
+        #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
+            crate::route_flow::NativeReceipt,
+        >,
     ) -> ConnectorCallbackInsertResult {
         let _operation = if fence_operation {
             match self.operation_fence.try_enter() {
@@ -2521,6 +2717,8 @@ impl ConnectorEventSink {
             event,
             observation,
             callback_work,
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt,
         };
         let Some(mailbox) = self.events.mailbox(callback_class) else {
             // Real-time units must enter through an exact RealtimeFlowPort.
@@ -2538,6 +2736,16 @@ impl ConnectorEventSink {
         {
             return ConnectorCallbackInsertResult::ReceiverClosed;
         }
+        // Sample only an opted-in native Message, after all admission/fence
+        // checks and immediately before the actual bounded mailbox attempt.
+        #[cfg(feature = "route-flow-diagnostics")]
+        let queued = {
+            let mut queued = queued;
+            if let Some(receipt) = queued.route_flow_receipt.as_mut() {
+                receipt.mark_mailbox_attempt();
+            }
+            queued
+        };
         match mailbox.try_insert(queued) {
             Ok(()) => ConnectorCallbackInsertResult::Queued,
             Err(error) => match error.kind() {
@@ -2735,11 +2943,18 @@ impl WebRtcConnectorEventReceiver {
         if terminal_close {
             self.data_channel_closed = true;
         }
+        #[cfg(feature = "route-flow-diagnostics")]
+        let receipt = queued.route_flow_receipt.map(|mut receipt| {
+            receipt.mark_dequeued();
+            receipt
+        });
         Some(WebRtcConnectorEvent {
             incarnation: Arc::clone(&self.ownership.incarnation),
             event: queued.event,
             _queue_observation: queued.observation,
             _callback_work: queued.callback_work,
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt: receipt,
         })
     }
 
@@ -5044,7 +5259,45 @@ impl session_flow::RealtimeSessionBinding for crate::runtime::session_broker::Se
     }
 }
 
+/// Fixed, payload-free refusal vocabulary for the funded callback control.
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FundedCallbackTestRefusal {
+    NotConnected,
+    ObservationUnavailable,
+    NativeAdmission,
+    NotQueued,
+}
+
 impl WebRtcConnectorWorker {
+    /// Prepare the original receiver's lifecycle in an already-connected
+    /// fixture. The caller must expose and accept this exact Open, then call
+    /// the existing receiver commit. This is not native Open/auth qualification.
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    pub(crate) async fn enqueue_data_channel_open_callback_for_test(
+        &self,
+    ) -> std::result::Result<(), FundedCallbackTestRefusal> {
+        self.session
+            ._events_tx
+            .enqueue_open_for_test(&self.ownership)
+            .await
+    }
+
+    /// Inject through this worker's original native callback producer and
+    /// receiver. No event stamp, observation, or provider is supplied by callers.
+    /// This proves callback custody, not arrival over an actual SCTP connection.
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    pub(crate) fn enqueue_funded_message_callback_for_test(
+        &self,
+        bytes: Bytes,
+    ) -> impl std::future::Future<Output = std::result::Result<(), FundedCallbackTestRefusal>>
+           + Send
+           + 'static {
+        self.session
+            ._events_tx
+            .enqueue_funded_message_for_test(&self.ownership, bytes)
+    }
+
     /// Reserve exact finite work against this connector's attempt owner before
     /// parsing an endpoint protocol frame.
     pub(crate) fn reserve_attempt_work(
@@ -5475,13 +5728,7 @@ impl WebRtcConnectorWorker {
         {
             return None;
         }
-        Some(AcceptedWebRtcConnectorEvent {
-            event: event.event,
-            resources: AcceptedWebRtcConnectorEventResources {
-                _queue_observation: event._queue_observation,
-                _callback_work: event._callback_work,
-            },
-        })
+        Some(event.into_accepted())
     }
 
     #[cfg(test)]
@@ -5491,6 +5738,8 @@ impl WebRtcConnectorWorker {
             event,
             _queue_observation: None,
             _callback_work: None,
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt: None,
         }
     }
 
@@ -7929,44 +8178,9 @@ fn install_data_channel_handlers(
         let tx = tx.clone();
         let callback_observation = observe_callback_if(resource_scope, "data-channel-message");
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let _keep_callback_observation = &callback_observation;
-            #[cfg(feature = "transport-lab")]
-            let message_kind = transport_lab_message_kind(&msg.data);
-            #[cfg(feature = "transport-lab")]
-            transport_lab_message_marker("native-message-enter", message_kind);
-            let payload_bytes = msg.data.len();
-            let callback_work = match tx.begin_native_callback_operation_with_payload(
-                ConnectorCallbackClass::EndpointData,
-                payload_bytes,
-                0,
-            ) {
-                Ok(work) => work,
-                Err(error) => {
-                    warn!(
-                        ?error,
-                        "refusing native endpoint-data callback under resource pressure"
-                    );
-                    #[cfg(feature = "transport-lab")]
-                    transport_lab_message_marker("native-message-refused", message_kind);
-                    tx.retire_after_callback_violation();
-                    return Box::pin(async {});
-                }
-            };
-            let tx = tx.clone();
+            let callback = tx.begin_message_callback(msg.data, &callback_observation);
             Box::pin(async move {
-                let _callback_work = callback_work;
-                let accepted = tx
-                    .emit_data_channel(TransportEvent::Message(msg.data))
-                    .await;
-                #[cfg(feature = "transport-lab")]
-                transport_lab_message_marker(
-                    if accepted {
-                        "native-message-mailbox-accepted"
-                    } else {
-                        "native-message-mailbox-refused"
-                    },
-                    message_kind,
-                );
+                let _ = callback.await;
             })
         }));
     }
@@ -10886,6 +11100,8 @@ mod tests {
             event,
             _queue_observation: None,
             _callback_work: None,
+            #[cfg(feature = "route-flow-diagnostics")]
+            route_flow_receipt: None,
         }
     }
 
@@ -11478,6 +11694,8 @@ mod tests {
                 event: test_realtime_event(0, 0, b""),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             reservation,
         ));
@@ -11717,6 +11935,8 @@ mod tests {
                 event: test_realtime_event(0, 1, b"first"),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             first.reserve_output(5).expect("first unit is reserved"),
         ));
@@ -11725,6 +11945,8 @@ mod tests {
                 event: test_realtime_event(1, 1, b"secnd"),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             second.reserve_output(5).expect("second unit is reserved"),
         ));
@@ -11796,6 +12018,8 @@ mod tests {
                 event: test_realtime_event(0, 1, b"owned"),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             flow.reserve_output(5).expect("payload bytes are reserved"),
         ));
@@ -11839,6 +12063,8 @@ mod tests {
                 event: test_realtime_event(0, 7, b"stale"),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             flow.reserve_output(5).expect("unit is reserved"),
         ));
@@ -12092,6 +12318,8 @@ mod tests {
                 event: test_realtime_event(0, 1, b"owned"),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             flow.reserve_output(5).expect("unit is admitted"),
         ));
@@ -14897,6 +15125,624 @@ mod tests {
         assert_eq!(completed.completed_lease_count, 1);
     }
 
+    #[cfg(feature = "route-flow-diagnostics")]
+    fn route_flow_mailbox_fixture(
+        payload_bytes: usize,
+        scope: Option<PeerConnectionResourceScope>,
+    ) -> (
+        crate::connector::ConnectedChannelCapability,
+        ConnectorEventSink,
+        WebRtcConnectorEventReceiver,
+    ) {
+        let one = NonZeroUsize::new(1).expect("one callback");
+        let policy = test_realtime_workload(one);
+        let (events, raw) = test_event_mailboxes_with_grant(
+            lab_callback_grant_exact(
+                one,
+                one,
+                1,
+                payload_bytes,
+                NonZeroUsize::new(2).expect("open and close reservations"),
+            ),
+            policy,
+        );
+        let (candidate, lifetime) = crate::runtime::attempt::connector_candidate_for_test(
+            crate::runtime::runtime_for_test(),
+        );
+        let ownership = admitted_ownership(candidate);
+        // A candidate stamp alone cannot admit Message events. Exercise the
+        // same live candidate-to-connected transition as the existing channel
+        // ownership controls, and retain its move-only capability in the caller.
+        let before_open = stamped_event(
+            &ownership,
+            TransportEvent::Message(Bytes::from_static(b"connection-precondition")),
+        );
+        assert!(!ownership.accepts(&before_open));
+        let connected = match ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("route-flow fixture requires a live connected candidate"),
+        };
+        assert!(ownership.accepts(&before_open));
+        drop(before_open);
+        let mut sink = test_event_sink_for_receiver(events, policy, scope, &raw);
+        sink.callback_gate = Arc::clone(&ownership.incarnation);
+        sink.operation_fence = Arc::clone(&ownership.operation_fence);
+        let receiver = WebRtcConnectorEventReceiver {
+            retirement: ownership.incarnation.subscribe_retirement(),
+            operation_fence: Arc::clone(&ownership.operation_fence),
+            ownership,
+            attempt_retirement: None,
+            raw,
+            attempt_lifetime: Some(lifetime),
+            remote_candidates: Arc::new(SyncMutex::new(test_remote_candidate_state())),
+            close_owner: None,
+            data_channel_open_committed: false,
+            data_channel_closed: false,
+        };
+        (connected, sink, receiver)
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_receipt_held_mailbox_order_and_exact_phase_pricing() {
+        use crate::resource::ResourceClass;
+        use crate::route_flow::NativeReceipt;
+
+        const DATA: &[u8] = b"receipt";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let active = || {
+            context
+                .report()
+                .pre_authentication
+                .into_iter()
+                .find(|report| report.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame family exists")
+                .active
+        };
+        let (_connected, sink, mut receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let baseline = active();
+        let entered = Instant::now();
+        println!(
+            "route_flow_event_sizes receipt={} queued={} links={} executing={} accepted_resources={}",
+            size_of::<Option<NativeReceipt>>(),
+            size_of::<QueuedTransportEvent>(),
+            2 * size_of::<usize>(),
+            size_of::<WebRtcConnectorEvent>(),
+            size_of::<AcceptedWebRtcConnectorEventResources>(),
+        );
+        assert!(
+            sink.emit_observed_message(
+                Bytes::from_static(DATA),
+                Some(NativeReceipt::for_test(entered)),
+            )
+            .await
+        );
+        assert_ne!(active(), baseline, "queued event owns a real observation");
+
+        // The engine has not polled its receiver. Inspect the actual funded
+        // queue item, then return that same item before its production dequeue.
+        let queued = receiver
+            .raw
+            .endpoint_data
+            .try_take()
+            .expect("one held item");
+        let receipt = queued.route_flow_receipt.expect("native receipt retained");
+        let (callback, attempt, dequeued) = receipt.timestamps_for_test();
+        assert_eq!(callback, entered);
+        assert!(attempt.is_some_and(|at| at >= callback));
+        assert!(
+            dequeued.is_none(),
+            "holding a queue item is not dequeue exposure"
+        );
+        let work = queued
+            .callback_work
+            .as_ref()
+            .expect("queued callback lease");
+        assert_eq!(work.phase(), callback::CallbackWorkPhase::Queued);
+        assert_eq!(
+            work.claim().amount(ResourceClass::QueuedBytes),
+            DATA.len() as u64
+        );
+        assert_eq!(
+            work.claim().amount(ResourceClass::AccountedMemoryBytes),
+            (DATA.len() + size_of::<QueuedTransportEvent>() + 2 * size_of::<usize>()) as u64
+        );
+        assert!(receiver.raw.endpoint_data.try_insert(queued).is_ok());
+
+        let queued = receiver
+            .raw
+            .try_scheduled_filtered(true)
+            .expect("real dequeue");
+        let event = receiver.expose_queued(queued).expect("live exact worker");
+        assert!(receiver.ownership.accepts(&event));
+        let (payload, resources) = event.into_accepted().into_parts();
+        assert!(matches!(payload, TransportEvent::Message(ref bytes) if bytes.as_ref() == DATA));
+        let work = resources
+            ._callback_work
+            .as_ref()
+            .expect("executing callback lease");
+        assert_eq!(work.phase(), callback::CallbackWorkPhase::Executing);
+        assert_eq!(work.claim().amount(ResourceClass::QueuedBytes), 0);
+        assert_eq!(
+            work.claim().amount(ResourceClass::AccountedMemoryBytes),
+            (DATA.len() + size_of::<WebRtcConnectorEvent>()) as u64
+        );
+        let (callback, inserted, dequeued) = resources
+            .route_flow_receipt()
+            .expect("receipt moved with accepted leases")
+            .timestamps_for_test();
+        assert_eq!(callback, entered);
+        assert_eq!(
+            inserted, attempt,
+            "exposure cannot replace the insertion point"
+        );
+        assert!(dequeued.is_some_and(|at| at >= inserted.expect("insertion exists")));
+        assert!(
+            receiver.raw.endpoint_data.try_take().is_none(),
+            "no extra event"
+        );
+        assert_ne!(
+            active(),
+            baseline,
+            "accepted lease remains held by the handler"
+        );
+        drop(payload);
+        drop(resources);
+        assert_eq!(
+            active(),
+            baseline,
+            "handler completion releases the exact observation"
+        );
+        assert!(
+            sink.callback_producer
+                .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+                .is_ok(),
+            "released callback claim is reusable without a larger grant"
+        );
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_receipt_stale_worker_never_reassigns_and_drop_releases() {
+        const DATA: &[u8] = b"stale";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let active = || {
+            context
+                .report()
+                .pre_authentication
+                .into_iter()
+                .find(|report| report.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame family exists")
+                .active
+        };
+        let (_first_connected, sink, mut first) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let (_successor_connected, _successor_sink, successor) =
+            route_flow_mailbox_fixture(DATA.len(), None);
+        let baseline = active();
+        let entered = Instant::now();
+        assert!(
+            sink.emit_observed_message(
+                Bytes::from_static(DATA),
+                Some(crate::route_flow::NativeReceipt::for_test(entered))
+            )
+            .await
+        );
+        let queued = first
+            .raw
+            .try_scheduled_filtered(true)
+            .expect("queued native message");
+        let event = first.expose_queued(queued).expect("W0 is live at exposure");
+        assert!(first.ownership.accepts(&event));
+        assert!(
+            !successor.ownership.accepts(&event),
+            "W1 cannot adopt W0's receipt/event"
+        );
+        assert_eq!(
+            event
+                .route_flow_receipt
+                .expect("receipt")
+                .timestamps_for_test()
+                .0,
+            entered
+        );
+        first.ownership.retire();
+        assert!(
+            !first.ownership.accepts(&event),
+            "retirement refuses the old event"
+        );
+        assert!(!successor.ownership.accepts(&event));
+        assert_ne!(active(), baseline);
+        // Same drop as a refused event, or cancellation before handler admission.
+        drop(event);
+        assert_eq!(active(), baseline);
+        assert!(sink
+            .callback_producer
+            .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+            .is_ok());
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_receipt_pressure_close_and_cancel_preserve_lease_release() {
+        const DATA: &[u8] = b"retained";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let active = || {
+            context
+                .report()
+                .pre_authentication
+                .into_iter()
+                .find(|report| report.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame family exists")
+                .active
+        };
+        let (_connected, sink, mut receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let baseline = active();
+        let receipt = || Some(crate::route_flow::NativeReceipt::for_test(Instant::now()));
+        assert!(
+            sink.emit_observed_message(Bytes::from_static(DATA), receipt())
+                .await
+        );
+        let held = active();
+        assert_ne!(held, baseline);
+        assert!(
+            !sink
+                .emit_observed_message(Bytes::from_static(DATA), receipt())
+                .await,
+            "second callback meets the same finite provider pressure"
+        );
+        assert_eq!(
+            active(),
+            held,
+            "refused callback retained no extra observation"
+        );
+        let close = receiver
+            .raw
+            .try_terminal_close()
+            .expect("pressure retires the connector");
+        assert!(
+            close.route_flow_receipt.is_none(),
+            "close never fabricates a message receipt"
+        );
+        drop(close);
+        assert!(
+            sink.emit_observed_message(Bytes::from_static(DATA), receipt())
+                .await,
+            "post-close callback keeps the existing accepted-discard convention"
+        );
+        assert_eq!(active(), held);
+        let queued = receiver
+            .raw
+            .endpoint_data
+            .try_take()
+            .expect("only original message remains");
+        assert!(
+            receiver.expose_queued(queued).is_none(),
+            "closed operation fence refuses exposure"
+        );
+        assert_eq!(active(), baseline);
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+
+        let (_cancel_connected, sink, receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let unpolled = Box::pin(sink.emit_observed_message(Bytes::from_static(DATA), receipt()));
+        // Drop before polling must neither enqueue nor acquire observation work.
+        drop(unpolled);
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+        assert_eq!(active(), baseline);
+        assert!(
+            sink.emit_observed_message(Bytes::from_static(DATA), receipt())
+                .await
+        );
+        drop(receiver);
+        drop(sink);
+        assert_eq!(
+            active(),
+            baseline,
+            "queued cancellation releases callback and observation"
+        );
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_disabled_gate_has_no_clock_receipt_or_extra_event() {
+        let receipt = crate::route_flow::capture_native_receipt_with_gate_for_test(false, || {
+            panic!("disabled observation must never sample a clock");
+        });
+        assert!(receipt.is_none());
+        let (_connected, sink, mut receiver) = route_flow_mailbox_fixture(4, None);
+        assert!(
+            sink.emit_observed_message(Bytes::from_static(b"data"), receipt)
+                .await
+        );
+        let queued = receiver
+            .raw
+            .try_scheduled_filtered(true)
+            .expect("ordinary message queued");
+        assert!(queued.route_flow_receipt.is_none());
+        let event = receiver
+            .expose_queued(queued)
+            .expect("ordinary exact worker exposure");
+        assert!(receiver.ownership.accepts(&event));
+        let (event, resources) = event.into_accepted().into_parts();
+        assert!(resources.route_flow_receipt().is_none());
+        assert!(matches!(event, TransportEvent::Message(_)));
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+        drop(resources);
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_funded_callback_uses_original_owner_queue_and_leases() {
+        const DATA: &[u8] = b"funded-callback";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let active = || {
+            context
+                .report()
+                .pre_authentication
+                .into_iter()
+                .find(|row| row.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame observation exists")
+                .active
+        };
+        let (_connected, sink, mut first) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let (_successor_connected, _, successor) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let baseline = active();
+        assert_eq!(
+            sink.enqueue_funded_message_for_test(&successor.ownership, Bytes::from_static(DATA))
+                .await,
+            Err(FundedCallbackTestRefusal::NotConnected),
+            "a different connected owner cannot borrow this callback producer",
+        );
+        assert!(first.raw.endpoint_data.try_take().is_none());
+        assert_eq!(active(), baseline);
+
+        // Exercise the reserved lifecycle delivery rather than setting the
+        // receiver's endpoint-data filter flag. Ownership is already connected.
+        assert_eq!(
+            sink.enqueue_open_for_test(&successor.ownership).await,
+            Err(FundedCallbackTestRefusal::NotConnected)
+        );
+        assert!(
+            first.try_recv_nonblocking().is_none(),
+            "wrong worker recorded no Open"
+        );
+        assert_eq!(sink.enqueue_open_for_test(&first.ownership).await, Ok(()));
+        assert_eq!(
+            sink.enqueue_open_for_test(&first.ownership).await,
+            Err(FundedCallbackTestRefusal::NotQueued),
+            "duplicate is not queued"
+        );
+        first.commit_data_channel_open();
+        assert!(
+            !first.data_channel_open_committed,
+            "Open must be exposed before commit"
+        );
+        let open = first.try_recv_nonblocking().expect("real reserved Open");
+        assert!(first.ownership.accepts(&open));
+        assert!(!successor.ownership.accepts(&open));
+        assert!(matches!(&open.event, TransportEvent::DataChannelOpen));
+        drop(open);
+
+        let receipt_enabled = crate::route_flow::capture_native_receipt().is_some();
+        let callback =
+            sink.enqueue_funded_message_for_test(&first.ownership, Bytes::from_static(DATA));
+        assert!(
+            first.raw.endpoint_data.try_take().is_none(),
+            "not polled yet"
+        );
+        assert_eq!(active(), baseline, "payload observation starts at enqueue");
+        assert_eq!(callback.await, Ok(()));
+        assert_ne!(active(), baseline, "original queue holds real observation");
+        assert!(
+            first.try_recv_nonblocking().is_none(),
+            "Message remains filtered before commit"
+        );
+        assert_ne!(
+            active(),
+            baseline,
+            "filtered Message keeps its funded custody"
+        );
+        first.commit_data_channel_open();
+        assert!(first.data_channel_open_committed);
+        let event = first
+            .try_recv_nonblocking()
+            .expect("production filtered dequeue");
+        assert!(first.ownership.accepts(&event));
+        assert!(!successor.ownership.accepts(&event));
+        let work = event._callback_work.as_ref().expect("real executing work");
+        assert_eq!(work.phase(), callback::CallbackWorkPhase::Executing);
+        assert_eq!(
+            work.claim()
+                .amount(crate::resource::ResourceClass::QueuedBytes),
+            0
+        );
+        assert_eq!(
+            work.claim()
+                .amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            (DATA.len() + size_of::<WebRtcConnectorEvent>()) as u64,
+        );
+        assert!(event._queue_observation.is_some());
+        assert_eq!(event.route_flow_receipt.is_some(), receipt_enabled);
+        if let Some(receipt) = event.route_flow_receipt {
+            let (entered, inserted, dequeued) = receipt.timestamps_for_test();
+            let inserted = inserted.expect("shared enqueue sampled insertion");
+            let dequeued = dequeued.expect("actual receiver sampled dequeue");
+            assert!(entered <= inserted && inserted <= dequeued);
+        }
+        first.ownership.incarnation.retire();
+        assert_eq!(
+            sink.enqueue_open_for_test(&first.ownership).await,
+            Err(FundedCallbackTestRefusal::NotConnected),
+            "retired worker cannot reopen"
+        );
+        assert!(!first.ownership.accepts(&event));
+        assert!(!successor.ownership.accepts(&event), "W0 never becomes W1");
+        assert_ne!(
+            active(),
+            baseline,
+            "stale event still owns its actual leases"
+        );
+        drop(event);
+        assert_eq!(active(), baseline);
+        assert!(first.raw.endpoint_data.try_take().is_none());
+        assert!(sink
+            .callback_producer
+            .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+            .is_ok());
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_funded_callback_synchronous_pressure_and_unpolled_cancel() {
+        const DATA: &[u8] = b"funded-callback";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let active = || {
+            context
+                .report()
+                .pre_authentication
+                .into_iter()
+                .find(|row| row.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame observation exists")
+                .active
+        };
+        let (_connected, sink, receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let baseline = active();
+        // This consumes the actual queued-byte budget. Native entry must try
+        // admission and retire on refusal BEFORE its future is ever polled.
+        let held = sink
+            .callback_producer
+            .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+            .expect("the one queued payload is funded");
+        let refused =
+            sink.enqueue_funded_message_for_test(&receiver.ownership, Bytes::from_static(DATA));
+        assert!(
+            sink.operation_fence.is_closed(),
+            "native admission ran synchronously"
+        );
+        assert_eq!(
+            refused.await,
+            Err(FundedCallbackTestRefusal::NativeAdmission)
+        );
+        assert_eq!(active(), baseline);
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+        drop(held);
+        assert!(sink
+            .callback_producer
+            .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+            .is_ok());
+
+        let (_cancel_connected, sink, receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let callback =
+            sink.enqueue_funded_message_for_test(&receiver.ownership, Bytes::from_static(DATA));
+        assert!(!sink.operation_fence.is_closed());
+        drop(callback); // releases the already-admitted native executing lease
+        assert_eq!(active(), baseline);
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+        assert_eq!(
+            sink.enqueue_funded_message_for_test(&receiver.ownership, Bytes::from_static(DATA))
+                .await,
+            Ok(())
+        );
+        assert_ne!(active(), baseline);
+        drop(receiver); // cancellation before handler ownership
+        assert_eq!(active(), baseline);
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test]
+    async fn route_flow_funded_callback_closed_discard_is_not_queued() {
+        const DATA: &[u8] = b"funded-callback";
+        let process = ProcessResourceRoot::isolated();
+        let context = process.mesh_runtime_scope().network_instance_scope();
+        let (_connected, sink, receiver) =
+            route_flow_mailbox_fixture(DATA.len(), Some(context.peer_connection_scope()));
+        let baseline = context.report();
+        sink.operation_fence.begin_close();
+        assert_eq!(
+            sink.enqueue_open_for_test(&receiver.ownership).await,
+            Err(FundedCallbackTestRefusal::NotQueued),
+            "closed worker records no Open"
+        );
+        assert!(!receiver.raw.lifecycle.has_pending());
+        assert_eq!(
+            sink.enqueue_funded_message_for_test(&receiver.ownership, Bytes::from_static(DATA))
+                .await,
+            Err(FundedCallbackTestRefusal::NotQueued),
+            "the native accepted-discard convention is not an enqueue witness",
+        );
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+        let frame = |report: crate::resource::ResourceReport| {
+            report
+                .pre_authentication
+                .into_iter()
+                .find(|row| row.family == PreAuthResourceFamily::FrameBytes)
+                .expect("frame observation exists")
+                .active
+        };
+        assert_eq!(frame(context.report()), frame(baseline));
+        assert!(sink
+            .callback_producer
+            .try_admit(ConnectorCallbackClass::EndpointData, DATA.len())
+            .is_ok());
+
+        let (_unobserved_connected, unobserved, receiver) =
+            route_flow_mailbox_fixture(DATA.len(), None);
+        assert_eq!(
+            unobserved
+                .enqueue_funded_message_for_test(&receiver.ownership, Bytes::from_static(DATA))
+                .await,
+            Err(FundedCallbackTestRefusal::ObservationUnavailable)
+        );
+        assert!(receiver.raw.endpoint_data.try_take().is_none());
+    }
+
+    #[cfg(not(feature = "route-flow-diagnostics"))]
+    #[test]
+    fn route_flow_disabled_feature_preserves_event_layouts() {
+        #[allow(dead_code)]
+        struct OriginalQueued {
+            event: TransportEvent,
+            observation: Option<ObservationLease>,
+            callback_work: Option<CallbackWorkLease>,
+        }
+        #[allow(dead_code)]
+        struct OriginalStamped {
+            incarnation: Arc<WebRtcConnectorIncarnation>,
+            event: TransportEvent,
+            _queue_observation: Option<ObservationLease>,
+            _callback_work: Option<CallbackWorkLease>,
+        }
+        #[allow(dead_code)]
+        struct OriginalResources {
+            _queue_observation: Option<ObservationLease>,
+            _callback_work: Option<CallbackWorkLease>,
+        }
+        assert_eq!(
+            size_of::<QueuedTransportEvent>(),
+            size_of::<OriginalQueued>()
+        );
+        assert_eq!(
+            size_of::<WebRtcConnectorEvent>(),
+            size_of::<OriginalStamped>()
+        );
+        assert_eq!(
+            size_of::<AcceptedWebRtcConnectorEventResources>(),
+            size_of::<OriginalResources>()
+        );
+    }
+
     #[test]
     fn v4_arc03_callback_stamp_requires_exact_live_worker() {
         let (first_candidate, first_lifetime) =
@@ -15040,6 +15886,8 @@ mod tests {
                 event: first,
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             first_reservation,
         ));
@@ -15199,6 +16047,8 @@ mod tests {
                         )),
                         observation: None,
                         callback_work: None,
+                        #[cfg(feature = "route-flow-diagnostics")]
+                        route_flow_receipt: None,
                     },
                     reservation,
                 ));
@@ -15274,6 +16124,8 @@ mod tests {
                     )),
                     observation: None,
                     callback_work: None,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    route_flow_receipt: None,
                 },
                 reservation,
             ));
@@ -15296,6 +16148,8 @@ mod tests {
                     )),
                     observation: None,
                     callback_work: None,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    route_flow_receipt: None,
                 },
                 reservation,
             ));

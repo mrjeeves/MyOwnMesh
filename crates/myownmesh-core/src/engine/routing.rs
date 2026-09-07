@@ -569,6 +569,28 @@ impl RoutingState {
     }
 }
 
+/// Exact provider charge retained by one admitted replay identity.
+///
+/// This is a test-only view of the same two private map-node claims acquired
+/// by `admit_replay`; callers cannot substitute a layout-compatible proxy for
+/// either production key type.
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+pub(super) fn replay_entry_reservation_charge_for_test() -> crate::resource::ResourceClaim {
+    let key_claim = LeasedMap::<RouteKey, RouteGeneration>::entry_claim()
+        .expect("the production replay-key map-node claim is representable");
+    let generation_claim = LeasedMap::<RouteGeneration, RouteKey>::entry_claim()
+        .expect("the production replay-generation map-node claim is representable");
+    let key_charge =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(key_claim)
+            .expect("the production replay-key reservation charge is representable");
+    let generation_charge =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(generation_claim)
+            .expect("the production replay-generation reservation charge is representable");
+    key_charge
+        .checked_add(generation_charge)
+        .expect("the two production replay map-node charges compose")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReplayDecision {
     New,

@@ -239,6 +239,15 @@ function cleanPayloadResult(result) {
 }
 
 export function classifyActionResult(action, result) {
+  // Route rows describe observations, not this listener's RPC outcome. Preserve
+  // an uncertain row in failed evidence without inventing a command send.
+  // Typed cleanup/done errors still dominate in classifyLifetimeResult.
+  if (action === "route_trace_listen") {
+    if (result?.kind === "route_trace_ready") return "ready";
+    return result?.kind === "route_trace_summary" && result.complete === true &&
+      result.outcome === "complete" && result.failure_code === null &&
+      result.observed_rows === 32 ? "passed" : "failed";
+  }
   if (hasOutcomeUnknown(result)) return "outcome_unknown";
   if (action === "rpc") {
     if (result?.ok === true) return "acknowledged";
@@ -859,7 +868,122 @@ export class RpcClient {
   }
 }
 
-class EventHub {
+function routeTraceConfig(command) {
+  const keys = ["id", "action", "network", "run_label", "samples", "expected_rows", "max_rows"];
+  if (!command || typeof command !== "object" || Array.isArray(command) ||
+      Object.keys(command).length !== keys.length || keys.some(key => !Object.hasOwn(command, key)) ||
+      command.action !== "route_trace_listen" ||
+      typeof command.id !== "string" || command.id.length === 0 || Buffer.byteLength(command.id) > LIMITS.commandIdBytes || /[\u0000-\u001f]/.test(command.id) ||
+      typeof command.network !== "string" || command.network.length === 0 || Buffer.byteLength(command.network) > 128 ||
+      /[\u0000-\u001f]/.test(command.network) ||
+      typeof command.run_label !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(command.run_label) ||
+      command.samples !== 16 || command.expected_rows !== 32 || command.max_rows !== 64) {
+    throw new ControllerError("route trace command shape is invalid");
+  }
+  return { network: command.network, run_label: command.run_label,
+    samples: 16, expected_rows: 32, max_rows: 64 };
+}
+
+const ROUTE_SCHEMA = "myownmesh.route-flow/v1";
+const ROUTE_DURATIONS = Object.freeze(["callback_to_insert_us", "insert_to_dequeue_us",
+  "dequeue_to_handler_us", "handler_to_route_decision_us", "route_dispatch_us", "handler_total_us"]);
+const ROUTE_FIELDS = Object.freeze(["schema", "kind", "run_id", "direction", "seq", "route_id",
+  "role", "hop_index", "remaining_ttl", "owner_epoch", ...ROUTE_DURATIONS, "outcome"]);
+function exactRouteKeys(value, keys) {
+  return value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+function routeTraceRow(detail, config) {
+  const invalid = () => { throw new ControllerError("invalid selected route diagnostic"); };
+  if (!detail || detail.schema !== ROUTE_SCHEMA) invalid();
+  if (detail.kind === "overflow") {
+    if (!exactRouteKeys(detail, ["schema", "kind", "capacity", "outcome"]) ||
+        detail.capacity !== 64 || detail.outcome !== "outcome_unknown") invalid();
+    return "overflow";
+  }
+  if (detail.kind !== "disposition" || typeof detail.run_id !== "string" ||
+      !/^[A-Za-z0-9_-]{1,80}$/.test(detail.run_id)) invalid();
+  if (detail.run_id !== config.run_label) return null;
+  if (!exactRouteKeys(detail, ROUTE_FIELDS) ||
+      !["request", "reply"].includes(detail.direction) ||
+      !Number.isSafeInteger(detail.seq) || detail.seq < 0 || detail.seq >= config.samples ||
+      typeof detail.route_id !== "string" || !/^[0-9a-f]{32}$/.test(detail.route_id) ||
+      !["origin", "relay", "destination"].includes(detail.role) ||
+      ![detail.hop_index, detail.remaining_ttl].every(value => Number.isInteger(value) && value >= 0 && value <= 255) ||
+      !["delivered", "unavailable", "refused", "outcome_unknown"].includes(detail.outcome)) invalid();
+  if (detail.owner_epoch !== null && (typeof detail.owner_epoch !== "string" ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(detail.owner_epoch) ||
+      BigInt(detail.owner_epoch) > 18446744073709551615n)) invalid();
+  // IPC JSON numbers above JS's exact integer range cannot be evidence. Fail
+  // rather than round an otherwise native-u64 duration into a false precision.
+  if (!ROUTE_DURATIONS.every(key => detail[key] === null ||
+      (Number.isSafeInteger(detail[key]) && detail[key] >= 0))) invalid();
+  if (detail.role === "origin" && (detail.owner_epoch !== null ||
+      ROUTE_DURATIONS.slice(0, 3).some(key => detail[key] !== null))) invalid();
+  if (detail.role === "destination" && detail.route_dispatch_us !== null) invalid();
+  return Object.fromEntries(ROUTE_FIELDS.map(key => [key, detail[key]]));
+}
+
+function createRouteTrace(config, signal, unsubscribe) {
+  const rows = new Array(config.max_rows);
+  let count = 0, closed = false, resolveDone;
+  const done = new Promise(resolve => { resolveDone = resolve; });
+  function finish(failureCode) {
+    if (closed) return;
+    closed = true;
+    unsubscribe();
+    signal.removeEventListener("abort", onAbort);
+    // Observation dispatch has no await/user callback. Removing the exact
+    // subscription therefore also joins its dispatch before terminal ownership
+    // transfers; the shared channel pump is deliberately not stopped here.
+    const failure = failureCode ?? (count !== config.expected_rows ? "incomplete_rows" :
+      rows.slice(0, count).some(row => row.outcome !== "delivered") ? "route_not_delivered" : null);
+    resolveDone({ kind: "route_trace_summary", schema: "route-flow-listener/v1",
+      ...config, network_attribution: "command_only_native_sentinel", observed_rows: count, complete: failure === null,
+      outcome: failure === null ? "complete" : "failed", failure_code: failure,
+      rows: rows.slice(0, count) });
+    rows.fill(undefined);
+    resolveDone = null;
+  }
+  function onAbort() { finish("cancelled"); }
+  return {
+    start() {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    },
+    fail: finish,
+    observe(frame) {
+      if (closed) return;
+      if (frame?.kind === "lagged") { finish("lagged"); return; }
+      const event = frame?.kind === "event" ? frame.event : null;
+      if (event?.event_kind !== "diag" || event.category !== "route_flow" || event.network_id !== "route_flow_diagnostic") return;
+      try {
+        const row = routeTraceRow(event.detail, config);
+        if (row === null) return;
+        if (row === "overflow") { finish("overflow"); return; }
+        if (count === config.max_rows) { finish("overflow"); return; }
+        for (let i = 0; i < count; i++) {
+          if (rows[i].route_id === row.route_id && rows[i].role === row.role) {
+            finish("duplicate_route_role"); return;
+          }
+          if (rows[i].direction === row.direction && rows[i].seq === row.seq) {
+            finish("duplicate_direction_seq"); return;
+          }
+        }
+        rows[count++] = row;
+      } catch {
+        finish("malformed_selected_diag");
+      }
+    },
+    lifetime: {
+      result: { kind: "route_trace_ready", ...config },
+      cleanup: () => finish(null),
+      done,
+    },
+  };
+}
+
+export class EventHub {
   constructor(endpoint, rpc, deadlineMs, signal) {
     this.endpoint = endpoint;
     this.rpc = rpc;
@@ -872,6 +996,8 @@ class EventHub {
     this.events = 0;
     this.worker = null;
     this.failure = null;
+    this.routeTrace = null;
+    this.routeTraceUsed = false;
   }
 
   async #ensure() {
@@ -916,6 +1042,9 @@ class EventHub {
         }
         this.events += 1;
         if (this.events > LIMITS.events) throw new ControllerError("event count exceeded the bound");
+        // Only an explicit diagnostic lifetime observes mesh Diag/Lagged.
+        // Its reducer is synchronous, bounded, and never serializes/emits here.
+        this.routeTrace?.observe(frame);
         if (frame?.kind !== "channel_inbound") continue;
         for (const subscription of this.subscriptions.values()) {
           if (frame.network === subscription.network && frame.channel === subscription.channel) {
@@ -923,10 +1052,47 @@ class EventHub {
           }
         }
       }
+      this.routeTrace?.fail(this.signal.aborted ? "cancelled" : "stream_closed");
     } catch (error) {
+      this.routeTrace?.fail(this.signal.aborted ? "cancelled" : "stream_failure");
       if (!this.signal.aborted) this.failure = error;
       this.connection?.close();
     }
+  }
+
+  async listenRouteTrace(command) {
+    const config = routeTraceConfig(command);
+    if (this.routeTraceUsed) throw new ControllerError("route trace lifetime already used");
+    if (this.failure) throw this.failure;
+    if (this.signal.aborted) throw new ControllerError("route trace cancelled", "censored");
+    this.routeTraceUsed = true;
+    // Registers on the existing events_subscribe stream. No channel/network
+    // RPC, native flag, retry, or second event pump is introduced.
+    const trace = createRouteTrace(config, this.signal, () => {
+      if (this.routeTrace === trace) this.routeTrace = null;
+    });
+    this.routeTrace = trace;
+    trace.start();
+    try {
+      await this.#ensure();
+      if (this.failure) throw this.failure;
+    } catch (error) {
+      trace.fail("subscription_failure");
+      throw error;
+    }
+    return trace.lifetime;
+  }
+
+  finishRouteTrace() {
+    // Explicit orderly close only: quiesce this synchronous observer before
+    // aborting the shared work signal. Prior failure/cancellation is sticky.
+    if (!this.routeTrace) return;
+    // A socket failure may already be recorded while the pump continuation is
+    // still queued. Do not turn that genuine failure into our orderly abort.
+    if (!this.failure && !this.signal.aborted && this.connection?.terminal) {
+      this.failure = this.connection.terminal;
+    }
+    this.routeTrace?.fail(this.failure ? "stream_failure" : this.signal.aborted ? "cancelled" : null);
   }
 
   async subscribe(network, channel, onEvent) {
@@ -974,6 +1140,7 @@ class EventHub {
   }
 
   async close() {
+    this.routeTrace?.fail("stream_closed");
     this.subscriptions.clear();
     this.connection?.close();
     if (this.worker) await Promise.resolve(this.worker).catch(() => {});
@@ -1211,6 +1378,13 @@ function isLifetimeEnvelope(value) {
 
 async function executeCommand(command, baseContext, lifetimes) {
   if (command.action === "stop") return { stop: true, result: { requested: true } };
+  if (command.action === "route_trace_listen") {
+    const value = await baseContext.routeTraceListen(command);
+    if (!isLifetimeEnvelope(value)) throw new ControllerError("route trace requires an owned lifetime");
+    lifetimes.push({ commandId: command.id, action: command.action,
+      cleanup: value.cleanup, done: value.done, cleaned: false });
+    return { stop: false, result: value.result };
+  }
   if (command.action === "rpc") {
     if (command.request === null || Array.isArray(command.request) || typeof command.request !== "object") {
       throw new ControllerError("rpc action requires a request object");
@@ -1359,11 +1533,12 @@ class PeerSession {
         rpc: testState.rpc,
         close: testState.closeRpc ?? (() => {}),
       };
-      this.events = {
+      this.events = testState.events ?? {
         subscribe: testState.subscribe ?? (async () => {
           throw new ControllerError("test session did not provide subscribe");
         }),
         close: testState.closeEvents ?? (async () => {}),
+        listenRouteTrace: async () => { throw new ControllerError("test session did not provide route trace"); },
       };
       this.ready = Promise.resolve(testState.ready ?? {});
     } else {
@@ -1507,6 +1682,7 @@ class PeerSession {
       rpc: createRpcContextAdapter(this.rpc, this.workAbort.signal, () => this.cleanupMode),
       requireOk,
       subscribe: (network, channel, onEvent) => this.events.subscribe(network, channel, onEvent),
+      routeTraceListen: (command) => this.events.listenRouteTrace(command),
       monoMs,
       get deadlineMs() {
         return session.rpc.deadlineMs;
@@ -1671,6 +1847,7 @@ class PeerSession {
     this.finishPromise = (async () => {
       const cleanupDeadlineMs = monoMs() + LIMITS.shutdownMs;
       if (this.rpc) this.rpc.deadlineMs = cleanupDeadlineMs;
+      if (!this.terminalError && this.activeExecution === null) this.events?.finishRouteTrace?.();
       this.workAbort.abort();
       let activeJoined = this.activeExecution === null;
       if (this.activeExecution) {
@@ -1788,7 +1965,7 @@ export function createPeerSession(args, options = {}) {
 // Exercises the exact PeerSession command/capture/close path without launching
 // a daemon. It deliberately exposes no filesystem, process-launch, or raw VFS
 // capability and is intended only for the maintained Node controls.
-export function createPeerSessionTestHarness({ rpc, writer, onRecord, durationMs = 5_000 }) {
+export function createPeerSessionTestHarness({ rpc, writer, onRecord, events, durationMs = 5_000 }) {
   if (typeof rpc !== "function" || typeof writer?.append !== "function" ||
       typeof writer?.close !== "function") {
     throw new ControllerError("test session requires rpc and a bounded writer");
@@ -1797,7 +1974,7 @@ export function createPeerSessionTestHarness({ rpc, writer, onRecord, durationMs
   const session = new PeerSession(
     { durationMs },
     { onRecord },
-    { token: TEST_SESSION, rpc, writer, child },
+    { token: TEST_SESSION, rpc, writer, child, events },
   );
   return { session, child };
 }
@@ -1942,6 +2119,7 @@ export async function runController(args) {
         rpc: createRpcContextAdapter(rpc, workAbort.signal, () => cleanupMode),
         requireOk,
         subscribe: (network, channel, onEvent) => events.subscribe(network, channel, onEvent),
+        routeTraceListen: (command) => events.listenRouteTrace(command),
         monoMs,
         get deadlineMs() {
           return rpc.deadlineMs;
@@ -2038,6 +2216,7 @@ export async function runController(args) {
     const cleanupDeadlineMs = monoMs() + LIMITS.shutdownMs;
     if (rpc) rpc.deadlineMs = cleanupDeadlineMs;
     cleanupMode = true;
+    if (!controllerError) events?.finishRouteTrace?.();
     workAbort.abort();
     await drainLifetimes(lifetimes, cleanupDeadlineMs, writer).catch((error) => {
       controllerError = mergeControllerError(controllerError, error);

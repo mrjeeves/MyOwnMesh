@@ -2180,6 +2180,8 @@ mod elastic_resource_tests {
                 event: fixture_realtime_unit(&label),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             output,
         )
@@ -2294,6 +2296,8 @@ mod elastic_resource_tests {
                     event: fixture_realtime_unit(&label),
                     observation: None,
                     callback_work: None,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    route_flow_receipt: None,
                 },
                 output,
             ),
@@ -2361,6 +2365,8 @@ mod elastic_resource_tests {
                 event: fixture_realtime_unit(&label),
                 observation: None,
                 callback_work: None,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt: None,
             },
             output,
         )

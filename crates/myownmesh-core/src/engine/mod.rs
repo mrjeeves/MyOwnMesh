@@ -4253,7 +4253,9 @@ async fn handle_transport_event_from_worker(
         trace!(peer = %device_id, "ignoring transport event from stale/absent connector worker");
         return false;
     };
-    let (event, _callback_resources) = event.into_parts();
+    let (event, callback_resources) = event.into_parts();
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_flow_native_receipt = callback_resources.route_flow_receipt();
     // Retain the worker that accepted this callback through every effect. The
     // owner installation can survive a speculative W0 -> W1 handoff, so an
     // owner-only lookup after this point could accidentally mutate W1.
@@ -4527,12 +4529,26 @@ async fn handle_transport_event_from_worker(
             handle_exact_promoted_terminal(state, &owner, worker, reason).await;
         }
         TransportEvent::Message(bytes) => {
-            handle_exact_promoted_message(state, &owner, worker, bytes).await;
+            handle_exact_promoted_message_with_receipt(
+                state,
+                &owner,
+                worker,
+                bytes,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_native_receipt,
+            )
+            .await;
         }
         TransportEvent::RealtimeUnit(delivery) => {
             state.deliver_realtime_unit(&owner, delivery);
         }
     }
+    // The accepted callback's resource authority belongs to the whole handler,
+    // not merely to extraction of its diagnostic receipt.  Keep it named and
+    // drop it after the selected arm has completed all of its awaits.  In
+    // particular, a routed relay cannot release callback capacity while its
+    // exact forwarding session is still pending.
+    drop(callback_resources);
     false
 }
 
@@ -4558,8 +4574,37 @@ async fn handle_exact_promoted_message(
     worker: &Arc<crate::transport::WebRtcConnectorWorker>,
     bytes: Bytes,
 ) {
+    handle_exact_promoted_message_with_receipt(
+        state,
+        owner,
+        worker,
+        bytes,
+        #[cfg(feature = "route-flow-diagnostics")]
+        None,
+    )
+    .await;
+}
+
+async fn handle_exact_promoted_message_with_receipt(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    bytes: Bytes,
+    #[cfg(feature = "route-flow-diagnostics")] native_receipt: Option<
+        crate::route_flow::NativeReceipt,
+    >,
+) {
     let exact_owner = owner.for_worker(Arc::clone(worker));
-    handle_inbound_frame_from(state, &exact_owner, bytes).await;
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_flow_receipt = crate::route_flow::capture_handler_receipt(native_receipt);
+    handle_inbound_frame_from_inner(
+        state,
+        &exact_owner,
+        bytes,
+        #[cfg(feature = "route-flow-diagnostics")]
+        route_flow_receipt,
+    )
+    .await;
 }
 
 async fn handle_ice_state_change(
@@ -5115,6 +5160,24 @@ async fn handle_inbound_frame_from(
     owner: &peer_registry::PeerOwnerToken,
     bytes: Bytes,
 ) {
+    handle_inbound_frame_from_inner(
+        state,
+        owner,
+        bytes,
+        #[cfg(feature = "route-flow-diagnostics")]
+        None,
+    )
+    .await;
+}
+
+async fn handle_inbound_frame_from_inner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    bytes: Bytes,
+    #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
+        crate::route_flow::HandlerReceipt,
+    >,
+) {
     let device_id = owner.device_id();
     #[cfg(feature = "transport-lab")]
     closed_relay_ingress_marker(&bytes, "raw");
@@ -5582,6 +5645,8 @@ async fn handle_inbound_frame_from(
                 application_claim,
                 application_work,
                 envelope,
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow_receipt,
             )
             .await
         }
@@ -7270,6 +7335,9 @@ async fn on_routed_application(
     claim: crate::resource::ResourceClaim,
     retention: crate::resource::ResourceLease,
     envelope: RoutedApplicationEnvelope,
+    #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
+        crate::route_flow::HandlerReceipt,
+    >,
 ) {
     let Ok(local_id) = DeviceId::from_canonical_str(state.identity.public_id()) else {
         return;
@@ -7302,12 +7370,40 @@ async fn on_routed_application(
     };
     match admission {
         Ok(routing::RouteAdmission::Destination { envelope }) => {
+            #[cfg(feature = "route-flow-diagnostics")]
+            let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
+                &envelope,
+                crate::route_flow::RouteRole::Destination,
+                Some(dispatch.owner().binding_coordinate().binding_epoch),
+                route_flow_receipt,
+            );
             let origin = envelope.origin().to_string();
             let ClosedRoutedPayload::ChannelFrame { channel, payload } = envelope.into_payload();
-            on_channel_frame_from(state, dispatch, claim, retention, &origin, channel, payload)
-                .await;
+            let disposition =
+                on_channel_frame_from(state, dispatch, claim, retention, &origin, channel, payload)
+                    .await;
+            #[cfg(not(feature = "route-flow-diagnostics"))]
+            let _ = disposition;
+            #[cfg(feature = "route-flow-diagnostics")]
+            if let Some(route_flow) = route_flow {
+                route_flow.emit(
+                    state,
+                    None,
+                    disposition.map_or(
+                        crate::route_flow::RouteOutcome::Refused,
+                        ChannelDisposition::route_flow_outcome,
+                    ),
+                );
+            }
         }
         Ok(routing::RouteAdmission::Relay { envelope, plan }) => {
+            #[cfg(feature = "route-flow-diagnostics")]
+            let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
+                &envelope,
+                crate::route_flow::RouteRole::Relay,
+                Some(dispatch.owner().binding_coordinate().binding_epoch),
+                route_flow_receipt,
+            );
             let provider = NetworkRoutingSessionProvider {
                 state: Arc::clone(state),
             };
@@ -7318,11 +7414,21 @@ async fn on_routed_application(
                         peer = %dispatch.owner().device_id(),
                         "routed application frame failed canonical serialization: {error}"
                     );
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    if let Some(route_flow) = route_flow {
+                        route_flow.emit(state, None, crate::route_flow::RouteOutcome::Refused);
+                    }
                     drop(retention);
                     return;
                 }
             };
-            let report = routing::dispatch_routed_frame(plan, frame, &provider).await;
+            let report = dispatch_routed_frame_with_route_flow(
+                state,
+                routing::dispatch_routed_frame(plan, frame, &provider),
+                #[cfg(feature = "route-flow-diagnostics")]
+                route_flow,
+            )
+            .await;
             if report.delivered == 0 {
                 trace!(
                     peer = %dispatch.owner().device_id(),
@@ -7356,7 +7462,7 @@ async fn on_channel_frame(
     channel: String,
     payload: serde_json::Value,
 ) {
-    on_channel_frame_from(
+    let _ = on_channel_frame_from(
         state,
         dispatch,
         claim,
@@ -7376,7 +7482,7 @@ async fn on_channel_frame_from(
     from: &str,
     channel: String,
     payload: serde_json::Value,
-) {
+) -> Option<ChannelDisposition> {
     // Delivery is an application effect, and the one whose escape is visible
     // outside the engine: a subscriber reads `from` as a device identity, so a
     // payload admitted for one installation, delivered after that installation
@@ -7427,6 +7533,7 @@ async fn on_channel_frame_from(
         // would end a session because the local application had not asked for
         // that channel yet.
         match outcome {
+            Ok(_) => ChannelDisposition::Accepted,
             Err(crate::application_gateway::GatewayRefusal::Pressure(_)) => {
                 ChannelDisposition::Dropped
             }
@@ -7437,10 +7544,14 @@ async fn on_channel_frame_from(
                     "delivered a channel frame that is not representable",
                 )
             }
-            _ => ChannelDisposition::Settled,
+            Err(
+                crate::application_gateway::GatewayRefusal::NoReceiver
+                | crate::application_gateway::GatewayRefusal::Revoked
+                | crate::application_gateway::GatewayRefusal::Lag(_),
+            ) => ChannelDisposition::Refused,
         }
     });
-    match disposition {
+    match disposition.as_ref() {
         Some(ChannelDisposition::Unsettleable(reason)) => {
             // Outside the capture: retirement takes the same mutation lock.
             state.reach_exact_retirement_barrier();
@@ -7462,25 +7573,41 @@ async fn on_channel_frame_from(
         // or captured nothing at all because the installation was superseded —
         // in which case the payload was dropped rather than delivered under an
         // id someone else now holds, and no subscriber is owed a notification.
-        Some(ChannelDisposition::Settled) | None => {}
+        Some(ChannelDisposition::Accepted | ChannelDisposition::Refused) | None => {}
     }
+    disposition
 }
 
 /// What one channel delivery attempt leaves owed to the session it ran under.
 ///
-/// Three outcomes rather than an `Option<witness>`, because "dropped" is a real
+/// Four outcomes rather than an `Option<witness>`, because "dropped" is a real
 /// answer here and not the absence of one: it is the arm that says the frame is
 /// gone *and* the session stays, which is exactly the distinction a bare
 /// `None` — shared with "delivered" and with "captured nothing" — could not
 /// carry.
+#[derive(Clone, Copy)]
 enum ChannelDisposition {
-    /// Delivered, or refused for a reason that says nothing about the session.
-    Settled,
+    /// Accepted into the local application gateway.
+    Accepted,
+    /// Refused before local application delivery for a non-terminal reason.
+    Refused,
     /// Best-effort, and this side could not afford it. The frame is lost and
     /// the session is kept.
     Dropped,
     /// Terminal for the session named by the witness, for the stated reason.
     Unsettleable(&'static str),
+}
+
+#[cfg(feature = "route-flow-diagnostics")]
+impl ChannelDisposition {
+    fn route_flow_outcome(self) -> crate::route_flow::RouteOutcome {
+        match self {
+            Self::Accepted => crate::route_flow::RouteOutcome::Delivered,
+            Self::Refused | Self::Dropped | Self::Unsettleable(_) => {
+                crate::route_flow::RouteOutcome::Refused
+            }
+        }
+    }
 }
 
 /// Resolve the exact current owner once, then send through it.
@@ -8072,6 +8199,8 @@ impl routing::ExactApprovedSession for NetworkRoutingSession {
                     &self.state.mesh_context_id().to_string(),
                 )
                 .ok_or(routing::RouteSendError::Refused)?;
+            #[cfg(all(test, feature = "route-flow-diagnostics"))]
+            hold_route_flow_dispatch_for_test().await;
             let sent = operation
                 .send_frame(&self.state.peers, frame, timeout)
                 .await
@@ -8082,6 +8211,122 @@ impl routing::ExactApprovedSession for NetworkRoutingSession {
     }
 }
 
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+struct RouteFlowDispatchTestGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    interval_open: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+static ROUTE_FLOW_DISPATCH_TEST_GATE: std::sync::OnceLock<
+    parking_lot::Mutex<Option<Arc<RouteFlowDispatchTestGate>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+fn install_route_flow_dispatch_gate_for_test() -> Arc<RouteFlowDispatchTestGate> {
+    let gate = Arc::new(RouteFlowDispatchTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        interval_open: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut slot = ROUTE_FLOW_DISPATCH_TEST_GATE
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock();
+    assert!(
+        slot.is_none(),
+        "the route-flow dispatch gate is single-owner"
+    );
+    *slot = Some(Arc::clone(&gate));
+    gate
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+struct RouteFlowIntervalTestGuard(Option<Arc<RouteFlowDispatchTestGate>>);
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+impl Drop for RouteFlowIntervalTestGuard {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.interval_open
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+fn open_route_flow_interval_for_test(enabled: bool) -> RouteFlowIntervalTestGuard {
+    let gate = enabled
+        .then(|| {
+            ROUTE_FLOW_DISPATCH_TEST_GATE
+                .get_or_init(|| parking_lot::Mutex::new(None))
+                .lock()
+                .clone()
+        })
+        .flatten();
+    if let Some(gate) = &gate {
+        gate.interval_open
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    RouteFlowIntervalTestGuard(gate)
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+async fn hold_route_flow_dispatch_for_test() {
+    let gate = ROUTE_FLOW_DISPATCH_TEST_GATE
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock()
+        .clone();
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
+fn clear_route_flow_dispatch_gate_for_test(gate: &Arc<RouteFlowDispatchTestGate>) {
+    let mut slot = ROUTE_FLOW_DISPATCH_TEST_GATE
+        .get_or_init(|| parking_lot::Mutex::new(None))
+        .lock();
+    assert!(slot
+        .as_ref()
+        .is_some_and(|installed| Arc::ptr_eq(installed, gate)));
+    *slot = None;
+}
+
+/// Run the real route dispatcher while one selected diagnostic owns the exact
+/// interval around its await.  Origin and relay use this single seam so neither
+/// can accidentally stamp dispatch completion as dispatch start.
+async fn dispatch_routed_frame_with_route_flow<F>(
+    state: &NetworkState,
+    dispatch: F,
+    #[cfg(feature = "route-flow-diagnostics")] route_flow: Option<
+        crate::route_flow::SelectedRouteFlow,
+    >,
+) -> routing::RouteDispatchReport
+where
+    F: Future<Output = routing::RouteDispatchReport>,
+{
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_dispatch_started = route_flow
+        .as_ref()
+        .map(crate::route_flow::SelectedRouteFlow::dispatch_started);
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    let _route_flow_interval = open_route_flow_interval_for_test(route_flow.is_some());
+    let report = dispatch.await;
+    #[cfg(feature = "route-flow-diagnostics")]
+    if let Some(route_flow) = route_flow {
+        route_flow.emit(
+            state,
+            route_dispatch_started,
+            crate::route_flow::RouteOutcome::from_dispatch(&report),
+        );
+    }
+    #[cfg(not(feature = "route-flow-diagnostics"))]
+    let _ = state;
+    report
+}
+
 async fn send_routed_channel_frame(
     state: &Arc<NetworkState>,
     peer: &str,
@@ -8089,6 +8334,9 @@ async fn send_routed_channel_frame(
     payload: serde_json::Value,
 ) -> Result<()> {
     use rand::RngCore;
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_flow_receipt = crate::route_flow::capture_handler_receipt(None);
 
     let destination = DeviceId::from_canonical_str(peer)
         .map_err(|_| Error::Network("routed destination is not canonical".into()))?;
@@ -8156,13 +8404,33 @@ async fn send_routed_channel_frame(
         }
         Err(error) => return Err(Error::Network(format!("routed frame refused: {error}"))),
     };
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
+        &envelope,
+        crate::route_flow::RouteRole::Origin,
+        None,
+        route_flow_receipt,
+    );
     let provider = NetworkRoutingSessionProvider {
         state: Arc::clone(state),
     };
-    let frame = serde_json::to_vec(&MeshMessage::RoutedApplication(envelope))
-        .map(Bytes::from)
-        .map_err(Error::Serde)?;
-    let report = routing::dispatch_routed_frame(plan, frame, &provider).await;
+    let frame = match serde_json::to_vec(&MeshMessage::RoutedApplication(envelope)) {
+        Ok(frame) => Bytes::from(frame),
+        Err(error) => {
+            #[cfg(feature = "route-flow-diagnostics")]
+            if let Some(route_flow) = route_flow {
+                route_flow.emit(state, None, crate::route_flow::RouteOutcome::Refused);
+            }
+            return Err(Error::Serde(error));
+        }
+    };
+    let report = dispatch_routed_frame_with_route_flow(
+        state,
+        routing::dispatch_routed_frame(plan, frame, &provider),
+        #[cfg(feature = "route-flow-diagnostics")]
+        route_flow,
+    )
+    .await;
     if report.delivered == 0 {
         if report.outcome_unknown > 0 || report.failed > 0 {
             return Err(Error::Network(
@@ -19866,6 +20134,17 @@ mod tests {
             .clone()
     }
 
+    #[cfg(feature = "route-flow-diagnostics")]
+    async fn next_channel_message_for_test(
+        subscriber: &mut crate::channels::ChannelSubscription<serde_json::Value>,
+    ) -> crate::channels::ChannelMessage<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
+            .await
+            .expect("a delivered channel message reaches its subscriber")
+            .expect("the subscription is live")
+            .expect("and carries a message rather than a lag report")
+    }
+
     /// Whether `device_id`'s current session is live **and** still holds the
     /// exact operation `filed` names.
     ///
@@ -27804,5 +28083,865 @@ mod tests {
             (0, 0),
             "shutdown leaves no registered or pending peer-event pumps"
         );
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    fn route_flow_frame_for_test(
+        state: &NetworkState,
+        origin_key: &ed25519_dalek::SigningKey,
+        destination: DeviceId,
+        message_id: [u8; 16],
+        run_id: &str,
+        seq: u64,
+        kind: &str,
+    ) -> Bytes {
+        let origin = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
+            .expect("the route-flow origin key has a canonical id");
+        let policy = state.routing.policy();
+        let limits = RoutedApplicationLimits::checked(
+            usize::try_from(policy.max_envelope_bytes())
+                .expect("the fixture routing envelope limit fits usize"),
+            policy.max_hop_budget(),
+        )
+        .expect("the fixture uses the state's checked routing limits");
+        let envelope = RoutedApplicationEnvelope::new_with_limits(
+            state.mesh_context_id(),
+            origin,
+            destination,
+            message_id,
+            policy.max_hop_budget(),
+            ClosedRoutedPayload::ChannelFrame {
+                channel: "route-flow-control".to_string(),
+                payload: serde_json::json!({
+                    "run_id": run_id,
+                    "seq": seq,
+                    "kind": kind,
+                    "body": "not copied into diagnostics"
+                }),
+            },
+            origin_key,
+            limits,
+        )
+        .expect("the bounded route-flow envelope is valid");
+        Bytes::from(
+            serde_json::to_vec(&MeshMessage::RoutedApplication(envelope))
+                .expect("the route-flow envelope serializes"),
+        )
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    async fn next_route_flow_detail_for_test(
+        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
+    ) -> serde_json::Value {
+        for _ in 0..10_000 {
+            match events.try_recv() {
+                Ok(MeshEvent::Diag(entry)) if entry.category == "route_flow" => {
+                    return entry.detail;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    panic!("the route-flow event hub closed before a diagnostic row")
+                }
+            }
+        }
+        panic!("the production event hub emitted no route-flow row")
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    fn try_route_flow_detail_for_test(
+        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
+    ) -> Option<serde_json::Value> {
+        loop {
+            match events.try_recv() {
+                Ok(MeshEvent::Diag(entry)) if entry.category == "route_flow" => {
+                    return Some(entry.detail);
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => return None,
+            }
+        }
+    }
+
+    #[cfg(feature = "route-flow-diagnostics")]
+    fn assert_no_route_flow_detail_for_test(
+        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
+    ) {
+        assert!(
+            try_route_flow_detail_for_test(events).is_none(),
+            "an unselected or unadmitted frame emitted route-flow evidence"
+        );
+    }
+
+    /// Exact environment-backed qualification for the diagnostic-only engine
+    /// path. It is ignored so the process-global selector initializes in a
+    /// fresh, single-test process with the manager-supplied value.
+    #[cfg(feature = "route-flow-diagnostics")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires MYOWNMESH_ROUTE_FLOW_RUN_ID=first-echo-route-cc6-c1 and opens local WebRTC objects"]
+    async fn route_flow_engine_qualification() {
+        const RUN_ID: &str = "first-echo-route-cc6-c1";
+        assert_eq!(
+            crate::route_flow::active_run_id_for_test(),
+            Some(RUN_ID),
+            "the exact ignored selector must run in a fresh process with the bounded opt-in"
+        );
+
+        eprintln!("route_flow_qualification:destination:before");
+        // Destination: real route admission and application-gateway acceptance.
+        let destination_state = build_test_state_with_connector_slots("route-flow-destination", 1);
+        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let origin_id = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
+            .expect("origin id")
+            .to_string();
+        let origin_fixture = insert_admitted_peer(&destination_state, &origin_id).await;
+        let origin_owner = destination_state
+            .peers
+            .owner(&origin_id)
+            .expect("the route origin is current");
+        let origin_worker = origin_fixture
+            .peer
+            .current_worker()
+            .expect("the route origin owns an accepted worker");
+        let mut subscriber = crate::channels::Channel::<serde_json::Value>::new(
+            "route-flow-control".to_string(),
+            Arc::clone(&destination_state),
+        )
+        .subscribe()
+        .expect("the destination gateway owns one real subscriber");
+        let mut destination_events = destination_state.events_tx.subscribe();
+        let local_destination =
+            DeviceId::from_canonical_str(destination_state.identity.public_id())
+                .expect("the destination state has a canonical identity");
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            route_flow_frame_for_test(
+                &destination_state,
+                &origin_key,
+                local_destination.clone(),
+                [0x11; 16],
+                RUN_ID,
+                0,
+                "request",
+            ),
+        )
+        .await;
+        let destination_message = next_channel_message_for_test(&mut subscriber).await;
+        assert_eq!(
+            destination_message.body(),
+            &serde_json::json!({
+                "run_id": RUN_ID,
+                "seq": 0,
+                "kind": "request",
+                "body": "not copied into diagnostics"
+            }),
+            "the destination row accompanies the exact body accepted by the real gateway"
+        );
+        assert_eq!(
+            destination_message.from(),
+            origin_id,
+            "the destination gateway attributes the selected body to the admitted route origin"
+        );
+        let destination = next_route_flow_detail_for_test(&mut destination_events).await;
+        assert_eq!(destination["role"], "destination");
+        assert_eq!(destination["outcome"], "delivered");
+        assert!(destination["owner_epoch"].as_str().is_some());
+        assert!(destination["route_dispatch_us"].is_null());
+
+        // Wrong label, out-of-range sequence, and duplicate all traverse the
+        // ordinary handler without qualifying an extra diagnostic row.
+        for (message_id, run_id, seq, kind) in [
+            ([0x12; 16], "wrong-run", 1, "request"),
+            ([0x13; 16], RUN_ID, 10_000, "request"),
+            ([0x18; 16], RUN_ID, 1, "finish"),
+        ] {
+            handle_exact_promoted_message(
+                &destination_state,
+                &origin_owner,
+                &origin_worker,
+                route_flow_frame_for_test(
+                    &destination_state,
+                    &origin_key,
+                    local_destination.clone(),
+                    message_id,
+                    run_id,
+                    seq,
+                    kind,
+                ),
+            )
+            .await;
+            assert_no_route_flow_detail_for_test(&mut destination_events);
+        }
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            frame_bytes(&MeshMessage::Channel {
+                channel: "route-flow-control".to_string(),
+                payload: serde_json::json!({
+                    "run_id": RUN_ID,
+                    "seq": 1,
+                    "kind": "request"
+                }),
+            }),
+        )
+        .await;
+        assert_no_route_flow_detail_for_test(&mut destination_events);
+        let pressure_frame = frame_bytes(&MeshMessage::Channel {
+            channel: "route-flow-control".to_string(),
+            payload: serde_json::json!("pressure-refused-control"),
+        });
+        let pressure_seal = seal_retained_memory_below_admission(
+            &destination_state,
+            &origin_id,
+            pressure_frame.len(),
+        );
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            pressure_frame,
+        )
+        .await;
+        drop(pressure_seal);
+        assert!(
+            destination_state
+                .peers
+                .get_if_current(&origin_owner)
+                .is_some(),
+            "best-effort Channel pressure keeps the exact admitted session"
+        );
+        assert_no_route_flow_detail_for_test(&mut destination_events);
+        let duplicate = route_flow_frame_for_test(
+            &destination_state,
+            &origin_key,
+            local_destination,
+            [0x14; 16],
+            RUN_ID,
+            2,
+            "request",
+        );
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            duplicate.clone(),
+        )
+        .await;
+        let _ = next_route_flow_detail_for_test(&mut destination_events).await;
+        handle_exact_promoted_message(&destination_state, &origin_owner, &origin_worker, duplicate)
+            .await;
+        assert_no_route_flow_detail_for_test(&mut destination_events);
+        drop(subscriber);
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            route_flow_frame_for_test(
+                &destination_state,
+                &origin_key,
+                DeviceId::from_canonical_str(destination_state.identity.public_id())
+                    .expect("the destination remains canonical"),
+                [0x16; 16],
+                RUN_ID,
+                5,
+                "request",
+            ),
+        )
+        .await;
+        let refused = next_route_flow_detail_for_test(&mut destination_events).await;
+        assert_eq!(refused["role"], "destination");
+        assert_eq!(refused["outcome"], "refused");
+        assert!(
+            destination_state
+                .peers
+                .get_if_current(&origin_owner)
+                .is_some(),
+            "a destination with no local receiver refuses one row without retiring the session"
+        );
+        handle_exact_promoted_message(
+            &destination_state,
+            &origin_owner,
+            &origin_worker,
+            Bytes::from_static(br#"{"kind":"channel"}"#),
+        )
+        .await;
+        assert!(
+            destination_state
+                .peers
+                .get_if_current(&origin_owner)
+                .is_none(),
+            "a classified but undecodable application frame retires its exact session"
+        );
+        assert_no_route_flow_detail_for_test(&mut destination_events);
+        destination_state.shutdown().await;
+        let destination_origin_close = origin_worker.retire_and_close().await;
+        drop(origin_fixture);
+        destination_origin_close
+            .expect("the destination fixture's exact origin worker reaches native terminal");
+        eprintln!("route_flow_qualification:destination:after");
+
+        eprintln!("route_flow_qualification:origin:before");
+        // Origin: the actual route dispatcher preserves its ambiguous native
+        // send result rather than manufacturing delivery proof.
+        let origin_state = build_test_state_with_connector_slots("route-flow-origin", 1);
+        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let destination_id =
+            DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
+                .expect("destination id");
+        let destination_id_text = destination_id.to_string();
+        let destination_fixture = insert_admitted_peer(&origin_state, &destination_id_text).await;
+        let origin_destination_worker = destination_fixture
+            .peer
+            .current_worker()
+            .expect("the origin fixture's destination owns an accepted worker");
+        let mut origin_events = origin_state.events_tx.subscribe();
+        let result = send_routed_channel_frame(
+            &origin_state,
+            &destination_id_text,
+            "route-flow-control",
+            serde_json::json!({"run_id": RUN_ID, "seq": 3, "kind": "echo"}),
+        )
+        .await;
+        assert!(result.is_err(), "the solo connector cannot prove delivery");
+        let origin = next_route_flow_detail_for_test(&mut origin_events).await;
+        assert_eq!(origin["role"], "origin");
+        assert_eq!(origin["outcome"], "outcome_unknown");
+        assert!(origin["owner_epoch"].is_null());
+        assert!(origin["callback_to_insert_us"].is_null());
+        origin_state.shutdown().await;
+        let origin_destination_close = origin_destination_worker.retire_and_close().await;
+        drop(destination_fixture);
+        origin_destination_close
+            .expect("the origin fixture's exact destination worker reaches native terminal");
+        eprintln!("route_flow_qualification:origin:after");
+
+        eprintln!("route_flow_qualification:relay:before");
+        // Relay: enqueue through the worker's original funded native-callback
+        // sink, expose that exact callback through its retained receiver, and
+        // hold inside the real approved-session send future. Provider usage,
+        // not a synthetic drop flag, proves the accepted callback resources
+        // remain owned across that production await.
+        let (relay_state, _relay_signaling, relay_commands, relay_provider, _relay_grant) =
+            build_test_state_parts_metered("route-flow-relay", None, 3, None);
+        relay_state.park_command_receiver_for_test(relay_commands);
+        let relay_origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        let relay_origin_id =
+            DeviceId::from_public_key_bytes(*relay_origin_key.verifying_key().as_bytes())
+                .expect("relay origin id")
+                .to_string();
+        let relay_destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x64; 32]);
+        let relay_destination_id =
+            DeviceId::from_public_key_bytes(*relay_destination_key.verifying_key().as_bytes())
+                .expect("relay destination id");
+        let relay_destination_id_text = relay_destination_id.to_string();
+        // Construct every fallible routed fixture before opening native
+        // connector objects. A fixture-shape failure therefore cannot strand
+        // those objects before the controlled shutdown below.
+        let relay_frame = route_flow_frame_for_test(
+            &relay_state,
+            &relay_origin_key,
+            relay_destination_id.clone(),
+            [0x15; 16],
+            RUN_ID,
+            4,
+            "request",
+        );
+        let cancelled_frame = route_flow_frame_for_test(
+            &relay_state,
+            &relay_origin_key,
+            relay_destination_id.clone(),
+            [0x17; 16],
+            RUN_ID,
+            6,
+            "request",
+        );
+        let stale_frame = route_flow_frame_for_test(
+            &relay_state,
+            &relay_origin_key,
+            relay_destination_id,
+            [0x19; 16],
+            RUN_ID,
+            7,
+            "request",
+        );
+        let mut relay_origin = insert_admitted_peer(&relay_state, &relay_origin_id).await;
+        let relay_destination =
+            insert_admitted_peer(&relay_state, &relay_destination_id_text).await;
+        let relay_destination_worker = relay_destination
+            .peer
+            .current_worker()
+            .expect("the relay destination owns an accepted worker");
+        let relay_worker = relay_origin
+            .peer
+            .current_worker()
+            .expect("the relay origin owns a worker");
+        let clock_start = Instant::now();
+        let route_clock = crate::route_flow::install_test_clock(clock_start);
+        eprintln!("route_flow_qualification:relay_open:enqueue_before");
+        relay_worker
+            .enqueue_data_channel_open_callback_for_test()
+            .await
+            .expect("the exact connected worker queues one funded Open callback");
+        eprintln!("route_flow_qualification:relay_open:enqueue_after_recv_before");
+        let open = relay_origin
+            ._events
+            .recv()
+            .await
+            .expect("the original receiver exposes its reserved Open callback");
+        eprintln!("route_flow_qualification:relay_open:recv_after");
+        let open = relay_worker
+            .accept_event(open)
+            .expect("the current worker accepts its exact Open callback");
+        let (open, open_resources) = open.into_parts();
+        assert!(matches!(open, TransportEvent::DataChannelOpen));
+        drop(open_resources);
+        relay_origin._events.commit_data_channel_open();
+
+        let baseline = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let replay_charge = routing::replay_entry_reservation_charge_for_test();
+        let callback_baseline = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+        eprintln!("route_flow_qualification:first_message:enqueue_before");
+        relay_worker
+            .enqueue_funded_message_callback_for_test(relay_frame)
+            .await
+            .expect("the original native callback sink queues the exact routed frame");
+        eprintln!("route_flow_qualification:first_message:enqueue_after_recv_before");
+        let queued_provider = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let callback_queued = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+        let callback = relay_origin
+            ._events
+            .recv()
+            .await
+            .expect("the original receiver exposes the funded routed callback");
+        eprintln!("route_flow_qualification:first_message:recv_after");
+        let exposed_callback_provider = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let mut relay_events = relay_state.events_tx.subscribe();
+        let gate = install_route_flow_dispatch_gate_for_test();
+        let running_state = Arc::clone(&relay_state);
+        let running_worker = Arc::clone(&relay_worker);
+        let running_owner_id = relay_origin_id.clone();
+        let mut running = tokio::spawn(async move {
+            handle_transport_event_from_worker(
+                &running_state,
+                running_owner_id,
+                &running_worker,
+                callback,
+            )
+            .await
+        });
+        if tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+            .await
+            .is_err()
+        {
+            running.abort();
+            let _ = running.await;
+            clear_route_flow_dispatch_gate_for_test(&gate);
+            drop(route_clock);
+            relay_state.shutdown().await;
+            let _ = futures::future::join(
+                relay_worker.retire_and_close(),
+                relay_destination_worker.retire_and_close(),
+            )
+            .await;
+            drop(relay_destination);
+            drop(relay_origin);
+            panic!("the admitted relay did not enter the production dispatch await");
+        }
+        eprintln!("route_flow_qualification:first_send:held_entered");
+        let interval_open_while_held = gate.interval_open.load(std::sync::atomic::Ordering::SeqCst);
+        let callback_held = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+        let premature_relay = try_route_flow_detail_for_test(&mut relay_events);
+        route_clock.set(clock_start + Duration::from_micros(250));
+        eprintln!("route_flow_qualification:first_send:release_before");
+        gate.release.notify_one();
+        let running_result = match tokio::time::timeout(Duration::from_secs(10), &mut running).await
+        {
+            Ok(result) => result.expect("the accepted callback handler joins"),
+            Err(_) => {
+                running.abort();
+                let _ = running.await;
+                clear_route_flow_dispatch_gate_for_test(&gate);
+                drop(route_clock);
+                relay_state.shutdown().await;
+                let _ = futures::future::join(
+                    relay_worker.retire_and_close(),
+                    relay_destination_worker.retire_and_close(),
+                )
+                .await;
+                drop(relay_destination);
+                drop(relay_origin);
+                panic!("the accepted callback handler did not settle within the control bound");
+            }
+        };
+        eprintln!("route_flow_qualification:first_send:join_after");
+        let interval_closed_after_send =
+            !gate.interval_open.load(std::sync::atomic::Ordering::SeqCst);
+        clear_route_flow_dispatch_gate_for_test(&gate);
+        let premature_relay_emitted = premature_relay.is_some();
+        let relay = match premature_relay {
+            Some(detail) => detail,
+            None => next_route_flow_detail_for_test(&mut relay_events).await,
+        };
+        let retained_after_first = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let callback_complete = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+
+        // Cancellation while the same real send future is held releases the
+        // callback and route-operation claims without manufacturing a terminal
+        // disposition. The field collector's exact expected-row count makes
+        // this absence incomplete evidence rather than a phantom success.
+        eprintln!("route_flow_qualification:cancel_message:enqueue_before");
+        relay_worker
+            .enqueue_funded_message_callback_for_test(cancelled_frame)
+            .await
+            .expect("the exact worker queues the cancellation control callback");
+        eprintln!("route_flow_qualification:cancel_message:enqueue_after_recv_before");
+        let cancelled_callback = relay_origin
+            ._events
+            .recv()
+            .await
+            .expect("the original receiver exposes the cancellation callback");
+        eprintln!("route_flow_qualification:cancel_message:recv_after");
+        let cancel_gate = install_route_flow_dispatch_gate_for_test();
+        let cancelled_state = Arc::clone(&relay_state);
+        let cancelled_worker = Arc::clone(&relay_worker);
+        let cancelled_origin_id = relay_origin_id.clone();
+        let cancelled = tokio::spawn(async move {
+            handle_transport_event_from_worker(
+                &cancelled_state,
+                cancelled_origin_id,
+                &cancelled_worker,
+                cancelled_callback,
+            )
+            .await
+        });
+        if tokio::time::timeout(Duration::from_secs(10), cancel_gate.entered.notified())
+            .await
+            .is_err()
+        {
+            cancelled.abort();
+            let _ = cancelled.await;
+            clear_route_flow_dispatch_gate_for_test(&cancel_gate);
+            drop(route_clock);
+            relay_state.shutdown().await;
+            let _ = futures::future::join(
+                relay_worker.retire_and_close(),
+                relay_destination_worker.retire_and_close(),
+            )
+            .await;
+            drop(relay_destination);
+            drop(relay_origin);
+            panic!("the cancellation control did not reach the actual approved-session send");
+        }
+        eprintln!("route_flow_qualification:cancel_send:held_entered");
+        let cancel_interval_open_while_held = cancel_gate
+            .interval_open
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let callback_cancel_held = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+        cancelled.abort();
+        let cancelled_joined = cancelled
+            .await
+            .expect_err("aborting the held handler cancels its exact task")
+            .is_cancelled();
+        eprintln!("route_flow_qualification:cancel_send:join_after");
+        let cancel_interval_closed = !cancel_gate
+            .interval_open
+            .load(std::sync::atomic::Ordering::SeqCst);
+        clear_route_flow_dispatch_gate_for_test(&cancel_gate);
+        let cancellation_emitted = try_route_flow_detail_for_test(&mut relay_events).is_some();
+        let retained_after_cancel = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let callback_cancelled = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+
+        eprintln!("route_flow_qualification:stale_message:enqueue_before");
+        relay_worker
+            .enqueue_funded_message_callback_for_test(stale_frame)
+            .await
+            .expect("the predecessor queues one funded callback before replacement");
+        eprintln!("route_flow_qualification:stale_message:enqueue_after_recv_before");
+        let stale_callback = relay_origin
+            ._events
+            .recv()
+            .await
+            .expect("the predecessor's original receiver exposes its callback");
+        eprintln!("route_flow_qualification:stale_message:recv_after");
+        eprintln!("route_flow_qualification:stale_message:replacement_before");
+        let relay_successor = insert_admitted_peer(&relay_state, &relay_origin_id).await;
+        eprintln!("route_flow_qualification:stale_message:replacement_after");
+        let successor_worker = relay_successor
+            .peer
+            .current_worker()
+            .expect("the replacement owns a distinct current worker");
+        let successor_is_distinct = !Arc::ptr_eq(&successor_worker, &relay_worker);
+        let retained_before_stale_refusal = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let stale_was_refused = !handle_transport_event_from_worker(
+            &relay_state,
+            relay_origin_id,
+            &relay_worker,
+            stale_callback,
+        )
+        .await;
+        eprintln!("route_flow_qualification:stale_message:refusal_after");
+        let stale_emitted = try_route_flow_detail_for_test(&mut relay_events).is_some();
+        let retained_after_stale_refusal = (
+            relay_provider.in_use(),
+            relay_provider.active_reservations(),
+            relay_provider.active_scopes(),
+        );
+        let callback_after_stale = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
+        drop(route_clock);
+        eprintln!("route_flow_qualification:relay_shutdown:before");
+        relay_state.shutdown().await;
+        let (relay_predecessor_close, relay_destination_close, relay_successor_close) =
+            futures::future::join3(
+                relay_worker.retire_and_close(),
+                relay_destination_worker.retire_and_close(),
+                successor_worker.retire_and_close(),
+            )
+            .await;
+        eprintln!("route_flow_qualification:relay_shutdown:after");
+        drop(relay_successor);
+        drop(relay_destination);
+        drop(relay_origin);
+        relay_predecessor_close
+            .expect("the relay predecessor's exact native close reaches terminal");
+        relay_destination_close
+            .expect("the relay destination's exact native close reaches terminal");
+        relay_successor_close.expect("the relay successor's exact native close reaches terminal");
+        eprintln!("route_flow_qualification:relay_fixtures:dropped");
+
+        eprintln!("route_flow_qualification:final_assertions:before");
+        let callback_provider_charge = exposed_callback_provider
+            .0
+            .checked_sub(baseline.0)
+            .expect("the exposed callback provider charge is nonnegative");
+        assert!(
+            !callback_provider_charge.is_zero(),
+            "the queued callback is visibly funded by the fixture's real provider"
+        );
+        let callback_provider_reservations = exposed_callback_provider
+            .1
+            .checked_sub(baseline.1)
+            .expect("the exposed callback reservation count is nonnegative");
+        assert_eq!(queued_provider.2, baseline.2);
+        assert_eq!(exposed_callback_provider.2, baseline.2);
+        assert_ne!(callback_queued.active, callback_baseline.active);
+        assert_eq!(
+            callback_queued.active_lease_count,
+            callback_baseline.active_lease_count + 1,
+            "the original queue owns one exact FrameBytes observation"
+        );
+        assert!(
+            interval_open_while_held,
+            "the diagnostic interval is already open inside the actual send future"
+        );
+        assert_ne!(callback_held.active, callback_baseline.active);
+        assert_eq!(
+            callback_held.active_lease_count,
+            callback_queued.active_lease_count,
+            "the exact queued callback observation becomes executing and remains active through the real send"
+        );
+        assert!(
+            !premature_relay_emitted,
+            "the route-flow row is not emitted before the actual send future settles"
+        );
+        assert!(
+            !running_result,
+            "an application message callback is nonterminal"
+        );
+        assert!(
+            interval_closed_after_send,
+            "the diagnostic interval closes when the dispatcher settles"
+        );
+        assert_eq!(relay["role"], "relay");
+        assert_eq!(relay["outcome"], "outcome_unknown");
+        assert!(relay["owner_epoch"].as_str().is_some());
+        assert_eq!(relay["callback_to_insert_us"], 0);
+        assert_eq!(relay["insert_to_dequeue_us"], 0);
+        assert_eq!(relay["dequeue_to_handler_us"], 0);
+        assert_eq!(relay["route_dispatch_us"], 250);
+        assert_eq!(relay["handler_total_us"], 250);
+        assert_eq!(
+            retained_after_first.0,
+            baseline
+                .0
+                .checked_add(replay_charge)
+                .expect("the first retained replay charge composes with baseline"),
+            "the first admitted route retains exactly its two production replay map entries"
+        );
+        assert_eq!(
+            retained_after_first.1,
+            baseline
+                .1
+                .checked_add(2)
+                .expect("the first replay reservation count composes with baseline")
+        );
+        assert_eq!(retained_after_first.2, baseline.2);
+        assert_eq!(callback_complete.active, callback_baseline.active);
+        assert_eq!(
+            callback_complete.active_lease_count,
+            callback_baseline.active_lease_count
+        );
+        assert!(
+            cancel_interval_open_while_held,
+            "the cancelled send is held inside the same production interval"
+        );
+        assert!(
+            callback_cancel_held.active_lease_count > callback_baseline.active_lease_count,
+            "the held cancellation control retains its real FrameBytes observation"
+        );
+        assert!(cancelled_joined, "the held handler joins as cancelled");
+        assert!(
+            cancel_interval_closed,
+            "cancelling the dispatcher drops and closes its interval owner"
+        );
+        assert!(
+            !cancellation_emitted,
+            "cancellation cannot manufacture a terminal route-flow row"
+        );
+        let two_replay_charges = replay_charge
+            .checked_add(replay_charge)
+            .expect("two retained replay identity charges compose");
+        assert_eq!(
+            retained_after_cancel.0,
+            baseline
+                .0
+                .checked_add(two_replay_charges)
+                .expect("the two retained replay identities compose with baseline"),
+            "cancelling the second admitted send releases its callback and operation but retains its replay identity"
+        );
+        assert_eq!(
+            retained_after_cancel.1,
+            baseline
+                .1
+                .checked_add(4)
+                .expect("the two replay reservation counts compose with baseline")
+        );
+        assert_eq!(retained_after_cancel.2, baseline.2);
+        assert_eq!(
+            callback_cancelled.active_lease_count, callback_baseline.active_lease_count,
+            "cancellation joins the exact callback observation"
+        );
+        assert!(successor_is_distinct);
+        assert!(
+            stale_was_refused,
+            "the funded predecessor callback is refused by the exact-worker fence"
+        );
+        assert!(
+            !stale_emitted,
+            "the stale exact-worker refusal emits no qualified route-flow row"
+        );
+        assert_eq!(
+            retained_after_stale_refusal.0,
+            retained_before_stale_refusal
+                .0
+                .checked_sub(callback_provider_charge)
+                .expect("the stale callback charge is present before refusal"),
+            "the stale refusal releases only its funded callback and admits no replay identity"
+        );
+        assert_eq!(
+            retained_after_stale_refusal.1,
+            retained_before_stale_refusal
+                .1
+                .checked_sub(callback_provider_reservations)
+                .expect("the stale callback reservations are present before refusal"),
+            "the stale refusal releases its callback reservations without adding replay entries"
+        );
+        assert_eq!(
+            retained_after_stale_refusal.2,
+            retained_before_stale_refusal.2
+        );
+        assert_eq!(
+            callback_after_stale.active_lease_count, callback_baseline.active_lease_count,
+            "the stale exact-worker refusal releases its funded callback observation"
+        );
+        eprintln!("route_flow_qualification:final_assertions:after");
+
+        eprintln!("route_flow_qualification:drop_messages:before");
+        drop(destination_message);
+        drop(destination);
+        drop(refused);
+        drop(origin);
+        drop(relay);
+        eprintln!("route_flow_qualification:drop_messages:after");
+
+        eprintln!("route_flow_qualification:drop_event_receivers:before");
+        drop(destination_events);
+        drop(origin_events);
+        drop(relay_events);
+        drop(_relay_signaling);
+        eprintln!("route_flow_qualification:drop_event_receivers:after");
+
+        eprintln!("route_flow_qualification:drop_dispatch_handles:before");
+        drop(running);
+        drop(gate);
+        drop(cancel_gate);
+        eprintln!("route_flow_qualification:drop_dispatch_handles:after");
+
+        eprintln!("route_flow_qualification:drop_worker_owners:before");
+        drop(successor_worker);
+        drop(relay_worker);
+        drop(origin_worker);
+        drop(origin_owner);
+        eprintln!("route_flow_qualification:drop_worker_owners:after");
+
+        let relay_transport_drop_probe = relay_state.transport.clone();
+        eprintln!("route_flow_qualification:drop_relay_state:before");
+        drop(relay_state);
+        eprintln!("route_flow_qualification:drop_relay_state:after");
+        let relay_cleanup = relay_transport_drop_probe
+            .connector_resource_report()
+            .expect("the relay transport retains its connector resource owner")
+            .cleanup;
+        eprintln!(
+            "route_flow_qualification:relay_cleanup:queued={} active={} completed={} failed={} executor_failed={}",
+            relay_cleanup.queued_jobs,
+            relay_cleanup.active_jobs,
+            relay_cleanup.completed_jobs,
+            relay_cleanup.failed_jobs,
+            relay_cleanup.executor_failed
+        );
+        eprintln!("route_flow_qualification:drop_relay_transport:before");
+        drop(relay_transport_drop_probe);
+        eprintln!("route_flow_qualification:drop_relay_transport:after");
+        eprintln!("route_flow_qualification:drop_origin_state:before");
+        drop(origin_state);
+        eprintln!("route_flow_qualification:drop_origin_state:after");
+        eprintln!("route_flow_qualification:drop_destination_state:before");
+        drop(destination_state);
+        eprintln!("route_flow_qualification:drop_destination_state:after");
+        eprintln!("route_flow_qualification:drop_relay_provider:before");
+        drop(relay_provider);
+        eprintln!("route_flow_qualification:drop_relay_provider:after");
     }
 }

@@ -1119,6 +1119,8 @@ impl SessionRealtimeFlows {
                     )),
                     observation: None,
                     callback_work: None,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    route_flow_receipt: None,
                 },
                 reservation,
             )
