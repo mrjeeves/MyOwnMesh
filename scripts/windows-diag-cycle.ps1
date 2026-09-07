@@ -3,7 +3,7 @@
 # or GUI/game processes are changed. Build first, then activate explicitly.
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][ValidateSet('Stage','Activate','Rollback')][string]$Action,
+    [Parameter(Mandatory=$true)][ValidateSet('Stage','Activate','Rollback','Probe')][string]$Action,
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-zA-Z0-9-]{1,70}$')][string]$RunId,
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{40}$')][string]$ExpectedCommit,
     [ValidateSet('Legacy','Guarded')][string]$NackMode = 'Legacy'
@@ -90,11 +90,28 @@ function Wait-Ready($ams, [string]$directory) {
         if ($ams.HasExited) { return $false }
         $mesh = @(Get-CimInstance Win32_Process -Filter "Name='myownmesh.exe'" | Where-Object { $_.ExecutablePath -eq "$directory\myownmesh.exe" })
         if ($mesh.Count -eq 1) {
-            $probe = Start-Process -FilePath "$directory\myownmesh.exe" -ArgumentList 'ctl status' -NoNewWindow -PassThru -RedirectStandardOutput "$run\probe.json" -RedirectStandardError "$run\probe-error.txt"
-            if ($probe.WaitForExit(2500)) {
-                $probe.Refresh()
-                if ($probe.ExitCode -eq 0) { return $true }
-            } else { $probe.Kill(); $probe.WaitForExit() }
+            # Windows PowerShell Start-Process can lose ExitCode after the
+            # redirected child exits. Own the Process handle directly.
+            $info = New-Object System.Diagnostics.ProcessStartInfo
+            $info.FileName = "$directory\myownmesh.exe"
+            $info.Arguments = 'ctl status'
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.RedirectStandardOutput = $true
+            $info.RedirectStandardError = $true
+            $probe = [Diagnostics.Process]::Start($info)
+            try {
+                $output = $probe.StandardOutput.ReadToEndAsync()
+                $errors = $probe.StandardError.ReadToEndAsync()
+                if ($probe.WaitForExit(2500)) {
+                    $output.Result | Set-Content -LiteralPath "$run\probe.json" -Encoding UTF8
+                    $errors.Result | Set-Content -LiteralPath "$run\probe-error.txt" -Encoding UTF8
+                    if ($probe.ExitCode -eq 0) {
+                        $status = $output.Result | ConvertFrom-Json
+                        if ($status.device_id) { return $true }
+                    }
+                } else { $probe.Kill(); $probe.WaitForExit() }
+            } finally { $probe.Dispose() }
         }
         Start-Sleep -Milliseconds 300
     }
@@ -144,11 +161,28 @@ if ($manifest.commit -ne $ExpectedCommit) { throw 'Stage manifest commit mismatc
 foreach ($artifact in $manifest.artifacts) {
     if ((Get-FileHash -LiteralPath $artifact.path -Algorithm SHA256).Hash -ne $artifact.sha256) { throw 'Staged artifact changed' }
 }
+if ($Action -eq 'Probe') {
+    $pair = @(Get-Pair)
+    $ams = @($pair | Where-Object name -eq 'allmystuff-serve.exe')[0]
+    $directory = Split-Path -Parent $ams.path
+    foreach ($item in $pair) {
+        Assert-SameProcess $item
+        if ($item.path -ne "$directory\$($item.name)") { throw 'Backend directories differ' }
+    }
+    if (-not (Wait-Ready (Get-Process -Id $ams.pid) $directory)) { throw 'Readiness probe failed; processes left untouched' }
+    Write-Host "Readiness passed; processes left untouched: $directory"
+    exit
+}
 Start-Transcript -Path "$run\activate-$Action-$NackMode.log" -Append | Out-Null
 try {
     $pair = @(Get-Pair)
     if ($Action -eq 'Activate') {
-        foreach ($item in $manifest.previous) { Assert-SameProcess $item }
+        # A failed activation may already have restored this slot's saved
+        # binaries with new PIDs. Permit that exact hashed pair on retry.
+        $savedPair = @($pair | Where-Object { $_.path -eq "$run\rollback\$($_.name)" })
+        if ($savedPair.Count -ne 2) {
+            foreach ($item in $manifest.previous) { Assert-SameProcess $item }
+        }
         $directory = $run
         $mode = $NackMode
     } else {
