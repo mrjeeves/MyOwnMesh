@@ -450,3 +450,154 @@ hashes after reading the final 56-control and three-case probe logs to EOF.
 The preliminary harness-publication gate passes; this is not the final field
 audit. The actual connected 10-node pilot, capacity-gated larger stages and
 full route matrix remain unqualified, and the operator's release HOLD remains.
+
+### First native connected-10 attempt (2026-09-07 UTC)
+
+The first actual multi-host driver attempt used published harness head
+`4cdc19ec1932f61ba1b68a9d5fa9cb7f7fe8231f`, ten distinct prepared native
+Windows identities (desktop 2, home 5, laptop 3), and the same feature-free
+production executable `51592459...c1bde` and unchanged per-peer grant
+`6a214df7...3780a`. All ten passed native configuration parsing, started,
+exposed their exact planned canonical public keys, and were observed by the
+native resource collector with pinned process-creation identities. The
+laptop's operator-corrected execution policy allowed its native scripts to
+run; the agent changed no execution policy or firewall rule.
+
+This attempt FAILED and is not a connected-10 performance qualification:
+
+| Host | Durable run | Retained host result |
+| --- | --- | --- |
+| Desktop | `f70cf685-c3b7-4cae-8fac-0bc5e93b4e37` | Censored at 211.031 s; exit 1 |
+| Home | `4355c213-7409-4846-bd5e-fa0f87d8fb5a` | Censored at 210.758 s; remote runner reported target HTTP 400 |
+| Laptop | `50a3c967-b517-4ff3-9d4b-b9a9ad3b22b4` | Failed at 133.947 s; remote runner reported target HTTP 400 |
+
+Only the initial `peers_list` phase was issued. The manager did not publish
+the payload phase or explicit completion before the finite work window
+expired. The desktop/home therefore stopped at the intended work deadline.
+Their collectors each retained a successful required-owner-exit terminal
+with zero evidence failures; this does not convert the incomplete trial to
+success. No payload command was attempted and no RTT was measured here.
+
+The laptop stopped earlier: its last retained samples were complete
+`Continue` observations, followed by a host terminal carrying only
+`error: {name: "Error"}` and no collector terminal. Existing host error
+serialization discarded the discriminating message/code/stage. The original
+cause cannot be recovered from those records; a filesystem/manifest failure
+is a hypothesis, not an established cause. No retained sample shows a
+memory, disk, or other resource-limit breach. Bounded error capture and
+autonomous command sequencing are required before another attempt; neither
+the resource limits nor the failed historical result may be relaxed.
+
+The ten initial snapshots, taken at different times during startup, contain
+all nine intended tree edges in their union: seven appear active,
+authenticated and mutually approved in both endpoints' snapshots; the two
+later home-to-desktop leaf edges appear in the leaf's snapshot only. All
+observed active edges match the plan. LAN pairs show host/host and
+cross-town pairs show host/peer-reflexive; none of these snapshots reports a
+relay candidate. This is not simultaneous complete adjacency, nomination
+attestation, proof of a particular forwarded payload route, or a TURN test.
+
+Observed maximum sums of private committed bytes, including the host
+controller and collector, were 209,620,992 (desktop), 212,762,624 (home), and
+202,924,032 (laptop). Corresponding maximum summed working sets were
+258,035,712, 313,384,960, and 267,902,976 bytes. These sampled startup/idle
+observations contain no measured payload load and are not a projection of
+500-node capacity. Working-set sums may double-count shared pages.
+
+All ten daemon PIDs and all three host-controller PIDs were subsequently
+checked absent; the laptop collector PID was absent too. Windows owned-child
+termination remains forced, with no graceful-shutdown durability claim.
+The retained host JSONL byte counts and SHA-256 digests are:
+
+- Desktop: 1,512,548 bytes,
+  `E096BEF8BB986248283255FCC2FC03837C71E4A4106E8993197EC4CF209FBD28`.
+- Home: 2,533,769 bytes,
+  `796C471B611AB47DB98872242165E7CAE174FD2F073A0F7BD4FF31415238C340`.
+- Laptop: 1,070,827 bytes,
+  `BA20E56510531C955773061E157FECB24B232893026566CAD070D1621BB34542`.
+
+Artifacts remain under each host's `pilot10-4cdc19e/connected2` directory.
+The manager's bounded joined summary is
+`target/qualification-evidence/live-device-inputs/pilot10-4cdc19e/connected2/retained-terminal-summary.json`.
+Larger stages, payload throughput/latency, Closed automatic convergence, the
+full route matrix, independent final field audit, and release remain unqualified.
+
+### Bounded pilot-harness correction gate (in progress)
+
+The first diagnostic patch failed composed validation: run
+`6a2bf124-1e21-49ed-86a2-2fc6a0bcac40` retained 57/59 passing controls.
+Its allowlisted OS error was serialized under the generic sensitive field
+`code`, so the shared sanitizer correctly redacted it. The correction uses
+`os_code` without weakening the shared sensitive-key rule.
+
+Independent review also found that a held diagnostic sink could delay
+owned teardown, and a first violation during teardown could miss the final
+capture join. Manager reproduction
+`c5c79cb0-86d3-4ad5-9eb2-5d75fa4382e9` confirmed both paths using the actual
+host controller with mocked peers and collector: zero native daemon starts.
+After the host correction (`1553C2FA...C6883A`), the same probe passed in
+`f87df078-a0dd-4cc9-97d5-920f9b90c087` (931 stdout bytes, zero stderr,
+complete retained logs). Both mock peers closed before a held sink was
+released; a delayed teardown capture rejection was joined and preserved as
+`outcome_unknown`, including its allowlisted `EPIPE` discriminator.
+The combined run `de010ef3-7f89-49e0-8c1d-3ae027b43099` still failed 2 of
+63 controls because of a reversed error-field fixture and an unowned
+pre-rejected test promise; these failures are retained, not counted as a
+successful combined gate.
+
+The autonomous input wrapper initially passed 14 mocked controls in
+`54191e3a-3c34-43a6-9acb-06fc81e9aded`. Additional composition diagnostics
+then exposed two blockers: a `performance.now()` deadline passed to a
+native `process.hrtime`-based sampler was immediately censored
+(`7f1d5edc-fb79-4430-a81c-24319565085f`, with a passing same-clock positive
+control), and a late joined host `outcome_unknown` was hidden by an earlier
+external cancellation (`fec9cd0c-9758-4e03-bf3d-9a84653578c3`). Both
+diagnostics launched zero daemons. Earlier diagnostic setup failures
+`6dca00d9-93de-4bc1-b5d8-668d8e602d3c` and
+`e83e28ea-b382-4bda-bbca-406e21e4f0bc` did not establish those defects and
+are not substituted for the corrected reproductions.
+
+No second live pilot has run at this gate. The planned follow-up preserves
+the ten identities, network configurations, grants, safety limits and
+240-second host envelope; it is not a fresh-identity or fresh-ledger trial.
+The fixed autonomous local schedule remains census at 30/45/60 seconds
+(four-second capture allowance), qualification by 64 seconds, receiver
+ready by 65, sender at 80, final census at 120 and completion by 150.
+Those scheduling offsets are not cross-host latency measurements.
+
+The corrected combined host controls subsequently passed 63/63 in
+`7b8d174d-f10c-481e-be54-fdd8e03d3768` (13,631 stdout bytes, zero stderr,
+complete logs), with host hash `1553C2FA...C6883A` and test hash
+`E7E488B4...D4B4CB`. Independent review then identified a distinct remaining
+deadline composition: an already-settled ambiguous capture result was
+discarded if cleanup exhausted the deadline before the final join. The
+expanded actual-host/mock-owner probe
+`53fddb53-7012-4af8-8e66-bb1d8b579fe0` reproduced that loss while retaining
+the two earlier positive cases. This remains a host publication blocker;
+the 63 passing controls do not establish that missing boundary.
+
+Wrapper hash `47048D86...F54017` and test hash `34AD179E...55C0240` passed
+19/19 controls in `93c45314-24ff-43b7-b82c-a05a07fe50c7` (4,462 stdout
+bytes, zero stderr, complete logs), including the wrapper's actual default
+clock composed with the real sampler gate without starting a process. The
+manager's late-unknown reproduction also passed after correction in
+`9c911500-1e82-4ec7-9e4d-61e2a07d5702` (171 stdout bytes, zero stderr).
+An independent wrapper source/control review found no blocking interface or
+schedule contradiction. Final hash-bound case inputs, corrected host
+deadline handling, deployed-byte custody, live execution and final field
+audit remain separate gates.
+
+The owned settled-result latch (`CBF73371...F56F8CB`) passed the expanded
+64-control suite in `593c660e-1127-4019-b08e-4339bb4a102f` (13,850 stdout
+bytes, zero stderr, complete logs). The three-case capture-owner probe also
+passed in `f1d2ac7f-df77-498c-b669-aa871b929b85` (1,470 stdout bytes,
+zero stderr), including preservation of the already-settled `EPIPE`
+unknown outcome after cleanup reached the original deadline. The unresolved
+expired-capture case still remains censored; no deadline was extended.
+These are source/helper validation results, not another live mesh result.
+
+Independent verification of the frozen `CBF73371...F56F8CB` host and
+`AC8749F9...71118A` controls closed the reproduced diagnostic/capture
+blockers after reading both final runs in full. This permits preliminary
+harness publication only; it does not replace the separate case-input,
+deployment, actual network workload or final independent field-audit gates.

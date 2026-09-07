@@ -373,6 +373,128 @@ function controllerStatus(error) {
         : "complete";
 }
 
+const SAFE_ERROR_CODES = new Set([
+  "EACCES", "EAGAIN", "EBUSY", "ECONNRESET", "EEXIST", "EINTR", "EINVAL",
+  "EIO", "EMFILE", "ENAMETOOLONG", "ENFILE", "ENOENT", "ENOMEM", "ENOSPC",
+  "ENOTDIR", "EPERM", "EPIPE", "EROFS", "ETIMEDOUT", "EXDEV",
+]);
+const SAFE_ERROR_SYSCALLS = new Set([
+  "close", "connect", "fdatasync", "fsync", "kill", "lstat", "mkdir", "open",
+  "pipe", "read", "rename", "spawn", "stat", "unlink", "write",
+]);
+const SAFE_LIFECYCLE_STAGES = new Set([
+  "command_execution", "host", "peer_close", "resource_sampler", "sampler_close",
+  "sampler_complete", "sampler_freshness", "sampler_manifest_heartbeat",
+  "sampler_observation", "sampler_output", "sampler_stderr",
+  "sampler_violation_capture", "teardown_manifest", "teardown_phase",
+  "terminal_capture", "writer_close",
+]);
+const RETAINED_ERROR_EVIDENCE = new WeakMap();
+
+function errorChain(error) {
+  const chain = [];
+  let current = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    chain.push(current);
+    current = current.cause;
+  }
+  return chain;
+}
+
+/**
+ * Preserve only finite, non-secret failure metadata. Messages, paths, stacks,
+ * arbitrary object fields, and unrecognised strings never cross this boundary.
+ */
+export function boundedHostErrorEvidence(error, lifecycleStage = "host") {
+  const chain = errorChain(error);
+  const kind = controllerStatus(error);
+  const result = {
+    name: error instanceof ControllerError ? "ControllerError" : "Error",
+    kind: ["failed", "censored", "outcome_unknown"].includes(kind) ? kind : "failed",
+    lifecycle_stage: SAFE_LIFECYCLE_STAGES.has(lifecycleStage) ? lifecycleStage : "host",
+  };
+  const code = chain.map((entry) => entry.code).find(
+    (value) => typeof value === "string" && SAFE_ERROR_CODES.has(value),
+  );
+  const syscall = chain.map((entry) => entry.syscall).find(
+    (value) => typeof value === "string" && SAFE_ERROR_SYSCALLS.has(value),
+  );
+  const errno = chain.map((entry) => entry.errno).find(
+    (value) => Number.isSafeInteger(value) && Math.abs(value) <= 1_000_000,
+  );
+  if (code !== undefined) result.os_code = code;
+  if (syscall !== undefined) result.syscall = syscall;
+  if (errno !== undefined) result.errno = errno;
+  return result;
+}
+
+export function hostProcessFailureRecord(error) {
+  const retained = error && typeof error === "object"
+    ? RETAINED_ERROR_EVIDENCE.get(error)
+    : undefined;
+  return { type: "host_process_error", error: retained ?? boundedHostErrorEvidence(error, "host") };
+}
+
+function ownDiagnosticCapture(capture) {
+  const owned = {
+    settled: false,
+    frozen: false,
+    outcome: undefined,
+    promise: undefined,
+  };
+  owned.promise = Promise.resolve(capture).then(
+    () => {
+      const outcome = { status: "complete" };
+      if (!owned.frozen) {
+        owned.settled = true;
+        owned.outcome = outcome;
+      }
+      return outcome;
+    },
+    (error) => {
+      const outcome = { status: "failed", error };
+      if (!owned.frozen) {
+        owned.settled = true;
+        owned.outcome = outcome;
+      }
+      return outcome;
+    },
+  );
+  return owned;
+}
+
+/** Join one already-owned diagnostic write without extending the host deadline. */
+export async function settleDiagnosticCapture(capture, deadlineMs, now = monoMs) {
+  if (!capture) return { status: "absent" };
+  const owned = capture && typeof capture === "object" && capture.promise instanceof Promise
+    ? capture
+    : null;
+  if (owned?.settled) {
+    owned.frozen = true;
+    return owned.outcome;
+  }
+  const remaining = Math.floor(deadlineMs - now());
+  if (remaining <= 0) {
+    if (owned) owned.frozen = true;
+    return { status: "censored" };
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (owned) owned.frozen = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ status: "censored" }), remaining);
+    Promise.resolve(owned?.promise ?? capture).then(
+      (value) => finish(value),
+      (error) => finish({ status: "failed", error }),
+    );
+  });
+}
+
 async function writeAtomicJson(filePath, value) {
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const handle = await open(temporary, "wx", 0o600);
@@ -473,7 +595,10 @@ export class ResourceSampler {
     this.child.stderr.on("data", (chunk) => {
       this.samplerStderrBytes = (this.samplerStderrBytes ?? 0) + chunk.length;
       if (this.samplerStderrBytes > SCALE_LIMITS.samplerLineBytes) {
-        this.#violate(new ControllerError("resource sampler stderr exceeded its bound"));
+        this.#violate(
+          new ControllerError("resource sampler stderr exceeded its bound"),
+          "sampler_stderr",
+        );
       }
     });
     const lines = readline.createInterface({ input: this.child.stdout, crlfDelay: Infinity });
@@ -491,24 +616,35 @@ export class ResourceSampler {
           await this.acceptObservation(record);
         }
         if (!this.closed && this.latest?.kind !== "terminal") {
-          this.#violate(new ControllerError("resource sampler ended without a terminal record"));
+          this.#violate(
+            new ControllerError("resource sampler ended without a terminal record"),
+            "sampler_output",
+          );
         }
       } catch (error) {
-        this.#violate(error);
+        this.#violate(error, "sampler_output");
       }
     })();
     this.heartbeat = setInterval(() => {
-      this.#publish().catch((error) => this.#violate(error));
+      this.#publish().catch((error) => this.#violate(error, "sampler_manifest_heartbeat"));
     }, this.config.heartbeatMs);
     this.heartbeat.unref?.();
     await this.#pinOwner("host-controller", () => !this.signal.aborted);
   }
 
-  #violate(error) {
+  #violate(error, lifecycleStage = "resource_sampler") {
     clearInterval(this.heartbeat);
     clearTimeout(this.freshnessTimer);
+    const violationEvidence = boundedHostErrorEvidence(error, lifecycleStage);
+    this.firstViolation ??= violationEvidence;
+    const previous = this.failure;
     this.failure = mergeControllerError(this.failure, error);
-    try { this.onViolation?.(this.failure); } catch (callbackError) {
+    if (this.failure !== previous) {
+      this.failureEvidence = boundedHostErrorEvidence(this.failure, lifecycleStage);
+    }
+    try {
+      this.onViolation?.(this.failure, this.failureEvidence, this.firstViolation);
+    } catch (callbackError) {
       this.failure = mergeControllerError(this.failure, callbackError);
     }
     for (const wake of this.waiters) wake();
@@ -527,10 +663,13 @@ export class ResourceSampler {
     clearTimeout(this.freshnessTimer);
     if (this.closed || this.latest?.kind === "terminal") return;
     this.freshnessTimer = setTimeout(() => {
-      this.#violate(new ControllerError(
-        "resource sampler produced no observation within sampleIntervalMs + maxSweepMs",
-        "censored",
-      ));
+      this.#violate(
+        new ControllerError(
+          "resource sampler produced no observation within sampleIntervalMs + maxSweepMs",
+          "censored",
+        ),
+        "sampler_freshness",
+      );
     }, this.freshnessMs);
   }
 
@@ -539,7 +678,7 @@ export class ResourceSampler {
       clearTimeout(this.freshnessTimer);
     } else if (record?.kind === "sample") this.#armFreshness();
     const error = samplerObservationError(record, this.phase);
-    if (error) this.#violate(error);
+    if (error) this.#violate(error, "sampler_observation");
   }
 
   async #publish() {
@@ -656,7 +795,10 @@ export class ResourceSampler {
       });
     }
     await this.reader?.catch(() => {});
-    if (this.failure) throw this.failure;
+    const failure = this.failure;
+    this.onRecord = undefined;
+    this.onViolation = undefined;
+    if (failure) throw failure;
   }
 }
 
@@ -789,6 +931,11 @@ export async function runScaleHost(args, hooks = {}) {
   const sessions = new Map();
   let sampler;
   let terminalError;
+  let terminalErrorStage = "host";
+  let firstSamplerViolation;
+  let samplerViolationCaptureError;
+  let samplerViolationCapture;
+  let samplerCallbacksOpen = true;
   let totalCommands = 0;
   let journalDigests = [];
   let processedRows = 0;
@@ -806,6 +953,19 @@ export async function runScaleHost(args, hooks = {}) {
     const safe = sanitizeEvidence(value);
     await writer.append(safe);
     if (lifecycle) await emitLifecycle(safe);
+  };
+  const mergeTerminal = (error, lifecycleStage) => {
+    const previous = terminalError;
+    terminalError = mergeControllerError(terminalError, error);
+    if (terminalError !== previous) {
+      terminalErrorStage = lifecycleStage;
+      if (terminalError && typeof terminalError === "object") {
+        RETAINED_ERROR_EVIDENCE.set(
+          terminalError,
+          boundedHostErrorEvidence(terminalError, terminalErrorStage),
+        );
+      }
+    }
   };
   try {
     const topology = await verifyTopology(manifest);
@@ -830,8 +990,20 @@ export async function runScaleHost(args, hooks = {}) {
       sampler = new Sampler(manifest.sampler, manifest.runId, abort.signal, {
         ...hooks.samplerHooks,
         onRecord: (row) => record({ type: "resource_observation", record: row }),
-        onViolation: (error) => {
-          terminalError = mergeControllerError(terminalError, error);
+        onViolation: (error, evidence, firstEvidence) => {
+          if (!samplerCallbacksOpen) return;
+          mergeTerminal(error, evidence?.lifecycle_stage ?? "resource_sampler");
+          if (firstSamplerViolation === undefined) {
+            firstSamplerViolation = firstEvidence ?? evidence ?? boundedHostErrorEvidence(
+              error,
+              "resource_sampler",
+            );
+            samplerViolationCapture = ownDiagnosticCapture(record({
+              type: "resource_violation",
+              mono_ms: clock(),
+              error: firstSamplerViolation,
+            }, true));
+          }
           abort.abort();
         },
       });
@@ -914,7 +1086,8 @@ export async function runScaleHost(args, hooks = {}) {
                   try {
                     await record({ type: "host_command_result", sequence: row.sequence, peer: item.peer,
                       id: item.command.id, action: item.command.action, status: controllerStatus(error),
-                      mono_ms: clock(), error: { name: error?.name, kind: error?.kind } }, true);
+                      mono_ms: clock(),
+                      error: boundedHostErrorEvidence(error, "command_execution") }, true);
                   } catch (captureError) {
                     batchError = mergeControllerError(batchError, captureError);
                   }
@@ -953,7 +1126,7 @@ export async function runScaleHost(args, hooks = {}) {
     }
     if (!runResult) throw new ControllerError("host plan ended without an explicit complete row", "censored");
   } catch (error) {
-    terminalError = mergeControllerError(terminalError, error);
+    mergeTerminal(error, "command_execution");
     abort.abort();
   } finally {
     for (const [inputPath, expectedHash, limit, label] of [
@@ -964,26 +1137,49 @@ export async function runScaleHost(args, hooks = {}) {
         const bytes = await readStable(inputPath, limit, label);
         if (bytes === null || sha256(bytes) !== expectedHash) throw new ControllerError(`${label} changed during execution`);
       } catch (error) {
-        terminalError = mergeControllerError(terminalError, error);
+        mergeTerminal(error, "teardown_manifest");
       }
     }
     await sampler?.setPhase("teardown").catch((error) => {
-      terminalError = mergeControllerError(terminalError, error);
+      mergeTerminal(error, "teardown_phase");
     });
     const terminals = await Promise.all([...sessions.entries()].reverse().map(async ([alias, session]) => {
       try { return { peer: alias, terminal: await session.close() }; }
       catch (error) {
-        terminalError = mergeControllerError(terminalError, error);
-        return { peer: alias, error: { message: String(error?.message), kind: error?.kind } };
+        mergeTerminal(error, "peer_close");
+        return { peer: alias, error: boundedHostErrorEvidence(error, "peer_close") };
       }
     }));
     let samplerTerminal;
     if (sampler) {
       try { samplerTerminal = await sampler.complete(deadlineMs); }
-      catch (error) { terminalError = mergeControllerError(terminalError, error); }
+      catch (error) { mergeTerminal(error, "sampler_complete"); }
       await sampler.close().catch((error) => {
-        terminalError = mergeControllerError(terminalError, error);
+        mergeTerminal(error, "sampler_close");
       });
+    }
+    samplerCallbacksOpen = false;
+    const captureOutcome = await settleDiagnosticCapture(
+      samplerViolationCapture,
+      deadlineMs,
+      clock,
+    );
+    if (captureOutcome.status === "failed") {
+      samplerViolationCaptureError ??= boundedHostErrorEvidence(
+        captureOutcome.error,
+        "sampler_violation_capture",
+      );
+      mergeTerminal(captureOutcome.error, "sampler_violation_capture");
+    } else if (captureOutcome.status === "censored") {
+      const captureError = new ControllerError(
+        "resource violation evidence capture did not settle before the host deadline",
+        "censored",
+      );
+      samplerViolationCaptureError ??= boundedHostErrorEvidence(
+        captureError,
+        "sampler_violation_capture",
+      );
+      mergeTerminal(captureError, "sampler_violation_capture");
     }
     clearTimeout(timer);
     process.off("SIGINT", signalAbort);
@@ -992,12 +1188,14 @@ export async function runScaleHost(args, hooks = {}) {
     hooks.signal?.removeEventListener("abort", externalAbort);
     await record({ type: "host_terminal", mono_ms: clock(), elapsed_ms: clock() - startedMs,
       status: controllerStatus(terminalError), peer_terminals: terminals, sampler_terminal: samplerTerminal,
-      error: terminalError ? { name: terminalError.name, kind: terminalError.kind } : null,
+      error: terminalError ? boundedHostErrorEvidence(terminalError, terminalErrorStage) : null,
+      first_sampler_violation: firstSamplerViolation ?? null,
+      sampler_violation_capture_error: samplerViolationCaptureError ?? null,
       output_close_pending: true }, true).catch((error) => {
-      terminalError = mergeControllerError(terminalError, error);
+      mergeTerminal(error, "terminal_capture");
     });
     await writer.close().catch((error) => {
-      terminalError = mergeControllerError(terminalError, error);
+      mergeTerminal(error, "writer_close");
     });
   }
   if (terminalError) throw terminalError;
@@ -1007,7 +1205,11 @@ export async function runScaleHost(args, hooks = {}) {
 async function main() {
   let code = 0;
   try { await runScaleHost(parseArgs(process.argv.slice(2))); }
-  catch { code = 1; }
+  catch (error) {
+    code = 1;
+    try { process.stderr.write(`${JSON.stringify(hostProcessFailureRecord(error))}\n`); }
+    catch { /* The nonzero process status remains the final evidence ceiling. */ }
+  }
   process.exitCode = code;
 }
 

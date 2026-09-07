@@ -11,12 +11,15 @@ import {
 import {
   GRANT_DIMENSIONS,
   ResourceSampler,
+  boundedHostErrorEvidence,
   enforceHostGrantLedger,
+  hostProcessFailureRecord,
   parseGrant,
   parseJournal,
   runScaleHost,
   samplerFreshnessMs,
   samplerObservationError,
+  settleDiagnosticCapture,
   validateManifest,
 } from "../run-live-device-scale-host.mjs";
 
@@ -88,11 +91,57 @@ test("sampler health permits only bootstrap confirmation and derives freshness f
   assert.ok(samplerObservationError({ kind: "terminal", success: false }, "steady"));
 });
 
+test("host errors retain only allowlisted OS and lifecycle discrimination", () => {
+  const cause = Object.assign(new Error("SECRET path C:/private/config.json"), {
+    name: "SECRET_NAME",
+    code: "EPERM",
+    syscall: "rename",
+    errno: -4048,
+    path: "C:/private/config.json",
+    dest: "C:/private/manifest.json",
+    token: "SECRET_TOKEN",
+  });
+  const error = new ControllerError("SECRET outer message", "outcome_unknown", cause);
+  const evidence = boundedHostErrorEvidence(error, "sampler_manifest_heartbeat");
+  assert.deepEqual(evidence, {
+    name: "ControllerError",
+    kind: "outcome_unknown",
+    lifecycle_stage: "sampler_manifest_heartbeat",
+    os_code: "EPERM",
+    syscall: "rename",
+    errno: -4048,
+  });
+  const terminal = JSON.stringify(hostProcessFailureRecord(error));
+  assert.doesNotMatch(terminal, /SECRET|private|config\.json|TOKEN|stack|path|dest/);
+  assert.doesNotMatch(
+    JSON.stringify(boundedHostErrorEvidence(Object.assign(new Error("hidden"), {
+      code: "SECRET_CODE", syscall: "SECRET_SYSCALL", errno: 9_999_999,
+    }), "SECRET_STAGE")),
+    /SECRET/,
+  );
+});
+
+test("diagnostic capture refuses to extend an exhausted host deadline", async () => {
+  assert.deepEqual(
+    await settleDiagnosticCapture(new Promise(() => {}), 10, () => 10),
+    { status: "censored" },
+  );
+  assert.deepEqual(
+    await settleDiagnosticCapture(Promise.resolve({ status: "complete" }), 10, () => 0),
+    { status: "complete" },
+  );
+});
+
 test("a missing sampler heartbeat cancels held work at the declared freshness bound", async () => {
   const cancellation = new AbortController();
   let violation;
+  let violationEvidence;
   const sampler = new ResourceSampler({ files: [] }, "freshness-control", cancellation.signal, {
-    onViolation: (error) => { violation = error; cancellation.abort(); },
+    onViolation: (error, evidence) => {
+      violation = error;
+      violationEvidence = evidence;
+      cancellation.abort();
+    },
   });
   sampler.phase = "steady";
   sampler.freshnessMs = samplerFreshnessMs({ sampleIntervalMs: 1, maxSweepMs: 1 });
@@ -101,6 +150,7 @@ test("a missing sampler heartbeat cancels held work at the declared freshness bo
   await held;
   assert.equal(violation?.kind, "censored");
   assert.match(violation?.message, /sampleIntervalMs \+ maxSweepMs/);
+  assert.equal(violationEvidence?.lifecycle_stage, "sampler_freshness");
   await assert.rejects(sampler.close(), /sampleIntervalMs \+ maxSweepMs/);
 });
 
@@ -154,6 +204,323 @@ class FakeSampler {
   async complete() { return { kind: "terminal", success: true, observedRequiredExited: true }; }
   async close() {}
 }
+
+function codedSampler(error, evidenceStage = "sampler_manifest_heartbeat") {
+  return class extends ResourceSampler {
+    constructor(config, runId, signal, hooks) {
+      super(config, runId, signal, hooks);
+      this.testHooks = hooks;
+    }
+    async start() {
+      this.testHooks.onViolation(error, boundedHostErrorEvidence(error, evidenceStage));
+    }
+    async gate() { return { decision: "Continue" }; }
+    async setPhase() {}
+    async registerDaemon() { throw new Error("aborted startup must not register a daemon"); }
+    async complete() { return { kind: "terminal", success: true, observedRequiredExited: true }; }
+    async close() {}
+  };
+}
+
+function triggeredSampler(error, triggerPhase = null, onInstance = () => {}) {
+  return class extends ResourceSampler {
+    constructor(config, runId, signal, hooks) {
+      super(config, runId, signal, hooks);
+      this.testHooks = hooks;
+      this.triggered = false;
+      onInstance(this);
+    }
+    async start() {}
+    async gate() { return { decision: "Continue" }; }
+    async setPhase(phase) {
+      if (phase === triggerPhase) this.trigger();
+    }
+    trigger() {
+      if (this.triggered) return;
+      this.triggered = true;
+      const evidence = boundedHostErrorEvidence(error, "sampler_manifest_heartbeat");
+      this.testHooks.onViolation(error, evidence, evidence);
+    }
+    async registerDaemon(_alias, session) {
+      await session.pinDaemonCreationIdentity("638612345678901234");
+      return "638612345678901234";
+    }
+    async complete() { return { kind: "terminal", success: true, observedRequiredExited: true }; }
+    async close() {}
+  };
+}
+
+function closeObservedSessions(log, closeStarted, afterClose = () => {}) {
+  const basic = fakeSessions(log);
+  return (args, options) => {
+    const session = basic(args, options);
+    const close = session.close.bind(session);
+    session.close = async () => {
+      closeStarted();
+      afterClose();
+      return close();
+    };
+    return session;
+  };
+}
+
+test("a coded sampler failure is retained without its message or paths", async () => {
+  const files = await caseFiles([{ sequence: 1, kind: "complete" }]);
+  const samplerError = Object.assign(new Error("SECRET manifest path C:/private/manifest.json"), {
+    name: "SECRET_NAME",
+    code: "EPERM",
+    syscall: "rename",
+    errno: -4048,
+    path: "C:/private/manifest.json",
+  });
+  await assert.rejects(
+    runScaleHost(
+      { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+      { createPeerSession: () => { throw new Error("startup continued after violation"); },
+        ResourceSampler: codedSampler(samplerError), emitLifecycle: async () => {} },
+    ),
+    (error) => error === samplerError,
+  );
+  const raw = await readFile(files.outputPath, "utf8");
+  const evidence = raw.trim().split("\n").map(JSON.parse);
+  const violation = evidence.find((row) => row.type === "resource_violation");
+  const terminal = evidence.find((row) => row.type === "host_terminal");
+  assert.deepEqual(violation.error, {
+    name: "Error", kind: "failed", lifecycle_stage: "sampler_manifest_heartbeat",
+    os_code: "EPERM", syscall: "rename", errno: -4048,
+  });
+  assert.deepEqual(terminal.error, violation.error);
+  assert.deepEqual(terminal.first_sampler_violation, violation.error);
+  assert.equal(terminal.sampler_violation_capture_error, null);
+  assert.doesNotMatch(raw, /SECRET|private|manifest\.json/);
+});
+
+test("sampler evidence capture failure is retained and unknown dominates", async () => {
+  const files = await caseFiles([{ sequence: 1, kind: "complete" }]);
+  const samplerError = Object.assign(new Error("SECRET sampler"), {
+    code: "EPERM", syscall: "rename", errno: -4048, path: "C:/secret",
+  });
+  const captureError = Object.assign(
+    new ControllerError("SECRET capture", "outcome_unknown"),
+    { code: "EPIPE", syscall: "write", errno: -32, path: "C:/secret-output" },
+  );
+  await assert.rejects(
+    runScaleHost(
+      { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+      {
+        createPeerSession: () => { throw new Error("startup continued after violation"); },
+        ResourceSampler: codedSampler(samplerError),
+        emitLifecycle: async (row) => {
+          if (row.type === "resource_violation") throw captureError;
+        },
+      },
+    ),
+    (error) => error === captureError && error.kind === "outcome_unknown",
+  );
+  const raw = await readFile(files.outputPath, "utf8");
+  const terminal = raw.trim().split("\n").map(JSON.parse)
+    .find((row) => row.type === "host_terminal");
+  assert.equal(terminal.status, "outcome_unknown");
+  assert.deepEqual(terminal.error, {
+    name: "ControllerError", kind: "outcome_unknown",
+    lifecycle_stage: "sampler_violation_capture", os_code: "EPIPE", syscall: "write", errno: -32,
+  });
+  assert.deepEqual(hostProcessFailureRecord(captureError).error, terminal.error);
+  assert.equal(terminal.first_sampler_violation.os_code, "EPERM");
+  assert.deepEqual(terminal.sampler_violation_capture_error, terminal.error);
+  assert.doesNotMatch(raw, /SECRET|secret-output|C:\/secret/);
+});
+
+test("held violation evidence never sits ahead of owned peer teardown", async () => {
+  const files = await caseFiles([
+    { sequence: 1, kind: "phase", phase: "held", commands: [
+      { peer: "node-0", command: { id: "held", action: "rpc", request: { op: "held" } },
+        acceptedStatuses: ["acknowledged"] },
+    ] },
+    { sequence: 2, kind: "complete" },
+  ]);
+  const samplerError = Object.assign(new Error("hidden"), {
+    code: "EPERM", syscall: "rename", errno: -4048,
+  });
+  let samplerInstance;
+  let releaseCapture;
+  const heldCapture = new Promise((resolve) => { releaseCapture = resolve; });
+  let observeClose;
+  const closeStarted = new Promise((resolve) => { observeClose = resolve; });
+  let captureReleased = false;
+  const log = [];
+  const baseSessions = closeObservedSessions(log, observeClose);
+  const createHeldSession = (args, options) => {
+    const session = baseSessions(args, options);
+    const execute = session.execute.bind(session);
+    session.execute = async (command) => {
+      if (command.request?.op !== "held") return execute(command);
+      return new Promise((resolve) => {
+        options.signal.addEventListener("abort", () => resolve({
+          id: command.id, action: "rpc", status: "failed",
+        }), { once: true });
+        queueMicrotask(() => samplerInstance.trigger());
+      });
+    };
+    return session;
+  };
+  const running = runScaleHost(
+    { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+    {
+      createPeerSession: createHeldSession,
+      ResourceSampler: triggeredSampler(samplerError, null, (instance) => { samplerInstance = instance; }),
+      emitLifecycle: async (row) => {
+        if (row.type === "resource_violation") await heldCapture;
+      },
+    },
+  );
+  await closeStarted;
+  assert.equal(captureReleased, false);
+  releaseCapture();
+  captureReleased = true;
+  await assert.rejects(running, (error) => error === samplerError);
+  assert.equal(log.filter((row) => row.startsWith("close:")).length, 4);
+});
+
+test("a teardown violation joins delayed unknown capture before terminal status", async () => {
+  const files = await caseFiles([{ sequence: 1, kind: "complete" }]);
+  const samplerError = Object.assign(new Error("hidden"), {
+    code: "EPERM", syscall: "rename", errno: -4048,
+  });
+  const captureError = Object.assign(
+    new ControllerError("hidden", "outcome_unknown"),
+    { code: "EPIPE", syscall: "write", errno: -32 },
+  );
+  let rejectCapture;
+  const heldCapture = new Promise((_, reject) => { rejectCapture = reject; });
+  let observeCaptureEntry;
+  const captureEntered = new Promise((resolve) => { observeCaptureEntry = resolve; });
+  let observeClose;
+  const closeStarted = new Promise((resolve) => { observeClose = resolve; });
+  const log = [];
+  const running = runScaleHost(
+    { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+    {
+      createPeerSession: closeObservedSessions(log, observeClose),
+      ResourceSampler: triggeredSampler(samplerError, "teardown"),
+      emitLifecycle: async (row) => {
+        if (row.type === "resource_violation") {
+          observeCaptureEntry();
+          await heldCapture;
+        }
+      },
+    },
+  );
+  const ownedRunning = running.then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await Promise.all([closeStarted, captureEntered]);
+  rejectCapture(captureError);
+  const outcome = await ownedRunning;
+  assert.equal(outcome.error, captureError);
+  assert.equal(outcome.error.kind, "outcome_unknown");
+  const evidence = (await readFile(files.outputPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const terminal = evidence.find((row) => row.type === "host_terminal");
+  assert.equal(terminal.status, "outcome_unknown");
+  assert.equal(terminal.first_sampler_violation.os_code, "EPERM");
+  assert.equal(terminal.sampler_violation_capture_error.os_code, "EPIPE");
+  assert.equal(log.filter((row) => row.startsWith("close:")).length, 4);
+});
+
+test("a settled unknown capture survives peer closes consuming the host deadline", async () => {
+  const files = await caseFiles([{ sequence: 1, kind: "complete" }]);
+  const samplerError = Object.assign(new Error("hidden"), {
+    code: "EPERM", syscall: "rename", errno: -4048,
+  });
+  const captureError = Object.assign(
+    new ControllerError("hidden", "outcome_unknown"),
+    { code: "EPIPE", syscall: "write", errno: -32 },
+  );
+  let now = 0;
+  let observeCaptureEntry;
+  const captureEntered = new Promise((resolve) => { observeCaptureEntry = resolve; });
+  let observeAllCloses;
+  const allClosesStarted = new Promise((resolve) => { observeAllCloses = resolve; });
+  let releaseCloses;
+  const closeGate = new Promise((resolve) => { releaseCloses = resolve; });
+  let closeCount = 0;
+  const log = [];
+  const baseSessions = fakeSessions(log);
+  const heldCloseSessions = (args, options) => {
+    const session = baseSessions(args, options);
+    const close = session.close.bind(session);
+    session.close = async () => {
+      closeCount += 1;
+      if (closeCount === 4) observeAllCloses();
+      await closeGate;
+      now += 15_000;
+      return close();
+    };
+    return session;
+  };
+  const running = runScaleHost(
+    { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+    {
+      monoMs: () => now,
+      createPeerSession: heldCloseSessions,
+      ResourceSampler: triggeredSampler(samplerError, "teardown"),
+      emitLifecycle: async (row) => {
+        if (row.type === "resource_violation") {
+          observeCaptureEntry();
+          throw captureError;
+        }
+      },
+    },
+  );
+  const ownedRunning = running.then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await Promise.all([captureEntered, allClosesStarted]);
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseCloses();
+  const outcome = await ownedRunning;
+  assert.equal(outcome.error, captureError);
+  assert.equal(outcome.error.kind, "outcome_unknown");
+  assert.equal(now, 60_000);
+  const evidence = (await readFile(files.outputPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const terminal = evidence.find((row) => row.type === "host_terminal");
+  assert.equal(terminal.status, "outcome_unknown");
+  assert.equal(terminal.error.os_code, "EPIPE");
+  assert.equal(terminal.sampler_violation_capture_error.os_code, "EPIPE");
+  assert.equal(log.filter((row) => row.startsWith("close:")).length, 4);
+});
+
+test("an unresolved violation sink is censored only after owned peers exit", async () => {
+  const files = await caseFiles([{ sequence: 1, kind: "complete" }]);
+  const samplerError = Object.assign(new Error("hidden"), {
+    code: "EPERM", syscall: "rename", errno: -4048,
+  });
+  let now = 0;
+  let closes = 0;
+  const log = [];
+  await assert.rejects(
+    runScaleHost(
+      { manifest: files.manifestPath, commands: files.commandPath, output: files.outputPath },
+      {
+        monoMs: () => now,
+        createPeerSession: closeObservedSessions(log, () => { closes += 1; }, () => { now = 60_000; }),
+        ResourceSampler: triggeredSampler(samplerError, "teardown"),
+        emitLifecycle: async (row) => {
+          if (row.type === "resource_violation") await new Promise(() => {});
+        },
+      },
+    ),
+    (error) => error === samplerError,
+  );
+  assert.equal(closes, 4);
+  const evidence = (await readFile(files.outputPath, "utf8")).trim().split("\n").map(JSON.parse);
+  const terminal = evidence.find((row) => row.type === "host_terminal");
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.sampler_violation_capture_error.kind, "censored");
+  assert.equal(terminal.sampler_violation_capture_error.lifecycle_stage, "sampler_violation_capture");
+});
 
 async function caseFiles(journalRows) {
   const root = await mkdtemp(path.join(os.tmpdir(), "myownmesh-scale-host-"));
