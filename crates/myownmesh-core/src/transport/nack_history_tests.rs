@@ -83,6 +83,7 @@ async fn check_repair(start: u16, separation: u16) {
     let generator = Generator::builder()
         .with_log2_size_minus_6(super::webrtc::NACK_GENERATOR_LOG2_SIZE_MINUS_6)
         .with_skip_last_n(super::webrtc::NACK_REORDER_TAIL_PACKETS)
+        .with_max_nacks_per_tick(super::webrtc::NACK_MAX_REQUESTS_PER_TICK)
         .with_interval(super::webrtc::NACK_INTERVAL)
         .build("nack-history-regression")
         .unwrap();
@@ -105,7 +106,7 @@ async fn check_repair(start: u16, separation: u16) {
     generator.bind_rtcp_writer(Arc::new(Feedback(tx))).await;
     let first = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
     let legacy = std::env::var("MYOWNMESH_DIAG_LEGACY_NACK_HISTORY").as_deref() == Ok("1");
-    if legacy && separation >= 512 {
+    if legacy && separation >= (64 << super::webrtc::NACK_GENERATOR_LOG2_SIZE_MINUS_6) {
         // Explicit A/B mode must reproduce the old corruption. Run this in
         // a separate process; never mutate the environment between tests.
         assert!(first.is_err(), "legacy mode should reproduce the lost NACK");
@@ -126,7 +127,8 @@ async fn check_repair(start: u16, separation: u16) {
 #[tokio::test(start_paused = true)]
 async fn late_repair_keeps_newer_hole_nacked() {
     for start in [1000, 65400] {
-        for separation in [512, 1024] {
+        let history = 64 << super::webrtc::NACK_GENERATOR_LOG2_SIZE_MINUS_6;
+        for separation in [history, history * 2] {
             check_repair(start, separation).await;
         }
     }
@@ -137,4 +139,56 @@ async fn in_window_repair_and_wrap_still_work() {
     for start in [1000, 65530] {
         check_repair(start, 32).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn feedback_limit_does_not_forget_waiting_repairs() {
+    let input = Arc::new(Input(Mutex::new(VecDeque::from([0, 700]))));
+    let info = StreamInfo {
+        ssrc: 7,
+        rtcp_feedback: vec![RTCPFeedback {
+            typ: "nack".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let generator = Generator::builder()
+        .with_log2_size_minus_6(super::webrtc::NACK_GENERATOR_LOG2_SIZE_MINUS_6)
+        .with_skip_last_n(super::webrtc::NACK_REORDER_TAIL_PACKETS)
+        .with_max_nacks_per_tick(super::webrtc::NACK_MAX_REQUESTS_PER_TICK)
+        .with_interval(super::webrtc::NACK_INTERVAL)
+        .build("nack-feedback-bound")
+        .unwrap();
+    let reader = generator.bind_remote_stream(&info, input.clone()).await;
+    for _ in 0..2 {
+        reader
+            .read(&mut [0; 1500], &Attributes::new())
+            .await
+            .unwrap();
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    generator.bind_rtcp_writer(Arc::new(Feedback(tx))).await;
+    let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let limit = super::webrtc::NACK_MAX_REQUESTS_PER_TICK as u16;
+    assert_eq!(first, (1..=limit).collect::<Vec<_>>());
+    for sequence in first {
+        input.0.lock().push_back(sequence);
+        reader
+            .read(&mut [0; 1500], &Attributes::new())
+            .await
+            .unwrap();
+    }
+    let next = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next,
+        (limit + 1..=700 - super::webrtc::NACK_REORDER_TAIL_PACKETS).collect::<Vec<_>>()
+    );
+    generator.unbind_remote_stream(&info).await;
+    generator.close().await.unwrap();
 }
