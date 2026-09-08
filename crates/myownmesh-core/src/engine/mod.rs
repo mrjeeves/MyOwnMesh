@@ -35,6 +35,7 @@ pub mod signaling_bridge;
 pub mod state;
 pub mod tick;
 pub mod traffic;
+pub mod video_fanout;
 pub mod wake;
 
 pub use signaling_bridge::{

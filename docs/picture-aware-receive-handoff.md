@@ -69,6 +69,35 @@ This prevents the reproduced secondary local loss; it does not explain the
 initial RTP hole or guarantee that multiple repair releases, competing lanes,
 or a persistently blocked consumer cannot overflow a finite queue.
 
+### Engine fan-out uses the same units
+
+A subsequent receiver-only field check had zero IPC overflows but 52 engine
+video-subscription lag reports during a 3.175-second recovery episode. The
+preceding Tokio broadcast ring still counted sixteen **samples**, so even one
+fragmented picture could exhaust it while the bridge task was briefly busy.
+Cooperative yields do not guarantee that the subscriber runs between sends.
+
+Video fan-out now uses independent, immediately readable subscriber queues,
+bounded to sixteen `(peer, lane, timestamp)` pictures, 64 MiB including peer
+names, and 4096 samples. It never waits for a complete picture or for a reader.
+Oldest samples are evicted on real pressure, with `RecvError::Lagged` delivered
+before remaining samples; the bridge still owns ordered IPC discontinuities.
+Audio and ordinary event broadcasts are unchanged. Payloads use shared `Bytes`,
+not per-subscriber payload copies. No history is replayed to new subscribers.
+
+The core repair regression explicitly fails the old sixteen-sample broadcast
+and preserves gap + fifteen eight-fragment pictures on the corrected fan-out.
+Companion tests cover slow/fast subscriber independence, picture/byte/fragment
+bounds, peer/lane separation, and send/close wakeups. The daemon regression
+passes this burst through both the engine fan-out and actual IPC admission,
+checking that it produces only the original transport discontinuity.
+
+Embedding API note: `NetworkState::subscribe_video` now returns `VideoReceiver`
+instead of Tokio's broadcast receiver. Its async `recv()` retains the same
+sample and `RecvError::{Lagged, Closed}` contract. Direct users of the previous
+concrete receiver type must update that annotation. The media wire protocol
+and AMS client API are unchanged.
+
 ## Validation boundary
 
 These tests establish the two specific defects and their corrections. They
