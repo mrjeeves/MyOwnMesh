@@ -49,6 +49,26 @@ The bridge regression additionally checks that this release does not invent
 a discontinuity, while a genuinely full picture budget still does. Queue
 tests cover byte, item, peer/lane and audio bounds, and cleanup on disconnect.
 
+### Bounded multi-picture repair release
+
+The eight-picture implementation can still reject a valid release containing
+a discontinuity and fifteen pictures from the existing RTP repair window.
+The production queue now admits those sixteen timestamps. Audio remains
+limited to eight packets, and aggregate byte/sample bounds are unchanged.
+This is a larger maximum queue, not a playout target or a new timer: a blocked
+reader can retain more pictures, while a ready writer drains immediately.
+
+`repair_batch_crosses_busy_media_pipe_without_secondary_loss` runs the actual
+binary pipe writer against a 4 KiB duplex pipe, with three 8 KiB fragments per
+picture. The reader is held busy during admission. The test reproduces drops
+with the eight-picture channel and verifies complete, ordered delivery with
+the production factory. Existing bridge tests check discontinuity ordering
+and rejection beyond the bounded release, including the unchanged audio cap.
+
+This prevents the reproduced secondary local loss; it does not explain the
+initial RTP hole or guarantee that multiple repair releases, competing lanes,
+or a persistently blocked consumer cannot overflow a finite queue.
+
 ## Validation boundary
 
 These tests establish the two specific defects and their corrections. They

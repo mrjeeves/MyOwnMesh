@@ -2501,6 +2501,76 @@ mod media_frame_tests {
     use super::*;
 
     #[tokio::test]
+    async fn repair_batch_crosses_busy_media_pipe_without_secondary_loss() {
+        let mut bodies = vec![encode_inbound_frame(
+            MEDIA_KIND_VIDEO_DISCONTINUITY,
+            false,
+            0,
+            0,
+            "peer",
+            &[],
+        )];
+        // The transport can release a gap followed by fifteen pictures. Keep
+        // several paced fragments per picture, as in the observed recovery.
+        for timestamp in 1..VIDEO_SOURCE_QUEUE_CAPACITY as u32 {
+            for fragment in 0..3u8 {
+                bodies.push(encode_inbound_frame(
+                    MEDIA_KIND_VIDEO,
+                    timestamp == 1,
+                    0,
+                    timestamp,
+                    "peer",
+                    &vec![fragment; 8192],
+                ));
+            }
+        }
+
+        for legacy in [true, false] {
+            let (tx, rx) = if legacy {
+                crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY)
+            } else {
+                media_source_queue()
+            };
+            let (daemon, mut client) = tokio::io::duplex(4096);
+            let (reader, mut writer) = tokio::io::split(daemon);
+            let pump =
+                tokio::spawn(async move { run_media_source_pipe(reader, &mut writer, rx).await });
+            let mut admitted = Vec::new();
+            for body in &bodies {
+                match tx.try_send(body.clone()) {
+                    Ok(()) => admitted.push(body.clone()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if legacy => {}
+                    result => panic!("bounded repair release lost locally: {result:?}"),
+                }
+                // Run the actual pipe writer, not merely an unscheduled
+                // receiver. It fills the small pipe while its reader is busy;
+                // yielding alone cannot preserve the rest of the repair.
+                tokio::task::yield_now().await;
+            }
+            if legacy {
+                assert!(
+                    admitted.len() < bodies.len(),
+                    "reproduce the eight-picture loss"
+                );
+            } else {
+                assert_eq!(admitted, bodies);
+            }
+            drop(tx);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                for expected in admitted {
+                    let len = client.read_u32_le().await.unwrap() as usize;
+                    let mut actual = vec![0; len];
+                    client.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, expected, "preserve order and picture fragments");
+                }
+                pump.await.unwrap().unwrap();
+            })
+            .await
+            .expect("drain immediately once the reader resumes");
+        }
+    }
+
+    #[tokio::test]
     async fn repaired_picture_crosses_media_pipe_with_a_temporarily_busy_reader() {
         let bodies: Vec<_> = (0..32u8)
             .map(|n| {
