@@ -9,10 +9,176 @@ use tokio::sync::mpsc;
 use webrtc::interceptor::nack::generator::Generator;
 use webrtc::interceptor::stream_info::{RTCPFeedback, StreamInfo};
 use webrtc::interceptor::{Attributes, InterceptorBuilder, RTCPWriter, RTPReader};
+use webrtc::interceptor::{RTCPReader, RTPWriter};
 use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
 use webrtc::rtp::packet::Packet;
 
 type RtcpPacket = Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>;
+
+struct RepeatedNack;
+#[async_trait]
+impl RTCPReader for RepeatedNack {
+    async fn read(
+        &self,
+        _: &mut [u8],
+        a: &Attributes,
+    ) -> Result<(Vec<RtcpPacket>, Attributes), webrtc::interceptor::Error> {
+        Ok((vec![Box::new(TransportLayerNack {
+            media_ssrc: 7,
+            nacks: webrtc::rtcp::transport_feedbacks::transport_layer_nack::nack_pairs_from_sequence_numbers(
+                &(0..32).map(|i| 65520u16.wrapping_add(i)).collect::<Vec<_>>()
+            ),
+            ..Default::default()
+        })], a.clone()))
+    }
+}
+
+struct GatedRepairs {
+    blocked: std::sync::atomic::AtomicBool,
+    gate: tokio::sync::Semaphore,
+    started: mpsc::UnboundedSender<u16>,
+}
+#[async_trait]
+impl RTPWriter for GatedRepairs {
+    async fn write(&self, p: &Packet, _: &Attributes) -> Result<usize, webrtc::interceptor::Error> {
+        if self.blocked.load(std::sync::atomic::Ordering::Relaxed) {
+            self.started.send(p.header.sequence_number).unwrap();
+            self.gate.acquire().await.unwrap().forget();
+        }
+        Ok(p.payload.len())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn overlapping_nacks_coalesce_pending_repairs_without_delaying_new_retries() {
+    use std::sync::atomic::Ordering;
+    let responder = webrtc::interceptor::nack::responder::Responder::builder()
+        .with_log2_size(13)
+        .build("repair-overlap")
+        .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sink = Arc::new(GatedRepairs {
+        blocked: std::sync::atomic::AtomicBool::new(false),
+        gate: tokio::sync::Semaphore::new(0),
+        started: tx,
+    });
+    let info = StreamInfo {
+        ssrc: 7,
+        rtcp_feedback: vec![RTCPFeedback {
+            typ: "nack".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let writer = responder.bind_local_stream(&info, sink.clone()).await;
+    for i in 0..32 {
+        writer
+            .write(
+                &Packet {
+                    header: webrtc::rtp::header::Header {
+                        ssrc: 7,
+                        sequence_number: 65520u16.wrapping_add(i),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                &Attributes::new(),
+            )
+            .await
+            .unwrap();
+    }
+    sink.blocked.store(true, Ordering::Relaxed);
+    let feedback = responder.bind_rtcp_reader(Arc::new(RepeatedNack)).await;
+    for _ in 0..6 {
+        feedback
+            .read(&mut [0; 1500], &Attributes::new())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rx.try_recv().unwrap(), 65520);
+    assert!(
+        rx.try_recv().is_err(),
+        "overlapping feedback started duplicate repair writers"
+    );
+    sink.gate.add_permits(32);
+    for i in 1..32 {
+        assert_eq!(rx.recv().await.unwrap(), 65520u16.wrapping_add(i));
+    }
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(rx.try_recv().is_err(), "duplicate feedback remained queued");
+    // A subsequent NACK is a real retry, not something to suppress by time.
+    feedback
+        .read(&mut [0; 1500], &Attributes::new())
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap(), 65520);
+    sink.gate.add_permits(32);
+    for _ in 1..32 {
+        rx.recv().await.unwrap();
+    }
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    feedback
+        .read(&mut [0; 1500], &Attributes::new())
+        .await
+        .unwrap();
+    assert_eq!(rx.recv().await.unwrap(), 65520);
+    responder.unbind_local_stream(&info).await;
+    sink.gate.add_permits(32);
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "unbound stream retained a repair worker"
+    );
+    responder.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn nack_timer_does_not_replay_missed_feedback_ticks() {
+    let info = StreamInfo {
+        ssrc: 7,
+        rtcp_feedback: vec![RTCPFeedback {
+            typ: "nack".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let generator = Generator::builder()
+        .with_interval(super::webrtc::NACK_INTERVAL)
+        .build("feedback-catchup")
+        .unwrap();
+    let reader = generator
+        .bind_remote_stream(&info, Arc::new(Input(Mutex::new(VecDeque::from([0, 2])))))
+        .await;
+    for _ in 0..2 {
+        reader
+            .read(&mut [0; 1500], &Attributes::new())
+            .await
+            .unwrap();
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    generator.bind_rtcp_writer(Arc::new(Feedback(tx))).await;
+    assert_eq!(rx.recv().await.unwrap(), vec![1]);
+    // A scheduler pause does not create six independent loss observations.
+    tokio::time::advance(super::webrtc::NACK_INTERVAL * 6).await;
+    for _ in 0..12 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(rx.try_recv().unwrap(), vec![1]);
+    assert!(
+        rx.try_recv().is_err(),
+        "stale timer ticks produced a repair burst"
+    );
+    tokio::time::advance(super::webrtc::NACK_INTERVAL).await;
+    assert_eq!(rx.recv().await.unwrap(), vec![1]);
+    generator.close().await.unwrap();
+}
 
 struct Input(Mutex<VecDeque<u16>>);
 

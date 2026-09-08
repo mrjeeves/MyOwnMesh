@@ -37,3 +37,15 @@ The 8192-packet replay/responder history, 20 ms feedback interval, reorder tail,
 assembly deadline, media queues and quality targets are unchanged. Focused
 regressions cover feedback bounds and a ~627 KiB frame whose missing packet
 is now requested and delivered through assembly rather than timing out.
+
+The responder now owns one immediate repair worker per SSRC, coalescing
+duplicate sequence requests only while queued/in flight. The queue cannot
+exceed the retained packet history; expired packets are rechecked before
+sending, and stream unbind/close cancels its worker. This replaces the
+upstream unbounded task-per-feedback behavior. A completed repair remains
+immediately retryable if later feedback says it was lost. Original RTP
+writes do not acquire the repair worker. No bitrate or time limiter is added.
+The generator skips missed timer ticks rather than replaying identical current
+holes once per elapsed interval after a scheduler pause. Normal feedback still
+runs every 20 ms. A paused-clock regression fails with upstream Burst behavior
+and passes with Skip, while checking the next normal retry is preserved.

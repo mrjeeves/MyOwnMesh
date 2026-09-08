@@ -117,6 +117,9 @@ impl Generator {
         internal: Arc<GeneratorInternal>,
     ) -> Result<()> {
         let mut ticker = tokio::time::interval(internal.interval);
+        // Feedback describes the current holes, not historical timer ticks.
+        // After scheduler delay send once, then resume the normal cadence.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut close_rx = {
             let mut close_rx = internal.close_rx.lock().await;
             if let Some(close) = close_rx.take() {
