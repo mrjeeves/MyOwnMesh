@@ -41,6 +41,10 @@ mod tests {
     #[tokio::test]
     async fn udp_socket_diagnostic_preserves_packet_buffer_admission() {
         use webrtc::util::{buffer::Buffer, Error};
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("error,myownmesh_core::video_timing=debug,webrtc_util=error")
+            .with_test_writer()
+            .try_init();
         let buffer = Buffer::new(1, 0);
         assert_eq!(buffer.write(b"first").await.unwrap(), 5);
         assert_eq!(
