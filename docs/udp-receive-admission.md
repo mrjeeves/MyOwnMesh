@@ -33,7 +33,8 @@ This is available kernel admission capacity, **not** a fill target or a
 playout buffer. Reads drain immediately. No timer, low-water mark, extra
 application queue, bitrate/FPS reduction, assembly deadline, or playback
 delay is introduced. No system-wide socket or security setting is changed.
-The OS's actual capacity is logged once per socket in detailed logs; an OS
+The OS's actual capacity is logged once per socket at the
+`myownmesh_core::transport::udp_socket` debug target; an OS
 clamp is warned about rather than silently claiming the requested capacity.
 
 ## Focused verification
@@ -49,3 +50,27 @@ clamp is warned about rather than silently claiming the requested capacity.
 
 The source display remains native 1080p in the current test. Passing this
 test is not a claim that native 4K60 has been exercised.
+
+## Live validation: a real fix, not the entire incident
+
+Both Windows endpoints passed the focused tests and were deployed with the
+socket change. The Windows burst regression measured **54/81 packets** with
+64 KiB and **81/81** with the configured socket. In the subsequent 20-second
+AFD trace there were no media-socket drops, but the displayed video still
+froze. This change must not be presented as a complete stutter fix.
+
+The diagnostic branch therefore reports bounded internal packet-buffer
+overflows under the existing detailed-video target, identifying the ICE,
+mux or decrypted SRTP constructor site. It changes no queue behavior and
+emits at most once per five seconds per overflowing buffer, with no packet
+contents or successful-packet timing overhead. Its visibility was verified
+with the production filters.
+
+A later event-triggered NIC-plus-AFD capture (2026-09-08 22:43:28–22:44:02
+UTC on Stream PC) captured a remaining failure. The NIC and application
+reported exactly **1,622 skipped video packets and 1,400 reordered repairs**.
+Audio also had 11 missing packets at the NIC. No AFD or internal packet-buffer
+overflow was reported. This incident's loss therefore precedes the receiver
+application pipeline; paired sender/receiver captures are needed to separate
+sender egress from loss in transit. It is not evidence of LAN saturation by
+itself. Native 1080p and the existing latency/bitrate/FPS targets were retained.
