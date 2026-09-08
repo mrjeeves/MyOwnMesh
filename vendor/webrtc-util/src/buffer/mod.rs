@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod buffer_test;
 
+use std::panic::Location;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{timeout, Duration};
@@ -26,9 +28,31 @@ struct BufferInternal {
     count: usize,
     limit_count: usize,
     limit_size: usize,
+    origin: &'static Location<'static>,
+    drops: u64,
+    last_drop_report: Option<Instant>,
 }
 
 impl BufferInternal {
+    // Error path only: no successful-packet timing or packet contents. The
+    // constructor site distinguishes ICE, mux and decrypted SRTP admission.
+    fn report_full(&mut self) {
+        self.drops += 1;
+        if !log::log_enabled!(target: "myownmesh_core::video_timing", log::Level::Debug) {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_drop_report
+            .is_none_or(|last| now.duration_since(last).as_secs() >= 5)
+        {
+            log::debug!(target: "myownmesh_core::video_timing",
+                "packet buffer admission loss origin={} buffer={:p} drops={} queued_packets={} queued_bytes={} limit_count={} limit_bytes={} capacity={}",
+                self.origin, self, self.drops, self.count, self.size(), self.limit_count, self.limit_size, self.data.len());
+            self.last_drop_report = Some(now);
+        }
+    }
+
     /// available returns true if the buffer is large enough to fit a packet
     /// of the given size, taking overhead into account.
     fn available(&self, size: usize) -> bool {
@@ -102,6 +126,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    #[track_caller]
     pub fn new(limit_count: usize, limit_size: usize) -> Self {
         Buffer {
             buffer: Arc::new(Mutex::new(BufferInternal {
@@ -115,6 +140,9 @@ impl Buffer {
                 count: 0,
                 limit_count,
                 limit_size,
+                origin: Location::caller(),
+                drops: 0,
+                last_drop_report: None,
             })),
             notify: Arc::new(Notify::new()),
         }
@@ -138,12 +166,16 @@ impl Buffer {
         if (b.limit_count > 0 && b.count >= b.limit_count)
             || (b.limit_size > 0 && b.size() + 2 + packet.len() > b.limit_size)
         {
+            b.report_full();
             return Err(Error::ErrBufferFull);
         }
 
         // grow the buffer until the packet fits
         while !b.available(packet.len()) {
-            b.grow()?;
+            if let Err(error) = b.grow() {
+                b.report_full();
+                return Err(error);
+            }
         }
 
         // store the length of the packet

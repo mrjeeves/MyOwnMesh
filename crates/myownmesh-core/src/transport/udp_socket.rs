@@ -38,6 +38,21 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
 
+    #[tokio::test]
+    async fn udp_socket_diagnostic_preserves_packet_buffer_admission() {
+        use webrtc::util::{buffer::Buffer, Error};
+        let buffer = Buffer::new(1, 0);
+        assert_eq!(buffer.write(b"first").await.unwrap(), 5);
+        assert_eq!(
+            buffer.write(b"lost").await.unwrap_err(),
+            Error::ErrBufferFull
+        );
+        let mut packet = [0; 16];
+        let n = buffer.read(&mut packet, None).await.unwrap();
+        assert_eq!(&packet[..n], b"first");
+        assert_eq!(buffer.write(b"fresh").await.unwrap(), 5);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn udp_socket_admits_existing_media_burst_before_reader_is_scheduled() {
