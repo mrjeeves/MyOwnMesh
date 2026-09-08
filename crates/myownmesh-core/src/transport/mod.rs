@@ -20,6 +20,7 @@ pub mod ice;
 mod nack_history_tests;
 mod rtp_replay;
 mod turn_stream;
+mod udp_socket;
 pub mod webrtc;
 
 pub use diag::{

@@ -408,6 +408,9 @@ impl Transport {
         // intentionally *kept* (it's a real path); only the dead virtual
         // interfaces in `VIRTUAL_IFACE_PREFIXES` are dropped.
         let mut setting_engine = SettingEngine::default();
+        // Despite the upstream setter's name, this is a real OS network,
+        // retaining normal ICE candidate/port selection and socket ownership.
+        setting_engine.set_vnet(Some(Arc::new(super::udp_socket::real_network())));
         setting_engine.set_srtp_replay_protection_window(SRTP_REPLAY_WINDOW_PACKETS);
         setting_engine.set_interface_filter(Box::new(|name: &str| {
             let keep = !is_virtual_interface(name);
