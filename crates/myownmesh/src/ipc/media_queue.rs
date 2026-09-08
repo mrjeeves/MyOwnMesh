@@ -68,6 +68,7 @@ pub struct Sender {
     tx: mpsc::UnboundedSender<Item>,
     budget: Arc<Mutex<Budget>>,
     capacity: usize,
+    other_capacity: usize,
     byte_capacity: usize,
 }
 
@@ -84,6 +85,15 @@ pub fn channel(capacity: usize) -> (Sender, Receiver) {
     channel_with_bytes(capacity, crate::control::MAX_MEDIA_FRAME_BYTES)
 }
 
+/// Admit one bounded transport repair release while retaining the smaller
+/// non-video packet budget. No timer, playout delay or producer wait is added.
+pub fn channel_with_other_capacity(capacity: usize, other_capacity: usize) -> (Sender, Receiver) {
+    assert!(other_capacity > 0 && other_capacity <= capacity);
+    let (mut tx, rx) = channel(capacity);
+    tx.other_capacity = other_capacity;
+    (tx, rx)
+}
+
 fn channel_with_bytes(capacity: usize, byte_capacity: usize) -> (Sender, Receiver) {
     assert!(capacity > 0 && byte_capacity > 0);
     let (tx, rx) = mpsc::unbounded_channel();
@@ -92,6 +102,7 @@ fn channel_with_bytes(capacity: usize, byte_capacity: usize) -> (Sender, Receive
             tx,
             budget: Arc::new(Mutex::new(Budget::default())),
             capacity,
+            other_capacity: capacity,
             byte_capacity,
         },
         Receiver(rx),
@@ -110,6 +121,7 @@ impl Sender {
                 .as_ref()
                 .is_some_and(|p| budget.pictures.contains_key(p));
             if (!known && budget.pictures.len() + budget.other >= self.capacity)
+                || (picture.is_none() && budget.other >= self.other_capacity)
                 || body.len() > self.byte_capacity.saturating_sub(budget.bytes)
                 || budget.items >= MAX_QUEUED_SAMPLES
             {

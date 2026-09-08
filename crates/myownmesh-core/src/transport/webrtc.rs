@@ -927,6 +927,11 @@ const MAX_AU_PARTS: usize = 2048;
 /// below remain independent. Cooperative downstream handoffs drain releases;
 /// their queue capacities must not define the RTP repair window.
 const MAX_PENDING_FRAMES: usize = 15;
+/// Maximum distinct picture timestamps released by one receive repair pass:
+/// the pending window plus the arriving picture that closes/overflows it.
+/// Local handoffs must accommodate this existing burst without manufacturing
+/// new loss merely because their socket writer has not been scheduled yet.
+pub const VIDEO_RECEIVE_REPAIR_MAX_FRAMES: usize = MAX_PENDING_FRAMES + 1;
 /// Aggregate per-track memory guard (roughly 5 MiB at normal RTP MTUs).
 const MAX_PENDING_PARTS: usize = 4096;
 /// Long enough for several NACK attempts plus the measured 55 ms live-path

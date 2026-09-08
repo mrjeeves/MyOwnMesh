@@ -993,6 +993,78 @@ async fn repaired_picture_handoff_does_not_invent_a_gap_for_a_busy_consumer() {
 }
 
 #[tokio::test]
+async fn repair_batch_survives_writer_scheduling_without_extra_capacity_growth() {
+    use crate::control::{encode_inbound_frame, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY};
+    let limit = myownmesh_core::transport::webrtc::VIDEO_RECEIVE_REPAIR_MAX_FRAMES;
+    let (tx, mut rx) = crate::control::media_source_queue();
+    let mut expected = Vec::new();
+    let mut recovery = None;
+    // The real assembler's pending_window_still_bounds_distinct_frames test
+    // releases one discontinuity plus 15 pictures in a single repair pass.
+    // Keep the writer unscheduled for that bounded burst, as in the field.
+    let gap = encode_inbound_frame(MEDIA_KIND_VIDEO_DISCONTINUITY, false, 0, 0, "peer", &[]);
+    let (open, state) = handoff_video_to_media_sink(&tx, recovery, true, true, &gap, &gap).await;
+    assert!(open);
+    recovery = state;
+    expected.push(gap);
+    for timestamp in 1..limit as u32 {
+        for fragment in 0..3 {
+            let body = encode_inbound_frame(
+                MEDIA_KIND_VIDEO,
+                timestamp == 1,
+                0,
+                timestamp,
+                "peer",
+                &[fragment],
+            );
+            let gap = encode_inbound_frame(
+                MEDIA_KIND_VIDEO_DISCONTINUITY,
+                false,
+                0,
+                timestamp,
+                "peer",
+                &[],
+            );
+            let (open, state) =
+                handoff_video_to_media_sink(&tx, recovery, false, false, &gap, &body).await;
+            assert!(open);
+            assert_eq!(
+                state, None,
+                "local handoff must not destroy a valid repair batch"
+            );
+            recovery = state;
+            expected.push(body);
+        }
+    }
+    let next = encode_inbound_frame(MEDIA_KIND_VIDEO, false, 0, limit as u32, "peer", &[0]);
+    assert!(matches!(
+        tx.try_send(next),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+    ));
+    for body in expected {
+        assert_eq!(rx.try_recv().unwrap(), body);
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(tx.capacity(), limit);
+}
+
+#[test]
+fn repair_batch_capacity_keeps_audio_packet_limit() {
+    let (tx, mut rx) = crate::control::media_source_queue();
+    for _ in 0..crate::control::MEDIA_SOURCE_QUEUE_CAPACITY {
+        tx.try_send(vec![1]).unwrap();
+    }
+    assert!(matches!(
+        tx.try_send(vec![1]),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+    ));
+    for _ in 0..crate::control::MEDIA_SOURCE_QUEUE_CAPACITY {
+        assert_eq!(rx.try_recv().unwrap(), vec![1]);
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn buffered_video_ipc_burst_preserves_ready_consumer_and_stays_bounded_when_stalled() {
     for cooperative in [false, true] {
         let (tx, mut rx) = super::media_queue::channel(crate::control::MEDIA_SOURCE_QUEUE_CAPACITY);

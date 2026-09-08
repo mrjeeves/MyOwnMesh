@@ -782,7 +782,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await?;
                 continue;
             };
-            let (tx, rx) = crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
+            let (tx, rx) = media_source_queue();
             client.set_media_sink(tx);
             let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
             writer
@@ -2411,6 +2411,21 @@ pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// (peer/lane/timestamp), not individual paced samples; audio counts per packet.
 /// Aggregate queued bytes are separately bounded by MAX_MEDIA_FRAME_BYTES.
 pub const MEDIA_SOURCE_QUEUE_CAPACITY: usize = 8;
+/// Retain one already-admitted RTP repair batch, not an arbitrary larger
+/// playout buffer. The socket writer still drains immediately. Audio keeps
+/// its eight-packet cap; aggregate byte/sample limits remain unchanged.
+pub const VIDEO_SOURCE_QUEUE_CAPACITY: usize =
+    myownmesh_core::transport::webrtc::VIDEO_RECEIVE_REPAIR_MAX_FRAMES;
+
+pub(crate) fn media_source_queue() -> (
+    crate::ipc::media_queue::Sender,
+    crate::ipc::media_queue::Receiver,
+) {
+    crate::ipc::media_queue::channel_with_other_capacity(
+        VIDEO_SOURCE_QUEUE_CAPACITY,
+        MEDIA_SOURCE_QUEUE_CAPACITY,
+    )
+}
 
 /// One decoded media-track frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
