@@ -971,6 +971,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 Action::NoPeer => {}
             }
         }
+        SignalingInbound::DiscoveryLost { device_id } => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "signaling",
+                format!("mDNS discovery lost; transport unchanged: {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "driver": "mdns", "action": "discovery_only" }),
+            );
+        }
         SignalingInbound::PeerLeft { device_id } => {
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
@@ -4595,6 +4603,65 @@ mod tests {
                 data: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
             }),
         ]
+    }
+
+    #[tokio::test]
+    async fn discovery_departure_preserves_fresh_media_but_explicit_leave_drops_it() {
+        let state = build_test_state("diagnostic-discovery-departure");
+        let peer_id = "streamer";
+        insert_session_less_peer(&state, peer_id, None);
+        set_admission(&state, peer_id, true, PeerStatus::Active);
+        let epoch = state.peers.get(peer_id).unwrap().epoch;
+        handle_transport_event(
+            &state,
+            peer_id.into(),
+            epoch,
+            media_liveness_events().remove(0),
+        )
+        .await;
+        assert!(state
+            .peers
+            .get(peer_id)
+            .unwrap()
+            .state
+            .read()
+            .last_recv_at
+            .is_some());
+        let mut events = state.events_tx.subscribe();
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::DiscoveryLost {
+                device_id: peer_id.into(),
+            },
+        )
+        .await;
+        assert!(
+            state.peers.contains_key(peer_id),
+            "discovery removal must not remove a receiving peer"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, MeshEvent::Peer(PeerEvent::Dropped { .. })));
+        }
+        assert_eq!(state.peers.get(peer_id).unwrap().epoch, epoch);
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::PeerLeft {
+                device_id: peer_id.into(),
+            },
+        )
+        .await;
+        assert!(!state.peers.contains_key(peer_id));
+        let mut observed_user_left = false;
+        while let Ok(event) = events.try_recv() {
+            observed_user_left |= matches!(
+                event,
+                MeshEvent::Peer(PeerEvent::Dropped {
+                    reason: DropReason::UserLeft,
+                    ..
+                })
+            );
+        }
+        assert!(observed_user_left);
     }
 
     #[tokio::test]

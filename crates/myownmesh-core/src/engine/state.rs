@@ -329,6 +329,10 @@ pub enum NetworkCmd {
 /// Inbound signaling messages from the signaling task.
 #[derive(Debug)]
 pub enum SignalingInbound {
+    /// mDNS cache expiry / goodbye is advisory, never a membership decision.
+    DiscoveryLost {
+        device_id: String,
+    },
     PeerAnnounced {
         device_id: String,
     },
@@ -355,6 +359,7 @@ impl SignalingInbound {
     /// Variant name for driver-liveness traces — cheap, no payload.
     pub fn kind_name(&self) -> &'static str {
         match self {
+            SignalingInbound::DiscoveryLost { .. } => "discovery_lost",
             SignalingInbound::PeerAnnounced { .. } => "peer_announced",
             SignalingInbound::Offer { .. } => "offer",
             SignalingInbound::Answer { .. } => "answer",
