@@ -669,27 +669,28 @@ where
         .map_err(|error| Error::Other(format!("mDNS custodian unavailable: {error:?}")))?;
     let reaper_owner = DedicatedTaskCustodian::new(2)
         .map_err(|error| Error::Other(format!("mDNS reaper custodian unavailable: {error:?}")))?;
-    let backend_owner = match configured_discovery_backend() {
-        DiscoveryBackend::Embedded => {
-            let plan = super::discovery::checked_embedded_custody_plan()
-                .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
-            Some(
-                DedicatedTaskCustodian::new(plan.observer_slots).map_err(|error| {
-                    Error::Other(format!("mDNS backend custodian unavailable: {error:?}"))
-                })? as Arc<dyn TaskCustodian>,
-            )
-        }
-        DiscoveryBackend::System => {
-            let capacity = config
-                .limits
-                .discovery
-                .max_resolve_owners
-                .checked_add(2)
-                .ok_or_else(|| Error::Other("invalid system worker capacity".into()))?;
-            Some(DedicatedTaskCustodian::new(capacity).map_err(|error| {
-                Error::Other(format!("mDNS system custodian unavailable: {error:?}"))
-            })? as Arc<dyn TaskCustodian>)
-        }
+    // Only the selected backend is compiled; match its custody construction here.
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    let backend_owner = {
+        let plan = super::discovery::checked_embedded_custody_plan()
+            .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
+        Some(
+            DedicatedTaskCustodian::new(plan.observer_slots).map_err(|error| {
+                Error::Other(format!("mDNS backend custodian unavailable: {error:?}"))
+            })? as Arc<dyn TaskCustodian>,
+        )
+    };
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    let backend_owner = {
+        let capacity = config
+            .limits
+            .discovery
+            .max_resolve_owners
+            .checked_add(2)
+            .ok_or_else(|| Error::Other("invalid system worker capacity".into()))?;
+        Some(DedicatedTaskCustodian::new(capacity).map_err(|error| {
+            Error::Other(format!("mDNS system custodian unavailable: {error:?}"))
+        })? as Arc<dyn TaskCustodian>)
     };
     start_with_custodian(
         config,
@@ -3430,9 +3431,19 @@ mod tests {
         let driver_plan = checked_driver_custody_plan(limits, DiscoveryBackend::Embedded)
             .expect("valid driver custody plan");
         assert_eq!(driver_plan.outer_driver_handle_slots, 5);
-        assert_eq!(driver_plan.backend_runtime_slots, 1);
-        assert_eq!(driver_plan.backend_observer_slots, 3);
-        assert_eq!(driver_plan.backend_queue_slots, 3);
+        // Embedded observer custody exists only when that implementation is compiled.
+        #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+        {
+            assert_eq!(driver_plan.backend_runtime_slots, 1);
+            assert_eq!(driver_plan.backend_observer_slots, 3);
+            assert_eq!(driver_plan.backend_queue_slots, 3);
+        }
+        #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+        {
+            assert_eq!(driver_plan.backend_runtime_slots, 0);
+            assert_eq!(driver_plan.backend_observer_slots, 0);
+            assert_eq!(driver_plan.backend_queue_slots, 0);
+        }
         assert_eq!(driver_plan.reaper_observer_runtime_slots, 1);
         assert_eq!(driver_plan.reaper_observer_task_slots, 2);
         assert_eq!(driver_plan.reaper_observer_queue_slots, 2);
@@ -3452,6 +3463,15 @@ mod tests {
         assert_eq!(system.outer_driver_fallback_overflow_slots, 1);
         assert_eq!(system.outer_driver_cancel_signal_slots, 1);
         assert_eq!(system.opaque_dependency_slots, 5);
+        let system_driver_plan = checked_driver_custody_plan(limits, DiscoveryBackend::System)
+            .expect("valid system driver custody plan");
+        assert_eq!(system_driver_plan.outer_driver_handle_slots, 4);
+        assert_eq!(system_driver_plan.backend_runtime_slots, 0);
+        assert_eq!(system_driver_plan.backend_observer_slots, 0);
+        assert_eq!(system_driver_plan.backend_queue_slots, 0);
+        assert_eq!(system_driver_plan.reaper_observer_runtime_slots, 1);
+        assert_eq!(system_driver_plan.reaper_observer_task_slots, 2);
+        assert_eq!(system_driver_plan.reaper_observer_queue_slots, 2);
 
         let mut invalid = limits;
         invalid.event_capacity = 0;

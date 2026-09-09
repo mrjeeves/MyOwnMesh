@@ -168,6 +168,25 @@ function rustVariantNames(source, declaration) {
   );
 }
 
+function rustEnumAttributeBlock(source, declaration) {
+  const marker = new RegExp("^\\s*pub enum " + declaration + "\\s*\\{", "m");
+  const match = marker.exec(source);
+  assert.ok(match, "missing Rust enum " + declaration);
+  const lines = source.slice(0, match.index).split(/\r?\n/);
+  const attributes = [];
+  while (lines.length > 0) {
+    const line = lines.pop().trim();
+    if (line === "" && attributes.length === 0) continue;
+    if (/^(?:#\[[^\n]*\]|\/\/.*)$/.test(line)) {
+      attributes.unshift(line);
+      continue;
+    }
+    break;
+  }
+  assert.ok(attributes.length > 0, declaration + " has no contiguous attribute block");
+  return attributes.join("\n");
+}
+
 function snakeCase(name) {
   return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
 }
@@ -406,10 +425,35 @@ test("daemon and Tauri Request enums have exhaustive exact wire coverage", () =>
   assert.deepEqual([...new Set(fixtureVariants)].sort(), expected);
 
   for (const source of [daemonWireSource, tauriClientSource]) {
-    const requestStart = source.indexOf("enum Request");
-    const requestHeader = source.slice(Math.max(0, requestStart - 160), requestStart + 80);
-    assert.match(requestHeader, /serde\s*\(tag\s*=\s*"op"/);
-    assert.match(requestHeader, /rename_all\s*=\s*"snake_case"/);
+    const requestAttributes = rustEnumAttributeBlock(source, "Request");
+    assert.match(requestAttributes, /serde\s*\(tag\s*=\s*"op"/);
+    assert.match(requestAttributes, /rename_all\s*=\s*"snake_case"/);
+
+    // Negative control: removing the bound serde line must not let a
+    // detached/later attribute satisfy the exact-enum binding check.
+    const serdeLine =
+      /^[ \t]*#\[serde\s*\(\s*tag\s*=\s*"op"\s*,\s*rename_all\s*=\s*"snake_case"\s*\)\][ \t]*(?:\r?\n|$)/m;
+    const removeBoundSerdeLine = (candidate) => {
+      const detached = candidate.replace(serdeLine, "");
+      assert.notEqual(
+        detached,
+        candidate,
+        "expected the Request-bound serde line to be removed",
+      );
+      return detached;
+    };
+    const detachedSources = [
+      removeBoundSerdeLine(source),
+      removeBoundSerdeLine(source.replace(/\r?\n/g, "\r\n")),
+    ];
+    for (const detachedSource of detachedSources) {
+      const detachedAttributes = rustEnumAttributeBlock(detachedSource, "Request");
+      assert.doesNotMatch(
+        detachedAttributes,
+        /serde\s*\(tag\s*=\s*"op"/,
+        "detached serde metadata must not satisfy Request binding",
+      );
+    }
   }
 
   const wireNames = expectedRequestVariants.map(snakeCase);

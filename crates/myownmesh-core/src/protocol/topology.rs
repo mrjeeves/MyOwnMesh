@@ -290,7 +290,7 @@ impl RoutedApplicationLimits {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoutedApplicationError {
     #[error("routed envelope contains a non-canonical device id")]
-    NonCanonicalDeviceId,
+    NonCanonicalEndpointId,
     #[error("routed envelope origin does not match the signing key")]
     OriginKeyMismatch,
     #[error("routed envelope origin and destination must differ")]
@@ -685,9 +685,9 @@ impl RoutedApplicationEnvelope {
 
     fn validate_device(device: &DeviceId) -> Result<(), RoutedApplicationError> {
         let canonical = DeviceId::canonical_key_bytes(device)
-            .map_err(|_| RoutedApplicationError::NonCanonicalDeviceId)?;
+            .map_err(|_| RoutedApplicationError::NonCanonicalEndpointId)?;
         if canonical != device.as_bytes() {
-            return Err(RoutedApplicationError::NonCanonicalDeviceId);
+            return Err(RoutedApplicationError::NonCanonicalEndpointId);
         }
         Ok(())
     }

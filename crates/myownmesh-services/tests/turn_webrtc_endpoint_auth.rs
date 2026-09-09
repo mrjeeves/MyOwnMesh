@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode,
-    TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
+    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SemanticPolicyConfig,
+    SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
+    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
@@ -176,6 +177,42 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
         .checked_add(candidate_workload)
         .and_then(|claim| claim.checked_add(remote_descriptions))
         .and_then(|claim| claim.checked_add(json_input_work))
+        .and_then(|claim| {
+            // The positive and negative controls each own two engines.  The
+            // explicit engine handles and drivers are fully shut down before
+            // the second pair starts; shutdown releases each semantic store
+            // lease even though channel/subscription locals retain the old
+            // NetworkState Arcs.  Carol/Dave therefore exercise reuse of the
+            // same two funded storage envelopes, and the peak is two.
+            const LIVE_NETWORK_OWNERS: u64 = 2;
+            let semantic_policy = SemanticPolicyConfig::default();
+            let envelope = semantic_policy
+                .checked_storage_envelope(
+                    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+                    semantic_policy.storage_workload(),
+                )
+                .expect("fixture semantic storage envelope is representable");
+            let storage_claim =
+                ResourceClaim::single(ResourceClass::StorageBytes, envelope.total_bytes);
+            let storage_grant = FiniteResourceProvider::reservation_planning_charge(storage_claim)
+                .expect("fixture semantic storage reservation is representable")
+                .checked_scale(LIVE_NETWORK_OWNERS)
+                .expect("fixture semantic storage owner capacity is representable");
+            assert_eq!(
+                storage_grant.amount(ResourceClass::StorageBytes),
+                envelope
+                    .total_bytes
+                    .checked_mul(LIVE_NETWORK_OWNERS)
+                    .expect("fixture semantic storage byte capacity is representable"),
+                "semantic storage funding equals the checked envelope per owner"
+            );
+            assert_eq!(
+                storage_grant.amount(ResourceClass::OpaqueDependencyResidual),
+                LIVE_NETWORK_OWNERS,
+                "semantic storage funding includes one reservation record per owner"
+            );
+            claim.checked_add(storage_grant)
+        })
         .expect("the fixture provider grant is representable");
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
         .expect("the fixture provider accounts for its process scope");

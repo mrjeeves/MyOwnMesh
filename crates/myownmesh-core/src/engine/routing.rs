@@ -270,7 +270,7 @@ fn plan_next_hops_with_local_origin_and_tree_parent(
 ) -> Result<RoutePlan, RouteRefusal> {
     if destination.is_empty() {
         return Err(RouteRefusal::Envelope(
-            RoutedApplicationError::NonCanonicalDeviceId,
+            RoutedApplicationError::NonCanonicalEndpointId,
         ));
     }
     if incoming_ttl > policy.max_hop_budget() || incoming_ttl > topology.flood_ttl() {

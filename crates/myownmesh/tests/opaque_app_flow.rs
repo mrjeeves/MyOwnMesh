@@ -4,14 +4,16 @@
 //! bind exact capabilities; application bodies cross the dedicated sockets as
 //! length-prefixed raw bytes and are never base64 or codec values.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use interprocess::local_socket::{tokio::prelude::*, GenericFilePath, ToFsName};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const NETWORK_CONFIG_ID: &str = "opaque-app";
@@ -28,9 +30,121 @@ const REALTIME_PROFILE: &str = r#"{
     {"kind":"audio","payload_type":111,"mime":"audio/opus","clock_rate":48000,"channels":2,"framing":"whole"}
   ]
 }"#;
+// Match the reviewed bounded-output convention used by the isolated daemon
+// lifecycle controls. Readers continue draining after this tail is full, so
+// diagnostics cannot back-pressure the daemon under test.
+const DAEMON_LOG_TAIL_BYTES: usize = 1024 * 1024;
+
+struct DaemonLogTail {
+    daemon: &'static str,
+    stream: &'static str,
+    text: String,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+struct DaemonProcess {
+    name: &'static str,
+    child: Child,
+    stdout: Option<JoinHandle<DaemonLogTail>>,
+    stderr: Option<JoinHandle<DaemonLogTail>>,
+}
+
+struct DaemonReap {
+    name: &'static str,
+    process: Result<(), String>,
+    stdout: Result<DaemonLogTail, String>,
+    stderr: Result<DaemonLogTail, String>,
+}
+
+impl DaemonLogTail {
+    fn succeeded(&self) -> bool {
+        self.read_error.is_none()
+    }
+
+    fn report(&self) -> String {
+        format!(
+            "{} {} truncated={} read_error={:?}\n{}",
+            self.daemon, self.stream, self.truncated, self.read_error, self.text
+        )
+    }
+}
+
+impl DaemonReap {
+    fn succeeded(&self) -> bool {
+        matches!(
+            (&self.process, &self.stdout, &self.stderr),
+            (Ok(()), Ok(stdout), Ok(stderr)) if stdout.succeeded() && stderr.succeeded()
+        )
+    }
+
+    fn report(&self) -> String {
+        let stdout = match &self.stdout {
+            Ok(log) => log.report(),
+            Err(error) => format!("{} stdout error={error}", self.name),
+        };
+        let stderr = match &self.stderr {
+            Ok(log) => log.report(),
+            Err(error) => format!("{} stderr error={error}", self.name),
+        };
+        format!(
+            "{} process={:?}\n{stdout}\n{stderr}",
+            self.name, self.process
+        )
+    }
+}
 
 fn require(condition: bool, message: impl Into<String>) -> Result<(), String> {
     condition.then_some(()).ok_or_else(|| message.into())
+}
+
+async fn named_stage<T>(
+    name: &str,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    work.await
+        .map_err(|error| format!("daemon stage {name}: {error}"))
+}
+
+async fn drain_daemon_log<R>(
+    mut reader: R,
+    daemon: &'static str,
+    stream: &'static str,
+) -> DaemonLogTail
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut bytes = Vec::with_capacity(DAEMON_LOG_TAIL_BYTES);
+    let mut chunk = [0u8; 8192];
+    let mut read_error = None;
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let overflow = bytes
+                    .len()
+                    .saturating_add(read)
+                    .saturating_sub(DAEMON_LOG_TAIL_BYTES);
+                if overflow != 0 {
+                    bytes.drain(..overflow);
+                    truncated = true;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) => {
+                read_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    DaemonLogTail {
+        daemon,
+        stream,
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+        read_error,
+    }
 }
 
 async fn bounded<T>(
@@ -101,19 +215,28 @@ fn save_config(home: &Path, config: &myownmesh_core::MeshConfig) {
     config.save().expect("persist isolated daemon config");
 }
 
-fn spawn_daemon(home: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_myownmesh"))
+fn spawn_daemon(home: &Path, name: &'static str) -> DaemonProcess {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_myownmesh"))
         .arg("serve")
         .env("MYOWNMESH_HOME", home)
         .env("MYOWNMESH_RESOURCE_GRANT", RESOURCE_GRANT)
         .env("MYOWNMESH_CONNECTOR_REALTIME_POLICY", "enabled")
         .env("MYOWNMESH_REALTIME_PROFILE", REALTIME_PROFILE)
+        .env("MYOWNMESH_LOG_FORMAT", "json")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn shipped connector-capable daemon")
+        .expect("spawn shipped connector-capable daemon");
+    let stdout = child.stdout.take().expect("spawned daemon stdout capture");
+    let stderr = child.stderr.take().expect("spawned daemon stderr capture");
+    DaemonProcess {
+        name,
+        child,
+        stdout: Some(tokio::spawn(drain_daemon_log(stdout, name, "stdout"))),
+        stderr: Some(tokio::spawn(drain_daemon_log(stderr, name, "stderr"))),
+    }
 }
 
 async fn connect_socket(path: &Path, deadline: Instant) -> Result<LocalSocketStream, String> {
@@ -419,6 +542,59 @@ async fn reap(child: &mut Child, deadline: Instant) -> Result<(), String> {
     .await
 }
 
+async fn reap_daemon(daemon: &mut DaemonProcess, deadline: Instant) -> DaemonReap {
+    let process = reap(&mut daemon.child, deadline).await;
+    if process.is_err() {
+        // If the kill request was accepted, the readers will see EOF; abort
+        // them here as well so a failed observation cannot outlive cleanup.
+        if let Some(reader) = daemon.stdout.as_ref() {
+            reader.abort();
+        }
+        if let Some(reader) = daemon.stderr.as_ref() {
+            reader.abort();
+        }
+    }
+    let stdout = join_log_reader(
+        daemon.stdout.take().expect("daemon stdout reader"),
+        daemon.name,
+        "stdout",
+        deadline,
+    )
+    .await;
+    let stderr = join_log_reader(
+        daemon.stderr.take().expect("daemon stderr reader"),
+        daemon.name,
+        "stderr",
+        deadline,
+    )
+    .await;
+    DaemonReap {
+        name: daemon.name,
+        process,
+        stdout,
+        stderr,
+    }
+}
+
+async fn join_log_reader(
+    mut reader: JoinHandle<DaemonLogTail>,
+    daemon: &'static str,
+    stream: &'static str,
+    deadline: Instant,
+) -> Result<DaemonLogTail, String> {
+    match tokio::time::timeout_at(deadline, &mut reader).await {
+        Ok(Ok(log)) => Ok(log),
+        Ok(Err(error)) => Err(format!("{daemon} {stream} reader join: {error}")),
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            Err(format!(
+                "{daemon} {stream} reader exceeded the cleanup deadline"
+            ))
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "two shipped daemon processes and a native WebRTC session"]
 async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
@@ -438,35 +614,53 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
         bob_home.path(),
         &daemon_config(bob_home.path(), bob_socket.clone(), &relay_url),
     );
-    let mut alice_daemon = spawn_daemon(alice_home.path());
-    let mut bob_daemon = spawn_daemon(bob_home.path());
+    let mut alice_daemon = spawn_daemon(alice_home.path(), "alice");
+    let mut bob_daemon = spawn_daemon(bob_home.path(), "bob");
 
     let stage_deadline = Instant::now() + Duration::from_secs(60);
     let result: Result<(), String> = async {
-        let alice_id = identity(&alice_socket, stage_deadline).await?;
-        let bob_id = identity(&bob_socket, stage_deadline).await?;
-        wait_for_peer(&alice_socket, &bob_id, stage_deadline).await?;
-        wait_for_peer(&bob_socket, &alice_id, stage_deadline).await?;
+        let alice_id =
+            named_stage("identity-alice", identity(&alice_socket, stage_deadline)).await?;
+        let bob_id = named_stage("identity-bob", identity(&bob_socket, stage_deadline)).await?;
+        named_stage(
+            "peer-wait-alice",
+            wait_for_peer(&alice_socket, &bob_id, stage_deadline),
+        )
+        .await?;
+        named_stage(
+            "peer-wait-bob",
+            wait_for_peer(&bob_socket, &alice_id, stage_deadline),
+        )
+        .await?;
 
-        let (alice_events, alice_client, alice_capability) =
-            subscribe_client(&alice_socket, stage_deadline).await?;
-        let (bob_events, bob_client, bob_capability) =
-            subscribe_client(&bob_socket, stage_deadline).await?;
+        let (alice_events, alice_client, alice_capability) = named_stage(
+            "subscribe-alice",
+            subscribe_client(&alice_socket, stage_deadline),
+        )
+        .await?;
+        let (bob_events, bob_client, bob_capability) = named_stage(
+            "subscribe-bob",
+            subscribe_client(&bob_socket, stage_deadline),
+        )
+        .await?;
         let label = vec![0, 0xff, b'a', b'p', b'p'];
-        let inbound_opened = request(
-            &bob_socket,
-            json!({
-                "op":"opaque_flow_open",
-                "network":NETWORK_CONFIG_ID,
-                "peer":alice_id,
-                "label":label,
-                "client_id":bob_client,
-                "client_capability":bob_capability,
-                "direction":"inbound",
-                "mode":"reliable_ordered",
-                "max_unit_bytes":1024
-            }),
-            stage_deadline,
+        let inbound_opened = named_stage(
+            "open-inbound",
+            request(
+                &bob_socket,
+                json!({
+                    "op":"opaque_flow_open",
+                    "network":NETWORK_CONFIG_ID,
+                    "peer":alice_id,
+                    "label":label,
+                    "client_id":bob_client,
+                    "client_capability":bob_capability,
+                    "direction":"inbound",
+                    "mode":"reliable_ordered",
+                    "max_unit_bytes":1024
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
         let inbound_flow_capability = inbound_opened
@@ -474,20 +668,23 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
             .and_then(Value::as_str)
             .ok_or_else(|| "inbound-first opaque open returned no flow capability".to_owned())?
             .to_owned();
-        let opened = request(
-            &alice_socket,
-            json!({
-                "op":"opaque_flow_open",
-                "network":NETWORK_CONFIG_ID,
-                "peer":bob_id,
-                "label":label,
-                "client_id":alice_client,
-                "client_capability":alice_capability,
-                "direction":"outbound",
-                "mode":"reliable_ordered",
-                "max_unit_bytes":1024
-            }),
-            stage_deadline,
+        let opened = named_stage(
+            "open-outbound",
+            request(
+                &alice_socket,
+                json!({
+                    "op":"opaque_flow_open",
+                    "network":NETWORK_CONFIG_ID,
+                    "peer":bob_id,
+                    "label":label,
+                    "client_id":alice_client,
+                    "client_capability":alice_capability,
+                    "direction":"outbound",
+                    "mode":"reliable_ordered",
+                    "max_unit_bytes":1024
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
         let flow_capability = opened
@@ -495,78 +692,90 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
             .and_then(Value::as_str)
             .ok_or_else(|| "opaque open returned no flow capability".to_owned())?
             .to_owned();
-        let mut inbound = open_pipe(
-            &bob_socket,
-            json!({
-                "op":"opaque_pipe",
-                "direction":"inbound",
-                "network":NETWORK_CONFIG_ID,
-                "peer":alice_id,
-                "client_id":bob_client,
-                "client_capability":bob_capability
-            }),
-            stage_deadline,
+        let mut inbound = named_stage(
+            "pipe-inbound",
+            open_pipe(
+                &bob_socket,
+                json!({
+                    "op":"opaque_pipe",
+                    "direction":"inbound",
+                    "network":NETWORK_CONFIG_ID,
+                    "peer":alice_id,
+                    "client_id":bob_client,
+                    "client_capability":bob_capability
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
-        let mut outbound = open_pipe(
-            &alice_socket,
-            json!({
-                "op":"opaque_pipe",
-                "direction":"outbound",
-                "network":NETWORK_CONFIG_ID,
-                "client_id":alice_client,
-                "client_capability":alice_capability,
-                "flow_capability":flow_capability
-            }),
-            stage_deadline,
+        let mut outbound = named_stage(
+            "pipe-outbound",
+            open_pipe(
+                &alice_socket,
+                json!({
+                    "op":"opaque_pipe",
+                    "direction":"outbound",
+                    "network":NETWORK_CONFIG_ID,
+                    "client_id":alice_client,
+                    "client_capability":alice_capability,
+                    "flow_capability":flow_capability
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
 
         let body = vec![0, 0xff, 0x80, b'{', b'\n', 0, 1, 2, 3];
-        bounded(stage_deadline, async {
-            let body_len = u32::try_from(body.len())
-                .map_err(|_| "opaque fixture body length is not representable".to_owned())?;
-            outbound
-                .write_all(&body_len.to_le_bytes())
-                .await
-                .map_err(|error| format!("write opaque body length: {error}"))?;
-            outbound
-                .write_all(&body)
-                .await
-                .map_err(|error| format!("write opaque body: {error}"))?;
-            outbound
-                .flush()
-                .await
-                .map_err(|error| format!("flush opaque body: {error}"))
-        })
+        named_stage(
+            "initial-write",
+            bounded(stage_deadline, async {
+                let body_len = u32::try_from(body.len())
+                    .map_err(|_| "opaque fixture body length is not representable".to_owned())?;
+                outbound
+                    .write_all(&body_len.to_le_bytes())
+                    .await
+                    .map_err(|error| format!("write opaque body length: {error}"))?;
+                outbound
+                    .write_all(&body)
+                    .await
+                    .map_err(|error| format!("write opaque body: {error}"))?;
+                outbound
+                    .flush()
+                    .await
+                    .map_err(|error| format!("flush opaque body: {error}"))
+            }),
+        )
         .await?;
-        let (received_label, received_body) = bounded(stage_deadline, async {
-            let payload_len = inbound
-                .read_u32_le()
-                .await
-                .map_err(|error| format!("read opaque payload length: {error}"))?
-                as usize;
-            let label_len = inbound
-                .read_u8()
-                .await
-                .map_err(|error| format!("read opaque label length: {error}"))?
-                as usize;
-            require(
-                payload_len >= 1 + label_len,
-                "opaque inbound payload length is shorter than its label",
-            )?;
-            let mut received_label = vec![0; label_len];
-            inbound
-                .read_exact(&mut received_label)
-                .await
-                .map_err(|error| format!("read opaque label: {error}"))?;
-            let mut received_body = vec![0; payload_len - 1 - label_len];
-            inbound
-                .read_exact(&mut received_body)
-                .await
-                .map_err(|error| format!("read opaque body: {error}"))?;
-            Ok((received_label, received_body))
-        })
+        let (received_label, received_body) = named_stage(
+            "initial-read",
+            bounded(stage_deadline, async {
+                let payload_len = inbound
+                    .read_u32_le()
+                    .await
+                    .map_err(|error| format!("read opaque payload length: {error}"))?
+                    as usize;
+                let label_len = inbound
+                    .read_u8()
+                    .await
+                    .map_err(|error| format!("read opaque label length: {error}"))?
+                    as usize;
+                require(
+                    payload_len >= 1 + label_len,
+                    "opaque inbound payload length is shorter than its label",
+                )?;
+                let mut received_label = vec![0; label_len];
+                inbound
+                    .read_exact(&mut received_label)
+                    .await
+                    .map_err(|error| format!("read opaque label: {error}"))?;
+                let mut received_body = vec![0; payload_len - 1 - label_len];
+                inbound
+                    .read_exact(&mut received_body)
+                    .await
+                    .map_err(|error| format!("read opaque body: {error}"))?;
+                Ok((received_label, received_body))
+            }),
+        )
         .await?;
         require(
             received_label == label,
@@ -700,22 +909,29 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
             ),
         ];
         for (operation, change, expected_code) in refused_changes {
-            let response = request_unchecked(&alice_socket, change, stage_deadline).await?;
+            let response = named_stage(
+                operation,
+                request_unchecked(&alice_socket, change, stage_deadline),
+            )
+            .await?;
             require_refusal(&response, expected_code, operation)?;
         }
-        let local_inbound_change = request_unchecked(
-            &bob_socket,
-            opaque_change_request(
-                NETWORK_CONFIG_ID,
-                &label,
-                &bob_client,
-                &bob_capability,
-                &inbound_flow_capability,
-                "outbound",
-                json!("reliable_ordered"),
-                32,
+        let local_inbound_change = named_stage(
+            "change-local-inbound",
+            request_unchecked(
+                &bob_socket,
+                opaque_change_request(
+                    NETWORK_CONFIG_ID,
+                    &label,
+                    &bob_client,
+                    &bob_capability,
+                    &inbound_flow_capability,
+                    "outbound",
+                    json!("reliable_ordered"),
+                    32,
+                ),
+                stage_deadline,
             ),
-            stage_deadline,
         )
         .await?;
         require_refusal(
@@ -724,27 +940,37 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
             "change-local-inbound",
         )?;
         let predecessor_body = b"predecessor-still-usable";
-        write_opaque_body(&mut outbound, predecessor_body, stage_deadline).await?;
-        let (predecessor_label, predecessor_received) =
-            read_opaque_body(&mut inbound, stage_deadline).await?;
+        named_stage(
+            "predecessor-write",
+            write_opaque_body(&mut outbound, predecessor_body, stage_deadline),
+        )
+        .await?;
+        let (predecessor_label, predecessor_received) = named_stage(
+            "predecessor-read",
+            read_opaque_body(&mut inbound, stage_deadline),
+        )
+        .await?;
         require(
             predecessor_label == label && predecessor_received.as_slice() == predecessor_body,
             "a refused daemon Change mutated the predecessor flow",
         )?;
 
-        let changed = request(
-            &alice_socket,
-            opaque_change_request(
-                NETWORK_CONFIG_ID,
-                &label,
-                &alice_client,
-                &alice_capability,
-                &flow_capability,
-                "outbound",
-                json!("reliable_ordered"),
-                32,
+        let changed = named_stage(
+            "change-commit",
+            request(
+                &alice_socket,
+                opaque_change_request(
+                    NETWORK_CONFIG_ID,
+                    &label,
+                    &alice_client,
+                    &alice_capability,
+                    &flow_capability,
+                    "outbound",
+                    json!("reliable_ordered"),
+                    32,
+                ),
+                stage_deadline,
             ),
-            stage_deadline,
         )
         .await?;
         require(
@@ -759,72 +985,103 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
             "daemon Change acknowledgement replaced the capability or ceiling",
         )?;
         let changed_body = vec![0xc3; 32];
-        write_opaque_body(&mut outbound, &changed_body, stage_deadline).await?;
-        let (changed_label, changed_received) =
-            read_opaque_body(&mut inbound, stage_deadline).await?;
+        named_stage(
+            "changed-write",
+            write_opaque_body(&mut outbound, &changed_body, stage_deadline),
+        )
+        .await?;
+        let (changed_label, changed_received) = named_stage(
+            "changed-read",
+            read_opaque_body(&mut inbound, stage_deadline),
+        )
+        .await?;
         require(
             changed_label == label && changed_received == changed_body,
             "committed daemon Change did not deliver the exact new-limit body",
         )?;
 
         let above_changed_ceiling = vec![0xc4; 33];
-        write_opaque_body(&mut outbound, &above_changed_ceiling, stage_deadline).await?;
-        require_pipe_eof(
-            &mut outbound,
-            stage_deadline,
-            "changed-ceiling-admission-refusal",
+        named_stage(
+            "changed-ceiling-write",
+            write_opaque_body(&mut outbound, &above_changed_ceiling, stage_deadline),
         )
         .await?;
-        let mut fresh_outbound = open_pipe(
-            &alice_socket,
-            json!({
-                "op":"opaque_pipe",
-                "direction":"outbound",
-                "network":NETWORK_CONFIG_ID,
-                "client_id":alice_client,
-                "client_capability":alice_capability,
-                "flow_capability":flow_capability
-            }),
-            stage_deadline,
+        named_stage(
+            "changed-ceiling-admission-refusal",
+            require_pipe_eof(
+                &mut outbound,
+                stage_deadline,
+                "changed-ceiling-admission-refusal",
+            ),
+        )
+        .await?;
+        let mut fresh_outbound = named_stage(
+            "reopen-outbound",
+            open_pipe(
+                &alice_socket,
+                json!({
+                    "op":"opaque_pipe",
+                    "direction":"outbound",
+                    "network":NETWORK_CONFIG_ID,
+                    "client_id":alice_client,
+                    "client_capability":alice_capability,
+                    "flow_capability":flow_capability
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
         let fresh_body = b"fresh-after-limit-refusal";
-        write_opaque_body(&mut fresh_outbound, fresh_body, stage_deadline).await?;
-        let (fresh_label, fresh_received) = read_opaque_body(&mut inbound, stage_deadline).await?;
+        named_stage(
+            "reopen-write",
+            write_opaque_body(&mut fresh_outbound, fresh_body, stage_deadline),
+        )
+        .await?;
+        let (fresh_label, fresh_received) = named_stage(
+            "reopen-read",
+            read_opaque_body(&mut inbound, stage_deadline),
+        )
+        .await?;
         require(
             fresh_label == label && fresh_received.as_slice() == fresh_body,
             "same capability did not remain usable after the refused oversized unit",
         )?;
 
         drop((outbound, fresh_outbound, inbound));
-        let closed = request(
-            &alice_socket,
-            json!({
-                "op":"opaque_flow_close",
-                "client_id":alice_client,
-                "client_capability":alice_capability,
-                "flow_capability":flow_capability
-            }),
-            stage_deadline,
+        let closed = named_stage(
+            "close",
+            request(
+                &alice_socket,
+                json!({
+                    "op":"opaque_flow_close",
+                    "client_id":alice_client,
+                    "client_capability":alice_capability,
+                    "flow_capability":flow_capability
+                }),
+                stage_deadline,
+            ),
         )
         .await?;
         require(
             closed.pointer("/data/closed").and_then(Value::as_bool) == Some(true),
             "opaque close was not acknowledged after retirement",
         )?;
-        let closed_change = request_unchecked(
-            &alice_socket,
-            opaque_change_request(
-                NETWORK_CONFIG_ID,
-                &label,
-                &alice_client,
-                &alice_capability,
-                &flow_capability,
-                "outbound",
-                json!("reliable_ordered"),
-                16,
+        let closed_change = named_stage(
+            "change-closed-capability",
+            request_unchecked(
+                &alice_socket,
+                opaque_change_request(
+                    NETWORK_CONFIG_ID,
+                    &label,
+                    &alice_client,
+                    &alice_capability,
+                    &flow_capability,
+                    "outbound",
+                    json!("reliable_ordered"),
+                    16,
+                ),
+                stage_deadline,
             ),
-            stage_deadline,
         )
         .await?;
         require_refusal(&closed_change, None, "change-closed-capability")?;
@@ -834,21 +1091,28 @@ async fn two_daemons_carry_non_utf8_application_bytes_without_json_codec() {
     .await;
 
     let cleanup_deadline = Instant::now() + Duration::from_secs(20);
-    let alice_reap = reap(&mut alice_daemon, cleanup_deadline).await;
-    let bob_reap = reap(&mut bob_daemon, cleanup_deadline).await;
-    let relay_stop = bounded(cleanup_deadline, async {
-        relay
-            .stop_and_wait()
-            .await
-            .map_err(|error| format!("stop signaling relay: {error}"))
-    })
+    let alice_reap = reap_daemon(&mut alice_daemon, cleanup_deadline).await;
+    let bob_reap = reap_daemon(&mut bob_daemon, cleanup_deadline).await;
+    let relay_stop = named_stage(
+        "cleanup-relay",
+        bounded(cleanup_deadline, async {
+            relay
+                .stop_and_wait()
+                .await
+                .map_err(|error| format!("stop signaling relay: {error}"))
+        }),
+    )
     .await;
     assert!(
-        alice_reap.is_ok() && bob_reap.is_ok() && relay_stop.is_ok(),
-        "daemon cleanup failed: alice={alice_reap:?} bob={bob_reap:?} relay={relay_stop:?}; result={result:?}"
+        alice_reap.succeeded() && bob_reap.succeeded() && relay_stop.is_ok(),
+        "daemon cleanup failed: alice={} bob={} relay={relay_stop:?}; result={result:?}",
+        alice_reap.report(),
+        bob_reap.report(),
     );
     assert!(
         result.is_ok(),
-        "opaque daemon acceptance failed: {result:?}"
+        "opaque daemon acceptance failed: {result:?}; alice_logs={}; bob_logs={}",
+        alice_reap.report(),
+        bob_reap.report(),
     );
 }
