@@ -74,3 +74,20 @@ overflow was reported. This incident's loss therefore precedes the receiver
 application pipeline; paired sender/receiver captures are needed to separate
 sender egress from loss in transit. It is not evidence of LAN saturation by
 itself. Native 1080p and the existing latency/bitrate/FPS targets were retained.
+
+## Subsequent awake check
+
+A short paired capture on 2026-09-09 around 00:34 UTC contained no video
+sequence skips, reordering, or retransmitted duplicates on either endpoint.
+The receiver's approximately 64-second window averaged 3.3 Mbps, peaking at
+40.4 Mbps over 100 ms. Sender output was roughly 45–49 fps with about 6 ms
+encode time. This did not reproduce the reported 300–600 Mbps bursts or a
+multi-second freeze; it is not evidence that all remaining issues are fixed.
+The endpoints' capture windows differ, so their separate maximum packet gaps
+must not be subtracted to estimate network delay.
+
+The internal admission diagnostic also exposed overflowing 100,000-byte
+SRTCP report buffers after a long session. These are not the 1,000,000-byte
+video SRTP buffers, and no causal link to the video incident was established.
+Sleep/idle intervals and this unrelated report-buffer warning must not be
+used as evidence of a reproduced active-video stall.
