@@ -1370,7 +1370,7 @@ impl ClientRegistry {
             .map(|claim| claim.value)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn handler_mode(&self, key: &ClaimKey) -> Option<HandlerMode> {
         self.inner
             .tables

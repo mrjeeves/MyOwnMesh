@@ -3225,13 +3225,9 @@ impl Rpc {
             .unwrap_or_default()
     }
 
-    // There is deliberately no `take_pending(request_id)` here.
-    // One existed, unused and `#[allow(dead_code)]`, and it was the
-    // unbound settle in its purest form: a request id in, someone's
-    // pending effect out, with no question asked about who was
-    // sending or what class they were sending. Reaching a pending
-    // operation now requires naming the authenticated device too,
-    // which that signature had no way to express.
+    // Pending settlement is scoped to the exact promoted session capability.
+    // Its SessionRpcState checks the operation class before extracting an
+    // effect; a request id alone cannot reach another session's pending map.
 
     /// Snapshot registered methods for lifecycle controls. Production lookup
     /// is borrowed and performs no unfunded allocation.

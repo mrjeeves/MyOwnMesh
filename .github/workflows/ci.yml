@@ -139,10 +139,10 @@ jobs:
         # through the process-global MYOWNMESH_HOME; keep those roots isolated.
         run: cargo test --workspace --no-fail-fast -- --test-threads=1
 
-      # `--workspace` above runs default features only, so the transport-lab
-      # controls never compile there. Keep the core feature run and separately
-      # exercise the shipped daemon/CLI package, whose feature forwards the
-      # same core seam to the external R2 control.
+      # Workspace dev-dependencies can unify transport-lab onto core. Keep an
+      # explicit core feature run so its coverage does not depend on that
+      # unification, and exercise the shipped daemon/CLI feature separately;
+      # that package forwards the same core seam to the external R2 control.
       - name: Suite-wide transport-lab tests
         run: cargo test -p myownmesh-core --features "transport-lab" --no-fail-fast -- --test-threads=1
 

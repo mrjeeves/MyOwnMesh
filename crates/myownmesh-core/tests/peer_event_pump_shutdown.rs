@@ -1,12 +1,13 @@
 #![cfg(feature = "transport-lab")]
 
+mod support;
+
 use std::sync::Arc;
 
 use myownmesh_core::config::NetworkConfig;
 use myownmesh_core::engine::transport_lab::spawn_network_in_instance_root;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::resource::ResourceReport;
-use myownmesh_core::transport::Transport;
 
 fn assert_resource_baseline(before: &ResourceReport, after: &ResourceReport) {
     for (before, after) in before
@@ -40,7 +41,7 @@ async fn shutdown_joins_a_late_peer_event_pump() {
     config.stun_servers.clear();
     config.turn_servers.clear();
     let identity = Arc::new(Identity::ephemeral());
-    let transport = Transport::new().expect("test transport");
+    let transport = support::test_transport();
     let (state, driver) =
         spawn_network_in_instance_root(config, identity, transport, root.path().to_path_buf())
             .await

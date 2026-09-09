@@ -35,13 +35,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-/// GUI-used subset of `myownmesh::control::Request`.
+/// Complete wire mirror of `myownmesh::control::Request`.
 ///
-/// This is a wire schema: every field and tag
-/// below must match the daemon's current control protocol. Requests not used
-/// by the GUI stay on the daemon/CLI surface and are intentionally absent.
-/// The complete schema is retained so serialization and commit-policy
-/// controls cover every supported operation, including daemon/CLI-only ones.
+/// Every field and tag must match the daemon's current control protocol.
+/// The frontend invokes a subset; the complete schema is retained so
+/// serialization and commit-policy controls cover every supported operation,
+/// including daemon/CLI-only ones.
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -585,6 +584,9 @@ impl fmt::Display for SocketAddr {
 
 pub struct ControlClient {
     addr: SocketAddr,
+    // Per-client test seam only: never a production identity bypass or global override.
+    #[cfg(test)]
+    server_verifier: fn(&LocalSocketStream) -> Result<()>,
 }
 
 impl ControlClient {
@@ -601,12 +603,16 @@ impl ControlClient {
             let socket_path = home.join(".myownmesh").join("daemon.sock");
             Ok(Self {
                 addr: SocketAddr::Path(socket_path),
+                #[cfg(test)]
+                server_verifier: verify_local_server,
             })
         }
         #[cfg(not(unix))]
         {
             Ok(Self {
                 addr: SocketAddr::Name("myownmesh.sock".to_string()),
+                #[cfg(test)]
+                server_verifier: verify_local_server,
             })
         }
     }
@@ -620,7 +626,7 @@ impl ControlClient {
         request_stream(req, stream, Duration::from_secs(5)).await
     }
 
-    /// Whether the daemon's control listener currently accepts a connection.
+    /// Whether a same-user control listener currently accepts a connection.
     ///
     /// This deliberately does not issue a request: lifecycle code uses it to
     /// distinguish an endpoint that has terminated from one that is merely
@@ -754,11 +760,166 @@ impl ControlClient {
                 }
             }
         };
-        LocalSocketStream::connect(name).await.context(format!(
+        let stream = LocalSocketStream::connect(name).await.context(format!(
             "connect daemon socket at {} — is `myownmesh serve` running?",
             self.addr
-        ))
+        ))?;
+        // Authenticate the OS peer before any request/EventsSubscribe write or
+        // reachability success. A failed lookup is not an anonymous connection.
+        #[cfg(not(test))]
+        verify_local_server(&stream)?;
+        #[cfg(test)]
+        (self.server_verifier)(&stream)?;
+        Ok(stream)
     }
+}
+
+// Same reverse-identity boundary as the CLI: authenticated OS account, not
+// a claim that every process owned by that account is the intended daemon.
+#[cfg(windows)]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn token_user_sid(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_USER};
+
+    let mut needed = 0_u32;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    anyhow::ensure!(needed != 0, "measure token user SID");
+    let word = std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; (needed as usize).div_ceil(word)];
+    anyhow::ensure!(
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } != 0,
+        "read token user SID: {}",
+        std::io::Error::last_os_error()
+    );
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let sid_len = unsafe { GetLengthSid(token_user.User.Sid) };
+    anyhow::ensure!(sid_len != 0, "token user SID has no length");
+    Ok(unsafe {
+        std::slice::from_raw_parts(token_user.User.Sid.cast::<u8>(), sid_len as usize).to_vec()
+    })
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Security::TOKEN_QUERY,
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+        "open GUI process token: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = WindowsHandle(token);
+    token_user_sid(token.0)
+}
+
+#[cfg(windows)]
+fn process_user_sid(pid: u32) -> Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Security::TOKEN_QUERY,
+        System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    anyhow::ensure!(
+        !process.is_null(),
+        "open named-pipe server process {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    let process = WindowsHandle(process);
+    let mut token = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } != 0,
+        "open named-pipe server token {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = WindowsHandle(token);
+    token_user_sid(token.0)
+}
+
+#[cfg(windows)]
+fn verify_server_process_user(pid: u32, expected_sid: &[u8]) -> Result<()> {
+    use windows_sys::Win32::Security::EqualSid;
+
+    let server_sid = process_user_sid(pid)?;
+    anyhow::ensure!(
+        unsafe {
+            EqualSid(
+                server_sid.as_ptr().cast_mut().cast(),
+                expected_sid.as_ptr().cast_mut().cast(),
+            )
+        } != 0,
+        "named-pipe server process {pid} is not the GUI user"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_local_server(stream: &LocalSocketStream) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let server_pid = match stream {
+        LocalSocketStream::NamedPipe(pipe) => {
+            let mut pid = 0_u32;
+            anyhow::ensure!(
+                unsafe { GetNamedPipeServerProcessId(pipe.inner().as_raw_handle(), &mut pid) } != 0
+                    && pid != 0,
+                "obtain named-pipe server process identity: {}",
+                std::io::Error::last_os_error()
+            );
+            pid
+        }
+    };
+    let expected_sid = current_process_user_sid()?;
+    verify_server_process_user(server_pid, &expected_sid)
+}
+
+#[cfg(unix)]
+fn verify_server_euid(server: u32, expected: u32) -> Result<()> {
+    anyhow::ensure!(
+        server == expected,
+        "control server euid {server} does not match GUI euid {expected}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_local_server(stream: &LocalSocketStream) -> Result<()> {
+    let credentials = stream
+        .peer_creds()
+        .context("read control server credentials")?;
+    let server = credentials
+        .euid()
+        .context("control transport did not provide server euid")?;
+    verify_server_euid(server, unsafe { libc::geteuid() })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_local_server(_stream: &LocalSocketStream) -> Result<()> {
+    bail!("control server identity is unsupported on this platform")
 }
 
 async fn request_stream<S>(
@@ -828,6 +989,291 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
+
+    #[cfg(any(unix, windows))]
+    struct IdentitySocketRoot {
+        #[cfg(unix)]
+        directory: PathBuf,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for IdentitySocketRoot {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(self.directory.join("ctl.sock"));
+                let _ = std::fs::remove_dir(&self.directory);
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn identity_listener() -> Result<(IdentitySocketRoot, LocalSocketListener, SocketAddr)> {
+        use interprocess::local_socket::ListenerOptions;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let label = format!(
+            "mm-gui-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let directory = std::env::temp_dir().join(label);
+            std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            let root = IdentitySocketRoot { directory };
+            let path = root.directory.join("ctl.sock");
+            let listener = ListenerOptions::new()
+                .name(path.as_path().to_fs_name::<GenericFilePath>()?)
+                .create_tokio()?;
+            Ok((root, listener, SocketAddr::Path(path)))
+        }
+        #[cfg(windows)]
+        {
+            let listener = ListenerOptions::new()
+                .name(label.clone().to_ns_name::<GenericNamespaced>()?)
+                .create_tokio()?;
+            Ok((IdentitySocketRoot {}, listener, SocketAddr::Name(label)))
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[derive(Clone, Copy, Debug)]
+    enum IdentityProbe {
+        Status,
+        Mfa,
+        Services,
+        Events,
+        Reachability,
+    }
+
+    #[cfg(any(unix, windows))]
+    const IDENTITY_PROBES: [IdentityProbe; 5] = [
+        IdentityProbe::Status,
+        IdentityProbe::Mfa,
+        IdentityProbe::Services,
+        IdentityProbe::Events,
+        IdentityProbe::Reachability,
+    ];
+
+    // Real local stream and real public entry points. Only the impossible-to-
+    // arrange cross-account/credential-failure CI result is injected per client.
+    // No live credentials, global environment, daemon process or detached task.
+    #[cfg(any(unix, windows))]
+    async fn identity_probe(
+        operation: IdentityProbe,
+        verifier: fn(&LocalSocketStream) -> Result<()>,
+        fake_status: bool,
+    ) -> Result<(std::result::Result<(), String>, String)> {
+        let (root, listener, addr) = identity_listener()?;
+        let client = ControlClient {
+            addr,
+            server_verifier: verifier,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let cancellation = EventPumpCancellation::new();
+        let mut pump = None;
+        let server = async {
+            use tokio::io::AsyncReadExt;
+            let stream = listener.accept().await?;
+            let (mut reader, mut writer) = stream.split();
+            let response = b"{\"ok\":true,\"data\":{\"subscribed\":true}}\n";
+            if fake_status {
+                // A refusal may already have closed the stream. Even if this
+                // forged success arrives first, it cannot authorize the peer.
+                let _ = writer.write_all(response).await;
+            }
+            let mut received = Vec::new();
+            let mut replied = fake_status;
+            loop {
+                let mut bytes = [0_u8; 1024];
+                let count = match reader.read(&mut bytes).await {
+                    Ok(count) => count,
+                    // A verified refusal closes without consuming the fake
+                    // reply; some local transports report reset instead of EOF.
+                    Err(error)
+                        if fake_status
+                            && received.is_empty()
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if count == 0 {
+                    break;
+                }
+                anyhow::ensure!(
+                    received.len() + count <= 4096,
+                    "fixture request exceeded bound"
+                );
+                received.extend_from_slice(&bytes[..count]);
+                if !replied && received.contains(&b'\n') {
+                    writer.write_all(response).await?;
+                    writer.flush().await?;
+                    replied = true;
+                }
+            }
+            Ok::<_, anyhow::Error>(String::from_utf8(received)?)
+        };
+        let caller = async {
+            match operation {
+                IdentityProbe::Reachability => Ok(if client.listener_reachable().await {
+                    Ok(())
+                } else {
+                    Err("listener identity refused".into())
+                }),
+                IdentityProbe::Events => {
+                    let (tx, _rx) = mpsc::channel(1);
+                    match client.subscribe_events(tx, cancellation.clone()).await {
+                        Err(error) => Ok(Err(error.to_string())),
+                        Ok(join) => {
+                            pump = Some(join);
+                            cancellation.cancel();
+                            pump.as_mut().expect("owned event pump").await?;
+                            drop(pump.take());
+                            Ok(Ok(()))
+                        }
+                    }
+                }
+                _ => {
+                    let request = match operation {
+                        IdentityProbe::Status => Request::Status,
+                        IdentityProbe::Mfa => Request::GovernanceProposeRoleGrant {
+                            network: "fixture".into(),
+                            target: "fixture-peer".into(),
+                            role: Role::Member,
+                            mfa_code: Some("fixture-not-a-secret".into()),
+                        },
+                        IdentityProbe::Services => Request::ServicesSet {
+                            services: serde_json::json!({"fixture_password": "not-a-secret"}),
+                        },
+                        _ => unreachable!(),
+                    };
+                    match client.request(&request).await {
+                        Ok(response) => {
+                            anyhow::ensure!(response.ok, "fixture response refused");
+                            Ok(Ok(()))
+                        }
+                        Err(RequestError::Transport(error)) => Ok(Err(error.to_string())),
+                        Err(RequestError::OutcomeUnknown) => {
+                            bail!("identity refusal became outcome unknown")
+                        }
+                    }
+                }
+            }
+        };
+        let (server_result, caller_result) = tokio::join!(
+            tokio::time::timeout_at(deadline, server),
+            tokio::time::timeout_at(deadline, caller),
+        );
+        // Cleanup precedes propagating errors/asserting. A timeout cancels
+        // socket futures; any returned event task stays owned here until join.
+        cancellation.cancel();
+        if let Some(join) = pump {
+            join.abort();
+            let _ = join.await;
+        }
+        drop(client);
+        drop(listener);
+        drop(root);
+        Ok((
+            caller_result.context("identity caller deadline")??,
+            server_result.context("identity server deadline")??,
+        ))
+    }
+
+    #[cfg(any(unix, windows))]
+    fn injected_foreign_server(_stream: &LocalSocketStream) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let expected = unsafe { libc::geteuid() };
+            verify_server_euid(expected ^ 1, expected)
+        }
+        #[cfg(windows)]
+        {
+            let mut expected = current_process_user_sid()?;
+            *expected.last_mut().context("current SID is empty")? ^= 1;
+            verify_server_process_user(std::process::id(), &expected)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn injected_unverifiable_server(_stream: &LocalSocketStream) -> Result<()> {
+        #[cfg(unix)]
+        bail!("injected unavailable server credentials");
+        #[cfg(windows)]
+        {
+            verify_server_process_user(u32::MAX, &current_process_user_sid()?)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn gui_same_owner_native_identity_allows_request_subscription_and_reachability() {
+        for operation in IDENTITY_PROBES {
+            let (outcome, received) = identity_probe(operation, verify_local_server, false)
+                .await
+                .expect("owned same-user socket completed");
+            assert!(outcome.is_ok(), "{operation:?}: {outcome:?}");
+            let expected_op = match operation {
+                IdentityProbe::Status => "status",
+                IdentityProbe::Mfa => "governance_propose_role_grant",
+                IdentityProbe::Services => "services_set",
+                IdentityProbe::Events => "events_subscribe",
+                IdentityProbe::Reachability => {
+                    assert!(received.is_empty());
+                    continue;
+                }
+            };
+            let value: serde_json::Value = serde_json::from_str(received.trim()).unwrap();
+            assert_eq!(value["op"], expected_op);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn gui_injected_foreign_identity_refuses_all_entry_points_before_bytes() {
+        for operation in IDENTITY_PROBES {
+            let (outcome, received) = identity_probe(operation, injected_foreign_server, true)
+                .await
+                .expect("owned refusal socket completed");
+            let error = outcome.expect_err("foreign account must not be trusted");
+            assert!(error.contains("GUI") || error == "listener identity refused");
+            assert!(
+                received.is_empty(),
+                "{operation:?} wrote to an untrusted peer"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn gui_injected_unverifiable_identity_refuses_all_entry_points_before_bytes() {
+        for operation in IDENTITY_PROBES {
+            let (outcome, received) = identity_probe(operation, injected_unverifiable_server, true)
+                .await
+                .expect("owned refusal socket completed");
+            let error = outcome.expect_err("unavailable identity must not be trusted");
+            assert!(
+                error == "listener identity refused"
+                    || error.contains("injected unavailable server credentials")
+                    || error.contains("open named-pipe server process 4294967295")
+            );
+            assert!(
+                received.is_empty(),
+                "{operation:?} wrote before identity was available"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn event_pump_cancellation_is_latched_and_wakes_waiters() {

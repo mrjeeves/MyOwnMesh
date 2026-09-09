@@ -23,20 +23,12 @@ pub(crate) mod session_broker;
 /// Every future authority consumer must compare this witness with the Runtime
 /// Supervisor's current witness before use.
 #[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "Arc 02 links this witness before production capability migration"
-)]
 pub(crate) struct RuntimeIncarnation {
     marker: Arc<RuntimeMarker>,
 }
 
 struct RuntimeMarker;
 
-#[allow(
-    dead_code,
-    reason = "Arc 02 links this witness before production capability migration"
-)]
 impl RuntimeIncarnation {
     pub(crate) fn new() -> Self {
         Self {

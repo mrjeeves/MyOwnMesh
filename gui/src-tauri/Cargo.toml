@@ -6,7 +6,7 @@
 
 [package]
 name = "myownmesh-gui"
-version = "0.3.2"
+version = "1.0.0"
 description = "MyOwnMesh GUI — Tauri shell that talks to the daemon over the control socket."
 authors = ["Chris Paul"]
 license = "MIT"
@@ -44,6 +44,12 @@ parking_lot = "0.12"
 # Logging. Tauri pipes stderr to the dev console / app logs.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [profile.release]
 panic = "abort"

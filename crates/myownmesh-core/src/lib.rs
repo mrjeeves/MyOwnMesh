@@ -147,9 +147,8 @@ pub mod resource;
 pub mod roster;
 pub mod rpc;
 pub mod runtime;
-/// Canonical V4 durable semantic facts.  This is the authority-bearing
-/// surface; legacy governance/roster values are adapters and must not mint a
-/// second fact identity.
+/// Canonical V4 durable semantic facts and authority. Roster values are
+/// advisory projections, not an independent source of authority or fact identity.
 pub mod semantic;
 pub mod services;
 pub mod signing;
@@ -169,9 +168,7 @@ pub use engine::ladder::ConnectionTier;
 pub use engine::signaling_bridge::{
     mdns_connection_identity_planning_claim, mdns_connection_planning_claim,
 };
-/// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
-/// it answers the same question under a different contract: measured before it
-/// is built, and refusable at four separate points.
+/// Common error and result types for core operations.
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};

@@ -18,10 +18,12 @@
 //!      proof authenticates the peer's key while binding it to this exact
 //!      endpoint-auth context; a nonce-only signature is not accepted.
 //!
-//! After mutual auth verification, the receiver side either
-//! auto-accepts (peer is in the roster) or queues the request for
-//! user approval. The receiver sends `approve` once cleared; the
-//! connection becomes ACTIVE on both sides at that point.
+//! After mutual auth verification, activation checks canonical policy for
+//! both peers. Open participation requires no pair approval. Closed activation
+//! also requires the actual local and remote `approve` observations; local
+//! approval may be automatic under the configured policy. The roster is
+//! advisory metadata, not an activation authority. Session promotion retains
+//! its current-connector and resource-admission checks in either mode.
 //!
 //! Post-active, peers exchange:
 //!   - `capabilities_update` whenever local capabilities change

@@ -29,6 +29,7 @@ impl ParentDeviceKey {
         Self(device.as_bytes())
     }
 
+    #[cfg(feature = "transport-lab")]
     pub(super) const fn as_bytes(self) -> [u8; 32] {
         self.0
     }

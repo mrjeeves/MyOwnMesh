@@ -26353,10 +26353,29 @@ mod tests {
         drop(owner);
         drop(remote_state_w1);
         drop(remote_state_w2);
+        let semantic_policy = state.config.read().semantic_policy;
+        let semantic_storage_claim = crate::resource::ResourceClaim::single(
+            crate::resource::ResourceClass::StorageBytes,
+            semantic_policy
+                .checked_storage_envelope(
+                    crate::config::SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+                    semantic_policy.storage_workload(),
+                )
+                .expect("the W1 semantic policy has a checked storage envelope")
+                .total_bytes,
+        );
+        let semantic_storage_release =
+            crate::resource::FiniteResourceProvider::reservation_planning_charge(
+                semantic_storage_claim,
+            )
+            .expect("the W1 semantic storage reservation charge is representable");
+        let terminal_baseline = baseline
+            .checked_sub(semantic_storage_release)
+            .expect("the W1 baseline contains the semantic storage lease");
         assert_eq!(
             provider.in_use(),
-            baseline,
-            "exact W1 settlement returns provider baseline"
+            terminal_baseline,
+            "exact W1 settlement returns the post-shutdown provider baseline"
         );
     }
 

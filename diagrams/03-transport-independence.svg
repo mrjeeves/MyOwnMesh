@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1380" height="640" viewBox="0 0 1380 640" role="img" aria-labelledby="title desc">
   <title id="title">Transport-independent authority with real transport ownership</title>
-  <desc id="desc">Durable semantic facts converge independently of their carrier while current application reachability requires connector, endpoint-auth, and session owners.</desc>
+  <desc id="desc">Durable semantic facts converge independently of their carrier. Application data uses endpoint-authenticated native WebRTC, direct or through configured standard TURN. Hubs provide discovery and introduction only, never application forwarding.</desc>
   <defs><marker id="a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0L10 4L0 8z" fill="#294a62"/></marker><style>.title{font:700 24px sans-serif;fill:#173143}.lane{stroke-width:2;rx:14}.semantic{fill:#f2effd;stroke:#6553a4}.runtime{fill:#eef8ed;stroke:#3d7a44}.carrier{fill:#eaf6ff;stroke:#2376a1;stroke-width:1.7;rx:8}.box{fill:white;stroke:#294a62;stroke-width:1.7;rx:8}.h{font:700 15px sans-serif;fill:#173143}.t{font:12px monospace;fill:#213c4f}.s{font:11px sans-serif;fill:#465f70}.edge{fill:none;stroke:#294a62;stroke-width:2;marker-end:url(#a)}.dash{stroke-dasharray:6 4}</style></defs>
   <rect width="1380" height="640" fill="white"/>
   <text class="title" x="690" y="38" text-anchor="middle">Transport independence preserves authority boundaries; it does not remove networking</text>
@@ -18,13 +18,13 @@
   <rect class="lane runtime" x="30" y="330" width="1320" height="255"/>
   <text class="h" x="690" y="359" text-anchor="middle">CURRENT REACHABILITY LANE — a medium must actually pass packets</text>
   <rect class="carrier" x="65" y="395" width="230" height="92"/><text class="h" x="180" y="421" text-anchor="middle">Production adapters</text><text class="t" x="180" y="443" text-anchor="middle">mdns/driver.rs</text><text class="t" x="180" y="461" text-anchor="middle">nostr/driver.rs</text><text class="s" x="180" y="479" text-anchor="middle">typed signaling only</text>
-  <rect class="box" x="360" y="395" width="275" height="92"/><text class="h" x="497" y="421" text-anchor="middle">Connector and carrier</text><text class="t" x="497" y="443" text-anchor="middle">engine/connection.rs</text><text class="t" x="497" y="461" text-anchor="middle">transport/{ice,webrtc}.rs</text>
+  <rect class="box" x="360" y="395" width="275" height="92"/><text class="h" x="497" y="421" text-anchor="middle">Native WebRTC / ICE</text><text class="t" x="497" y="443" text-anchor="middle">engine/connection.rs</text><text class="t" x="497" y="461" text-anchor="middle">transport/{ice,webrtc}.rs</text><text class="s" x="497" y="479" text-anchor="middle">direct or configured standard TURN</text>
   <rect class="box" x="700" y="395" width="270" height="92"/><text class="h" x="835" y="421" text-anchor="middle">Endpoint authentication</text><text class="t" x="835" y="443" text-anchor="middle">endpoint_auth/task.rs</text><text class="t" x="835" y="461" text-anchor="middle">engine/handshake.rs</text>
   <rect class="box" x="1035" y="395" width="280" height="92"/><text class="h" x="1175" y="421" text-anchor="middle">Exact live session</text><text class="t" x="1175" y="443" text-anchor="middle">runtime/session_broker/mod.rs</text><text class="t" x="1175" y="461" text-anchor="middle">runtime/peer_session/slot.rs</text>
   <path class="edge" d="M295 441H360"/><path class="edge" d="M635 441H700"/><path class="edge" d="M970 441H1035"/>
   <path class="edge dash" d="M1175 198V395"/>
   <text class="s" x="1210" y="302">current semantic guard</text>
-  <text class="s" x="690" y="548" text-anchor="middle">Direct, TURN, or Closed member relay changes the carrier owner and observations—not endpoint identity or application authority.</text>
-<text class="s" x="690" y="568" text-anchor="middle">Adopted Hub direction (not qualified by this LAN path): a Hub may copy endpoint ciphertext/metadata but cannot decrypt/read plaintext; E2E failure is refusal.</text>
+  <text class="s" x="690" y="548" text-anchor="middle">Direct or configured standard TURN WebRTC preserves authenticated endpoint identity; TURN is distinct from a Hub even when cohosted.</text>
+  <text class="s" x="690" y="568" text-anchor="middle">Hubs: bounded discovery/introduction setup only. No application plaintext or ciphertext forwarding; no usable endpoint path means refusal.</text>
   <text class="s" x="690" y="615" text-anchor="middle">The executable LAN profile selects mDNS + direct WebRTC; it does not imply that offline fact media can carry an interactive session.</text>
 </svg>

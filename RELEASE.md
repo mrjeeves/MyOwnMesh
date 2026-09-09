@@ -77,7 +77,13 @@ daemon and GUI archives additionally publish their `.sha256` sidecars. The
 artifact verifier checks the workflow and manifest boundary, scans the daemon
 binary and portable archive members for the `transport-lab` seam, and verifies
 the complete payload/signature set; the opaque Tauri installers are included in
-that same manifest and signature set.
+that same manifest and signature set. These are separate verifier modes:
+`--binary` and `--archive --member` check forbidden bytes and archive-member
+requirements, while `--signature-tree --public-key` also checks checksum
+sidecars and detached signatures. `--tree` scans regular files in the Tauri
+bundle directory as bytes; it does not unpack opaque installer formats or
+prove installation behavior. A binary/archive scan alone is not signing or
+publication qualification.
 
 The `sign` job is mandatory. It requires both `MINISIGN_SECRET_KEY` and
 `MINISIGN_PUBLIC_KEY`, refuses missing or stale payloads, and verifies every
@@ -98,7 +104,7 @@ Semver. `MAJOR.MINOR.PATCH`:
   `PROTOCOL_VERSION`), removed / renamed public API, removed
   config keys.
 
-`PROTOCOL_VERSION` is currently `2`. It is an exact pre-authentication wire
+`PROTOCOL_VERSION` is currently `3`. It is an exact pre-authentication wire
 gate. The frame set is closed: an unknown `kind` is refused rather than
 ignored, so old peers do not silently ignore new closed variants. There is no
 mixed-version or optional-frame fallback. Adding or changing wire variants

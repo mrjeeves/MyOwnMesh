@@ -2,7 +2,14 @@
 
 > Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
 
-Status: proposed application contract for the hybrid networking architecture.
+Status: 1.0.0 application integration contract for the hybrid networking architecture.
+
+The practical Rust embedding reference is [APPLICATION-API.md](docs/APPLICATION-API.md).
+It is the source-linked inventory of the supported production facade, exact
+ownership/lifetime rules, and the boundaries around lab and internal hooks.
+The abstract shapes in section 3 remain conceptual design vocabulary; where a
+shape does not have a corresponding public Rust method, applications must not
+implement against its name.
 
 This document defines the smallest interface between MyOwnMesh and a local application. It does not define application features, application authorization, or application workflow.
 
@@ -231,6 +238,30 @@ close_realtime_flow(realtime_flow_handle)
 ```
 
 The exact API and operation set require owner selection. The ordinary application API does not receive RTP internals, SDP, m-line indexes, connector candidates, or a transport-wide lane number as authority.
+
+The abstract names above are not Rust methods. Their current 1.0.0 mapping is
+explicit:
+
+| conceptual operation | supported Rust mapping |
+| --- | --- |
+| `list_meshes()` | no in-process equivalent; the application owns its `MeshHandle` instances |
+| `mesh_snapshot(context)` | `JoinedNetwork::network_id`, `label`, `current_phase`, `current_topology`, `peers`, and `peer` |
+| `watch_mesh(context)` | `MeshHandle::events()`; handle broadcast lag as a reported receive condition |
+| `peer_reachability(context, device)` | `JoinedNetwork::peer`, `peers`, `current_phase`, and `traffic`; there is no single aggregate reachability object |
+| `request_session(context, device)` | `connect_peer` for queue admission, or `connect_peer_wait` for active-session/terminal outcome |
+| `watch_session(operation)` | `MeshHandle::events()` plus `connect_peer_wait`; there is no separate session event stream |
+| `transport_diagnostics(session)` | `traffic()` and `subscribe_conn_trace()` are separate observations; no consolidated method is promised |
+| `close_session(session)` | no public session-only close; use `close_realtime` for an exact flow or `shutdown`/`leave` for the joined network |
+| `open_realtime_flow(session, spec)` | `open_opaque_flow` or `open_webrtc_realtime`, returning a move-only `RealtimeFlowHandle` |
+| `write_realtime_unit(handle, unit)` | `send_opaque_flow` or `send_webrtc_realtime` |
+| `read_realtime_units(handle)` | claim `realtime_inbound`, then use `recv_opaque_flow`, `recv_webrtc_realtime_any`, or `recv_realtime_arrival` |
+| `close_realtime_flow(handle)` | `close_realtime`, which consumes and awaits the exact handle |
+| `administer(...)` | `propose_role_grant`, `propose_role_revoke`, and `propose_evict`; no generic admin pseudo-call exists |
+| durable `watch_mesh`/`watch_session` replay | no equivalent; semantic page export/import is the bounded durable-state API |
+
+The source-linked signatures and ownership rules are maintained in
+[`docs/APPLICATION-API.md`](docs/APPLICATION-API.md). This table prevents the
+conceptual section from being read as an implemented compatibility facade.
 
 Administrative APIs are separate and locally authenticated. They request semantic changes, while MyOwnMesh constructs and validates the exact durable facts.
 

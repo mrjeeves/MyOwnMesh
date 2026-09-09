@@ -251,19 +251,37 @@ fn ready_invalid_fact_does_not_starve_valid_sibling_in_either_arrival_order() {
 
     for reverse_order in [false, true] {
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
-        if reverse_order {
-            graph.admit(good.clone()).expect("good fact quarantines");
-            graph.admit(bad.clone()).expect("bad fact quarantines");
+        // An unknown signer cannot retain a missing-dependency fact. The
+        // eligible root's sibling still quarantines in either arrival order.
+        for candidate in if reverse_order {
+            [good.clone(), bad.clone()]
         } else {
-            graph.admit(bad.clone()).expect("bad fact quarantines");
-            graph.admit(good.clone()).expect("good fact quarantines");
+            [bad.clone(), good.clone()]
+        } {
+            if candidate.id == bad.id {
+                let before = graph_state(&graph);
+                assert_eq!(
+                    graph.admit(candidate),
+                    Err(SemanticError::QuarantineSignerNotEligible)
+                );
+                assert_eq!(graph_state(&graph), before);
+            } else {
+                assert!(matches!(
+                    graph.admit(candidate),
+                    Ok(Admission::Quarantined { .. })
+                ));
+            }
         }
         graph.admit(genesis.clone()).expect("genesis admits");
+        let before_ready_refusal = graph_state(&graph);
         assert_eq!(
-            graph.retry_quarantined(),
+            graph.admit(bad.clone()),
             Err(SemanticError::UnauthorizedRoleGrant),
-            "the rejected sibling remains observable without blocking valid work"
+            "the now-ready invalid sibling still refuses without retaining work"
         );
+        assert_eq!(graph_state(&graph), before_ready_refusal);
+        assert_eq!(graph.retry_quarantined().unwrap(), vec![good.id]);
+        assert!(graph.get(&bad.id).is_none());
         assert_eq!(
             graph.evaluator().effective_role(&good_target),
             Some(Role::Member)
@@ -699,10 +717,13 @@ fn stale_operation_is_explicit_but_arrival_order_independent() {
         .expect("the revoke admits after the shared controller grant");
 
     let mut reverse = FactGraph::from_bootstrap(&bootstrap);
-    assert!(matches!(
+    let before_unauthorized_delivery = graph_state(&reverse);
+    assert_eq!(
         reverse.admit(earlier_operation.clone()),
-        Ok(Admission::Quarantined { .. })
-    ));
+        Err(SemanticError::QuarantineSignerNotEligible),
+        "a missing controller grant cannot authorize quarantine retention"
+    );
+    assert_eq!(graph_state(&reverse), before_unauthorized_delivery);
     assert!(matches!(
         reverse.admit(later_revoke.clone()),
         Ok(Admission::Quarantined { .. })
@@ -717,10 +738,16 @@ fn stale_operation_is_explicit_but_arrival_order_independent() {
         retried
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
-        [earlier_operation.id, later_revoke.id]
+        [later_revoke.id]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
     );
+    assert_eq!(
+        reverse.admit(earlier_operation.clone()),
+        Ok(Admission::Inserted),
+        "redelivery after the grant uses the signed causal past, not the current revoke"
+    );
+    assert_eq!(reverse.quarantined().count(), 0);
     assert_eq!(
         source.ids().copied().collect::<Vec<_>>(),
         reverse.ids().copied().collect::<Vec<_>>(),
@@ -887,8 +914,8 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
     // A selector that omits a current AuthorityUse head remains invalid even
     // when its signed AuthorityUse(C) predecessor set is complete. Deliver
     // it through production quarantine first, then retry after both omitted
-    // heads arrive; retry rejects and clears it rather than repairing the
-    // citation set from arrival order.
+    // heads arrive. The public retry transaction rolls back on error rather
+    // than clearing the waiter or repairing its signed citation set.
     let omitted_head = fact(
         &bootstrap,
         &controller_key,
@@ -911,12 +938,20 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
     quarantined
         .admit(operation.clone())
         .expect("the omitted selector's operation parent admits");
+    let before_retry = graph_state(&quarantined);
     assert_eq!(
         quarantined.retry_quarantined(),
         Err(SemanticError::IncompleteResolution),
         "complete AuthorityUse predecessors cannot hide an omitted current head"
     );
-    assert_eq!(quarantined.quarantined().count(), 0);
+    assert_eq!(quarantined.quarantined().count(), 1);
+    assert_eq!(graph_state(&quarantined), before_retry);
+    assert_eq!(
+        quarantined.retry_quarantined(),
+        Err(SemanticError::IncompleteResolution),
+        "a repeated public retry preserves the same refusal and signed waiter"
+    );
+    assert_eq!(graph_state(&quarantined), before_retry);
 
     assert_eq!(
         forward.authority_use_heads(&controller),
@@ -991,11 +1026,16 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
         },
         Vec::new(),
     );
+    let before_ordinary_selection = graph_state(&forward);
+    assert!(!forward
+        .evaluator()
+        .is_conflicted(&ExclusiveCell::role(controller.clone())));
     assert_eq!(
         forward.admit(ordinary_role_selection),
-        Err(SemanticError::IncompleteResolution),
-        "ordinary Role(C) resolution cannot select the cross-cell O lineage"
+        Err(SemanticError::NoOp("resolution has no live conflict")),
+        "a non-conflicted Role(C) cannot select the cross-cell O lineage"
     );
+    assert_eq!(graph_state(&forward), before_ordinary_selection);
     assert_eq!(
         forward.authority_lineage(&controller).heads().len(),
         2,
@@ -1194,9 +1234,8 @@ fn cross_cell_resolution_cannot_select_a_role_authority_fork() {
         "G/O/R establishes the concurrent AuthorityUse fork before the payload"
     );
 
-    // A Membership(C) resolution may cite the exact AuthorityUse(C) fork,
-    // but it is not a typed selection of that lineage. The cross-cell
-    // payload is rejected before it can collapse the fork.
+    // Membership(C) has no live conflict, so this obsolete payload is a
+    // preflight NoOp, not a typed selection of the AuthorityUse(C) fork.
     let membership_resolution = authored(
         &graph,
         &root_key,
@@ -1207,10 +1246,78 @@ fn cross_cell_resolution_cannot_select_a_role_authority_fork() {
         },
         Vec::new(),
     );
+    assert!(!graph
+        .evaluator()
+        .is_conflicted(&ExclusiveCell::membership(controller.clone())));
+    let before_noop = graph_state(&graph);
     assert_eq!(
         graph.admit(membership_resolution),
+        Err(SemanticError::NoOp("resolution has no live conflict")),
+        "an unconflicted Membership(C) payload cannot select AuthorityUse(C)"
+    );
+    assert_eq!(graph_state(&graph), before_noop);
+
+    // Create a real, independent Membership(D) conflict so the next payload
+    // reaches typed validation. Its cited C heads advance neither D branch.
+    let member = author(&key(127));
+    let membership_cell = ExclusiveCell::membership(member.clone());
+    let admit_member = authored(
+        &graph,
+        &root_key,
+        FactBody::MembershipAdmit {
+            target: member.clone(),
+        },
+        Vec::new(),
+    );
+    let evict_member = authored(
+        &graph,
+        &root_key,
+        FactBody::Evict { target: member },
+        Vec::new(),
+    );
+    let mut wrong_cell_graph = graph.clone();
+    wrong_cell_graph
+        .admit(admit_member.clone())
+        .expect("first concurrent membership branch admits");
+    wrong_cell_graph
+        .admit(evict_member.clone())
+        .expect("second concurrent membership branch admits");
+    let mut membership_heads = vec![admit_member.id, evict_member.id];
+    membership_heads.sort();
+    assert_eq!(
+        wrong_cell_graph.cell_heads(&membership_cell),
+        membership_heads
+    );
+    assert!(wrong_cell_graph.evaluator().is_conflicted(&membership_cell));
+    assert_eq!(
+        wrong_cell_graph.authority_use_heads(&controller),
+        authority_heads
+    );
+    let wrong_cell_resolution = authored(
+        &wrong_cell_graph,
+        &root_key,
+        FactBody::Resolution {
+            cell: membership_cell.clone(),
+            cited_heads: authority_heads.clone(),
+            selected_head: operation.id,
+        },
+        authority_heads.clone(),
+    );
+    let before_wrong_cell = graph_state(&wrong_cell_graph);
+    assert_eq!(
+        wrong_cell_graph.admit(wrong_cell_resolution),
         Err(SemanticError::IncompleteResolution),
-        "Membership(C) cannot bypass the AuthorityUse(C) resolution type"
+        "a live Membership(D) conflict cannot be resolved with AuthorityUse(C) heads"
+    );
+    assert_eq!(graph_state(&wrong_cell_graph), before_wrong_cell);
+    assert_eq!(
+        wrong_cell_graph.cell_heads(&membership_cell),
+        membership_heads
+    );
+    assert!(wrong_cell_graph.evaluator().is_conflicted(&membership_cell));
+    assert_eq!(
+        wrong_cell_graph.authority_use_heads(&controller),
+        authority_heads
     );
     assert_eq!(
         graph.authority_lineage(&controller).heads().len(),
@@ -1491,7 +1598,7 @@ fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
         "a plain Member cannot author a member-log admission"
     );
 
-    let owner_admit = authored(
+    let owner_repeat = authored(
         &graph,
         &root_key,
         FactBody::MembershipAdmit {
@@ -1499,9 +1606,30 @@ fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
         },
         Vec::new(),
     );
+    let before_repeat = graph_state(&graph);
+    assert_eq!(
+        graph.admit(owner_repeat),
+        Err(SemanticError::NoOp("membership is already admitted"))
+    );
+    assert_eq!(graph_state(&graph), before_repeat);
+
+    let owner_target = author(&key(74));
+    let owner_admit = authored(
+        &graph,
+        &root_key,
+        FactBody::MembershipAdmit {
+            target: owner_target.clone(),
+        },
+        Vec::new(),
+    );
     graph
         .admit(owner_admit)
         .expect("Owner remains a valid higher-tier member-admission signer");
+    assert_eq!(graph.evaluator().effective_membership(&target), Some(true));
+    assert_eq!(
+        graph.evaluator().effective_membership(&owner_target),
+        Some(true)
+    );
 }
 
 #[test]
@@ -1573,23 +1701,25 @@ fn finite_authority_fork_requires_complete_resolution_before_regrant() {
     let incomplete = fact(
         &bootstrap,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: vec![operation.id],
             selected_head: operation.id,
         },
-        vec![operation.id],
+        vec![operation.id, revoke.id],
     );
+    let before_invalid_selection = graph_state(&fork);
     assert_eq!(
         fork.admit(incomplete),
         Err(SemanticError::IncompleteResolution),
         "Q must cite every incomparable AuthorityUse(C) head"
     );
+    assert_eq!(graph_state(&fork), before_invalid_selection);
     let wrong = fact(
         &bootstrap,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: vec![operation.id, revoke.id],
             selected_head: grant.id,
         },
@@ -1600,6 +1730,8 @@ fn finite_authority_fork_requires_complete_resolution_before_regrant() {
         Err(SemanticError::ResolutionSelectionNotCited),
         "Q cannot select a head outside the complete conflict set"
     );
+
+    assert_eq!(graph_state(&fork), before_invalid_selection);
 
     // Q selects R. N is the only later regrant; O remains a historical loser.
     let resolution = authored(
@@ -1752,13 +1884,33 @@ fn stale_selector_follows_newer_typed_role_resolution() {
     let mut expected_payload_heads = vec![membership_m.id, eviction_v.id];
     expected_payload_heads.sort();
     assert_eq!(payload_heads, expected_payload_heads);
-    let q = authored(
+    let obsolete_resolution = authored(
         &payload,
         &controller_key,
         FactBody::Resolution {
             cell: ExclusiveCell::membership(controller.clone()),
             cited_heads: payload_heads,
             selected_head: membership_m.id,
+        },
+        Vec::new(),
+    );
+    let mut unchanged_payload = payload.clone();
+    let before_obsolete_resolution = graph_state(&unchanged_payload);
+    assert_eq!(
+        unchanged_payload.admit(obsolete_resolution),
+        Err(SemanticError::NoOp("resolution has no live conflict")),
+        "the selected eviction already ended the old Membership(C) conflict"
+    );
+    assert_eq!(graph_state(&unchanged_payload), before_obsolete_resolution);
+
+    // Q restores membership through the real operation on selected V's
+    // false value, as in the owner's historical-membership control. Q is
+    // not another selector over the already-settled M/V conflict.
+    let q = authored(
+        &payload,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
         },
         Vec::new(),
     );
@@ -1775,7 +1927,7 @@ fn stale_selector_follows_newer_typed_role_resolution() {
     let mut settled = post_ga.clone();
     settled
         .admit(q.clone())
-        .expect("Q membership resolution admits");
+        .expect("Q membership restoration admits");
     settled.admit(r.clone()).expect("R role revoke admits");
     // Pick from a bounded, deterministic set of valid redundant-support
     // profiles until the production IDs make the old LIFO walk observable:

@@ -131,38 +131,29 @@ myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX
 tokio = { version = "1", features = ["full"] }
 ```
 
-```rust
-use myownmesh_core::{ConnectorCapableResourcePolicy, Mesh, MeshConfig, NetworkConfig, TopologyMode};
+Start with the [embedding quickstart](docs/QUICKSTART.md) and the
+[production bootstrap example](crates/myownmesh-core/examples/application_bootstrap.rs).
+The application supplies its process resource grant, WebRTC profile, and
+semantic storage policy. Production construction uses
+`Mesh::open_connector_capable` with `WebRtcConnectorCapablePolicy`, then
+`NetworkConfig::from_network_id_with_semantic_policy` and
+`JoinedNetwork::attach_signaling`. Keep the caller runtime alive until the
+network and its signaling drivers have completed shutdown.
 
-async fn run(
-    connector_policy: ConnectorCapableResourcePolicy,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mesh = Mesh::open_connector_capable(
-        MeshConfig::load().unwrap_or_default(),
-        connector_policy,
-    ).await?;
+Choose the integration surface that fits your application:
 
-    let net = mesh.join(NetworkConfig {
-        id: "home".into(),
-        network_id: "my-cool-mesh".into(),
-        label: "Home mesh".into(),
-        kind: Default::default(),                 // Open governance
-        topology: TopologyMode::default(),       // FullMesh
-        signaling: Default::default(),            // Nostr + mDNS defaults
-        stun_servers: Default::default(),
-        turn_servers: Default::default(),
-        auto_approve: false,
-    }).await?;
+| Surface | Reference | Covers |
+| --- | --- | --- |
+| Rust embedding | [Application API](docs/APPLICATION-API.md) | Lifecycle, configuration, identity, governance, channels, RPC, opaque/realtime flows, events, errors, and resource ownership. |
+| Separate application process | [Daemon API](docs/DAEMON-API.md) | Local control protocol, authentication, request/reply inventory, subscriptions, and administrative boundaries. |
+| Application responsibilities | [Integration contract](APPLICATION-INTEGRATION.md) | Application authorization and payload semantics; discovery/setup versus endpoint data; conceptual views mapped to implemented APIs. |
 
-    let _signaling = myownmesh_core::engine::attach_signaling(&net.state());
-
-    let mut events = mesh.events();
-    while let Ok(event) = events.recv().await {
-        println!("{event:?}");
-    }
-    Ok(())
-}
-```
+The references distinguish ordinary application APIs, advanced provider and
+administrative interfaces, internal seams, and `transport-lab` controls.
+Authenticated peers still require the application's own authorization.
+Hubs carry setup traffic only; application data uses endpoint WebRTC directly
+or through configured standard TURN. Protected Hub TURN-credential exchange
+is excluded from the 1.0.0 release.
 
 Three other supported dependency shapes:
 

@@ -40,6 +40,23 @@ New exact-source removal/refusal, direct/TURN behavior, and terminal resource
 evidence must be recorded separately before claiming qualification. This
 ledger adds no new PASS and adopts no proposed native-runtime owner.
 
+### Current release scanner modes
+
+The historical scanner rows below retain their original evidence and ceiling.
+In current `scripts/verify-release-artifact.py`, `--binary` scans forbidden
+bytes; `--archive --member` also requires each named ZIP/TAR.GZ member exactly
+once as a nonempty regular file and scans regular member contents. Neither
+mode alone verifies signatures, the checksum sidecar, or equality with a
+separately built executable. `--tree` scans every regular file in the Tauri
+bundle directory and refuses empty files, symlinks and non-regular entries,
+but does not unpack opaque installer formats or establish install behavior.
+The separate `--signature-tree --public-key` mode verifies checksum sidecars
+and detached signatures; build-owned asset allowlists and remote asset
+reverification are additional publication gates. These source capabilities
+do not turn historical binary/archive scans into signature, installer or
+publication evidence. `--preflight-release` can create a remote draft release
+and is not a read-only local check.
+
 ## Historical ownership matrix
 
 | Profile / boundary | Raw input | First funded or finite admission | Maximum retained unit / count | Queue / execution owner | Refusal | Terminal owner | Shutdown / join / baseline | Controls and evidence | Disposition |
@@ -64,8 +81,25 @@ ledger adds no new PASS and adopts no proposed native-runtime owner.
 The following table is exhaustive for the persisted `MdnsPolicyConfig` fields
 and relay `Limits` fields. A default is a deserialization/configuration
 default, not proof of capacity, throughput, or an SLO. Source-of-truth
-anchors refer to the published source family above; bridge translation and
-runtime validation are separate evidence from these declarations.
+anchors in the original rows refer to the published source family above;
+the four added TXT/address/heartbeat rows describe current checked owners
+and do not retroactively extend that historical evidence. Bridge translation
+and runtime validation remain separate evidence from these declarations.
+
+For the current mDNS rows, let `R = max_resolve_owners`, `E = event_capacity`,
+`T = max_txt_entries`, `B = max_txt_bytes`, and `A = max_resolved_addresses`.
+`DiscoveryLimits::checked_residency` checks `R*T` TXT entry slots, `R*A`
+address slots, per-resolver scratch `B + A*size_of::<IpAddr>()`, and total
+scratch `R*(B + A*size_of::<IpAddr>())`. Payload-owner slots are `R + 2*E`
+for Embedded and `R + E` for System. Every product/sum is checked; invalid
+limits or overflow refuse the plan. `DiscoveryRetention::from_backend`
+consumes these dimensions, and `checked_driver_custody_plan` derives the
+driver custody split before actual provider admission. These formulas
+are not byte-precise claims for dependency caches or native DNS-SD internals.
+`MdnsPolicyConfig::validate` and `mdns_limits_from_policy` preserve positive,
+platform-`usize`-representable values; TXT bytes also must fit the DNS-SD
+`u16` envelope. Defaults are not protocol maxima: per-entry wire checks still
+apply, and increasing a configured limit does not grant resources.
 
 | Domain / field | Value and unit (default) | Retained object | Classification | Source of truth | Selector / configuration | Pressure behavior | Field evidence |
 |---|---|---|---|---|---|---|---|
@@ -75,6 +109,9 @@ runtime validation are separate evidence from these declarations.
 | mDNS `max_resolve_owners` | 256 exact service keys | `ResolveOwnership` lease/table entry | Count cap | `MdnsPolicyConfig` plus `DiscoveryLimits` | Persisted policy; discovery backend constructor | Duplicate coalesces; new key refuses at cap | `config.rs:403,420,442,457`; `mdns/discovery/mod.rs:66-100` |
 | mDNS `event_capacity` | 128 events | Bounded discovery handoff/coalescer slots | Queue cap | `MdnsPolicyConfig` plus `DiscoveryLimits` | Persisted policy | Latest same-key state coalesces; overflow refuses | `config.rs:404,421,443,452-458`; `mdns/discovery/mod.rs:72-100` |
 | mDNS `max_event_epochs` | 1024 generations | Exact service-key epoch table | ABA/fence cap | `MdnsPolicyConfig` plus `DiscoveryLimits` | Persisted policy | Generation exhaustion refuses; never wraps | `config.rs:405,422,444,459`; `mdns/discovery/mod.rs:DiscoveryEvent` |
+| mDNS `max_txt_entries` | 64 entries/resolved service, from `MAX_TXT_ENTRIES` | Bounded TXT map/resolve entry slots; checked `R*T` concurrent slots | Owner-selected count cap, not a DNS-SD count maximum | `MdnsPolicyConfig::default/validate`; `DiscoveryLimits::checked_residency` | Persisted `signaling.mdns_policy`, checked translation to `MdnsLimits.discovery` | Zero/platform overflow or residency arithmetic overflow refuses; Embedded checks count before copying; System parsing returns an empty TXT map on count excess rather than retaining a prefix | Current `config.rs:MdnsPolicyConfig`; `signaling_bridge.rs:mdns_limits_from_policy`; `mdns/discovery/mod.rs:DiscoveryLimits`; source controls `mdns_policy_translation_preserves_sentinels_and_rejects_zero` (not new execution evidence) |
+| mDNS `max_txt_bytes` | 4096 encoded bytes/resolved service, from `MAX_TXT_BYTES` | Bounded TXT payload and resolver scratch; checked `R*(B + A*size_of::<IpAddr>())` | Owner-selected byte cap subject to `u16` DNS-SD envelope | Same checked owners; `DiscoveryConfig::validate` and backend TXT admission | Persisted policy translated unchanged after checked conversion | Zero, over-`u16`, platform/arithmetic overflow refuses the plan; Embedded rejects an oversized encoded payload, while System refuses to parse oversized TXT and leaves an empty map; encoded key/value entries include length octet and separator | Current `config.rs:MdnsPolicyConfig`; `mdns/discovery/mod.rs:DiscoveryConfig/DiscoveryLimits`; `mdns/discovery/embedded.rs` admission and `system.rs:parse_txt`; source control `mdns_policy_rejects_zero_and_platform_overflow` (not new execution evidence) |
+| mDNS `max_resolved_addresses` | 32 unique addresses/resolved service, from `MAX_RESOLVED_ADDRESSES` | Resolved address vector; checked `R*A` slots and address scratch term | Owner-selected count cap, not a DNS-SD address-count maximum | `MdnsPolicyConfig::default/validate`; `DiscoveryLimits::checked_residency` | Persisted policy translated to `MdnsLimits.discovery` | Zero/platform overflow or checked address-size overflow refuses; backend collection is bounded before payload retention | Current `signaling_bridge.rs:mdns_limits_from_policy`; `mdns/discovery/mod.rs:DiscoveryLimits`; `mdns/discovery/embedded.rs` and `system.rs` address collection; source control `mdns_policy_translation_preserves_sentinels_and_rejects_zero` (not new execution evidence) |
 | mDNS `dial_timeout_ms` | 5,000 ms | Dial future deadline, no durable payload | Timeout | `MdnsPolicyConfig` | Persisted policy translated to timing profile | Failed dial releases attempt/slot and tries permitted next path | `config.rs:406,423,445`; `mdns/driver.rs` timing profile |
 | mDNS `connection_idle_timeout_ms` | 30,000 ms | Idle deadline for exchange connection | Timeout | `MdnsPolicyConfig` | Persisted policy | Idle connection closes and releases owner | `config.rs:407,424,446` |
 | mDNS `inbound_idle_timeout_ms` | 120,000 ms | Idle deadline for inbound connection | Timeout | `MdnsPolicyConfig` | Persisted policy | Idle inbound connection closes and releases owner | `config.rs:408,425,447` |
@@ -93,6 +130,7 @@ runtime validation are separate evidence from these declarations.
 | relay `max_frame_bytes` | 65,536 bytes/WebSocket frame | Bounded frame payload | Byte cap | `Limits` | Relay server configuration | Reject oversize frame before message retention | `server.rs:103-104,133` |
 | relay `max_stored_events` | 8,192 events | Durable/in-memory event store entry | Count cap | `Limits` | Relay server configuration | Refuse/evict only under explicit store policy; no unbounded retention | `server.rs:105-106,134` |
 | relay `stored_retention_secs` | 900 seconds | Event expiry metadata | Retention duration | `Limits` | Relay server configuration | Expired replay event is unavailable and releases store custody | `server.rs:107-108,135` |
+| signaling relay `stats_heartbeat_interval_secs` | 900 seconds (`15*60`) | Existing heartbeat task's Tokio interval and activity snapshot | Cadence, independent of stored-event retention; not a capacity grant or SLO | `server.rs:Limits::default/validate/stats_heartbeat_interval` | Relay `Limits` configuration; `start_with_custodian` passes `Duration::from_secs(value)` to `stats_heartbeat` | Zero refuses before listener/task creation; the immediate first interval tick is consumed, then activity logs follow this cadence under existing task custody | Current `server.rs:stats_heartbeat`; source controls `limits_reject_every_unlimited_field` and `activity_heartbeat_uses_its_configured_horizon` (not new execution evidence) |
 | relay `max_replay_per_req` | 500 events/REQ | Replay materialization vector | Count cap | `Limits` | Relay server configuration | Bound replay output before delivery | `server.rs:109-110,136` |
 | relay `outbound_queue_cap` | 128 frames/connection | Bounded writer queue | Queue cap | `Limits` | Relay server configuration | Refuse/close exact overloaded writer; reaper releases it | `server.rs:111-112,137` |
 | relay `strike_limit` | 50 violations/connection | Strike counter | Count cap | `Limits` | Relay server configuration | Close exact connection at threshold | `server.rs:113-114,138` |

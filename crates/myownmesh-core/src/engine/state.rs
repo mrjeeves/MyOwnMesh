@@ -1072,9 +1072,9 @@ pub struct NetworkState {
     semantic_storage_claim: ResourceClaim,
     pub topology: RwLock<TopologyMode>,
     pub topology_impl: RwLock<Box<dyn Topology>>,
-    /// The one bounded route planner and replay owner for this network.
-    /// Its child resource scope makes every retained replay identity part of
-    /// this network's provider-funded lifetime rather than an unfunded cache.
+    /// Round-robin offset for the finite Hub wanted-edge dial list.
+    /// Retained across dial passes to rotate candidates within the configured
+    /// per-pass dial limit.
     pub(crate) hub_dial_cursor: AtomicUsize,
 
     /// Optional owner-funded hub advertisement scheduler. Spokes retain this
@@ -7640,8 +7640,7 @@ impl NetworkState {
     }
 
     /// Refresh the compatibility roster after canonical admission. It does NOT
-    /// transition any active session — call
-    /// It never emits a transport approval frame.
+    /// transition any active session or emit a transport approval frame.
     pub(super) fn refresh_roster_projection(&self, device_id: &str, label: &str) -> Result<()> {
         self.refresh_roster_projection_with(device_id, label, |candidate| {
             let mut affected = std::collections::BTreeSet::new();

@@ -438,7 +438,13 @@ fn production_graph_replay_and_semantic_refusals_do_not_change_commitment() {
 fn production_graph_wakes_only_indexed_waiters_and_refuses_ineligible_author() {
     let (bootstrap, root) = bootstrap();
     let parent = role_grant(&bootstrap, &root, 50, Vec::new());
-    let child = role_grant(&bootstrap, &root, 50, vec![parent.id]);
+    let child = {
+        let mut producer = FactGraph::from_bootstrap(&bootstrap);
+        producer
+            .admit(parent.clone())
+            .expect("producer parent admits for an exact child witness");
+        authored_role_grant(&producer, &root, 54)
+    };
     let other_dependency = FactId::from_bytes([0xa5; 32]);
     let other = role_grant(&bootstrap, &root, 51, vec![other_dependency]);
     let mut graph = FactGraph::from_bootstrap_with_policy(
@@ -457,11 +463,14 @@ fn production_graph_wakes_only_indexed_waiters_and_refuses_ineligible_author() {
         Ok(Admission::Quarantined { .. })
     ));
     graph.admit(parent).expect("parent admits");
+    assert!(graph.get(&child.id).is_none());
+    assert!(graph.quarantined().any(|(id, _)| *id == child.id));
     assert_eq!(graph.retry_quarantined().unwrap(), vec![child.id]);
     assert!(graph.get(&child.id).is_some());
     assert!(graph.quarantined().any(|(id, _)| *id == other.id));
 
     let outsider = key(52);
+    assert_eq!(graph.evaluator().effective_role(&device(&outsider)), None);
     let ineligible = role_grant(
         &bootstrap,
         &outsider,
@@ -657,6 +666,7 @@ async fn production_lifecycle_funds_exact_database_envelope_and_releases_it(
         "provider refusal leaves the public lifecycle baseline unchanged"
     );
     drop(blocker);
+    drop(blocker_scope);
     assert_eq!(
         provider_view.in_use(),
         provider_baseline,
