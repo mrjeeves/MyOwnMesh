@@ -4,12 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SemanticPolicyConfig,
+    NetworkConfig, NetworkKind, RoutingPolicyConfig, SchedulerPolicyConfig, SemanticPolicyConfig,
     SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
     SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, create_network_in_instance_root, import_network_in_instance_root,
+    spawn_network,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
@@ -394,8 +397,14 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
             .expect("approved peer remains current");
         assert_eq!(peer.status, PeerStatus::Active);
         assert!(peer.authenticated);
-        assert!(peer.local_approve_sent);
-        assert!(peer.remote_approve_seen);
+        assert!(
+            !peer.local_approve_sent,
+            "Open admission must not fabricate local approval"
+        );
+        assert!(
+            !peer.remote_approve_seen,
+            "Open admission must not fabricate remote approval"
+        );
         if let Some(pair) = peer.selected_pair {
             assert_eq!(pair.local, IceCandidateKind::Relay);
             assert_eq!(pair.remote, IceCandidateKind::Relay);
@@ -458,20 +467,33 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     // are reached through `JoinedNetwork` and not from an engine handle.
     let carol_id = Arc::new(Identity::ephemeral());
     let dave_id = Arc::new(Identity::ephemeral());
-    let (carol, carol_driver) = spawn_network(
-        network_config("carol", turn_url.clone(), false),
+    let carol_root = tempfile::tempdir().expect("Carol Closed instance root");
+    let dave_root = tempfile::tempdir().expect("Dave Closed instance root");
+    let mut carol_config = network_config("carol", turn_url.clone(), false);
+    carol_config.kind = NetworkKind::Closed;
+    let (carol, carol_driver) = create_network_in_instance_root(
+        carol_config,
         Arc::clone(&carol_id),
         relay_only_test_transport(&test_resources),
+        carol_root.path().to_path_buf(),
+        [0xC3; 32],
     )
     .await
-    .expect("Carol engine starts");
-    let (dave, dave_driver) = spawn_network(
-        network_config("dave", turn_url, false),
+    .expect("Carol Closed creator starts");
+    let closed_context = carol.mesh_context_id();
+    let closed_record = carol.verified_bootstrap_record().clone();
+    let mut dave_config = network_config("dave", turn_url, false);
+    dave_config.kind = NetworkKind::Closed;
+    let (dave, dave_driver) = import_network_in_instance_root(
+        dave_config,
         Arc::clone(&dave_id),
         relay_only_test_transport(&test_resources),
+        dave_root.path().to_path_buf(),
+        closed_context,
+        closed_record,
     )
     .await
-    .expect("Dave engine starts");
+    .expect("Dave Closed importer starts");
     let mut carol_events = carol.events_tx.subscribe();
     let mut dave_events = dave.events_tx.subscribe();
     let negative_broker = LocalBroker::new();

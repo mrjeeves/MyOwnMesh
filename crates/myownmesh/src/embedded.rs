@@ -2100,7 +2100,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("the inner current-thread runtime builds");
-        let startup_provider = provider.clone();
+        let _startup_provider = provider.clone();
         let (daemon, witness, supervisor, registry, services, temp) =
             runtime.block_on(async move {
                 let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;

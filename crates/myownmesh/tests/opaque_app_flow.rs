@@ -493,6 +493,9 @@ async fn wait_for_peer(path: &Path, peer: &str, deadline: Instant) -> Result<(),
                     peers.iter().any(|candidate| {
                         candidate.get("device_id").and_then(Value::as_str) == Some(peer)
                             && candidate.get("authenticated").and_then(Value::as_bool) == Some(true)
+                            // Auth precedes the promoted current session; wait for
+                            // the serialized Active edge before opening a flow.
+                            && candidate.get("status").and_then(Value::as_str) == Some("active")
                     })
                 });
             if ready {
