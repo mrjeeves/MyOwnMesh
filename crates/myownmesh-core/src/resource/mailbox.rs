@@ -1115,9 +1115,18 @@ mod tests {
                 .0,
             item
         );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "popping releases item custody while the mailbox handles retain the root"
+        );
         drop(tx);
         drop(rx);
-        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(
+            provider.in_use(),
+            ResourceClaim::ZERO,
+            "dropping the final mailbox handles releases root and scope custody"
+        );
     }
 
     #[test]

@@ -11,112 +11,65 @@
 //! both on one host.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Condvar;
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread;
 
 use stun::message::{Message, BINDING_REQUEST, BINDING_SUCCESS};
 use stun::xoraddr::XorMappedAddress;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
 use myownmesh_core::config::StunServiceConfig;
-use myownmesh_core::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
+use myownmesh_core::{FundedArc, LocalApplicationResourceScope, ResourceClaim, ResourceClass};
 
-use crate::turn::{reserve_final_task_custody, FinalTaskCustody};
-use crate::{Error, Result};
+use crate::cleanup::{planned, ServiceCompletion, ServiceCustody, StunTerminalGuard};
+use crate::{Error, Result, ServiceCleanupError, ServiceCleanupPort};
 
 /// A running STUN server. Constructed via
 /// [`StunServer::start_with_resource_scope`].
 pub struct StunServer;
 
-struct TaskTerminal {
-    finished: AtomicBool,
-    notify: Notify,
-    #[cfg(test)]
-    done: (std::sync::Mutex<bool>, Condvar),
-}
-
-impl TaskTerminal {
-    fn new() -> Self {
-        Self {
-            finished: AtomicBool::new(false),
-            notify: Notify::new(),
-            #[cfg(test)]
-            done: (std::sync::Mutex::new(false), Condvar::new()),
-        }
-    }
-
-    fn mark(&self) {
-        self.finished.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-        #[cfg(test)]
-        {
-            let (done, wake) = &self.done;
-            *done
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-            wake.notify_all();
-        }
-    }
-
-    #[cfg(test)]
-    fn wait_finished(&self) {
-        let (done, wake) = &self.done;
-        let mut done = done
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*done {
-            done = wake
-                .wait(done)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
-/// Handle to a running STUN server. Call [`StunServerHandle::stop_and_wait`]
-/// to abort and join the listener. Dropping it aborts the listener and hands
-/// its exact join handle to the service's explicitly bounded final custodian
-/// for terminal observation when the owner cannot await. The terminal closure
-/// joins the original task directly on the custodian worker.
+/// A running STUN listener with an already registered outside cleanup entry.
+/// Drop aborts and transfers the exact listener; it never joins locally.
 pub struct StunServerHandle {
     task: Option<JoinHandle<()>>,
-    terminal: Arc<TaskTerminal>,
-    final_task_custody: FinalTaskCustody,
-    service_lease: Option<ResourceLease>,
+    terminal: FundedArc<ServiceCompletion>,
+    custody: ServiceCustody,
     local_addr: SocketAddr,
 }
 
 impl StunServerHandle {
-    /// The address the server actually bound. Useful when the config
-    /// requested port 0 (ephemeral) — common in tests.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Abort the listener and join it to its terminal state.
-    ///
-    /// STUN's listener has no protocol shutdown frame; cancellation is the
-    /// service's explicit stop signal. Awaiting the join closes the lifecycle
-    /// boundary and surfaces an unexpected panic instead of leaving a detached
-    /// task behind.
-    pub async fn stop_and_wait(mut self) -> Result<()> {
-        let task_result = if let Some(task) = self.task.take() {
+    fn request_stop(&self) {
+        if let Some(task) = &self.task {
+            self.terminal.request_stun_stop();
             task.abort();
-            task.await
+        }
+    }
+
+    /// Observe the original listener, then the same outside-owned disposition.
+    /// Cancelling either await leaves the task in this handle or the root.
+    pub async fn stop_and_wait(mut self) -> Result<()> {
+        self.request_stop();
+        let task_result = if let Some(task) = self.task.as_mut() {
+            (&mut *task).await
         } else {
             Ok(())
         };
-        self.terminal.mark();
-        drop(self.service_lease.take());
+        self.task.take();
+        let failed = self.terminal.stun_task_failed(&task_result);
+        self.custody.finish_stun(None, failed);
+        self.terminal.wait_joined().await;
+        self.custody.observe_disposition();
+        if !failed && self.terminal.task_failed() {
+            return Err(Error::Cleanup(ServiceCleanupError::WorkerJoin));
+        }
         match task_result {
             Ok(()) => Ok(()),
-            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) if error.is_cancelled() && !failed => Ok(()),
             Err(error) => Err(Error::TaskJoin(error.to_string())),
         }
     }
@@ -124,63 +77,19 @@ impl StunServerHandle {
 
 impl Drop for StunServerHandle {
     fn drop(&mut self) {
-        let final_task_custody = &mut self.final_task_custody;
-        let Some(task) = self.task.take() else {
-            return;
-        };
-        task.abort();
-        let terminal = Arc::clone(&self.terminal);
-        let service_lease = self.service_lease.take();
-        submit_final_task(
-            Box::new(move || {
-                if let Err(error) = join_without_runtime(task) {
-                    if !error.is_cancelled() {
-                        warn!("dropped STUN listener did not join normally: {error}");
-                    }
-                }
-                terminal.mark();
-                drop(service_lease);
-            }),
-            final_task_custody,
-        );
-    }
-}
-
-fn submit_final_task(task: Box<dyn FnOnce() + Send + 'static>, custody: &mut FinalTaskCustody) {
-    if let Err(task) = custody.submit(task) {
-        // Refusal is explicit and nonblocking. The exact owned terminal job
-        // is run here; no fallback thread may detach the observation.
-        task();
-    }
-}
-
-struct ThreadUnparker(thread::Thread);
-
-impl Wake for ThreadUnparker {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-fn join_without_runtime(
-    mut task: JoinHandle<()>,
-) -> std::result::Result<(), tokio::task::JoinError> {
-    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut task = std::pin::Pin::new(&mut task);
-    loop {
-        match std::future::Future::poll(task.as_mut(), &mut context) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => thread::park(),
+        self.request_stop();
+        if let Some(task) = self.task.take() {
+            self.custody.finish_stun(Some(task), false);
         }
     }
 }
 
 impl StunServer {
+    /// Exact retained no-client service reservations; excludes root and scopes.
+    pub fn startup_planning_charge() -> std::result::Result<ResourceClaim, ServiceCleanupError> {
+        Ok(planned(stun_startup_claim())?
+            .checked_add(ServiceCleanupPort::entry_planning_charge()?)?)
+    }
     /// The unscoped constructor is intentionally non-binding. Service
     /// ownership must come from the process owner's resource scope.
     pub async fn start(config: &StunServiceConfig) -> Result<StunServerHandle> {
@@ -196,28 +105,51 @@ impl StunServer {
     pub async fn start_with_resource_scope(
         config: &StunServiceConfig,
         scope: LocalApplicationResourceScope,
+        cleanup: ServiceCleanupPort,
     ) -> Result<StunServerHandle> {
         let service_lease = scope
             .acquire(stun_startup_claim())
             .map_err(|error| Error::Resource(error.to_string()))?;
-        let final_task_custody = reserve_final_task_custody(1)
-            .ok_or_else(|| Error::TaskJoin("service final-task custody exhausted".into()))?;
+        let mut custody = cleanup.reserve(&scope, service_lease)?;
+        let terminal = custody.completion();
+        if let Err(error) = custody.spawn_stun_observer() {
+            custody.submit();
+            terminal.wait_joined().await;
+            custody.observe_disposition();
+            return Err(error.into());
+        }
         let addr = format!("{}:{}", config.bind, config.port);
-        let socket = UdpSocket::bind(&addr)
-            .await
-            .map_err(|e| Error::Bind(addr.clone(), e))?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| Error::Bind(addr.clone(), e))?;
+        let socket = match UdpSocket::bind(&addr).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                custody.submit();
+                terminal.wait_joined().await;
+                custody.observe_disposition();
+                return Err(Error::Bind(addr, error));
+            }
+        };
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                drop(socket);
+                custody.submit();
+                terminal.wait_joined().await;
+                custody.observe_disposition();
+                return Err(Error::Bind(addr, error));
+            }
+        };
         info!(%local_addr, "STUN server listening");
         let socket = Arc::new(socket);
-        let terminal = Arc::new(TaskTerminal::new());
-        let task = tokio::spawn(serve(socket));
+        let terminal_guard = StunTerminalGuard(terminal.clone());
+        let task = tokio::spawn(async move {
+            terminal_guard.entered();
+            let _terminal = terminal_guard;
+            serve(socket).await;
+        });
         Ok(StunServerHandle {
             task: Some(task),
             terminal,
-            final_task_custody,
-            service_lease: Some(service_lease),
+            custody,
             local_addr,
         })
     }
@@ -292,6 +224,98 @@ fn binding_response(packet: &[u8], src: SocketAddr) -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cleanup::test_support::{with_runtime, TestRoot};
+
+    #[test]
+    fn two_queued_stun_services_keep_both_leases_until_original_tasks_and_workers_join() {
+        use myownmesh_core::{FiniteResourceProvider, ResourceProviderPort};
+        let root = TestRoot::new();
+        let plan = StunServer::startup_planning_charge().unwrap();
+        let grant = plan
+            .checked_scale(2)
+            .unwrap()
+            .checked_add(
+                FiniteResourceProvider::scope_planning_charge()
+                    .checked_scale(2)
+                    .unwrap(),
+            )
+            .unwrap();
+        let provider = FiniteResourceProvider::new(grant);
+        let provider_port = ResourceProviderPort::new(provider.clone()).unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&provider_port).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let observations = runtime.block_on(async {
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let first =
+                StunServer::start_with_resource_scope(&config, scope.clone(), root.port()).await?;
+            let second =
+                StunServer::start_with_resource_scope(&config, scope.clone(), root.port()).await?;
+            tokio::task::yield_now().await;
+            let terminals = (first.terminal.clone(), second.terminal.clone());
+            // No await after abort: neither listener can be destroyed by this
+            // current-thread runtime until its execution/destruction resumes.
+            drop((first, second));
+            let held = provider.in_use().amount(ResourceClass::SocketOrHandle) == 2
+                && provider.in_use().amount(ResourceClass::WorkerOrTask) == 4;
+            let both_pending = !terminals.0.is_joined() && !terminals.1.is_joined();
+            Ok::<_, Error>((terminals, held, both_pending))
+        });
+        drop(runtime);
+        let report = root.close();
+        let observed = observations.map(|(terminals, held, pending)| {
+            let joined = terminals.0.is_joined() && terminals.1.is_joined();
+            drop(terminals);
+            (held, pending, joined)
+        });
+        drop((scope, provider_port));
+        let (held, pending, joined) = observed.expect("two exact real listeners");
+        assert!(held && pending && joined);
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.task_failures, 0);
+        assert_eq!(report.worker_failures, 0);
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+    }
+
+    #[test]
+    fn cancelled_stun_stop_preserves_original_task_custody() {
+        use std::future::Future;
+        use std::task::Poll;
+        with_runtime(|cleanup| async move {
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server = start_with_scope(&cleanup, &config).await.unwrap();
+            tokio::task::yield_now().await;
+            let terminal = server.terminal.clone();
+            let first_pending = {
+                let stopping = server.stop_and_wait();
+                tokio::pin!(stopping);
+                std::future::poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending()))
+                    .await
+                // pinned future is destroyed here, before waiting on terminal
+            };
+            terminal.wait_joined().await;
+            let report = cleanup.report_for_test();
+            assert!(first_pending && terminal.is_joined());
+            assert!(!terminal.task_failed());
+            assert_eq!(report.completed, 1);
+            assert_eq!(report.task_failures, 0);
+            assert_eq!(report.worker_failures, 0);
+        });
+    }
     use stun::message::Getter;
     use stun::xoraddr::XorMappedAddress;
 
@@ -310,243 +334,450 @@ mod tests {
             .expect("test application scope is valid")
     }
 
-    async fn start_with_scope(config: &StunServiceConfig) -> Result<StunServerHandle> {
-        StunServer::start_with_resource_scope(config, test_scope()).await
+    async fn start_with_scope(
+        cleanup: &ServiceCleanupPort,
+        config: &StunServiceConfig,
+    ) -> Result<StunServerHandle> {
+        StunServer::start_with_resource_scope(config, test_scope(), cleanup.clone()).await
     }
 
-    #[tokio::test]
-    async fn binding_request_gets_reflexive_address_back() {
-        let cfg = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0, // ephemeral
-        };
-        let server = start_with_scope(&cfg).await.unwrap();
-        let server_addr = server.local_addr();
-
-        // A real client socket sends a real Binding request.
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = client.local_addr().unwrap();
-
-        let mut req = Message::new();
-        req.build(&[Box::new(BINDING_REQUEST)]).unwrap();
-        client.send_to(&req.raw, server_addr).await.unwrap();
-
-        let mut buf = vec![0u8; 1500];
-        let (n, from) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.recv_from(&mut buf),
-        )
-        .await
-        .expect("STUN response timed out")
-        .unwrap();
-        assert_eq!(from, server_addr);
-
-        let mut resp = Message::new();
-        resp.unmarshal_binary(&buf[..n]).unwrap();
-        assert_eq!(resp.typ, BINDING_SUCCESS);
-        assert_eq!(resp.transaction_id, req.transaction_id);
-
-        // The server should report back the client's own address.
-        let mut mapped = XorMappedAddress::default();
-        mapped.get_from(&resp).unwrap();
-        assert_eq!(mapped.ip, client_addr.ip());
-        assert_eq!(mapped.port, client_addr.port());
-
-        server.stop_and_wait().await.unwrap();
+    /// Evidence discriminator only: run alone under an external process
+    /// deadline. A stuck synchronous Drop cannot be preempted by Tokio.
+    #[test]
+    #[ignore = "real current-thread STUN Drop; requires an external process watchdog"]
+    fn live_stun_drop_current_thread_without_external_custodian() {
+        use myownmesh_core::{FiniteResourceProvider, ResourceProviderPort};
+        let root = TestRoot::new();
+        let startup = StunServer::startup_planning_charge().expect("actual service plan");
+        let grant = startup
+            .checked_add(
+                FiniteResourceProvider::scope_planning_charge()
+                    .checked_scale(2)
+                    .unwrap(),
+            )
+            .unwrap();
+        let provider = FiniteResourceProvider::new(grant);
+        let provider_port = ResourceProviderPort::new(provider.clone()).unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&provider_port).unwrap();
+        let baseline = provider.in_use();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let observed = runtime.block_on(async {
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server =
+                StunServer::start_with_resource_scope(&config, scope.clone(), root.port()).await?;
+            tokio::task::yield_now().await;
+            let live_listener = server.local_addr().port() != 0
+                && server.task.as_ref().is_some_and(|task| !task.is_finished());
+            let live_delta = provider.in_use().checked_sub(baseline);
+            let terminal = server.terminal.clone();
+            eprintln!("stun-drop-discriminator/v2 before-handle-drop");
+            drop(server);
+            eprintln!("stun-drop-discriminator/v2 after-handle-drop");
+            Ok::<_, Error>((live_listener, live_delta, terminal))
+        });
+        eprintln!("stun-drop-discriminator/v2 before-runtime-drop");
+        drop(runtime);
+        eprintln!("stun-drop-discriminator/v2 after-runtime-drop");
+        let report = root.close();
+        let (live_listener, live_delta, terminal) = observed.expect("real constructor");
+        let service_terminal = terminal.is_joined();
+        let custodian_terminal = report.completed == 1 && report.worker_failures == 0;
+        drop(terminal);
+        let after_cleanup = provider.in_use();
+        drop((scope, provider_port));
+        assert!(live_listener);
+        assert_eq!(live_delta.unwrap(), startup);
+        assert!(service_terminal, "the exact listener join was observed");
+        assert!(
+            custodian_terminal,
+            "the outside root joined the final worker"
+        );
+        assert_eq!(report.task_failures, 0);
+        assert_eq!(after_cleanup, baseline);
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
     }
 
-    #[tokio::test]
-    async fn non_binding_packet_is_ignored() {
-        // Garbage that isn't STUN at all decodes-errors and is dropped;
-        // a well-formed non-Binding message returns None. Either way
-        // the helper must not panic.
-        let src: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(binding_response(b"not a stun packet", src).is_err());
+    #[test]
+    fn binding_request_gets_reflexive_address_back() {
+        with_runtime(|cleanup| async move {
+            let cfg = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0, // ephemeral
+            };
+            let server = start_with_scope(&cleanup, &cfg).await.unwrap();
+            let server_addr = server.local_addr();
+
+            // A real client socket sends a real Binding request.
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            let mut req = Message::new();
+            req.build(&[Box::new(BINDING_REQUEST)]).unwrap();
+            client.send_to(&req.raw, server_addr).await.unwrap();
+
+            let mut buf = vec![0u8; 1500];
+            let (n, from) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .expect("STUN response timed out")
+            .unwrap();
+            assert_eq!(from, server_addr);
+
+            let mut resp = Message::new();
+            resp.unmarshal_binary(&buf[..n]).unwrap();
+            assert_eq!(resp.typ, BINDING_SUCCESS);
+            assert_eq!(resp.transaction_id, req.transaction_id);
+
+            // The server should report back the client's own address.
+            let mut mapped = XorMappedAddress::default();
+            mapped.get_from(&resp).unwrap();
+            assert_eq!(mapped.ip, client_addr.ip());
+            assert_eq!(mapped.port, client_addr.port());
+
+            server.stop_and_wait().await.unwrap();
+        });
     }
 
-    #[tokio::test]
-    async fn active_stop_observes_listener_terminal() {
-        let cfg = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        let server = start_with_scope(&cfg).await.unwrap();
-        let terminal = Arc::clone(&server.terminal);
+    #[test]
+    fn non_binding_packet_is_ignored() {
+        with_runtime(|_cleanup| async move {
+            // Garbage that isn't STUN at all decodes-errors and is dropped;
+            // a well-formed non-Binding message returns None. Either way
+            // the helper must not panic.
+            let src: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            assert!(binding_response(b"not a stun packet", src).is_err());
+        });
+    }
 
-        server.stop_and_wait().await.unwrap();
+    #[test]
+    fn active_stop_observes_listener_terminal() {
+        with_runtime(|cleanup| async move {
+            let cfg = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server = start_with_scope(&cleanup, &cfg).await.unwrap();
+            let terminal = server.terminal.clone();
 
-        assert!(terminal.finished.load(Ordering::Acquire));
+            server.stop_and_wait().await.unwrap();
+
+            assert!(terminal.is_joined());
+        });
     }
 
     #[test]
     fn runtime_ended_before_drop_is_reaped_without_runtime_reentry() {
+        let root = TestRoot::new();
         let (server, terminal) = {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("single-thread runtime");
+                .unwrap();
             runtime.block_on(async {
                 let config = StunServiceConfig {
                     enabled: true,
                     bind: "127.0.0.1".into(),
                     port: 0,
                 };
-                let server = start_with_scope(&config).await.unwrap();
-                let terminal = Arc::clone(&server.terminal);
+                let server = start_with_scope(&root.port(), &config).await.unwrap();
+                let terminal = server.terminal.clone();
                 (server, terminal)
             })
         };
-
         drop(server);
+        let report = root.close();
+        assert!(terminal.is_joined());
+        assert!(terminal.task_failed());
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.task_failures, 1);
+        assert_eq!(report.worker_failures, 0);
+    }
 
-        terminal.wait_finished();
-        assert!(terminal.finished.load(Ordering::Acquire));
+    fn cancellation_provenance_control(request_before_runtime_drop: bool, poll_listener: bool) {
+        use myownmesh_core::{FiniteResourceProvider, ResourceProviderPort};
+        let root = TestRoot::new();
+        let startup = StunServer::startup_planning_charge().unwrap();
+        let grant = startup
+            .checked_add(
+                FiniteResourceProvider::scope_planning_charge()
+                    .checked_scale(2)
+                    .unwrap(),
+            )
+            .unwrap();
+        let provider = FiniteResourceProvider::new(grant);
+        let provider_port = ResourceProviderPort::new(provider.clone()).unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&provider_port).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = runtime.block_on(async {
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server =
+                StunServer::start_with_resource_scope(&config, scope.clone(), root.port()).await?;
+            if poll_listener {
+                while !server.terminal.listener_was_polled() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok::<_, Error>(server)
+        });
+        // Both handle and root stay outside the destroyed origin runtime. The
+        // only difference between paired cases is the private request's order.
+        let observed = started.as_ref().ok().map(|server| {
+            let polled = server.terminal.listener_was_polled();
+            let retained = provider.in_use();
+            if request_before_runtime_drop {
+                server.request_stop();
+            }
+            (server.terminal.clone(), polled, retained)
+        });
+        drop(runtime);
+        let setup_error = started.err(); // drops the still-owned handle on Ok
+        let report = root.close();
+        let observed = observed.map(|(terminal, polled, retained)| {
+            let joined = terminal.is_joined();
+            let failed = terminal.task_failed();
+            drop(terminal);
+            (polled, retained, joined, failed)
+        });
+        drop((scope, provider_port));
+        assert!(
+            setup_error.is_none(),
+            "real listener setup: {setup_error:?}"
+        );
+        let (polled, retained, joined, failed) = observed.expect("saved exact listener");
+        assert_eq!(polled, poll_listener);
+        assert_eq!(retained, grant);
+        assert!(joined);
+        assert_eq!(failed, !request_before_runtime_drop);
+        assert_eq!(report.completed, 1);
+        assert_eq!(
+            report.task_failures,
+            u64::from(!request_before_runtime_drop)
+        );
+        assert_eq!(report.worker_failures, 0);
+        // Unexpected cancellation is a task failure, not an unobserved cleanup:
+        // both exact handles were joined, so no native obligation is retained.
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+    }
+
+    #[test]
+    fn runtime_first_unpolled_stun_cancellation_cannot_be_relabelled_by_late_drop() {
+        cancellation_provenance_control(false, false);
+    }
+
+    #[test]
+    fn requested_unpolled_stun_cancellation_is_clean_after_exact_joins() {
+        cancellation_provenance_control(true, false);
+    }
+
+    #[test]
+    fn runtime_first_polled_stun_cancellation_cannot_be_relabelled_by_late_drop() {
+        cancellation_provenance_control(false, true);
+    }
+
+    #[test]
+    fn requested_polled_stun_cancellation_is_clean_after_exact_joins() {
+        cancellation_provenance_control(true, true);
     }
 
     #[test]
     fn current_thread_drop_observes_worker_before_runtime_destruction() {
-        let (terminal, worker_done, port) = {
+        // The repaired contract observes the worker AFTER runtime destruction
+        // and outside-root join; Drop itself must return without joining.
+        let root = TestRoot::new();
+        let (terminal, port) = {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("single-thread runtime");
+                .unwrap();
             runtime.block_on(async {
                 let config = StunServiceConfig {
                     enabled: true,
                     bind: "127.0.0.1".into(),
                     port: 0,
                 };
-                let server = start_with_scope(&config).await.unwrap();
-                let terminal = Arc::clone(&server.terminal);
-                let worker_done = server.final_task_custody.worker_done_witness();
+                let server = start_with_scope(&root.port(), &config).await.unwrap();
+                let terminal = server.terminal.clone();
                 let port = server.local_addr().port();
                 drop(server);
-                (terminal, worker_done, port)
+                (terminal, port)
             })
         };
-
-        assert!(terminal.finished.load(Ordering::Acquire));
-        assert!(worker_done.load(Ordering::Acquire));
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("replacement runtime");
-        runtime.block_on(async {
+        let report = root.close();
+        assert!(terminal.is_joined());
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.worker_failures, 0);
+        with_runtime(|cleanup| async move {
             let config = StunServiceConfig {
                 enabled: true,
                 bind: "127.0.0.1".into(),
                 port,
             };
-            start_with_scope(&config)
+            start_with_scope(&cleanup, &config)
                 .await
-                .expect("Drop released the exact control port")
+                .expect("exact port reusable")
                 .stop_and_wait()
                 .await
                 .unwrap();
         });
     }
 
-    #[tokio::test]
-    async fn stopped_stun_releases_the_exact_control_port_for_reuse() {
-        let mut config = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        let first = start_with_scope(&config).await.unwrap();
-        let port = first.local_addr().port();
-        first.stop_and_wait().await.unwrap();
+    #[test]
+    fn stopped_stun_releases_the_exact_control_port_for_reuse() {
+        with_runtime(|cleanup| async move {
+            let mut config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let first = start_with_scope(&cleanup, &config).await.unwrap();
+            let port = first.local_addr().port();
+            first.stop_and_wait().await.unwrap();
 
-        config.port = port;
-        let second = start_with_scope(&config).await.unwrap();
-        assert_eq!(second.local_addr().port(), port);
-        second.stop_and_wait().await.unwrap();
+            config.port = port;
+            let second = start_with_scope(&cleanup, &config).await.unwrap();
+            assert_eq!(second.local_addr().port(), port);
+            second.stop_and_wait().await.unwrap();
+        });
     }
 
-    #[tokio::test]
-    async fn exact_startup_grant_rejects_n_plus_one_and_reuses_after_stop() {
-        let insufficient_port =
-            myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(
-                stun_startup_claim()
-                    .checked_sub(ResourceClaim::single(ResourceClass::WorkerOrTask, 1))
-                    .unwrap(),
-            ))
+    #[test]
+    fn exact_startup_grant_rejects_n_plus_one_and_reuses_after_stop() {
+        with_runtime(|cleanup| async move {
+            let insufficient_port = myownmesh_core::ResourceProviderPort::new(
+                myownmesh_core::FiniteResourceProvider::new(
+                    StunServer::startup_planning_charge()
+                        .unwrap()
+                        .checked_sub(ResourceClaim::single(ResourceClass::WorkerOrTask, 1))
+                        .unwrap()
+                        .checked_add(
+                            myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                                .checked_scale(2)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                ),
+            )
             .unwrap();
-        let insufficient_scope =
-            LocalApplicationResourceScope::transport_lab_child_of(&insufficient_port).unwrap();
-        let insufficient_config = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        assert!(matches!(
-            StunServer::start_with_resource_scope(&insufficient_config, insufficient_scope).await,
-            Err(Error::Resource(_))
-        ));
+            let insufficient_scope =
+                LocalApplicationResourceScope::transport_lab_child_of(&insufficient_port).unwrap();
+            let insufficient_config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            assert!(matches!(
+                StunServer::start_with_resource_scope(
+                    &insufficient_config,
+                    insufficient_scope,
+                    cleanup.clone()
+                )
+                .await,
+                Err(Error::Resource(_))
+            ));
 
-        let port = myownmesh_core::ResourceProviderPort::new(
-            myownmesh_core::FiniteResourceProvider::new(stun_startup_claim()),
-        )
-        .unwrap();
-        let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
-        let config = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        let first = StunServer::start_with_resource_scope(&config, scope.clone())
-            .await
+            let port = myownmesh_core::ResourceProviderPort::new(
+                myownmesh_core::FiniteResourceProvider::new(
+                    StunServer::startup_planning_charge()
+                        .unwrap()
+                        .checked_add(
+                            myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                                .checked_scale(2)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                ),
+            )
             .unwrap();
-        let refused = StunServer::start_with_resource_scope(&config, scope.clone()).await;
-        assert!(matches!(refused, Err(Error::Resource(_))));
-        first.stop_and_wait().await.unwrap();
-        StunServer::start_with_resource_scope(&config, scope)
-            .await
-            .unwrap()
-            .stop_and_wait()
-            .await
-            .unwrap();
+            let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let first =
+                StunServer::start_with_resource_scope(&config, scope.clone(), cleanup.clone())
+                    .await
+                    .unwrap();
+            let refused =
+                StunServer::start_with_resource_scope(&config, scope.clone(), cleanup.clone())
+                    .await;
+            assert!(matches!(refused, Err(Error::Resource(_))));
+            first.stop_and_wait().await.unwrap();
+            StunServer::start_with_resource_scope(&config, scope, cleanup.clone())
+                .await
+                .unwrap()
+                .stop_and_wait()
+                .await
+                .unwrap();
+        });
     }
 
-    #[tokio::test]
-    async fn drop_outside_runtime_is_reaped_by_runtime_owner() {
-        let cfg = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        let server = start_with_scope(&cfg).await.unwrap();
-        let terminal = Arc::clone(&server.terminal);
-        let notified = terminal.notify.notified();
+    #[test]
+    fn drop_outside_runtime_is_reaped_by_runtime_owner() {
+        with_runtime(|cleanup| async move {
+            let cfg = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server = start_with_scope(&cleanup, &cfg).await.unwrap();
+            let terminal = server.terminal.clone();
+            let notified = terminal.wait_joined();
 
-        std::thread::spawn(move || drop(server))
-            .join()
-            .expect("drop thread panicked");
-        notified.await;
+            std::thread::spawn(move || drop(server))
+                .join()
+                .expect("drop thread panicked");
+            notified.await;
 
-        assert!(terminal.finished.load(Ordering::Acquire));
+            assert!(terminal.is_joined());
+        });
     }
 
-    #[tokio::test]
-    async fn double_bind_same_port_errors() {
-        let cfg = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-        };
-        let server = start_with_scope(&cfg).await.unwrap();
-        let taken = server.local_addr();
-        // Re-binding the now-occupied port must surface as Error::Bind.
-        let cfg2 = StunServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: taken.port(),
-        };
-        let err = start_with_scope(&cfg2).await;
-        assert!(matches!(err, Err(Error::Bind(_, _))));
-        server.stop_and_wait().await.unwrap();
+    #[test]
+    fn double_bind_same_port_errors() {
+        with_runtime(|cleanup| async move {
+            let cfg = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+            };
+            let server = start_with_scope(&cleanup, &cfg).await.unwrap();
+            let taken = server.local_addr();
+            // Re-binding the now-occupied port must surface as Error::Bind.
+            let cfg2 = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: taken.port(),
+            };
+            let err = start_with_scope(&cleanup, &cfg2).await;
+            assert!(matches!(err, Err(Error::Bind(_, _))));
+            server.stop_and_wait().await.unwrap();
+        });
     }
 }

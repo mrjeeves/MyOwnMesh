@@ -35,6 +35,11 @@ fn long_term_credentials(username: &str, shared_secret: &str) -> String {
     BASE64_STANDARD.encode(password)
 }
 
+/// Output bytes retained by one key from the existing MD5-based auth helper.
+pub fn auth_key_len() -> usize {
+    <Md5 as md5::digest::OutputSizeUser>::output_size()
+}
+
 /// A convenience function to easily generate keys in the format used by [`AuthHandler`].
 pub fn generate_auth_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
     let s = format!("{username}:{realm}:{password}");

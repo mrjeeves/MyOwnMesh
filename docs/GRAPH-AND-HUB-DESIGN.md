@@ -49,7 +49,7 @@ add that consumer.
 ## Existing sparse Hub topology and bounded maintenance
 
 Hub identities remain explicitly configured. Spokes select redundant hubs by
-deterministic rendezvous ranking; routing uses the existing exact-session
+deterministic rendezvous ranking; setup uses the existing exact-session
 authenticated transport. With `N` total members, `H` distinct configured hubs,
 and spoke redundancy `R <= H`, the configured topology has at most
 
@@ -65,34 +65,29 @@ That full tier is a property of the legacy configured `Hubs` selector, not a
 universal requirement for every Hub-introduction path or for every active
 application pair.
 
-### Hub/application demand direction
+### Hub-assisted endpoint connections
 
-The configured Hub set is a sparse directory and forwarding preference, not a
-permanent all-to-all connection plan. A real application request introduces
-bounded, coalesced endpoint demand: prefer a directly usable authenticated
-endpoint connection and use configured TURN as a distinct ICE service when the
-direct path is unsuitable. A Hub introduction negotiates endpoint connectivity;
-it does not own application payload.
+Hubs consolidate discovery and introduce endpoints. They do not route
+application payloads, including ciphertext. Application demand obtains an
+authenticated endpoint WebRTC session using direct ICE connectivity or
+configured TURN. TURN is a distinct protocol service even when hosted on a Hub.
 
-Only a separately bounded residual Hub-transit fallback carries endpoint
-ciphertext. Its endpoints derive a fresh endpoint-to-endpoint E2E epoch bound
-to the exact mesh context and full endpoint keys; the Hub may copy/forward that
-ciphertext and observe metadata, but cannot decrypt or read application
-plaintext. If the epoch cannot be established, the operation refuses; there is
-no plaintext compatibility fallback. A Hub receives no membership authority or
-permission to veto an independently viable direct or alternate route.
+`NetworkConfig.introduction` contains only owner-selected connection-setup
+and demand limits. Discovery and introductions cannot grant membership;
+endpoint authentication and current network policy gate application operations.
+There is no application fallback through Hub signaling when setup fails.
 
-This avoids unavoidable all-pairs maintained links, but all-pairs active
-application demand can still produce quadratic endpoint sessions. The
-direction is an architecture contract, not a shipped-feature or qualification
-claim; exact implementation and evidence remain governed by the current
-head's ownership and qualification records.
+Service advertisements currently carry TURN URLs only; credentials remain
+local configuration. They must not be published as presence metadata or hidden
+inside generic signaling payloads. Custom endpoint-cipher and Closed member
+relay transports are removed. Historical qualification records remain
+historical and do not qualify this new boundary.
 
 The optional Hub maintenance policy bounds parallel dials and work per pass.
 Rotation through eligible work must prevent a repeatedly unavailable early
 candidate from starving later candidates. Resource admission and existing
 session promotion remain mandatory. A Hub role is neither a trust root nor a
-promise of unlimited relay capacity.
+promise of unlimited connection-setup capacity.
 
 Trickle applies only to idempotent Hub configuration advertisements. The
 consistency digest binds the network context through its envelope and binds
@@ -128,37 +123,13 @@ small set of backup candidates. A prospective parent rechecks its capacity
 when accepting a registration. A candidate being visible is not a completed
 registration or an authenticated connection.
 
-The first proposed shape is deliberately shallow: a configured routing root,
-its hub children, and leaf peers attached to those hubs. The root is a topology
-role, never a semantic authority. The longest primary route is
-leaf -> hub -> root -> hub -> leaf, within the existing four-hop envelope.
-Deeper trees require separate protocol work; increasing the TTL silently is
-not an implementation of this contract. The legacy Hubs mode above remains
-unchanged. The existing local control record reports PASS for authenticated
-attachment, bidirectional four-hop delivery, lower-ranked fallback, discovery,
-and accepted relation expiry at its cited historical source. That evidence is
-not current-head qualification; the new Hub introduction and endpoint-cipher
-overlay remain unqualified. See [the local verification record](qualification/graph-hub-local-evidence.md)
-for exact source/binary evidence and limits.
+Parent/child attachment and preferred Hub selection organize discovery and
+connection setup. They do not establish a multi-hop application data plane.
+Accepted parents and independently usable endpoint connections remain distinct:
+a failed Hub cannot veto an otherwise permitted direct or TURN-backed endpoint
+session. Topology membership is not semantic membership authority.
 
-The tree is a preferred sparse route, not an exclusive connectivity or
-permission hierarchy. A hub can refuse resources or forwarding service that
-it owns; it cannot veto a separately permitted direct connection or a route
-through another hub or relay. Parent refusal, failure, or exhaustion must
-leave bounded alternate attempts available. A failed hub is a connectivity
-dead end only when it was the only usable way out and no alternative route
-exists. Authentication, membership rules, and each participant's resource
-limits still apply; this is not a promise of unlimited capacity or reachability.
-
-Preferred candidate ranking must agree between attachment and routing.
-Retaining only a small preferred set must not permanently hide other eligible
-candidates from paced exploration. Accepted parent slots and independently
-admitted alternate forwarding are distinct services: neither a raw referral
-nor an absent parent relation alone decides whether an alternate connection
-is authorized. Retrying a payload after an ambiguous write also requires the
-existing delivery/deduplication contract, not an unconditional second send.
-
-Healthy routes must not disable exploration. Discovery has its own paced,
+Healthy endpoint connections must not disable exploration. Discovery has its own paced,
 jittered budget, independent of Trickle suppression and connection health.
 A peer can request a bounded identity page over an existing authenticated
 session. Returned identities are attributed hints, not permission to connect,

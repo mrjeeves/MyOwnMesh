@@ -78,12 +78,6 @@ const expectedRequestVariants = [
   "GovernanceMfaAbort",
   "GovernanceMfaStatus",
   "GovernanceMfaDisable",
-  "ClosedRelayOpen",
-  "ClosedRelayAccept",
-  "ClosedRelaySend",
-  "ClosedRelayRecv",
-  "ClosedRelayClose",
-  "ClosedRelayState",
   "UpdateStatus",
   "UpdateCheck",
   "UpdateApply",
@@ -414,14 +408,14 @@ test("daemon and Tauri Request enums have exhaustive exact wire coverage", () =>
   const tauriVariants = rustVariantNames(tauriClientSource, "Request");
   const expected = [...expectedRequestVariants].sort();
 
-  assert.equal(expected.length, 68);
+  assert.equal(expected.length, 62);
   assert.deepEqual([...new Set(daemonVariants)].sort(), expected);
   assert.deepEqual([...new Set(tauriVariants)].sort(), expected);
-  assert.equal(daemonVariants.length, 68, "daemon Request has duplicate/missing variants");
-  assert.equal(tauriVariants.length, 68, "Tauri Request has duplicate/missing variants");
+  assert.equal(daemonVariants.length, 62, "daemon Request has duplicate/missing variants");
+  assert.equal(tauriVariants.length, 62, "Tauri Request has duplicate/missing variants");
 
   const fixtureVariants = fixtureVariantNames();
-  assert.equal(fixtureVariants.length, 68, "Tauri fixture must cover every variant once");
+  assert.equal(fixtureVariants.length, 62, "Tauri fixture must cover every variant once");
   assert.deepEqual([...new Set(fixtureVariants)].sort(), expected);
 
   for (const source of [daemonWireSource, tauriClientSource]) {
@@ -457,12 +451,27 @@ test("daemon and Tauri Request enums have exhaustive exact wire coverage", () =>
   }
 
   const wireNames = expectedRequestVariants.map(snakeCase);
-  assert.equal(new Set(wireNames).size, 68, "wire operation names must remain unique");
+  assert.equal(new Set(wireNames).size, 62, "wire operation names must remain unique");
   assert.deepEqual(
     fixtureWireTagNames().sort(),
     wireNames.sort(),
     "Tauri serialization tags drifted",
   );
+});
+
+test("member relay requests are absent from both current wire facades", () => {
+  for (const source of [daemonWireSource, tauriClientSource]) {
+    const variants = rustVariantNames(source, "Request");
+    const body = declarationBody(source, "Request");
+    for (const suffix of ["Open", "Accept", "Send", "Recv", "Close", "State"]) {
+      const retired = `ClosedRelay${suffix}`;
+      assert.ok(!variants.includes(retired), `${retired} must not be constructible`);
+      assert.ok(
+        !body.includes(`"${snakeCase(retired)}"`),
+        `${retired} must not survive as a renamed or aliased wire operation`,
+      );
+    }
+  }
 });
 
 test("every frontend invoke uses the exact payload keys for its Tauri command", () => {

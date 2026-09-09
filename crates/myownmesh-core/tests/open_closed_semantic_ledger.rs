@@ -13,7 +13,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use myownmesh_core::config::{NetworkConfig, NetworkKind, SemanticPolicyConfig};
-use myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES;
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
 };
@@ -159,7 +158,6 @@ fn connector_policy() -> WebRtcConnectorCapablePolicy {
 fn network_config(id: &str, kind: NetworkKind) -> NetworkConfig {
     let mut config = NetworkConfig::from_network_id(id, id);
     config.kind = kind;
-    config.routing_policy = Default::default();
     config.signaling.strategy = "none".into();
     config.signaling.mdns = false;
     config.stun_servers.clear();
@@ -202,8 +200,7 @@ async fn exported_fact(
         context_id: identity.context_id(),
         cursor: None,
         max_facts: 64,
-        max_encoded_bytes: u32::try_from(CLOSED_RELAY_WEBRTC_CALLBACK_BYTES)
-            .expect("protocol callback bound fits u32"),
+        max_encoded_bytes: 65_535,
     })?;
     page.facts()
         .iter()

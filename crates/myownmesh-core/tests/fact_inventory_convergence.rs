@@ -14,8 +14,7 @@ use myownmesh_core::semantic::{
     DeviceId, FactBody, FactContent, FactId, MeshContextId, SignedFact,
 };
 
-const EXACT_RECEIVE_FRAME_BYTES: usize =
-    myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES as usize;
+const EXACT_RECEIVE_FRAME_BYTES: usize = 65_535;
 
 #[derive(Clone, Copy)]
 struct ExactRoute {

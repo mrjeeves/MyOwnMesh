@@ -660,6 +660,7 @@ mod tests {
         Arc<DurableSemanticOwner>,
         MeshContextId,
         ProofRecord,
+        u64,
     ) {
         let root = root();
         let key = SigningKey::from_bytes(&[9; 32]);
@@ -682,6 +683,9 @@ mod tests {
             &key,
         )
         .expect("fact");
+        let fact_encoded_bytes =
+            u64::try_from(serde_json::to_vec(&fact).expect("fact JSON encoding").len())
+                .expect("fact JSON length fits");
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.admit(fact.clone()).expect("fact admission");
         let store = DurableSemanticStore::new(&root, "slot");
@@ -695,7 +699,24 @@ mod tests {
             "race-binding",
         )
         .expect("record");
-        (root, owner, bootstrap.context_id(), record)
+        (
+            root,
+            owner,
+            bootstrap.context_id(),
+            record,
+            fact_encoded_bytes,
+        )
+    }
+
+    fn owner_with_policy(
+        root: &std::path::Path,
+        policy: SemanticPolicyConfig,
+    ) -> Arc<DurableSemanticOwner> {
+        Arc::new(
+            DurableSemanticStore::with_policy(root, "slot", policy)
+                .open_writable()
+                .expect("shared owner with requested policy"),
+        )
     }
 
     fn shared_owner_fixture() -> (
@@ -704,7 +725,7 @@ mod tests {
         MeshContextId,
         ProofRecord,
     ) {
-        let (root, owner, context, record) = shared_owner_components();
+        let (root, owner, context, record, _) = shared_owner_components();
         let outbox = Arc::new(
             DurableProofOutbox::from_owner_with_policy(owner, checked_default_policy())
                 .expect("checked owner policy"),
@@ -728,11 +749,12 @@ mod tests {
     }
 
     fn policy_for_pending_limits(
+        max_fact_encoded_bytes: u64,
         max_pending_proofs: u64,
         max_pending_proof_bytes: u64,
     ) -> SemanticPolicyConfig {
         SemanticPolicyConfig {
-            max_fact_encoded_bytes: 1,
+            max_fact_encoded_bytes,
             max_pending_proofs,
             max_pending_proof_bytes,
             max_ready_batch: max_pending_proofs,
@@ -741,13 +763,14 @@ mod tests {
     }
 
     fn policy_for_total_limits(
+        max_fact_encoded_bytes: u64,
         max_proof_records: u64,
         max_proof_bytes: u64,
     ) -> SemanticPolicyConfig {
         SemanticPolicyConfig {
-            max_fact_encoded_bytes: 1,
+            max_fact_encoded_bytes,
             max_pending_proofs: 1,
-            max_pending_proof_bytes: 65_535,
+            max_pending_proof_bytes: max_proof_bytes,
             max_ready_batch: 1,
             max_proof_records,
             max_proof_bytes,
@@ -757,14 +780,16 @@ mod tests {
 
     #[test]
     fn pending_limits_measure_exact_records_and_refuse_before_mutation() {
-        let (root, owner, context, first) = shared_owner_components();
+        let (root, owner, context, first, fact_encoded_bytes) = shared_owner_components();
         let second = second_target_record(context, &first.fact_ids);
         let first_bytes = canonical_record_bytes(&first).expect("first record bytes");
         let second_bytes = canonical_record_bytes(&second).expect("second record bytes");
         let exact_bytes = first_bytes
             .checked_add(second_bytes)
             .expect("test record bytes fit");
-        let policy = policy_for_pending_limits(2, exact_bytes);
+        let policy = policy_for_pending_limits(fact_encoded_bytes, 2, exact_bytes);
+        drop(owner);
+        let owner = owner_with_policy(&root, policy);
         let outbox = DurableProofOutbox::from_owner_with_policy(owner, policy)
             .expect("exact pending policy");
 
@@ -798,17 +823,21 @@ mod tests {
         drop(outbox);
         let _ = std::fs::remove_dir_all(root);
 
-        let (short_root, short_owner, short_context, short_first) = shared_owner_components();
+        let (short_root, short_owner, short_context, short_first, short_fact_encoded_bytes) =
+            shared_owner_components();
         let short_second = second_target_record(short_context, &short_first.fact_ids);
         let short_first_bytes = canonical_record_bytes(&short_first).expect("first bytes");
         let short_second_bytes = canonical_record_bytes(&short_second).expect("second bytes");
         let short_policy = policy_for_pending_limits(
+            short_fact_encoded_bytes,
             2,
             short_first_bytes
                 .checked_add(short_second_bytes)
                 .expect("short test bytes fit")
                 - 1,
         );
+        drop(short_owner);
+        let short_owner = owner_with_policy(&short_root, short_policy);
         let short_outbox = DurableProofOutbox::from_owner_with_policy(short_owner, short_policy)
             .expect("one-unit-short policy");
         short_outbox
@@ -828,13 +857,14 @@ mod tests {
         drop(short_outbox);
         let _ = std::fs::remove_dir_all(short_root);
 
-        let (count_root, count_owner, count_context, count_first) = shared_owner_components();
+        let (count_root, count_owner, count_context, count_first, count_fact_encoded_bytes) =
+            shared_owner_components();
         let count_second = second_target_record(count_context, &count_first.fact_ids);
-        let count_outbox = DurableProofOutbox::from_owner_with_policy(
-            count_owner,
-            policy_for_pending_limits(1, 65_535),
-        )
-        .expect("count-limited policy");
+        let count_policy = policy_for_pending_limits(count_fact_encoded_bytes, 1, 65_535);
+        drop(count_owner);
+        let count_owner = owner_with_policy(&count_root, count_policy);
+        let count_outbox = DurableProofOutbox::from_owner_with_policy(count_owner, count_policy)
+            .expect("count-limited policy");
         count_outbox
             .enqueue(count_first.clone())
             .expect("count-limited first enqueue");
@@ -851,21 +881,31 @@ mod tests {
         drop(count_outbox);
         let _ = std::fs::remove_dir_all(count_root);
 
-        let (history_root, history_owner, history_context, history_first) =
-            shared_owner_components();
-        let history_second = second_target_record(history_context, &history_first.fact_ids);
-        let history_outbox = DurableProofOutbox::from_owner_with_policy(
+        let (
+            history_root,
             history_owner,
-            policy_for_total_limits(1, 65_535),
-        )
-        .expect("total-count-limited policy");
+            history_context,
+            history_first,
+            history_fact_encoded_bytes,
+        ) = shared_owner_components();
+        let history_second = second_target_record(history_context, &history_first.fact_ids);
+        let history_policy = policy_for_total_limits(history_fact_encoded_bytes, 1, 65_535);
+        drop(history_owner);
+        let history_owner = owner_with_policy(&history_root, history_policy);
+        let history_outbox =
+            DurableProofOutbox::from_owner_with_policy(history_owner, history_policy)
+                .expect("total-count-limited policy");
         history_outbox
             .enqueue(history_first.clone())
             .expect("total-count first enqueue");
-        assert!(matches!(
-            history_outbox.enqueue(history_second),
-            Err(ProofOutboxError::LimitExceeded("proof record count"))
-        ));
+        let history_result = history_outbox.enqueue(history_second);
+        assert!(
+            matches!(
+                &history_result,
+                &Err(ProofOutboxError::LimitExceeded("proof count"))
+            ),
+            "total-count refusal result: {history_result:?}"
+        );
         assert_eq!(
             history_outbox
                 .pending(history_context)
@@ -875,25 +915,30 @@ mod tests {
         drop(history_outbox);
         let _ = std::fs::remove_dir_all(history_root);
 
-        let (bytes_root, bytes_owner, bytes_context, bytes_first) = shared_owner_components();
+        let (bytes_root, bytes_owner, bytes_context, bytes_first, bytes_fact_encoded_bytes) =
+            shared_owner_components();
         let bytes_second = second_target_record(bytes_context, &bytes_first.fact_ids);
         let bytes_total = canonical_record_bytes(&bytes_first)
             .expect("history first bytes")
             .checked_add(canonical_record_bytes(&bytes_second).expect("history second bytes"))
             .expect("history bytes fit")
             - 1;
-        let bytes_outbox = DurableProofOutbox::from_owner_with_policy(
-            bytes_owner,
-            policy_for_total_limits(2, bytes_total),
-        )
-        .expect("total-byte-limited policy");
+        let bytes_policy = policy_for_total_limits(bytes_fact_encoded_bytes, 2, bytes_total);
+        drop(bytes_owner);
+        let bytes_owner = owner_with_policy(&bytes_root, bytes_policy);
+        let bytes_outbox = DurableProofOutbox::from_owner_with_policy(bytes_owner, bytes_policy)
+            .expect("total-byte-limited policy");
         bytes_outbox
             .enqueue(bytes_first.clone())
             .expect("total-byte first enqueue");
-        assert!(matches!(
-            bytes_outbox.enqueue(bytes_second),
-            Err(ProofOutboxError::LimitExceeded("proof record bytes"))
-        ));
+        let bytes_result = bytes_outbox.enqueue(bytes_second);
+        assert!(
+            matches!(
+                &bytes_result,
+                &Err(ProofOutboxError::LimitExceeded("proof bytes"))
+            ),
+            "total-byte refusal result: {bytes_result:?}"
+        );
         assert_eq!(
             bytes_outbox
                 .pending(bytes_context)
@@ -1236,7 +1281,7 @@ mod tests {
         let settled = settle_thread.join().expect("settle race thread");
         let superseded = supersede_thread.join().expect("supersede race thread");
         let terminal_state = match (settled, superseded) {
-            (Ok(true), Err(ProofOutboxError::AlreadySettled)) => ProofRecordState::Settled,
+            (Ok(true), Ok(false)) => ProofRecordState::Settled,
             (Ok(false), Ok(true)) => ProofRecordState::Superseded,
             (settled, superseded) => panic!(
                 "shared-owner race returned an invalid terminal pair: {settled:?}, {superseded:?}"

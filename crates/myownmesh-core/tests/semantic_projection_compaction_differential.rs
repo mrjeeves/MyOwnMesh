@@ -22,8 +22,8 @@ use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
-    SignalingConfig, TopologyMode, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+    NetworkConfig, NetworkKind, SemanticPolicyConfig, SignalingConfig, TopologyMode,
+    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
@@ -498,11 +498,10 @@ fn config(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
         label: id.to_string(),
         kind,
         semantic_policy: Default::default(),
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig {
@@ -514,7 +513,6 @@ fn config(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
         auto_approve: false,
-        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 
@@ -581,8 +579,7 @@ async fn export_facts(
     bootstrap: &VerifiedBootstrap,
 ) -> myownmesh_core::Result<Vec<SignedFact>> {
     const MAX_EXPORT_PAGES: usize = 65_536;
-    const MAX_ENCODED_BYTES: u32 =
-        myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES as u32;
+    const MAX_ENCODED_BYTES: u32 = 65_535;
     let mut cursor = None;
     let mut facts = Vec::new();
     let mut pages = 0usize;

@@ -95,7 +95,7 @@ fn live_slot_network(id: &str) -> myownmesh_core::config::NetworkConfig {
         ..myownmesh_core::config::SignalingConfig::default()
     };
     config.auto_approve = true;
-    config.application_transport = None;
+    config.introduction = None;
     config.validate().expect("live slot network validates");
     config
 }
@@ -1325,6 +1325,443 @@ async fn a_resubscription_cannot_inherit_an_in_flight_frame() {
         delivered.push(client.id);
     }
     assert_eq!(delivered, vec![a.id, b.id]);
+    eprintln!("route-resubscription: membership assertions complete; before scope teardown");
+}
+
+/// Unlike the retirement controls that keep an external custodian alive, only
+/// weak observations escape this runtime. The child really owns and uses the
+/// funded cancellation, so its destruction can release the last custodian.
+/// The manager's external process envelope bounds a hang; a timeout is never
+/// success, and this control does not replace teardown with explicit retirement.
+#[test]
+fn route_last_owner_runtime_drop_releases_captured_cancellation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the last-owner fixture runtime builds");
+    let (cancel_observer, retirement_observer, registry_observer, installed) =
+        runtime.block_on(async {
+            let reg = ClientRegistry::default();
+            let (client, _receiver) = fresh_client(&reg);
+            let key = ("net".to_string(), "last-owner".to_string());
+            let ChannelJoin::Install(installing) = reg
+                .subscribe_channel(key.clone(), client.id)
+                .expect("the original exact membership is admitted")
+            else {
+                panic!("the first subscriber owns installation")
+            };
+            let cancel = reg
+                .route_cancellation()
+                .expect("the existing daemon grant funds the exact pump cancellation");
+            let cancel_observer = cancel.downgrade();
+            let retirement_observer = cancel.retirement.downgrade();
+            let registry_observer = Arc::downgrade(&reg.inner);
+            let waiting = cancel.clone();
+            let join = tokio::spawn(async move { waiting.cancelled().await });
+            let orphan = reg.finish_channel_install(&key, &installing, Some((cancel, join)));
+            let installed = orphan.is_none();
+            // Preserve the existing abort/handoff Drop path even on an
+            // unexpected install refusal; no orphaned join is detached here.
+            drop(orphan);
+            (
+                cancel_observer,
+                retirement_observer,
+                registry_observer,
+                installed,
+            )
+        });
+
+    eprintln!("route-last-owner: before runtime destruction");
+    drop(runtime);
+    eprintln!("route-last-owner: after runtime destruction");
+
+    assert!(installed, "the exact original pump was installed");
+    assert_eq!(cancel_observer.strong_count(), 0);
+    assert!(
+        cancel_observer.upgrade().is_none(),
+        "no funded cancellation owner survives runtime destruction"
+    );
+    assert!(
+        retirement_observer.upgrade().is_none(),
+        "the exact retirement custodian has been destroyed"
+    );
+    assert!(
+        registry_observer.upgrade().is_none(),
+        "the original registry has no surviving owner"
+    );
+    // Weak expiry and runtime destruction are the available terminal evidence.
+    // The shared fixture provider is not an isolated zero-census oracle, and
+    // the custodian's shared terminal bit is not proof both threads joined.
+}
+
+// An explicitly owned root: its finite provider is never installed in OnceLock.
+// The registry remains alive across the before/after comparison, so its process
+// scope and independently owned final-watchdog custody have identical lifetimes.
+fn isolated_route_join_fixture() -> (
+    ClientRegistry,
+    myownmesh_core::FiniteResourceProvider,
+    RouteJoinOwner,
+    ResourceClaim,
+) {
+    let grant = registry_fixture_claim(1, 1, 10)
+        .map_err(IpcAdmissionError::Claim)
+        .and_then(|claim| {
+            claim
+                .checked_add(route_join_root_planning_charge()?)
+                .map_err(IpcAdmissionError::Claim)
+        })
+        .and_then(|claim| {
+            claim
+                .checked_add(
+                    route_custody_planning_charge()?
+                        .checked_scale(2)
+                        .map_err(IpcAdmissionError::Claim)?,
+                )
+                .map_err(IpcAdmissionError::Claim)
+        })
+        .expect("two exact route custodians and one isolated join root are representable");
+    let registry = ClientRegistry::over_grant(grant);
+    let RegistryResources::Isolated {
+        _provider: provider,
+        ..
+    } = &registry.inner.resources
+    else {
+        unreachable!("over_grant owns an isolated provider")
+    };
+    let provider = provider.clone();
+    let baseline = provider.in_use();
+    let owner = RouteJoinOwner::reserve(&registry.inner.resources)
+        .expect("the exact root planning claim admits its owner");
+    (registry, provider, owner, baseline)
+}
+
+#[test]
+fn route_join_isolated_last_owner_runtime_drop_joins_and_releases_every_owner() {
+    let (registry, provider, owner, _registry_baseline) = isolated_route_join_fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the isolated last-owner runtime starts");
+    let port = owner.port.clone();
+    let (cancel_weak, retirement_weak, registry_weak, terminal, watchdogs, installed) = runtime
+        .block_on(async move {
+            let (client, _receiver) = fresh_client(&registry);
+            let key = ("net".to_string(), "last-owner".to_string());
+            let ChannelJoin::Install(installing) = registry
+                .subscribe_channel(key.clone(), client.id)
+                .expect("the exact isolated membership is admitted")
+            else {
+                panic!("the first member owns installation")
+            };
+            let cancel = registry
+                .route_cancellation_with_port(port, None)
+                .expect("the isolated owner admits the actual funded cancellation");
+            let terminal = cancel.retirement.terminal.clone();
+            let cancel_weak = cancel.downgrade();
+            let retirement_weak = cancel.retirement.downgrade();
+            let registry_weak = Arc::downgrade(&registry.inner);
+            let waiting = cancel.clone();
+            let pump_registry = registry.clone();
+            let child = tokio::spawn(async move {
+                let _registry = pump_registry;
+                waiting.cancelled().await;
+            });
+            let orphan = registry.finish_channel_install(&key, &installing, Some((cancel, child)));
+            let installed = orphan.is_none();
+            drop(orphan);
+            // The unrelated registry watchdog owner also owns native threads.
+            // Take their actual handles while its senders are still open so
+            // this isolated control can join ALL fixture owners after teardown.
+            // No watchdog/registry/cancellation owner Arc escapes this block.
+            let watchdogs = {
+                let tables = registry.inner.tables.lock();
+                let custody = tables
+                    .final_watchdog_custody
+                    .as_ref()
+                    .expect("the registry has its original watchdog custody");
+                let primary = route_join_lock(&custody.custodian.worker).take();
+                let fallback = route_join_lock(&custody.custodian.fallback_worker).take();
+                [primary, fallback]
+            };
+            (
+                cancel_weak,
+                retirement_weak,
+                registry_weak,
+                terminal,
+                watchdogs,
+                installed,
+            )
+        });
+    eprintln!("route-isolated-last-owner: before runtime destruction");
+    drop(runtime);
+    eprintln!("route-isolated-last-owner: after runtime destruction");
+    // Only the independent Owner can join the root. The funded terminal
+    // witness retains neither cancellation nor custodian nor registry.
+    drop(owner);
+    let watchdogs_joined = watchdogs.map(|handle| match handle {
+        Some(handle) => handle.join().is_ok(),
+        None => false,
+    });
+    let joined = terminal.observed.load(Ordering::Acquire);
+    let errors = terminal.join_errors.load(Ordering::Acquire);
+    let expired = cancel_weak.strong_count() == 0
+        && cancel_weak.upgrade().is_none()
+        && retirement_weak.upgrade().is_none()
+        && registry_weak.upgrade().is_none();
+    drop((terminal, cancel_weak, retirement_weak, registry_weak));
+    let final_claim = provider.in_use();
+    let final_reservations = provider.active_reservations();
+    let final_scopes = provider.active_scopes();
+    assert!(
+        installed && expired && joined,
+        "installed={installed}, exact owners expired={expired}, both observers joined={joined}"
+    );
+    assert_eq!(errors, 0);
+    assert!(watchdogs_joined.into_iter().all(|joined| joined));
+    assert_eq!(final_claim, ResourceClaim::ZERO);
+    assert_eq!(final_reservations, 0);
+    assert_eq!(final_scopes, 0);
+}
+
+#[test]
+fn route_join_close_waits_for_registered_unqueued_custody() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let cancel = registry
+        .route_cancellation_with_port(owner.port.clone(), None)
+        .expect("the route registers before its observers start");
+    let terminal = cancel.retirement.terminal.clone();
+    let port = owner.port.clone();
+    owner.close();
+    let registered_unqueued = {
+        let mut state = route_join_lock(&port.0.state);
+        while !state.waiting_after_close {
+            state = port
+                .0
+                .changed
+                .wait(state)
+                .expect("the test custody fence is not poisoned");
+        }
+        !state.accepting && state.outstanding == 1 && state.head.is_none()
+    };
+    let root_still_waiting = !owner
+        .worker
+        .as_ref()
+        .expect("the owner retains its join")
+        .is_finished();
+    let refused = matches!(
+        registry.route_cancellation_with_port(port.clone(), None),
+        Err(IpcAdmissionError::Closing)
+    );
+    // The already registered node must still be accepted AFTER close.
+    drop(cancel);
+    drop(owner);
+    let joined = terminal.observed.load(Ordering::Acquire);
+    let join_errors = terminal.join_errors.load(Ordering::Acquire);
+    let outstanding = route_join_lock(&port.0.state).outstanding;
+    drop((terminal, port));
+    let restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(registered_unqueued && root_still_waiting && refused);
+    assert!(joined);
+    assert_eq!(join_errors, 0);
+    assert_eq!(outstanding, 0);
+    assert!(
+        restored,
+        "the isolated root itself and every route lease returned"
+    );
+}
+
+#[test]
+fn route_join_constructor_refusals_leave_no_registered_node() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let root_baseline = provider.in_use();
+    let mut refused = [false; 2];
+    let mut restored = [false; 2];
+    for index in 0..2 {
+        refused[index] = matches!(
+            registry.route_cancellation_with_port(owner.port.clone(), Some(index)),
+            Err(IpcAdmissionError::CustodyUnavailable)
+        );
+        restored[index] = provider.in_use() == root_baseline
+            && route_join_lock(&owner.port.0.state).outstanding == 0;
+    }
+    // Scope plus registry watchdog custody only: no cancellation-record lease
+    // can be acquired, and no observer or registered node may be produced.
+    let starved = ClientRegistry::over_grant(
+        registry_fixture_claim(0, 0, 0).expect("the scope claim is representable"),
+    );
+    let before = starved.in_use();
+    let record_refused = matches!(
+        starved.route_cancellation_with_port(owner.port.clone(), None),
+        Err(IpcAdmissionError::Resources(_))
+    );
+    let refusal_clean =
+        starved.in_use() == before && route_join_lock(&owner.port.0.state).outstanding == 0;
+    drop(starved);
+    drop(owner);
+    let root_restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(refused.into_iter().all(|value| value));
+    assert!(restored.into_iter().all(|value| value));
+    assert!(record_refused && refusal_clean && root_restored);
+}
+
+#[test]
+fn route_join_two_queued_pairs_retain_funding_through_fallback_join() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let root_baseline = provider.in_use();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the pair-gate runtime starts");
+    let mut primary_gates = Vec::new();
+    let mut fallback_gates = Vec::new();
+    let mut primary_done = Vec::new();
+    let mut fallback_done = Vec::new();
+    let mut witnesses = Vec::new();
+    for _ in 0..2 {
+        let cancel = registry
+            .route_cancellation_with_port(owner.port.clone(), None)
+            .expect("both exact paired-observer reservations are admitted");
+        witnesses.push(cancel.retirement.terminal.clone());
+        for (index, destination) in [
+            &cancel.retirement.sender,
+            &cancel.retirement.fallback_sender,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let (finished, done) = tokio::sync::oneshot::channel::<()>();
+            let task = runtime.spawn(async move {
+                let _ = wait.await;
+                let _ = finished.send(());
+            });
+            // Exercise both actual observer receivers, not a synthetic funding
+            // flag. Each receives its one exact task while that task is gated.
+            let sender = route_join_lock(destination);
+            if let Err(refused) = sender
+                .as_ref()
+                .expect("the observer sender is live")
+                .try_send(task)
+            {
+                let _retained_handle = refused;
+                std::process::abort();
+            }
+            if index == 0 {
+                primary_gates.push(release);
+                primary_done.push(done);
+            } else {
+                fallback_gates.push(release);
+                fallback_done.push(done);
+            }
+        }
+        drop(cancel);
+    }
+    owner.close();
+    let pair_workers = route_retirement_claim()
+        .expect("the pair claim is valid")
+        .amount(ResourceClass::WorkerOrTask)
+        .checked_mul(2)
+        .expect("two pairs fit");
+    let expected_workers = root_baseline
+        .amount(ResourceClass::WorkerOrTask)
+        .checked_add(pair_workers)
+        .expect("root and two pairs fit");
+    let both_pairs_held = provider.in_use().amount(ResourceClass::WorkerOrTask) == expected_workers;
+    for gate in primary_gates {
+        let _ = gate.send(());
+    }
+    runtime.block_on(async {
+        for done in primary_done {
+            let _ = done.await;
+        }
+    });
+    // Observe each real primary's terminal body, not just its child's signal.
+    // The fallback tasks remain gated throughout this observation.
+    for terminal in &witnesses {
+        let mut exited = route_join_lock(&terminal.exited);
+        while *exited & 1 == 0 {
+            exited = terminal
+                .exited_changed
+                .wait(exited)
+                .expect("the observer-exit fence is not poisoned");
+        }
+    }
+    let fallback_still_holds_pairs = provider.in_use().amount(ResourceClass::WorkerOrTask)
+        == expected_workers
+        && witnesses
+            .iter()
+            .all(|terminal| !terminal.observed.load(Ordering::Acquire));
+    for gate in fallback_gates {
+        let _ = gate.send(());
+    }
+    runtime.block_on(async {
+        for done in fallback_done {
+            let _ = done.await;
+        }
+    });
+    drop(runtime);
+    drop(owner);
+    let joined = witnesses.iter().all(|terminal| {
+        terminal.observed.load(Ordering::Acquire)
+            && terminal.join_errors.load(Ordering::Acquire) == 0
+    });
+    drop(witnesses);
+    let restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(both_pairs_held && fallback_still_holds_pairs);
+    assert!(joined && restored);
+}
+
+#[test]
+fn route_join_isolated_normal_and_cancelled_retirement_restore_baseline() {
+    for cancelled in [false, true] {
+        let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the retirement runtime starts");
+        let terminal = runtime.block_on(async {
+            let cancel = registry
+                .route_cancellation_with_port(owner.port.clone(), None)
+                .expect("the actual cancellation record and observers are funded");
+            let retirement = cancel.retirement();
+            let terminal = retirement.terminal.clone();
+            let waiting = cancel.clone();
+            let child = tokio::spawn(async move { waiting.cancelled().await });
+            let retired = RetiredRoute::orphaned_pump(cancel, child);
+            if cancelled {
+                // Poll the actual retire future to its child-join boundary,
+                // then drop that future while the child is still unpolled.
+                let mut retiring = std::pin::pin!(retired.retire());
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(retiring.as_mut(), cx).is_pending(),
+                    )
+                })
+                .await;
+                // No assertion before cleanup; record unexpected readiness as
+                // a scalar alongside the independently funded terminal witness.
+                // Leaving this branch drops pin!'s underlying retire future,
+                // before the runtime and isolated join owner are destroyed.
+                (terminal, pending)
+            } else {
+                retired.retire().await;
+                (terminal, true)
+            }
+        });
+        drop(runtime);
+        drop(owner);
+        let joined = terminal.0.observed.load(Ordering::Acquire);
+        let errors = terminal.0.join_errors.load(Ordering::Acquire);
+        let pending = terminal.1;
+        drop(terminal);
+        let restored = provider.in_use() == baseline;
+        drop(registry);
+        assert!(joined && pending && restored);
+        assert_eq!(errors, 0);
+    }
 }
 
 /// A route that was replaced answers `Gone` to its predecessor's pump, and the

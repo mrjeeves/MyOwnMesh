@@ -52,7 +52,6 @@ your app can hold one.
 
 ```rust
 use myownmesh_core::{NetworkConfig, NetworkKind, TopologyMode};
-use myownmesh_core::config::ClosedRelayPolicyConfig;
 
 let net = mesh.join(NetworkConfig {
     id: "home".into(),                          // local config record id
@@ -61,7 +60,6 @@ let net = mesh.join(NetworkConfig {
     kind: NetworkKind::Open,
     topology: TopologyMode::default(),          // FullMesh
     signaling: Default::default(),
-    closed_relay: ClosedRelayPolicyConfig::default(), // disabled by default
     stun_servers: Default::default(),
     turn_servers: Default::default(),
     pinned_peers: Vec::new(),
@@ -211,51 +209,24 @@ causal edges, per-author usage, proof work, and indexed database bytes) are
 checked before mutation; the exact `N+1` request is refused without changing
 the graph, projection, ACK, identity, or authority.
 
-## 8. Closed-member opaque relay
+## 8. Direct connections and TURN
 
-Closed relaying is disabled by default. On a `NetworkKind::Closed` network,
-enable it explicitly on the `NetworkConfig` with a finite
-`ClosedRelayPolicyConfig`; the policy owns the allocation, queue, handshake,
-bandwidth, replay, and lifetime bounds.
+Application channels, RPC and native opaque flows use authenticated WebRTC
+connections between the actual endpoints. ICE uses a direct path when viable
+and configured TURN when a relay is needed. A Hub may introduce endpoints but
+never forwards their application payloads.
 
-```rust
-let policy = ClosedRelayPolicyConfig {
-    enabled: true,
-    ..ClosedRelayPolicyConfig::default()
-};
-// Set `kind: NetworkKind::Closed` and `closed_relay: policy` in NetworkConfig
-// before `mesh.join(...)`.
-```
+Configure `NetworkConfig.turn_servers` using `TurnServer` with `urls`,
+`username` and `credential`. The existing reference TURN default applies when
+the field is omitted; an explicit empty list disables TURN. Hosting TURN is a
+separate opt-in device service described in [Services](SERVICES.md). Service
+advertisements contain URLs, not passwords; credentials remain local config.
 
-After the endpoints have authenticated and been promoted on their direct
-links to the relay member, the requester opens a channel and the target
-accepts the next authenticated offer:
-
-```rust
-let requester = network_a
-    .open_closed_relay(&relay_id, &target_id)
-    .await?;
-let target = network_c.accept_closed_relay().await?;
-
-requester.send(b"hello").await?;
-assert_eq!(target.recv().await?, b"hello");
-println!("relay={}, session={:?}", requester.relay_device_id(), requester.session_id());
-
-requester.close().await?;
-target.close().await?;
-```
-
-The endpoint handles expose only opaque send/receive/close operations and
-route metadata. The relay forwards ciphertext; endpoint key material remains
-at the requester and target. A direct requester-to-target connection is not
-created by this lifecycle. Every control and data message is validated against
-the complete route and bounded control profile before mutation or forwarding.
-Admission refusal preserves the pending handshake custody. Close is
-route-bound, generation-fenced, and settles the exact live allocation through
-the opposite-endpoint acknowledgement; persistent terminal tombstones make
-duplicates idempotent and prevent a delayed predecessor close from affecting
-a successor with a reused session identifier. Shutdown wakes bounded relay
-waiters and joins their owned custody before completion.
+For bounded Hub-assisted connection setup, set `NetworkConfig.introduction`
+to `Some(HubIntroductionPolicyConfig { ... })` with owner-selected setup and
+demand limits. Removed `closed_relay`, `application_transport` and
+`routing_policy` keys are rejected. No application bytes are carried by
+discovery or signaling.
 
 ## 9. Topology
 

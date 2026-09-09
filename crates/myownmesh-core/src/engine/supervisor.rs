@@ -376,9 +376,6 @@ use super::{
 pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
     match cmd {
         NetworkCmd::OpaqueControl(transfer) => super::write_opaque_control(state, transfer).await,
-        NetworkCmd::EndpointControls(transfer) => {
-            super::write_endpoint_controls(state, transfer).await
-        }
         NetworkCmd::OpaqueChange(change) => {
             // This variant is admitted only to the separately owned connection
             // lane. A misplaced command fails closed without publishing it.
@@ -544,21 +541,8 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             payload,
             reply,
         } => {
-            if state
-                .peers
-                .owner(&peer)
-                .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner))
-            {
-                let result = send_channel_frame(state, &peer, &channel, payload).await;
-                let _ = reply.send(result);
-            } else {
-                let mut reply = Some(reply);
-                let result =
-                    super::queue_routed_channel_frame(state, &peer, &channel, payload, &mut reply);
-                if let Some(reply) = reply {
-                    let _ = reply.send(result);
-                }
-            }
+            let result = send_channel_frame(state, &peer, &channel, payload).await;
+            let _ = reply.send(result);
         }
         NetworkCmd::BroadcastChannelFrame {
             channel,

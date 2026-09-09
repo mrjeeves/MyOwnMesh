@@ -183,7 +183,7 @@ fn daemon_config(home: &Path, socket: PathBuf, relay_url: &str) -> myownmesh_cor
     network.auto_approve = true;
     network.stun_servers.clear();
     network.turn_servers.clear();
-    network.application_transport = None;
+    network.introduction = None;
     network.signaling = myownmesh_core::config::SignalingConfig {
         strategy: "nostr".to_owned(),
         mdns: false,

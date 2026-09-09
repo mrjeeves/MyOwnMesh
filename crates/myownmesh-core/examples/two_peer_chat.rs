@@ -13,9 +13,7 @@
 use std::time::Duration;
 
 #[cfg(feature = "transport-lab")]
-use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
-};
+use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 #[cfg(feature = "transport-lab")]
 use myownmesh_core::identity::Identity;
 #[cfg(feature = "transport-lab")]
@@ -48,15 +46,13 @@ fn cfg(label: &str) -> NetworkConfig {
         label: label.into(),
         kind: Default::default(),
         semantic_policy: Default::default(),
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
+        introduction: None,
         tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
-        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),

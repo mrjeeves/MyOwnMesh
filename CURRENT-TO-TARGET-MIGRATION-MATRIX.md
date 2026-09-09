@@ -1,5 +1,7 @@
 # V4 architecture ownership matrix
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: final ownership map for the adopted hybrid architecture of
 `mrjeeves/MyOwnMesh`.
 
@@ -24,17 +26,16 @@ are non-authoritative projections. The former `NetworkState` transition,
 quorum, split, and serialized-roster authority model is removed and cannot
 authorize a session, membership change, or application operation.
 
-The sole bounded exception to ordinary plaintext-forwarding restrictions is
-the explicit Closed-member opaque relay. A-B and B-C are independently
-authenticated and promoted before A sends `Open`, B sends `Offer`, and C
-sends `Accept`. Endpoint sessions seal/open plaintext; B forwards only opaque
-packets under the complete route and exact live allocation generation. The
-provider-backed two-direction queues, pending handshake custody, retained
-packets, and cleanup are finite under the Closed-relay profile. Admission
-refusal preserves pending custody. Generation tombstones make duplicate
-terminal closes idempotent and prevent delayed predecessor controls from
-affecting successors. Shutdown wakes bounded waiters, settles endpoint,
-accepted, pending, closing, and allocation custody, and joins owned tasks.
+There is no Hub or Closed-member application-forwarding exception. Endpoint
+application channels use native authenticated WebRTC directly or configured
+standard TURN. Hubs consolidate bounded discovery/introduction only. TURN is
+a separate service even if cohosted; current advertisements carry URLs and
+credentials remain locally configured, not protected credential distribution.
+
+The cutover configuration is `introduction: Option<HubIntroductionPolicyConfig>`.
+Removed `closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy` config/wire surfaces must refuse. The removal disposition
+below is normative, not a claim that pending builds or tests have passed.
 
 | Source path or subsystem | Owned capability | Final owner | Final disposition | Invariant |
 |---|---|---|---|---|
@@ -60,7 +61,7 @@ accepted, pending, closing, and allocation custody, and joins owned tasks.
 | `engine/wake.rs` | Resume detection | Reachability and Peer Session recovery | Reachability/session signal | Wake never synthesizes leave or roster changes |
 | `engine/reconcile.rs` | Config-triggered restart behavior | Runtime Supervisor and Connector Node | Split by owned configuration | No global stop/start is used for an unrelated local change |
 | `engine/reliable.rs` | Delivery semantics and retransmission experience | Application session data service | Session-capability-bound delivery | Unknown peer strings cannot create unbounded durable outboxes |
-| `engine/routing.rs` | Failure reproductions only | No final owner | Ordinary member forwarding is absent | No ordinary forwarding authority exists |
+| Former application forwarding in `engine/routing.rs` | No current payload capability | Removed profile | Retain only independently required bounded setup/typed semantic-control in its own owner | Discovery/introduction cannot authorize payload forwarding |
 | `engine/signaling_bridge.rs` | Existing Nostr/mDNS fan-in/out and dedup | Signaling Node | Typed ports with retained provenance | Durable and ephemeral lanes are classified before domain parsing |
 | `engine/governance.rs` | Governance interaction workflows and tests | Closed Semantic Node | Author and verify canonical RoleGrant/RoleRevoke/Evict facts and typed lineage selectors | Closed projection is pure; policy guards consume verified FactGraph state |
 | `engine/traffic.rs` | Traffic counters and observations | Reachability / diagnostics | Retain only as local evidence | No counter is an authorization input |
@@ -69,7 +70,7 @@ accepted, pending, closing, and allocation custody, and joins owned tasks.
 | `rpc.rs` | RPC API and streaming behavior | Application facade over Peer Session | Public RPC surface with bounded tasks and queues | No RPC is dispatched pre-promotion |
 | `handle.rs` | `Mesh`, `JoinedNetwork`, and embedder API | Application Gateway facade | Public gateway surface over typed capabilities | Public IDs are not internal capabilities |
 | `events.rs` | Diagnostics and embedder events | Narrow node event DTOs | Node-scoped diagnostic DTOs | No global event enum authorizes another subsystem |
-| `engine/closed_relay.rs` plus runtime relay | Closed-member opaque relay | Exact Closed Relay Node | Explicit A-B/B-C promotion, route-bound controls, provider-backed directional opaque allocation, and generation-safe terminal custody | Relay has finite exact allocation, no endpoint key material, and no application parsing |
+| Former `engine/closed_relay.rs`, runtime payload relay, and custom endpoint cipher | No current payload capability | Removed profile | Superseded by direct/configured standard TURN WebRTC; removed config/wire refuses | No custom Hub/member application transit, including ciphertext |
 | `myownmesh-signaling` Nostr driver | Production signaling carrier and reconnect knowledge | Signaling Adapter | Typed signaling lane with bounded provider-backed delivery | Carrier identity never becomes Device authority |
 | `myownmesh-signaling` mDNS driver | LAN discovery and local signaling | Discovery/Signaling Adapter | Bounded hints and typed control exchange | Withdrawal cannot synthesize durable leave |
 | `LocalBroker` | Deterministic in-process transport | `transport-lab` signaling adapter only | Retain only as an explicitly feature-gated integration control; never advertise as a production carrier or field proof | Exercises the bounded typed-lane ingress/authentication/promotion shape without substituting for a production adapter |

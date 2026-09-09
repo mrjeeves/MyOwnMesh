@@ -10,10 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
-    TopologyMode,
-};
+use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::transport_lab::{
     admit_durable_proof, durable_proof_records, materialize_durable_proof_delivery,
     pending_durable_proofs, promote_exact_owner_for_lab, proof_owner_for_device,
@@ -47,17 +44,15 @@ fn closed_config(id: &str) -> NetworkConfig {
         semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
         auto_approve: true,
-        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 

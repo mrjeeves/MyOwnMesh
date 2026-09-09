@@ -13,7 +13,7 @@
 //! #     semantic_policy: myownmesh_core::config::SemanticPolicyConfig,
 //! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! use myownmesh_core::{
-//!     ClosedRelayPolicyConfig, Mesh, MeshConfig, NetworkConfig, RoutingPolicyConfig, TopologyMode,
+//!     HubIntroductionPolicyConfig, Mesh, MeshConfig, NetworkConfig, TopologyMode,
 //! };
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
@@ -33,8 +33,7 @@
 //!     // Resource retention is an owner decision; the library supplies no
 //!     // hidden production ceiling.
 //!     semantic_policy,
-//!     application_transport: None,
-//!     routing_policy: RoutingPolicyConfig::default(),
+//!     introduction: None,
 //!     tree: None,
 //!     hub: None,
 //!     local_observations: None,
@@ -42,7 +41,6 @@
 //!     connection_trace_capacity: 512,
 //!     topology: TopologyMode::default(),
 //!     signaling: Default::default(),
-//!     closed_relay: ClosedRelayPolicyConfig::default(),
 //!     stun_servers: Default::default(),
 //!     turn_servers: Default::default(),
 //!     pinned_peers: Vec::new(),
@@ -147,8 +145,6 @@ pub mod protocol;
 pub mod realtime;
 pub mod resource;
 pub mod roster;
-#[cfg(feature = "route-flow-diagnostics")]
-pub(crate) mod route_flow;
 pub mod rpc;
 pub mod runtime;
 /// Canonical V4 durable semantic facts.  This is the authority-bearing
@@ -164,8 +160,8 @@ pub mod verification;
 pub use application_gateway::capability_advert_planning_claim;
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NetworkKind, NodeServiceConfig,
-    RoutingPolicyConfig, ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer,
+    AutoUpdateConfig, HubIntroductionPolicyConfig, MeshConfig, NetworkConfig, NetworkKind,
+    NodeServiceConfig, ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer,
     StunServiceConfig, TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::conn_trace::ConnTrace;
@@ -176,7 +172,7 @@ pub use engine::signaling_bridge::{
 /// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
 /// it answers the same question under a different contract: measured before it
 /// is built, and refusable at four separate points.
-pub use error::{ClosedRelayError, Error, Result};
+pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 /// The real-link fixture owner, exported at the root for the same reason the
@@ -244,8 +240,8 @@ pub use transport::{
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version for the one current closed profile. A receiver
+/// Wire-protocol version for the current direct-peer profile. A receiver
 /// refuses a previous, future, or missing version before endpoint
 /// authentication; there is no feature-negotiated or mixed-version fallback.
-/// This bump records the incompatible addition of the Closed relay wire set.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// This bump records removal of the legacy member-relay wire set.
+pub const PROTOCOL_VERSION: u32 = 3;

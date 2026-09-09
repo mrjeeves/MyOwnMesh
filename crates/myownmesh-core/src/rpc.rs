@@ -1729,6 +1729,16 @@ impl TransportLabStreamInbox {
         }
     }
 
+    /// Settle the stream with a clean end and no peer-supplied reason.
+    ///
+    /// This is the transport-lab counterpart of the production stream's
+    /// natural `recv_funded` exhaustion path. It deliberately calls the same
+    /// inbox settlement primitive as production; unlike [`Self::finish_owned`]
+    /// it has no variable terminal text and therefore acquires no lease.
+    pub fn finish_clean(&self) {
+        self.inbox.settle(None, None);
+    }
+
     /// Settle the stream with peer-supplied text, funded before it is retained.
     ///
     /// Refuses rather than degrading. Production's `finish_owned` falls back to

@@ -19,11 +19,9 @@
 //! without understanding the corresponding field-discovered bug.
 
 pub(crate) mod carrier_state;
-pub(crate) mod closed_relay;
 pub(crate) mod command;
 pub mod conn_trace;
 pub mod connection;
-pub(crate) mod endpoint_cipher;
 pub mod governance;
 pub mod handshake;
 pub mod heartbeat;
@@ -39,7 +37,6 @@ pub(crate) mod peer_registry;
 pub mod phase;
 pub mod reconcile;
 pub mod reliable;
-pub(crate) mod routing;
 pub mod scheduler;
 pub(crate) mod semantic_ingress;
 pub(crate) mod signaling_bridge;
@@ -79,8 +76,6 @@ use state::SignalingEmissionId;
 #[cfg(test)]
 const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,9 +93,8 @@ use crate::protocol::{
         CapabilitiesUpdateMessage, RpcRequestMessage, RpcResponseMessage, RpcStreamChunkMessage,
         RpcStreamEndMessage,
     },
-    topology::{ClosedRoutedPayload, ShelveMessage},
+    topology::ShelveMessage,
     CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
-    RoutedApplicationEnvelope,
 };
 use crate::semantic::DeviceId;
 #[cfg(test)]
@@ -182,11 +176,6 @@ pub mod transport_lab {
     use crate::transport::{PeerSession, Role, Transport};
     use crate::{Channel, ConnectorCallbackPolicy};
 
-    pub use super::closed_relay::{
-        transport_lab_closed_relay_fixture_grant, transport_lab_pending_share_capacity_witness,
-        ClosedRelayFixtureGrant, ClosedRelayFixtureWorkload, ClosedRelayPendingShareCapacities,
-        ClosedRelayPendingShareCapacityWitness,
-    };
     pub use super::signaling_bridge::mdns_startup_planning_claim_for_lab;
     pub use super::state::NetworkState;
     pub use crate::semantic::store::SemanticCommitFaultForLab;
@@ -3098,7 +3087,7 @@ async fn begin_hub_connection_demand(state: &Arc<NetworkState>, target: &str) ->
         if let Err(error) = state
             .send_introduction_body(
                 admission.ticket,
-                crate::protocol::HubIntroductionBody::Request,
+                crate::protocol::HubIntroductionBody::Request {},
                 None,
             )
             .await
@@ -3205,7 +3194,11 @@ async fn on_hub_introduction(
     match action {
         IntroductionAction::Accept(ticket) | IntroductionAction::AcceptReplacing { ticket, .. } => {
             let _ = state
-                .send_introduction_body(ticket, crate::protocol::HubIntroductionBody::Accept, None)
+                .send_introduction_body(
+                    ticket,
+                    crate::protocol::HubIntroductionBody::Accept {},
+                    None,
+                )
                 .await;
         }
         IntroductionAction::BeginOffer(ticket) => {
@@ -4974,8 +4967,6 @@ async fn handle_transport_event_from_worker(
         return false;
     };
     let (event, callback_resources) = event.into_parts();
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_flow_native_receipt = callback_resources.route_flow_receipt();
     // Retain the worker that accepted this callback through every effect. The
     // owner installation can survive a speculative W0 -> W1 handoff, so an
     // owner-only lookup after this point could accidentally mutate W1.
@@ -5249,30 +5240,14 @@ async fn handle_transport_event_from_worker(
             handle_exact_promoted_terminal(state, &owner, worker, reason).await;
         }
         TransportEvent::Message(bytes) => {
-            handle_exact_promoted_message_with_receipt(
-                state,
-                &owner,
-                worker,
-                bytes,
-                #[cfg(feature = "route-flow-diagnostics")]
-                route_flow_native_receipt,
-            )
-            .await;
+            handle_exact_promoted_message(state, &owner, worker, bytes).await;
         }
         TransportEvent::RealtimeUnit(delivery) => {
             state.deliver_realtime_unit(&owner, delivery);
         }
         TransportEvent::ApplicationFlowMessage { mode, bytes } => {
             let exact_owner = owner.for_worker(Arc::clone(worker));
-            handle_inbound_frame_from_inner(
-                state,
-                &exact_owner,
-                bytes,
-                Some(mode),
-                #[cfg(feature = "route-flow-diagnostics")]
-                None,
-            )
-            .await;
+            handle_inbound_frame_from_inner(state, &exact_owner, bytes, Some(mode)).await;
         }
     }
     // The accepted callback's resource authority belongs to the whole handler,
@@ -5306,38 +5281,8 @@ async fn handle_exact_promoted_message(
     worker: &Arc<crate::transport::WebRtcConnectorWorker>,
     bytes: Bytes,
 ) {
-    handle_exact_promoted_message_with_receipt(
-        state,
-        owner,
-        worker,
-        bytes,
-        #[cfg(feature = "route-flow-diagnostics")]
-        None,
-    )
-    .await;
-}
-
-async fn handle_exact_promoted_message_with_receipt(
-    state: &Arc<NetworkState>,
-    owner: &peer_registry::PeerOwnerToken,
-    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
-    bytes: Bytes,
-    #[cfg(feature = "route-flow-diagnostics")] native_receipt: Option<
-        crate::route_flow::NativeReceipt,
-    >,
-) {
     let exact_owner = owner.for_worker(Arc::clone(worker));
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_flow_receipt = crate::route_flow::capture_handler_receipt(native_receipt);
-    handle_inbound_frame_from_inner(
-        state,
-        &exact_owner,
-        bytes,
-        None,
-        #[cfg(feature = "route-flow-diagnostics")]
-        route_flow_receipt,
-    )
-    .await;
+    handle_inbound_frame_from_inner(state, &exact_owner, bytes, None).await;
 }
 
 async fn handle_ice_state_change(
@@ -5880,29 +5825,13 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
     handle_inbound_frame_from(state, &owner, bytes).await;
 }
 
-#[cfg(feature = "transport-lab")]
-#[inline]
-fn closed_relay_ingress_marker(bytes: &[u8], stage: &'static str) {
-    if bytes.starts_with(br#"{"kind":"closed_relay_data"#) {
-        eprintln!("closed-relay-ingress:{stage}");
-    }
-}
-
 #[cfg(test)]
 async fn handle_inbound_frame_from(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     bytes: Bytes,
 ) {
-    handle_inbound_frame_from_inner(
-        state,
-        owner,
-        bytes,
-        None,
-        #[cfg(feature = "route-flow-diagnostics")]
-        None,
-    )
-    .await;
+    handle_inbound_frame_from_inner(state, owner, bytes, None).await;
 }
 
 async fn handle_inbound_frame_from_inner(
@@ -5910,9 +5839,6 @@ async fn handle_inbound_frame_from_inner(
     owner: &peer_registry::PeerOwnerToken,
     bytes: Bytes,
     native_mode: Option<crate::realtime::OpaqueFlowMode>,
-    #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
-        crate::route_flow::HandlerReceipt,
-    >,
 ) {
     let device_id = owner.device_id();
     // The callback supplies native mode provenance. An opaque lane never
@@ -5921,8 +5847,6 @@ async fn handle_inbound_frame_from_inner(
     {
         return;
     }
-    #[cfg(feature = "transport-lab")]
-    closed_relay_ingress_marker(&bytes, "raw");
     if bytes.len() > crate::protocol::RECEIVE_FRAME_BYTES {
         warn!(
             peer = %device_id,
@@ -5945,8 +5869,6 @@ async fn handle_inbound_frame_from_inner(
         warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
     };
-    #[cfg(feature = "transport-lab")]
-    closed_relay_ingress_marker(&bytes, "classified");
     // Admission gate, folded into the per-frame liveness touch below so it
     // costs no extra lookup or lock. Admission is a per-connection property
     // that flips only at the handshake/approval (and topology-shelve)
@@ -6160,11 +6082,7 @@ async fn handle_inbound_frame_from_inner(
             witness,
             dispatch,
             frame: Some(frame),
-        }) => {
-            #[cfg(feature = "transport-lab")]
-            closed_relay_ingress_marker(&bytes, "funded");
-            (frame, witness, dispatch)
-        }
+        }) => (frame, witness, dispatch),
         Some(FundedInbound {
             witness,
             dispatch: _,
@@ -6249,8 +6167,6 @@ async fn handle_inbound_frame_from_inner(
         }
         return;
     };
-    #[cfg(feature = "transport-lab")]
-    closed_relay_ingress_marker(&bytes, "decoded");
 
     // Committed under the exact session that funded the parse. A revocation or
     // replacement that landed while the parse ran refuses here: the work was
@@ -6374,28 +6290,6 @@ async fn handle_inbound_frame_from_inner(
         MeshMessage::HubTreeAttachResponse(response) => {
             state.handle_hub_tree_attach_response(dispatch.owner(), response);
         }
-        MeshMessage::ClosedRelayControl(control) => {
-            let relay_profile = state.config.read().closed_relay.clone();
-            if !relay_profile.validate_closed_relay_control(&control) {
-                trace!(
-                    peer = %device_id,
-                    "discarding Closed relay control refused by configured profile or wire bound"
-                );
-            } else {
-                match closed_relay::handle_control(state, dispatch.owner(), control).await {
-                    Ok(Some(endpoint_session)) => {
-                        // The handler installs the session in the bounded state
-                        // registry; retain this clone through the dispatch arm
-                        // so endpoint crypto is not dropped before that handoff.
-                        let _endpoint_session = endpoint_session;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        trace!(peer = %device_id, "Closed relay control refused: {error}");
-                    }
-                }
-            }
-        }
         MeshMessage::RpcRequest(req) => on_rpc_request(state, &dispatch, req).await,
         // The three response arms settle *our own* pending outbound calls,
         // resolved by `request_id` against a table the local requester owns.
@@ -6411,18 +6305,6 @@ async fn handle_inbound_frame_from_inner(
             on_proof_delivery(state, &route, delivery).await;
         }
         MeshMessage::ProofAck(ack) => on_proof_ack(state, dispatch.owner(), ack),
-        MeshMessage::RoutedApplication(envelope) => {
-            on_routed_application(
-                state,
-                &dispatch,
-                application_claim,
-                application_work,
-                envelope,
-                #[cfg(feature = "route-flow-diagnostics")]
-                route_flow_receipt,
-            )
-            .await
-        }
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(
                 state,
@@ -6462,52 +6344,6 @@ async fn handle_inbound_frame_from_inner(
         // resolved there, while each frame and its lease were still together.
         // Nothing is owed out here, which is why this arm does nothing.
         MeshMessage::ChannelAck { .. } => {}
-        MeshMessage::ClosedRelayData(data) => {
-            #[cfg(feature = "transport-lab")]
-            closed_relay_ingress_marker(&bytes, "dispatch");
-            let relay_profile = state.config.read().closed_relay.clone();
-            if !relay_profile.validate() {
-                trace!(peer = %device_id, "Closed relay data refused by invalid configured profile");
-                return;
-            }
-            let max_ciphertext_bytes = match crate::runtime::relay::checked_ciphertext_ceiling(
-                relay_profile.max_frame_ciphertext_bytes,
-            ) {
-                Ok(max_ciphertext_bytes) => max_ciphertext_bytes,
-                Err(_) => {
-                    trace!(peer = %device_id, "Closed relay data refused by invalid profile bound");
-                    return;
-                }
-            };
-            let relay_direction = match data.direction(max_ciphertext_bytes) {
-                Ok(crate::protocol::ClosedRelayDataDirection::RequesterToTarget) => {
-                    crate::runtime::relay::RelayDirection::RequesterToTarget
-                }
-                Ok(crate::protocol::ClosedRelayDataDirection::TargetToRequester) => {
-                    crate::runtime::relay::RelayDirection::TargetToRequester
-                }
-                Err(error) => {
-                    trace!(peer = %device_id, "discarding invalid Closed relay data: {error}");
-                    return;
-                }
-            };
-            let session_id = data.session_id;
-            let relay_local = DeviceId::from_canonical_str(state.identity.public_id())
-                .is_ok_and(|local| data.relay == local);
-            if let Err(error) = closed_relay::handle_data(state, dispatch.owner(), data).await {
-                trace!(peer = %device_id, "Closed relay data refused: {error}");
-            } else if relay_local {
-                if let Err(error) =
-                    closed_relay::forward_closed_relay_data(state, session_id, relay_direction)
-                        .await
-                {
-                    trace!(
-                        peer = %device_id,
-                        "Closed relay data forwarding refused: {error}"
-                    );
-                }
-            }
-        }
         // Unreachable at runtime: the durable semantic port returns before
         // this arm. Discarded rather than panicked on: this is peer-supplied
         // input.
@@ -8184,156 +8020,6 @@ async fn on_rpc_stream_end(
     });
 }
 
-async fn on_routed_application(
-    state: &Arc<NetworkState>,
-    dispatch: &peer_registry::AdmittedInboundDispatch,
-    _claim: crate::resource::ResourceClaim,
-    retention: crate::resource::ResourceLease,
-    envelope: RoutedApplicationEnvelope,
-    #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
-        crate::route_flow::HandlerReceipt,
-    >,
-) {
-    let Ok(local_id) = DeviceId::from_canonical_str(state.identity.public_id()) else {
-        return;
-    };
-    let Ok(previous_hop) = DeviceId::from_canonical_str(dispatch.owner().device_id()) else {
-        return;
-    };
-    // Admission verifies and may append a signed hop. Both operations allocate
-    // canonical scratch; acquire it before either, independently of ingress
-    // retention and the separately funded route candidates/plan.
-    let Ok(work_claim) =
-        crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
-    else {
-        return;
-    };
-    let Ok(_wire_work) = state.acquire_application_work(work_claim) else {
-        return;
-    };
-    let Ok(mut selection) = capture_funded_route_input(state) else {
-        return;
-    };
-    let admission = dispatch.with_captured_logical_state(&state.peers, |_| {
-        let topology = state.topology_impl.read();
-        state.routing.admit_captured_previous_hop_with_tree_parent(
-            &local_id,
-            &previous_hop,
-            || selection.connected.take().expect("one funded route input"),
-            |candidate| state.peers.routed_origin_policy_admits(candidate.origin()),
-            topology.as_ref(),
-            state.mesh_context_id(),
-            envelope,
-            state.identity.signing_key(),
-            selection.preferred_parent.as_deref(),
-        )
-    });
-    let Some(admission) = admission else {
-        return;
-    };
-    match admission {
-        Ok(routing::RouteAdmission::Destination { envelope }) => {
-            #[cfg(feature = "route-flow-diagnostics")]
-            let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
-                &envelope,
-                crate::route_flow::RouteRole::Destination,
-                Some(dispatch.owner().binding_coordinate().binding_epoch),
-                route_flow_receipt,
-            );
-            let origin = envelope.origin().clone();
-            let disposition = match envelope.into_payload() {
-                ClosedRoutedPayload::EndpointControl { control } => {
-                    receive_endpoint_control(state, dispatch, &origin, &control);
-                    None
-                }
-                ClosedRoutedPayload::EndpointCiphertext { packet } => {
-                    receive_endpoint_channel(state, dispatch, &origin, &packet)
-                }
-                // Wire admission also refuses this retired representation.
-                // Never reinterpret it as a direct-channel compatibility path.
-                ClosedRoutedPayload::ChannelFrame { .. } => None,
-            };
-            drop(retention);
-            #[cfg(not(feature = "route-flow-diagnostics"))]
-            let _ = disposition;
-            #[cfg(feature = "route-flow-diagnostics")]
-            if let Some(route_flow) = route_flow {
-                route_flow.emit(
-                    state,
-                    None,
-                    disposition.map_or(
-                        crate::route_flow::RouteOutcome::Refused,
-                        ChannelDisposition::route_flow_outcome,
-                    ),
-                );
-            }
-        }
-        Ok(routing::RouteAdmission::Relay { envelope, plan }) => {
-            #[cfg(feature = "route-flow-diagnostics")]
-            let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
-                &envelope,
-                crate::route_flow::RouteRole::Relay,
-                Some(dispatch.owner().binding_coordinate().binding_epoch),
-                route_flow_receipt,
-            );
-            let provider = NetworkRoutingSessionProvider {
-                state: Arc::clone(state),
-                class: if matches!(
-                    envelope.payload(),
-                    ClosedRoutedPayload::EndpointControl { .. }
-                ) {
-                    traffic::FrameClass::Control
-                } else {
-                    traffic::FrameClass::App
-                },
-            };
-            let frame = match envelope.encode_complete() {
-                Ok(frame) => Bytes::from(frame),
-                Err(error) => {
-                    trace!(
-                        peer = %dispatch.owner().device_id(),
-                        "routed application frame failed canonical serialization: {error}"
-                    );
-                    #[cfg(feature = "route-flow-diagnostics")]
-                    if let Some(route_flow) = route_flow {
-                        route_flow.emit(state, None, crate::route_flow::RouteOutcome::Refused);
-                    }
-                    drop(retention);
-                    return;
-                }
-            };
-            let report = dispatch_routed_frame_with_route_flow(
-                state,
-                routing::dispatch_routed_frame(plan, frame, &provider),
-                #[cfg(feature = "route-flow-diagnostics")]
-                route_flow,
-            )
-            .await;
-            if report.delivered == 0 {
-                trace!(
-                    peer = %dispatch.owner().device_id(),
-                    "routed application frame had no current approved forwarding session"
-                );
-            }
-            drop(retention);
-        }
-        Ok(routing::RouteAdmission::Duplicate) => {
-            trace!(
-                peer = %dispatch.owner().device_id(),
-                "discarding duplicate routed application frame"
-            );
-            drop(retention);
-        }
-        Err(error) => {
-            trace!(
-                peer = %dispatch.owner().device_id(),
-                "routed application frame refused: {error}"
-            );
-            drop(retention);
-        }
-    }
-}
-
 async fn on_channel_frame(
     state: &Arc<NetworkState>,
     dispatch: &peer_registry::AdmittedInboundDispatch,
@@ -8476,18 +8162,6 @@ enum ChannelDisposition {
     Dropped,
     /// Terminal for the session named by the witness, for the stated reason.
     Unsettleable(&'static str),
-}
-
-#[cfg(feature = "route-flow-diagnostics")]
-impl ChannelDisposition {
-    fn route_flow_outcome(self) -> crate::route_flow::RouteOutcome {
-        match self {
-            Self::Accepted => crate::route_flow::RouteOutcome::Delivered,
-            Self::Refused | Self::Dropped | Self::Unsettleable(_) => {
-                crate::route_flow::RouteOutcome::Refused
-            }
-        }
-    }
 }
 
 /// Resolve the exact current owner once, then send through it.
@@ -8895,7 +8569,6 @@ pub(crate) async fn send_to_peer_owner(
                 | MeshMessage::RpcResponse(_)
                 | MeshMessage::RpcStreamChunk(_)
                 | MeshMessage::RpcStreamEnd(_)
-                | MeshMessage::ClosedRelayData(_)
         );
         return send_application_bytes_with_use(
             state,
@@ -9071,831 +8744,17 @@ pub(in crate::engine) async fn send_logical_reply(
     Ok(())
 }
 
-struct NetworkRoutingSessionProvider {
-    state: Arc<NetworkState>,
-    class: traffic::FrameClass,
-}
-
-/// Bounded input and plan work, separate from wire/AEAD work. The caller
-/// captures it before entering graph -> cipher locks, so topology selection
-/// never performs a peer-registry lookup under the canonical graph fence.
-struct FundedRouteInput {
-    connected: Option<Vec<String>>,
-    preferred_parent: Option<String>,
-    #[cfg(feature = "route-flow-diagnostics")]
-    route_flow: Option<crate::route_flow::SelectedRouteFlow>,
-    _work: crate::resource::ResourceLease,
-}
-
-/// Raw claim shared by candidate capture and its finite fixture planner.
-/// No selection, authority, allocation or reservation occurs here.
-fn funded_route_input_work_claim(
-    count: usize,
-    limit: usize,
-    max_parallel_routes: usize,
-) -> Result<crate::resource::ResourceClaim> {
-    use crate::resource::{ResourceClaim, ResourceClass};
-    use std::mem::size_of;
-    let key_bytes = (32usize * 8).div_ceil(5); // canonical base32 public key
-    let overflow = || Error::Network("route preparation claim overflow".into());
-    // Connected spellings, topology return and final plan coexist. Hubs uses
-    // ranked (bool,score,key,spelling); HubTree's smaller ranking is covered by
-    // that same layout. Growing topology Vecs request at most the next doubled
-    // capacity (minimum four), not an allocator/RSS or CPU-cycle guarantee.
-    let grow = limit.checked_mul(2).ok_or_else(overflow)?.max(4);
-    let connected = count
-        .checked_mul(size_of::<String>() + key_bytes)
-        .ok_or_else(overflow)?;
-    let plans = grow
-        .checked_mul(size_of::<String>() + key_bytes)
-        .and_then(|n| n.checked_mul(2))
-        .ok_or_else(overflow)?;
-    let ranking = grow
-        .checked_mul(size_of::<(bool, u64, &str, &str)>())
-        .ok_or_else(overflow)?;
-    let memory = connected
-        .checked_add(plans)
-        .and_then(|n| n.checked_add(ranking))
-        .and_then(|n| {
-            n.checked_add(
-                size_of::<FundedRouteInput>()
-                    + size_of::<routing::RoutePlan>()
-                    + size_of::<String>()
-                    + key_bytes,
-            )
-        })
-        .ok_or_else(overflow)?;
-    // The stored observation is included in FundedRouteInput above. Its one
-    // scalar copy spans the dispatch await while the queued owner remains
-    // borrowed. Also price the builder's earlier local receipt scratch; none
-    // of these values owns an allocation, capability or emission permit.
-    #[cfg(feature = "route-flow-diagnostics")]
-    let memory = memory
-        .checked_add(size_of::<Option<crate::route_flow::SelectedRouteFlow>>())
-        .and_then(|n| n.checked_add(size_of::<Option<crate::route_flow::HandlerReceipt>>()))
-        .ok_or_else(overflow)?;
-    let allocations = count
-        .checked_add(limit.checked_mul(2).ok_or_else(overflow)?)
-        .and_then(|n| n.checked_add(5))
-        .ok_or_else(overflow)?;
-    let claim = ResourceClaim::try_from_entries([
-        (
-            ResourceClass::AccountedMemoryBytes,
-            u64::try_from(memory).map_err(|_| overflow())?,
-        ),
-        (
-            ResourceClass::OpaqueDependencyResidual,
-            u64::try_from(allocations).map_err(|_| overflow())?,
-        ),
-    ])
-    .map_err(|_| overflow())?;
-    let claim = claim
-        .checked_add(routing::dispatch_work_claim(max_parallel_routes).map_err(|_| overflow())?)
-        .map_err(|_| overflow())?;
-    Ok(claim)
-}
-
-fn capture_funded_route_input(state: &NetworkState) -> Result<FundedRouteInput> {
-    // These are the three routed Hub implementations whose scratch shapes
-    // this claim covers. Other topologies do not inherit a guessed allowance.
-    if !matches!(
-        &state.config.read().topology,
-        crate::config::TopologyMode::Star { .. }
-            | crate::config::TopologyMode::Hubs { .. }
-            | crate::config::TopologyMode::HubTree { .. }
-    ) {
-        return Err(Error::Network(
-            "endpoint Hub routing is unavailable for this topology".into(),
-        ));
-    }
-    let count = state.peers.len();
-    let limit = state.routing.policy().max_next_hops();
-    let key_bytes = (32usize * 8).div_ceil(5); // canonical base32 public key
-    let claim =
-        funded_route_input_work_claim(count, limit, state.routing.policy().max_parallel_routes())?;
-    let work = state.acquire_application_work(claim)?;
-    let preferred_parent = state.tree_preferred_parent_for_route();
-    let mut connected = Vec::with_capacity(count);
-    let mut grew = false;
-    state.peers.visit_owners(|owner| {
-        if owner.device_id().len() != key_bytes
-            || !state.peers.has_usable_authenticated_current(&owner)
-        {
-            return;
-        }
-        if connected.len() == count {
-            grew = true;
-            return;
-        }
-        connected.push(owner.device_id().to_owned());
-    });
-    // A concurrent registry growth may refuse this preparation before any
-    // crypto sequence or queued write, but may not grow beyond its real lease.
-    if grew {
-        return Err(Error::Network(
-            "route candidates changed during funded capture".into(),
-        ));
-    }
-    Ok(FundedRouteInput {
-        connected: Some(connected),
-        preferred_parent,
-        #[cfg(feature = "route-flow-diagnostics")]
-        route_flow: None,
-        _work: work,
-    })
-}
-
-struct FundedRoutedFrame {
-    plan: routing::RoutePlan,
-    bytes: Bytes,
-    class: traffic::FrameClass,
-    // Captured/planning scratch remains owned through terminal dispatch.
-    _selection: FundedRouteInput,
-}
-
-struct EndpointRoutedFrames {
-    peer: DeviceId,
-    first: FundedRoutedFrame,
-    second: Option<FundedRoutedFrame>,
-}
-
-/// Only locally originated envelopes choose a hop budget. Received signed
-/// TTLs remain subject to routing's unchanged strict policy/topology checks.
-fn endpoint_origin_hop_budget(policy_max: u8, topology_max: u8) -> Option<u8> {
-    let budget = policy_max.min(topology_max);
-    (budget != 0).then_some(budget)
-}
-
-/// Called only within the canonical endpoint fence and a controller-owned
-/// outer wire reservation. All peer selection happened beforehand; `true`
-/// below is the already-established local endpoint policy, not a hint grant.
-fn prepare_endpoint_routed_frame(
-    state: &NetworkState,
-    peer: &DeviceId,
-    payload: ClosedRoutedPayload,
-    mut selection: FundedRouteInput,
-) -> Result<FundedRoutedFrame> {
-    use rand::RngCore;
-    // Capture only after the caller owns the priced route input, and before
-    // local envelope/signature/route work. Origins have no native receipt.
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_flow_receipt = crate::route_flow::capture_handler_receipt(None);
-    let class = if matches!(&payload, ClosedRoutedPayload::EndpointControl { .. }) {
-        traffic::FrameClass::Control
-    } else {
-        traffic::FrameClass::App
-    };
-    let origin = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|_| Error::Network("local endpoint identity invalid".into()))?;
-    let policy = state.routing.policy();
-    let limits = policy.protocol_limits();
-    // Use one captured topology for both the signed initial budget and the
-    // synchronous route admission. Reconciliation cannot swap the selector
-    // between those steps. This guard never crosses a native await.
-    let topology = state.topology_impl.read();
-    let initial_hop_budget =
-        endpoint_origin_hop_budget(policy.max_hop_budget(), topology.flood_ttl())
-            .ok_or_else(|| Error::Network("endpoint origin hop budget is zero".into()))?;
-    let mut id = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut id);
-    let envelope = RoutedApplicationEnvelope::new_with_limits(
-        state.mesh_context_id(),
-        origin.clone(),
-        peer.clone(),
-        id,
-        initial_hop_budget,
-        payload,
-        state.identity.signing_key(),
-        limits,
-    )
-    .map_err(|_| Error::Network("endpoint envelope refused".into()))?;
-    let admission = state
-        .routing
-        .admit_captured_previous_hop_with_tree_parent(
-            &origin,
-            &origin,
-            || selection.connected.take().expect("one funded route input"),
-            |candidate| candidate.origin() == &origin && candidate.destination() == peer,
-            topology.as_ref(),
-            state.mesh_context_id(),
-            envelope,
-            state.identity.signing_key(),
-            selection.preferred_parent.as_deref(),
-        )
-        .map_err(|_| Error::Network("endpoint route refused".into()))?;
-    drop(topology);
-    let routing::RouteAdmission::Relay { envelope, plan } = admission else {
-        return Err(Error::Network(
-            "endpoint route is not an outbound relay".into(),
-        ));
-    };
-    #[cfg(feature = "route-flow-diagnostics")]
-    {
-        selection.route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
-            &envelope,
-            crate::route_flow::RouteRole::Origin,
-            None,
-            route_flow_receipt,
-        );
-    }
-    let bytes = envelope
-        .encode_complete()
-        .map_err(|_| Error::Network("endpoint route encoding refused".into()))?;
-    Ok(FundedRoutedFrame {
-        plan,
-        bytes: bytes.into(),
-        class,
-        _selection: selection,
-    })
-}
-
-fn endpoint_control_outer_claim() -> Result<crate::resource::ResourceClaim> {
-    crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
-        .map_err(|_| Error::Network("routed work claim refused".into()))?
-        .checked_scale(2)
-        .map_err(|_| Error::Network("routed control work overflow".into()))
-}
-
-/// Prepare or coalesce outside any serial driver wait. Only typed signed
-/// key controls are queued; no caller plaintext is retained in this exchange.
-pub(super) fn begin_endpoint_cipher_wait(
-    state: &NetworkState,
-    peer: &DeviceId,
-) -> Result<endpoint_cipher::ReadinessWaiter> {
-    // Reuse a live exact epoch without preparing an unnecessary resend.
-    if let Some(waiter) = state.with_endpoint_cipher(peer, |root| {
-        root.observe(peer, Instant::now())
-            .map(|observed| root.waiter(&observed.ticket, Instant::now()))
-            .transpose()
-    })? {
-        return Ok(waiter);
-    }
-    let first = capture_funded_route_input(state)?;
-    let mut first = Some(first);
-    let outer = endpoint_control_outer_claim()?;
-    state.with_endpoint_cipher(peer, |root| {
-        let update = root.begin(&state.identity, peer, None, outer, Instant::now())?;
-        if let Some(output) = update.output {
-            let prepared = output.try_map(|frames| {
-                if frames.second.is_some() {
-                    return Err(endpoint_cipher::ControllerError::Invalid);
-                }
-                let first = prepare_endpoint_routed_frame(
-                    state,
-                    peer,
-                    ClosedRoutedPayload::EndpointControl {
-                        control: frames.first.clone(),
-                    },
-                    first
-                        .take()
-                        .ok_or(endpoint_cipher::ControllerError::Invalid)?,
-                )
-                .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
-                Ok(EndpointRoutedFrames {
-                    peer: peer.clone(),
-                    first,
-                    second: None,
-                })
-            });
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    root.retire(&update.ticket);
-                    return Err(error);
-                }
-            };
-            if state.queue_endpoint_controls(prepared).is_err() {
-                root.retire(&update.ticket);
-                return Err(endpoint_cipher::ControllerError::Pressure);
-            }
-        }
-        root.waiter(&update.ticket, Instant::now())
-    })
-}
-
-async fn write_endpoint_controls(
-    state: &Arc<NetworkState>,
-    transfer: command::EndpointControlTransfer,
-) {
-    let result = dispatch_endpoint_output(state, &transfer.output).await;
-    if let Some(reply) = transfer.reply {
-        let _ = reply.send(result);
-    }
-}
-
-/// Reduce signed endpoint controls only under the captured carrier and the
-/// independent canonical endpoint fence. Two funded selections and two outer
-/// wire claims cover the responder's simultaneous answer + confirmation.
-fn receive_endpoint_control(
-    state: &Arc<NetworkState>,
-    dispatch: &peer_registry::AdmittedInboundDispatch,
-    peer: &DeviceId,
-    control: &crate::protocol::EndpointCipherControl,
-) {
-    let Ok(first) = capture_funded_route_input(state) else {
-        return;
-    };
-    let Ok(second) = capture_funded_route_input(state) else {
-        return;
-    };
-    let Ok(outer) = endpoint_control_outer_claim() else {
-        return;
-    };
-    let mut selections = [Some(first), Some(second)];
-    let _ = dispatch.with_captured_logical_state(&state.peers, |_| {
-        state.with_endpoint_cipher(peer, |root| {
-            // The controller verifies a share/confirmation without consuming
-            // its current phase first; hostile mismatches cannot evict it.
-            let update =
-                root.receive_control(&state.identity, peer, control, outer, Instant::now())?;
-            if let Some(output) = update.output {
-                let prepared = output.try_map(|frames| {
-                    let mut prepare =
-                        |index: usize, control: &crate::protocol::EndpointCipherControl| {
-                            prepare_endpoint_routed_frame(
-                                state,
-                                peer,
-                                ClosedRoutedPayload::EndpointControl {
-                                    control: control.clone(),
-                                },
-                                selections[index]
-                                    .take()
-                                    .ok_or(endpoint_cipher::ControllerError::Invalid)?,
-                            )
-                            .map_err(|_| endpoint_cipher::ControllerError::Invalid)
-                        };
-                    let first = prepare(0, &frames.first)?;
-                    let second = frames
-                        .second
-                        .as_ref()
-                        .map(|control| prepare(1, control))
-                        .transpose()?;
-                    Ok(EndpointRoutedFrames {
-                        peer: peer.clone(),
-                        first,
-                        second,
-                    })
-                });
-                let prepared = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        root.retire(&update.ticket);
-                        return Err(error);
-                    }
-                };
-                // A waiter observing Ready must re-enter this same root fence;
-                // it cannot publish data ahead of this confirmation admission.
-                if state.queue_endpoint_controls(prepared).is_err() {
-                    root.retire(&update.ticket);
-                    return Err(endpoint_cipher::ControllerError::Pressure);
-                }
-            }
-            Ok(())
-        })
-    });
-}
-
-/// The plaintext guard remains live through bounded decode and synchronous
-/// subscriber admission. Gateway copies acquire their own exact retention
-/// before allocation; no decrypted bytes escape through an unfunded callback.
-fn receive_endpoint_channel(
-    state: &Arc<NetworkState>,
-    dispatch: &peer_registry::AdmittedInboundDispatch,
-    peer: &DeviceId,
-    packet: &crate::protocol::endpoint_cipher::CiphertextPacket,
-) -> Option<ChannelDisposition> {
-    use crate::application_gateway::GatewayRefusal;
-    dispatch
-        .with_captured_logical_state(&state.peers, |operation| {
-            state
-                .with_endpoint_cipher(peer, |root| {
-                    let observed = root
-                        .observe(peer, Instant::now())
-                        .ok_or(endpoint_cipher::ControllerError::Phase)?;
-                    let length = packet
-                        .ciphertext
-                        .len()
-                        .checked_sub(16)
-                        .ok_or(endpoint_cipher::ControllerError::Invalid)?;
-                    let parse_claim = crate::application_gateway::structural_json_claim(length)
-                        .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
-                    // Distinct custody: this lease moves into the gateway along with
-                    // the decoded Value; the cipher's guard owns only plaintext/work.
-                    let parse_retention = state
-                        .acquire_application_work(parse_claim)
-                        .map_err(|_| endpoint_cipher::ControllerError::Pressure)?;
-                    let opened = root.open(
-                        &observed.ticket,
-                        packet,
-                        crate::resource::ResourceClaim::ZERO,
-                        Instant::now(),
-                    )?;
-                    // Decode only the permitted payload family. Deserializing the
-                    // entire MeshMessage enum and rejecting afterward could already
-                    // have constructed semantic/interner-bearing control objects.
-                    let message: EndpointChannelMessage = serde_json::from_slice(opened.bytes())
-                        .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
-                    let EndpointChannelMessage::Channel { channel, payload } = message;
-                    let result = state.application_gateway.accept_channel(
-                        operation.validity(),
-                        parse_claim,
-                        parse_retention,
-                        &channel,
-                        peer.as_ref(),
-                        payload,
-                    );
-                    Ok(match result {
-                        Ok(_) => ChannelDisposition::Accepted,
-                        Err(GatewayRefusal::Pressure(_)) => ChannelDisposition::Dropped,
-                        Err(_) => ChannelDisposition::Refused,
-                    })
-                })
-                .ok()
-        })
-        .flatten()
-}
-
-/// Funding, not graph/controller locks, spans every native await. The complete
-/// queued owner remains borrowed until all admitted parallel writes settle.
-async fn dispatch_endpoint_output(
-    state: &Arc<NetworkState>,
-    output: &endpoint_cipher::PreparedOutput<EndpointRoutedFrames>,
-) -> Result<()> {
-    let prepared = output.value();
-    for frame in std::iter::once(&prepared.first).chain(prepared.second.iter()) {
-        state.with_endpoint_cipher(&prepared.peer, |root| {
-            if root.current(output.ticket(), Instant::now()) {
-                Ok(())
-            } else {
-                Err(endpoint_cipher::ControllerError::Stale)
-            }
-        })?;
-        let provider = NetworkRoutingSessionProvider {
-            state: Arc::clone(state),
-            class: frame.class,
-        };
-        // One writer visits each prepared frame once. Copy only the nonowning
-        // selected scalars into this terminal dispatch, never the queued work
-        // or cipher ticket. Stale epochs returned above; cancellation drops
-        // the observation without manufacturing a terminal disposition.
-        let report = dispatch_routed_frame_with_route_flow(
-            state,
-            routing::dispatch_borrowed_routed_frame(&frame.plan, frame.bytes.clone(), &provider),
-            #[cfg(feature = "route-flow-diagnostics")]
-            frame._selection.route_flow,
-        )
-        .await;
-        if report.delivered == 0 || report.outcome_unknown != 0 || report.failed != 0 {
-            if let Some(root) = state.endpoint_cipher.as_ref() {
-                root.lock().retire(output.ticket());
-            }
-            return Err(Error::Network(
-                if report.outcome_unknown != 0 || report.failed != 0 {
-                    "endpoint routed write outcome unknown"
-                } else {
-                    "endpoint routed write refused"
-                }
-                .into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-struct NetworkRoutingSession {
-    state: Arc<NetworkState>,
-    owner: peer_registry::PeerOwnerToken,
-    class: traffic::FrameClass,
-    _work: Option<crate::resource::ResourceLease>,
-}
-
-impl routing::ExactApprovedSessionProvider for NetworkRoutingSessionProvider {
-    fn exact_approved_session(
-        &self,
-        peer_id: &str,
-    ) -> Option<Arc<dyn routing::ExactApprovedSession>> {
-        let owner = self.state.peers.owner(peer_id)?;
-        self.state
-            .peers
-            .has_usable_authenticated_current(&owner)
-            .then(|| {
-                let mut session = NetworkRoutingSession {
-                    state: Arc::clone(&self.state),
-                    owner,
-                    class: self.class,
-                    _work: None,
-                };
-                // Constructing an unpolled concrete future allocates nothing.
-                // Price its actual compiler layout before the Box/Arc exist.
-                let future_bytes =
-                    std::mem::size_of_val(&send_network_routed(&session, Bytes::new()));
-                let memory = std::mem::size_of::<NetworkRoutingSession>()
-                    .checked_add(2 * std::mem::size_of::<usize>())?
-                    .checked_add(future_bytes)?;
-                let claim = crate::resource::ResourceClaim::try_from_entries([
-                    (
-                        crate::resource::ResourceClass::AccountedMemoryBytes,
-                        u64::try_from(memory).ok()?,
-                    ),
-                    // Session Arc, erased future Box, and bounded native-send
-                    // dependency bookkeeping; no allocator/crypto-heap claim.
-                    (crate::resource::ResourceClass::OpaqueDependencyResidual, 3),
-                ])
-                .ok()?;
-                session._work = Some(self.state.acquire_application_work(claim).ok()?);
-                Some(Arc::new(session) as Arc<dyn routing::ExactApprovedSession>)
-            })
-            .flatten()
-    }
-}
-
-impl routing::ExactApprovedSession for NetworkRoutingSession {
-    fn peer_id(&self) -> &str {
-        self.owner.device_id()
-    }
-
-    fn send_routed<'a>(
-        &'a self,
-        frame: Bytes,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), routing::RouteSendError>> + Send + 'a>>
-    {
-        Box::pin(send_network_routed(self, frame))
-    }
-}
-
-async fn send_network_routed(
-    session: &NetworkRoutingSession,
-    frame: Bytes,
-) -> std::result::Result<(), routing::RouteSendError> {
-    let timeout = Duration::from_millis(scheduler_policy(&session.state).peer_send_timeout_ms);
-    let mut encoded_context = [0u8; 52];
-    data_encoding::BASE32_NOPAD.encode_mut(
-        session.state.mesh_context_id().as_bytes(),
-        &mut encoded_context,
-    );
-    encoded_context.make_ascii_lowercase();
-    let context =
-        std::str::from_utf8(&encoded_context).map_err(|_| routing::RouteSendError::Refused)?;
-    // Refusal before acquiring an application operation proves that
-    // no write was attempted. Once send_frame starts, an error does
-    // not establish whether the remote endpoint received the frame.
-    let operation = session
-        .state
-        .peers
-        .admit_application_operation(
-            &session.owner,
-            session.state.session_broker.as_ref(),
-            context,
-        )
-        .ok_or(routing::RouteSendError::Refused)?;
-    // The selector above may have been unstamped. Activity belongs to
-    // the admitted channel W0, never whichever W1 is selected later.
-    let captured = operation.captured_owner();
-    let _demand_use = session
-        .state
-        .begin_demand_link_use(&captured)
-        .map_err(|_| routing::RouteSendError::Refused)?;
-    #[cfg(all(test, feature = "route-flow-diagnostics"))]
-    hold_route_flow_dispatch_for_test().await;
-    let sent = operation
-        .send_frame(&session.state.peers, frame, timeout)
-        .await
-        .map_err(|_| routing::RouteSendError::OutcomeUnknown)?;
-    session.state.traffic.record_tx(session.class, sent);
-    Ok(())
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-struct RouteFlowDispatchTestGate {
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-    interval_open: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-static ROUTE_FLOW_DISPATCH_TEST_GATE: std::sync::OnceLock<
-    parking_lot::Mutex<Option<Arc<RouteFlowDispatchTestGate>>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-fn install_route_flow_dispatch_gate_for_test() -> Arc<RouteFlowDispatchTestGate> {
-    let gate = Arc::new(RouteFlowDispatchTestGate {
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-        interval_open: std::sync::atomic::AtomicBool::new(false),
-    });
-    let mut slot = ROUTE_FLOW_DISPATCH_TEST_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock();
-    assert!(
-        slot.is_none(),
-        "the route-flow dispatch gate is single-owner"
-    );
-    *slot = Some(Arc::clone(&gate));
-    gate
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-struct RouteFlowIntervalTestGuard(Option<Arc<RouteFlowDispatchTestGate>>);
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-impl Drop for RouteFlowIntervalTestGuard {
-    fn drop(&mut self) {
-        if let Some(gate) = &self.0 {
-            gate.interval_open
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-fn open_route_flow_interval_for_test(enabled: bool) -> RouteFlowIntervalTestGuard {
-    let gate = enabled
-        .then(|| {
-            ROUTE_FLOW_DISPATCH_TEST_GATE
-                .get_or_init(|| parking_lot::Mutex::new(None))
-                .lock()
-                .clone()
-        })
-        .flatten();
-    if let Some(gate) = &gate {
-        gate.interval_open
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    RouteFlowIntervalTestGuard(gate)
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-async fn hold_route_flow_dispatch_for_test() {
-    let gate = ROUTE_FLOW_DISPATCH_TEST_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock()
-        .clone();
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-fn clear_route_flow_dispatch_gate_for_test(gate: &Arc<RouteFlowDispatchTestGate>) {
-    let mut slot = ROUTE_FLOW_DISPATCH_TEST_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock();
-    assert!(slot
-        .as_ref()
-        .is_some_and(|installed| Arc::ptr_eq(installed, gate)));
-    *slot = None;
-}
-
-/// Run the real route dispatcher while one selected diagnostic owns the exact
-/// interval around its await.  Origin and relay use this single seam so neither
-/// can accidentally stamp dispatch completion as dispatch start.
-async fn dispatch_routed_frame_with_route_flow<F>(
-    state: &NetworkState,
-    dispatch: F,
-    #[cfg(feature = "route-flow-diagnostics")] route_flow: Option<
-        crate::route_flow::SelectedRouteFlow,
-    >,
-) -> routing::RouteDispatchReport
-where
-    F: Future<Output = routing::RouteDispatchReport>,
-{
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_dispatch_started = route_flow
-        .as_ref()
-        .map(crate::route_flow::SelectedRouteFlow::dispatch_started);
-    #[cfg(all(test, feature = "route-flow-diagnostics"))]
-    let _route_flow_interval = open_route_flow_interval_for_test(route_flow.is_some());
-    let report = dispatch.await;
-    #[cfg(feature = "route-flow-diagnostics")]
-    if let Some(route_flow) = route_flow {
-        route_flow.emit(
-            state,
-            route_dispatch_started,
-            crate::route_flow::RouteOutcome::from_dispatch(&report),
-        );
-    }
-    #[cfg(not(feature = "route-flow-diagnostics"))]
-    let _ = state;
-    report
-}
-
-#[derive(serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BorrowedChannelMessage<'a> {
-    Channel {
-        channel: &'a str,
-        payload: &'a serde_json::Value,
-    },
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum EndpointChannelMessage {
-    Channel {
-        channel: String,
-        payload: serde_json::Value,
-    },
-}
-
-fn queue_routed_channel_frame(
-    state: &Arc<NetworkState>,
-    peer: &str,
-    channel: &str,
-    payload: serde_json::Value,
-    reply: &mut Option<tokio::sync::oneshot::Sender<Result<()>>>,
-) -> Result<()> {
-    use crate::protocol::endpoint_cipher::CipherError;
-    use crate::resource::{ResourceClaim, ResourceClass};
-    let (destination, _identity_work) = state.funded_endpoint_id(peer)?;
-    let mut selection = Some(capture_funded_route_input(state)?);
-    let outer = crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
-        .map_err(|_| Error::Network("routed work claim refused".into()))?;
-    state.with_endpoint_cipher(&destination, |root| {
-        let observed = root
-            .observe(&destination, Instant::now())
-            .ok_or(endpoint_cipher::ControllerError::Phase)?;
-        let maximum = observed
-            .max_plaintext_bytes
-            .ok_or(endpoint_cipher::ControllerError::Phase)?;
-        let input = BorrowedChannelMessage::Channel {
-            channel,
-            payload: &payload,
-        };
-        let (_, encoded, _) =
-            crate::resource::mailbox_measure_serialized(&input).map_err(|_| CipherError::Limit)?;
-        // Count the WHOLE channel message before allocation or crypto sequence
-        // mutation. A negotiated one-byte limit is valid but cannot fit it.
-        if encoded > maximum {
-            return Err(CipherError::Limit.into());
-        }
-        let raw = ResourceClaim::try_from_entries([
-            (ResourceClass::AccountedMemoryBytes, encoded as u64),
-            (ResourceClass::ParsingOrCpuWork, encoded as u64),
-            (ResourceClass::OpaqueDependencyResidual, 1),
-        ])
-        .map_err(|_| CipherError::Limit)?;
-        let _input_work = state
-            .acquire_application_work(raw)
-            .map_err(|_| endpoint_cipher::ControllerError::Pressure)?;
-        let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(encoded));
-        serde_json::to_writer(&mut *plaintext, &input).map_err(|_| CipherError::Limit)?;
-        if plaintext.len() != encoded {
-            return Err(CipherError::Limit.into());
-        }
-        let sealed = root.seal(&observed.ticket, &plaintext, outer, Instant::now())?;
-        let prepared = sealed.try_map(|packet| {
-            // The outer reservation covers this one retained DTO copy and
-            // complete canonical/envelope encoding. No clone escapes on Err.
-            let first = prepare_endpoint_routed_frame(
-                state,
-                &destination,
-                ClosedRoutedPayload::EndpointCiphertext {
-                    packet: packet.clone(),
-                },
-                selection.take().ok_or(CipherError::OperationOwner)?,
-            )
-            .map_err(|_| CipherError::Limit)?;
-            Ok(EndpointRoutedFrames {
-                peer: destination.clone(),
-                first,
-                second: None,
-            })
-        })?;
-        // Publish the owned ciphertext while the canonical graph and exact
-        // epoch are still fenced. The serial driver does not await this next
-        // command: it transfers the original caller reply to the terminal
-        // writer, then continues. There is no nested-supervisor wait.
-        state
-            .queue_endpoint_payload(prepared, reply.take().ok_or(CipherError::OperationOwner)?)
-            .map_err(|_| endpoint_cipher::ControllerError::Pressure)
-    })
-}
-
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
-async fn send_routed_channel_frame(
-    state: &Arc<NetworkState>,
-    peer: &str,
-    channel: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
-    let (reply, receive) = tokio::sync::oneshot::channel();
-    queue_routed_channel_frame(state, peer, channel, payload, &mut Some(reply))?;
-    receive
-        .await
-        .map_err(|_| Error::Network("endpoint writer ended".into()))?
-}
-
 async fn send_channel_frame(
     state: &Arc<NetworkState>,
     peer: &str,
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    // An absent or definitively unusable direct owner cannot veto a route.
-    // Once the direct write starts, its error is returned without fallback:
-    // it may already have delivered the application payload.
+    // An absent or definitively unusable direct owner cannot send application
+    // data. TURN remains a native ICE fallback for that direct WebRTC session;
+    // the Hub never becomes an application-data relay. Once the direct write
+    // starts, its error is returned without a second path because delivery may
+    // already have occurred.
     if let Some(owner) = state
         .peers
         .owner(peer)
@@ -10493,7 +9352,6 @@ async fn finish_drop_peer_inner_with_recovery(
         if let Err(error) = peer.retire_and_close().await {
             warn!(%error, "peer cleanup did not complete successfully");
         }
-        state.settle_stale_closed_relay_owners();
         // Policy can change while native close is in flight.  Revalidate at
         // the terminal boundary and detach the exact provider-owned cohort;
         // this path must never turn a stale terminal handle into admission.
@@ -10877,7 +9735,6 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                 if let Err(error) = peer.retire_and_close().await {
                     warn!(%error, "carrier promoted cleanup did not complete");
                 }
-                state.settle_stale_closed_relay_owners();
                 if recovery.is_none() {
                     state.clear_reconnect_intent(owner.device_id());
                 }
@@ -10902,7 +9759,6 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                     if let Err(error) = peer.retire_and_close().await {
                         warn!(%error, "carrier current-worker cleanup did not complete");
                     }
-                    state.settle_stale_closed_relay_owners();
                     if recovery.is_none() {
                         state.clear_reconnect_intent(owner.device_id());
                     }
@@ -11297,7 +10153,7 @@ fn build_test_state_parts_metered_with_application(
     connector_slots: usize,
     retained: Option<crate::resource::ResourceClaim>,
     closed_creation_id: Option<[u8; 32]>,
-    application_transport: Option<crate::config::ApplicationTransportPolicyConfig>,
+    introduction: Option<crate::config::HubIntroductionPolicyConfig>,
 ) -> MeteredTestStateParts {
     try_build_test_state_parts_metered_with_application_in_instance_root(
         network_id_suffix,
@@ -11305,7 +10161,7 @@ fn build_test_state_parts_metered_with_application(
         connector_slots,
         retained,
         closed_creation_id,
-        application_transport,
+        introduction,
         None,
     )
     .expect("network state")
@@ -11320,7 +10176,7 @@ fn try_build_test_state_parts_metered_with_application_in_instance_root(
     connector_slots: usize,
     retained: Option<crate::resource::ResourceClaim>,
     closed_creation_id: Option<[u8; 32]>,
-    application_transport: Option<crate::config::ApplicationTransportPolicyConfig>,
+    introduction: Option<crate::config::HubIntroductionPolicyConfig>,
     instance_root: Option<std::path::PathBuf>,
 ) -> Result<MeteredTestStateParts> {
     use std::sync::OnceLock;
@@ -11347,13 +10203,11 @@ fn try_build_test_state_parts_metered_with_application_in_instance_root(
         semantic_policy,
         scheduler: crate::config::SchedulerPolicyConfig::default(),
         topology: crate::config::TopologyMode::FullMesh,
-        routing_policy: crate::config::RoutingPolicyConfig::default(),
         hub: None,
         tree: None,
         local_observations: None,
-        application_transport,
+        introduction,
         signaling: crate::config::SignalingConfig::default(),
-        closed_relay: crate::config::ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
@@ -12917,58 +11771,8 @@ pub(crate) fn legacy_test_has_authenticated_channel(
 mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
+    use std::future::Future;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn routed_channel_borrowed_count_includes_name_and_complete_message() {
-        for channel in ["x", "quoted\"channel", "\u{1f642}"] {
-            let payload = serde_json::json!({"nested": [null, true, "private"]});
-            let borrowed = BorrowedChannelMessage::Channel {
-                channel,
-                payload: &payload,
-            };
-            let wire = serde_json::to_vec(&MeshMessage::Channel {
-                channel: channel.into(),
-                payload: payload.clone(),
-            })
-            .unwrap();
-            let (_, counted, _) = crate::resource::mailbox_measure_serialized(&borrowed).unwrap();
-            assert_eq!(counted, wire.len());
-            assert_eq!(serde_json::to_vec(&borrowed).unwrap(), wire);
-            assert!(counted > serde_json::to_vec(&payload).unwrap().len());
-            assert!(
-                counted > 1,
-                "a signed one-byte agreement cannot fit a channel message"
-            );
-        }
-    }
-
-    #[test]
-    fn decrypted_endpoint_decoder_refuses_other_families_before_typed_construction() {
-        for kind in [
-            "hub_introduction",
-            "routed_application",
-            "application_flow_control",
-            "rpc_request",
-            "hello",
-        ] {
-            let wire =
-                format!("{{\"kind\":\"{kind}\",\"source\":\"never construct a semantic key\"}}");
-            assert!(serde_json::from_slice::<EndpointChannelMessage>(wire.as_bytes()).is_err());
-        }
-        let wire = br#"{"kind":"channel","channel":"private","payload":{"kind":"hello"}}"#;
-        let EndpointChannelMessage::Channel { channel, payload } =
-            serde_json::from_slice(wire).unwrap();
-        assert_eq!(channel, "private");
-        assert_eq!(
-            payload["kind"], "hello",
-            "application payload stays opaque JSON"
-        );
-        assert!(serde_json::from_slice::<EndpointChannelMessage>(
-            br#"{"kind":"channel","channel":"x","payload":null,"extra":1}"#
-        )
-        .is_err());
-    }
 
     #[test]
     fn introduction_endpoint_policy_accepts_local_destination_without_self_connect() {
@@ -13251,7 +12055,7 @@ mod tests {
                     0,
                     None,
                     4,
-                    HubIntroductionBody::Request,
+                    HubIntroductionBody::Request {},
                     key,
                 )
                 .map_err(|error| Error::Network(format!("fixture request: {error:?}")))?;
@@ -13272,7 +12076,7 @@ mod tests {
                 0,
                 None,
                 4,
-                HubIntroductionBody::Request,
+                HubIntroductionBody::Request {},
                 remote.signing_key(),
             )
             .map_err(|error| Error::Network(format!("fixture request: {error:?}")))?;
@@ -13317,7 +12121,7 @@ mod tests {
                 0,
                 Some(challenge),
                 4,
-                HubIntroductionBody::Accept,
+                HubIntroductionBody::Accept {},
                 state.identity.signing_key(),
             )
             .map_err(|error| Error::Network(format!("fixture Accept: {error:?}")))?;
@@ -13345,332 +12149,6 @@ mod tests {
         result.expect("actual policy/controller admission yields a bound responder challenge");
     }
 
-    #[tokio::test]
-    async fn routed_channel_without_enabled_ready_epoch_never_queues_plaintext() {
-        let (state, mut commands) = build_test_state_parts("cipher-disabled-no-plaintext");
-        while commands.try_recv().is_some() {}
-        let destination = crate::identity::Identity::ephemeral();
-        let (reply, _receive) = tokio::sync::oneshot::channel();
-        let mut reply = Some(reply);
-        let result = queue_routed_channel_frame(
-            &state,
-            destination.public_id(),
-            "private",
-            serde_json::json!({"body": "must not route in plaintext"}),
-            &mut reply,
-        );
-        assert!(result.is_err());
-        assert!(reply.is_some(), "no terminal writer was admitted");
-        assert!(
-            commands.try_recv().is_none(),
-            "refusal queues neither legacy plaintext nor a keyless ciphertext"
-        );
-        state.shutdown().await;
-    }
-
-    #[tokio::test]
-    #[ignore = "opens a local WebRTC object; run explicitly in the isolated native harness"]
-    async fn endpoint_routed_builder_default_policy_accepts_control_and_ciphertext_shapes() {
-        use crate::resource::{FiniteResourceProvider, ResourceClass};
-
-        // Exercise the actual builder and funded candidate capture with the
-        // existing locally promoted connector fixture. These are wire-shape
-        // controls, not proof of key confirmation or native delivery; the
-        // public encrypted-channel fixture remains the acceptance gate.
-        let config = crate::config::RoutingPolicyConfig::default()
-            .checked()
-            .expect("default routing fixture policy is valid");
-        let candidate_count = 1;
-        let next_hops = usize::try_from(config.max_next_hops).unwrap();
-        let parallel_routes = usize::try_from(config.max_parallel_routes).unwrap();
-        let wire_bound = crate::protocol::RECEIVE_FRAME_BYTES;
-        let wire_claim = crate::protocol::topology::routed_work_claim(wire_bound).unwrap();
-        let selection_claim =
-            funded_route_input_work_claim(candidate_count, next_hops, parallel_routes).unwrap();
-        let decode_claim =
-            crate::application_gateway::AdmittedApplicationFrame::claim(wire_bound).unwrap();
-        // One lease of each kind, all three live at the decode/verify peak:
-        // W owns the routed wire work, S moves into the resulting frame, and
-        // D owns the second decoded representation until its envelope drops.
-        // Each actual reservation gets its own provider bookkeeping charge.
-        let wire_charge = FiniteResourceProvider::reservation_planning_charge(wire_claim).unwrap();
-        let selection_charge =
-            FiniteResourceProvider::reservation_planning_charge(selection_claim).unwrap();
-        let decode_charge =
-            FiniteResourceProvider::reservation_planning_charge(decode_claim).unwrap();
-        // Only replay records persist between the two successive outputs.
-        // E already charges both map-node reservations, so do not charge it
-        // again. This is two route IDs, not two simultaneous W/S/D lifetimes.
-        let replay_charge = routing::replay_entry_reservation_charge_for_test()
-            .checked_scale(2)
-            .unwrap();
-        let retained = wire_charge
-            .checked_add(selection_charge)
-            .and_then(|claim| claim.checked_add(decode_charge))
-            .and_then(|claim| claim.checked_add(replay_charge))
-            .unwrap();
-        let (state, _signaling, commands, _provider, grant) = build_test_state_parts_metered(
-            "endpoint-builder-default-policy",
-            None,
-            2,
-            Some(retained),
-        );
-        // The fixture adds this exact planning term. Preserve the original
-        // refused-base discriminator without constructing a second connector
-        // or deriving a grant from the observed numerical deficit.
-        let baseline_grant = grant.checked_sub(retained).unwrap();
-        assert!(
-            wire_charge.amount(ResourceClass::ParsingOrCpuWork)
-                > baseline_grant.amount(ResourceClass::ParsingOrCpuWork),
-            "the unchanged ordinary-frame fixture alone cannot fund routed work"
-        );
-        state.park_command_receiver_for_test(commands);
-        let remote = crate::identity::Identity::ephemeral();
-        let peer = DeviceId::from_canonical_str(remote.public_id()).unwrap();
-        let local = DeviceId::from_canonical_str(state.identity.public_id()).unwrap();
-        // Configure the fixture's paired sparse selector before installing
-        // its peer. Keep its default routing cap and fixture base unchanged;
-        // only the named simultaneous workload above supplies extra capacity.
-        let topology = crate::config::TopologyMode::Star {
-            hub: remote.public_id().to_owned(),
-        };
-        *state.topology_impl.write() = crate::topology::from_mode(&topology);
-        state.config.write().topology = topology;
-        assert_eq!(state.routing.policy().max_envelope_bytes(), 65_535);
-        assert_eq!(state.routing.policy().max_hop_budget(), 4);
-        assert_eq!(state.topology_impl.read().flood_ttl(), 3);
-        assert_eq!(
-            state.routing.policy().max_envelope_bytes(),
-            config.max_envelope_bytes
-        );
-        assert_eq!(state.routing.policy().max_next_hops(), next_hops);
-        assert_eq!(
-            state.routing.policy().max_parallel_routes(),
-            parallel_routes
-        );
-        assert_eq!(
-            u64::from(state.routing.policy().max_hop_budget()),
-            config.max_hop_budget
-        );
-        assert_eq!(
-            state.routing.policy().protocol_limits().max_payload_bytes,
-            40_000
-        );
-        let fixture = insert_admitted_peer(&state, remote.public_id()).await;
-        let worker = fixture.peer.current_worker().unwrap();
-
-        // Return fallible preparation/verification before asserting so the
-        // original cap-conflation failure still closes the native fixture.
-        let result = (|| -> Result<()> {
-            for is_control in [true, false] {
-                if state.peers.len() != candidate_count {
-                    return Err(Error::Network("fixture candidate count changed".into()));
-                }
-                let work = state.acquire_application_work(wire_claim)?;
-                let mut payload = crate::protocol::topology::ciphertext_payload_for_test(
-                    state.mesh_context_id(),
-                    &local,
-                    &peer,
-                    32,
-                );
-                if let (true, ClosedRoutedPayload::EndpointCiphertext { packet }) =
-                    (is_control, &payload)
-                {
-                    payload = ClosedRoutedPayload::EndpointControl {
-                        control: crate::protocol::topology::EndpointCipherControl::Confirmation(
-                            crate::protocol::endpoint_cipher::KeyConfirmation {
-                                binding: packet.binding.clone(),
-                                sender: packet.sender,
-                                transcript_hash: [0x39; 32],
-                                tag: [0x47; 16],
-                            },
-                        ),
-                    };
-                }
-                let selection = capture_funded_route_input(&state)?;
-                if selection.connected.as_ref().map(Vec::len) != Some(candidate_count)
-                    || selection._work.claim() != selection_claim
-                {
-                    return Err(Error::Network("fixture route-input claim mismatch".into()));
-                }
-                let frame = {
-                    let graph = state.fact_graph.read();
-                    if !governance::canonical_policy_admits_devices(
-                        state.verified_bootstrap(),
-                        &graph,
-                        &local,
-                        &peer,
-                    ) {
-                        return Err(Error::Network("fixture endpoint policy refused".into()));
-                    }
-                    prepare_endpoint_routed_frame(&state, &peer, payload, selection)?
-                };
-                if frame.bytes.len() > wire_bound {
-                    return Err(Error::Network(
-                        "builder exceeded planned decode bound".into(),
-                    ));
-                }
-                let decoded_work = state.acquire_application_work(
-                    crate::application_gateway::AdmittedApplicationFrame::claim(frame.bytes.len())
-                        .map_err(|error| {
-                            Error::Network(format!("builder decode claim: {error:?}"))
-                        })?,
-                )?;
-                let MeshMessage::RoutedApplication(envelope) =
-                    serde_json::from_slice::<MeshMessage>(&frame.bytes)
-                        .map_err(|error| Error::Network(format!("builder decode: {error}")))?
-                else {
-                    return Err(Error::Network("builder emitted a non-routed frame".into()));
-                };
-                envelope
-                    .verify_for_previous_hop_with_limits(
-                        &local,
-                        state.mesh_context_id(),
-                        state.routing.policy().protocol_limits(),
-                    )
-                    .map_err(|error| Error::Network(format!("builder verify: {error:?}")))?;
-                let expected_class = if is_control {
-                    traffic::FrameClass::Control
-                } else {
-                    traffic::FrameClass::App
-                };
-                if frame.class != expected_class
-                    || frame.plan.next_hops().len() != 1
-                    || frame.plan.next_hops()[0].as_str() != remote.public_id()
-                    || frame.plan.outgoing_ttl() != 2
-                    || envelope.initial_hop_budget() != 3
-                    || envelope.remaining_ttl() != 2
-                    || envelope.hops().len() != 1
-                    || envelope.hops()[0].previous_remaining_ttl != 3
-                    || envelope.hops()[0].remaining_ttl != 2
-                    || envelope.destination() != &peer
-                    || envelope.complete_encoded_len() != Some(frame.bytes.len())
-                    || frame.bytes.len() > 65_535
-                    || matches!(
-                        envelope.payload(),
-                        ClosedRoutedPayload::EndpointControl { .. }
-                    ) != is_control
-                {
-                    return Err(Error::Network("builder output contract mismatch".into()));
-                }
-                drop(envelope);
-                drop(decoded_work);
-                drop(frame);
-                drop(work);
-            }
-            Ok(())
-        })();
-        state.shutdown().await;
-        let closed = worker.retire_and_close().await;
-        drop(fixture);
-        closed.expect("the builder fixture's original worker reaches native terminal");
-        result.expect("default complete-wire policy admits both actual routed builder branches");
-    }
-
-    #[test]
-    fn endpoint_origin_hop_budget_uses_both_ceilings_and_refuses_zero() {
-        assert_eq!(endpoint_origin_hop_budget(4, 3), Some(3));
-        assert_eq!(endpoint_origin_hop_budget(2, 3), Some(2));
-        assert_eq!(endpoint_origin_hop_budget(4, 4), Some(4));
-        assert_eq!(endpoint_origin_hop_budget(1, 3), Some(1));
-        assert_eq!(endpoint_origin_hop_budget(4, 0), None);
-        assert_eq!(endpoint_origin_hop_budget(0, 3), None);
-    }
-
-    #[test]
-    fn endpoint_star_received_ttl_is_refused_not_clamped_even_for_direct_destination() {
-        let config = crate::config::RoutingPolicyConfig::default()
-            .checked()
-            .unwrap();
-        let policy = routing::RoutingPolicy::checked(
-            usize::try_from(config.max_next_hops).unwrap(),
-            usize::try_from(config.max_parallel_routes).unwrap(),
-            config.max_envelope_bytes,
-            usize::try_from(config.max_dedup_entries).unwrap(),
-            config.max_dedup_bytes,
-            u8::try_from(config.max_hop_budget).unwrap(),
-        )
-        .unwrap();
-        let topology =
-            crate::topology::from_mode(&crate::config::TopologyMode::Star { hub: "hub".into() });
-        assert_eq!(policy.max_hop_budget(), 4);
-        assert_eq!(topology.flood_ttl(), 3);
-        // This is the existing received-frame planner, not the local-origin
-        // helper. Both direct and transit cases must reject the incoming TTL
-        // before choosing a next hop; string labels convey no session authority.
-        let connected = vec!["spoke-a".to_owned(), "spoke-b".to_owned()];
-        for destination in ["spoke-b", "unconnected"] {
-            assert!(matches!(
-                routing::plan_next_hops(
-                    topology.as_ref(),
-                    "hub",
-                    destination,
-                    &connected,
-                    4,
-                    policy,
-                ),
-                Err(routing::RouteRefusal::TtlExceedsPolicy)
-            ));
-            assert!(matches!(
-                routing::plan_next_hops(
-                    topology.as_ref(),
-                    "hub",
-                    destination,
-                    &connected,
-                    0,
-                    policy,
-                ),
-                Err(routing::RouteRefusal::Envelope(
-                    crate::protocol::topology::RoutedApplicationError::HopBudgetExhausted
-                ))
-            ));
-        }
-        let at_limit =
-            routing::plan_next_hops(topology.as_ref(), "hub", "spoke-b", &connected, 3, policy)
-                .expect("unchanged received TTL at the topology ceiling is valid");
-        assert_eq!(at_limit.outgoing_ttl(), 2);
-        assert_eq!(at_limit.next_hops(), &["spoke-b"]);
-    }
-
-    #[test]
-    fn routed_channel_is_application_admission() {
-        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
-        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x32; 32]);
-        let origin = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
-            .expect("origin key produces a canonical device id");
-        let destination =
-            DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
-                .expect("destination key produces a canonical device id");
-        let context = crate::semantic::MeshContextId::from_bytes([0x42; 32]);
-        // This classification control proves signed ciphertext wire admission,
-        // not encryption or endpoint key confirmation.
-        let payload = crate::protocol::topology::ciphertext_payload_for_test(
-            context,
-            &origin,
-            &destination,
-            32,
-        );
-        let envelope = RoutedApplicationEnvelope::new(
-            context,
-            origin,
-            destination,
-            [0x43; 16],
-            2,
-            payload,
-            &origin_key,
-        )
-        .expect("the signed routed channel envelope is valid");
-        assert!(matches!(
-            message_admission(&MeshMessage::RoutedApplication(envelope)),
-            Admission::Application
-        ));
-    }
-
-    /// One presence observation, as the in-process carrier would report it.
-    ///
-    /// Every carrier now reaches the driver through the ingress boundary, so a
-    /// control that handed `handle_signaling_inbound` a bare `SignalingInbound`
-    /// would be exercising a path production no longer has.
     fn announced_by_local_carrier(device_id: &str) -> EphemeralIngress {
         EphemeralIngress::presence_for_control(
             SignalingCarrier::Local,
@@ -14689,8 +13167,15 @@ mod tests {
 
         // Deliberate dial opens a real session on the same entry.
         connect_peer(&state, peer, false, None).await;
+        let dial_returned_with_worker = state
+            .peers
+            .get(peer)
+            .is_some_and(|entry| entry.has_current_worker());
+        eprintln!("silent-connect: dial returned");
+        state.shutdown().await;
+        eprintln!("silent-connect: shutdown returned");
         assert!(
-            state.peers.get(peer).unwrap().has_current_worker(),
+            dial_returned_with_worker,
             "connect_peer must open a session, upgrading the Sighted placeholder"
         );
     }
@@ -21536,7 +20021,11 @@ mod tests {
         let live = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
-        let state = build_test_closed_state(&format!("evicted-no-reconnect-{evicted}"), [0x73; 32]);
+        let evicted_suffix: String = evicted.chars().take(16).collect();
+        let state = build_test_closed_state(
+            &format!("evicted-no-reconnect-{evicted_suffix}"),
+            [0x73; 32],
+        );
         governance::propose_role_grant(&state, &evicted, crate::semantic::Role::Member, None)
             .await
             .expect("canonical member grant admits the eviction control target");
@@ -21561,17 +20050,23 @@ mod tests {
         // The evicted peer: its IceFailed drop must leave no reconnect intent.
         insert_session_less_peer(&state, &evicted, None);
         drop_peer(&state, &evicted, DropReason::IceFailed).await;
-        assert!(
-            !state.has_reconnect_intent(&evicted),
-            "an evicted peer's drop must not arm a reconnect intent"
-        );
+        let evicted_recovery = state.has_reconnect_intent(&evicted);
 
         // Control: a non-evicted sticky peer with the identical drop does arm
         // recovery, proving the eviction predicate suppresses only the target.
         insert_session_less_peer(&state, &live, None);
         drop_peer(&state, &live, DropReason::IceFailed).await;
+        let live_recovery = state.has_reconnect_intent(&live);
+        eprintln!("evicted-peer-drop: observations captured");
+        eprintln!("evicted-peer-drop: shutdown begin");
+        state.shutdown().await;
+        eprintln!("evicted-peer-drop: shutdown returned");
         assert!(
-            state.has_reconnect_intent(&live),
+            !evicted_recovery,
+            "an evicted peer's drop must not arm a reconnect intent"
+        );
+        assert!(
+            live_recovery,
             "a non-evicted sticky peer still recovers on IceFailed"
         );
     }
@@ -23761,17 +22256,6 @@ mod tests {
             .clone()
     }
 
-    #[cfg(feature = "route-flow-diagnostics")]
-    async fn next_channel_message_for_test(
-        subscriber: &mut crate::channels::ChannelSubscription<serde_json::Value>,
-    ) -> crate::channels::ChannelMessage<serde_json::Value> {
-        tokio::time::timeout(Duration::from_secs(5), subscriber.recv())
-            .await
-            .expect("a delivered channel message reaches its subscriber")
-            .expect("the subscription is live")
-            .expect("and carries a message rather than a lag report")
-    }
-
     /// Whether `device_id`'s current session is live **and** still holds the
     /// exact operation `filed` names.
     ///
@@ -24580,7 +23064,9 @@ mod tests {
         // test intentionally persists the first adopted log, so reusing a
         // fixed suffix would make the incoming genesis a non-extension and
         // invalidate the before-tombstone non-vacuity assertions.
-        let state = build_test_closed_state(&format!("evicted-not-admitted-{target}"), [0x71; 32]);
+        let target_suffix: String = target.chars().take(16).collect();
+        let state =
+            build_test_closed_state(&format!("evicted-not-admitted-{target_suffix}"), [0x71; 32]);
         let me = state.identity.public_id().to_string();
         governance::propose_role_grant(&state, &target, crate::semantic::Role::Member, None)
             .await
@@ -24609,6 +23095,11 @@ mod tests {
             state.is_rostered(&target),
             "non-vacuity: and the roster mirror really did seat it"
         );
+        let local_admitted_before = state.is_rostered(&me);
+        assert!(
+            local_admitted_before,
+            "non-vacuity: the local authority remains admitted before target removal"
+        );
 
         // The owner's canonical removal is applied through the same authoring
         // path as every other durable governance fact.
@@ -24632,9 +23123,10 @@ mod tests {
             "the roster mirror deleted it, so there is no rostered row for a \
              later auto-approve to treat as a re-admission"
         );
+        let local_admitted_after = state.is_rostered(&me);
         assert!(
-            canonical_policy_admits_for_test(&state, &me, &me),
-            "and this device is still a member of its own network — the removal \
+            local_admitted_after && local_admitted_after == local_admitted_before,
+            "and this device remains admitted after target removal — the removal \
              is exactly one device wide"
         );
 
@@ -24848,6 +23340,15 @@ mod tests {
             )
         }
 
+        fn persisted_roster_contains(state: &Arc<NetworkState>, device_id: &str) -> bool {
+            state
+                .roster
+                .read()
+                .authorized_devices
+                .iter()
+                .any(|peer| peer.device_id == device_id)
+        }
+
         let state = build_test_state("third-party-lan-claim");
         let victim = crate::identity::Identity::ephemeral()
             .public_id()
@@ -24868,6 +23369,7 @@ mod tests {
         install_peer(&state.peers, Arc::clone(&attempt));
 
         let before = durable(&state);
+        let persisted_before = persisted_roster_contains(&state, &stranger);
 
         // A record appears on the LAN naming a device nobody here has met.
         handle_signaling_inbound(&state, announced_over_mdns(&stranger)).await;
@@ -24875,48 +23377,59 @@ mod tests {
             .peers
             .owner(&stranger)
             .is_some_and(|owner| owner.connection().holds_promoted_session());
+        let open_admission = state.is_rostered(&stranger);
+        let persisted_after_announce = persisted_roster_contains(&state, &stranger);
+        let durable_after_announce = durable(&state);
+
+        // …and the same LAN participant then says the victim is gone.
+        handle_signaling_inbound(&state, withdrawn_over_mdns(&victim)).await;
+        let victim_retained_after_claimed = state.peers.get(&victim).is_some();
+        let durable_after_claimed = durable(&state);
+
+        // Non-vacuity: the same device id, withdrawn by a carrier that observed
+        // the loss itself, does cancel the same unpromoted attempt. Without
+        // this, an arm that had stopped retiring anything would pass.
+        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&victim)).await;
+        let victim_removed_after_carrier = state.peers.get(&victim).is_none();
+        let durable_after_carrier = durable(&state);
+
+        state.shutdown().await;
+        drop(attempt);
+
         assert!(
             !promoted,
             "a claimed id may pace a dial and may not become a session: whatever \
              the announce left behind must hold no promoted capability"
         );
         assert!(
-            !state.is_rostered(&stranger),
-            "and it certainly does not seat one"
+            open_admission,
+            "Open policy admits the transport-local pair without authorizing durable seating"
         );
-
-        // …and the same LAN participant then says the victim is gone.
-        handle_signaling_inbound(&state, withdrawn_over_mdns(&victim)).await;
         assert!(
-            state.peers.get(&victim).is_some(),
+            !persisted_before && !persisted_after_announce,
+            "the claimed LAN announce does not create a persisted roster row"
+        );
+        assert_eq!(
+            durable_after_announce, before,
+            "the claimed LAN announce moved no durable state"
+        );
+        assert!(
+            victim_retained_after_claimed,
             "a claimed withdrawal retires nothing: the sender chose this target, \
              so it may not choose a victim"
         );
         assert_eq!(
-            durable(&state),
-            before,
-            "neither report moved the roster or either log — a LAN participant \
-             is not an authority, and this compares the whole durable state \
-             rather than the movements somebody thought to rule out"
+            durable_after_claimed, before,
+            "the claimed withdrawal moved no durable state"
         );
-
-        // Non-vacuity: the same device id, withdrawn by a carrier that observed
-        // the loss itself, does cancel the same unpromoted attempt. Without
-        // this, an arm that had stopped retiring anything would pass.
-        handle_signaling_inbound(&state, withdrawn_by_local_carrier(&victim)).await;
         assert!(
-            state.peers.get(&victim).is_none(),
-            "so the rule above is about who established the id, not about \
-             refusing to act on withdrawals"
+            victim_removed_after_carrier,
+            "the carrier-observed withdrawal cancels the same unpromoted attempt"
         );
         assert_eq!(
-            durable(&state),
-            before,
-            "and cancelling an attempt is still only that: the withdrawal that \
-             *was* allowed to act moved nothing durable either"
+            durable_after_carrier, before,
+            "cancelling an attempt moved nothing durable either"
         );
-
-        state.shutdown().await;
     }
 
     /// **A replacement installed before the departure sweep reaches a peer is
@@ -25941,6 +24454,753 @@ mod tests {
         );
 
         state.shutdown().await;
+    }
+
+    /// Whole-network shutdown retains the original promoted registry owner
+    /// while its native worker is held, then removes that exact peer only
+    /// after the same shutdown future reaches terminal state.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_shutdown_retains_promoted_registry_owner_until_native_close() {
+        let (near, near_signaling, near_commands, near_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-native-gate-near", None, 2, None);
+        near.park_command_receiver_for_test(near_commands);
+        let (far, far_signaling, far_commands, far_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-native-gate-far", None, 2, None);
+        far.park_command_receiver_for_test(far_commands);
+        let near_provider_baseline = near_provider.in_use();
+        let far_provider_baseline = far_provider.in_use();
+        let linked = install_promoted_session_over_real_link(&near, &far).await;
+        let target = linked.peer_device_id().to_string();
+        let owner = near
+            .peers
+            .owner(&target)
+            .expect("the linked peer is current");
+        let worker = owner
+            .connection()
+            .current_worker()
+            .expect("the linked peer has a promoted worker");
+        let gate = worker.install_native_close_gate_for_test();
+        let cleanup_gate = owner.connection().install_shutdown_cleanup_gate_for_test();
+        let mut shutdown = Box::pin(near.shutdown());
+        let shutdown_poll = futures::poll!(&mut shutdown);
+        let gate_reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+            .await
+            .is_ok();
+        let shutdown_pending = matches!(shutdown_poll, std::task::Poll::Pending);
+        let retained_in_registry = near.peers.owner(&target).is_some();
+        let retained_promoted_slot = owner.connection().holds_promoted_session();
+        let authority_refused = near
+            .peers
+            .admit_application_operation(
+                &owner,
+                near.session_broker.as_ref(),
+                &near.mesh_context_id().to_string(),
+            )
+            .is_none();
+        gate.open();
+        let shutdown_after_gate_poll = futures::poll!(&mut shutdown);
+        let cleanup_reached = {
+            let mut cleanup_wait = Box::pin(cleanup_gate.wait_for_entry());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                futures::future::poll_fn(|cx| {
+                    let shutdown_poll = shutdown.as_mut().poll(cx);
+                    let cleanup_poll = cleanup_wait.as_mut().poll(cx);
+                    if matches!(cleanup_poll, std::task::Poll::Ready(())) {
+                        std::task::Poll::Ready(true)
+                    } else if matches!(shutdown_poll, std::task::Poll::Ready(_)) {
+                        std::task::Poll::Ready(false)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap_or(false)
+        };
+        let mut second = Box::pin(near.shutdown());
+        let second_poll = futures::poll!(&mut second);
+        let second_waiting = {
+            let mut waiter_wait = Box::pin(cleanup_gate.wait_for_waiter());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                futures::future::poll_fn(|cx| {
+                    let second_poll = second.as_mut().poll(cx);
+                    let waiter_poll = waiter_wait.as_mut().poll(cx);
+                    if matches!(waiter_poll, std::task::Poll::Ready(())) {
+                        std::task::Poll::Ready(true)
+                    } else if matches!(second_poll, std::task::Poll::Ready(_)) {
+                        std::task::Poll::Ready(false)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap_or(false)
+        };
+        let second_pending = matches!(second_poll, std::task::Poll::Pending);
+        let retained_during_cleanup = near.peers.owner(&target).is_some();
+        cleanup_gate.open();
+        shutdown.await;
+        second.await;
+        let removed_after_terminal = near.peers.owner(&target).is_none();
+        let linked_outcomes = linked.close_outcomes().await;
+        far.shutdown().await;
+        drop((owner, worker, gate, cleanup_gate));
+        let near_after_shutdown = near_provider.in_use();
+        let far_after_shutdown = far_provider.in_use();
+        let near_retained = near_provider.retained_after_failed_cleanup();
+        let far_retained = far_provider.retained_after_failed_cleanup();
+        drop((near, far, near_signaling, far_signaling));
+        let near_after = near_provider.in_use();
+        let far_after = far_provider.in_use();
+        let near_provider_clean = near_provider.in_use() == near_retained;
+        let far_provider_clean = far_provider.in_use() == far_retained;
+        let linked_closed = linked_outcomes.iter().all(|outcome| outcome.is_ok());
+        let near_storage_was_admitted =
+            near_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes) > 0;
+        let far_storage_was_admitted =
+            far_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes) > 0;
+        let near_native_retained = near_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                near_provider_baseline
+                    .amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("near native observation does not underflow its baseline");
+        let far_native_retained = far_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                far_provider_baseline.amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("far native observation does not underflow its baseline");
+        assert!(
+            gate_reached,
+            "prepared shutdown reached the native close gate"
+        );
+        assert!(
+            shutdown_pending,
+            "shutdown stayed pending at the native gate"
+        );
+        assert!(matches!(shutdown_after_gate_poll, std::task::Poll::Pending));
+        assert!(
+            retained_in_registry,
+            "the original registry owner was retained"
+        );
+        assert!(
+            retained_promoted_slot,
+            "the promoted slot stayed funded while gated"
+        );
+        assert!(
+            authority_refused,
+            "retirement revoked stale application authority"
+        );
+        assert!(
+            cleanup_reached,
+            "prepared join reached its post-native cleanup gate"
+        );
+        assert!(
+            second_waiting,
+            "the concurrent shutdown reached the join waiter"
+        );
+        assert!(
+            second_pending,
+            "a concurrent shutdown waited for full cleanup"
+        );
+        assert!(
+            retained_during_cleanup,
+            "registry custody survived before cleanup release"
+        );
+        assert!(
+            removed_after_terminal,
+            "the exact peer was removed after terminal close"
+        );
+        assert!(linked_closed, "the linked fixture closed cleanly");
+        assert!(
+            near_retained.is_zero(),
+            "successful near shutdown retains no failed claim"
+        );
+        assert!(
+            far_retained.is_zero(),
+            "successful far shutdown retains no failed claim"
+        );
+        assert!(near_storage_was_admitted);
+        assert!(far_storage_was_admitted);
+        assert_eq!(
+            near_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            0,
+            "successful near shutdown releases semantic storage"
+        );
+        assert_eq!(
+            far_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            0,
+            "successful far shutdown releases semantic storage"
+        );
+        assert_eq!(
+            near_native_retained,
+            near_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "near native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(
+            far_native_retained,
+            far_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "far native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(near_after, near_retained);
+        assert_eq!(far_after, far_retained);
+        assert_eq!(near_provider.active_reservations(), 0);
+        assert_eq!(near_provider.active_scopes(), 0);
+        assert_eq!(far_provider.active_reservations(), 0);
+        assert_eq!(far_provider.active_scopes(), 0);
+        assert!(near_provider_clean && far_provider_clean);
+    }
+
+    /// A native terminal failure is sticky for the exact prepared peer: a
+    /// concurrent waiter must not observe the same completed join as success.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_shutdown_native_failure_is_truthful_to_concurrent_waiters() {
+        let (near, near_signaling, near_commands, near_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-failure-near", None, 2, None);
+        near.park_command_receiver_for_test(near_commands);
+        let (far, far_signaling, far_commands, far_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-failure-far", None, 2, None);
+        far.park_command_receiver_for_test(far_commands);
+        let near_provider_baseline = near_provider.in_use();
+        let far_provider_baseline = far_provider.in_use();
+        let linked = install_promoted_session_over_real_link(&near, &far).await;
+        let target = linked.peer_device_id().to_string();
+        let owner = near
+            .peers
+            .owner(&target)
+            .expect("the linked peer is current");
+        let peer = Arc::clone(owner.connection());
+        let worker = owner
+            .connection()
+            .current_worker()
+            .expect("the linked peer has a promoted worker");
+        let gate = worker.install_native_close_gate_for_test();
+        gate.inject_close_failure();
+        let cleanup_gate = peer.install_shutdown_cleanup_gate_for_test();
+        peer.prepare_for_shutdown();
+        let mut first = Box::pin(peer.retire_and_close());
+        let first_poll = futures::poll!(&mut first);
+        let gate_reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+            .await
+            .is_ok();
+        let first_pending = matches!(first_poll, std::task::Poll::Pending);
+        gate.open();
+        let first_after_gate_poll = futures::poll!(&mut first);
+        let cleanup_reached = {
+            let mut cleanup_wait = Box::pin(cleanup_gate.wait_for_entry());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                futures::future::poll_fn(|cx| {
+                    let first_poll = first.as_mut().poll(cx);
+                    let cleanup_poll = cleanup_wait.as_mut().poll(cx);
+                    if matches!(cleanup_poll, std::task::Poll::Ready(())) {
+                        std::task::Poll::Ready(true)
+                    } else if matches!(first_poll, std::task::Poll::Ready(_)) {
+                        std::task::Poll::Ready(false)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap_or(false)
+        };
+        let mut second = Box::pin(peer.retire_and_close());
+        let second_poll = futures::poll!(&mut second);
+        let second_waiting = {
+            let mut waiter_wait = Box::pin(cleanup_gate.wait_for_waiter());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                futures::future::poll_fn(|cx| {
+                    let second_poll = second.as_mut().poll(cx);
+                    let waiter_poll = waiter_wait.as_mut().poll(cx);
+                    if matches!(waiter_poll, std::task::Poll::Ready(())) {
+                        std::task::Poll::Ready(true)
+                    } else if matches!(second_poll, std::task::Poll::Ready(_)) {
+                        std::task::Poll::Ready(false)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap_or(false)
+        };
+        let second_pending = matches!(second_poll, std::task::Poll::Pending);
+        let registry_retained = near.peers.owner(&target).is_some();
+        let authority_refused = near
+            .peers
+            .admit_application_operation(
+                &owner,
+                near.session_broker.as_ref(),
+                &near.mesh_context_id().to_string(),
+            )
+            .is_none();
+        cleanup_gate.open();
+        let first_result = first.await;
+        let second_result = second.await;
+        let retry_result = peer.retire_and_close().await;
+        let first_failed = first_result.is_err();
+        let second_failed = second_result.is_err();
+        let retry_failed = retry_result.is_err();
+        let second_error = second_result.as_ref().err().map(|error| error.to_string());
+        let retry_error = retry_result.as_ref().err().map(|error| error.to_string());
+        let slot_released = !peer.holds_promoted_session();
+        let linked_outcomes = linked.close_outcomes().await;
+        far.shutdown().await;
+        drop((
+            owner,
+            peer,
+            worker,
+            gate,
+            cleanup_gate,
+            near_signaling,
+            far_signaling,
+        ));
+        let near_after_shutdown = near_provider.in_use();
+        let far_after_shutdown = far_provider.in_use();
+        let near_retained = near_provider.retained_after_failed_cleanup();
+        let far_retained = far_provider.retained_after_failed_cleanup();
+        drop((near, far));
+        let near_after = near_provider.in_use();
+        let far_after = far_provider.in_use();
+        let linked_cleanup_completed = linked_outcomes.len() == 2;
+        let near_native_retained = near_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                near_provider_baseline
+                    .amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("near native observation does not underflow its baseline");
+        let far_native_retained = far_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                far_provider_baseline.amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("far native observation does not underflow its baseline");
+        assert!(gate_reached, "failed native close reached the gate");
+        assert!(
+            first_pending,
+            "the first failure waiter was gated before close"
+        );
+        assert!(matches!(first_after_gate_poll, std::task::Poll::Pending));
+        assert!(cleanup_reached, "failure reached post-native cleanup");
+        assert!(
+            second_waiting,
+            "the second caller waited for the same terminal pass"
+        );
+        assert!(
+            second_pending,
+            "the second caller stayed pending at the waiter gate"
+        );
+        assert!(
+            registry_retained,
+            "failed cleanup retained the exact registry owner"
+        );
+        assert!(authority_refused, "failed cleanup left no stale authority");
+        assert!(first_failed, "the first caller observed native failure");
+        assert!(
+            second_failed,
+            "the concurrent caller observed sticky failure"
+        );
+        assert!(
+            retry_failed,
+            "a retry observed the same stored native failure"
+        );
+        assert_eq!(
+            second_error, retry_error,
+            "retry preserves the stored failure"
+        );
+        assert!(
+            slot_released,
+            "terminal failure released the prepared session slot"
+        );
+        assert!(
+            linked_cleanup_completed,
+            "the linked fixture cleanup completed"
+        );
+        assert_eq!(
+            near_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            near_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes),
+            "failed near close retains semantic storage until state-root drop"
+        );
+        assert!(
+            far_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes) > 0,
+            "far semantic storage was admitted before shutdown"
+        );
+        assert_eq!(
+            far_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            0,
+            "far State::shutdown releases semantic storage"
+        );
+        assert_eq!(
+            near_native_retained,
+            near_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "near native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(
+            far_native_retained,
+            far_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "far native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(near_after, near_retained);
+        assert_eq!(far_after, far_retained);
+        assert_eq!(near_provider.active_reservations(), 0);
+        assert_eq!(near_provider.active_scopes(), 0);
+        assert_eq!(far_provider.active_reservations(), 0);
+        assert_eq!(far_provider.active_scopes(), 0);
+        assert!(
+            !near_retained.is_zero(),
+            "failed near cleanup retains its exact claim"
+        );
+        assert_eq!(far_retained, crate::resource::ResourceClaim::ZERO);
+    }
+
+    /// Cancellation of a gated whole-network shutdown must leave the original
+    /// peer owner available for a second call.  The closing-entry pressure is
+    /// constructed before shutdown, so success cannot depend on a late
+    /// ClosingWorker allocation after the promoted capability is retained.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_shutdown_retry_retains_original_owner_under_closing_pressure() {
+        let (near, near_signaling, near_commands, near_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-pressure-near", None, 2, None);
+        near.park_command_receiver_for_test(near_commands);
+        let (far, far_signaling, far_commands, far_provider, _) =
+            build_test_state_parts_metered("shutdown-promoted-pressure-far", None, 2, None);
+        far.park_command_receiver_for_test(far_commands);
+        let near_provider_baseline = near_provider.in_use();
+        let far_provider_baseline = far_provider.in_use();
+        let linked = install_promoted_session_over_real_link(&near, &far).await;
+        let target = linked.peer_device_id().to_string();
+        let owner = near
+            .peers
+            .owner(&target)
+            .expect("the linked peer is current");
+        let worker = owner
+            .connection()
+            .current_worker()
+            .expect("the linked peer has a promoted worker");
+        let gate = worker.install_native_close_gate_for_test();
+        let pressure = owner
+            .connection()
+            .prepare_closing_worker_pressure_for_test(&worker);
+        let pressure_ready = pressure.is_ok();
+        let pressure_seal = pressure.ok().map(|(seal, _)| seal);
+        let weak_peer = Arc::downgrade(owner.connection());
+        let LinkedPromotedSession {
+            near:
+                LinkedPromotedPeer {
+                    peer: fixture_peer,
+                    receive_ready,
+                },
+            _far_peer: fixture_far_peer,
+            near_pump,
+            far_pump,
+        } = linked;
+        drop((owner, fixture_peer, fixture_far_peer, worker));
+        let mut first = Box::pin(near.shutdown());
+        let first_poll = futures::poll!(&mut first);
+        let gate_reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+            .await
+            .is_ok();
+        let retained_before_cancel = weak_peer.upgrade().is_some();
+        let first_pending = matches!(first_poll, std::task::Poll::Pending);
+        drop(first);
+        let first_cancelled = first_pending;
+        let retained_after_cancel = weak_peer.upgrade().is_some();
+        let mut second = Box::pin(near.shutdown());
+        let second_poll = futures::poll!(&mut second);
+        let second_pending = matches!(second_poll, std::task::Poll::Pending);
+        gate.open();
+        second.await;
+        let removed_after_retry_immediate = near.peers.owner(&target).is_none();
+        let linked_outcomes = receive_ready.close_outcomes().await;
+        let near_pump_joined = near_pump.await.is_ok();
+        let far_pump_joined = far_pump.await.is_ok();
+        far.shutdown().await;
+        drop((pressure_seal, gate, near_signaling, far_signaling));
+        let near_after_shutdown = near_provider.in_use();
+        let far_after_shutdown = far_provider.in_use();
+        let near_retained = near_provider.retained_after_failed_cleanup();
+        let far_retained = far_provider.retained_after_failed_cleanup();
+        drop((near, far));
+        let removed_after_state_drop = weak_peer.upgrade().is_none();
+        drop(weak_peer);
+        let near_after = near_provider.in_use();
+        let far_after = far_provider.in_use();
+        let linked_closed = linked_outcomes.iter().all(|outcome| outcome.is_ok())
+            && near_pump_joined
+            && far_pump_joined;
+        let near_storage_was_admitted =
+            near_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes) > 0;
+        let far_storage_was_admitted =
+            far_provider_baseline.amount(crate::resource::ResourceClass::StorageBytes) > 0;
+        let near_native_retained = near_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                near_provider_baseline
+                    .amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("near native observation does not underflow its baseline");
+        let far_native_retained = far_after_shutdown
+            .amount(crate::resource::ResourceClass::NativeTransportObject)
+            .checked_sub(
+                far_provider_baseline.amount(crate::resource::ResourceClass::NativeTransportObject),
+            )
+            .expect("far native observation does not underflow its baseline");
+        assert!(
+            pressure_ready,
+            "closing-entry pressure was funded before shutdown"
+        );
+        assert!(gate_reached, "the native close reached its held gate");
+        assert!(
+            retained_before_cancel,
+            "the original owner survived first shutdown"
+        );
+        assert!(first_pending, "the first shutdown was pending at the gate");
+        assert!(
+            first_cancelled,
+            "the first shutdown future was actually cancelled"
+        );
+        assert!(
+            retained_after_cancel,
+            "cancellation retained the original registry owner"
+        );
+        assert!(
+            second_pending,
+            "the retry stayed pending while the native gate was held"
+        );
+        assert!(
+            removed_after_retry_immediate,
+            "retry removed the exact registry peer before pump closure"
+        );
+        assert!(
+            removed_after_state_drop,
+            "the exact peer expires after the final state roots drop"
+        );
+        assert!(linked_closed, "the linked fixture closed cleanly");
+        assert!(near_retained.is_zero());
+        assert!(far_retained.is_zero());
+        assert!(near_storage_was_admitted);
+        assert!(far_storage_was_admitted);
+        assert_eq!(
+            near_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            0,
+            "successful near shutdown releases semantic storage"
+        );
+        assert_eq!(
+            far_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes),
+            0,
+            "successful far shutdown releases semantic storage"
+        );
+        assert_eq!(
+            near_native_retained,
+            near_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "near native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(
+            far_native_retained,
+            far_retained.amount(crate::resource::ResourceClass::NativeTransportObject),
+            "far native residual matches the actual failed-retention amount"
+        );
+        assert_eq!(near_after, near_retained);
+        assert_eq!(far_after, far_retained);
+        assert_eq!(near_provider.active_reservations(), 0);
+        assert_eq!(near_provider.active_scopes(), 0);
+        assert_eq!(far_provider.active_reservations(), 0);
+        assert_eq!(far_provider.active_scopes(), 0);
+    }
+
+    /// A failed original closing waiter is consumed into the peer's sticky
+    /// shutdown result even when a second waiter remains pending.  Cancelling
+    /// the first retirement must retain that original waiter for the retry;
+    /// the retry and every later caller then observe the same failure.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_shutdown_original_closing_waiter_error_cancel_retry_is_sticky() {
+        let (near, near_signaling, near_commands, near_provider, _) =
+            build_test_state_parts_metered("shutdown-original-waiter-near", None, 2, None);
+        near.park_command_receiver_for_test(near_commands);
+        let (far, far_signaling, far_commands, far_provider, _) =
+            build_test_state_parts_metered("shutdown-original-waiter-far", None, 2, None);
+        far.park_command_receiver_for_test(far_commands);
+        let linked = install_promoted_session_over_real_link(&near, &far).await;
+        let target = linked.peer_device_id().to_string();
+        let owner = near
+            .peers
+            .owner(&target)
+            .expect("the linked peer is current");
+        let peer = Arc::clone(owner.connection());
+        let worker = owner
+            .connection()
+            .current_worker()
+            .expect("the linked peer has a promoted worker");
+        let gate = worker.install_native_close_gate_for_test();
+        let task_claim =
+            crate::resource::ResourceClaim::single(crate::resource::ResourceClass::WorkerOrTask, 1);
+        let a_lease = worker
+            .reserve_attempt_work(task_claim)
+            .expect("original waiter A has a funded task claim");
+        let b_lease = worker
+            .reserve_attempt_work(task_claim)
+            .expect("original waiter B has a funded task claim");
+        let b_entered = Arc::new(tokio::sync::Notify::new());
+        let b_release = Arc::new(tokio::sync::Notify::new());
+        let a_waiter = tokio::spawn(async move {
+            let _lease = a_lease;
+            panic!("original closing waiter A failed");
+        });
+        let b_entered_for_task = Arc::clone(&b_entered);
+        let b_release_for_task = Arc::clone(&b_release);
+        let b_waiter = tokio::spawn(async move {
+            let _lease = b_lease;
+            b_entered_for_task.notify_one();
+            b_release_for_task.notified().await;
+        });
+        peer.insert_original_closing_waiter_for_test(Arc::downgrade(&worker), a_waiter);
+        peer.insert_original_closing_waiter_for_test(Arc::downgrade(&worker), b_waiter);
+        let b_entered_observed =
+            tokio::time::timeout(Duration::from_secs(10), b_entered.notified())
+                .await
+                .is_ok();
+        drop((owner, worker));
+
+        peer.prepare_for_shutdown();
+        let mut first = Box::pin(peer.retire_and_close());
+        let first_poll = futures::poll!(&mut first);
+        let gate_reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+            .await
+            .is_ok();
+        let first_pending_at_native = matches!(first_poll, std::task::Poll::Pending);
+        gate.open();
+        let original_waiter_observed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let poll = futures::poll!(&mut first);
+                let sticky = peer.shutdown_join_failed_for_test();
+                let count = peer.original_closing_waiter_count_for_test();
+                if sticky && count == 1 && matches!(poll, std::task::Poll::Pending) {
+                    break true;
+                }
+                if matches!(poll, std::task::Poll::Ready(_)) {
+                    break false;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        drop(first);
+        let waiter_retained_after_cancel = peer.original_closing_waiter_count_for_test() == 1;
+
+        let mut retry = Box::pin(peer.retire_and_close());
+        let retry_poll = futures::poll!(&mut retry);
+        let retry_pending_with_b = matches!(retry_poll, std::task::Poll::Pending);
+        b_release.notify_one();
+        let retry_result = retry.await;
+        let subsequent_result = peer.retire_and_close().await;
+        let retry_failed = retry_result.is_err();
+        let subsequent_failed = subsequent_result.is_err();
+        let retry_error = retry_result.as_ref().err().map(|error| error.to_string());
+        let subsequent_error = subsequent_result
+            .as_ref()
+            .err()
+            .map(|error| error.to_string());
+        let waiters_after_retry = peer.original_closing_waiter_count_for_test();
+        near.shutdown().await;
+        let linked_outcomes = linked.close_outcomes().await;
+        far.shutdown().await;
+        drop((
+            peer,
+            gate,
+            b_release,
+            b_entered,
+            near_signaling,
+            far_signaling,
+        ));
+        let near_after_shutdown = near_provider.in_use();
+        let far_after_shutdown = far_provider.in_use();
+        let near_retained = near_provider.retained_after_failed_cleanup();
+        let far_retained = far_provider.retained_after_failed_cleanup();
+        drop((near, far));
+        let near_after = near_provider.in_use();
+        let far_after = far_provider.in_use();
+        let linked_closed = linked_outcomes.iter().all(|outcome| outcome.is_ok());
+        let near_storage_released =
+            near_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes) == 0;
+        let far_storage_released =
+            far_after_shutdown.amount(crate::resource::ResourceClass::StorageBytes) == 0;
+        assert!(
+            b_entered_observed,
+            "original waiter B entered its pending body"
+        );
+        assert!(
+            gate_reached,
+            "prepared retirement reached the native close gate"
+        );
+        assert!(
+            first_pending_at_native,
+            "the first retirement was gated before close"
+        );
+        assert!(
+            original_waiter_observed,
+            "waiter A failure became sticky while B remained"
+        );
+        assert!(
+            waiter_retained_after_cancel,
+            "cancelling the first retirement retained B"
+        );
+        assert!(
+            retry_pending_with_b,
+            "retry waited for the original pending waiter"
+        );
+        assert!(retry_failed, "retry returned the original waiter failure");
+        assert!(
+            subsequent_failed,
+            "a later caller observed the sticky waiter failure"
+        );
+        assert_eq!(
+            retry_error, subsequent_error,
+            "sticky waiter failure is preserved"
+        );
+        assert_eq!(
+            waiters_after_retry, 0,
+            "the retry joined the remaining waiter"
+        );
+        assert!(linked_closed, "the linked fixture closed cleanly");
+        assert!(
+            near_retained.is_zero(),
+            "successful native close retains no claim"
+        );
+        assert!(
+            far_retained.is_zero(),
+            "far cleanup retains no failed claim"
+        );
+        assert!(
+            near_storage_released,
+            "near state shutdown releases semantic storage before final Arc drop"
+        );
+        assert!(
+            far_storage_released,
+            "far state shutdown releases semantic storage before final Arc drop"
+        );
+        assert_eq!(near_after, near_retained);
+        assert_eq!(far_after, far_retained);
+        assert_eq!(near_provider.active_reservations(), 0);
+        assert_eq!(near_provider.active_scopes(), 0);
+        assert_eq!(far_provider.active_reservations(), 0);
+        assert_eq!(far_provider.active_scopes(), 0);
     }
 
     /// Full peer teardown retains and awaits every worker it owned, including
@@ -31723,1423 +30983,5 @@ mod tests {
             (0, 0),
             "shutdown leaves no registered or pending peer-event pumps"
         );
-    }
-
-    #[cfg(feature = "route-flow-diagnostics")]
-    fn route_flow_frame_for_test(
-        state: &NetworkState,
-        origin_key: &ed25519_dalek::SigningKey,
-        destination: DeviceId,
-        message_id: [u8; 16],
-        run_id: &str,
-        seq: u64,
-        kind: &str,
-    ) -> Bytes {
-        let origin = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
-            .expect("the route-flow origin key has a canonical id");
-        let policy = state.routing.policy();
-        let limits = crate::protocol::RoutedApplicationLimits::checked(
-            usize::try_from(policy.max_envelope_bytes())
-                .expect("the fixture routing envelope limit fits usize"),
-            policy.max_hop_budget(),
-        )
-        .expect("the fixture uses the state's checked routing limits");
-        let envelope = RoutedApplicationEnvelope::new_with_limits(
-            state.mesh_context_id(),
-            origin,
-            destination,
-            message_id,
-            policy.max_hop_budget(),
-            ClosedRoutedPayload::ChannelFrame {
-                channel: "route-flow-control".to_string(),
-                payload: serde_json::json!({
-                    "run_id": run_id,
-                    "seq": seq,
-                    "kind": kind,
-                    "body": "not copied into diagnostics"
-                }),
-            },
-            origin_key,
-            limits,
-        )
-        .expect("the bounded route-flow envelope is valid");
-        Bytes::from(
-            serde_json::to_vec(&MeshMessage::RoutedApplication(envelope))
-                .expect("the route-flow envelope serializes"),
-        )
-    }
-
-    #[cfg(feature = "route-flow-diagnostics")]
-    async fn next_route_flow_detail_for_test(
-        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
-    ) -> serde_json::Value {
-        for _ in 0..10_000 {
-            match events.try_recv() {
-                Ok(MeshEvent::Diag(entry)) if entry.category == "route_flow" => {
-                    return entry.detail;
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                    panic!("the route-flow event hub closed before a diagnostic row")
-                }
-            }
-        }
-        panic!("the production event hub emitted no route-flow row")
-    }
-
-    #[cfg(feature = "route-flow-diagnostics")]
-    fn try_route_flow_detail_for_test(
-        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
-    ) -> Option<serde_json::Value> {
-        loop {
-            match events.try_recv() {
-                Ok(MeshEvent::Diag(entry)) if entry.category == "route_flow" => {
-                    return Some(entry.detail);
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(
-                    tokio::sync::broadcast::error::TryRecvError::Empty
-                    | tokio::sync::broadcast::error::TryRecvError::Closed,
-                ) => return None,
-            }
-        }
-    }
-
-    #[cfg(feature = "route-flow-diagnostics")]
-    fn assert_no_route_flow_detail_for_test(
-        events: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
-    ) {
-        assert!(
-            try_route_flow_detail_for_test(events).is_none(),
-            "an unselected or unadmitted frame emitted route-flow evidence"
-        );
-    }
-
-    // These controls create genuinely confirmed endpoint epochs through the
-    // controller's signed share/confirmation exchange. The exchange is local
-    // fixture setup, not remote-handshake qualification. Ciphertext then uses
-    // the actual builder, funded command, writer and two live native links.
-    #[cfg(all(feature = "transport-lab", feature = "route-flow-diagnostics"))]
-    mod ciphertext_origin_controls {
-        use super::*;
-        use crate::resource::{FiniteResourceProvider, ResourceClaim, ResourceClass};
-
-        const RUN: &str = "cipher-origin-629";
-        const CHANNEL: &str = "cipher-origin";
-        const PLAIN: usize = 1024;
-
-        #[derive(Clone, Copy, PartialEq)]
-        enum Case {
-            Delivered,
-            Cancelled,
-            Stale,
-            Unavailable,
-            Disabled,
-        }
-
-        fn policy() -> crate::config::EndpointCipherPolicyConfig {
-            crate::config::EndpointCipherPolicyConfig {
-                max_sessions: 1,
-                max_plaintext_bytes: PLAIN as u64,
-                replay_window: 8,
-                max_age_ms: 10_000,
-            }
-        }
-
-        fn plan(endpoint: bool, peers: usize) -> ResourceClaim {
-            use endpoint_cipher::EndpointCipherController as Controller;
-            let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
-            let routing = crate::config::RoutingPolicyConfig::default()
-                .checked()
-                .unwrap();
-            let wire = crate::protocol::RECEIVE_FRAME_BYTES;
-            let outer = crate::protocol::topology::routed_work_claim(wire).unwrap();
-            let mut claims = vec![
-                // One received frame, its independent route signing/verification,
-                // and the captured candidates/plan/terminal observation coexist.
-                charge(crate::application_gateway::AdmittedApplicationFrame::claim(wire).unwrap()),
-                charge(outer),
-                charge(
-                    funded_route_input_work_claim(
-                        peers,
-                        usize::try_from(routing.max_next_hops).unwrap(),
-                        usize::try_from(routing.max_parallel_routes).unwrap(),
-                    )
-                    .unwrap(),
-                ),
-                // At origin the test control plus one ciphertext retain two IDs;
-                // downstream only the ciphertext is admitted. No repeated sends.
-                routing::replay_entry_reservation_charge_for_test()
-                    .checked_scale(if endpoint { 2 } else { 1 })
-                    .unwrap(),
-            ];
-            if endpoint {
-                claims.extend([
-                    Controller::planned_retention_claim(policy()).unwrap(),
-                    FiniteResourceProvider::scope_planning_charge(),
-                    // Offer and confirmation may both be held while a third
-                    // receive-control operation is in progress; no wire clones.
-                    charge(Controller::control_work_claim(ResourceClaim::ZERO).unwrap())
-                        .checked_scale(3)
-                        .unwrap(),
-                    charge(Controller::data_work_claim(PLAIN, outer).unwrap()),
-                    charge(crate::application_gateway::structural_json_claim(PLAIN).unwrap()),
-                    charge(
-                        ResourceClaim::try_from_entries([
-                            (
-                                ResourceClass::AccountedMemoryBytes,
-                                DeviceId::uninterned_backing_bytes() as u64,
-                            ),
-                            (ResourceClass::ParsingOrCpuWork, 52),
-                            (ResourceClass::OpaqueDependencyResidual, 2),
-                        ])
-                        .unwrap(),
-                    ),
-                    charge(
-                        ResourceClaim::try_from_entries([
-                            (ResourceClass::AccountedMemoryBytes, PLAIN as u64),
-                            (ResourceClass::ParsingOrCpuWork, PLAIN as u64),
-                            (ResourceClass::OpaqueDependencyResidual, 1),
-                        ])
-                        .unwrap(),
-                    ),
-                ]);
-            }
-            claims
-                .into_iter()
-                .try_fold(ResourceClaim::ZERO, |sum, next| sum.checked_add(next))
-                .unwrap()
-        }
-
-        fn confirmed(
-            source: &Arc<NetworkState>,
-            destination: &Arc<NetworkState>,
-        ) -> std::result::Result<bool, String> {
-            let source_id = DeviceId::from_canonical_str(source.identity.public_id())
-                .map_err(|e| format!("{e:?}"))?;
-            let destination_id = DeviceId::from_canonical_str(destination.identity.public_id())
-                .map_err(|e| format!("{e:?}"))?;
-            let selection = capture_funded_route_input(source).map_err(|e| format!("{e:?}"))?;
-            let work = source
-                .acquire_application_work(
-                    crate::protocol::topology::routed_work_claim(
-                        crate::protocol::RECEIVE_FRAME_BYTES,
-                    )
-                    .map_err(|e| format!("{e:?}"))?,
-                )
-                .map_err(|e| format!("{e:?}"))?;
-            let source_graph = source.fact_graph.read();
-            let destination_graph = destination.fact_graph.read();
-            if !governance::canonical_policy_admits_devices(
-                source.verified_bootstrap(),
-                &source_graph,
-                &source_id,
-                &destination_id,
-            ) || !governance::canonical_policy_admits_devices(
-                destination.verified_bootstrap(),
-                &destination_graph,
-                &destination_id,
-                &source_id,
-            ) {
-                return Err("fixture canonical endpoint policy refused".to_owned());
-            }
-            let at = Instant::now();
-            let mut a = source
-                .endpoint_cipher
-                .as_ref()
-                .ok_or("source cipher missing")?
-                .lock();
-            let mut b = destination
-                .endpoint_cipher
-                .as_ref()
-                .ok_or("destination cipher missing")?
-                .lock();
-            let offer = a
-                .begin(
-                    &source.identity,
-                    &destination_id,
-                    None,
-                    ResourceClaim::ZERO,
-                    at,
-                )
-                .map_err(|e| format!("offer {e:?}"))?;
-            let frames = offer.output.as_ref().ok_or("offer absent")?.frames();
-            // A real control also traverses the funded outer builder, but must
-            // not acquire an Origin observation or emit ciphertext metadata.
-            let control = prepare_endpoint_routed_frame(
-                source,
-                &destination_id,
-                ClosedRoutedPayload::EndpointControl {
-                    control: frames.first.clone(),
-                },
-                selection,
-            )
-            .map_err(|e| format!("control builder {e:?}"))?;
-            let control_unselected = control._selection.route_flow.is_none();
-            drop((control, work));
-            let answer = b
-                .receive_control(
-                    &destination.identity,
-                    &source_id,
-                    &frames.first,
-                    ResourceClaim::ZERO,
-                    at,
-                )
-                .map_err(|e| format!("answer {e:?}"))?;
-            let answer_frames = answer.output.as_ref().ok_or("answer absent")?.frames();
-            let confirmation = a
-                .receive_control(
-                    &source.identity,
-                    &destination_id,
-                    &answer_frames.first,
-                    ResourceClaim::ZERO,
-                    at,
-                )
-                .map_err(|e| format!("confirm {e:?}"))?;
-            b.receive_control(
-                &destination.identity,
-                &source_id,
-                &confirmation
-                    .output
-                    .as_ref()
-                    .ok_or("confirmation absent")?
-                    .frames()
-                    .first,
-                ResourceClaim::ZERO,
-                at,
-            )
-            .map_err(|e| format!("peer confirm {e:?}"))?;
-            a.receive_control(
-                &source.identity,
-                &destination_id,
-                answer_frames
-                    .second
-                    .as_ref()
-                    .ok_or("peer confirmation absent")?,
-                ResourceClaim::ZERO,
-                at,
-            )
-            .map_err(|e| format!("local confirm {e:?}"))?;
-            Ok(control_unselected
-                && offer.ticket.phase(at) == endpoint_cipher::CipherPhase::Ready
-                && answer.ticket.phase(at) == endpoint_cipher::CipherPhase::Ready)
-        }
-
-        async fn run(case: Case) {
-            let enabled = case != Case::Disabled;
-            assert_eq!(
-                crate::route_flow::active_run_id_for_test(),
-                enabled.then_some(RUN),
-                "run this isolated selector with the exact opt-in, or unset it for Disabled"
-            );
-            // Local storage locators are distinct; network/context and node
-            // identities are still constructed by the unchanged fixture body.
-            // Keep this root alive beyond every state/store owner, including
-            // the successfully constructed prefix of a failed setup.
-            let fixture_root = tempfile::tempdir().expect("Origin fixture storage root");
-            let mut built = [None, None, None];
-            let mut build_error = None;
-            for (index, (name, endpoint, peers)) in [
-                ("source", true, 1),
-                ("hub", false, 2),
-                ("destination", true, 1),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                match try_build_test_state_parts_metered_with_application_in_instance_root(
-                    "cipher-origin",
-                    None,
-                    peers,
-                    Some(plan(endpoint, peers)),
-                    None,
-                    None,
-                    Some(fixture_root.path().join(name)),
-                ) {
-                    Ok(node) => built[index] = Some(node),
-                    Err(error) => {
-                        build_error = Some((name, error));
-                        break;
-                    }
-                }
-            }
-            if let Some((name, error)) = build_error {
-                let mut prefix_clean = true;
-                for slot in &mut built {
-                    if let Some((node, signals, commands, provider, _)) = slot.take() {
-                        node.shutdown().await;
-                        drop((commands, signals, node));
-                        prefix_clean &= provider.active_reservations() == 0
-                            && provider.active_scopes() == 0
-                            && provider.in_use() == ResourceClaim::ZERO
-                            && provider.retained_after_failed_cleanup() == ResourceClaim::ZERO;
-                        drop(provider);
-                    }
-                }
-                drop(fixture_root);
-                panic!("Origin {name} construction failed after owned-prefix cleanup (clean={prefix_clean}): {error}");
-            }
-            let (mut source, source_signals, mut source_commands, source_provider, _) =
-                built[0].take().expect("source constructed");
-            let (hub, hub_signals, mut hub_commands, hub_provider, _) =
-                built[1].take().expect("hub constructed");
-            let (
-                mut destination,
-                destination_signals,
-                mut destination_commands,
-                destination_provider,
-                _,
-            ) = built[2].take().expect("destination constructed");
-            let mut source_events = source.events_tx.subscribe();
-            let mut hub_events = hub.events_tx.subscribe();
-            let mut destination_events = destination.events_tx.subscribe();
-            // Install only real cipher roots with their own issued child scope.
-            // No introduced-link record, Ready bit, epoch or capability is forged.
-            let setup = (|| -> std::result::Result<(), String> {
-                if source.mesh_context_id() != hub.mesh_context_id()
-                    || source.mesh_context_id() != destination.mesh_context_id()
-                    || source.identity.public_id() == hub.identity.public_id()
-                    || source.identity.public_id() == destination.identity.public_id()
-                    || hub.identity.public_id() == destination.identity.public_id()
-                {
-                    return Err(
-                        "fixture requires three distinct nodes in one actual context".to_owned(),
-                    );
-                }
-                for node in [&mut source, &mut destination] {
-                    let id = DeviceId::from_canonical_str(node.identity.public_id())
-                        .map_err(|e| format!("{e:?}"))?;
-                    let root = endpoint_cipher::EndpointCipherController::new(
-                        policy(),
-                        node.local_application_resource_scope()
-                            .map_err(|e| format!("{e:?}"))?,
-                        node.mesh_context_id(),
-                        &id,
-                    )
-                    .map_err(|e| format!("cipher root {e:?}"))?;
-                    Arc::get_mut(node)
-                        .ok_or("fixture state already shared")?
-                        .endpoint_cipher = Some(parking_lot::Mutex::new(root));
-                }
-                for node in [&source, &hub, &destination] {
-                    if node.routing.policy().max_envelope_bytes() != 65_535
-                        || node.routing.policy().max_hop_budget() != 4
-                    {
-                        return Err("original default routing limits changed".to_owned());
-                    }
-                    let topology = crate::config::TopologyMode::Star {
-                        hub: hub.identity.public_id().to_owned(),
-                    };
-                    *node.topology_impl.write() = crate::topology::from_mode(&topology);
-                    node.config.write().topology = topology;
-                }
-                Ok(())
-            })();
-            let first = if setup.is_ok() {
-                Some(install_retirable_session_over_real_link(&source, &hub).await)
-            } else {
-                None
-            };
-            let second = if setup.is_ok() {
-                Some(install_retirable_session_over_real_link(&hub, &destination).await)
-            } else {
-                None
-            };
-            let mut subscriber = crate::channels::Channel::<serde_json::Value>::new(
-                CHANNEL.to_owned(),
-                Arc::clone(&destination),
-            )
-            .subscribe();
-            let observations = async {
-                setup?;
-                if !confirmed(&source, &destination)? { return Err("control selection or genuine confirmation failed".to_owned()); }
-                // Installation announces capabilities on the undriven command
-                // queues. Retain no unexpected work and never reinterpret it.
-                for commands in [&mut source_commands, &mut hub_commands, &mut destination_commands] {
-                    while let Some(delivery) = commands.try_recv() {
-                        if !matches!(delivery.value(), NetworkCmd::ReplayCapabilities { .. }) {
-                            return Err("unexpected fixture command before payload".to_owned());
-                        }
-                        drop(delivery);
-                    }
-                }
-                if try_route_flow_detail_for_test(&mut source_events).is_some()
-                    || try_route_flow_detail_for_test(&mut hub_events).is_some()
-                    || try_route_flow_detail_for_test(&mut destination_events).is_some() {
-                    return Err("key controls emitted route-flow rows".to_owned());
-                }
-                let body = serde_json::json!({"opaque_application_value": 629});
-                let (reply, mut completion) = tokio::sync::oneshot::channel();
-                queue_routed_channel_frame(&source, destination.identity.public_id(), CHANNEL, body.clone(), &mut Some(reply))
-                    .map_err(|e| format!("actual ciphertext queue {e:?}"))?;
-                let delivery = source_commands.try_recv().ok_or("cipher command absent")?;
-                let NetworkCmd::EndpointControls(transfer) = delivery.value() else { return Err("not a cipher command".to_owned()); };
-                let frame = &transfer.output.value().first;
-                let selection_funded = frame._selection._work.claim() == funded_route_input_work_claim(1, source.routing.policy().max_next_hops(), source.routing.policy().max_parallel_routes()).map_err(|e| format!("{e:?}"))?;
-                let decode = source.acquire_application_work(crate::application_gateway::AdmittedApplicationFrame::claim(frame.bytes.len()).map_err(|e| format!("{e:?}"))?).map_err(|e| format!("{e:?}"))?;
-                let MeshMessage::RoutedApplication(envelope) = serde_json::from_slice::<MeshMessage>(&frame.bytes).map_err(|e| format!("{e:?}"))? else { return Err("not routed ciphertext".to_owned()); };
-                let route_id = hex::encode(envelope.message_id());
-                let selected = frame._selection.route_flow.is_some();
-                let ciphertext = matches!(envelope.payload(), ClosedRoutedPayload::EndpointCiphertext { .. });
-                if case == Case::Stale {
-                    source.endpoint_cipher.as_ref().ok_or("cipher absent")?.lock().retire(transfer.output.ticket());
-                }
-                if case == Case::Unavailable {
-                    // Retire only the adapter's originally captured carrier;
-                    // the queued ciphertext epoch is deliberately still live.
-                    let original_channel = &first.as_ref().ok_or("original link absent")?.near_channel;
-                    if frame.plan.next_hops().len() != 1
-                        || frame.plan.next_hops()[0] != original_channel.owner().device_id() {
-                        return Err("ciphertext does not select original carrier".to_owned());
-                    }
-                    original_channel.worker().retire();
-                }
-                drop((envelope, decode));
-                let mut early = false;
-                let gated = !matches!(case, Case::Stale | Case::Unavailable);
-                let mut entered = !gated;
-                let mut interval = !gated;
-                {
-                    let gate = gated.then(install_route_flow_dispatch_gate_for_test);
-                    let writer = delivery.run_terminal_effect(|command| handle_command(&source, command));
-                    tokio::pin!(writer);
-                    let first_poll = futures::poll!(&mut writer);
-                    if let Some(gate) = gate {
-                        let entered_notification = gate.entered.notified();
-                        tokio::pin!(entered_notification);
-                        entered = first_poll.is_pending()
-                            && futures::poll!(&mut entered_notification).is_ready();
-                        interval = gate.interval_open.load(std::sync::atomic::Ordering::SeqCst) == enabled;
-                        early = try_route_flow_detail_for_test(&mut source_events).is_some();
-                        // Clear the global gate before allowing the Hub's next
-                        // actual write; the captured origin waiter still owns it.
-                        clear_route_flow_dispatch_gate_for_test(&gate);
-                        gate.release.notify_one();
-                        if case != Case::Cancelled && first_poll.is_pending() { writer.await; }
-                    } else if first_poll.is_pending() {
-                        writer.await;
-                    }
-                    // Cancelled drops this exact pinned terminal effect here.
-                }
-                let outcome = completion.try_recv();
-                if !selection_funded || selected != enabled || !ciphertext || !entered || !interval || early {
-                    return Err(format!("builder/held-writer: funded={selection_funded} selected={selected} ciphertext={ciphertext} entered={entered} interval={interval} early={early}"));
-                }
-                if matches!(case, Case::Cancelled | Case::Stale) {
-                    let expected = if case == Case::Cancelled {
-                        matches!(outcome, Err(tokio::sync::oneshot::error::TryRecvError::Closed))
-                    } else { matches!(outcome, Ok(Err(_))) };
-                    if !expected { return Err(format!("cancel/stale terminal result {outcome:?}")); }
-                    for _ in 0..32 { tokio::task::yield_now().await; }
-                    if try_route_flow_detail_for_test(&mut source_events).is_some()
-                        || try_route_flow_detail_for_test(&mut hub_events).is_some()
-                        || try_route_flow_detail_for_test(&mut destination_events).is_some() {
-                        return Err("cancel/stale emitted a terminal row".to_owned());
-                    }
-                    return Ok(());
-                }
-                if case == Case::Unavailable {
-                    let row = try_route_flow_detail_for_test(&mut source_events).ok_or("missing unavailable Origin row")?;
-                    if !matches!(outcome, Ok(Err(_))) || row["outcome"] != "unavailable"
-                        || row["route_id"] != route_id || row["role"] != "origin"
-                        || row["schema"] != "myownmesh.route-flow-ciphertext/v1"
-                        || !row["route_dispatch_us"].is_u64()
-                        || try_route_flow_detail_for_test(&mut source_events).is_some()
-                        || try_route_flow_detail_for_test(&mut hub_events).is_some()
-                        || try_route_flow_detail_for_test(&mut destination_events).is_some() {
-                        return Err("retired original carrier lost actual unavailable outcome".to_owned());
-                    }
-                    return Ok(());
-                }
-                if !matches!(outcome, Ok(Ok(()))) { return Err(format!("actual writer result {outcome:?}")); }
-                let received = tokio::time::timeout(Duration::from_secs(10), subscriber.as_mut().map_err(|e| format!("subscribe {e:?}"))?.recv())
-                    .await.map_err(|_| "ciphertext delivery observation elapsed")?
-                    .ok_or("subscriber ended")?.map_err(|e| format!("delivery {e:?}"))?;
-                if received.body() != &body || received.from() != source.identity.public_id() {
-                    return Err("exact decrypted body/sender mismatch".to_owned());
-                }
-                let mut rows = [None, None, None];
-                for _ in 0..10_000 {
-                    for (slot, events) in rows.iter_mut().zip([&mut source_events, &mut hub_events, &mut destination_events]) {
-                        if slot.is_none() { *slot = try_route_flow_detail_for_test(events); }
-                    }
-                    if !enabled || rows.iter().all(Option::is_some) { break; }
-                    tokio::task::yield_now().await;
-                }
-                if !enabled {
-                    if rows.iter().any(Option::is_some) { return Err("disabled path emitted".to_owned()); }
-                    return Ok(());
-                }
-                for (row, role) in rows.into_iter().zip(["origin", "relay", "destination"]) {
-                    let row = row.ok_or_else(|| format!("missing {role} row"))?;
-                    if row["schema"] != "myownmesh.route-flow-ciphertext/v1"
-                        || row["local_run_label"] != RUN || row["label_attribution"] != "local_opt_in_only"
-                        || row["route_id"] != route_id || row["role"] != role
-                        || row["outcome"] != "delivered"
-                        || ["run_id", "seq", "direction", "payload", "channel"].iter().any(|key| row.get(*key).is_some()) {
-                        return Err(format!("metadata schema/route/outcome mismatch at {role}"));
-                    }
-                    if role == "origin" && (!row["owner_epoch"].is_null()
-                        || !row["callback_to_insert_us"].is_null()
-                        || !row["insert_to_dequeue_us"].is_null()
-                        || !row["dequeue_to_handler_us"].is_null()
-                        || !row["route_dispatch_us"].is_u64()
-                        || row["hop_index"] != 0 || row["remaining_ttl"] != 2) {
-                        return Err("origin fabricated native/owner or lost interval".to_owned());
-                    }
-                }
-                if try_route_flow_detail_for_test(&mut source_events).is_some()
-                    || try_route_flow_detail_for_test(&mut hub_events).is_some()
-                    || try_route_flow_detail_for_test(&mut destination_events).is_some() {
-                    return Err("duplicate row for a single actual writer".to_owned());
-                }
-                Ok::<(), String>(())
-            }.await;
-            // No assertion leaves real links/pumps, command deliveries, roots
-            // or subscriptions behind, including setup and saved-body failures.
-            drop(subscriber);
-            let first_closed = if let Some(link) = first {
-                link.retire_sessions().await
-            } else {
-                Vec::new()
-            };
-            let second_closed = if let Some(link) = second {
-                link.retire_sessions().await
-            } else {
-                Vec::new()
-            };
-            source.shutdown().await;
-            hub.shutdown().await;
-            destination.shutdown().await;
-            drop((
-                source_commands,
-                hub_commands,
-                destination_commands,
-                source_signals,
-                hub_signals,
-                destination_signals,
-                source_events,
-                hub_events,
-                destination_events,
-                source,
-                hub,
-                destination,
-            ));
-            drop(fixture_root);
-            assert!(
-                first_closed.iter().chain(&second_closed).all(Result::is_ok),
-                "both exact links and pumps must close"
-            );
-            for provider in [source_provider, hub_provider, destination_provider] {
-                assert_eq!(provider.active_reservations(), 0);
-                assert_eq!(provider.active_scopes(), 0);
-                assert_eq!(
-                    provider.retained_after_failed_cleanup(),
-                    ResourceClaim::ZERO
-                );
-                assert_eq!(provider.in_use(), ResourceClaim::ZERO);
-            }
-            observations.expect("current ciphertext Origin production-path control");
-        }
-
-        #[tokio::test]
-        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
-        async fn ready_ciphertext_command_writer_emits_correlated_origin() {
-            run(Case::Delivered).await;
-        }
-
-        #[tokio::test]
-        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
-        async fn cancelled_ciphertext_writer_emits_no_terminal_origin() {
-            run(Case::Cancelled).await;
-        }
-
-        #[tokio::test]
-        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
-        async fn stale_ciphertext_epoch_emits_no_origin() {
-            run(Case::Stale).await;
-        }
-
-        #[tokio::test]
-        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
-        async fn retired_original_carrier_emits_unavailable_origin() {
-            run(Case::Unavailable).await;
-        }
-
-        #[tokio::test]
-        #[ignore = "three native nodes; isolated process WITHOUT MYOWNMESH_ROUTE_FLOW_RUN_ID"]
-        async fn disabled_ciphertext_origin_keeps_actual_delivery() {
-            run(Case::Disabled).await;
-        }
-    }
-
-    /// Exact environment-backed qualification for the diagnostic-only engine
-    /// path. It is ignored so the process-global selector initializes in a
-    /// fresh, single-test process with the manager-supplied value.
-    #[cfg(feature = "route-flow-diagnostics")]
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires MYOWNMESH_ROUTE_FLOW_RUN_ID=first-echo-route-cc6-c1 and opens local WebRTC objects"]
-    async fn route_flow_engine_qualification() {
-        const RUN_ID: &str = "first-echo-route-cc6-c1";
-        assert_eq!(
-            crate::route_flow::active_run_id_for_test(),
-            Some(RUN_ID),
-            "the exact ignored selector must run in a fresh process with the bounded opt-in"
-        );
-
-        eprintln!("route_flow_qualification:destination:before");
-        // Destination: real route admission and application-gateway acceptance.
-        let destination_state = build_test_state_with_connector_slots("route-flow-destination", 1);
-        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
-        let origin_id = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
-            .expect("origin id")
-            .to_string();
-        let origin_fixture = insert_admitted_peer(&destination_state, &origin_id).await;
-        let origin_owner = destination_state
-            .peers
-            .owner(&origin_id)
-            .expect("the route origin is current");
-        let origin_worker = origin_fixture
-            .peer
-            .current_worker()
-            .expect("the route origin owns an accepted worker");
-        let mut subscriber = crate::channels::Channel::<serde_json::Value>::new(
-            "route-flow-control".to_string(),
-            Arc::clone(&destination_state),
-        )
-        .subscribe()
-        .expect("the destination gateway owns one real subscriber");
-        let mut destination_events = destination_state.events_tx.subscribe();
-        let local_destination =
-            DeviceId::from_canonical_str(destination_state.identity.public_id())
-                .expect("the destination state has a canonical identity");
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            route_flow_frame_for_test(
-                &destination_state,
-                &origin_key,
-                local_destination.clone(),
-                [0x11; 16],
-                RUN_ID,
-                0,
-                "request",
-            ),
-        )
-        .await;
-        let destination_message = next_channel_message_for_test(&mut subscriber).await;
-        assert_eq!(
-            destination_message.body(),
-            &serde_json::json!({
-                "run_id": RUN_ID,
-                "seq": 0,
-                "kind": "request",
-                "body": "not copied into diagnostics"
-            }),
-            "the destination row accompanies the exact body accepted by the real gateway"
-        );
-        assert_eq!(
-            destination_message.from(),
-            origin_id,
-            "the destination gateway attributes the selected body to the admitted route origin"
-        );
-        let destination = next_route_flow_detail_for_test(&mut destination_events).await;
-        assert_eq!(destination["role"], "destination");
-        assert_eq!(destination["outcome"], "delivered");
-        assert!(destination["owner_epoch"].as_str().is_some());
-        assert!(destination["route_dispatch_us"].is_null());
-
-        // Wrong label, out-of-range sequence, and duplicate all traverse the
-        // ordinary handler without qualifying an extra diagnostic row.
-        for (message_id, run_id, seq, kind) in [
-            ([0x12; 16], "wrong-run", 1, "request"),
-            ([0x13; 16], RUN_ID, 10_000, "request"),
-            ([0x18; 16], RUN_ID, 1, "finish"),
-        ] {
-            handle_exact_promoted_message(
-                &destination_state,
-                &origin_owner,
-                &origin_worker,
-                route_flow_frame_for_test(
-                    &destination_state,
-                    &origin_key,
-                    local_destination.clone(),
-                    message_id,
-                    run_id,
-                    seq,
-                    kind,
-                ),
-            )
-            .await;
-            assert_no_route_flow_detail_for_test(&mut destination_events);
-        }
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            frame_bytes(&MeshMessage::Channel {
-                channel: "route-flow-control".to_string(),
-                payload: serde_json::json!({
-                    "run_id": RUN_ID,
-                    "seq": 1,
-                    "kind": "request"
-                }),
-            }),
-        )
-        .await;
-        assert_no_route_flow_detail_for_test(&mut destination_events);
-        let pressure_frame = frame_bytes(&MeshMessage::Channel {
-            channel: "route-flow-control".to_string(),
-            payload: serde_json::json!("pressure-refused-control"),
-        });
-        let pressure_seal = seal_retained_memory_below_admission(
-            &destination_state,
-            &origin_id,
-            pressure_frame.len(),
-        );
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            pressure_frame,
-        )
-        .await;
-        drop(pressure_seal);
-        assert!(
-            destination_state
-                .peers
-                .get_if_current(&origin_owner)
-                .is_some(),
-            "best-effort Channel pressure keeps the exact admitted session"
-        );
-        assert_no_route_flow_detail_for_test(&mut destination_events);
-        let duplicate = route_flow_frame_for_test(
-            &destination_state,
-            &origin_key,
-            local_destination,
-            [0x14; 16],
-            RUN_ID,
-            2,
-            "request",
-        );
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            duplicate.clone(),
-        )
-        .await;
-        let _ = next_route_flow_detail_for_test(&mut destination_events).await;
-        handle_exact_promoted_message(&destination_state, &origin_owner, &origin_worker, duplicate)
-            .await;
-        assert_no_route_flow_detail_for_test(&mut destination_events);
-        drop(subscriber);
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            route_flow_frame_for_test(
-                &destination_state,
-                &origin_key,
-                DeviceId::from_canonical_str(destination_state.identity.public_id())
-                    .expect("the destination remains canonical"),
-                [0x16; 16],
-                RUN_ID,
-                5,
-                "request",
-            ),
-        )
-        .await;
-        let refused = next_route_flow_detail_for_test(&mut destination_events).await;
-        assert_eq!(refused["role"], "destination");
-        assert_eq!(refused["outcome"], "refused");
-        assert!(
-            destination_state
-                .peers
-                .get_if_current(&origin_owner)
-                .is_some(),
-            "a destination with no local receiver refuses one row without retiring the session"
-        );
-        handle_exact_promoted_message(
-            &destination_state,
-            &origin_owner,
-            &origin_worker,
-            Bytes::from_static(br#"{"kind":"channel"}"#),
-        )
-        .await;
-        assert!(
-            destination_state
-                .peers
-                .get_if_current(&origin_owner)
-                .is_none(),
-            "a classified but undecodable application frame retires its exact session"
-        );
-        assert_no_route_flow_detail_for_test(&mut destination_events);
-        destination_state.shutdown().await;
-        let destination_origin_close = origin_worker.retire_and_close().await;
-        drop(origin_fixture);
-        destination_origin_close
-            .expect("the destination fixture's exact origin worker reaches native terminal");
-        eprintln!("route_flow_qualification:destination:after");
-
-        eprintln!("route_flow_qualification:origin:before");
-        // Origin: the actual route dispatcher preserves its ambiguous native
-        // send result rather than manufacturing delivery proof.
-        let origin_state = build_test_state_with_connector_slots("route-flow-origin", 1);
-        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
-        let destination_id =
-            DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
-                .expect("destination id");
-        let destination_id_text = destination_id.to_string();
-        let destination_fixture = insert_admitted_peer(&origin_state, &destination_id_text).await;
-        let origin_destination_worker = destination_fixture
-            .peer
-            .current_worker()
-            .expect("the origin fixture's destination owns an accepted worker");
-        let mut origin_events = origin_state.events_tx.subscribe();
-        let result = send_routed_channel_frame(
-            &origin_state,
-            &destination_id_text,
-            "route-flow-control",
-            serde_json::json!({"run_id": RUN_ID, "seq": 3, "kind": "echo"}),
-        )
-        .await;
-        assert!(result.is_err(), "the solo connector cannot prove delivery");
-        let origin = next_route_flow_detail_for_test(&mut origin_events).await;
-        assert_eq!(origin["role"], "origin");
-        assert_eq!(origin["outcome"], "outcome_unknown");
-        assert!(origin["owner_epoch"].is_null());
-        assert!(origin["callback_to_insert_us"].is_null());
-        origin_state.shutdown().await;
-        let origin_destination_close = origin_destination_worker.retire_and_close().await;
-        drop(destination_fixture);
-        origin_destination_close
-            .expect("the origin fixture's exact destination worker reaches native terminal");
-        eprintln!("route_flow_qualification:origin:after");
-
-        eprintln!("route_flow_qualification:relay:before");
-        // Relay: enqueue through the worker's original funded native-callback
-        // sink, expose that exact callback through its retained receiver, and
-        // hold inside the real approved-session send future. Provider usage,
-        // not a synthetic drop flag, proves the accepted callback resources
-        // remain owned across that production await.
-        let (relay_state, _relay_signaling, relay_commands, relay_provider, _relay_grant) =
-            build_test_state_parts_metered("route-flow-relay", None, 3, None);
-        relay_state.park_command_receiver_for_test(relay_commands);
-        let relay_origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
-        let relay_origin_id =
-            DeviceId::from_public_key_bytes(*relay_origin_key.verifying_key().as_bytes())
-                .expect("relay origin id")
-                .to_string();
-        let relay_destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x64; 32]);
-        let relay_destination_id =
-            DeviceId::from_public_key_bytes(*relay_destination_key.verifying_key().as_bytes())
-                .expect("relay destination id");
-        let relay_destination_id_text = relay_destination_id.to_string();
-        // Construct every fallible routed fixture before opening native
-        // connector objects. A fixture-shape failure therefore cannot strand
-        // those objects before the controlled shutdown below.
-        let relay_frame = route_flow_frame_for_test(
-            &relay_state,
-            &relay_origin_key,
-            relay_destination_id.clone(),
-            [0x15; 16],
-            RUN_ID,
-            4,
-            "request",
-        );
-        let cancelled_frame = route_flow_frame_for_test(
-            &relay_state,
-            &relay_origin_key,
-            relay_destination_id.clone(),
-            [0x17; 16],
-            RUN_ID,
-            6,
-            "request",
-        );
-        let stale_frame = route_flow_frame_for_test(
-            &relay_state,
-            &relay_origin_key,
-            relay_destination_id,
-            [0x19; 16],
-            RUN_ID,
-            7,
-            "request",
-        );
-        let mut relay_origin = insert_admitted_peer(&relay_state, &relay_origin_id).await;
-        let relay_destination =
-            insert_admitted_peer(&relay_state, &relay_destination_id_text).await;
-        let relay_destination_worker = relay_destination
-            .peer
-            .current_worker()
-            .expect("the relay destination owns an accepted worker");
-        let relay_worker = relay_origin
-            .peer
-            .current_worker()
-            .expect("the relay origin owns a worker");
-        let clock_start = Instant::now();
-        let route_clock = crate::route_flow::install_test_clock(clock_start);
-        eprintln!("route_flow_qualification:relay_open:enqueue_before");
-        relay_worker
-            .enqueue_data_channel_open_callback_for_test()
-            .await
-            .expect("the exact connected worker queues one funded Open callback");
-        eprintln!("route_flow_qualification:relay_open:enqueue_after_recv_before");
-        let open = relay_origin
-            ._events
-            .recv()
-            .await
-            .expect("the original receiver exposes its reserved Open callback");
-        eprintln!("route_flow_qualification:relay_open:recv_after");
-        let open = relay_worker
-            .accept_event(open)
-            .expect("the current worker accepts its exact Open callback");
-        let (open, open_resources) = open.into_parts();
-        assert!(matches!(open, TransportEvent::DataChannelOpen));
-        drop(open_resources);
-        relay_origin._events.commit_data_channel_open();
-
-        let baseline = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let replay_charge = routing::replay_entry_reservation_charge_for_test();
-        let callback_baseline = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-        eprintln!("route_flow_qualification:first_message:enqueue_before");
-        relay_worker
-            .enqueue_funded_message_callback_for_test(relay_frame)
-            .await
-            .expect("the original native callback sink queues the exact routed frame");
-        eprintln!("route_flow_qualification:first_message:enqueue_after_recv_before");
-        let queued_provider = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let callback_queued = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-        let callback = relay_origin
-            ._events
-            .recv()
-            .await
-            .expect("the original receiver exposes the funded routed callback");
-        eprintln!("route_flow_qualification:first_message:recv_after");
-        let exposed_callback_provider = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let mut relay_events = relay_state.events_tx.subscribe();
-        let gate = install_route_flow_dispatch_gate_for_test();
-        let running_state = Arc::clone(&relay_state);
-        let running_worker = Arc::clone(&relay_worker);
-        let running_owner_id = relay_origin_id.clone();
-        let mut running = tokio::spawn(async move {
-            handle_transport_event_from_worker(
-                &running_state,
-                running_owner_id,
-                &running_worker,
-                callback,
-            )
-            .await
-        });
-        if tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
-            .await
-            .is_err()
-        {
-            running.abort();
-            let _ = running.await;
-            clear_route_flow_dispatch_gate_for_test(&gate);
-            drop(route_clock);
-            relay_state.shutdown().await;
-            let _ = futures::future::join(
-                relay_worker.retire_and_close(),
-                relay_destination_worker.retire_and_close(),
-            )
-            .await;
-            drop(relay_destination);
-            drop(relay_origin);
-            panic!("the admitted relay did not enter the production dispatch await");
-        }
-        eprintln!("route_flow_qualification:first_send:held_entered");
-        let interval_open_while_held = gate.interval_open.load(std::sync::atomic::Ordering::SeqCst);
-        let callback_held = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-        let premature_relay = try_route_flow_detail_for_test(&mut relay_events);
-        route_clock.set(clock_start + Duration::from_micros(250));
-        eprintln!("route_flow_qualification:first_send:release_before");
-        gate.release.notify_one();
-        let running_result = match tokio::time::timeout(Duration::from_secs(10), &mut running).await
-        {
-            Ok(result) => result.expect("the accepted callback handler joins"),
-            Err(_) => {
-                running.abort();
-                let _ = running.await;
-                clear_route_flow_dispatch_gate_for_test(&gate);
-                drop(route_clock);
-                relay_state.shutdown().await;
-                let _ = futures::future::join(
-                    relay_worker.retire_and_close(),
-                    relay_destination_worker.retire_and_close(),
-                )
-                .await;
-                drop(relay_destination);
-                drop(relay_origin);
-                panic!("the accepted callback handler did not settle within the control bound");
-            }
-        };
-        eprintln!("route_flow_qualification:first_send:join_after");
-        let interval_closed_after_send =
-            !gate.interval_open.load(std::sync::atomic::Ordering::SeqCst);
-        clear_route_flow_dispatch_gate_for_test(&gate);
-        let premature_relay_emitted = premature_relay.is_some();
-        let relay = match premature_relay {
-            Some(detail) => detail,
-            None => next_route_flow_detail_for_test(&mut relay_events).await,
-        };
-        let retained_after_first = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let callback_complete = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-
-        // Cancellation while the same real send future is held releases the
-        // callback and route-operation claims without manufacturing a terminal
-        // disposition. The field collector's exact expected-row count makes
-        // this absence incomplete evidence rather than a phantom success.
-        eprintln!("route_flow_qualification:cancel_message:enqueue_before");
-        relay_worker
-            .enqueue_funded_message_callback_for_test(cancelled_frame)
-            .await
-            .expect("the exact worker queues the cancellation control callback");
-        eprintln!("route_flow_qualification:cancel_message:enqueue_after_recv_before");
-        let cancelled_callback = relay_origin
-            ._events
-            .recv()
-            .await
-            .expect("the original receiver exposes the cancellation callback");
-        eprintln!("route_flow_qualification:cancel_message:recv_after");
-        let cancel_gate = install_route_flow_dispatch_gate_for_test();
-        let cancelled_state = Arc::clone(&relay_state);
-        let cancelled_worker = Arc::clone(&relay_worker);
-        let cancelled_origin_id = relay_origin_id.clone();
-        let cancelled = tokio::spawn(async move {
-            handle_transport_event_from_worker(
-                &cancelled_state,
-                cancelled_origin_id,
-                &cancelled_worker,
-                cancelled_callback,
-            )
-            .await
-        });
-        if tokio::time::timeout(Duration::from_secs(10), cancel_gate.entered.notified())
-            .await
-            .is_err()
-        {
-            cancelled.abort();
-            let _ = cancelled.await;
-            clear_route_flow_dispatch_gate_for_test(&cancel_gate);
-            drop(route_clock);
-            relay_state.shutdown().await;
-            let _ = futures::future::join(
-                relay_worker.retire_and_close(),
-                relay_destination_worker.retire_and_close(),
-            )
-            .await;
-            drop(relay_destination);
-            drop(relay_origin);
-            panic!("the cancellation control did not reach the actual approved-session send");
-        }
-        eprintln!("route_flow_qualification:cancel_send:held_entered");
-        let cancel_interval_open_while_held = cancel_gate
-            .interval_open
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let callback_cancel_held = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-        cancelled.abort();
-        let cancelled_joined = cancelled
-            .await
-            .expect_err("aborting the held handler cancels its exact task")
-            .is_cancelled();
-        eprintln!("route_flow_qualification:cancel_send:join_after");
-        let cancel_interval_closed = !cancel_gate
-            .interval_open
-            .load(std::sync::atomic::Ordering::SeqCst);
-        clear_route_flow_dispatch_gate_for_test(&cancel_gate);
-        let cancellation_emitted = try_route_flow_detail_for_test(&mut relay_events).is_some();
-        let retained_after_cancel = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let callback_cancelled = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-
-        eprintln!("route_flow_qualification:stale_message:enqueue_before");
-        relay_worker
-            .enqueue_funded_message_callback_for_test(stale_frame)
-            .await
-            .expect("the predecessor queues one funded callback before replacement");
-        eprintln!("route_flow_qualification:stale_message:enqueue_after_recv_before");
-        let stale_callback = relay_origin
-            ._events
-            .recv()
-            .await
-            .expect("the predecessor's original receiver exposes its callback");
-        eprintln!("route_flow_qualification:stale_message:recv_after");
-        eprintln!("route_flow_qualification:stale_message:replacement_before");
-        let relay_successor = insert_admitted_peer(&relay_state, &relay_origin_id).await;
-        eprintln!("route_flow_qualification:stale_message:replacement_after");
-        let successor_worker = relay_successor
-            .peer
-            .current_worker()
-            .expect("the replacement owns a distinct current worker");
-        let successor_is_distinct = !Arc::ptr_eq(&successor_worker, &relay_worker);
-        let retained_before_stale_refusal = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let stale_was_refused = !handle_transport_event_from_worker(
-            &relay_state,
-            relay_origin_id,
-            &relay_worker,
-            stale_callback,
-        )
-        .await;
-        eprintln!("route_flow_qualification:stale_message:refusal_after");
-        let stale_emitted = try_route_flow_detail_for_test(&mut relay_events).is_some();
-        let retained_after_stale_refusal = (
-            relay_provider.in_use(),
-            relay_provider.active_reservations(),
-            relay_provider.active_scopes(),
-        );
-        let callback_after_stale = pre_auth_report(&relay_state, PreAuthResourceFamily::FrameBytes);
-        drop(route_clock);
-        eprintln!("route_flow_qualification:relay_shutdown:before");
-        relay_state.shutdown().await;
-        let (relay_predecessor_close, relay_destination_close, relay_successor_close) =
-            futures::future::join3(
-                relay_worker.retire_and_close(),
-                relay_destination_worker.retire_and_close(),
-                successor_worker.retire_and_close(),
-            )
-            .await;
-        eprintln!("route_flow_qualification:relay_shutdown:after");
-        drop(relay_successor);
-        drop(relay_destination);
-        drop(relay_origin);
-        relay_predecessor_close
-            .expect("the relay predecessor's exact native close reaches terminal");
-        relay_destination_close
-            .expect("the relay destination's exact native close reaches terminal");
-        relay_successor_close.expect("the relay successor's exact native close reaches terminal");
-        eprintln!("route_flow_qualification:relay_fixtures:dropped");
-
-        eprintln!("route_flow_qualification:final_assertions:before");
-        let callback_provider_charge = exposed_callback_provider
-            .0
-            .checked_sub(baseline.0)
-            .expect("the exposed callback provider charge is nonnegative");
-        assert!(
-            !callback_provider_charge.is_zero(),
-            "the queued callback is visibly funded by the fixture's real provider"
-        );
-        let callback_provider_reservations = exposed_callback_provider
-            .1
-            .checked_sub(baseline.1)
-            .expect("the exposed callback reservation count is nonnegative");
-        assert_eq!(queued_provider.2, baseline.2);
-        assert_eq!(exposed_callback_provider.2, baseline.2);
-        assert_ne!(callback_queued.active, callback_baseline.active);
-        assert_eq!(
-            callback_queued.active_lease_count,
-            callback_baseline.active_lease_count + 1,
-            "the original queue owns one exact FrameBytes observation"
-        );
-        assert!(
-            interval_open_while_held,
-            "the diagnostic interval is already open inside the actual send future"
-        );
-        assert_ne!(callback_held.active, callback_baseline.active);
-        assert_eq!(
-            callback_held.active_lease_count,
-            callback_queued.active_lease_count,
-            "the exact queued callback observation becomes executing and remains active through the real send"
-        );
-        assert!(
-            !premature_relay_emitted,
-            "the route-flow row is not emitted before the actual send future settles"
-        );
-        assert!(
-            !running_result,
-            "an application message callback is nonterminal"
-        );
-        assert!(
-            interval_closed_after_send,
-            "the diagnostic interval closes when the dispatcher settles"
-        );
-        assert_eq!(relay["role"], "relay");
-        assert_eq!(relay["outcome"], "outcome_unknown");
-        assert!(relay["owner_epoch"].as_str().is_some());
-        assert_eq!(relay["callback_to_insert_us"], 0);
-        assert_eq!(relay["insert_to_dequeue_us"], 0);
-        assert_eq!(relay["dequeue_to_handler_us"], 0);
-        assert_eq!(relay["route_dispatch_us"], 250);
-        assert_eq!(relay["handler_total_us"], 250);
-        assert_eq!(
-            retained_after_first.0,
-            baseline
-                .0
-                .checked_add(replay_charge)
-                .expect("the first retained replay charge composes with baseline"),
-            "the first admitted route retains exactly its two production replay map entries"
-        );
-        assert_eq!(
-            retained_after_first.1,
-            baseline
-                .1
-                .checked_add(2)
-                .expect("the first replay reservation count composes with baseline")
-        );
-        assert_eq!(retained_after_first.2, baseline.2);
-        assert_eq!(callback_complete.active, callback_baseline.active);
-        assert_eq!(
-            callback_complete.active_lease_count,
-            callback_baseline.active_lease_count
-        );
-        assert!(
-            cancel_interval_open_while_held,
-            "the cancelled send is held inside the same production interval"
-        );
-        assert!(
-            callback_cancel_held.active_lease_count > callback_baseline.active_lease_count,
-            "the held cancellation control retains its real FrameBytes observation"
-        );
-        assert!(cancelled_joined, "the held handler joins as cancelled");
-        assert!(
-            cancel_interval_closed,
-            "cancelling the dispatcher drops and closes its interval owner"
-        );
-        assert!(
-            !cancellation_emitted,
-            "cancellation cannot manufacture a terminal route-flow row"
-        );
-        let two_replay_charges = replay_charge
-            .checked_add(replay_charge)
-            .expect("two retained replay identity charges compose");
-        assert_eq!(
-            retained_after_cancel.0,
-            baseline
-                .0
-                .checked_add(two_replay_charges)
-                .expect("the two retained replay identities compose with baseline"),
-            "cancelling the second admitted send releases its callback and operation but retains its replay identity"
-        );
-        assert_eq!(
-            retained_after_cancel.1,
-            baseline
-                .1
-                .checked_add(4)
-                .expect("the two replay reservation counts compose with baseline")
-        );
-        assert_eq!(retained_after_cancel.2, baseline.2);
-        assert_eq!(
-            callback_cancelled.active_lease_count, callback_baseline.active_lease_count,
-            "cancellation joins the exact callback observation"
-        );
-        assert!(successor_is_distinct);
-        assert!(
-            stale_was_refused,
-            "the funded predecessor callback is refused by the exact-worker fence"
-        );
-        assert!(
-            !stale_emitted,
-            "the stale exact-worker refusal emits no qualified route-flow row"
-        );
-        assert_eq!(
-            retained_after_stale_refusal.0,
-            retained_before_stale_refusal
-                .0
-                .checked_sub(callback_provider_charge)
-                .expect("the stale callback charge is present before refusal"),
-            "the stale refusal releases only its funded callback and admits no replay identity"
-        );
-        assert_eq!(
-            retained_after_stale_refusal.1,
-            retained_before_stale_refusal
-                .1
-                .checked_sub(callback_provider_reservations)
-                .expect("the stale callback reservations are present before refusal"),
-            "the stale refusal releases its callback reservations without adding replay entries"
-        );
-        assert_eq!(
-            retained_after_stale_refusal.2,
-            retained_before_stale_refusal.2
-        );
-        assert_eq!(
-            callback_after_stale.active_lease_count, callback_baseline.active_lease_count,
-            "the stale exact-worker refusal releases its funded callback observation"
-        );
-        eprintln!("route_flow_qualification:final_assertions:after");
-
-        eprintln!("route_flow_qualification:drop_messages:before");
-        drop(destination_message);
-        drop(destination);
-        drop(refused);
-        drop(origin);
-        drop(relay);
-        eprintln!("route_flow_qualification:drop_messages:after");
-
-        eprintln!("route_flow_qualification:drop_event_receivers:before");
-        drop(destination_events);
-        drop(origin_events);
-        drop(relay_events);
-        drop(_relay_signaling);
-        eprintln!("route_flow_qualification:drop_event_receivers:after");
-
-        eprintln!("route_flow_qualification:drop_dispatch_handles:before");
-        drop(running);
-        drop(gate);
-        drop(cancel_gate);
-        eprintln!("route_flow_qualification:drop_dispatch_handles:after");
-
-        eprintln!("route_flow_qualification:drop_worker_owners:before");
-        drop(successor_worker);
-        drop(relay_worker);
-        drop(origin_worker);
-        drop(origin_owner);
-        eprintln!("route_flow_qualification:drop_worker_owners:after");
-
-        let relay_transport_drop_probe = relay_state.transport.clone();
-        eprintln!("route_flow_qualification:drop_relay_state:before");
-        drop(relay_state);
-        eprintln!("route_flow_qualification:drop_relay_state:after");
-        let relay_cleanup = relay_transport_drop_probe
-            .connector_resource_report()
-            .expect("the relay transport retains its connector resource owner")
-            .cleanup;
-        eprintln!(
-            "route_flow_qualification:relay_cleanup:queued={} active={} completed={} failed={} executor_failed={}",
-            relay_cleanup.queued_jobs,
-            relay_cleanup.active_jobs,
-            relay_cleanup.completed_jobs,
-            relay_cleanup.failed_jobs,
-            relay_cleanup.executor_failed
-        );
-        eprintln!("route_flow_qualification:drop_relay_transport:before");
-        drop(relay_transport_drop_probe);
-        eprintln!("route_flow_qualification:drop_relay_transport:after");
-        eprintln!("route_flow_qualification:drop_origin_state:before");
-        drop(origin_state);
-        eprintln!("route_flow_qualification:drop_origin_state:after");
-        eprintln!("route_flow_qualification:drop_destination_state:before");
-        drop(destination_state);
-        eprintln!("route_flow_qualification:drop_destination_state:after");
-        eprintln!("route_flow_qualification:drop_relay_provider:before");
-        drop(relay_provider);
-        eprintln!("route_flow_qualification:drop_relay_provider:after");
     }
 }

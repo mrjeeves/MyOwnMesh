@@ -1,5 +1,7 @@
 # V4 release-closure resource matrix
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: exact source-publication ledger for review `5058637044`, bound to
 source head `de82d6be101b2d67919258f7b66ec76cad27f674`, tree
 `4a3da93b0f0d4a7ea9da6c707d7fb178d71e7ff1`, parent
@@ -16,7 +18,29 @@ PR #7 remains OPEN, draft, unmerged, and on HOLD.
 downstream core admission does not retroactively fund or bound bytes allocated
 inside an upstream carrier library.
 
-## Ownership matrix
+## Current cutover disposition
+
+The tables below preserve their exact historical source/publication context.
+In particular, the historical **Closed member opaque relay** row is
+**superseded: removal required**, not an advertised current exception and not
+evidence for the replacement path. Its run IDs, failures, source hashes, and
+audit outcomes are not rewritten.
+
+Current application carriage is endpoint-authenticated native WebRTC, direct
+or configured standard TURN. Hubs consolidate bounded discovery/introduction
+only; setup/control and existing typed semantic-control cannot carry application
+plaintext or ciphertext. TURN is distinct when cohosted. Advertisements are
+URL-only, credentials locally configured; protected distribution is not
+implemented. The cutover `introduction: Option<HubIntroductionPolicyConfig>`
+replaces the removed `closed_relay`, `application_transport`,
+`endpoint_cipher`, and `routing_policy` surfaces, whose old config/wire
+forms must refuse. Native opaque channels, realtime and RPC are retained.
+
+New exact-source removal/refusal, direct/TURN behavior, and terminal resource
+evidence must be recorded separately before claiming qualification. This
+ledger adds no new PASS and adopts no proposed native-runtime owner.
+
+## Historical ownership matrix
 
 | Profile / boundary | Raw input | First funded or finite admission | Maximum retained unit / count | Queue / execution owner | Refusal | Terminal owner | Shutdown / join / baseline | Controls and evidence | Disposition |
 |---|---|---|---|---|---|---|---|---|---|

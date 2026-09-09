@@ -4,12 +4,15 @@
 //! the shared [`PeerStateData`] (status, tier, watermarks,
 //! capabilities) plus the optional WebRTC connector worker.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::protocol::CapabilityAdvert;
@@ -583,6 +586,112 @@ struct ClosingWorker {
     additional_attached: bool,
 }
 
+/// Serializes the one whole-peer native join without making a canceled
+/// shutdown permanently own the peer.  A successor caller waits for the same
+/// terminal pass; cancellation releases only the in-progress marker.
+struct ShutdownJoinGuard<'a> {
+    in_progress: &'a AtomicBool,
+    complete: &'a AtomicBool,
+    failed: &'a AtomicBool,
+    ready: &'a Notify,
+    terminal: bool,
+}
+
+/// Test-only hold point between the native join and release of the original
+/// prepared owners.  It proves that completion is not published early and is
+/// deliberately per-connection rather than a process-global test switch.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(super) struct ShutdownCleanupGate {
+    entered: AtomicBool,
+    waiter_entered: AtomicBool,
+    released: AtomicBool,
+    entered_ready: Notify,
+    waiter_ready: Notify,
+    released_ready: Notify,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+impl ShutdownCleanupGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            waiter_entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_ready: Notify::new(),
+            waiter_ready: Notify::new(),
+            released_ready: Notify::new(),
+        })
+    }
+
+    pub(super) async fn wait_for_entry(&self) {
+        loop {
+            let notified = self.entered_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(super) fn open(&self) {
+        self.released.store(true, Ordering::Release);
+        self.released_ready.notify_waiters();
+    }
+
+    pub(super) async fn wait_for_waiter(&self) {
+        loop {
+            let notified = self.waiter_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.waiter_entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn note_waiter(&self) {
+        self.waiter_entered.store(true, Ordering::Release);
+        self.waiter_ready.notify_waiters();
+    }
+
+    async fn hold(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_ready.notify_waiters();
+        loop {
+            let notified = self.released_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl ShutdownJoinGuard<'_> {
+    fn complete(&mut self) {
+        self.terminal = true;
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ShutdownJoinGuard<'_> {
+    fn drop(&mut self) {
+        if self.terminal {
+            self.complete.store(true, Ordering::Release);
+        }
+        self.in_progress.store(false, Ordering::Release);
+        self.ready.notify_waiters();
+    }
+}
+
 /// The one pre-promotion owner for a connector installation.
 ///
 /// Promotion transfers the connector into `PromotedSessionSlot`; keeping the
@@ -710,6 +819,16 @@ pub struct PeerConnection {
     /// The legacy mirrors above remain only for unpromoted/compatibility paths.
     promoted_session: crate::runtime::peer_session::PromotedSessionSlot,
     registry_retired: AtomicBool,
+    /// Whole-network shutdown keeps the original owner slots in place until
+    /// their native workers have joined.  Ordinary replacement retirement does
+    /// not set this marker and retains its existing move-out behavior.
+    shutdown_prepared: AtomicBool,
+    shutdown_join_in_progress: AtomicBool,
+    shutdown_join_complete: AtomicBool,
+    shutdown_join_failed: AtomicBool,
+    shutdown_join_ready: Notify,
+    #[cfg(all(test, feature = "transport-lab"))]
+    shutdown_cleanup_gate: Mutex<Option<Arc<ShutdownCleanupGate>>>,
     /// Diagnostic-only rebuild ordinal. It is never accepted as callback,
     /// attempt, resource, or application authority.
     pub epoch: u64,
@@ -1817,6 +1936,13 @@ impl PeerConnection {
             additional_attempt_dedup: Mutex::new(PromotedDedupSet::new()),
             promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
+            shutdown_prepared: AtomicBool::new(false),
+            shutdown_join_in_progress: AtomicBool::new(false),
+            shutdown_join_complete: AtomicBool::new(false),
+            shutdown_join_failed: AtomicBool::new(false),
+            shutdown_join_ready: Notify::new(),
+            #[cfg(all(test, feature = "transport-lab"))]
+            shutdown_cleanup_gate: Mutex::new(None),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             unpromoted_offer_in_flight: AtomicBool::new(false),
             _introduction_backing: Mutex::new(backing.map(|lease| IntroductionBacking {
@@ -2114,6 +2240,10 @@ impl PeerConnection {
     /// Retire the exact connector worker owned by this registry entry.
     /// External `Arc` holders cannot keep callbacks or queued candidates live.
     pub(crate) fn retire_connector(&self) {
+        if self.shutdown_prepared.load(Ordering::Acquire) {
+            self.prepare_for_shutdown();
+            return;
+        }
         self.registry_retired.store(true, Ordering::Release);
         // Replacement invalidation is a security control, not housekeeping:
         // because the certificate-fingerprint binding is not session-unique,
@@ -2167,6 +2297,58 @@ impl PeerConnection {
         }
     }
 
+    /// Synchronously revoke this exact peer while retaining its original
+    /// funded owners for the later native join.  The registry mutation fence
+    /// calls this before removing any map entry; repeated calls are harmless.
+    pub(crate) fn prepare_for_shutdown(&self) {
+        if self.shutdown_prepared.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.registry_retired.store(true, Ordering::Release);
+        self.promoted_session.prepare_shutdown();
+        if let Some(worker) = self.media_renegotiation_worker.lock().as_ref() {
+            worker.retire();
+        }
+        if let Some(task) = self.endpoint_auth.lock().as_ref() {
+            task.retire();
+        }
+        self.speculative.lock().for_each(|attempt| {
+            if let Some(task) = attempt.endpoint_auth.as_ref() {
+                task.retire();
+            }
+            attempt.session.retire();
+        });
+        if let Some(owner) = self.unpromoted_connector.lock().as_ref() {
+            owner.worker.retire();
+        }
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn install_shutdown_cleanup_gate_for_test(&self) -> Arc<ShutdownCleanupGate> {
+        let gate = ShutdownCleanupGate::new();
+        *self.shutdown_cleanup_gate.lock() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn insert_original_closing_waiter_for_test(
+        &self,
+        worker: Weak<WebRtcConnectorWorker>,
+        waiter: JoinHandle<()>,
+    ) {
+        self.closing_waiters.lock().push((worker, waiter));
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn original_closing_waiter_count_for_test(&self) -> usize {
+        self.closing_waiters.lock().len()
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn shutdown_join_failed_for_test(&self) -> bool {
+        self.shutdown_join_failed.load(Ordering::Acquire)
+    }
+
     pub(super) fn take_retired_dedup(&self) -> DetachedDedupSet {
         std::mem::replace(&mut *self.retired_dedup.lock(), DetachedDedupSet::new())
     }
@@ -2176,10 +2358,85 @@ impl PeerConnection {
     pub(super) async fn retire_and_close(&self) -> crate::Result<()> {
         self.retire_connector();
         let result = self.await_retired_workers().await;
-        drop(self.authenticated_channel.lock().take());
-        self.promoted_session.clear();
-        drop(self.endpoint_auth.lock().take());
+        if !self.shutdown_prepared.load(Ordering::Acquire) {
+            drop(self.authenticated_channel.lock().take());
+            self.promoted_session.clear();
+            drop(self.endpoint_auth.lock().take());
+        }
         result
+    }
+
+    fn completed_shutdown_result(&self) -> crate::Result<()> {
+        if self.shutdown_join_failed.load(Ordering::Acquire) {
+            Err(crate::Error::Other(
+                "a previous native peer shutdown failed".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release every owner that was kept in place by the whole-peer shutdown
+    /// fence.  This is called by the guarded joiner immediately before it
+    /// publishes terminal completion; a concurrent caller therefore cannot
+    /// observe completion while these drops still hold the original scope.
+    fn finish_prepared_shutdown_owners(&self) {
+        drop(self.authenticated_channel.lock().take());
+        for (dedup, additional_dedup) in self.promoted_session.take_shutdown_dedup() {
+            self.release_dedup_custody(dedup, additional_dedup);
+        }
+        self.promoted_session.clear();
+        while let Some(attempt) = self.speculative.lock().pop() {
+            self.release_dedup_custody(attempt.dedup, attempt.additional_dedup.drain_tokens());
+        }
+        let dedup = self.attempt_dedup.lock().take();
+        let additional_dedup = std::mem::replace(
+            &mut *self.additional_attempt_dedup.lock(),
+            PromotedDedupSet::new(),
+        )
+        .drain_tokens();
+        self.release_dedup_custody(dedup, additional_dedup);
+        drop(self.take_unpromoted_connector());
+        drop(self.media_renegotiation_worker.lock().take());
+        drop(self.endpoint_auth.lock().take());
+    }
+
+    async fn await_prepared_closing_waiters(&self) -> Option<crate::Error> {
+        let mut first_error = None;
+        futures::future::poll_fn(|cx| {
+            let mut waiters = self.closing_waiters.lock();
+            let mut index = 0;
+            while index < waiters.len() {
+                let poll = {
+                    let (_, waiter) = &mut waiters[index];
+                    std::pin::Pin::new(waiter).poll(cx)
+                };
+                match poll {
+                    Poll::Ready(Ok(())) => {
+                        waiters.swap_remove(index);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(crate::Error::Other(format!(
+                                "exact retired connector waiter failed: {error}"
+                            )));
+                        }
+                        self.shutdown_join_failed.store(true, Ordering::Release);
+                        waiters.swap_remove(index);
+                    }
+                    Poll::Pending => {
+                        index += 1;
+                    }
+                }
+            }
+            if waiters.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        first_error
     }
 
     /// Await every worker this peer already retired without retiring the live
@@ -2188,31 +2445,142 @@ impl PeerConnection {
     /// moving every remaining worker into the same list.
     pub(super) async fn await_retired_workers(&self) -> crate::Result<()> {
         let mut result = Ok(());
+        let mut shutdown_guard = None;
+        if self.shutdown_prepared.load(Ordering::Acquire) {
+            loop {
+                if self.shutdown_join_complete.load(Ordering::Acquire) {
+                    return self.completed_shutdown_result();
+                }
+                let notified = self.shutdown_join_ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.shutdown_join_complete.load(Ordering::Acquire) {
+                    return self.completed_shutdown_result();
+                }
+                if self
+                    .shutdown_join_in_progress
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+                #[cfg(all(test, feature = "transport-lab"))]
+                if let Some(gate) = self.shutdown_cleanup_gate.lock().clone() {
+                    gate.note_waiter();
+                }
+                notified.await;
+            }
+            shutdown_guard = Some(ShutdownJoinGuard {
+                in_progress: &self.shutdown_join_in_progress,
+                complete: &self.shutdown_join_complete,
+                failed: &self.shutdown_join_failed,
+                ready: &self.shutdown_join_ready,
+                terminal: false,
+            });
+            let mut workers = self.promoted_session.shutdown_workers();
+            self.speculative
+                .lock()
+                .for_each(|attempt| workers.push(Arc::clone(&attempt.session)));
+            if let Some(worker) = self.unpromoted_connector.lock().as_ref() {
+                workers.push(Arc::clone(&worker.worker));
+            }
+            if let Some(worker) = self.media_renegotiation_worker.lock().as_ref() {
+                workers.push(Arc::clone(worker));
+            }
+            self.closing_workers
+                .lock()
+                .for_each(|entry| workers.push(Arc::clone(&entry.worker)));
+            workers.sort_by_key(|worker| Arc::as_ptr(worker) as usize);
+            workers.dedup_by(|left, right| Arc::ptr_eq(left, right));
+            for worker in &workers {
+                worker.start_close();
+            }
+            let prepared = shutdown_guard.is_some();
+            let outcomes = futures::future::join_all(workers.into_iter().map(|worker| {
+                let peer = self;
+                async move {
+                    let outcome = worker.retire_and_close().await;
+                    if prepared && outcome.is_err() {
+                        peer.shutdown_join_failed.store(true, Ordering::Release);
+                    }
+                    (worker, outcome)
+                }
+            }))
+            .await;
+            for (worker, outcome) in outcomes {
+                if let Err(error) = outcome {
+                    if shutdown_guard.is_some() {
+                        self.shutdown_join_failed.store(true, Ordering::Release);
+                    }
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                }
+                self.complete_closing_worker(&worker);
+            }
+        }
         loop {
             let mut workers = Vec::new();
             self.closing_workers
                 .lock()
                 .for_each(|entry| workers.push(Arc::clone(&entry.worker)));
             if workers.is_empty() {
-                let waiters = std::mem::take(&mut *self.closing_waiters.lock());
-                for (_, waiter) in waiters {
-                    if let Err(error) = waiter.await {
-                        tracing::warn!(%error, "exact retired connector waiter failed");
+                if shutdown_guard.is_some() {
+                    if let Some(error) = self.await_prepared_closing_waiters().await {
+                        if result.is_ok() {
+                            result = Err(error);
+                        }
                     }
+                } else {
+                    let waiters = std::mem::take(&mut *self.closing_waiters.lock());
+                    for (_, waiter) in waiters {
+                        if let Err(error) = waiter.await {
+                            tracing::warn!(%error, "exact retired connector waiter failed");
+                        }
+                    }
+                }
+                #[cfg(all(test, feature = "transport-lab"))]
+                let cleanup_gate = self.shutdown_cleanup_gate.lock().clone();
+                #[cfg(all(test, feature = "transport-lab"))]
+                if let Some(gate) = cleanup_gate {
+                    gate.hold().await;
+                }
+                if shutdown_guard.is_some() {
+                    self.finish_prepared_shutdown_owners();
+                }
+                if result.is_ok() && self.shutdown_join_failed.load(Ordering::Acquire) {
+                    result = Err(crate::Error::Other(
+                        "a previous native peer shutdown failed".to_string(),
+                    ));
+                }
+                if let Some(guard) = shutdown_guard.as_mut() {
+                    if result.is_err() {
+                        guard.mark_failed();
+                    }
+                    guard.complete();
                 }
                 return result;
             }
             for worker in &workers {
                 worker.start_close();
             }
-            let outcomes =
-                futures::future::join_all(workers.into_iter().map(|worker| async move {
+            let prepared = shutdown_guard.is_some();
+            let outcomes = futures::future::join_all(workers.into_iter().map(|worker| {
+                let peer = self;
+                async move {
                     let outcome = worker.retire_and_close().await;
+                    if prepared && outcome.is_err() {
+                        peer.shutdown_join_failed.store(true, Ordering::Release);
+                    }
                     (worker, outcome)
-                }))
-                .await;
+                }
+            }))
+            .await;
             for (worker, outcome) in outcomes {
                 if let Err(error) = outcome {
+                    if shutdown_guard.is_some() {
+                        self.shutdown_join_failed.store(true, Ordering::Release);
+                    }
                     if result.is_ok() {
                         result = Err(error);
                     }
@@ -2411,7 +2779,22 @@ impl PeerConnection {
         &self,
         worker: &Arc<WebRtcConnectorWorker>,
     ) -> std::result::Result<(ResourceLease, crate::resource::ResourcePressure), &'static str> {
-        let pressure = (|| {
+        let pressure = self.prepare_closing_worker_pressure_for_test(worker);
+        // Preserve the original control's behavior: it exercises the real
+        // fallback after constructing the exact finite seal.
+        self.retain_closing_worker(Arc::clone(worker));
+        pressure
+    }
+
+    /// Construct only the finite closing-entry seal.  Whole-network shutdown
+    /// uses this preparation without starting native cleanup or attempting a
+    /// late `ClosingWorker` reservation after the promoted capability drops.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn prepare_closing_worker_pressure_for_test(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+    ) -> std::result::Result<(ResourceLease, crate::resource::ResourcePressure), &'static str> {
+        (|| {
             use crate::resource::{FiniteResourceProvider, ResourceUnavailable};
             let entry = AttemptOwnerSet::<ClosingWorker>::entry_claim()
                 .map_err(|_| "closing entry claim overflow")?;
@@ -2465,11 +2848,7 @@ impl PeerConnection {
                 }
                 _ => Err("exact closing entry did not refuse at one byte short"),
             }
-        })();
-        // Exercise the unchanged real acquisition/fallback even if test
-        // preparation failed; the caller still awaits original cleanup.
-        self.retain_closing_worker(Arc::clone(worker));
-        pressure
+        })()
     }
 
     pub(super) fn take_attempt_displacement(&self) -> AttemptDisplacement {

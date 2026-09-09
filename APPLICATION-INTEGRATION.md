@@ -1,5 +1,7 @@
 # MyOwnMesh application integration contract
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: proposed application contract for the hybrid networking architecture.
 
 This document defines the smallest interface between MyOwnMesh and a local application. It does not define application features, application authorization, or application workflow.
@@ -26,8 +28,7 @@ MyOwnMesh supplies:
 - typed signaling for durable facts and ephemeral transport control;
 - candidate discovery, bounded remote ICE-candidate application, connectivity
   checks, and transport recovery;
-- direct, distinct TURN, bounded encrypted Hub fallback, and eligible Closed
-  member-relay connectors;
+- endpoint-authenticated native WebRTC directly or through configured standard TURN;
 - bounded speculative pre-authentication work;
 - fresh channel-bound endpoint authentication;
 - exact session promotion and principal-bound live handles;
@@ -158,7 +159,7 @@ TransportDiagnostics {
     session_handle,
     active_connector_profiles,
     current_carrier_kinds,
-    relay_device_ids_if_any,
+    turn_service_observation_if_any,
     measured_latency_if_available,
     measured_loss_if_available,
     local_observed_at
@@ -271,7 +272,7 @@ The application receives no inbound peer session until:
 
 ![Channel promotion boundary](diagrams/02-channel-promotion-boundary.svg)
 
-Before promotion, MyOwnMesh may gather candidates, open sockets, allocate bounded relay state, and perform bounded handshakes. It may not expose application payload or an authenticated peer-session handle.
+Before promotion, MyOwnMesh may gather candidates, open sockets, allocate bounded TURN state, and perform bounded handshakes. It may not expose application payload or an authenticated peer-session handle.
 
 This is the central application safety rule:
 
@@ -344,41 +345,28 @@ Direct and TURN-carried sessions expose the same remote Device ID and applicatio
 
 TURN is a packet carrier. It may observe addresses, packet sizes, timing, and the metadata required by its function. It cannot become the endpoint or application authority under the endpoint cryptographic premises.
 
-### 7.2 Hub introduction and encrypted transit fallback
+### 7.2 Hub discovery and introduction only
 
-The configured Hub set may introduce bounded direct endpoint demand, but it does
-not grant membership, authority, a permanent peer, or a veto over a viable
-direct or alternate route. A directly usable endpoint connection is preferred
-and TURN is a distinct ICE service. Hub introduction negotiates endpoint
-connectivity; it does not make the Hub a payload owner.
+The configured Hub set may consolidate discovery and bounded introduction for
+endpoint connection setup. It does not forward application plaintext or
+ciphertext, grant membership, or make a permanent peer or application session.
+If direct endpoint connectivity fails, use configured standard TURN within
+WebRTC or return a bounded no-viable-transport result. Signaling must not
+become a substitute application tunnel.
 
-If residual Hub transit is selected, endpoints derive a fresh endpoint-to-
-endpoint E2E epoch bound to the exact mesh context and full endpoint keys
-before payload is usable. The Hub may copy/forward endpoint ciphertext and
-observe carrier metadata, but cannot decrypt or read application plaintext.
-Failure to establish the endpoint epoch refuses the operation; there is no
-plaintext compatibility fallback. This is an adopted integration direction,
-not a claim that the current source has passed qualification.
+The configuration contract is
+`introduction: Option<HubIntroductionPolicyConfig>`; removed
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy` fields and removed wire forms refuse. There is no custom
+end-to-end route cipher or Closed-member payload-relay exception.
 
-### 7.3 Closed member relay
+### 7.3 TURN service boundary
 
-A currently authorized Closed member B may provide a bounded member-relay carrier when the selected Closed profile and local policies allow it.
-
-The application-visible endpoint relationship remains:
-
-```text
-AuthenticatedPeerSession(A, C)
-    carried through visible relay B
-```
-
-B is not anonymous. B may deny or degrade availability and observe metadata, but cannot read or author accepted A-C application plaintext under the endpoint cryptographic premises.
-
-A Closed member relay may be opened through its explicit route-bound setup when
-the local owner policy selects it. The current profile does not claim automatic
-racing with other carrier families or automatic backup selection, and the
-application does not receive raw route authority.
-
-![Closed member relay and handoff](diagrams/04-closed-member-relay-handoff.svg)
+TURN is a distinct infrastructure service, including when its process or host
+is colocated with a Hub. Current service advertisements are URL-only and TURN
+credentials are locally configured. Protected credential exchange is not an
+implemented API or qualification claim. Native opaque channels, realtime flows,
+and RPC continue to require the exact promoted endpoint session.
 
 ### 7.4 Explicit application intermediary
 
@@ -523,7 +511,7 @@ MyOwnMesh owns leases and pressure behavior for:
 - signaling connections, frames, queues, and provenance;
 - candidate gathering and transport attempts;
 - sockets, timers, tasks, and callbacks;
-- TURN and relay allocations;
+- standard TURN allocations;
 - pre-authentication packet and media quarantine;
 - endpoint authentication;
 - authenticated sessions and transport recovery;
@@ -603,8 +591,8 @@ final compliance PASS. The application integration requires:
 - no application payload is sent or delivered before channel promotion;
 - a working socket alone never becomes a peer session;
 - every session proves the exact remote Device on the exact channel;
-- direct, TURN, bounded encrypted Hub fallback, and Closed member relay preserve
-  the same endpoint identity;
+- direct and configured TURN WebRTC paths preserve the same endpoint identity;
+- Hub/signaling paths reject application plaintext and ciphertext transit;
 - carrier diagnostics are separate from peer identity and application authorization;
 - recovery does not require a persistent transport-path ledger or monotonic transport session generation;
 - stale or foreign-principal handles fail before payload use;
@@ -639,7 +627,7 @@ The owner must select:
 3. whether applications share peer sessions;
 4. key custody for in-process and shared-process deployments;
 5. connector and carrier profiles;
-6. bounded encrypted Hub fallback and Closed member-relay policy;
+6. local TURN configuration and optional bounded Hub introduction policy;
 7. session recovery and multi-channel behavior;
 8. diagnostic detail;
 9. headless consumer connector types;

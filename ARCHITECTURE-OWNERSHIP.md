@@ -1,5 +1,7 @@
 # MyOwnMesh architecture ownership and upstream intake policy
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: final execution and ownership policy for the architecture-owned repository.
 
 This document answers one question: when the adopted MyOwnMesh architecture and the existing or upstream implementation disagree, which one controls the product?
@@ -46,27 +48,27 @@ same-cell Role resolution from being reused as a cross-cell authority claim.
 and roster/peer-registry data are projections or runtime inputs and cannot
 authorize durable participation or application operations.
 
-The bounded Closed-member opaque relay is an explicit forwarding profile; it is
-not permission to forward plaintext. A-B and B-C are independently
-authenticated and promoted; A, B, and C then use route-bound `Open`, `Offer`,
-and `Accept` controls. Endpoint sessions seal/open plaintext, while B forwards
-only opaque packets under exact route, current-owner, and allocation-generation
-witnesses.
-The separately owned Hub profile has different semantics: a Hub may introduce
-bounded direct endpoint demand, but owns no payload. If residual Hub transit is
-used, endpoints derive a fresh endpoint-to-endpoint E2E epoch bound to the
-exact mesh context and full endpoint keys. The Hub may copy/forward endpoint
-ciphertext and observe metadata, but cannot decrypt or read application
-plaintext; it has no Closed `Open`/`Offer`/`Accept` allocation semantics,
-membership authority, or veto over an independently viable path. Failure to
-establish that endpoint epoch is refusal. This is adopted Hub direction, not a
-qualification claim for the depicted LAN path.
-Relay state has no key material, and its allocations, packet bytes, queues,
-retention, and cleanup are finite under the configured profile. Admission
-refusal preserves pending custody. Generation tombstones make duplicate
-terminal closes idempotent and keep delayed predecessor controls away from
-successors. Shutdown wakes bounded waiters, settles every relay custody class,
-and joins owned tasks before completion.
+Application payload belongs only to the authenticated endpoints. Native WebRTC
+direct connectivity is preferred; configured standard TURN supplies the
+indirect packet-carriage path when direct connectivity is unavailable. Neither
+a Hub nor an ordinary Open/Closed member is a custom application-data relay,
+including for endpoint ciphertext. Hub discovery and bounded introduction
+create no membership authority, payload route, or endpoint-session capability.
+
+The current configuration contract uses
+`introduction: Option<HubIntroductionPolicyConfig>`. The removed
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy` fields and their removed wire messages must be refused,
+not silently translated into a compatible payload path. Native direct opaque
+channels, realtime flows, and RPC remain endpoint-session operations.
+
+A TURN service is distinct from a Hub even when cohosted. Service
+advertisements currently provide URLs; credentials are configured locally.
+Protected TURN credential distribution is not implemented and is not claimed.
+Signaling carries bounded setup/control and existing typed semantic-control,
+never an application plaintext or ciphertext tunnel. Existing owned cleanup
+and resource obligations apply; no new native-runtime owner is adopted by
+this document.
 
 The former roster/two-log `NetworkState` authority model, including quorum,
 transition, split, and persistence authority, is excluded from the V4
@@ -74,7 +76,7 @@ contract. No legacy implementation is an executable authority path.
 
 Examples include:
 
-- unbounded or plaintext ordinary mesh-member application forwarding;
+- any custom Hub or ordinary mesh-member application forwarding, plaintext or ciphertext;
 - Closed admission through legacy `auto_approve`;
 - a connected socket, peer string, route, or IPC routing label acting as authority;
 - topology or carrier state mutating durable participation;

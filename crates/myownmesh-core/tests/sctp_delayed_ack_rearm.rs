@@ -7,12 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ed25519_dalek::SigningKey;
-use myownmesh_core::protocol::endpoint_cipher::{
-    CiphertextPacket, EpochBinding, ENDPOINT_CIPHER_SUITE, ENDPOINT_CIPHER_VERSION,
-};
-use myownmesh_core::protocol::{ClosedRoutedPayload, MeshMessage, RoutedApplicationEnvelope};
-use myownmesh_core::semantic::{DeviceId, MeshContextId};
+use myownmesh_core::protocol::MeshMessage;
 use tokio::time::{sleep, timeout, Instant};
 use webrtc::sctp::association::{Association, Config};
 use webrtc::sctp::chunk::chunk_payload_data::PayloadProtocolIdentifier;
@@ -55,52 +50,18 @@ struct FragmentedObservation {
     recovery_elapsed_us: u128,
 }
 
-fn representative_routed_frame() -> Bytes {
-    let origin_key = SigningKey::from_bytes(&[41; 32]);
-    let forwarding_key = SigningKey::from_bytes(&[42; 32]);
-    let destination_key = SigningKey::from_bytes(&[43; 32]);
-    let device = |key: &SigningKey| {
-        DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
-            .expect("the fixed public test key has a canonical device id")
+fn representative_application_frame() -> Bytes {
+    let message = MeshMessage::ChannelSeq {
+        stream: 1,
+        seq: 1,
+        channel: "sctp-fragment".to_owned(),
+        payload: serde_json::json!({"bytes": "x".repeat(1_040)}),
     };
-    let mut envelope = RoutedApplicationEnvelope::new(
-        MeshContextId::from_bytes([44; 32]),
-        device(&origin_key),
-        device(&destination_key),
-        [45; 16],
-        4,
-        ClosedRoutedPayload::EndpointCiphertext {
-            packet: CiphertextPacket {
-                binding: EpochBinding {
-                    version: ENDPOINT_CIPHER_VERSION,
-                    suite: ENDPOINT_CIPHER_SUITE,
-                    context: [44; 32],
-                    initiator: *origin_key.verifying_key().as_bytes(),
-                    responder: *destination_key.verifying_key().as_bytes(),
-                    epoch: [46; 16],
-                    introduction: None,
-                },
-                sender: *origin_key.verifying_key().as_bytes(),
-                sequence: 1,
-                // Representative opaque wire bytes, not a valid AEAD output.
-                // This SCTP-only control proves fragmentation/ACK behavior;
-                // it neither decrypts nor claims endpoint cipher admission.
-                ciphertext: vec![0x5a; 1_040],
-            },
-        },
-        &origin_key,
-    )
-    .expect("the current ciphertext-shaped routed wire envelope is valid");
-    envelope
-        .append_hop(device(&forwarding_key), &forwarding_key)
-        .expect("one native forwarding hop is valid");
-    let frame = Bytes::from(
-        serde_json::to_vec(&MeshMessage::RoutedApplication(envelope))
-            .expect("the public native protocol frame serializes"),
-    );
+    let frame =
+        Bytes::from(serde_json::to_vec(&message).expect("the public application frame serializes"));
     assert!(
         frame.len() > LOCKED_INITIAL_MTU,
-        "the public encoder must produce more than one locked SCTP DATA chunk"
+        "the public application encoder must produce more than one locked SCTP DATA chunk"
     );
     frame
 }
@@ -575,7 +536,7 @@ fn fragmented_routed_message_delivers_without_natural_retransmission() {
     // Build and validate the representative public wire shape before opening
     // any association-owned task. Fixed public keys provide signatures only;
     // no home, stored identity or private runtime configuration is read.
-    let frame = representative_routed_frame();
+    let frame = representative_application_frame();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -675,7 +636,7 @@ fn fragmented_routed_message_delivers_without_natural_retransmission() {
     assert_eq!(
         measurement,
         Ok(()),
-        "a representative fragmented routed message must complete inside the normal delayed-ACK bound; observation={observation:?}"
+        "a representative fragmented application message must complete inside the normal delayed-ACK bound; observation={observation:?}"
     );
     assert!(
         observation.frame_bytes > LOCKED_INITIAL_MTU

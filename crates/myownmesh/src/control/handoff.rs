@@ -258,46 +258,51 @@ mod tests {
     /// The second client is what makes this *exact* rather than approximate: it
     /// holds its own flow under its own capability, and the rollback of the
     /// first leaves it alone.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_an_unhanded_realtime_flow_leaves_its_client_holding_nothing() {
-        let state = crate::control::joinless_control_state().await;
-        let (client, _writer) = registered_client(&state);
-        let (bystander, _bystander_writer) = registered_client(&state);
+    #[test]
+    fn v4_r6_daemon_a1_an_unhanded_realtime_flow_leaves_its_client_holding_nothing() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
+                let (bystander, _bystander_writer) = registered_client(&state);
 
-        let capability = install_flow(
-            &state,
-            &client,
-            "device-b",
-            b"flow-a",
-            "the registry installs one flow on a registered client",
-        );
-        let bystander_capability = install_flow(
-            &state,
-            &bystander,
-            "device-c",
-            b"flow-b",
-            "and one on the second client",
-        );
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
+                let bystander_capability = install_flow(
+                    &state,
+                    &bystander,
+                    "device-c",
+                    b"flow-b",
+                    "and one on the second client",
+                );
 
-        ProvisionalHandoff::RealtimeFlow {
-            client: client.clone(),
-            capability: capability.clone(),
-        }
-        .settle(&state, false)
-        .await;
+                ProvisionalHandoff::RealtimeFlow {
+                    client: client.clone(),
+                    capability: capability.clone(),
+                }
+                .settle(&state, false)
+                .await;
 
-        assert!(
-            client.take_realtime_flow(&capability).is_none(),
-            "the exact capability names nothing on the exact client: the \
+                assert!(
+                    client.take_realtime_flow(&capability).is_none(),
+                    "the exact capability names nothing on the exact client: the \
              rollback took the flow out and handed it to the close path"
-        );
-        assert!(
-            bystander
-                .take_realtime_flow(&bystander_capability)
-                .is_some(),
-            "and the other client's flow is untouched — the undo is keyed to \
+                );
+                assert!(
+                    bystander
+                        .take_realtime_flow(&bystander_capability)
+                        .is_some(),
+                    "and the other client's flow is untouched — the undo is keyed to \
              the handle and the capability it was given, not to a client id or \
              a label"
+                );
+            },
         );
     }
 
@@ -307,30 +312,35 @@ mod tests {
     /// every open, which is worse than never undoing one. The capability still
     /// resolves to a flow afterwards, which is the whole of what the client was
     /// promised.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_a_delivered_realtime_flow_stays_installed() {
-        let state = crate::control::joinless_control_state().await;
-        let (client, _writer) = registered_client(&state);
+    #[test]
+    fn v4_r6_daemon_a1_a_delivered_realtime_flow_stays_installed() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
 
-        let capability = install_flow(
-            &state,
-            &client,
-            "device-b",
-            b"flow-a",
-            "the registry installs one flow on a registered client",
-        );
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
 
-        ProvisionalHandoff::RealtimeFlow {
-            client: client.clone(),
-            capability: capability.clone(),
-        }
-        .settle(&state, true)
-        .await;
+                ProvisionalHandoff::RealtimeFlow {
+                    client: client.clone(),
+                    capability: capability.clone(),
+                }
+                .settle(&state, true)
+                .await;
 
-        assert!(
-            client.take_realtime_flow(&capability).is_some(),
-            "the client holds the capability, so the flow it names is the \
+                assert!(
+                    client.take_realtime_flow(&capability).is_some(),
+                    "the client holds the capability, so the flow it names is the \
              daemon's to keep"
+                );
+            },
         );
     }
 
@@ -339,30 +349,35 @@ mod tests {
     /// direct `ProvisionalHandoff` value cannot cover: the value itself has no
     /// synchronous Drop cleanup, while the connection task can disappear at
     /// this boundary.
-    #[tokio::test]
-    async fn v4_r2_handoff_guard_drop_rolls_back_exact_realtime_flow() {
-        let state = crate::control::joinless_control_state().await;
-        let (client, _writer) = registered_client(&state);
-        let capability = install_flow(
-            &state,
-            &client,
-            "device-b",
-            b"flow-a",
-            "the registry installs one flow on a registered client",
-        );
+    #[test]
+    fn v4_r2_handoff_guard_drop_rolls_back_exact_realtime_flow() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
 
-        {
-            let _guard = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
-                client: client.clone(),
-                capability: capability.clone(),
-            });
-            // The connection task may be dropped here, immediately after the
-            // socket write has completed and before the normal settle call.
-        }
+                {
+                    let _guard = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
+                        client: client.clone(),
+                        capability: capability.clone(),
+                    });
+                    // The connection task may be dropped here, immediately after the
+                    // socket write has completed and before the normal settle call.
+                }
 
-        assert!(
-            client.take_realtime_flow(&capability).is_none(),
-            "dropping the armed handoff removes only its exact flow"
+                assert!(
+                    client.take_realtime_flow(&capability).is_none(),
+                    "dropping the armed handoff removes only its exact flow"
+                );
+            },
         );
     }
 }

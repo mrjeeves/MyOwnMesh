@@ -46,6 +46,7 @@ clap = "3"
 criterion = "0.5"
 
 [features]
+custody-lab = []
 metrics = []
 
 [[bench]]

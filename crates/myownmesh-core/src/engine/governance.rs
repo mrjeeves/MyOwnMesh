@@ -2041,7 +2041,8 @@ mod governance_projection_controls {
 
     #[tokio::test]
     async fn delta_inventory_mixes_admitted_rows_and_promoted_ids() {
-        let state = crate::engine::build_test_state("delta-inventory-mixed-control");
+        let state =
+            crate::engine::build_test_closed_state("delta-inventory-mixed-control", [0x42; 32]);
         let target_a = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();

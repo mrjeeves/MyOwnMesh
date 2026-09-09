@@ -33,9 +33,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
-};
+use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::governance::propose_role_grant;
 use myownmesh_core::engine::transport_lab::{attach_local, spawn_network, NetworkState};
 use myownmesh_core::identity::Identity;
@@ -56,13 +54,11 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
-        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),

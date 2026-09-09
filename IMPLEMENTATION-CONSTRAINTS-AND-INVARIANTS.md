@@ -1,5 +1,9 @@
 # MyOwnMesh implementation constraints and invariants
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
+In the current model, packet-relay allocation means configured standard TURN, not a mesh-member payload service. Nostr/signaling relay terminology refers only to its bounded control carrier. Existing accounting-dimension names do not grant payload-forwarding authority.
+
 Status: normative implementation contract for [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 This document states what a conforming implementation must and must not do. It deliberately keeps transport, signaling, connector, and session machinery inside MyOwnMesh while preventing transport placement from becoming semantic authority.
@@ -35,7 +39,7 @@ myownmesh-session-runtime
     session capability and application packet boundary
 
 connector-profile-*
-    direct LAN, ICE, TURN, Closed member relay,
+    native direct WebRTC, ICE, configured standard TURN,
     non-IP profiles
 
 myownmesh-application-api
@@ -115,8 +119,8 @@ EphemeralTransportSignal =
     | ConnectAnswer
     | CandidateHint
     | CandidateUpdate
-    | RelayRequest
-    | RelayResponse
+    | HubIntroductionRequest
+    | HubIntroductionResponse
     | CancelAttempt
     | RecoveryHint
 ```
@@ -333,7 +337,7 @@ The connector may allocate, under pre-authentication reservations:
 - candidate objects;
 - sockets and transport objects;
 - DNS, STUN, ICE, or connector-specific queries;
-- bounded TURN or relay allocation state;
+- bounded standard TURN allocation state;
 - transport handshake state;
 - bounded pre-authentication packet or media quarantine;
 - timers, tasks, and observations.
@@ -359,7 +363,7 @@ A media profile may instantiate receivers or transport tracks before promotion. 
 The current WebRTC connector uses its bounded planner to order and apply the
 admitted queued remote ICE candidates. The planner's path identifiers describe
 those candidate applications only; they do not prove a production race among
-direct WebRTC, TURN, and Closed member-relay channel families.
+direct WebRTC and configured standard TURN paths; there is no custom member-relay channel family.
 
 ICE may still gather host, server-reflexive, and relay candidates according to
 the connector configuration. No security rule requires a higher-priority ICE
@@ -499,54 +503,46 @@ Closed promotion requires the exact locally accepted Closed authorization proof 
 
 The connector may perform bounded speculative work while Closed proof validation occurs. An unauthorized or unknown endpoint is closed or left unpromoted after the proof result. No application payload is exposed.
 
-Closed governance and relay authorization must not depend on carrier count, arrival order, socket health, or a central signaling service unless the selected Closed profile explicitly adopts such a premise.
+Closed governance and endpoint authorization must not depend on carrier count, arrival order, socket health, or a central signaling service unless the selected Closed profile explicitly adopts such a premise.
 
-## 9. Relays
+## 9. Standard TURN and bounded Hub introduction
 
-### 9.1 Infrastructure relay
+### 9.1 Endpoint packet carriage
 
-TURN and a generic opaque relay may carry endpoint packets for one exact A-C session. They are not mesh participants or application endpoints by that function.
+Application data uses native endpoint-authenticated WebRTC directly or through
+configured standard TURN. TURN is infrastructure, not a mesh member or an
+application endpoint by that function. Device/context authentication and
+Open/Closed policy gates remain mandatory independently of ICE success or
+TURN credentials.
 
-### 9.2 Closed member relay
+### 9.2 No Hub/member payload forwarding
 
-A Closed member relay is allowed when the selected Closed profile permits it.
+Hubs consolidate discovery and bounded introduction only. Neither Hubs nor
+ordinary Open/Closed members forward application plaintext or ciphertext.
+Existing typed semantic-control and setup/control remain supported signaling
+traffic; signaling cannot become an application-data tunnel. If no viable
+direct/TURN endpoint transport exists, refuse with the bounded failure result.
 
-The relay is visibly attributable to Device B. The basal profile must reject anonymous relay credentials.
+### 9.3 Configuration and service boundary
 
-Relay eligibility may be:
+Use `introduction: Option<HubIntroductionPolicyConfig>`. Removed
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy` fields and removed wire forms must refuse. No custom
+endpoint route cipher or member-relay allocation is an allowed compatibility
+path. Native opaque channels, realtime, and RPC remain endpoint operations.
 
-```text
-current Closed authorization for B
-+ current signed relay offer from B
-+ local policy at A, B, and C
-```
+TURN service is distinct even when cohosted with a Hub. Current service
+advertisements are URL-only; credentials are locally configured. No protected
+credential-distribution mechanism is claimed.
 
-A stricter Closed profile may additionally require a durable relay capability granted by the selected governance system.
+### 9.4 Resource and cleanup custody
 
-### 9.3 Relay allocation
-
-A relay allocation must be ephemeral live state and must bind:
-
-- exact mesh context;
-- exact endpoints A and C;
-- exact relay B or service instance;
-- exact allocation capabilities for each endpoint;
-- explicit provider lifetime state where the relay protocol requires it;
-- lease-backed buffering, bandwidth, retry, and queued work.
-
-The allocation must not accept:
-
-- arbitrary host or port supplied in each packet;
-- application fanout;
-- another relay as recursive destination in the basal profile;
-- application plaintext;
-- mesh governance or durable fact mutation.
-
-### 9.4 Relay authentication
-
-B may authenticate setup using its Device key or an already authenticated Device channel. A separate relay operational key is optional only for narrower private-key custody and process isolation. It must be visibly delegated by B and must not be anonymous.
-
-Relay packets must use transport or per-allocation packet authentication. B's long-term Device key is not used to sign every packet.
+Standard TURN/native transport work retains finite owner/provider accounting,
+including explicit opaque-dependency residuals and external-service limits.
+Do not apply deleted custom route-allocation semantics as if they were a
+standard TURN guarantee. Close/cancellation must settle existing owned work
+or report retained failure; a timeout alone is not task completion. A proposed
+new native-runtime owner is not an implemented architecture requirement.
 
 ## 10. Handoff and recovery
 
@@ -605,7 +601,7 @@ No missing observation, carrier disconnect, expired timer, or failed candidate
 may synthesize a durable fact, Open runtime withdrawal authority, Closed
 removal, or application denial.
 
-A diagnostic API may expose latency, loss, carrier kind, relay identity, and local observation age. Those fields are observations, not authority.
+A diagnostic API may expose latency, loss, carrier kind, TURN service observation, and local observation age. Those fields are observations, not authority.
 
 ## 12. Persistence and compaction
 
@@ -1050,7 +1046,7 @@ The process component is checked regardless of identity. Per-ingress accounting 
 
 ### 14.4 Post-authentication resource class
 
-Post-authentication claims include authenticated sessions, application-facing queues, codec work, relay buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
+Post-authentication claims include authenticated sessions, application-facing queues, codec work, TURN/native transport buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
 
 ### 14.5 Queue and delayed-work contracts
 
@@ -1170,23 +1166,26 @@ A delayed callback cannot mutate a replacement object without the exact live cap
 
 ### I14. Carrier is not endpoint identity
 
-Direct, TURN, and Closed member relay preserve the same A-C endpoint identity after promotion.
+Direct and configured standard TURN WebRTC preserve the same A-C endpoint identity after promotion.
 
-### I15. Closed member relay is visible
+### I15. Hubs are not payload carriers
 
-The relay is attributable to its Device identity. Anonymous relay attestation is prohibited in the basal profile.
+Hub discovery/introduction never forwards application plaintext or ciphertext.
 
-### I16. Relay allocation is exact and bounded
+### I16. TURN work is finite and separately owned
 
-A relay allocation has one exact endpoint pair, no arbitrary destination, no fanout, and finite resources.
+Configured standard TURN allocations retain finite local accounting and
+external-service limits; a service URL grants no endpoint authority.
 
-### I17. Relay cannot promote or switch
+### I17. Infrastructure cannot promote or switch
 
-A relay cannot add a channel to an endpoint's authenticated set or authorize a handoff.
+A Hub or TURN service cannot add a channel to an endpoint's authenticated set
+or authorize a handoff.
 
-### I18. No relay-to-relay handoff dependency
+### I18. No custom relay handoff dependency
 
-Replacement transport can be established without old-relay to new-relay signaling.
+Replacement endpoint transport does not depend on custom member-relay state
+transfer or a custom route cipher.
 
 ### I19. Handoff is endpoint-driven
 
@@ -1339,7 +1338,7 @@ P6 at this disposition: the shipped provider holds no pending demand and keeps n
 
 ### 16.5 Connectors and recovery
 
-- direct, TURN, and Closed member relay positive controls;
+- direct and configured standard TURN positive controls, with Hub/member payload refusal controls;
 - bounded remote ICE-candidate application ordering, success, refusal, and
   failure behavior; any future cross-connector racing requires its own
   production owner and controls;
@@ -1352,14 +1351,14 @@ P6 at this disposition: the shipped provider holds no pending demand and keeps n
 - fixed codec and application-media semantics are absent from the basal core;
 - pre-promotion track setup cannot reach application delivery.
 
-### 16.6 Relay
+### 16.6 TURN and introduction separation
 
-- exact endpoint allocation;
-- no arbitrary destination or fanout;
-- visible member-relay identity;
-- anonymous relay credential rejection;
-- relay endpoint-substitution negatives;
-- exact allocation ownership, lease-backed buffering and retry, provider bandwidth constraints, and optional local cost policy.
+- endpoint authentication/integrity through configured standard TURN;
+- finite allocation, native callback/task ownership, and honest residuals;
+- no application plaintext or ciphertext through Hub/signaling handlers;
+- removed config and wire forms refuse rather than restoring a custom route;
+- cohosted TURN retains distinct service and mesh authority;
+- URL advertisements do not imply protected credential exchange.
 
 ### 16.7 Reachability and application boundary
 
@@ -1414,7 +1413,7 @@ A conforming implementation supplies:
 The owner must select:
 
 - exact cryptographic profiles;
-- Closed governance proof and relay authorization profile;
+- Closed governance proof and independent endpoint authorization through direct/TURN transport;
 - signaling and connector profiles;
 - required egress and restrictive-network environments;
 - resource-provider integration and host isolation for each deployment form;

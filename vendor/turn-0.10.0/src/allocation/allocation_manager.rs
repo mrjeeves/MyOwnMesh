@@ -12,7 +12,89 @@ use util::Conn;
 use super::*;
 use crate::error::*;
 use crate::relay::*;
-use crate::resource::{ResourceAdmission, ResourceCharge, ResourceKind, ResourceLease};
+use crate::resource::{
+    CleanupFailure, CleanupStatus, CleanupTaskLayer, ResourceAdmission, ResourceCharge,
+    ResourceKind, ResourceLease,
+};
+
+#[cfg(test)]
+mod cleanup_controls {
+    use super::*;
+    use crate::relay::relay_none::RelayAddressGeneratorNone;
+    use crate::resource::BoundedTestAdmission;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use util::vnet::net::Net;
+
+    struct Terminal(Arc<AtomicBool>);
+    impl Drop for Terminal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_joins_remaining_children_after_first_task_panic() {
+        let charge = CleanupStatus::charge().unwrap();
+        let limit = charge.units + charge.retained_bytes.div_ceil(1024) + 2;
+        let admission = Arc::new(BoundedTestAdmission::new(limit));
+        let cleanup = CleanupStatus::new(admission.as_ref()).unwrap();
+        let manager = Manager::new(ManagerConfig {
+            relay_addr_generator: Box::new(RelayAddressGeneratorNone {
+                address: "127.0.0.1".into(),
+                net: Arc::new(Net::new(None)),
+            }),
+            alloc_close_notify: None,
+            resource_admission: admission.clone(),
+            cleanup: cleanup.clone(),
+        });
+        let first_lease = admission
+            .acquire(ResourceKind::AllocationTimer, ResourceCharge::units(1))
+            .unwrap();
+        let second_lease = admission
+            .acquire(ResourceKind::AllocationTimer, ResourceCharge::units(1))
+            .unwrap();
+        let (first_ready, first_rx) = tokio::sync::oneshot::channel();
+        let (second_ready, second_rx) = tokio::sync::oneshot::channel();
+        let second_terminal = Arc::new(AtomicBool::new(false));
+        let second_observer = second_terminal.clone();
+        let first = tokio::spawn(async move {
+            let _lease = first_lease;
+            let _ = first_ready.send(());
+            panic!("injected manager child panic");
+        });
+        let second = tokio::spawn(async move {
+            let _lease = second_lease;
+            let _terminal = Terminal(second_observer);
+            let _ = second_ready.send(());
+            std::future::pending::<()>().await;
+        });
+        manager.tasks.lock().await.extend([first, second]);
+        let started = first_rx.await.is_ok() && second_rx.await.is_ok();
+        let result = manager.close().await;
+        let first_failure = cleanup.first();
+        let repeat = manager.close().await;
+        let terminal = second_terminal.load(Ordering::Acquire);
+        drop((manager, cleanup));
+        assert!(started && terminal);
+        assert_eq!(
+            first_failure,
+            Some(CleanupFailure::TaskPanicked(CleanupTaskLayer::ManagerChild))
+        );
+        assert!(matches!(
+            result,
+            Err(Error::Cleanup(CleanupFailure::TaskPanicked(
+                CleanupTaskLayer::ManagerChild
+            )))
+        ));
+        assert!(matches!(
+            repeat,
+            Err(Error::Cleanup(CleanupFailure::TaskPanicked(
+                CleanupTaskLayer::ManagerChild
+            )))
+        ));
+        assert_eq!(admission.remaining_for_test(), limit);
+    }
+}
 
 struct ReservationEntry {
     port: u16,
@@ -25,6 +107,7 @@ pub struct ManagerConfig {
     pub relay_addr_generator: Box<dyn RelayAddressGenerator + Send + Sync>,
     pub alloc_close_notify: Option<mpsc::Sender<AllocationInfo>>,
     pub resource_admission: Arc<dyn ResourceAdmission>,
+    pub cleanup: CleanupStatus,
 }
 
 /// `Manager` is used to hold active allocations.
@@ -36,6 +119,7 @@ pub struct Manager {
     resource_admission: Arc<dyn ResourceAdmission>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     next_reservation_generation: AtomicU64,
+    cleanup: CleanupStatus,
 }
 
 impl Manager {
@@ -49,17 +133,19 @@ impl Manager {
             resource_admission: config.resource_admission,
             tasks: Mutex::new(Vec::new()),
             next_reservation_generation: AtomicU64::new(1),
+            cleanup: config.cleanup,
         }
     }
 
     /// Closes this [`manager`] and closes all [`Allocation`]s it manages.
     pub async fn close(&self) -> Result<()> {
-        let mut close_error = None;
+        let mut first_error = self.cleanup.result().err();
         let allocations = self.allocations.lock().await;
         for a in allocations.values() {
             if let Err(err) = a.close().await {
                 if !matches!(err, Error::ErrClosed) {
-                    close_error = Some(err);
+                    self.cleanup.error(&err, CleanupFailure::AllocationClose);
+                    first_error.get_or_insert(err);
                 }
             }
         }
@@ -67,11 +153,12 @@ impl Manager {
         let tasks = self.tasks.lock().await.drain(..).collect::<Vec<_>>();
         for task in tasks {
             task.abort();
-            let _ = task.await;
+            self.cleanup
+                .observe_join(task.await, CleanupTaskLayer::ManagerChild, true);
         }
         self.allocations.lock().await.clear();
         self.reservations.lock().await.clear();
-        close_error.map_or(Ok(()), Err)
+        first_error.map_or_else(|| self.cleanup.result(), Err)
     }
 
     /// Returns the information about the all [`Allocation`]s associated with
@@ -155,6 +242,7 @@ impl Manager {
             self.alloc_close_notify.clone(),
             Arc::clone(&self.resource_admission),
             allocation_lease,
+            self.cleanup.clone(),
         );
 
         log::debug!("listening on relay addr: {:?}", a.relay_addr);
@@ -179,6 +267,9 @@ impl Manager {
 
         if let Some(a) = allocation {
             if let Err(err) = a.close().await {
+                if !matches!(err, Error::ErrClosed) {
+                    self.cleanup.error(&err, CleanupFailure::AllocationClose);
+                }
                 log::error!("Failed to close allocation: {}", err);
             }
         }
@@ -207,6 +298,9 @@ impl Manager {
 
         future::join_all(to_delete.iter().map(|a| async move {
             if let Err(err) = a.close().await {
+                if !matches!(err, Error::ErrClosed) {
+                    self.cleanup.error(&err, CleanupFailure::AllocationClose);
+                }
                 log::error!("Failed to close allocation: {}", err);
             }
         }))

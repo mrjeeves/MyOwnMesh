@@ -29,12 +29,9 @@ const SCHEDULER_FIELDS = `reactive_announce_min_interval_ms reoffer_min_interval
   data_channel_open_timeout_ms offer_build_timeout_ms ice_introspect_timeout_ms peer_send_timeout_ms
   restart_traffic_grace_ms relay_rescue_min_interval_ms network_change_restart_cooldown_ms
   reconnecting_grace_ms`.split(/\s+/);
-const ROUTING_FIELDS = `max_next_hops max_parallel_routes max_envelope_bytes max_dedup_entries
-  max_dedup_bytes max_hop_budget`.split(/\s+/);
-const RELAY_FIELDS = `enabled max_allocations max_allocations_per_member max_pending_handshakes
-  pending_handshake_timeout_ms replay_window max_frame_ciphertext_bytes queue_items_per_direction
-  queue_bytes_per_direction bandwidth_rate_bytes_per_second bandwidth_burst_bytes idle_timeout_ms
-  max_lifetime_ms max_control_bytes shutdown_grace_ms`.split(/\s+/);
+const INTRODUCTION_FIELDS = `max_records max_waiters_per_target max_signaling_bytes
+  max_candidates_per_attempt attempt_timeout_ms terminal_retention_ms max_transient_links
+  idle_timeout_ms max_maintenance_per_tick`.split(/\s+/);
 const MDNS_FIELDS = `max_active_connections max_discovered_peers outbound_queue_capacity
   max_resolve_owners event_capacity max_event_epochs max_txt_entries max_txt_bytes
   max_resolved_addresses dial_timeout_ms connection_idle_timeout_ms inbound_idle_timeout_ms
@@ -160,20 +157,17 @@ function primaryHub(spoke, hubs) {
 
 function validateBase(base) {
   const keys = `id network_id event_capacity connection_trace_capacity label kind scheduler
-    semantic_policy topology routing_policy hub tree local_observations signaling closed_relay
+    semantic_policy topology hub tree local_observations signaling
     stun_servers turn_servers pinned_peers auto_approve`.split(/\s+/);
+  if (Object.hasOwn(base, "introduction")) keys.push("introduction");
   fields(base, keys, "base_network_config");
   uint(base.event_capacity, "event_capacity", 1);
   uint(base.connection_trace_capacity, "connection_trace_capacity", 1);
-  requireValue(Array.isArray(base.pinned_peers) && base.pinned_peers.length === 0, "routed case must not contain pins");
+  requireValue(Array.isArray(base.pinned_peers) && base.pinned_peers.length === 0, "topology case must not contain pins");
   requireValue(typeof base.auto_approve === "boolean", "auto_approve must be explicit");
   requireValue(base.tree === null && base.local_observations === null, "base tree/observations must be null; tree limits are per node");
   for (const key of ["stun_servers", "turn_servers"]) requireValue(Array.isArray(base[key]), `${key} must be explicit`);
   numericPolicy(base.semantic_policy, SEMANTIC_FIELDS, "semantic_policy");
-  numericPolicy(base.routing_policy, ROUTING_FIELDS, "routing_policy");
-  requireValue(Object.values(base.routing_policy).every((v) => v > 0)
-    && base.routing_policy.max_parallel_routes <= base.routing_policy.max_next_hops
-    && base.routing_policy.max_hop_budget === 4, "routing policy must retain the four-hop bounded path");
   fields(base.scheduler, SCHEDULER_FIELDS, "scheduler");
   for (const key of SCHEDULER_FIELDS) {
     const length = key === "handshake_hello_retry_schedule_ms" ? 3 : key === "reconnect_retry_backoff_ms" ? 4 : 0;
@@ -185,9 +179,10 @@ function validateBase(base) {
   requireValue(base.scheduler.state_watch_interval_ms === 2000, "scale case requires nonfast 2000ms state watch");
   fields(base.hub, Object.keys(HUB_PROFILE), "hub");
   for (const key of Object.keys(HUB_PROFILE)) requireValue(base.hub[key] === HUB_PROFILE[key], `hub.${key} differs from reviewed nonfast profile`);
-  fields(base.closed_relay, RELAY_FIELDS, "closed_relay");
-  requireValue(typeof base.closed_relay.enabled === "boolean", "closed_relay.enabled must be explicit");
-  for (const key of RELAY_FIELDS.filter((k) => k !== "enabled")) uint(base.closed_relay[key], key);
+  if (base.introduction !== undefined && base.introduction !== null) {
+    fields(base.introduction, INTRODUCTION_FIELDS, "introduction");
+    for (const key of INTRODUCTION_FIELDS) uint(base.introduction[key], `introduction.${key}`, 1);
+  }
   fields(base.signaling, ["strategy", "mdns", "servers", "redundancy", "denylist", "public_fallback", "mdns_policy", "nostr_timing"], "signaling");
   requireValue(["none", "nostr"].includes(base.signaling.strategy), "unsupported signaling strategy");
   requireValue(typeof base.signaling.mdns === "boolean" && typeof base.signaling.public_fallback === "boolean", "signaling flags must be explicit");

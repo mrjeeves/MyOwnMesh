@@ -1,5 +1,9 @@
 # MyOwnMesh formal model and proof obligations
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
+In the current model, packet-relay allocation means configured standard TURN, not a mesh-member payload service. Nostr/signaling relay terminology refers only to its bounded control carrier. Existing accounting-dimension names do not grant payload-forwarding authority.
+
 Status: formal architecture model and proof obligations for the hybrid networking architecture in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 This document separates mathematical claims from the minimal architecture and concrete implementation constraints. These are proof sketches and obligations, not a claim of completed machine verification.
@@ -105,7 +109,7 @@ TransportHint =
     AddressHint
     | CandidateHint
     | IncomingSocketHint
-    | RelayHint
+    | TurnServiceHint
     | ConnectIntent
     | ConnectorSpecificHint
 ```
@@ -117,7 +121,7 @@ PreAuthEffect =
     CreateBoundedCandidate
     | OpenBoundedTransport
     | SendBoundedProbe
-    | CreateBoundedRelayAllocation
+    | CreateBoundedTurnAllocation
     | PerformBoundedHandshake
     | RecordBoundedTransportObservation
     | CancelOrReleaseCandidate
@@ -403,13 +407,13 @@ Safety requires only that each used channel be individually authenticated. It do
 
 Application packet acceptance is keyed to the authenticated channel and endpoint-session binding, not to a global carrier variable. Temporary use of two valid channels does not weaken endpoint identity.
 
-### Theorem 9.4. Relay-to-relay signaling is unnecessary for endpoint handoff
+### Note 9.4. Superseded custom relay handoff theorem
 
-A replacement relay D can be authenticated and used through endpoint communication A-D, C-D, and A-C without any B-D state transfer.
-
-#### Proof
-
-D's candidate channel and allocation are independently established. A and C perform fresh endpoint authentication or current-session key confirmation through D. No security predicate requires B's approval, key, or state.
+The former member-relay handoff theorem is withdrawn from the current
+requirements. Recovery uses endpoint-authenticated native WebRTC with direct
+or configured standard TURN paths. It must not require custom member-to-member
+relay state transfer. This is a cutover obligation, not new executable recovery
+evidence.
 
 ### Theorem 9.5. Forced failure can influence selection but not authorization
 
@@ -419,31 +423,40 @@ An attacker capable of dropping channel B may cause local policy to choose anoth
 
 Failure changes live observations and selection input. It does not satisfy the insertion or promotion predicate for D.
 
-## 10. Relay safety
+## 10. Standard TURN boundary; custom relay proofs withdrawn
 
-### Definition 10.1. Exact relay allocation
+### Assumption 10.1. Endpoint-authenticated WebRTC
 
-A relay allocation is live bounded state naming one exact endpoint pair and one exact relay instance. It accepts only endpoint-authentication packets or endpoint ciphertext for that pair.
+The current model permits direct WebRTC and configured standard TURN packet
+carriage. Endpoint authentication binds the actual WebRTC channel to the exact
+Device pair and mesh context. WebRTC transport integrity/confidentiality and
+correct key custody are explicit cryptographic premises, not consequences of
+a TURN credential or service advertisement.
 
-### Theorem 10.2. Relay non-substitution
+### Conditional argument 10.2. TURN is not an endpoint
 
-Assume A-C endpoint authentication and packet protection. A malicious TURN or Closed member relay cannot cause C to accept an application packet as authored by A without breaking endpoint authentication or packet integrity.
+Under those premises, a TURN service cannot cause an endpoint to accept
+modified application data or gain endpoint plaintext/authority without violating
+the endpoint/transport protection. It may deny service or observe traffic
+metadata. This argument does not prove availability, allocation cleanup,
+credential security, or concrete implementation conformance.
 
-#### Proof sketch
+### Withdrawn 10.3–10.4. Custom allocation and member-identity claims
 
-The relay lacks A-C endpoint keys. C accepts application data only after verification under keys derived by A and C over an authenticated channel. Relay modification or substitution fails verification.
+The custom exact-destination relay-allocation theorem and visible-member-relay
+corollary are no longer current requirements. Standard TURN is not modeled as
+the deleted mesh route/allocation protocol. No custom Hub or Closed-member
+payload cipher, plaintext forwarding exception, or ciphertext tunnel is
+permitted.
 
-### Theorem 10.3. Exact-destination confinement
+### Current proof and evidence boundary
 
-If the relay effect accepts no caller-supplied arbitrary destination and is created only for one exact endpoint pair, a conforming relay operation cannot become a general network gateway or application fanout service.
-
-### Corollary 10.4. Visible member relay identity
-
-A Closed member relay may be authenticated as Device B. Anonymous attestation is unnecessary. Visibility does not weaken the A-C endpoint theorem because B is not an endpoint of the inner A-C session.
-
-### Residual relay powers
-
-The relay may deny, delay, reorder, duplicate, meter, and correlate traffic and may observe packet metadata. These are availability and privacy residuals, not endpoint-authentication failures.
+Hub introduction and existing typed semantic-control must be shown disjoint
+from application payload dispatch. Removed config/wire forms must refuse.
+TURN service cohosting does not grant mesh authority; URL-only advertisements
+and locally configured credentials do not establish protected credential
+distribution. Direct/TURN endpoint tests and negative Hub/signaling payload
+tests remain required; this documentation edit establishes no new test PASS.
 
 ## 11. Signaling and payload noninterference
 
@@ -1069,7 +1082,7 @@ Under the stated assumptions, if a conforming application receives and successfu
 5. an authenticated local principal was allowed to use the session;
 6. post-authentication resources and a fresh opaque session capability were reserved;
 7. application payload did not traverse the signaling effect path;
-8. any relay carrier lacked A-C endpoint authority and plaintext under the cryptographic premises.
+8. any configured TURN carrier lacked A-C endpoint authority and plaintext under the stated WebRTC cryptographic premises; no Hub/member payload path was used.
 
 #### Proof sketch
 
@@ -1078,7 +1091,7 @@ follows from the exact endpoint handshake. The working channel follows from
 the connector transition. The endpoint, context, principal, resource, and
 capability properties are conjuncts of `MayPromote`. Application delivery is
 reachable only through the promoted capability. Signaling noninterference and
-relay non-substitution provide the final two properties.
+the conditional TURN boundary provide the final two properties.
 
 ## 18. Required mechanized or executable evidence
 
@@ -1091,8 +1104,8 @@ A concrete implementation must provide:
 5. bounded speculative-work tests under malformed and identity-rotating input;
 6. promotion tests that independently remove every predicate;
 7. replay tests across channels, restart, and delayed callbacks;
-8. direct, TURN, and Closed member-relay equivalence tests;
-9. handoff tests with two concurrently authenticated channels and no relay-to-relay protocol;
+8. direct and configured standard TURN endpoint tests, plus refusal of custom Hub/member payload paths;
+9. endpoint recovery tests without a custom member-relay handoff protocol; no concurrent-channel implementation claim is inferred;
 10. signaling and payload parser/effect reachability analysis;
 11. crash tests for reservations and effect intents;
 12. compaction equivalence tests for each adopted durable domain;

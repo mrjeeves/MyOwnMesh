@@ -358,30 +358,6 @@ pub enum Request {
         code: String,
     },
 
-    ClosedRelayOpen {
-        network: String,
-        relay: String,
-        target: String,
-    },
-    ClosedRelayAccept {
-        network: String,
-        wait_ms: u64,
-    },
-    ClosedRelaySend {
-        handle: String,
-        payload: Vec<u8>,
-    },
-    ClosedRelayRecv {
-        handle: String,
-        wait_ms: u64,
-    },
-    ClosedRelayClose {
-        handle: String,
-    },
-    ClosedRelayState {
-        handle: String,
-    },
-
     // ---- self-update ----------------------------------------------
     UpdateStatus,
     UpdateCheck,
@@ -1048,7 +1024,7 @@ mod tests {
             "update_status",
         ];
         let requests = fixture_requests();
-        assert_eq!(requests.len(), 68);
+        assert_eq!(requests.len(), 62);
         for request in requests {
             let encoded = serde_json::to_value(&request).expect("request serializes");
             let tag = encoded
@@ -1332,29 +1308,6 @@ mod tests {
                 network: "net".into(),
                 code: "123456".into(),
             },
-            Request::ClosedRelayOpen {
-                network: "net".into(),
-                relay: "relay".into(),
-                target: "target".into(),
-            },
-            Request::ClosedRelayAccept {
-                network: "net".into(),
-                wait_ms: 10,
-            },
-            Request::ClosedRelaySend {
-                handle: "handle".into(),
-                payload: vec![1, 2, 3],
-            },
-            Request::ClosedRelayRecv {
-                handle: "handle".into(),
-                wait_ms: 10,
-            },
-            Request::ClosedRelayClose {
-                handle: "handle".into(),
-            },
-            Request::ClosedRelayState {
-                handle: "handle".into(),
-            },
             Request::UpdateStatus,
             Request::UpdateCheck,
             Request::UpdateApply,
@@ -1425,12 +1378,6 @@ mod tests {
             "governance_mfa_abort",
             "governance_mfa_status",
             "governance_mfa_disable",
-            "closed_relay_open",
-            "closed_relay_accept",
-            "closed_relay_send",
-            "closed_relay_recv",
-            "closed_relay_close",
-            "closed_relay_state",
             "update_status",
             "update_check",
             "update_apply",

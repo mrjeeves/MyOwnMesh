@@ -1927,6 +1927,16 @@ impl PeerRegistry {
     ) -> Option<DisplacedPeerInstallation> {
         let device_id = peer.device_id.clone();
         let _mutation = self.mutation.lock();
+        // Whole-network shutdown deliberately leaves retired originals in the
+        // map until their native joins finish. Do not replace one while its
+        // exact pointer is still retained for completion.
+        if self
+            .peers
+            .get(&device_id)
+            .is_some_and(|current| current.value().peer.registry_retired())
+        {
+            return None;
+        }
         if self
             .peers
             .get(&device_id)
@@ -2477,6 +2487,37 @@ impl PeerRegistry {
         }
         self.peers.clear();
         retired
+    }
+
+    /// Prepare every current peer for asynchronous whole-network shutdown
+    /// without clearing the registry's original owners.  The mutation fence
+    /// makes the snapshot and authority revocation one operation; callers
+    /// remove each exact pointer only after its native close has joined.
+    pub(super) fn prepare_for_shutdown(&self) -> Vec<Arc<PeerConnection>> {
+        let _mutation = self.mutation.lock();
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .map(|entry| Arc::clone(&entry.value().peer))
+            .collect();
+        for peer in &peers {
+            peer.prepare_for_shutdown();
+        }
+        peers
+    }
+
+    /// Remove one prepared peer only when the registry still owns that exact
+    /// installation.  A replacement or stale pointer cannot consume it.
+    pub(super) fn complete_shutdown_peer(&self, peer: &Arc<PeerConnection>) -> bool {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(&peer.device_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.value().peer, peer) {
+            return false;
+        }
+        drop(current);
+        self.peers.remove(&peer.device_id).is_some()
     }
 }
 
@@ -3520,7 +3561,9 @@ mod introduction_vacant_install_controls {
         assert!(!called.get());
         assert!(!peer.registry_retired());
         peer.state.write().authenticated = false;
-        registry.install(Arc::clone(&peer));
+        assert!(registry.install(Arc::clone(&peer)).is_none());
+        let successor_peer = Arc::new(PeerConnection::new("target".into(), None));
+        registry.install(Arc::clone(&successor_peer));
         let replacement = registry.owner("target").unwrap();
         let epoch = registry.next_binding_epoch.load(Ordering::Acquire);
         assert!(!original.same_exact_owner(&replacement));

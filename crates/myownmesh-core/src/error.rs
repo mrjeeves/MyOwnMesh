@@ -7,104 +7,6 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Stable public classification for failures at the Closed-member relay
-/// boundary.  Internal refusal details (including route names and crypto
-/// diagnostics) remain behind the facade.
-#[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClosedRelayError {
-    #[error("queue pressure")]
-    QueuePressure,
-
-    #[error("closed relay allocation expired")]
-    Expired,
-
-    #[error("invalid closed relay profile")]
-    InvalidProfile,
-
-    #[error("invalid closed relay packet or route")]
-    InvalidPacket,
-
-    #[error("closed relay owner is not valid")]
-    Owner,
-
-    #[error("closed relay cryptographic operation failed")]
-    Crypto,
-
-    #[error("closed relay carrier is unavailable")]
-    Carrier,
-
-    #[error("closed relay is closed")]
-    Closed,
-}
-
-impl ClosedRelayError {
-    /// Collapse internal relay refusal details to the stable public contract.
-    pub(crate) fn from_refusal(refusal: &crate::runtime::relay::ClosedRelayRefusal) -> Self {
-        use crate::runtime::relay::ClosedRelayRefusal;
-
-        match refusal {
-            ClosedRelayRefusal::QueueFull => Self::QueuePressure,
-            ClosedRelayRefusal::Expired => Self::Expired,
-            ClosedRelayRefusal::InvalidProfile => Self::InvalidProfile,
-            ClosedRelayRefusal::InvalidEndpoints(_) | ClosedRelayRefusal::InvalidPacket(_) => {
-                Self::InvalidPacket
-            }
-            ClosedRelayRefusal::OwnerNotLive | ClosedRelayRefusal::OwnerMismatch => Self::Owner,
-            ClosedRelayRefusal::Crypto(_) => Self::Crypto,
-            ClosedRelayRefusal::CarrierUnavailable => Self::Carrier,
-            ClosedRelayRefusal::QueueClosed => Self::Closed,
-        }
-    }
-}
-
-#[cfg(test)]
-mod closed_relay_error_controls {
-    use super::{ClosedRelayError, Error};
-    use crate::runtime::relay::ClosedRelayRefusal;
-
-    #[test]
-    fn refusal_mapping_preserves_public_classes() {
-        let cases = [
-            (
-                ClosedRelayRefusal::QueueFull,
-                ClosedRelayError::QueuePressure,
-            ),
-            (ClosedRelayRefusal::QueueClosed, ClosedRelayError::Closed),
-            (ClosedRelayRefusal::Expired, ClosedRelayError::Expired),
-            (
-                ClosedRelayRefusal::InvalidProfile,
-                ClosedRelayError::InvalidProfile,
-            ),
-            (
-                ClosedRelayRefusal::InvalidEndpoints("route".into()),
-                ClosedRelayError::InvalidPacket,
-            ),
-            (
-                ClosedRelayRefusal::InvalidPacket("payload".into()),
-                ClosedRelayError::InvalidPacket,
-            ),
-            (ClosedRelayRefusal::OwnerNotLive, ClosedRelayError::Owner),
-            (ClosedRelayRefusal::OwnerMismatch, ClosedRelayError::Owner),
-            (
-                ClosedRelayRefusal::CarrierUnavailable,
-                ClosedRelayError::Carrier,
-            ),
-            (
-                ClosedRelayRefusal::Crypto("seal".into()),
-                ClosedRelayError::Crypto,
-            ),
-        ];
-
-        for (refusal, expected) in cases {
-            assert_eq!(ClosedRelayError::from_refusal(&refusal), expected);
-            match Error::ClosedRelay(ClosedRelayError::from_refusal(&refusal)) {
-                Error::ClosedRelay(actual) => assert_eq!(actual, expected),
-                _ => unreachable!("relay mapping must retain its typed error"),
-            }
-        }
-    }
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("io error at {path}: {source}")]
@@ -177,9 +79,6 @@ pub enum Error {
 
     #[error("network: {0}")]
     Network(String),
-
-    #[error("closed relay: {0}")]
-    ClosedRelay(ClosedRelayError),
 
     /// Per-device custody MFA: enrollment, verification, or a gate
     /// refusal (a custody-affecting governance change attempted without

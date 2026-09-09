@@ -229,6 +229,12 @@ impl SessionValidityWitness {
         self.validity.live.load(Ordering::Acquire)
     }
 
+    /// Revoke this exact logical lineage while its owning session remains
+    /// retained for terminal transport cleanup.
+    pub(crate) fn invalidate(&self) {
+        self.validity.invalidate();
+    }
+
     /// Whether this witness was minted by `session` — the very same promoted
     /// session, not merely one that is also live.
     ///

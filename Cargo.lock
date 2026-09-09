@@ -1439,7 +1439,6 @@ dependencies = [
 name = "myownmesh-core"
 version = "0.3.2"
 dependencies = [
- "aes-gcm",
  "async-trait",
  "bincode",
  "bytes",
@@ -1451,7 +1450,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
- "hkdf",
  "hmac",
  "if-addrs",
  "libc",
@@ -1470,8 +1468,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]

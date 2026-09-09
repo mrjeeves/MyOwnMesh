@@ -6,9 +6,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SemanticPolicyConfig,
-    SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
-    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+    NetworkConfig, SchedulerPolicyConfig, SemanticPolicyConfig, SignalingConfig, TopologyMode,
+    TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::engine::transport_lab::{attach_local, channel, depart_for_lab, spawn_network};
 use myownmesh_core::events::{DropReason, MeshEvent, PeerEvent};
@@ -182,13 +181,11 @@ fn config(id: &str, turn_url: String) -> NetworkConfig {
         scheduler: SchedulerPolicyConfig::default(),
         semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         tree: None,
         hub: None,
         local_observations: None,
-        application_transport: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
-        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: vec![IceTurnServer {
             urls: vec![turn_url],
@@ -237,90 +234,138 @@ async fn wait_for_user_left(
     .expect("authenticated TURN departure was not observed");
 }
 
-#[tokio::test]
+#[test]
 // Native TURN owns UDP sockets and is therefore opt-in for ordinary test
 // suites; the Linux integration job invokes this exact ignored test.
 #[ignore = "opens native TURN/WebRTC peers; run explicitly in the isolated Linux harness"]
-async fn authenticated_depart_observed_over_actual_turn() {
-    let _process_controls = exclusive_process_controls().await;
-    let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
-    std::env::set_var("MYOWNMESH_HOME", home.path());
-    let turn = TurnServer::start_with_resource_scope(
-        &TurnServiceConfig {
-            enabled: true,
-            bind: "127.0.0.1".into(),
-            port: 0,
-            public_ip: "127.0.0.1".into(),
-            realm: "depart-control".into(),
-            credentials: vec![TurnCredential {
-                username: "depart-user".into(),
-                password: "depart-password".into(),
-            }],
-            max_bps_per_connection: 0,
-            relay_port_min: 0,
-            relay_port_max: 0,
-        },
-        service_scope(),
-    )
-    .await
-    .expect("real TURN service starts");
-    let turn_url = format!("turn:{}?transport=udp", turn.local_addr());
-    let transport = Transport::new_relay_only_for_lab()
-        .expect("relay-only transport")
-        .with_connector_resource_policy(policy())
-        .expect("TURN policy is consistent");
-    let alice_id = Arc::new(Identity::ephemeral());
-    let bob_id = Arc::new(Identity::ephemeral());
-    let (alice, alice_driver) = spawn_network(
-        config("alice", turn_url.clone()),
-        Arc::clone(&alice_id),
-        transport.clone(),
-    )
-    .await
-    .expect("alice engine starts");
-    let (bob, bob_driver) = spawn_network(config("bob", turn_url), bob_id.clone(), transport)
+fn authenticated_depart_observed_over_actual_turn() {
+    with_service_cleanup(None, |cleanup| async move {
+        let _process_controls = exclusive_process_controls().await;
+        let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
+        std::env::set_var("MYOWNMESH_HOME", home.path());
+        let turn = TurnServer::start_with_resource_scope(
+            &TurnServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port: 0,
+                public_ip: "127.0.0.1".into(),
+                realm: "depart-control".into(),
+                credentials: vec![TurnCredential {
+                    username: "depart-user".into(),
+                    password: "depart-password".into(),
+                }],
+                max_bps_per_connection: 0,
+                relay_port_min: 0,
+                relay_port_max: 0,
+            },
+            service_scope(),
+            cleanup.clone(),
+        )
         .await
-        .expect("bob engine starts");
-    let mut alice_events = alice.events_tx.subscribe();
-    let mut bob_events = bob.events_tx.subscribe();
-    let broker = LocalBroker::new();
-    attach_local(&alice, &broker);
-    attach_local(&bob, &broker);
-    wait_for_approved(&mut alice_events, bob_id.public_id()).await;
-    wait_for_approved(&mut bob_events, alice_id.public_id()).await;
+        .expect("real TURN service starts");
+        let turn_url = format!("turn:{}?transport=udp", turn.local_addr());
+        let transport = Transport::new_relay_only_for_lab()
+            .expect("relay-only transport")
+            .with_connector_resource_policy(policy())
+            .expect("TURN policy is consistent");
+        let alice_id = Arc::new(Identity::ephemeral());
+        let bob_id = Arc::new(Identity::ephemeral());
+        let (alice, alice_driver) = spawn_network(
+            config("alice", turn_url.clone()),
+            Arc::clone(&alice_id),
+            transport.clone(),
+        )
+        .await
+        .expect("alice engine starts");
+        let (bob, bob_driver) = spawn_network(config("bob", turn_url), bob_id.clone(), transport)
+            .await
+            .expect("bob engine starts");
+        let mut alice_events = alice.events_tx.subscribe();
+        let mut bob_events = bob.events_tx.subscribe();
+        let broker = LocalBroker::new();
+        attach_local(&alice, &broker);
+        attach_local(&bob, &broker);
+        wait_for_approved(&mut alice_events, bob_id.public_id()).await;
+        wait_for_approved(&mut bob_events, alice_id.public_id()).await;
 
-    // Relay-only transport makes this the carrying channel for the
-    // authenticated session. Prove its receipt settles before departure
-    // retires the session, rather than treating relay selection as a shape
-    // assertion around the teardown path.
-    let alice_channel = channel::<String>("turn-receipt-before-close".into(), alice.clone());
-    let mut bob_channel = channel::<String>("turn-receipt-before-close".into(), bob.clone())
-        .subscribe()
-        .expect("bob subscribes to the TURN carrying channel");
-    alice_channel
-        .send_to(bob_id.public_id(), &"turn-receipt".to_string())
-        .await
-        .expect("TURN carrying-channel receipt is accepted");
-    let received = tokio::time::timeout(TEST_TIMEOUT, bob_channel.recv())
-        .await
-        .expect("TURN carrying-channel receipt timed out")
-        .expect("TURN carrying channel closed before receipt")
-        .expect("TURN carrying-channel receipt is valid");
-    assert_eq!(received.body(), "turn-receipt");
+        // Relay-only transport makes this the carrying channel for the
+        // authenticated session. Prove its receipt settles before departure
+        // retires the session, rather than treating relay selection as a shape
+        // assertion around the teardown path.
+        let alice_channel = channel::<String>("turn-receipt-before-close".into(), alice.clone());
+        let mut bob_channel = channel::<String>("turn-receipt-before-close".into(), bob.clone())
+            .subscribe()
+            .expect("bob subscribes to the TURN carrying channel");
+        alice_channel
+            .send_to(bob_id.public_id(), &"turn-receipt".to_string())
+            .await
+            .expect("TURN carrying-channel receipt is accepted");
+        let received = tokio::time::timeout(TEST_TIMEOUT, bob_channel.recv())
+            .await
+            .expect("TURN carrying-channel receipt timed out")
+            .expect("TURN carrying channel closed before receipt")
+            .expect("TURN carrying-channel receipt is valid");
+        assert_eq!(received.body(), "turn-receipt");
 
-    let departure = depart_for_lab(&alice).await;
-    assert_eq!(departure.observed, 1);
-    assert_eq!(departure.cancelled, 0);
-    wait_for_user_left(&mut bob_events, alice_id.public_id()).await;
+        let departure = depart_for_lab(&alice).await;
+        assert_eq!(departure.observed, 1);
+        assert_eq!(departure.cancelled, 0);
+        wait_for_user_left(&mut bob_events, alice_id.public_id()).await;
+        assert_eq!(
+            alice.peer_count(),
+            0,
+            "relay departure closes Alice only after its authenticated waiter completes"
+        );
+        assert_eq!(bob.peer_count(), 0);
+        alice.request_shutdown();
+        bob.request_shutdown();
+        alice_driver.await.expect("alice shuts down cleanly");
+        bob_driver.await.expect("bob shuts down cleanly");
+        turn.stop().await.expect("TURN service stops cleanly");
+    });
+}
+
+fn with_service_cleanup<F, Fut>(workers: Option<usize>, body: F)
+where
+    F: FnOnce(myownmesh_services::ServiceCleanupPort) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use myownmesh_services::ServiceCleanupOwner;
+    let grant = ServiceCleanupOwner::planning_charge()
+        .expect("actual outside root plan")
+        .checked_add(
+            FiniteResourceProvider::scope_planning_charge()
+                .checked_scale(2)
+                .unwrap(),
+        )
+        .unwrap();
+    let provider = FiniteResourceProvider::new(grant);
+    let port = ResourceProviderPort::new(provider.clone()).unwrap();
+    let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+    let owner = ServiceCleanupOwner::new(scope.clone()).unwrap();
+    let cleanup = owner.port();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut builder = if let Some(workers) = workers {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(workers);
+            builder
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
+        let runtime = builder.enable_all().build().unwrap();
+        runtime.block_on(body(cleanup));
+        drop(runtime);
+    }));
+    let report = owner.close_and_join().expect("outside service root joined");
+    drop((scope, port));
+    assert_eq!(provider.in_use(), ResourceClaim::ZERO);
     assert_eq!(
-        alice.peer_count(),
-        0,
-        "relay departure closes Alice only after its authenticated waiter completes"
+        provider.retained_after_failed_cleanup(),
+        ResourceClaim::ZERO
     );
-    assert_eq!(bob.peer_count(), 0);
-    alice.request_shutdown();
-    bob.request_shutdown();
-    alice_driver.await.expect("alice shuts down cleanly");
-    bob_driver.await.expect("bob shuts down cleanly");
-    turn.stop().await.expect("TURN service stops cleanly");
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+    assert_eq!(report.task_failures, 0);
+    assert_eq!(report.worker_failures, 0);
 }

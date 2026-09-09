@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use myownmesh_core::config::{
-    HubPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
-    TreePolicyConfig,
+    HubPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode, TreePolicyConfig,
 };
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort, ResourceReport,
@@ -83,11 +82,6 @@ fn hub_tree_config(id: &str, root: &str, hubs: &[String]) -> NetworkConfig {
         root: root.to_owned(),
         hubs: hubs.to_vec(),
         backup_candidates: 0,
-    };
-    config.routing_policy = RoutingPolicyConfig {
-        max_next_hops: 1,
-        max_parallel_routes: 1,
-        ..RoutingPolicyConfig::default()
     };
     config.hub = Some(hub_policy());
     config.tree = Some(tree_policy());
@@ -542,28 +536,6 @@ async fn hub_tree_routes_without_parent_service_and_fails_without_exit_path(
     assert!(a.peer(&c_id).is_none(), "A has no direct C owner");
     assert!(a.peer(&root_id).is_none(), "the configured root is absent");
 
-    let c_channel = c.channel::<String>(CHANNEL_NAME);
-    let mut c_subscription = c_channel.subscribe().expect("C subscription is funded");
-    let a_channel = a.channel::<String>(CHANNEL_NAME);
-    let routed_payload = "A-to-C through authenticated B".to_owned();
-    a_channel
-        .send_to(&c_id, &routed_payload)
-        .await
-        .expect("the authenticated B-C route is usable without an accepted parent relation");
-    let delivered = tokio::time::timeout(Duration::from_secs(5), c_subscription.recv())
-        .await
-        .expect("C receives the routed payload")
-        .expect("C subscription remains live")
-        .expect("C receives without a decode refusal");
-    assert_eq!(delivered.from(), a_id);
-    assert_eq!(delivered.body(), &routed_payload);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), c_subscription.recv())
-            .await
-            .is_err(),
-        "the routed payload is delivered exactly once"
-    );
-
     // Capture both exact endpoint owners while the authenticated link is
     // still live.  The lab terminal seam uses these captured witnesses for
     // an injected exact terminal notification rather than re-resolving a
@@ -584,6 +556,9 @@ async fn hub_tree_routes_without_parent_service_and_fails_without_exit_path(
 
     let a_c = a.install_promoted_peer_over_real_link(&c).await;
     assert_eq!(a_c.peer_device_id(), c_id);
+    let c_channel = c.channel::<String>(CHANNEL_NAME);
+    let mut c_subscription = c_channel.subscribe().expect("C subscription is funded");
+    let a_channel = a.channel::<String>(CHANNEL_NAME);
     let direct_payload = "A-to-C direct after B retirement".to_owned();
     a_channel
         .send_to(&c_id, &direct_payload)
@@ -669,7 +644,7 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
     let h1_id = h1_identity.public_id().to_owned();
     let h2_id = h2_identity.public_id().to_owned();
     let configured_hubs = vec![h1_id.clone(), h2_id.clone()];
-    let (l1_identity, l1_seed) =
+    let (l1_identity, _l1_seed) =
         choose_leaf_identity(&root_id, &configured_hubs, &h1_id, 0x40..=0x7f);
     let (l2_identity, l2_seed) =
         choose_leaf_identity(&root_id, &configured_hubs, &h2_id, 0x80..=0xbf);
@@ -767,9 +742,8 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
         ))
         .await?;
 
-    // These are the only four transport links.  Consequently the successful
-    // application delivery below has exactly the physical four-hop route
-    // L1-H1-R-H2-L2; no direct or alternate transport can hide a route error.
+    // These are the only parenting/transport links. The accepted hierarchy is
+    // exercised below; it does not itself authorize member payload forwarding.
     let root_h1 = root.install_promoted_peer_over_real_link(&h1).await;
     let root_h2 = root.install_promoted_peer_over_real_link(&h2).await;
     let h1_l1 = h1.install_promoted_peer_over_real_link(&l1).await;
@@ -808,49 +782,10 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
         ("L1", l1_id.as_str(), &l1),
         ("L2", l2_id.as_str(), &l2),
     ];
-    assert_four_hop_adjacency("before bidirectional payload", &path_nodes);
+    assert_four_hop_adjacency("after parent setup", &path_nodes);
 
-    let l2_channel = l2.channel::<String>(CHANNEL_NAME);
-    let mut l2_subscription = l2_channel.subscribe().expect("L2 subscription is funded");
-    let l1_channel = l1.channel::<String>(CHANNEL_NAME);
-    let mut l1_subscription = l1_channel.subscribe().expect("L1 subscription is funded");
-    let four_hop_payload = format!("L1-{l1_seed}-to-L2-{l2_seed}");
-    l1_channel
-        .send_to(&l2_id, &four_hop_payload)
-        .await
-        .expect("forward four-hop payload is sent");
-    let delivered = tokio::time::timeout(Duration::from_secs(5), l2_subscription.recv())
-        .await
-        .expect("four-hop payload reaches L2")
-        .expect("L2 subscription remains live")
-        .expect("four-hop payload decodes");
-    assert_eq!(delivered.from(), l1_id);
-    assert_eq!(delivered.body(), &four_hop_payload);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), l2_subscription.recv())
-            .await
-            .is_err(),
-        "four-hop payload is delivered exactly once"
-    );
-    let reverse_payload = "L2-to-L1 reverse four-hop payload".to_owned();
-    l2_channel
-        .send_to(&l1_id, &reverse_payload)
-        .await
-        .expect("reverse four-hop payload is sent");
-    let reverse_delivered = tokio::time::timeout(Duration::from_secs(5), l1_subscription.recv())
-        .await
-        .expect("reverse four-hop payload reaches L1")
-        .expect("L1 subscription remains live")
-        .expect("reverse four-hop payload decodes");
-    assert_eq!(reverse_delivered.from(), l2_id);
-    assert_eq!(reverse_delivered.body(), &reverse_payload);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), l1_subscription.recv())
-            .await
-            .is_err(),
-        "reverse four-hop payload is delivered exactly once"
-    );
-    assert_four_hop_adjacency("after bidirectional payload", &path_nodes);
+    // No member payload is sent over this hierarchy. Direct endpoint payload
+    // coverage is kept in the preceding setup/direct-link control.
 
     // H1's one-child service is full.  The sixth leaf is connected only to
     // H1, so the production attach request must be refused rather than

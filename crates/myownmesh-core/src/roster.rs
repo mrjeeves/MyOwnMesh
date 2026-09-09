@@ -1618,6 +1618,8 @@ mod tests {
             false,
         )
         .expect("manifest");
+        drop(transaction_cap);
+        drop(directory_cap);
 
         let loaded = load_advisory_at(Some(root.path()), "net-recovery");
         assert_eq!(loaded.authorized_devices[0].label, "old");

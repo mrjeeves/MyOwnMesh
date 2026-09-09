@@ -88,12 +88,11 @@ Arc 03 connector-capable daemon startup requires an explicit finite process
 resource grant. The owner also selects whether optional local ceilings and
 codec-neutral real-time ownership are enabled. Ordinary elastic construction
 outside an explicitly bounded optional profile does not require static Mesh,
-peer, attempt, queue, or flow counts. The separate Closed-member relay
-profile applies finite allocation, queue, handshake, replay, frame, control,
-bandwidth, lifetime, and shutdown bounds, with route and generation fences,
-pending-preserving refusal, and joined terminal custody. See [the quickstart
-policy input list](docs/QUICKSTART.md#2-open-the-mesh). An explicitly
-non-participating infrastructure host needs no connector policy.
+peer, attempt, queue, or flow counts. Hubs coordinate discovery and endpoint
+connection setup. Application traffic uses authenticated endpoint WebRTC
+connections, directly or through configured TURN; mesh members do not forward
+application payloads. See [the quickstart policy input list](docs/QUICKSTART.md#2-open-the-mesh).
+An explicitly non-participating infrastructure host needs no connector policy.
 
 ### 2. Run the desktop GUI
 
@@ -150,7 +149,6 @@ async fn run(
         kind: Default::default(),                 // Open governance
         topology: TopologyMode::default(),       // FullMesh
         signaling: Default::default(),            // Nostr + mDNS defaults
-        closed_relay: Default::default(),
         stun_servers: Default::default(),
         turn_servers: Default::default(),
         auto_approve: false,
@@ -226,7 +224,7 @@ protocol-message checklist, and the topology-mode checklist.
 - **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. Its graduated sequence is Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start. It uses the cheapest action that still recovers from the failure class above it and never tears a live link down on an ICE-state blip. The retained pre-V4 evidence for each tunable is in [`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md); V4 ownership and authority come from the canonical architecture documents.
 - **Trystero-derived Nostr routing algorithms.** The room-handle derivation matches JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), and the deterministic relay shuffle follows the same algorithm. The strict V4 signaling envelope and recipient-tagged event shapes are MyOwnMesh's current wire and are not a Trystero interoperability claim. Eight upstream-derived fixes are catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs).
 - **LAN discovery and signaling.** The signaling package includes mDNS/DNS-SD alongside its configured remote strategy. It advertises a network room handle and exchanges signaling data over the local transport when enabled. Backend, operating-system, and network availability remain deployment-dependent; configure `signaling.mdns` and the remote strategy explicitly for the intended environment. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
-- **Hosted infrastructure and network-scoped relay.** A device can host the signaling, STUN, and TURN services described in [`docs/SERVICES.md`](docs/SERVICES.md). Those are device-wide infrastructure services and advertise only their own service roles. Separately, an authorized member of a Closed network may provide a network-scoped opaque relay through bounded `NetworkConfig.closed_relay` policy. Its independently promoted A-B and B-C legs use explicit route-bound `Open` / `Offer` / `Accept` / `Close` controls; B forwards only opaque ciphertext through provider-backed directional queues. Generation tombstones, pending-preserving refusal, bounded controls, and joined shutdown custody protect the exact session. It is not a hosted URL, service role, GUI service toggle, or generic WebRTC A-C upgrade.
+- **Hosted infrastructure with separate control and data paths.** A device can host signaling, STUN and TURN as described in [Services](docs/SERVICES.md). Hubs coordinate discovery and endpoint setup. Application channels, RPC and native opaque flows use endpoint WebRTC sessions, directly or through configured TURN. No mesh-member application forwarding or signaling payload tunnel is provided.
 - **Self-hosted signaling, STUN, and TURN.** The signaling server speaks the supported NIP-01 subset, while STUN and TURN provide their respective ICE services. Turn off the node role for a **pure-infrastructure box**. Hosted-service configuration and release-specific deployment limits are documented in [`docs/SERVICES.md`](docs/SERVICES.md).
 - **Selectable topologies.** FullMesh is the default. Ring uses sorted peers with 2 immediate neighbours and deterministic shortcuts, while Star uses an explicit hub. Exact edge predicates are symmetric where the topology contract requires them; locally selected preferred or shortcut sets are deterministic but are not universally pairwise symmetric.
 - **Typed pub/sub + generic RPC over one data channel.** `Channel<T>` is a typed publish/subscribe channel keyed by name. `Rpc::call` / `serve` / `call_stream` / `serve_stream` is the generic request/response surface. Embedders define their own message types — the mesh treats payloads opaquely.

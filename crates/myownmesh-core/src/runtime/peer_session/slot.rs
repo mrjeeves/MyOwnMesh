@@ -525,6 +525,67 @@ impl PromotedSessionSlot {
         drop(self.slot.lock().take());
     }
 
+    /// Revoke application authority in place while retaining every original
+    /// channel, flow set, dedup token, and leased map node for whole-peer
+    /// native close.  This is used only by the registry's shutdown fence;
+    /// ordinary channel retirement still consumes the slot below.
+    pub(crate) fn prepare_shutdown(&self) {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return;
+        };
+        session.logical.validity().invalidate();
+        session.channels.for_each(|_, channel| {
+            if let Some(task) = channel.endpoint_auth.as_ref() {
+                task.retire();
+            }
+            channel.worker.retire();
+        });
+    }
+
+    /// Snapshot workers still held by this original promoted slot.  The slot
+    /// lock is released before callers start or await native close.
+    pub(crate) fn shutdown_workers(
+        &self,
+    ) -> Vec<Arc<crate::transport::webrtc::WebRtcConnectorWorker>> {
+        let mut workers = Vec::new();
+        if let Some(session) = self.slot.lock().as_ref() {
+            session
+                .channels
+                .for_each(|_, channel| workers.push(Arc::clone(&channel.worker)));
+        }
+        workers
+    }
+
+    /// Detach only the promoted channels' de-duplication custody after their
+    /// workers have reached native terminal state.  The session and its
+    /// leased-map entries remain in place while native close is pending, so
+    /// taking these tokens cannot drop the capability's work scope early.
+    pub(crate) fn take_shutdown_dedup(&self) -> Vec<(Option<DedupToken>, PromotedDedupDrain)> {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return Vec::new();
+        };
+        let count = session.channels.len();
+        let mut detached = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut remaining = index;
+            if let Some(channel) = session.channels.find_value_mut(|_| {
+                if remaining == 0 {
+                    true
+                } else {
+                    remaining -= 1;
+                    false
+                }
+            }) {
+                let additional_dedup =
+                    std::mem::replace(&mut channel.additional_dedup, PromotedDedupSet::new());
+                detached.push((channel.dedup.take(), additional_dedup.drain_tokens()));
+            }
+        }
+        detached
+    }
+
     pub(crate) fn take_workers_with_dedup(
         &self,
     ) -> Vec<(

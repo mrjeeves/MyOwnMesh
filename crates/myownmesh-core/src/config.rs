@@ -473,52 +473,6 @@ pub struct MdnsPolicyConfig {
     pub accept_error_backoff_ms: u64,
 }
 
-/// Owner-selected bounds for the Closed member opaque relay. The relay only
-/// forwards ciphertext; endpoint key material remains in the endpoint session.
-/// Packet bytes are plaintext bytes before the AEAD tag is added, and all
-/// queue/replay values are finite persisted integers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
-pub struct ClosedRelayPolicyConfig {
-    pub enabled: bool,
-    pub max_allocations: u64,
-    pub max_allocations_per_member: u64,
-    pub max_pending_handshakes: u64,
-    /// Maximum age of one pending handshake before it is rejected. This is
-    /// distinct from the lifetime of an established relay allocation.
-    pub pending_handshake_timeout_ms: u64,
-    pub replay_window: u64,
-    pub max_frame_ciphertext_bytes: u64,
-    pub queue_items_per_direction: u64,
-    pub queue_bytes_per_direction: u64,
-    pub bandwidth_rate_bytes_per_second: u64,
-    pub bandwidth_burst_bytes: u64,
-    pub idle_timeout_ms: u64,
-    pub max_lifetime_ms: u64,
-    pub max_control_bytes: u64,
-    pub shutdown_grace_ms: u64,
-}
-
-/// Owner-selected bounds for topology forwarding. These values fund the
-/// route planner itself; they are not inferred from the current peer count
-/// and are required on the persisted network record.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingPolicyConfig {
-    /// Maximum number of next-hop candidates returned for one route.
-    pub max_next_hops: u64,
-    /// Maximum number of route futures that may be active at once.
-    pub max_parallel_routes: u64,
-    /// Maximum complete encoded route envelope accepted by the protocol.
-    pub max_envelope_bytes: u64,
-    /// Maximum retained route identities in the owner-scoped dedup set.
-    pub max_dedup_entries: u64,
-    /// Maximum bytes retained by the owner-scoped dedup set.
-    pub max_dedup_bytes: u64,
-    /// Maximum forwarding hop budget for one route envelope.
-    pub max_hop_budget: u64,
-}
-
 /// Optional owner-selected maintenance policy for configured hub tiers.
 ///
 /// This policy is deliberately separate from [`TopologyMode`]: topology
@@ -618,152 +572,6 @@ impl LocalObservationPolicyConfig {
             && usize::try_from(self.max_records).is_ok()
             && usize::try_from(self.max_records_per_subject).is_ok()
             && usize::try_from(self.max_maintenance_per_tick).is_ok()
-    }
-}
-
-impl Default for RoutingPolicyConfig {
-    fn default() -> Self {
-        Self {
-            max_next_hops: 8,
-            max_parallel_routes: 4,
-            max_envelope_bytes: crate::protocol::RECEIVE_FRAME_BYTES as u64,
-            max_dedup_entries: 4_096,
-            max_dedup_bytes: 4 * 1024 * 1024,
-            max_hop_budget: crate::protocol::topology::MAX_ROUTED_HOP_BUDGET as u64,
-        }
-    }
-}
-
-impl RoutingPolicyConfig {
-    /// Validate every route bound before a planner, decoder, dedup set, or
-    /// forwarding task is created.
-    pub fn validate(&self) -> bool {
-        let semaphore_max = match u64::try_from(tokio::sync::Semaphore::MAX_PERMITS) {
-            Ok(max) => max,
-            Err(_) => return false,
-        };
-        let receive_bound = match u64::try_from(crate::protocol::RECEIVE_FRAME_BYTES) {
-            Ok(bound) => bound,
-            Err(_) => return false,
-        };
-        self.max_next_hops > 0
-            && self.max_next_hops <= semaphore_max
-            && self.max_parallel_routes > 0
-            && self.max_parallel_routes <= self.max_next_hops
-            && self.max_parallel_routes <= semaphore_max
-            && self.max_envelope_bytes > 0
-            && self.max_envelope_bytes <= receive_bound
-            && self.max_dedup_entries > 0
-            && self.max_dedup_bytes > 0
-            && self.max_hop_budget > 0
-            && self.max_hop_budget <= u64::from(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET)
-            && usize::try_from(self.max_next_hops).is_ok()
-            && usize::try_from(self.max_parallel_routes).is_ok()
-            && usize::try_from(self.max_envelope_bytes).is_ok()
-            && usize::try_from(self.max_dedup_entries).is_ok()
-            && usize::try_from(self.max_dedup_bytes).is_ok()
-    }
-
-    pub(crate) fn checked(self) -> Result<Self> {
-        if self.validate() {
-            Ok(self)
-        } else {
-            Err(Error::Config(
-                "routing policy contains zero, overflow, or inconsistent values".into(),
-            ))
-        }
-    }
-}
-
-/// A bounded protocol allocation that keeps malformed or hostile config from
-/// asking the relay to construct an unbounded packet buffer.
-pub const MAX_CLOSED_RELAY_PACKET_BYTES: u64 = 1024 * 1024;
-/// The largest encoded Closed relay control the receive callback can carry.
-/// This is separate from the ciphertext ceiling: controls are validated as
-/// their complete JSON `MeshMessage` representation, including the kind tag.
-pub const MAX_CLOSED_RELAY_CONTROL_BYTES: u64 =
-    crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES;
-
-impl Default for ClosedRelayPolicyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_allocations: 64,
-            max_allocations_per_member: 8,
-            max_pending_handshakes: 32,
-            pending_handshake_timeout_ms: 30_000,
-            replay_window: 64,
-            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
-            queue_items_per_direction: 64,
-            queue_bytes_per_direction: 4 * 1024 * 1024,
-            bandwidth_rate_bytes_per_second: 1024 * 1024,
-            bandwidth_burst_bytes: 2 * 1024 * 1024,
-            idle_timeout_ms: 30_000,
-            max_lifetime_ms: 3_600_000,
-            max_control_bytes: 16 * 1024,
-            shutdown_grace_ms: 5_000,
-        }
-    }
-}
-
-impl ClosedRelayPolicyConfig {
-    pub fn validate(&self) -> bool {
-        let semaphore_max = match u64::try_from(tokio::sync::Semaphore::MAX_PERMITS) {
-            Ok(max) => max,
-            Err(_) => return false,
-        };
-        self.max_allocations > 0
-            && self.max_allocations <= semaphore_max
-            && self.max_allocations_per_member > 0
-            && self.max_allocations_per_member <= semaphore_max
-            && self.max_pending_handshakes > 0
-            && self.max_pending_handshakes <= semaphore_max
-            && self.pending_handshake_timeout_ms > 0
-            && self.replay_window > 0
-            && self.replay_window <= semaphore_max
-            && self.max_frame_ciphertext_bytes > 0
-            && self.max_frame_ciphertext_bytes
-                <= crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
-            && self.queue_items_per_direction > 0
-            && self.queue_items_per_direction <= semaphore_max
-            && self.queue_bytes_per_direction > 0
-            && self.bandwidth_rate_bytes_per_second > 0
-            && self.bandwidth_burst_bytes > 0
-            && self.idle_timeout_ms > 0
-            && self.max_lifetime_ms > 0
-            && self.max_control_bytes > 0
-            && self.max_control_bytes <= MAX_CLOSED_RELAY_CONTROL_BYTES
-            && self.shutdown_grace_ms > 0
-            && usize::try_from(self.max_allocations).is_ok()
-            && usize::try_from(self.max_allocations_per_member).is_ok()
-            && usize::try_from(self.max_pending_handshakes).is_ok()
-            && usize::try_from(self.replay_window).is_ok()
-            && usize::try_from(self.max_frame_ciphertext_bytes).is_ok()
-            && usize::try_from(self.queue_items_per_direction).is_ok()
-            && usize::try_from(self.queue_bytes_per_direction).is_ok()
-            && usize::try_from(self.bandwidth_rate_bytes_per_second).is_ok()
-            && usize::try_from(self.bandwidth_burst_bytes).is_ok()
-            && usize::try_from(self.max_control_bytes).is_ok()
-    }
-
-    /// Validate one control against this profile's exact encoded-byte budget.
-    /// The protocol layer performs both complete route binding and field-size
-    /// checks before this configured ceiling is applied.
-    pub fn validate_closed_relay_control(
-        &self,
-        control: &crate::protocol::relay::ClosedRelayControl,
-    ) -> bool {
-        self.validate() && control.validate_for_wire(self.max_control_bytes).is_ok()
-    }
-
-    /// Return the checked pending-handshake duration used by the relay.
-    pub fn pending_handshake_timeout(&self) -> Result<Duration> {
-        if !self.validate() {
-            return Err(Error::Config(
-                "closed relay pending handshake policy is invalid".into(),
-            ));
-        }
-        Ok(Duration::from_millis(self.pending_handshake_timeout_ms))
     }
 }
 
@@ -1054,79 +862,6 @@ impl HubIntroductionPolicyConfig {
     ) -> Result<ResourceClaim> {
         self.checked()?;
         planned_application_reservations(root, entry, self.max_transient_links)
-    }
-}
-
-/// Explicit routed endpoint-encryption limits. These do not authorize a peer
-/// or change Closed relay policy. All phases of one epoch share its finite
-/// lifetime, and route changes cannot restart replay or nonce state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EndpointCipherPolicyConfig {
-    pub max_sessions: u64,
-    /// Complete encrypted inner application message, including channel/name
-    /// framing, not just the caller's body bytes. The wire owner supplies the
-    /// outer signed-envelope ceiling used below.
-    pub max_plaintext_bytes: u64,
-    pub replay_window: u64,
-    pub max_age_ms: u64,
-}
-
-impl EndpointCipherPolicyConfig {
-    pub fn checked(self) -> Result<Self> {
-        checked_application_count(self.max_sessions, "cipher max_sessions")?;
-        let plaintext = checked_application_count(self.max_plaintext_bytes, "cipher plaintext")?;
-        let replay = checked_application_count(self.replay_window, "cipher replay window")?;
-        if plaintext > crate::protocol::topology::max_routed_plaintext_bytes()
-            || replay > crate::protocol::endpoint_cipher::MAX_REPLAY_WINDOW
-        {
-            return Err(Error::Config(
-                "endpoint cipher exceeds its representation bounds".into(),
-            ));
-        }
-        checked_application_duration(self.max_age_ms, "cipher max_age_ms")?;
-        Ok(self)
-    }
-
-    /// Registry-root, per-entry and per-epoch/key allocations are distinct
-    /// reservations. The caller supplies exact disjoint raw claims from their owners;
-    /// the entry claim must exclude backing already funded by the epoch claim.
-    /// returned planning totals mint no capacity and must not be reserved a
-    /// second time alongside actual entries. Wire/work/queues remain separate.
-    pub fn planned_epochs_claim(
-        self,
-        registry_root: ResourceClaim,
-        registry_entry: ResourceClaim,
-        epoch: ResourceClaim,
-    ) -> Result<ResourceClaim> {
-        self.checked()?;
-        let registry =
-            planned_application_reservations(registry_root, registry_entry, self.max_sessions)?;
-        let epochs = application_reservation_claim(epoch)?
-            .checked_scale(self.max_sessions)
-            .map_err(|_| Error::Config("endpoint cipher epoch plan overflows".into()))?;
-        registry
-            .checked_add(epochs)
-            .map_err(|_| Error::Config("endpoint cipher registry plan overflows".into()))
-    }
-}
-
-/// Opt-in introduction and encrypted routed-message behavior. `None` on a
-/// network disables these additions and supplies no default production grant.
-/// Opaque byte flows are independent: they reuse the existing realtime
-/// provider policy, negotiated unit limit and provider-backed queue leases.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ApplicationTransportPolicyConfig {
-    pub introduction: HubIntroductionPolicyConfig,
-    pub endpoint_cipher: EndpointCipherPolicyConfig,
-}
-
-impl ApplicationTransportPolicyConfig {
-    pub fn checked(self) -> Result<Self> {
-        self.introduction.checked()?;
-        self.endpoint_cipher.checked()?;
-        Ok(self)
     }
 }
 
@@ -2075,9 +1810,6 @@ pub struct NetworkConfig {
     pub semantic_policy: SemanticPolicyConfig,
     #[serde(default)]
     pub topology: TopologyMode,
-    /// Checked owner-selected bounds for topology forwarding. This field is
-    /// intentionally required on persisted V4 network records.
-    pub routing_policy: RoutingPolicyConfig,
     /// Optional bounded local hub maintenance and topology advertisement
     /// policy. `None` is the explicit disabled state; no enabled defaults are
     /// synthesized during V4 deserialization.
@@ -2091,18 +1823,12 @@ pub struct NetworkConfig {
     /// authority and is never consulted by semantic admission or routing.
     #[serde(default)]
     pub local_observations: Option<LocalObservationPolicyConfig>,
-    /// Explicit introduction and encrypted routed-message policy. Every edit
-    /// requires exact runtime replacement; no saved-only or hot capacity edit.
-    /// This does not gate independently provider-admitted opaque byte flows.
+    /// Setup-only Hub introduction limits. Every edit requires exact runtime
+    /// replacement; this never authorizes forwarding application payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub application_transport: Option<ApplicationTransportPolicyConfig>,
+    pub introduction: Option<HubIntroductionPolicyConfig>,
     #[serde(default)]
     pub signaling: SignalingConfig,
-    /// Closed-member opaque relay policy for this network. It is a network
-    /// policy, not a signaling-carrier policy, because the closed projection
-    /// owns admission and endpoint membership.
-    #[serde(default)]
-    pub closed_relay: ClosedRelayPolicyConfig,
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<StunServer>,
     /// TURN servers. Defaults to the project's reference TURN (shared
@@ -2217,13 +1943,11 @@ impl NetworkConfig {
             scheduler: SchedulerPolicyConfig::default(),
             semantic_policy,
             topology: Default::default(),
-            routing_policy: RoutingPolicyConfig::default(),
             hub: None,
             tree: None,
             local_observations: None,
-            application_transport: None,
+            introduction: None,
             signaling: Default::default(),
-            closed_relay: ClosedRelayPolicyConfig::default(),
             stun_servers: default_stun_servers(),
             turn_servers: default_turn_servers(),
             pinned_peers: Vec::new(),
@@ -2244,8 +1968,8 @@ impl NetworkConfig {
     /// process-wide timing constants.
     pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
         self.validate_topology()?;
-        if let Some(application) = self.application_transport {
-            application.checked()?;
+        if let Some(introduction) = self.introduction {
+            introduction.checked()?;
         }
         match (&self.topology, self.tree) {
             (TopologyMode::HubTree { .. }, None) => {
@@ -2269,7 +1993,6 @@ impl NetworkConfig {
                 "HubTree requires an explicit hub timing/profile policy".into(),
             ));
         }
-        self.routing_policy()?;
         self.semantic_policy()?;
         self.validate_ice_servers()?;
         let scheduler = self.scheduler.checked()?;
@@ -2332,17 +2055,10 @@ impl NetworkConfig {
         Ok(())
     }
 
-    /// Return this network's checked forwarding bounds before route planning
-    /// or any route-owned allocation is started.
-    pub(crate) fn routing_policy(&self) -> Result<RoutingPolicyConfig> {
-        self.routing_policy.checked()
-    }
-
     /// Validate the complete policy subset needed before engine construction
     /// performs side effects. Runtime callers may use the narrower accessors
     /// when they need only one policy.
     pub fn validate(&self) -> Result<()> {
-        self.routing_policy()?;
         self.scheduler_policy()?;
         Ok(())
     }
@@ -3253,56 +2969,48 @@ mod tests {
             .expect("constructor network config serializes")
     }
 
-    fn application_transport_fixture() -> ApplicationTransportPolicyConfig {
-        ApplicationTransportPolicyConfig {
-            introduction: HubIntroductionPolicyConfig {
-                max_records: 4,
-                max_waiters_per_target: 2,
-                max_signaling_bytes: 32_768,
-                max_candidates_per_attempt: 4,
-                attempt_timeout_ms: 1_000,
-                terminal_retention_ms: 2_000,
-                max_transient_links: 2,
-                idle_timeout_ms: 3_000,
-                max_maintenance_per_tick: 2,
-            },
-            endpoint_cipher: EndpointCipherPolicyConfig {
-                max_sessions: 4,
-                max_plaintext_bytes: 1_024,
-                replay_window: 64,
-                max_age_ms: 4_000,
-            },
+    fn introduction_policy_fixture() -> HubIntroductionPolicyConfig {
+        HubIntroductionPolicyConfig {
+            max_records: 4,
+            max_waiters_per_target: 2,
+            max_signaling_bytes: 32_768,
+            max_candidates_per_attempt: 4,
+            attempt_timeout_ms: 1_000,
+            terminal_retention_ms: 2_000,
+            max_transient_links: 2,
+            idle_timeout_ms: 3_000,
+            max_maintenance_per_tick: 2,
         }
     }
 
     #[test]
-    fn application_transport_requires_explicit_complete_policy_and_round_trips() {
+    fn introduction_requires_explicit_complete_policy_and_round_trips() {
         let mut network = NetworkConfig::from_network_id("app-policy", "app-policy-net");
         let disabled = serde_json::to_value(&network).unwrap();
-        assert!(disabled.get("application_transport").is_none());
+        assert!(disabled.get("introduction").is_none());
         assert!(serde_json::from_value::<NetworkConfig>(disabled)
             .unwrap()
-            .application_transport
+            .introduction
             .is_none());
-        let policy = application_transport_fixture();
-        network.application_transport = Some(policy);
+        let policy = introduction_policy_fixture();
+        network.introduction = Some(policy);
         network.validate().expect("complete explicit profile");
         let mut encoded = serde_json::to_value(&network).unwrap();
         let decoded: NetworkConfig = serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(decoded.application_transport, Some(policy));
-        encoded["application_transport"]["introduction"]
+        assert_eq!(decoded.introduction, Some(policy));
+        encoded["introduction"]
             .as_object_mut()
             .unwrap()
             .remove("max_signaling_bytes");
         assert!(serde_json::from_value::<NetworkConfig>(encoded).is_err());
         let mut encoded = serde_json::to_value(policy).unwrap();
-        encoded["endpoint_cipher"]["grant"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<ApplicationTransportPolicyConfig>(encoded).is_err());
+        encoded["grant"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<HubIntroductionPolicyConfig>(encoded).is_err());
     }
 
     #[test]
     fn introduction_policy_checks_zero_max_plus_one_and_workload_overflow() {
-        let valid = application_transport_fixture().introduction;
+        let valid = introduction_policy_fixture();
         assert_eq!(valid.checked().unwrap(), valid);
         for field in [
             "max_records",
@@ -3338,62 +3046,28 @@ mod tests {
         overflow = valid;
         overflow.attempt_timeout_ms = u64::MAX;
         assert!(overflow.checked().is_err());
-    }
-
-    #[test]
-    fn cipher_policy_uses_exact_wire_and_replay_bounds() {
-        let mut exact = application_transport_fixture().endpoint_cipher;
-        exact.max_plaintext_bytes = crate::protocol::topology::max_routed_plaintext_bytes() as u64;
-        exact.replay_window = crate::protocol::endpoint_cipher::MAX_REPLAY_WINDOW as u64;
-        assert!(exact.checked().is_ok());
-        let mut invalid = exact;
-        invalid.max_plaintext_bytes += 1;
-        assert!(invalid.checked().is_err());
-        invalid = exact;
-        invalid.replay_window += 1;
-        assert!(invalid.checked().is_err());
-        for field in [
-            "max_sessions",
-            "max_plaintext_bytes",
-            "replay_window",
-            "max_age_ms",
-        ] {
-            let mut value = serde_json::to_value(exact).unwrap();
-            value[field] = serde_json::json!(0);
-            let invalid: EndpointCipherPolicyConfig = serde_json::from_value(value).unwrap();
-            assert!(invalid.checked().is_err(), "zero {field}");
-        }
-        invalid = exact;
-        invalid.max_age_ms = u64::MAX;
-        assert!(invalid.checked().is_err());
-        let mut network = NetworkConfig::from_network_id("app-invalid", "app-invalid-net");
-        let mut policy = application_transport_fixture();
-        policy.endpoint_cipher = invalid;
-        network.application_transport = Some(policy);
+        let mut network = NetworkConfig::from_network_id("intro-invalid", "intro-invalid-net");
+        network.introduction = Some(overflow);
         assert!(network.validate().is_err());
     }
 
     #[test]
-    fn application_claim_plans_price_distinct_reservations_and_refuse_overflow() {
+    fn introduction_claim_plans_price_distinct_reservations_and_refuse_overflow() {
         use crate::resource::FiniteResourceProvider;
         // Synthetic raw claims discriminate planner arithmetic, not private
         // production object sizes or a deployable provider budget.
         let root = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 17);
         let entry = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 23);
-        let epoch = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 31);
         let reservation =
             |claim| FiniteResourceProvider::reservation_planning_charge(claim).unwrap();
-        let policy = application_transport_fixture();
-        let introduction = policy
-            .introduction
-            .planned_records_claim(root, entry)
-            .unwrap();
+        let policy = introduction_policy_fixture();
+        let introduction = policy.planned_records_claim(root, entry).unwrap();
         assert_eq!(
             introduction,
             reservation(root)
                 .checked_add(
                     reservation(entry)
-                        .checked_scale(policy.introduction.max_records)
+                        .checked_scale(policy.max_records)
                         .unwrap(),
                 )
                 .unwrap()
@@ -3401,66 +3075,28 @@ mod tests {
         assert_ne!(
             introduction,
             reservation(
-                root.checked_add(
-                    entry
-                        .checked_scale(policy.introduction.max_records)
-                        .unwrap(),
-                )
-                .unwrap()
+                root.checked_add(entry.checked_scale(policy.max_records).unwrap(),)
+                    .unwrap()
             )
         );
-        let demand = policy
-            .introduction
-            .planned_demand_links_claim(root, entry)
-            .unwrap();
+        let demand = policy.planned_demand_links_claim(root, entry).unwrap();
         assert_eq!(
             demand,
             reservation(root)
                 .checked_add(
                     reservation(entry)
-                        .checked_scale(policy.introduction.max_transient_links)
-                        .unwrap(),
-                )
-                .unwrap()
-        );
-        let cipher = policy
-            .endpoint_cipher
-            .planned_epochs_claim(root, entry, epoch)
-            .unwrap();
-        assert_eq!(
-            cipher,
-            reservation(root)
-                .checked_add(
-                    reservation(entry)
-                        .checked_add(reservation(epoch))
-                        .unwrap()
-                        .checked_scale(policy.endpoint_cipher.max_sessions)
+                        .checked_scale(policy.max_transient_links)
                         .unwrap(),
                 )
                 .unwrap()
         );
         let excessive = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, u64::MAX);
-        assert!(policy
-            .introduction
-            .planned_records_claim(excessive, entry)
-            .is_err());
-        assert!(policy
-            .endpoint_cipher
-            .planned_epochs_claim(root, entry, excessive)
-            .is_err());
+        assert!(policy.planned_records_claim(excessive, entry).is_err());
         let multiply_overflow = ResourceClaim::single(ResourceClass::QueuedBytes, u64::MAX / 2);
         assert!(policy
-            .introduction
             .planned_records_claim(root, multiply_overflow)
             .is_err());
-        assert!(policy
-            .introduction
-            .planned_demand_links_claim(root, excessive)
-            .is_err());
-        assert!(policy
-            .endpoint_cipher
-            .planned_epochs_claim(root, entry, multiply_overflow)
-            .is_err());
+        assert!(policy.planned_demand_links_claim(root, excessive).is_err());
 
         // Only the standalone provider's process scope is added here. The
         // production planners reuse an already funded application scope.
@@ -3473,7 +3109,7 @@ mod tests {
         let authority = crate::resource::ResourceAuthorityClass::Admitted;
         let retained_root = port.acquire(&scope, authority, root).unwrap();
         let mut entries = Vec::new();
-        for _ in 0..policy.introduction.max_records {
+        for _ in 0..policy.max_records {
             entries.push(port.acquire(&scope, authority, entry).unwrap());
         }
         assert!(
@@ -3488,7 +3124,7 @@ mod tests {
         drop(entries);
         drop(retained_root);
         let restored_root = port.acquire(&scope, authority, root).unwrap();
-        let restored_entries = (0..policy.introduction.max_records)
+        let restored_entries = (0..policy.max_records)
             .map(|_| port.acquire(&scope, authority, entry).unwrap())
             .collect::<Vec<_>>();
         drop(restored_entries);
@@ -4153,77 +3789,6 @@ mod tests {
     }
 
     #[test]
-    fn routing_policy_boundaries_are_checked() {
-        let valid = RoutingPolicyConfig::default();
-        assert!(valid.validate());
-        assert_eq!(
-            valid.max_envelope_bytes,
-            crate::protocol::RECEIVE_FRAME_BYTES as u64
-        );
-
-        assert!(!RoutingPolicyConfig {
-            max_next_hops: 0,
-            ..valid
-        }
-        .validate());
-        assert!(!RoutingPolicyConfig {
-            max_parallel_routes: valid.max_next_hops + 1,
-            ..valid
-        }
-        .validate());
-        assert!(!RoutingPolicyConfig {
-            max_envelope_bytes: crate::protocol::RECEIVE_FRAME_BYTES as u64 + 1,
-            ..valid
-        }
-        .validate());
-        assert!(!RoutingPolicyConfig {
-            max_dedup_entries: 0,
-            ..valid
-        }
-        .validate());
-        assert!(!RoutingPolicyConfig {
-            max_dedup_bytes: 0,
-            ..valid
-        }
-        .validate());
-        assert!(!RoutingPolicyConfig {
-            max_hop_budget: 0,
-            ..valid
-        }
-        .validate());
-        assert_eq!(
-            valid.max_hop_budget,
-            crate::protocol::topology::MAX_ROUTED_HOP_BUDGET as u64
-        );
-        assert!(!RoutingPolicyConfig {
-            max_hop_budget: u64::from(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET) + 1,
-            ..valid
-        }
-        .validate());
-
-        let mut network = NetworkConfig::from_network_id("routing", "routing-net");
-        network.routing_policy.max_parallel_routes = network.routing_policy.max_next_hops + 1;
-        assert!(network.validate().is_err());
-    }
-
-    #[test]
-    fn network_serde_requires_routing_policy() {
-        let mut encoded = serde_json::to_value(NetworkConfig::from_network_id(
-            "routing-required",
-            "routing-required-net",
-        ))
-        .expect("network config serializes");
-        encoded
-            .as_object_mut()
-            .expect("network config serializes as an object")
-            .remove("routing_policy");
-        assert!(
-            serde_json::from_value::<NetworkConfig>(encoded).is_err(),
-            "V4 network config must not synthesize missing routing policy"
-        );
-    }
-
-    #[test]
     fn old_hard_alpha_config_is_refused_not_migrated() {
         let old = MeshConfig {
             version: 1,
@@ -4492,69 +4057,32 @@ mod tests {
     }
 
     #[test]
-    fn closed_relay_policy_defaults_disabled_and_roundtrips_bounded_config() {
-        let mut default_json = serialized_network("omitted", "omitted-net");
-        default_json
-            .as_object_mut()
-            .expect("serialized network is an object")
-            .remove("closed_relay");
-        let defaults: NetworkConfig = serde_json::from_value(default_json).unwrap();
-        assert_eq!(defaults.closed_relay, ClosedRelayPolicyConfig::default());
-
-        let configured = ClosedRelayPolicyConfig {
-            enabled: true,
-            max_allocations: 3,
-            max_allocations_per_member: 2,
-            max_pending_handshakes: 5,
-            pending_handshake_timeout_ms: 47_000,
-            replay_window: 11,
-            max_frame_ciphertext_bytes: 8191,
-            queue_items_per_direction: 7,
-            queue_bytes_per_direction: 17_000,
-            bandwidth_rate_bytes_per_second: 19_000,
-            bandwidth_burst_bytes: 23_000,
-            idle_timeout_ms: 29_000,
-            max_lifetime_ms: 31_000,
-            max_control_bytes: 37_000,
-            shutdown_grace_ms: 41_000,
-        };
-        let network = NetworkConfig {
-            closed_relay: configured.clone(),
-            ..NetworkConfig::from_network_id("configured", "configured-net")
-        };
-        let encoded = serde_json::to_string(&network).unwrap();
-        let decoded: NetworkConfig = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.closed_relay, configured);
-        assert!(decoded.closed_relay.validate());
-        assert_eq!(
-            decoded
-                .closed_relay
-                .pending_handshake_timeout()
-                .expect("configured pending-handshake timeout is valid"),
-            Duration::from_millis(47_000)
-        );
-        assert!(ClosedRelayPolicyConfig {
-            pending_handshake_timeout_ms: 0,
-            ..configured.clone()
+    fn retired_application_transit_config_fields_are_rejected() {
+        for field in [
+            "closed_relay",
+            "application_transport",
+            "endpoint_cipher",
+            "routing_policy",
+        ] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                serde_json::json!({"enabled": false}),
+                serde_json::json!({"enabled": true}),
+            ] {
+                let mut encoded = serialized_network("retired", "retired-net");
+                encoded.as_object_mut().unwrap().insert(field.into(), value);
+                let error = serde_json::from_value::<NetworkConfig>(encoded).unwrap_err();
+                let message = error.to_string();
+                assert!(
+                    message.contains("unknown field") && message.contains(field),
+                    "{message}"
+                );
+            }
         }
-        .pending_handshake_timeout()
-        .is_err());
-
-        assert!(!ClosedRelayPolicyConfig {
-            queue_items_per_direction: 0,
-            ..configured.clone()
-        }
-        .validate());
-        assert!(!ClosedRelayPolicyConfig {
-            max_frame_ciphertext_bytes: MAX_CLOSED_RELAY_PACKET_BYTES + 1,
-            ..configured.clone()
-        }
-        .validate());
-        assert!(!ClosedRelayPolicyConfig {
-            max_control_bytes: MAX_CLOSED_RELAY_CONTROL_BYTES + 1,
-            ..configured
-        }
-        .validate());
+        let mut encoded = serde_json::to_value(introduction_policy_fixture()).unwrap();
+        encoded["endpoint_cipher"] = serde_json::json!({});
+        assert!(serde_json::from_value::<HubIntroductionPolicyConfig>(encoded).is_err());
     }
 
     #[test]

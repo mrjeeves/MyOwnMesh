@@ -1268,6 +1268,14 @@ impl ConnectorCloseOwner {
         ) {
             return;
         }
+        #[cfg(any(test, feature = "transport-lab"))]
+        {
+            let bounded_reason = reason
+                .char_indices()
+                .nth(256)
+                .map_or(reason.as_str(), |(index, _)| &reason[..index]);
+            eprintln!("[arc03j-cleanup-failure] {bounded_reason}");
+        }
         self.late_transport_sealed.store(true, Ordering::Release);
         self.late_transport_custodian.close_sender();
         self.ownership.cleanup_failed.store(true, Ordering::Release);
@@ -1534,7 +1542,10 @@ mod task_reaper_tests {
             .submit(vec![task])
             .expect_err("closed custodian refuses handoff");
         for task in rejected.drain(..) {
-            record_join_result(join_task_without_runtime(task));
+            let result = tokio::task::spawn_blocking(move || join_task_without_runtime(task))
+                .await
+                .expect("closed-handoff rejected task join worker remains observed");
+            record_join_result(result);
         }
     }
 }

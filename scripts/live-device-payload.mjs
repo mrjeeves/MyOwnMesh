@@ -1,18 +1,15 @@
 // Public daemon IPC only. No console output: ctx.emit and returned results are
-// the evidence boundary. Never include raw IPC replies, errors or relay handles.
+// the evidence boundary. Never include raw IPC replies, errors.
 //
 // Commands share network, channel, peer (full canonical key), run_id, samples,
 // bytes, timeout_ms and lifetime_ms. echo_listen/echo_run use channel_send_to.
-// relay_echo_listen/relay_echo_run perform accept/open, exact byte-array echoes,
-// and close; both relay actions also require relay (full canonical key).
 // Listen actions return {result, cleanup, done}; main owns/joins that lifetime
 // and serializes only result/done. Other actions return a JSON-safe summary.
 // bytes counts ASCII application body bytes, excluding tags/JSON. Each message
 // carries all tags. Sequential goodput is NOT saturated transport throughput.
 // Use a fresh run_id for each experiment and identical sample/byte settings on
 // both ends. Start the listener first; its peer is the sender's full key.
-// Reserve controller time beyond lifetime_ms for cleanup. A relay responder
-// waits for a tagged finish after the last echo; no unverified close is hidden.
+// Reserve controller time beyond lifetime_ms for subscription cleanup.
 // Optional diagnostic_timing (strict boolean, generic echo actions only) adds
 // local numeric phase evidence to the terminal summary, never to mesh packets.
 
@@ -172,10 +169,9 @@ function remaining(ctx, c, cap = c.timeout_ms) {
 }
 async function rpc(ctx, c, request, stage, cap = c.timeout_ms, timing = null) {
   const timeout = remaining(ctx, c, cap);
-  if (stage === 'channel_send' || stage === 'relay_send') {
+  if (stage === 'channel_send') {
     c.last_send_encoding = { operation: request.op,
-      packet_json_bytes: stage === 'relay_send' ? request.payload.length
-        : Buffer.byteLength(JSON.stringify(request.payload), 'utf8'),
+      packet_json_bytes: Buffer.byteLength(JSON.stringify(request.payload), 'utf8'),
       request_json_bytes: Buffer.byteLength(JSON.stringify(request), 'utf8'),
       scope: 'last_send_attempt_local_JSON_UTF8_excludes_JSONL_delimiter_not_native_wire_or_resource_claim' };
   }
@@ -410,7 +406,7 @@ async function echoListen(ctx, c) {
     channel: c.channel, peer: c.peer, deadline_ms: c.deadline }, cleanup, done };
 }
 
-async function echoRun(ctx, c, relaySession = null) {
+async function echoRun(ctx, c) {
   const stats = counts();
   const rtts = [];
   const seen = new Set();
@@ -437,13 +433,11 @@ async function echoRun(ctx, c, relaySession = null) {
     pending.wait.settle(true);
   };
   try {
-    if (!relaySession) {
-      unsubscribe = await ctx.subscribe(c.network, c.channel, event => {
-        if (!fullEvent(event, c, 'echo')) { bump(stats, 'mismatch'); return; }
-        accept(event.payload);
-      });
-      if (typeof unsubscribe !== 'function') fail('subscribe', 'missing_cleanup');
-    }
+    unsubscribe = await ctx.subscribe(c.network, c.channel, event => {
+      if (!fullEvent(event, c, 'echo')) { bump(stats, 'mismatch'); return; }
+      accept(event.payload);
+    });
+    if (typeof unsubscribe !== 'function') fail('subscribe', 'missing_cleanup');
     routeBefore = await observePeers(ctx, c);
     c.started = ctx.monoMs();
     for (let seq = 0; seq < c.samples; seq += 1) {
@@ -457,8 +451,7 @@ async function echoRun(ctx, c, relaySession = null) {
       }
       const value = packet(c, seq, 'request');
       try {
-        if (relaySession) await relaySend(ctx, c, relaySession, value);
-        else await channelSend(ctx, c, value, pending.timing);
+        await channelSend(ctx, c, value, pending.timing);
         stats.sent += 1;
       } catch (error) {
         stats.send_outcome_unknown += 1;
@@ -467,20 +460,12 @@ async function echoRun(ctx, c, relaySession = null) {
         errorRecord = failure(error, 'send');
         break; // Never retry a possibly written message.
       }
-      if (relaySession) {
-        // One bounded receive per sent sample. Unexpected bytes terminate the
-        // sequential relay run instead of silently consuming/retrying reads.
-        const budget = pending.expires - ctx.monoMs();
-        if (budget < 1) { outcome = 'relay_echo_deadline'; break; }
-        accept(await relayReceive(ctx, c, relaySession, budget));
-      }
       const received = await pending.wait.promise;
       pending = null;
       if (!received && (ctx.signal.aborted || ctx.monoMs() >= c.deadline)) {
         outcome = 'cancelled_or_deadline';
         break;
       }
-      if (relaySession && !received) { outcome = 'relay_echo_unverified'; break; }
     }
   } catch (error) {
     outcome = 'failed'; errorRecord = failure(error);
@@ -495,12 +480,6 @@ async function echoRun(ctx, c, relaySession = null) {
   }
   stats.lost = stats.attempted - stats.received;
   if (outcome === 'complete' && stats.lost !== 0) outcome = 'completed_with_unverified_samples';
-  // The responder must not close the relay merely because its last echo was
-  // queued: acknowledge all verified echoes before its bounded terminal wait.
-  if (relaySession && outcome === 'complete' && stats.received === c.samples) {
-    try { await relaySend(ctx, c, relaySession, packet(c, c.samples - 1, 'finish')); }
-    catch (error) { outcome = 'finish_outcome_unknown'; errorRecord = failure(error); }
-  }
   const routeAfter = await observePeers(ctx, c);
   for (const sample of rtts) {
     await ctx.emit({ kind: 'payload_rtt', run_id: c.run_id, ...sample,
@@ -514,177 +493,12 @@ async function echoRun(ctx, c, relaySession = null) {
     counter_scope: 'sender_attempts_send_acknowledgements_and_verified_on_time_echoes' });
 }
 
-function relayData(data, variant) {
-  const value = data?.closed_relay?.[variant];
-  if (!value || typeof value !== 'object') fail(`relay_${variant}`, 'invalid_reply');
-  return value;
-}
-function relayIdentity(value) {
-  for (const field of ['generation', 'allocation_epoch']) {
-    integer(value[field], 1, Number.MAX_SAFE_INTEGER, `relay_${field}`);
-  }
-  return { generation: value.generation, allocation_epoch: value.allocation_epoch };
-}
-function checkRelayOwner(value, session) {
-  const identity = relayIdentity(value);
-  if (identity.generation !== session.generation || identity.allocation_epoch !== session.allocation_epoch) {
-    fail('relay_reply', 'session_identity_mismatch');
-  }
-  if (value.handle !== session.handle) fail('relay_reply', 'handle_mismatch');
-}
-function relayPublic(session) {
-  return { ...relayIdentity(session), session_id: session.session_id,
-    peer: session.peer, relay: session.relay, max_frame_bytes: session.max_frame_bytes };
-}
-async function relayAcquire(ctx, c, command, accept) {
-  const data = await rpc(ctx, c, accept
-    ? { op: 'closed_relay_accept', network: c.network, wait_ms: remaining(ctx, c) }
-    : { op: 'closed_relay_open', network: c.network, relay: key(command.relay, 'relay'), target: c.peer },
-  accept ? 'relay_accept' : 'relay_open');
-  const value = relayData(data, accept ? 'accepted' : 'opened');
-  // Capture the handle first, so even malformed metadata receives one close
-  // attempt rather than abandoning a capability returned by the daemon.
-  if (typeof value.handle !== 'string' || value.handle.length === 0 || value.handle.length > 1024) {
-    fail('relay_acquire', 'unusable_handle_outcome_unknown');
-  }
-  try {
-    relayIdentity(value);
-    if (value.peer !== c.peer || value.network !== c.network
-        || value.relay !== key(command.relay, 'relay')
-        || !Array.isArray(value.session_id) || value.session_id.length !== 16
-        || value.session_id.some(b => !Number.isInteger(b) || b < 0 || b > 255)
-        || !value.session_id.some(b => b !== 0)) fail('relay_acquire', 'session_metadata_mismatch');
-    integer(value.max_frame_bytes, 1, 65_535, 'relay_max_frame_bytes');
-    if (Math.max(encodePacket(packet(c, c.samples - 1, 'request')).length,
-      encodePacket(packet(c, c.samples - 1, 'echo')).length) > value.max_frame_bytes) {
-      fail('relay_acquire', 'tagged_payload_exceeds_frame');
-    }
-    return value;
-  } catch (error) {
-    let cleanup = 'close_outcome_unknown';
-    try {
-      const closed = await closeHandle(ctx, c, value.handle);
-      if (closed.handle === value.handle) cleanup = 'close_acknowledged_metadata_untrusted';
-    } catch { /* Do not repeat a possibly consuming close. */ }
-    await ctx.emit({ kind: 'relay_acquire_refused', run_id: c.run_id,
-      failure: failure(error), close_outcome: cleanup });
-    throw error;
-  }
-}
-function encodePacket(value) { return [...Buffer.from(JSON.stringify(value), 'utf8')]; }
-async function relaySend(ctx, c, session, value) {
-  const bytes = encodePacket(value);
-  if (bytes.length > session.max_frame_bytes) fail('relay_send', 'payload_exceeds_frame');
-  const answer = relayData(await rpc(ctx, c, { op: 'closed_relay_send',
-    handle: session.handle, payload: bytes }, 'relay_send'), 'sent');
-  checkRelayOwner(answer, session);
-  if (answer.bytes !== bytes.length) fail('relay_send', 'byte_count_mismatch');
-}
-async function relayReceive(ctx, c, session, timeout = c.timeout_ms) {
-  const wait = remaining(ctx, c, timeout);
-  const answer = relayData(await rpc(ctx, c, { op: 'closed_relay_recv',
-    handle: session.handle, wait_ms: wait }, 'relay_recv', wait), 'received');
-  checkRelayOwner(answer, session);
-  if (!Array.isArray(answer.payload) || answer.payload.length > session.max_frame_bytes
-      || answer.payload.some(b => !Number.isInteger(b) || b < 0 || b > 255)) {
-    fail('relay_recv', 'invalid_byte_payload');
-  }
-  try {
-    const buffer = Buffer.from(answer.payload);
-    const value = JSON.parse(buffer.toString('utf8'));
-    if (!buffer.equals(Buffer.from(JSON.stringify(value), 'utf8'))) fail('relay_recv', 'nonexact_encoding');
-    return value;
-  } catch { fail('relay_recv', 'invalid_tagged_encoding'); }
-}
-async function closeHandle(ctx, c, handle) {
-  // Cleanup is a separately bounded phase. Do not let a work cancellation skip
-  // the single consuming close; main keeps RPC alive until cleanup is joined.
-  // Never extend the controller deadline or retry an ambiguous close.
-  const budget = Math.min(c.timeout_ms, ctx.deadlineMs - ctx.monoMs());
-  if (budget < 1) fail('relay_close', 'deadline_before_close_attempt');
-  let reply;
-  try { reply = await ctx.rpc({ op: 'closed_relay_close', handle }, Math.floor(budget)); }
-  catch { fail('relay_close', 'transport_outcome_unknown'); }
-  if (reply?.ok !== true) fail('relay_close', 'close_outcome_unknown');
-  return relayData(reply.data, 'closed');
-}
-async function relayClose(ctx, c, session) {
-  try {
-    const answer = await closeHandle(ctx, c, session.handle);
-    checkRelayOwner(answer, session);
-    return 'closed';
-  } catch (error) {
-    return error instanceof PayloadError && error.category === 'deadline_before_close_attempt'
-      ? 'close_not_attempted_deadline' : 'close_outcome_unknown';
-  }
-}
-async function relayRun(ctx, c, command) {
-  const session = await relayAcquire(ctx, c, command, false);
-  let result;
-  let closeOutcome;
-  try { result = await echoRun(ctx, c, session); }
-  finally { closeOutcome = await relayClose(ctx, c, session); }
-  return { ...result, relay_session: relayPublic(session), close_outcome: closeOutcome,
-    workload_outcome: result.outcome,
-    outcome: closeOutcome === 'closed' ? result.outcome : 'terminal_cleanup_unconfirmed' };
-}
-function relayListen(ctx, c, command) {
-  let stopped = false;
-  const stats = counts();
-  let session;
-  const abort = () => { stopped = true; };
-  ctx.signal.addEventListener('abort', abort, { once: true });
-  const done = (async () => {
-    let outcome = 'complete';
-    let errorRecord = null;
-    let closeOutcome = 'not_acquired';
-    try {
-      session = await relayAcquire(ctx, c, command, true);
-      await ctx.emit({ kind: 'relay_echo_ready', run_id: c.run_id, relay_session: relayPublic(session) });
-      const seen = new Set();
-      for (let i = 0; i < c.samples && !stopped; i += 1) {
-        const value = await relayReceive(ctx, c, session);
-        if (!validPacket(value, c, 'request')) { bump(stats, 'mismatch'); outcome = 'mismatch'; break; }
-        if (seen.has(value.seq)) { bump(stats, 'duplicate'); outcome = 'duplicate'; break; }
-        seen.add(value.seq);
-        stats.received += 1;
-        if (stopped) break;
-        stats.attempted += 1;
-        try { await relaySend(ctx, c, session, packet(c, value.seq, 'echo')); stats.sent += 1; }
-        catch (error) { stats.send_outcome_unknown += 1; throw error; }
-      }
-      if (!stopped && stats.sent === c.samples) {
-        const finish = await relayReceive(ctx, c, session);
-        if (!validPacket(finish, c, 'finish') || finish.seq !== c.samples - 1) {
-          bump(stats, 'mismatch'); outcome = 'finish_unverified';
-        }
-      }
-      if (stopped) outcome = 'stopped';
-    } catch (error) { outcome = 'failed'; errorRecord = failure(error); }
-    finally {
-      if (session) closeOutcome = await relayClose(ctx, c, session);
-      ctx.signal.removeEventListener('abort', abort);
-    }
-    stats.lost = stats.received - stats.sent;
-    if (closeOutcome !== 'closed' && session) outcome = 'terminal_cleanup_unconfirmed';
-    return summary(ctx, c, stats, outcome, { failure: errorRecord, close_outcome: closeOutcome,
-      relay_session: session ? relayPublic(session) : null,
-      counter_scope: 'responder_received_requests_and_attempted_echo_replies',
-      sequential_app_goodput_bytes_per_second: null,
-      loss_scope: 'verified_requests_without_acknowledged_echo_send' });
-  })();
-  return { result: { kind: 'relay_accepting', run_id: c.run_id, deadline_ms: c.deadline },
-    cleanup: async () => { stopped = true; return await done; }, done };
-}
-
 export async function runPayload(ctx, command) {
   try {
     const c = prepare(ctx, command);
     switch (c.action) {
       case 'echo_listen': return await echoListen(ctx, c);
       case 'echo_run': return await echoRun(ctx, c);
-      case 'relay_echo_listen': key(command.relay, 'relay'); return relayListen(ctx, c, command);
-      case 'relay_echo_run': key(command.relay, 'relay'); return await relayRun(ctx, c, command);
       default: fail('preflight', 'unsupported_payload_action');
     }
   } catch (error) {

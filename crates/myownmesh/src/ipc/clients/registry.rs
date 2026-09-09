@@ -1533,14 +1533,48 @@ impl ClientRegistry {
     pub(crate) fn route_cancellation(
         &self,
     ) -> Result<FundedArc<RouteCancellation>, IpcAdmissionError> {
-        let retirement = RouteRetirementCustodian::reserve(&self.inner.resources)?;
         let retained = self
             .inner
             .resources
             .acquire(route_cancellation_retained().map_err(IpcAdmissionError::Claim)?)
             .map_err(IpcAdmissionError::Resources)?;
-        Ok(FundedArc::new(RouteCancellation::new(retirement), retained)
-            .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared")))
+        let port = process_route_join_port(&self.inner.resources)?;
+        self.route_cancellation_reserved(
+            retained,
+            port,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn route_cancellation_reserved(
+        &self,
+        retained: ResourceLease,
+        port: RouteJoinPort,
+        #[cfg(test)] fail_at: Option<usize>,
+    ) -> Result<FundedArc<RouteCancellation>, IpcAdmissionError> {
+        let retirement = RouteRetirementCustodian::reserve(&self.inner.resources, port)?;
+        let cancel = FundedArc::new(RouteCancellation::new(retirement.clone()), retained)
+            .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared"));
+        retirement.start(
+            #[cfg(test)]
+            fail_at,
+        )?;
+        Ok(cancel)
+    }
+
+    #[cfg(test)]
+    pub(super) fn route_cancellation_with_port(
+        &self,
+        port: RouteJoinPort,
+        fail_at: Option<usize>,
+    ) -> Result<FundedArc<RouteCancellation>, IpcAdmissionError> {
+        let retained = self
+            .inner
+            .resources
+            .acquire(route_cancellation_retained().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        self.route_cancellation_reserved(retained, port, fail_at)
     }
 
     /// Publish the outcome of an install, and wake everyone waiting on it.

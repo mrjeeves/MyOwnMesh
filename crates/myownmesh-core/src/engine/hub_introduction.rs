@@ -599,7 +599,7 @@ impl HubIntroduction {
         frame
             .verify_for_previous_hop(frame.current_carrier(), self.context)
             .map_err(|_| IntroductionError::Invalid)?;
-        if matches!(frame.body(), HubIntroductionBody::Request) {
+        if matches!(frame.body(), HubIntroductionBody::Request {}) {
             if self.records.get(&frame.introduction_id()).is_some() {
                 return Err(IntroductionError::Replay);
             }
@@ -700,7 +700,7 @@ impl HubIntroduction {
             return Ok(IntroductionAction::Terminal(ticket));
         }
         Ok(match frame.body() {
-            HubIntroductionBody::Accept => IntroductionAction::BeginOffer(ticket),
+            HubIntroductionBody::Accept {} => IntroductionAction::BeginOffer(ticket),
             HubIntroductionBody::Offer { .. }
             | HubIntroductionBody::Answer { .. }
             | HubIntroductionBody::Candidate { .. } => {
@@ -752,7 +752,7 @@ impl HubIntroduction {
                 return Err(IntroductionError::Stale);
             }
         }
-        if matches!(frame.body(), HubIntroductionBody::Request) {
+        if matches!(frame.body(), HubIntroductionBody::Request {}) {
             if record.request_sent
                 || record.phase != Phase::Requested
                 || now >= record.deadline
@@ -1015,7 +1015,7 @@ fn advance(
         return Err(IntroductionError::Replay);
     }
     let challenge = frame.challenge();
-    if matches!(frame.body(), HubIntroductionBody::Accept) {
+    if matches!(frame.body(), HubIntroductionBody::Accept {}) {
         let proposed = challenge.ok_or(IntroductionError::Invalid)?;
         if Some(proposed.request_hash) != record.request_hash
             || proposed.responder_challenge == [0; 32]
@@ -1037,7 +1037,7 @@ fn advance(
         return Err(IntroductionError::Invalid);
     }
     let phase = match frame.body() {
-        HubIntroductionBody::Accept if reverse && record.phase == Phase::Requested => {
+        HubIntroductionBody::Accept {} if reverse && record.phase == Phase::Requested => {
             Phase::Accepted
         }
         HubIntroductionBody::Offer { .. } if !reverse && record.phase == Phase::Accepted => {
@@ -1051,7 +1051,7 @@ fn advance(
         {
             record.phase
         }
-        HubIntroductionBody::Cancel | HubIntroductionBody::Refuse { .. } => Phase::Terminal,
+        HubIntroductionBody::Cancel {} | HubIntroductionBody::Refuse { .. } => Phase::Terminal,
         _ => return Err(IntroductionError::Phase),
     };
     let total = record
@@ -1075,7 +1075,7 @@ fn advance(
     }
     record.signaling_bytes = total;
     record.sequences[index] = Some(frame.sequence());
-    if matches!(frame.body(), HubIntroductionBody::Accept) {
+    if matches!(frame.body(), HubIntroductionBody::Accept {}) {
         record.coordinates.challenge = challenge;
     }
     record.phase = phase;
@@ -1225,7 +1225,7 @@ mod tests {
             0,
             None,
             4,
-            HubIntroductionBody::Request,
+            HubIntroductionBody::Request {},
             &key,
         )
         .unwrap()
@@ -1449,7 +1449,7 @@ mod tests {
         let source = coordinates.source;
         let destination = coordinates.destination;
         let request_hash = request(9).request_digest().unwrap();
-        let accept = frame(9, true, 0, HubIntroductionBody::Accept);
+        let accept = frame(9, true, 0, HubIntroductionBody::Accept {});
         let owner = PeerOwnerToken::detached_for_control(&device(2));
         let now = Instant::now();
         let ticket = controller
@@ -1777,7 +1777,7 @@ mod tests {
         let later = now + Duration::from_millis(40);
         advance(
             controller.records.get_mut(&ticket.id).unwrap(),
-            &frame(9, true, 0, HubIntroductionBody::Accept),
+            &frame(9, true, 0, HubIntroductionBody::Accept {}),
             later,
             policy(1),
         )
@@ -1980,7 +1980,7 @@ mod tests {
             advance(record, &offer, now, limits),
             Err(IntroductionError::Invalid)
         );
-        let accept = frame(3, true, 0, HubIntroductionBody::Accept);
+        let accept = frame(3, true, 0, HubIntroductionBody::Accept {});
         advance(record, &accept, now, limits).unwrap();
         assert_eq!(
             advance(record, &accept, now, limits),
@@ -2040,7 +2040,7 @@ mod tests {
         let (mut controller, provider) = fixture(1, 1);
         let now = Instant::now();
         let old = insert(&mut controller, 4, now);
-        let accept = frame(4, true, 0, HubIntroductionBody::Accept);
+        let accept = frame(4, true, 0, HubIntroductionBody::Accept {});
         assert_eq!(
             advance(
                 controller.records.get_mut(&old.id).unwrap(),

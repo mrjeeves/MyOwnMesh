@@ -219,6 +219,11 @@ impl SignalingTaskCustodian {
         self._reservation.as_mut()
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_terminal_thread_for_test(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.observer_owner.take_terminal_thread_for_test()
+    }
+
     /// Release observer and bridge custody after ordinary shutdown has joined
     /// both bridge handles.
     pub(crate) fn close(&mut self) {
@@ -373,6 +378,11 @@ impl TerminalOwnerState {
             .as_ref()
             .cloned()
             .expect("terminal observer remains live until close")
+    }
+
+    #[cfg(test)]
+    fn take_terminal_thread_for_test(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.terminal_thread.lock().take()
     }
 
     fn close(&self) {
@@ -678,6 +688,11 @@ impl MdnsTaskCustodian {
                 }
             },
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_terminal_thread_for_test(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.state.take_terminal_thread_for_test()
     }
 
     #[cfg(test)]

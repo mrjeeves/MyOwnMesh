@@ -19,9 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
-};
+use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::conn_trace::ConnTrace;
 use myownmesh_core::engine::transport_lab::{attach_signaling, spawn_network};
 use myownmesh_core::identity::Identity;
@@ -199,13 +197,11 @@ fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> Net
         semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling,
-        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),

@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
-    SemanticStorageEnvelope, SignalingConfig, TopologyMode,
+    NetworkConfig, NetworkKind, SemanticPolicyConfig, SemanticStorageEnvelope, SignalingConfig,
+    TopologyMode,
 };
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
@@ -378,8 +378,7 @@ fn scale_capacity_with_ready_batch(
     // The connector owner also admits the protocol's finite callback
     // envelope while each real fact is proposed.  Price the larger of that
     // protocol bound and the measured real fact, once per workload item.
-    let one_fact_resource_bytes = max_fact_encoded_bytes
-        .max(myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES);
+    let one_fact_resource_bytes = max_fact_encoded_bytes;
     let provider_per_class = one_fact_resource_bytes
         .checked_mul(scale_u64)
         .expect("scaled provider capacity fits u64");
@@ -541,11 +540,10 @@ fn closed_config(id: &str, scale: usize, capacity: ScaleCapacity) -> NetworkConf
         connection_trace_capacity: 512,
         label: id.to_string(),
         kind: NetworkKind::Closed,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         scheduler: Default::default(),
         semantic_policy: semantic_policy(scale, capacity),
         topology: TopologyMode::FullMesh,
@@ -554,7 +552,6 @@ fn closed_config(id: &str, scale: usize, capacity: ScaleCapacity) -> NetworkConf
             mdns: false,
             ..SignalingConfig::default()
         },
-        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
@@ -570,11 +567,10 @@ fn open_config(id: &str) -> NetworkConfig {
         connection_trace_capacity: 512,
         label: id.to_string(),
         kind: NetworkKind::Open,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         scheduler: Default::default(),
         semantic_policy: SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
@@ -583,7 +579,6 @@ fn open_config(id: &str) -> NetworkConfig {
             mdns: false,
             ..SignalingConfig::default()
         },
-        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
@@ -1741,8 +1736,7 @@ async fn export_is_empty(network: &myownmesh_core::JoinedNetwork) -> myownmesh_c
         context_id: identity.context_id(),
         cursor: None,
         max_facts: 64,
-        max_encoded_bytes: myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
-            as u32,
+        max_encoded_bytes: 65_535,
     })?;
     assert!(page.is_complete());
     assert!(page.facts().is_empty(), "Open presence cannot create facts");

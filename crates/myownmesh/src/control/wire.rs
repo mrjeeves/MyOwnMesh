@@ -12,6 +12,20 @@ use myownmesh_core::realtime as core_realtime;
 use myownmesh_core::transport as core_webrtc;
 use myownmesh_core::{NetworkConfig, ServicesConfig};
 
+/// Deserialize an MFA field only when the field is present on the wire.
+///
+/// The `deserialize_with` attribute makes Serde report an absent field as a
+/// missing-field error, while this helper deliberately keeps both explicit
+/// `null` (`None`) and an explicit string (`Some`) intact.
+fn deserialize_present_mfa_code<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 /// Which way units flow on a [`Request::RealtimePipe`] connection.
 ///
 /// One request covers both directions because only the direction differed
@@ -274,12 +288,14 @@ pub enum Request {
         network: String,
         target: String,
         role: myownmesh_core::semantic::Role,
+        #[serde(deserialize_with = "deserialize_present_mfa_code")]
         mfa_code: Option<String>,
     },
     /// Float a role-revoke proposal.
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,
+        #[serde(deserialize_with = "deserialize_present_mfa_code")]
         mfa_code: Option<String>,
     },
     /// Float an evict proposal — remove a peer from the closed network's
@@ -287,6 +303,7 @@ pub enum Request {
     GovernanceProposeEvict {
         network: String,
         target: String,
+        #[serde(deserialize_with = "deserialize_present_mfa_code")]
         mfa_code: Option<String>,
     },
     /// Prepare a new enrollment and return its exact transaction identity.
@@ -323,40 +340,6 @@ pub enum Request {
     GovernanceMfaDisable {
         network: String,
         code: String,
-    },
-
-    // ---- bounded Closed relay capability --------------------------
-    /// Open an opaque endpoint session through one authenticated member.
-    ClosedRelayOpen {
-        network: String,
-        relay: String,
-        target: String,
-    },
-    /// Accept one queued authenticated endpoint offer, waiting only for the
-    /// caller-provided duration.
-    ClosedRelayAccept {
-        network: String,
-        wait_ms: u64,
-    },
-    /// Send one bounded opaque plaintext through a daemon-held capability.
-    ClosedRelaySend {
-        handle: String,
-        payload: Vec<u8>,
-    },
-    /// Receive one opaque plaintext from a daemon-held capability, waiting
-    /// only for the caller-provided duration.
-    ClosedRelayRecv {
-        handle: String,
-        wait_ms: u64,
-    },
-    /// Consume one exact relay capability and close its endpoint session.
-    ClosedRelayClose {
-        handle: String,
-    },
-    /// Return deterministic generation and configured/active allocation
-    /// evidence for one daemon-held capability.
-    ClosedRelayState {
-        handle: String,
     },
 
     // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------
@@ -870,5 +853,42 @@ impl RealtimeAdvert {
             supported: true,
             encodings,
         }
+    }
+}
+
+#[cfg(test)]
+mod cutover_tests {
+    use super::Request;
+
+    #[test]
+    fn retired_member_relay_operations_are_unknown_not_application_aliases() {
+        for op in [
+            "closed_relay_open",
+            "closed_relay_accept",
+            "closed_relay_send",
+            "closed_relay_recv",
+            "closed_relay_close",
+            "closed_relay_state",
+        ] {
+            let value = serde_json::json!({
+                "op": op,
+                "network": "network",
+                "relay": "relay",
+                "target": "target",
+                "handle": "handle",
+                "wait_ms": 1,
+                "payload": [1, 2, 3]
+            });
+            let error = serde_json::from_value::<Request>(value).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("unknown variant") && message.contains(op),
+                "{message}"
+            );
+        }
+        assert!(matches!(
+            serde_json::from_value::<Request>(serde_json::json!({"op": "networks_list"})).unwrap(),
+            Request::NetworksList
+        ));
     }
 }

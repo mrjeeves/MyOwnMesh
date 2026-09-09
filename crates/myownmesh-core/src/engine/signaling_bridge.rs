@@ -2886,14 +2886,20 @@ mod tests {
         let charged = bridge
             .checked_add(observer)
             .expect("split signaling reservation charges are representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
         let custodian = SignalingTaskCustodian::reserve(scope.clone())
             .expect("the provider admits the complete signaling custody envelope");
         let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
         let parked_gate = Arc::clone(&gate);
+        let parked_entered = Arc::clone(&entered);
         let fanout = tokio::spawn(async move {
-            parked_gate.notified().await;
+            let wait = parked_gate.notified();
+            tokio::pin!(wait);
+            wait.as_mut().enable();
+            parked_entered.wait().await;
+            wait.await;
         });
         let (reaper_sender, reaper_task) =
             spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
@@ -2907,6 +2913,11 @@ mod tests {
             task_custodian: custodian,
         };
 
+        let terminal_thread = drivers
+            .task_custodian
+            .take_terminal_thread_for_test()
+            .expect("the original terminal owner thread remains available");
+        entered.wait().await;
         drop(drivers);
         assert_ne!(
             accountant.in_use(),
@@ -2919,12 +2930,10 @@ mod tests {
         );
 
         gate.notify_waiters();
-        for _ in 0..1_000 {
-            if accountant.in_use() == baseline {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::task::spawn_blocking(move || terminal_thread.join())
+            .await
+            .expect("terminal join worker completes")
+            .expect("the original terminal owner joins after fanout terminality");
         assert_eq!(
             accountant.in_use(),
             baseline,
@@ -2961,9 +2970,9 @@ mod tests {
                 )
                 .expect("combined signaling claim is representable")
         );
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let mut custodian = SignalingTaskCustodian::reserve(scope)
+        let mut custodian = SignalingTaskCustodian::reserve(scope.clone())
             .expect("the provider admits the complete signaling custody envelope");
         let in_use = accountant.in_use();
         for dimension in crate::resource::ResourceClass::ALL {
@@ -2991,20 +3000,29 @@ mod tests {
         let charged = bridge
             .checked_add(observer)
             .expect("split signaling reservation charges are representable");
-        let short_claim = charged
+        let scope_overhead =
+            crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
+                .checked_scale(2)
+                .expect("two fixture scopes are representable");
+        let positive_grant = charged
+            .checked_add(scope_overhead)
+            .expect("custody grant plus fixture scopes is representable");
+        let short_claim = positive_grant
             .checked_sub(ResourceClaim::single(
                 crate::resource::ResourceClass::OpaqueDependencyResidual,
                 1,
             ))
             .expect("the one-unit-short custody grant is representable");
         let (_root, scope, accountant) = scoped(|dimension| short_claim.amount(dimension));
+        let _scope_lifetime = scope.clone();
         let baseline = accountant.in_use();
 
         let result = SignalingTaskCustodian::reserve(scope);
 
         assert!(matches!(
             result,
-            Err(crate::resource::ResourceUnavailable::Pressure(_))
+            Err(crate::resource::ResourceUnavailable::Pressure(pressure))
+                if pressure.dimension == crate::resource::ResourceClass::OpaqueDependencyResidual
         ));
         assert_eq!(
             accountant.in_use(),
@@ -3027,19 +3045,32 @@ mod tests {
         let charged = bridge
             .checked_add(observer)
             .expect("split signaling reservation charges are representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let mut custodian = SignalingTaskCustodian::reserve(scope)
+        let mut custodian = SignalingTaskCustodian::reserve(scope.clone())
             .expect("the provider admits the split signaling envelope");
-        let progress = TaskCustodian::progress(custodian.observer_for_test().as_ref());
+        let mut progress = TaskCustodian::progress(custodian.observer_for_test().as_ref());
+        let initial_progress = *progress.borrow();
         let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Barrier::new(SIGNALING_TASK_SLOTS + 1));
         for _ in 0..SIGNALING_TASK_SLOTS {
             let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
             custodian
                 .reservation_for_test()
-                .submit(tokio::spawn(async move { gate.notified().await }))
+                .submit(tokio::spawn(async move {
+                    let wait = gate.notified();
+                    tokio::pin!(wait);
+                    wait.as_mut().enable();
+                    entered.wait().await;
+                    wait.await;
+                }))
                 .expect("the observer accepts each parked signaling handle");
         }
+        entered.wait().await;
+        let terminal_thread = custodian
+            .take_terminal_thread_for_test()
+            .expect("the original terminal owner thread remains available");
         drop(custodian);
         assert_ne!(
             accountant.in_use(),
@@ -3047,13 +3078,15 @@ mod tests {
             "drop keeps observer custody while parked handles remain live"
         );
         gate.notify_waiters();
-        let mut progress = progress;
-        for _ in 0..SIGNALING_TASK_SLOTS {
+        while progress.borrow().wrapping_sub(initial_progress) < SIGNALING_TASK_SLOTS as u64 {
             progress
                 .changed()
                 .await
                 .expect("each parked signaling handle reaches terminal observation");
         }
+        terminal_thread
+            .join()
+            .expect("the original terminal owner joins after observer terminality");
         for _ in 0..100 {
             if accountant.in_use() == baseline {
                 break;
@@ -3081,17 +3114,26 @@ mod tests {
         let charged = bridge
             .checked_add(observer)
             .expect("split signaling reservation charges are representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let mut custodian = SignalingTaskCustodian::reserve(scope)
+        let mut custodian = SignalingTaskCustodian::reserve(scope.clone())
             .expect("the provider admits the split signaling envelope");
         custodian.observer_for_test().close();
         let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Barrier::new(SIGNALING_TASK_SLOTS + 1));
         let mut tasks = Vec::new();
         for _ in 0..SIGNALING_TASK_SLOTS {
             let gate = Arc::clone(&gate);
-            tasks.push(tokio::spawn(async move { gate.notified().await }));
+            let entered = Arc::clone(&entered);
+            tasks.push(tokio::spawn(async move {
+                let wait = gate.notified();
+                tokio::pin!(wait);
+                wait.as_mut().enable();
+                entered.wait().await;
+                wait.await;
+            }));
         }
+        entered.wait().await;
         custodian
             .submit(tasks)
             .expect("refused handles are retained by the terminal owner");
@@ -3111,9 +3153,9 @@ mod tests {
             .expect("mDNS task custody claim is representable");
         let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
             .expect("mDNS task reservation charge is representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+        let custodian = MdnsTaskCustodian::reserve(scope.clone(), TEST_OUTER_DRIVER_TASK_SLOTS)
             .expect("the provider admits the complete mDNS custody envelope");
         let in_use = accountant.in_use();
         for dimension in crate::resource::ResourceClass::ALL {
@@ -3133,20 +3175,29 @@ mod tests {
             .expect("mDNS task custody claim is representable");
         let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
             .expect("mDNS task reservation charge is representable");
+        let scope_overhead =
+            crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
+                .checked_scale(2)
+                .expect("two fixture scopes are representable");
+        let positive_grant = charged
+            .checked_add(scope_overhead)
+            .expect("mDNS grant plus fixture scopes is representable");
         for dimension in crate::resource::ResourceClass::ALL {
-            if charged.amount(dimension) == 0 {
+            if positive_grant.amount(dimension) == 0 {
                 continue;
             }
-            let short_claim = charged
+            let short_claim = positive_grant
                 .checked_sub(ResourceClaim::single(dimension, 1))
                 .expect("the one-unit-short mDNS grant is representable");
             let (_root, scope, accountant) = scoped(|class| short_claim.amount(class));
+            let _scope_lifetime = scope.clone();
             let baseline = accountant.in_use();
             let result = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS);
             assert!(
                 matches!(
                     result,
-                    Err(crate::resource::ResourceUnavailable::Pressure(_))
+                    Err(crate::resource::ResourceUnavailable::Pressure(pressure))
+                        if pressure.dimension == dimension
                 ),
                 "mDNS custody refuses a short {dimension:?} grant",
             );
@@ -3164,9 +3215,9 @@ mod tests {
             .expect("mDNS task custody claim is representable");
         let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
             .expect("mDNS task reservation charge is representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+        let custodian = MdnsTaskCustodian::reserve(scope.clone(), TEST_OUTER_DRIVER_TASK_SLOTS)
             .expect("the provider admits the complete mDNS custody envelope");
         let mut reservation =
             myownmesh_signaling::TaskCustodian::reserve(custodian.as_ref(), SIGNALING_TASK_SLOTS)
@@ -3191,21 +3242,34 @@ mod tests {
             .expect("mDNS task custody claim is representable");
         let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
             .expect("mDNS task reservation charge is representable");
-        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let (_root, scope, accountant) = scoped_with_custody_overhead(charged);
         let baseline = accountant.in_use();
-        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+        let custodian = MdnsTaskCustodian::reserve(scope.clone(), TEST_OUTER_DRIVER_TASK_SLOTS)
             .expect("the provider admits the complete mDNS custody envelope");
         let mut progress = myownmesh_signaling::TaskCustodian::progress(custodian.as_ref());
+        let initial_progress = *progress.borrow();
         let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Barrier::new(SIGNALING_TASK_SLOTS + 1));
         let mut reservation =
             myownmesh_signaling::TaskCustodian::reserve(custodian.as_ref(), SIGNALING_TASK_SLOTS)
                 .expect("the injected owner reserves both terminal handles");
         for _ in 0..SIGNALING_TASK_SLOTS {
             let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
             reservation
-                .submit(tokio::spawn(async move { gate.notified().await }))
+                .submit(tokio::spawn(async move {
+                    let wait = gate.notified();
+                    tokio::pin!(wait);
+                    wait.as_mut().enable();
+                    entered.wait().await;
+                    wait.await;
+                }))
                 .expect("the injected observer accepts each terminal handle");
         }
+        entered.wait().await;
+        let terminal_thread = custodian
+            .take_terminal_thread_for_test()
+            .expect("the original terminal owner thread remains available");
         drop(custodian);
         assert_ne!(
             accountant.in_use(),
@@ -3213,7 +3277,7 @@ mod tests {
             "drop-time blocked handles keep the provider lease live"
         );
         gate.notify_waiters();
-        for _ in 0..SIGNALING_TASK_SLOTS {
+        while progress.borrow().wrapping_sub(initial_progress) < SIGNALING_TASK_SLOTS as u64 {
             progress
                 .changed()
                 .await
@@ -3225,6 +3289,9 @@ mod tests {
             "reservation keepalive retains lease until its close/join boundary"
         );
         drop(reservation);
+        terminal_thread
+            .join()
+            .expect("the original terminal owner joins after observer terminality");
         assert_eq!(
             accountant.in_use(),
             baseline,
@@ -3346,6 +3413,43 @@ mod tests {
             .issue_local_application_scope()
             .expect("test local-application scope");
         (root, scope, accountant)
+    }
+
+    fn scoped_with_custody_overhead(
+        claim: ResourceClaim,
+    ) -> (
+        crate::resource::ProcessResourceRoot,
+        LocalApplicationResourceScope,
+        crate::resource::FiniteResourceProvider,
+    ) {
+        let scope_overhead =
+            crate::resource::FiniteResourceProvider::scope_record_charge_for_test()
+                .checked_scale(2)
+                .expect("two fixture scopes are representable");
+        let grant = claim
+            .checked_add(scope_overhead)
+            .expect("custody grant plus fixture scopes is representable");
+        scoped(|dimension| grant.amount(dimension))
+    }
+
+    fn baseline_after_network_shutdown(baseline: ResourceClaim) -> ResourceClaim {
+        let policy = crate::config::SemanticPolicyConfig::default();
+        let envelope = policy
+            .checked_storage_envelope(
+                crate::config::SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+                policy.storage_workload(),
+            )
+            .expect("default semantic storage envelope is representable");
+        let storage_claim = ResourceClaim::single(
+            crate::resource::ResourceClass::StorageBytes,
+            envelope.total_bytes,
+        );
+        let storage_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(storage_claim)
+                .expect("semantic storage reservation charge is representable");
+        baseline
+            .checked_sub(storage_charge)
+            .expect("network shutdown releases its startup storage charge")
     }
 
     /// One emission, labelled so a control can tell which one arrived.
@@ -3615,12 +3719,15 @@ mod tests {
         assert_eq!(
             in_use.amount(crate::resource::ResourceClass::WorkerOrTask)
                 - baseline.amount(crate::resource::ResourceClass::WorkerOrTask),
-            18
+            24
         );
         assert_eq!(
             in_use.amount(crate::resource::ResourceClass::OpaqueDependencyResidual)
                 - baseline.amount(crate::resource::ResourceClass::OpaqueDependencyResidual),
-            41
+            // The outer driver contributes fourteen residual units, including
+            // its overflow and cancellation slots, and the provider's acquire
+            // path contributes one existing bookkeeping unit.
+            43
         );
 
         drop(owner);
@@ -4863,11 +4970,17 @@ mod tests {
         drop(one_guard);
         drop(first_guard);
         drop(second_guard);
-        state.shutdown().await;
         assert_eq!(
             provider.in_use(),
             baseline,
-            "Accepted one-copy and Pending-to-Accepted two-copy custody return to baseline"
+            "carrier custody is settled before network storage shutdown"
+        );
+        let expected_after_shutdown = baseline_after_network_shutdown(baseline);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            expected_after_shutdown,
+            "Accepted one-copy and Pending-to-Accepted two-copy custody return after storage release"
         );
     }
 
@@ -4924,11 +5037,17 @@ mod tests {
         );
         drop(first_guard);
         drop(second_guard);
-        state.shutdown().await;
         assert_eq!(
             provider.in_use(),
             baseline,
-            "late sibling failure releases exact Accepted carrier custody"
+            "carrier custody is settled before network storage shutdown"
+        );
+        let expected_after_shutdown = baseline_after_network_shutdown(baseline);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            expected_after_shutdown,
+            "late sibling failure releases exact Accepted carrier custody before storage release"
         );
     }
 
@@ -5078,11 +5197,17 @@ mod tests {
         );
         state.acknowledge_terminal_carrier_emission(successor, "same-lane", instance);
         drop(guard);
-        state.shutdown().await;
         assert_eq!(
             provider.in_use(),
             baseline,
-            "claimed and queued lane custody returns to the metered baseline"
+            "carrier custody is settled before network storage shutdown"
+        );
+        let expected_after_shutdown = baseline_after_network_shutdown(baseline);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            expected_after_shutdown,
+            "claimed and queued lane custody returns after storage release"
         );
     }
 

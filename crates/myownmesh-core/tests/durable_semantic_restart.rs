@@ -12,10 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
-use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
-    TopologyMode,
-};
+use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::{
     create_network_in_instance_root, ingest_semantic_fact, spawn_network_in_instance_root,
@@ -198,17 +195,15 @@ fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
         semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
         auto_approve: false,
-        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 
@@ -320,8 +315,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
             context_id: context,
             cursor: None,
             max_facts: 64,
-            max_encoded_bytes:
-                myownmesh_core::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES as u32,
+            max_encoded_bytes: 65_535,
         })
         .expect("export admitted fact");
     let admitted_fact = page
@@ -334,8 +328,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         let recent = network
             .recent_semantic_facts(SemanticRecentFactsRequest {
                 max_facts: 2,
-                max_encoded_bytes:
-                    myownmesh_core::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES as u32,
+                max_encoded_bytes: 65_535,
             })
             .expect("render bounded recent facts");
         assert_eq!(

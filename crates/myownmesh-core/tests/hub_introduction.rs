@@ -10,8 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ApplicationTransportPolicyConfig, EndpointCipherPolicyConfig, HubIntroductionPolicyConfig,
-    HubPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
+    HubIntroductionPolicyConfig, HubPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
     TreePolicyConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
@@ -58,31 +57,19 @@ fn connector_policy() -> WebRtcConnectorCapablePolicy {
     )
 }
 
-fn application_policy() -> ApplicationTransportPolicyConfig {
-    ApplicationTransportPolicyConfig {
-        introduction: HubIntroductionPolicyConfig {
-            max_records: 16,
-            max_waiters_per_target: 4,
-            max_signaling_bytes: (16 + 4)
-                * myownmesh_core::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES
-                    as u64,
-            max_candidates_per_attempt: 16,
-            attempt_timeout_ms: 10_000,
-            terminal_retention_ms: 10_000,
-            max_transient_links: 6,
-            idle_timeout_ms: 2_000,
-            max_maintenance_per_tick: 16,
-        },
-        endpoint_cipher: EndpointCipherPolicyConfig {
-            max_sessions: 6,
-            max_plaintext_bytes: myownmesh_core::protocol::topology::max_routed_plaintext_bytes()
-                as u64,
-            replay_window: 64,
-            max_age_ms: 30_000,
-        },
+fn introduction_policy() -> HubIntroductionPolicyConfig {
+    HubIntroductionPolicyConfig {
+        max_records: 16,
+        max_waiters_per_target: 4,
+        max_signaling_bytes: (16 + 4)
+            * myownmesh_core::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES as u64,
+        max_candidates_per_attempt: 16,
+        attempt_timeout_ms: 10_000,
+        terminal_retention_ms: 10_000,
+        max_transient_links: 6,
+        idle_timeout_ms: 2_000,
+        max_maintenance_per_tick: 16,
     }
-    .checked()
-    .expect("finite application transport policy validates")
 }
 
 fn hub_tree_config(id: &str, root: &str, hub: &str) -> NetworkConfig {
@@ -92,11 +79,6 @@ fn hub_tree_config(id: &str, root: &str, hub: &str) -> NetworkConfig {
         root: root.to_owned(),
         hubs: vec![hub.to_owned()],
         backup_candidates: 0,
-    };
-    config.routing_policy = RoutingPolicyConfig {
-        max_next_hops: 1,
-        max_parallel_routes: 1,
-        ..RoutingPolicyConfig::default()
     };
     config.hub = Some(HubPolicyConfig {
         max_parallel_dials: 1,
@@ -123,7 +105,7 @@ fn hub_tree_config(id: &str, root: &str, hub: &str) -> NetworkConfig {
         public_fallback: false,
         ..SignalingConfig::default()
     };
-    config.application_transport = Some(application_policy());
+    config.introduction = Some(introduction_policy());
     config.auto_approve = true;
     config.scheduler.state_watch_interval_ms = 5;
     config.scheduler.wake_probe_delay_ms = 1;

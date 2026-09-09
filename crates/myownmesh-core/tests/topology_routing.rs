@@ -1,18 +1,15 @@
 #![cfg(feature = "transport-lab")]
 
-//! Production-path routing controls.
+//! Production-path topology and direct endpoint controls.
 //!
-//! The three-hop fixture deliberately installs only A-B1, A-B2, and B2-C.
-//! A therefore has no direct C owner, while the checked ring planner sees two
-//! bounded candidates. B1 is authenticated but is configured as a non-forwarder;
-//! its refusal must not cancel B2's sibling route. The malformed-envelope
-//! controls remain a transport-lab seam requirement because no public API
-//! accepts an externally constructed routed envelope for injection.
+//! The topology planner remains bounded and deterministic, while application
+//! bytes use an authenticated direct endpoint. Hub/sibling selection is not a
+//! member-payload forwarding permission.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort, ResourceReport,
 };
@@ -71,11 +68,6 @@ fn routing_config(id: &str, topology: TopologyMode, auto_approve: bool) -> Netwo
     let mut config = NetworkConfig::from_network_id(id, ROUTE_NETWORK_ID);
     config.label = id.to_owned();
     config.topology = topology;
-    config.routing_policy = RoutingPolicyConfig {
-        max_next_hops: 2,
-        max_parallel_routes: 2,
-        ..RoutingPolicyConfig::default()
-    };
     config.signaling = SignalingConfig {
         strategy: "none".to_owned(),
         mdns: false,
@@ -202,42 +194,42 @@ async fn bounded_route_fails_over_and_preserves_exact_once_delivery() -> myownme
 
     let c_channel = c.channel::<String>(CHANNEL_NAME);
     let mut c_subscription = c_channel.subscribe().expect("C subscription is funded");
-    let b1_rx_before = b1.traffic().app_rx.frames;
-    let b2_tx_before = b2.traffic().app_tx.frames;
     let c_rx_before = c.traffic().app_rx.frames;
 
+    let a_c = a.install_promoted_peer_over_real_link(&c).await;
+    assert_eq!(a_c.peer_device_id(), c_id);
+    assert!(
+        a.peer(&c_id).is_some(),
+        "A-C is an authenticated direct endpoint"
+    );
     let a_channel = a.channel::<String>(CHANNEL_NAME);
     a_channel
-        .send_to(&c_id, &"one routed payload".to_owned())
+        .send_to(&c_id, &"one direct application payload".to_owned())
         .await
-        .expect("B1 refusal must not cancel B2's sibling route");
+        .expect("the direct endpoint carries application bytes");
 
     let delivered = tokio::time::timeout(Duration::from_secs(5), c_subscription.recv())
         .await
-        .expect("C receives the routed payload")
+        .expect("C receives the direct application payload")
         .expect("C subscription remains live")
         .expect("C receives without a decode refusal");
     assert_eq!(delivered.from(), a_id);
-    assert_eq!(delivered.body(), &"one routed payload".to_owned());
-    assert!(
-        b1.traffic().app_rx.frames > b1_rx_before,
-        "the refusing sibling was attempted"
-    );
-    assert!(
-        b2.traffic().app_tx.frames > b2_tx_before,
-        "the healthy sibling forwarded"
+    assert_eq!(
+        delivered.body(),
+        &"one direct application payload".to_owned()
     );
     assert!(
         c.traffic().app_rx.frames > c_rx_before,
-        "C observed one application frame"
+        "C observed one direct application frame"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), c_subscription.recv())
             .await
             .is_err(),
-        "the routed message is delivered exactly once despite overlapping paths"
+        "the direct message is delivered exactly once"
     );
 
+    let _ = a_c.retire().await;
     let _ = a_b1.retire().await;
     let _ = a_b2.retire().await;
     let _ = b2_c.retire().await;

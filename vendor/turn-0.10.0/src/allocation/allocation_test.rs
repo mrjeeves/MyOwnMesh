@@ -271,7 +271,11 @@ async fn test_allocation_refresh() -> Result<()> {
         None,
     );
 
-    a.start(DEFAULT_LIFETIME).await;
+    let timer_admission = crate::resource::BoundedTestAdmission::new(1);
+    let timer_lease = timer_admission
+        .acquire(ResourceKind::AllocationTimer, ResourceCharge::units(1))
+        .map_err(|_| Error::ErrResourceAdmission)?;
+    a.start(DEFAULT_LIFETIME, timer_lease).await;
     a.refresh(Duration::from_secs(0)).await;
 
     assert!(!a.stop(), "lifetimeTimer has expired");
@@ -296,7 +300,11 @@ async fn test_allocation_close() -> Result<()> {
     );
 
     // add mock lifetimeTimer
-    a.start(DEFAULT_LIFETIME).await;
+    let timer_admission = crate::resource::BoundedTestAdmission::new(1);
+    let timer_lease = timer_admission
+        .acquire(ResourceKind::AllocationTimer, ResourceCharge::units(1))
+        .map_err(|_| Error::ErrResourceAdmission)?;
+    a.start(DEFAULT_LIFETIME, timer_lease).await;
 
     // add channel
     let addr = SocketAddr::from_str("127.0.0.1:3478")?;

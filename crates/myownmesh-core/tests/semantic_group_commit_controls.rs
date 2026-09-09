@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
-    SignalingConfig, TopologyMode, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+    NetworkConfig, NetworkKind, SemanticPolicyConfig, SignalingConfig, TopologyMode,
+    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::engine::transport_lab::SemanticCommitFaultForLab;
 use myownmesh_core::semantic::{
@@ -137,17 +137,15 @@ fn closed_config(label: &str) -> NetworkConfig {
         semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
         auto_approve: false,
-        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 
@@ -280,8 +278,7 @@ fn all_facts(network: &myownmesh_core::JoinedNetwork) -> Vec<SignedFact> {
                 .context_id(),
             cursor: None,
             max_facts: 64,
-            max_encoded_bytes: myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
-                as u32,
+            max_encoded_bytes: 65_535,
         })
         .expect("export semantic page")
         .facts()

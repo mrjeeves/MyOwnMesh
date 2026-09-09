@@ -21,8 +21,8 @@ use super::super::{ConnectionCancel, ControlState};
 use super::{funded, unknown_network, Answer};
 use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
 use crate::control::reply::{
-    prepare_reply_then, ClosedRelayReply, FundedDiagnostic, FundedVariableReply,
-    NetworkLifecycleSummary, OperationReplyData, PreparedReply, ResponseOwner,
+    prepare_reply_then, FundedVariableReply, NetworkLifecycleSummary, OperationReplyData,
+    PreparedReply, ResponseOwner,
 };
 
 /// Serialize control-surface mutations that pair a registry transition with
@@ -447,250 +447,6 @@ pub(in crate::control) async fn network_import_closed(
         Err(error) => return owner.finish(Err(format!("Closed network import: {error}"))),
     };
     register_new_network(state, config, joined, owner).await
-}
-
-fn relay_failure(admission: &FrameAdmission, message: String) -> Result<Answer> {
-    super::refused_text(message, admission)
-}
-
-fn relay_open_reply(
-    capability: crate::registry::ClosedRelayCapability,
-    active_allocations: usize,
-    owner: ResponseOwner,
-    admission: &FrameAdmission,
-    accepted: bool,
-) -> Result<Answer> {
-    let snapshot = capability.snapshot;
-    let reply = if accepted {
-        ClosedRelayReply::Accepted {
-            handle: capability.handle,
-            generation: snapshot.generation,
-            network: snapshot.network,
-            peer: snapshot.peer,
-            relay: snapshot.relay,
-            session_id: snapshot.session_id,
-            allocation_epoch: snapshot.allocation_epoch,
-            active_allocations,
-            max_allocations: snapshot.max_allocations,
-            max_frame_bytes: snapshot.max_frame_bytes,
-        }
-    } else {
-        ClosedRelayReply::Opened {
-            handle: capability.handle,
-            generation: snapshot.generation,
-            network: snapshot.network,
-            peer: snapshot.peer,
-            relay: snapshot.relay,
-            session_id: snapshot.session_id,
-            allocation_epoch: snapshot.allocation_epoch,
-            active_allocations,
-            max_allocations: snapshot.max_allocations,
-            max_frame_bytes: snapshot.max_frame_bytes,
-        }
-    };
-    funded(
-        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
-        admission,
-    )
-}
-
-pub(in crate::control) async fn closed_relay_open(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    relay: String,
-    target: String,
-) -> Result<Answer> {
-    let Some(joined) = state.registry.get(&network) else {
-        return unknown_network(&network, admission);
-    };
-    let owner =
-        ResponseOwner::acquire(admission).context("Closed relay open response was not admitted")?;
-    let resources = match state.mesh.local_application_resource_scope() {
-        Ok(resources) => resources,
-        Err(error) => {
-            return relay_failure(admission, format!("Closed relay custody scope: {error}"))
-        }
-    };
-    let reservation = match state.closed_relays.reserve(&resources, &joined) {
-        Ok(reservation) => reservation,
-        Err(error) => return relay_failure(admission, error.to_string()),
-    };
-    let channel = match joined.open_closed_relay(&relay, &target).await {
-        Ok(channel) => channel,
-        Err(error) => return relay_failure(admission, format!("Closed relay open: {error}")),
-    };
-    let capability = match reservation.commit(channel) {
-        Ok(capability) => capability,
-        Err(error) => {
-            let close_error = error.channel.close().await.err();
-            let message = match close_error {
-                Some(close_error) => format!("{}; cleanup failed: {close_error}", error.message),
-                None => error.message.to_string(),
-            };
-            return relay_failure(admission, message);
-        }
-    };
-    let active_allocations = state
-        .closed_relays
-        .state(&capability.handle)
-        .await
-        .map(|(_, active)| active)
-        .unwrap_or(0);
-    relay_open_reply(capability, active_allocations, owner, admission, false)
-        .context("Closed relay open response line was not admitted")
-}
-
-pub(in crate::control) async fn closed_relay_accept(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    wait_ms: u64,
-) -> Result<Answer> {
-    let Some(joined) = state.registry.get(&network) else {
-        return unknown_network(&network, admission);
-    };
-    let owner = ResponseOwner::acquire(admission)
-        .context("Closed relay accept response was not admitted")?;
-    let resources = match state.mesh.local_application_resource_scope() {
-        Ok(resources) => resources,
-        Err(error) => {
-            return relay_failure(admission, format!("Closed relay custody scope: {error}"))
-        }
-    };
-    let reservation = match state.closed_relays.reserve(&resources, &joined) {
-        Ok(reservation) => reservation,
-        Err(error) => return relay_failure(admission, error.to_string()),
-    };
-    let channel = match tokio::time::timeout(
-        std::time::Duration::from_millis(wait_ms),
-        joined.accept_closed_relay(),
-    )
-    .await
-    {
-        Ok(Ok(channel)) => channel,
-        Ok(Err(error)) => return relay_failure(admission, format!("Closed relay accept: {error}")),
-        Err(_) => return relay_failure(admission, "Closed relay accept wait expired".into()),
-    };
-    let capability = match reservation.commit(channel) {
-        Ok(capability) => capability,
-        Err(error) => {
-            let close_error = error.channel.close().await.err();
-            let message = match close_error {
-                Some(close_error) => format!("{}; cleanup failed: {close_error}", error.message),
-                None => error.message.to_string(),
-            };
-            return relay_failure(admission, message);
-        }
-    };
-    let active_allocations = state
-        .closed_relays
-        .state(&capability.handle)
-        .await
-        .map(|(_, active)| active)
-        .unwrap_or(0);
-    relay_open_reply(capability, active_allocations, owner, admission, true)
-        .context("Closed relay accept response line was not admitted")
-}
-
-pub(in crate::control) async fn closed_relay_send(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    handle: String,
-    payload: Vec<u8>,
-) -> Result<Answer> {
-    let owner =
-        ResponseOwner::acquire(admission).context("Closed relay send response was not admitted")?;
-    let (snapshot, bytes) = match state.closed_relays.send(&handle, &payload).await {
-        Ok(result) => result,
-        Err(error) => return relay_failure(admission, format!("Closed relay send: {error}")),
-    };
-    let reply = ClosedRelayReply::Sent {
-        handle,
-        generation: snapshot.generation,
-        allocation_epoch: snapshot.allocation_epoch,
-        bytes,
-    };
-    funded(
-        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
-        admission,
-    )
-    .context("Closed relay send response line was not admitted")
-}
-
-pub(in crate::control) async fn closed_relay_recv(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    handle: String,
-    wait_ms: u64,
-) -> Result<Answer> {
-    let owner = ResponseOwner::acquire(admission)
-        .context("Closed relay receive response was not admitted")?;
-    let (snapshot, payload) = match state.closed_relays.recv(&handle, wait_ms).await {
-        Ok(result) => result,
-        Err(error) => return relay_failure(admission, format!("Closed relay receive: {error}")),
-    };
-    let reply = ClosedRelayReply::Received {
-        handle,
-        generation: snapshot.generation,
-        allocation_epoch: snapshot.allocation_epoch,
-        payload,
-    };
-    funded(
-        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
-        admission,
-    )
-    .context("Closed relay receive response line was not admitted")
-}
-
-pub(in crate::control) async fn closed_relay_close(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    handle: String,
-) -> Result<Answer> {
-    let owner = ResponseOwner::acquire(admission)
-        .context("Closed relay close response was not admitted")?;
-    let snapshot = match state.closed_relays.close(&handle).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return relay_failure(admission, format!("Closed relay close: {error}")),
-    };
-    let reply = ClosedRelayReply::Closed {
-        handle,
-        generation: snapshot.generation,
-        allocation_epoch: snapshot.allocation_epoch,
-    };
-    funded(
-        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
-        admission,
-    )
-    .context("Closed relay close response line was not admitted")
-}
-
-pub(in crate::control) async fn closed_relay_state(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    handle: String,
-) -> Result<Answer> {
-    let owner = ResponseOwner::acquire(admission)
-        .context("Closed relay state response was not admitted")?;
-    let (snapshot, active_allocations) = match state.closed_relays.state(&handle).await {
-        Ok(result) => result,
-        Err(error) => return relay_failure(admission, format!("Closed relay state: {error}")),
-    };
-    let reply = ClosedRelayReply::State {
-        handle,
-        generation: snapshot.generation,
-        network: snapshot.network,
-        allocation_epoch: snapshot.allocation_epoch,
-        active_allocations,
-        max_allocations: snapshot.max_allocations,
-        max_frame_bytes: snapshot.max_frame_bytes,
-    };
-    funded(
-        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
-        admission,
-    )
-    .context("Closed relay state response line was not admitted")
 }
 
 /// Complete the on-disk half of forgetting a network under its exact owner.
@@ -1168,7 +924,7 @@ fn replacement_retirement_failure(result: RemoveResult) -> Option<String> {
 }
 
 /// Validate an edit before teardown or persistence. Label, auto-approve and
-/// ICE edits preserve live sessions; construction-time routing, pins and owner
+/// ICE edits preserve live sessions; construction-time introduction, pins and owner
 /// capacities use exact runtime replacement. Kind edits cannot mint authority.
 pub(in crate::control) async fn network_update(
     state: &Arc<ControlState>,
@@ -1218,7 +974,7 @@ pub(in crate::control) async fn network_update(
     let restart = joined.reconcile_status(&config);
     // Name the path taken so a config-driven flap is greppable: a hot-apply
     // keeps every live peer; a restart drops them. Network identity,
-    // signaling, routing/pins, closed-relay profile, semantic policy, scheduler, and
+    // signaling, introduction/pins, semantic policy, scheduler, and
     // broadcaster capacities force the restart; STUN/TURN remain hot (see
     // `reconcile`).
     info!(
@@ -1226,9 +982,8 @@ pub(in crate::control) async fn network_update(
         needs_restart = restart.needs_restart,
         signaling_changed = restart.signaling_changed,
         network_id_changed = restart.network_id_changed,
-        closed_relay_changed = restart.closed_relay_changed,
         semantic_policy_changed = restart.semantic_policy_changed,
-        routing_policy_changed = old_config.routing_policy != config.routing_policy,
+        introduction_changed = old_config.introduction != config.introduction,
         pinned_peers_changed = old_config.pinned_peers != config.pinned_peers,
         scheduler_changed = restart.scheduler_changed,
         event_capacity_changed = restart.event_capacity_changed,
@@ -1673,14 +1428,12 @@ mod tests {
         if let Some(root) = std::env::var_os(UPDATE_CHILD) {
             assert_eq!(std::env::var_os("MYOWNMESH_HOME"), Some(root.clone()));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("fixture runtime");
-            let report = runtime.block_on(actual_update_child(tokio::time::Instant::from_std(
-                deadline,
-            )));
-            drop(runtime);
+            let report = crate::services::with_service_cleanup(
+                crate::services::test_cleanup_scope(),
+                |cleanup_port| {
+                    actual_update_child(tokio::time::Instant::from_std(deadline), cleanup_port)
+                },
+            );
             // Synchronous destruction is not preempted by timeout_at. A late
             // Ready or runtime drop must never turn into successful evidence.
             assert!(
@@ -1816,10 +1569,9 @@ mod tests {
 
     async fn actual_update_child(
         deadline: tokio::time::Instant,
+        cleanup_port: myownmesh_services::ServiceCleanupPort,
     ) -> anyhow::Result<serde_json::Value> {
-        use crate::control::{
-            ClosedRelayRegistry, ControlState, RealtimeAdvert, RuntimeSupervisor,
-        };
+        use crate::control::{ControlState, RealtimeAdvert, RuntimeSupervisor};
         use myownmesh_core::{Mesh, MeshConfig, NetworkConfig};
         let work_deadline = deadline - std::time::Duration::from_secs(2);
         let _exclusive =
@@ -1839,7 +1591,8 @@ mod tests {
         )
         .await??;
         let registry = crate::registry::NetworkRegistry::new();
-        let services = crate::services::ServiceManager::new(mesh.clone(), registry.clone());
+        let services =
+            crate::services::ServiceManager::new(mesh.clone(), registry.clone(), cleanup_port);
         let clients = crate::ipc::ClientRegistry::new(mesh.local_application_resource_scope()?)?;
         let state = Arc::new(ControlState {
             finished: tokio::sync::Notify::new(),
@@ -1849,7 +1602,6 @@ mod tests {
             registry,
             services,
             clients,
-            closed_relays: ClosedRelayRegistry::new(),
             realtime: RealtimeAdvert {
                 supported: false,
                 encodings: Vec::new(),
@@ -1890,10 +1642,14 @@ mod tests {
                 let disk_before = std::fs::read(&path)?;
                 let mut next = before.clone();
                 match index {
-                    0 => next.routing_policy.max_next_hops = 0,
+                    0 => {
+                        let mut policy = introduction_policy_for_update();
+                        policy.max_records = 0;
+                        next.introduction = Some(policy);
+                    }
                     1 => next.kind = myownmesh_core::NetworkKind::Closed,
                     2 => next.pinned_peers = vec!["invalid-peer".into()],
-                    3 => next.routing_policy.max_next_hops += 1,
+                    3 => next.introduction = Some(introduction_policy_for_update()),
                     4 => next.pinned_peers = vec![myownmesh_core::Identity::ephemeral().public_id().into()],
                     5 => {
                         next.label = "actual-hot".into();
@@ -1962,7 +1718,6 @@ mod tests {
         let cleanup = tokio::time::timeout_at(deadline, async {
             let results = state.registry.shutdown_all().await;
             let services = state.services.shutdown().await;
-            let relays = state.closed_relays.shutdown_all().await;
             state.clients.begin_closing();
             let abnormal = state.clients.drain_watchdogs().await;
             state.clients.wait_for_tasks().await;
@@ -1972,7 +1727,6 @@ mod tests {
                 "driver cleanup failed"
             );
             services?;
-            relays.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(
                 abnormal == 0 && terminal == crate::ipc::Lifecycle::Closed,
                 "client cleanup failed"
@@ -1993,15 +1747,30 @@ mod tests {
         Ok(report)
     }
 
+    fn introduction_policy_for_update() -> myownmesh_core::config::HubIntroductionPolicyConfig {
+        myownmesh_core::config::HubIntroductionPolicyConfig {
+            max_records: 4,
+            max_waiters_per_target: 2,
+            max_signaling_bytes: 32_768,
+            max_candidates_per_attempt: 4,
+            attempt_timeout_ms: 1_000,
+            terminal_retention_ms: 2_000,
+            max_transient_links: 2,
+            idle_timeout_ms: 3_000,
+            max_maintenance_per_tick: 2,
+        }
+    }
+
     #[test]
-    fn network_update_validation_covers_kind_routes_pins_before_persistence() {
+    fn network_update_validation_covers_kind_introduction_pins_before_persistence() {
         use myownmesh_core::{NetworkConfig, NetworkKind};
         let current = NetworkConfig::from_network_id("edit-validation", "edit-validation");
-        let mut route = current.clone();
-        route.routing_policy.max_next_hops += 1;
-        validate_network_update(&current, &route).expect("valid routing replacement");
+        let mut introduction = current.clone();
+        introduction.introduction = Some(introduction_policy_for_update());
+        validate_network_update(&current, &introduction).expect("valid introduction replacement");
         assert!(myownmesh_core::engine::reconcile::requires_restart(
-            &current, &route
+            &current,
+            &introduction
         ));
         let peer = myownmesh_core::Identity::ephemeral()
             .public_id()
@@ -2015,12 +1784,13 @@ mod tests {
 
         let mut kind = current.clone();
         kind.kind = NetworkKind::Closed;
-        let mut invalid_route = current.clone();
-        invalid_route.routing_policy.max_parallel_routes =
-            invalid_route.routing_policy.max_next_hops + 1;
+        let mut invalid_introduction = current.clone();
+        let mut invalid_policy = introduction_policy_for_update();
+        invalid_policy.max_records = 0;
+        invalid_introduction.introduction = Some(invalid_policy);
         let mut invalid_pin = current.clone();
         invalid_pin.pinned_peers = vec!["invalid".into()];
-        for next in [kind, invalid_route, invalid_pin] {
+        for next in [kind, invalid_introduction, invalid_pin] {
             let saved = std::cell::RefCell::new(current.clone());
             let result = run_hot_update_with_rollback(
                 || validate_network_update(&current, &next),

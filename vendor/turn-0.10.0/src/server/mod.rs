@@ -1,6 +1,80 @@
 #[cfg(test)]
 mod server_test;
 
+#[cfg(test)]
+mod cleanup_controls {
+    use super::*;
+    use crate::resource::BoundedTestAdmission;
+
+    struct NoAuthentication;
+    impl AuthHandler for NoAuthentication {
+        fn auth_handle(&self, _: &str, _: &str, _: std::net::SocketAddr) -> Result<Vec<u8>> {
+            Err(Error::ErrClosed)
+        }
+    }
+
+    #[tokio::test]
+    async fn server_joins_all_taken_siblings_and_preserves_first_read_failure() {
+        let charge = CleanupStatus::charge().unwrap();
+        let limit = charge.units + charge.retained_bytes.div_ceil(1024) + 2;
+        let admission = Arc::new(BoundedTestAdmission::new(limit));
+        let cleanup = CleanupStatus::new(admission.as_ref()).unwrap();
+        let first_lease = admission
+            .acquire(ResourceKind::ReadLoop, ResourceCharge::units(1))
+            .unwrap();
+        let second_lease = admission
+            .acquire(ResourceKind::ReadLoop, ResourceCharge::units(1))
+            .unwrap();
+        let (release, held) = oneshot::channel();
+        let first = tokio::spawn(async move {
+            let _lease = first_lease;
+            panic!("injected first server read panic");
+        });
+        let second = tokio::spawn(async move {
+            let _lease = second_lease;
+            let _ = held.await;
+            Ok(())
+        });
+        let server = Arc::new(Server {
+            auth_handler: Arc::new(NoAuthentication),
+            realm: String::new(),
+            channel_bind_timeout: Duration::ZERO,
+            nonces: Arc::new(Mutex::new(HashMap::new())),
+            resource_admission: admission.clone(),
+            command_tx: Mutex::new(None),
+            tasks: Mutex::new(Some(vec![first, second])),
+            cleanup: cleanup.clone(),
+            #[cfg(feature = "custody-lab")]
+            cleanup_probe: None,
+        });
+        let closing = server.clone();
+        let close = tokio::spawn(async move { closing.close().await });
+        cleanup.wait_for_failure().await;
+        let pending = !close.is_finished();
+        let sibling_funded = admission.remaining_for_test()
+            < limit - charge.units - charge.retained_bytes.div_ceil(1024);
+        let _ = release.send(());
+        let result = close.await;
+        let repeat = server.close().await;
+        let no_handles = server.tasks.lock().await.is_none();
+        drop((server, cleanup));
+        assert!(pending && sibling_funded && no_handles);
+        assert!(matches!(
+            result,
+            Ok(Err(Error::Cleanup(CleanupFailure::TaskPanicked(
+                CleanupTaskLayer::ServerRead
+            ))))
+        ));
+        assert!(matches!(
+            repeat,
+            Err(Error::Cleanup(CleanupFailure::TaskPanicked(
+                CleanupTaskLayer::ServerRead
+            )))
+        ));
+        assert_eq!(admission.remaining_for_test(), limit);
+    }
+}
+
 pub mod config;
 pub mod request;
 
@@ -21,7 +95,10 @@ use crate::allocation::AllocationInfo;
 use crate::auth::AuthHandler;
 use crate::error::*;
 use crate::proto::lifetime::DEFAULT_LIFETIME;
-use crate::resource::{ResourceAdmission, ResourceCharge, ResourceKind, ResourceLease};
+use crate::resource::{
+    CleanupFailure, CleanupStatus, CleanupTaskLayer, ResourceAdmission, ResourceCharge,
+    ResourceKind, ResourceLease,
+};
 
 const INBOUND_MTU: usize = 1500;
 
@@ -33,7 +110,10 @@ pub struct Server {
     pub(crate) nonces: Arc<Mutex<HashMap<String, (Instant, Box<dyn ResourceLease>)>>>,
     resource_admission: Arc<dyn ResourceAdmission>,
     command_tx: Mutex<Option<broadcast::Sender<Command>>>,
-    tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    tasks: Mutex<Option<Vec<tokio::task::JoinHandle<Result<()>>>>>,
+    cleanup: CleanupStatus,
+    #[cfg(feature = "custody-lab")]
+    cleanup_probe: Option<crate::resource::CleanupProbe>,
 }
 
 impl Server {
@@ -45,7 +125,33 @@ impl Server {
         config: ServerConfig,
         admission: Arc<dyn ResourceAdmission>,
     ) -> Result<Self> {
+        Self::new_inner(
+            config,
+            admission,
+            #[cfg(feature = "custody-lab")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "custody-lab")]
+    pub async fn new_with_resource_admission_and_cleanup_probe(
+        config: ServerConfig,
+        admission: Arc<dyn ResourceAdmission>,
+        probe: crate::resource::CleanupProbe,
+    ) -> Result<Self> {
+        Self::new_inner(config, admission, Some(probe)).await
+    }
+
+    async fn new_inner(
+        config: ServerConfig,
+        admission: Arc<dyn ResourceAdmission>,
+        #[cfg(feature = "custody-lab")] cleanup_probe: Option<crate::resource::CleanupProbe>,
+    ) -> Result<Self> {
         config.validate()?;
+
+        let cleanup =
+            CleanupStatus::new(admission.as_ref()).map_err(|_| Error::ErrResourceAdmission)?;
 
         let (command_tx, _) = broadcast::channel(16);
         let mut s = Server {
@@ -56,6 +162,9 @@ impl Server {
             resource_admission: Arc::clone(&admission),
             command_tx: Mutex::new(Some(command_tx.clone())),
             tasks: Mutex::new(Some(Vec::new())),
+            cleanup,
+            #[cfg(feature = "custody-lab")]
+            cleanup_probe,
         };
 
         if s.channel_bind_timeout == Duration::from_secs(0) {
@@ -89,6 +198,7 @@ impl Server {
                 relay_addr_generator: p.relay_addr_generator,
                 alloc_close_notify: config.alloc_close_notify.clone(),
                 resource_admission: Arc::clone(&admission),
+                cleanup: s.cleanup.clone(),
             }));
 
             let task = tokio::spawn(Server::read_loop(
@@ -102,6 +212,9 @@ impl Server {
                 handle_rx,
                 read_lease,
                 command_lease,
+                s.cleanup.clone(),
+                #[cfg(feature = "custody-lab")]
+                s.cleanup_probe.clone(),
             ));
             s.tasks.lock().await.as_mut().unwrap().push(task);
         }
@@ -183,13 +296,17 @@ impl Server {
         mut handle_rx: broadcast::Receiver<Command>,
         read_lease: Box<dyn ResourceLease>,
         command_lease: Box<dyn ResourceLease>,
-    ) {
+        cleanup: CleanupStatus,
+        #[cfg(feature = "custody-lab")] cleanup_probe: Option<crate::resource::CleanupProbe>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; INBOUND_MTU];
 
         let (mut close_tx, mut close_rx) = oneshot::channel::<()>();
 
         let command_task = tokio::spawn({
             let allocation_manager = Arc::clone(&allocation_manager);
+            #[cfg(feature = "custody-lab")]
+            let cleanup_probe = cleanup_probe.clone();
 
             async move {
                 let _command_lease = command_lease;
@@ -207,7 +324,16 @@ impl Server {
 
                             continue;
                         }
-                        Err(RecvError::Closed) | Ok(Command::Close(_)) => {
+                        Ok(Command::Close(ack)) => {
+                            close_rx.close();
+                            drop(ack);
+                            #[cfg(feature = "custody-lab")]
+                            if let Some(probe) = &cleanup_probe {
+                                probe.command_after_ack().await;
+                            }
+                            break;
+                        }
+                        Err(RecvError::Closed) => {
                             close_rx.close();
                             break;
                         }
@@ -251,15 +377,34 @@ impl Server {
             }
         }
 
-        let _ = allocation_manager.close().await;
-        let _ = conn.close().await;
+        let mut first_error = cleanup.result().err();
+        if let Err(error) = allocation_manager.close().await {
+            if !matches!(error, Error::ErrClosed) {
+                cleanup.error(&error, CleanupFailure::AllocationClose);
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = conn.close().await {
+            cleanup.record(CleanupFailure::ControlSocketClose);
+            first_error.get_or_insert(error.into());
+        }
+        #[cfg(feature = "custody-lab")]
+        if let Some(probe) = &cleanup_probe {
+            probe.before_command_abort().await;
+        }
         command_task.abort();
-        let _ = command_task.await;
+        cleanup.observe_join(command_task.await, CleanupTaskLayer::ServerCommand, true);
+        #[cfg(feature = "custody-lab")]
+        if let Some(probe) = &cleanup_probe {
+            probe.mark_command_joined();
+        }
         let _read_lease = read_lease;
+        first_error.map_or_else(|| cleanup.result(), Err)
     }
 
     /// Close stops the TURN Server. It cleans up any associated state and closes all connections it is managing.
     pub async fn close(&self) -> Result<()> {
+        let mut first_error = self.cleanup.result().err();
         let tx = {
             let mut command_tx = self.command_tx.lock().await;
             command_tx.take()
@@ -274,11 +419,38 @@ impl Server {
         }
 
         let tasks = self.tasks.lock().await.take().unwrap_or_default();
+        #[cfg(feature = "custody-lab")]
+        if !tasks.is_empty() {
+            if let Some(probe) = &self.cleanup_probe {
+                probe.after_vec_take().await;
+            }
+        }
         for task in tasks {
-            let _ = task.await;
+            #[cfg(feature = "custody-lab")]
+            if let Some(probe) = &self.cleanup_probe {
+                probe.mark_read_waiting();
+            }
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.cleanup.error(&error, CleanupFailure::AllocationClose);
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    self.cleanup
+                        .observe_join(Err(error), CleanupTaskLayer::ServerRead, false)
+                }
+            }
+            if first_error.is_none() {
+                first_error = self.cleanup.result().err();
+            }
+        }
+        #[cfg(feature = "custody-lab")]
+        if let Some(probe) = &self.cleanup_probe {
+            probe.mark_read_joined();
         }
 
-        Ok(())
+        first_error.map_or_else(|| self.cleanup.result(), Err)
     }
 }
 

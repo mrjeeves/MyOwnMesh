@@ -9,7 +9,7 @@
 //! daemon as a child process), but nothing here is mobile-specific — any
 //! embedder that wants the daemon in-process can use it.
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::control;
 use crate::registry::NetworkRegistry;
@@ -72,12 +72,54 @@ pub struct EmbeddedShutdownFailure {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum EmbeddedCleanupResult {
+    Pending = 0,
+    Clean = 1,
+    Failed = 2,
+}
+
+// Reuse the existing one-byte, shared terminal witness allocation. This is
+// observation only, never a service/cleanup owner or permission to release it.
+#[cfg(test)]
+#[repr(transparent)]
+struct EmbeddedCleanupOutcome(std::sync::atomic::AtomicU8);
+
+#[cfg(test)]
+impl EmbeddedCleanupOutcome {
+    fn load(&self, ordering: std::sync::atomic::Ordering) -> bool {
+        self.0.load(ordering) != EmbeddedCleanupResult::Pending as u8
+    }
+
+    fn result(&self) -> EmbeddedCleanupResult {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => EmbeddedCleanupResult::Pending,
+            1 => EmbeddedCleanupResult::Clean,
+            _ => EmbeddedCleanupResult::Failed,
+        }
+    }
+}
+
+#[cfg(test)]
+const _: () = {
+    assert!(
+        std::mem::size_of::<EmbeddedCleanupOutcome>()
+            == std::mem::size_of::<std::sync::atomic::AtomicBool>()
+    );
+    assert!(
+        std::mem::align_of::<EmbeddedCleanupOutcome>()
+            == std::mem::align_of::<std::sync::atomic::AtomicBool>()
+    );
+};
+
+#[cfg(test)]
 struct EmbeddedTaskWitness {
     control_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     control_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     updater_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     updater_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    cleanup_terminal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cleanup_terminal: std::sync::Arc<EmbeddedCleanupOutcome>,
     cleanup_thread_joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cleanup_root_join_errors: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     cleanup_root_panics: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -95,7 +137,9 @@ impl EmbeddedTaskWitness {
             control_terminal: std::sync::Arc::new(AtomicBool::new(false)),
             updater_started: std::sync::Arc::new(AtomicBool::new(false)),
             updater_terminal: std::sync::Arc::new(AtomicBool::new(false)),
-            cleanup_terminal: std::sync::Arc::new(AtomicBool::new(false)),
+            cleanup_terminal: std::sync::Arc::new(EmbeddedCleanupOutcome(
+                std::sync::atomic::AtomicU8::new(EmbeddedCleanupResult::Pending as u8),
+            )),
             cleanup_thread_joined: std::sync::Arc::new(AtomicBool::new(false)),
             cleanup_root_join_errors: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cleanup_root_panics: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -143,8 +187,11 @@ impl Drop for EmbeddedTaskTerminal {
 /// custodian's OS-thread handle is then transferred to the process-owned join
 /// reaper, which retains and joins it after that terminal signal.
 struct EmbeddedCleanupCustodian {
-    mailbox: std::sync::Arc<EmbeddedCleanupMailbox>,
-    terminal: Option<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>>,
+    mailbox: myownmesh_core::FundedArc<EmbeddedCleanupMailbox>,
+    service_port: myownmesh_services::ServiceCleanupPort,
+    requested: std::sync::atomic::AtomicBool,
+    terminal:
+        Option<tokio::sync::oneshot::Receiver<std::result::Result<(), EmbeddedShutdownError>>>,
     thread_reaper: std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>,
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
@@ -155,6 +202,7 @@ struct EmbeddedCleanupCustodian {
 
 struct EmbeddedCleanupThreadBatch {
     thread: std::thread::JoinHandle<()>,
+    _mailbox: Option<myownmesh_core::FundedArc<EmbeddedCleanupMailbox>>,
     #[cfg(test)]
     joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -244,6 +292,9 @@ fn embedded_cleanup_thread_reaper_in(
                         .joining
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = batch.thread.join();
+                    // The joined witness must not race the final funded
+                    // transfer backing release in exact-baseline controls.
+                    drop(batch._mailbox);
                     #[cfg(test)]
                     batch
                         .joined
@@ -278,24 +329,59 @@ enum EmbeddedCleanupRequest {
         release: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     Dropped {
-        control: tokio::task::JoinHandle<std::result::Result<(), String>>,
-        updater: tokio::task::JoinHandle<()>,
+        control: Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
+        updater: Option<tokio::task::JoinHandle<()>>,
         service_manager: std::sync::Arc<ServiceManager>,
         registry: std::sync::Arc<NetworkRegistry>,
     },
 }
 
+/// Fixed ownership-transfer storage, not a whole-runtime/allocator bound.
+/// FundedArc retains it through the final cleanup-thread join; the two channel
+/// internals and shared allocation metadata use the existing residual model.
+pub(crate) fn cleanup_storage_claim(
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceClaimArithmeticError> {
+    let dimension = myownmesh_core::ResourceClass::AccountedMemoryBytes;
+    let bytes = [
+        std::mem::size_of::<EmbeddedCleanupCustodian>(),
+        std::mem::size_of::<EmbeddedCleanupMailbox>(),
+        std::mem::size_of::<EmbeddedCleanupThreadBatch>(),
+        std::mem::size_of::<myownmesh_core::ResourceLease>(),
+        std::mem::size_of::<Result<myownmesh_services::ServiceCleanupPort, String>>(),
+        std::mem::size_of::<Result<(), EmbeddedShutdownError>>(),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, bytes| {
+        u64::try_from(bytes)
+            .ok()
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or(myownmesh_core::ResourceClaimArithmeticError::Overflow { dimension })
+    })?;
+    myownmesh_core::ResourceClaim::try_from_entries([
+        (dimension, bytes),
+        (myownmesh_core::ResourceClass::OpaqueDependencyResidual, 3),
+    ])
+}
+
 impl EmbeddedCleanupCustodian {
     fn new(
         lease: myownmesh_core::ResourceLease,
+        scope: myownmesh_core::LocalApplicationResourceScope,
         thread_reaper: std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>,
         #[cfg(test)] witness: std::sync::Arc<EmbeddedTaskWitness>,
     ) -> std::result::Result<Self, String> {
-        let mailbox = std::sync::Arc::new(EmbeddedCleanupMailbox {
-            request: std::sync::Mutex::new(None),
-            ready: std::sync::Condvar::new(),
-        });
-        let thread_mailbox = std::sync::Arc::clone(&mailbox);
+        let storage = scope
+            .acquire(cleanup_storage_claim().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let mailbox = myownmesh_core::FundedArc::new(
+            EmbeddedCleanupMailbox {
+                request: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            },
+            storage,
+        )
+        .map_err(|_| "cleanup storage requires admitted funding".to_string())?;
+        let thread_mailbox = mailbox.clone();
         let (terminal_sender, terminal) = tokio::sync::oneshot::channel();
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         #[cfg(test)]
@@ -314,15 +400,25 @@ impl EmbeddedCleanupCustodian {
                     .enable_all()
                     .build()
                 {
-                    Ok(runtime) => {
-                        let _ = ready_sender.send(Ok(()));
-                        runtime
-                    }
+                    Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready_sender.send(Err(error.to_string()));
                         return;
                     }
                 };
+                // Neither this owner nor its joining Drop ever enters the
+                // origin runtime or the cleanup runtime's block_on future.
+                let owner = match myownmesh_services::ServiceCleanupOwner::new(scope) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                if ready_sender.send(Ok(owner.port())).is_err() {
+                    let _ = owner.close_and_join();
+                    return;
+                }
                 let request = {
                     let mut slot = thread_mailbox
                         .request
@@ -338,10 +434,9 @@ impl EmbeddedCleanupCustodian {
                             .expect("embedded cleanup mailbox is not poisoned");
                     }
                 };
-                let outcome = runtime.block_on(async move {
+                let mut failures = runtime.block_on(async {
                     let mut failures = Vec::new();
                     {
-                        let _lease = lease;
                         match request {
                             EmbeddedCleanupRequest::Graceful => {}
                             #[cfg(test)]
@@ -356,14 +451,22 @@ impl EmbeddedCleanupCustodian {
                                 service_manager,
                                 registry,
                             } => {
-                                let control_result = control.await;
+                                let control_result = match control {
+                                    Some(control) => control.await,
+                                    None => Ok(Ok(())),
+                                };
                                 match &control_result {
                                     Ok(Ok(())) => {}
                                     Ok(Err(error)) => {
-                                        failures.push(format!("control cleanup failed: {error}"));
+                                        failures.push(EmbeddedShutdownFailure {
+                                            stage: "control",
+                                            error: error.clone(),
+                                        });
                                     }
-                                    Err(error) => failures
-                                        .push(format!("control cleanup join failed: {error}")),
+                                    Err(error) => failures.push(EmbeddedShutdownFailure {
+                                        stage: "control",
+                                        error: error.to_string(),
+                                    }),
                                 }
                                 #[cfg(test)]
                                 if let Err(error) = &control_result {
@@ -381,7 +484,10 @@ impl EmbeddedCleanupCustodian {
                                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                     }
                                 }
-                                let updater_result = updater.await;
+                                let updater_result = match updater {
+                                    Some(updater) => updater.await,
+                                    None => Ok(()),
+                                };
                                 #[cfg(test)]
                                 if let Err(error) = &updater_result {
                                     witness
@@ -399,34 +505,66 @@ impl EmbeddedCleanupCustodian {
                                     }
                                 }
                                 if let Err(error) = updater_result {
-                                    failures.push(format!("updater cleanup join failed: {error}"));
+                                    failures.push(EmbeddedShutdownFailure {
+                                        stage: "updater",
+                                        error: error.to_string(),
+                                    });
                                 }
+                                owner.begin_close();
                                 if let Err(error) = service_manager.shutdown().await {
-                                    failures.push(format!("service cleanup failed: {error}"));
+                                    failures.push(EmbeddedShutdownFailure {
+                                        stage: "services",
+                                        error: error.to_string(),
+                                    });
                                 }
                                 for outcome in registry.shutdown_all_with_departures().await {
                                     if let Err(error) = outcome {
-                                        failures.push(format!("network cleanup failed: {error}"));
+                                        failures.push(EmbeddedShutdownFailure {
+                                            stage: "network",
+                                            error,
+                                        });
                                     }
                                 }
                             }
                         }
                     }
-                    #[cfg(test)]
-                    witness
-                        .cleanup_terminal
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    if failures.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(failures.join("; "))
-                    }
+                    failures
                 });
+                match owner.close_and_join() {
+                    Ok(report) if report.task_failures == 0 && report.worker_failures == 0 => {}
+                    Ok(report) => failures.push(EmbeddedShutdownFailure {
+                        stage: "service_cleanup",
+                        error: format!(
+                            "{} task failures, {} worker failures",
+                            report.task_failures, report.worker_failures
+                        ),
+                    }),
+                    Err(error) => failures.push(EmbeddedShutdownFailure {
+                        stage: "service_cleanup",
+                        error: error.to_string(),
+                    }),
+                }
+                drop(runtime);
+                drop(lease);
+                let outcome = if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(EmbeddedShutdownError { failures })
+                };
+                #[cfg(test)]
+                witness.cleanup_terminal.0.store(
+                    (if outcome.is_ok() {
+                        EmbeddedCleanupResult::Clean
+                    } else {
+                        EmbeddedCleanupResult::Failed
+                    }) as u8,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 let _ = terminal_sender.send(outcome);
             })
             .map_err(|error| error.to_string())?;
-        match ready_receiver.recv() {
-            Ok(Ok(())) => {}
+        let service_port = match ready_receiver.recv() {
+            Ok(Ok(port)) => port,
             Ok(Err(error)) => {
                 let _ = thread.join();
                 #[cfg(test)]
@@ -441,9 +579,11 @@ impl EmbeddedCleanupCustodian {
                     "cleanup runtime readiness handshake failed: {error}"
                 ));
             }
-        }
+        };
         Ok(Self {
             mailbox,
+            service_port,
+            requested: std::sync::atomic::AtomicBool::new(false),
             terminal: Some(terminal),
             thread_reaper,
             thread: Some(thread),
@@ -455,6 +595,13 @@ impl EmbeddedCleanupCustodian {
     }
 
     fn request(&self, request: EmbeddedCleanupRequest) {
+        if self
+            .requested
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // A second request could discard live handles. Never detach them.
+            std::process::abort();
+        }
         let mut slot = self
             .mailbox
             .request
@@ -468,8 +615,10 @@ impl EmbeddedCleanupCustodian {
         self.mailbox.ready.notify_one();
     }
 
-    async fn finish_graceful(mut self) -> std::result::Result<(), String> {
-        self.request(EmbeddedCleanupRequest::Graceful);
+    async fn finish_graceful(mut self) -> std::result::Result<(), EmbeddedShutdownError> {
+        if !self.requested.load(std::sync::atomic::Ordering::SeqCst) {
+            self.request(EmbeddedCleanupRequest::Graceful);
+        }
         let terminal = self
             .terminal
             .take()
@@ -486,23 +635,29 @@ impl EmbeddedCleanupCustodian {
         let mut failures = Vec::new();
         match terminal_result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(error),
-            Err(error) => failures.push(format!("cleanup terminal signal failed: {error}")),
+            Ok(Err(error)) => failures.extend(error.failures),
+            Err(error) => failures.push(EmbeddedShutdownFailure {
+                stage: "cleanup",
+                error: format!("cleanup terminal signal failed: {error}"),
+            }),
         }
         if thread_result.is_err() {
-            failures.push("embedded cleanup thread panicked before join".to_string());
+            failures.push(EmbeddedShutdownFailure {
+                stage: "cleanup",
+                error: "embedded cleanup thread panicked before join".to_string(),
+            });
         }
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(failures.join("; "))
+            Err(EmbeddedShutdownError { failures })
         }
     }
 
     fn handoff_drop(
         &self,
-        control: tokio::task::JoinHandle<std::result::Result<(), String>>,
-        updater: tokio::task::JoinHandle<()>,
+        control: Option<tokio::task::JoinHandle<std::result::Result<(), String>>>,
+        updater: Option<tokio::task::JoinHandle<()>>,
         service_manager: std::sync::Arc<ServiceManager>,
         registry: std::sync::Arc<NetworkRegistry>,
     ) {
@@ -539,18 +694,13 @@ impl Drop for EmbeddedCleanupCustodian {
         // this value is dropped. Graceful shutdown consumes its terminal
         // signal. If construction is abandoned before either handoff, wake the
         // owner into its empty terminal branch rather than leaving it parked.
-        if self
-            .mailbox
-            .request
-            .lock()
-            .expect("embedded cleanup mailbox is not poisoned")
-            .is_none()
-        {
+        if !self.requested.load(std::sync::atomic::Ordering::SeqCst) {
             self.request(EmbeddedCleanupRequest::Graceful);
         }
         if let Some(thread) = self.thread.take() {
             let batch = EmbeddedCleanupThreadBatch {
                 thread,
+                _mailbox: Some(self.mailbox.clone()),
                 #[cfg(test)]
                 joined: std::sync::Arc::clone(&self.cleanup_thread_joined),
                 #[cfg(test)]
@@ -571,7 +721,7 @@ pub struct EmbeddedDaemon {
     service_manager: std::sync::Arc<ServiceManager>,
     supervisor: crate::supervisor::RuntimeSupervisor,
     cleanup: Option<EmbeddedCleanupCustodian>,
-    graceful_completed: bool,
+    cleanup_handed_off: bool,
     #[cfg(test)]
     _task_witness: std::sync::Arc<EmbeddedTaskWitness>,
     /// The control surface, retained so shutdown can wait for it.
@@ -590,9 +740,33 @@ pub struct EmbeddedDaemon {
     updater: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Construct the actual armed startup owner before a network/service await.
+/// The same Drop handles a partially started daemon (no root tasks yet).
+fn arm_daemon_cleanup(
+    mesh: myownmesh_core::MeshHandle,
+    cleanup: EmbeddedCleanupCustodian,
+    #[cfg(test)] task_witness: std::sync::Arc<EmbeddedTaskWitness>,
+) -> EmbeddedDaemon {
+    let registry = NetworkRegistry::new();
+    let service_manager =
+        ServiceManager::new(mesh.clone(), registry.clone(), cleanup.service_port.clone());
+    EmbeddedDaemon {
+        mesh,
+        registry,
+        service_manager,
+        supervisor: crate::supervisor::RuntimeSupervisor::new(),
+        cleanup: Some(cleanup),
+        cleanup_handed_off: false,
+        #[cfg(test)]
+        _task_witness: task_witness,
+        control: None,
+        updater: None,
+    }
+}
+
 impl Drop for EmbeddedDaemon {
     fn drop(&mut self) {
-        if self.graceful_completed {
+        if self.cleanup_handed_off {
             return;
         }
         // Drop cannot await. Latch the same cancellation state used by the
@@ -600,14 +774,8 @@ impl Drop for EmbeddedDaemon {
         // custodian. This keeps their JoinErrors and service/network teardown
         // behind one bounded owner rather than aborting and detaching them.
         self.supervisor.request_shutdown();
-        let control = self
-            .control
-            .take()
-            .expect("embedded control task is present until shutdown");
-        let updater = self
-            .updater
-            .take()
-            .expect("embedded updater task is present until shutdown");
+        let control = self.control.take();
+        let updater = self.updater.take();
         self.cleanup
             .as_ref()
             .expect("embedded cleanup custodian is present until shutdown")
@@ -673,86 +841,24 @@ impl EmbeddedDaemon {
     /// tasks, and it ends them by signalling rather than by aborting, so a
     /// request already in flight is finished rather than dropped half-applied.
     pub async fn shutdown(mut self) -> std::result::Result<(), EmbeddedShutdownError> {
-        // The same request a reset submits, through the same object: idempotent,
-        // so a daemon already draining because its state was reset is not
-        // signalled twice, and an embedder is never told to wait on a second
-        // drain that will not happen.
+        // Transfer every actual owner before the first await. Cancellation of
+        // this waiter cannot detach a taken task or strand startup services.
         self.supervisor.request_shutdown();
-        // The control surface, before anything it might still be serving is
-        // taken away. A panic in the control task is reported rather than
-        // swallowed: it means the drain did not complete, and the teardown below
-        // is then running against state the control surface may still hold.
-        let mut failures = Vec::new();
-        match self
-            .control
+        self.cleanup
+            .as_ref()
+            .expect("cleanup owner is armed")
+            .handoff_drop(
+                self.control.take(),
+                self.updater.take(),
+                self.service_manager.clone(),
+                self.registry.clone(),
+            );
+        self.cleanup_handed_off = true; // ownership transferred, not a success claim
+        let cleanup = self
+            .cleanup
             .take()
-            .expect("embedded control task is present until shutdown")
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!("control task returned an error: {error}");
-                failures.push(EmbeddedShutdownFailure {
-                    stage: "control",
-                    error,
-                });
-            }
-            Err(error) => {
-                warn!("control task did not end cleanly: {error}");
-                failures.push(EmbeddedShutdownFailure {
-                    stage: "control",
-                    error: error.to_string(),
-                });
-            }
-        }
-        if let Err(error) = self
-            .updater
-            .take()
-            .expect("embedded updater task is present until shutdown")
-            .await
-        {
-            warn!("updater task did not end cleanly: {error}");
-            failures.push(EmbeddedShutdownFailure {
-                stage: "updater",
-                error: error.to_string(),
-            });
-        }
-        // Stop hosted services before tearing down networks.
-        if let Err(error) = self.service_manager.shutdown().await {
-            warn!("hosted service shutdown failed: {error}");
-            failures.push(EmbeddedShutdownFailure {
-                stage: "services",
-                error: error.to_string(),
-            });
-        }
-        // Supervise authenticated departures with teardown. A silent peer can
-        // otherwise hold departure forever before shutdown gets to cancel its
-        // waiter; the carrier hint remains in the departure future. Nothing is
-        // skipped, and failed teardown is reported rather than assumed clean.
-        for outcome in self.registry.shutdown_all_with_departures().await {
-            if let Err(e) = outcome {
-                warn!("network shutdown failed: {e}");
-                failures.push(EmbeddedShutdownFailure {
-                    stage: "network",
-                    error: e,
-                });
-            }
-        }
-        if let Some(cleanup) = self.cleanup.take() {
-            if let Err(error) = cleanup.finish_graceful().await {
-                warn!("embedded cleanup custodian did not end cleanly: {error}");
-                failures.push(EmbeddedShutdownFailure {
-                    stage: "cleanup",
-                    error,
-                });
-            }
-        }
-        self.graceful_completed = true;
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(EmbeddedShutdownError { failures })
-        }
+            .expect("cleanup terminal owner is present");
+        cleanup.finish_graceful().await
     }
 }
 
@@ -891,6 +997,7 @@ async fn start_with_mesh_inner(
     let cleanup_witness = std::sync::Arc::clone(&task_witness);
     let cleanup = EmbeddedCleanupCustodian::new(
         cleanup_lease,
+        cleanup_scope,
         thread_reaper,
         #[cfg(test)]
         cleanup_witness,
@@ -900,25 +1007,27 @@ async fn start_with_mesh_inner(
     // The registry holds every JoinedNetwork + its signaling driver handle so
     // the control socket can address them by id. Node participation is a
     // toggle, exactly as in the serve binary.
-    let registry = NetworkRegistry::new();
+    // The partially constructed daemon IS the armed startup guard. All roots
+    // exist here before any joining/service future can suspend or be cancelled.
+    let mut daemon = arm_daemon_cleanup(
+        mesh.clone(),
+        cleanup,
+        #[cfg(test)]
+        task_witness.clone(),
+    );
+    let registry = daemon.registry.clone();
+    let service_manager = daemon.service_manager.clone();
+    let supervisor = daemon.supervisor.clone();
     if cfg.services.node.enabled {
         if let Err(error) =
             crate::services::join_networks_checked(&mesh, &registry, &cfg.networks).await
         {
-            let mut cleanup_failures = Vec::new();
-            for outcome in registry.shutdown_all_with_departures().await {
-                if let Err(cleanup_error) = outcome {
-                    warn!("network startup refusal cleanup failed: {cleanup_error}");
-                    cleanup_failures.push(format!("network cleanup failed: {cleanup_error}"));
-                }
-            }
-            if cleanup_failures.is_empty() {
-                return Err(EmbeddedStartError::NetworkStartup(error));
-            }
-            return Err(EmbeddedStartError::NetworkStartup(format!(
-                "{error}; startup cleanup failed: {}",
-                cleanup_failures.join("; ")
-            )));
+            return Err(EmbeddedStartError::NetworkStartup(
+                match daemon.shutdown().await {
+                    Ok(()) => error,
+                    Err(cleanup) => format!("{error}; startup cleanup failed: {cleanup}"),
+                },
+            ));
         }
     } else {
         info!("node participation disabled — pure-infrastructure mode (hosting services only)");
@@ -926,27 +1035,15 @@ async fn start_with_mesh_inner(
 
     // Infrastructure services (signaling / STUN / TURN); an all-off config
     // (the default) starts nothing.
-    let service_manager = ServiceManager::new(mesh.clone(), registry.clone());
     let report = match service_manager.apply(cfg.services.clone()).await {
         Ok(report) => report,
         Err(error) => {
-            let mut cleanup_failures = Vec::new();
-            if let Err(cleanup_error) = service_manager.shutdown().await {
-                warn!("service startup refusal cleanup failed: {cleanup_error}");
-                cleanup_failures.push(format!("service cleanup failed: {cleanup_error}"));
-            }
-            for outcome in registry.shutdown_all_with_departures().await {
-                if let Err(cleanup_error) = outcome {
-                    warn!("network startup cleanup failed: {cleanup_error}");
-                    cleanup_failures.push(format!("network cleanup failed: {cleanup_error}"));
-                }
-            }
-            if cleanup_failures.is_empty() {
-                return Err(error.into());
-            }
-            return Err(EmbeddedStartError::ServicePolicyWithCleanup {
-                primary: error,
-                cleanup: cleanup_failures,
+            return Err(match daemon.shutdown().await {
+                Ok(()) => error.into(),
+                Err(cleanup) => EmbeddedStartError::ServicePolicyWithCleanup {
+                    primary: error,
+                    cleanup: vec![cleanup.to_string()],
+                },
             });
         }
     };
@@ -961,11 +1058,10 @@ async fn start_with_mesh_inner(
     // exits early.
     // The updater is owned by the embedded daemon and observes the same
     // latched shutdown signal as the control surface.
-    let supervisor = crate::supervisor::RuntimeSupervisor::new();
     let updater_supervisor = supervisor.clone();
     #[cfg(test)]
     let updater_witness = std::sync::Arc::clone(&task_witness);
-    let updater = tokio::spawn(async move {
+    daemon.updater = Some(tokio::spawn(async move {
         #[cfg(test)]
         let _terminal =
             EmbeddedTaskTerminal(std::sync::Arc::clone(&updater_witness.updater_terminal));
@@ -999,7 +1095,7 @@ async fn start_with_mesh_inner(
             updater_supervisor.wait_requested().await;
         })
         .await;
-    });
+    }));
 
     // Control socket: the same listener + wire protocol every client talks
     // to, whether the daemon is a process or embedded.
@@ -1011,7 +1107,7 @@ async fn start_with_mesh_inner(
     #[cfg(test)]
     let control_witness = std::sync::Arc::clone(&task_witness);
     // Kept, not discarded. See [`EmbeddedDaemon::control`].
-    let control = tokio::spawn(async move {
+    daemon.control = Some(tokio::spawn(async move {
         #[cfg(test)]
         let _terminal =
             EmbeddedTaskTerminal(std::sync::Arc::clone(&control_witness.control_terminal));
@@ -1029,25 +1125,163 @@ async fn start_with_mesh_inner(
         )
         .await
         .map_err(|error| error.to_string())
-    });
+    }));
 
-    Ok(EmbeddedDaemon {
-        mesh,
-        registry,
-        service_manager,
-        supervisor,
-        cleanup: Some(cleanup),
-        graceful_completed: false,
-        #[cfg(test)]
-        _task_witness: task_witness,
-        control: Some(control),
-        updater: Some(updater),
-    })
+    Ok(daemon)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production armed-startup owner with a real STUN listener, then the
+    /// actual public shutdown future cancelled after its synchronous handoff.
+    /// No extra ServiceCleanupOwner is parked in the fixture to mask Drop.
+    #[test]
+    fn armed_startup_drop_and_cancelled_shutdown_join_service_owners() {
+        use std::sync::atomic::Ordering;
+        crate::services::run_isolated_service_fixture(
+            "embedded::tests::armed_startup_drop_and_cancelled_shutdown_join_service_owners",
+            || {
+                let stun_plan = myownmesh_services::StunServer::startup_planning_charge().unwrap();
+                let scope_plan = myownmesh_core::FiniteResourceProvider::scope_planning_charge();
+                // Actual Mesh constructor: process scope, Mesh-owned application scope,
+                // and the child scope retained by the real STUN service. No root credit.
+                let service_grant = stun_plan
+                    .checked_add(scope_plan.checked_scale(3).unwrap())
+                    .unwrap();
+                let service_provider = myownmesh_core::FiniteResourceProvider::new(service_grant);
+                let service_resources =
+                    myownmesh_core::ResourceProviderPort::new(service_provider.clone()).unwrap();
+                let service_baseline = service_provider.in_use();
+                assert_eq!(
+                    service_baseline, scope_plan,
+                    "only the actual process scope exists before Mesh"
+                );
+                for cancel_shutdown in [false, true] {
+                    let root_plan =
+                        myownmesh_services::ServiceCleanupOwner::planning_charge().unwrap();
+                    let storage_plan =
+                        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                            cleanup_storage_claim().unwrap(),
+                        )
+                        .unwrap();
+                    // Process+application scopes, one isolated embedded final reaper,
+                    // one cleanup thread, and the actual root/storage plans.
+                    let grant = cleanup_reaper_control_grant(2)
+                        .checked_add(root_plan)
+                        .and_then(|c| c.checked_add(storage_plan))
+                        .unwrap();
+                    let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+                    let port = myownmesh_core::ResourceProviderPort::new(provider.clone()).unwrap();
+                    let scope =
+                        myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(
+                            &port,
+                        )
+                        .unwrap();
+                    let reaper = std::sync::Mutex::new(None);
+                    let sender = embedded_cleanup_thread_reaper_in(&scope, &reaper).unwrap();
+                    let witness = std::sync::Arc::new(EmbeddedTaskWitness::new());
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let (was_live, live_service_use, pending_handoff, terminal) =
+                        runtime.block_on(async {
+                            let mesh =
+                                myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                                    myownmesh_core::MeshConfig::default(),
+                                    std::sync::Arc::new(myownmesh_core::Identity::ephemeral()),
+                                    service_resources.clone(),
+                                )
+                                .await
+                                .unwrap();
+                            let cleanup = EmbeddedCleanupCustodian::new(
+                                scope
+                                    .acquire(myownmesh_core::ResourceClaim::single(
+                                        myownmesh_core::ResourceClass::WorkerOrTask,
+                                        1,
+                                    ))
+                                    .unwrap(),
+                                scope.clone(),
+                                sender.clone(),
+                                witness.clone(),
+                            )
+                            .unwrap();
+                            let mut daemon = arm_daemon_cleanup(mesh, cleanup, witness.clone());
+                            let mut config = myownmesh_core::ServicesConfig::default();
+                            config.node.enabled = false;
+                            config.stun.enabled = true;
+                            config.stun.bind = "127.0.0.1".into();
+                            config.stun.port = 0;
+                            let started = daemon.service_manager.apply(config).await;
+                            let live = started.as_ref().is_ok_and(|report| report.stun.running);
+                            let live_service_use = service_provider.in_use();
+                            let pending;
+                            if cancel_shutdown {
+                                let (release, wait) = tokio::sync::oneshot::channel::<()>();
+                                daemon.control = Some(tokio::spawn(async move {
+                                    let _ = wait.await;
+                                    Ok(())
+                                }));
+                                let mut shutdown = Box::pin(daemon.shutdown());
+                                pending = std::future::poll_fn(|cx| {
+                                    std::task::Poll::Ready(
+                                        std::future::Future::poll(shutdown.as_mut(), cx)
+                                            .is_pending(),
+                                    )
+                                })
+                                .await;
+                                drop(shutdown); // actual public shutdown cancellation
+                                let _ = release.send(()); // always release before checks
+                            } else {
+                                pending = true;
+                                drop(daemon); // partially started, both root slots absent
+                            }
+                            let terminal =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                    while !witness.cleanup_thread_joined.load(Ordering::SeqCst) {
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .is_ok();
+                            (live, live_service_use, pending, terminal)
+                        });
+                    drop(runtime);
+                    drop(sender);
+                    drop(reaper); // actual final embedded thread reaper join
+                    drop(scope);
+                    drop(port);
+                    assert!(was_live, "the armed owner held an actual STUN listener");
+                    assert_eq!(live_service_use, service_grant,
+                "the actual private Mesh/STUN provider owns the exact ready service and scope plans");
+                    assert!(
+                        pending_handoff,
+                        "shutdown suspends only after moving the held control owner"
+                    );
+                    assert!(
+                        terminal,
+                        "cleanup must complete within the original ten-second stage bound"
+                    );
+                    assert!(witness.cleanup_terminal.load(Ordering::SeqCst));
+                    assert_eq!(witness.cleanup_terminal.result(), EmbeddedCleanupResult::Clean,
+                "the aggregate result survives a dropped shutdown receiver; any service/owner failure refuses clean terminal");
+                    assert!(witness.cleanup_thread_joined.load(Ordering::SeqCst));
+                    assert_eq!(
+                        provider.in_use(),
+                        myownmesh_core::ResourceClaim::ZERO,
+                        "all outside owner/storage/scope leases are released after observed joins"
+                    );
+                    assert_eq!(service_provider.in_use(), service_baseline,
+                "actual STUN, Mesh and service ports release all but the installed process scope");
+                }
+                drop(service_resources);
+                assert_eq!(service_provider.in_use(), scope_plan,
+            "ProcessResourceRoot retains its installed provider: exact process-scope baseline, not fabricated ZERO");
+            },
+        );
+    }
 
     #[cfg(feature = "transport-lab")]
     #[test]
@@ -1152,6 +1386,7 @@ mod tests {
         sender
             .send(EmbeddedCleanupThreadBatch {
                 thread,
+                _mailbox: None,
                 joined: std::sync::Arc::clone(&joined),
                 joining: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
@@ -1211,6 +1446,7 @@ mod tests {
         sender
             .send(EmbeddedCleanupThreadBatch {
                 thread: first_thread,
+                _mailbox: None,
                 joined: std::sync::Arc::clone(&first_joined),
                 joining: std::sync::Arc::clone(&first_joining),
             })
@@ -1247,6 +1483,7 @@ mod tests {
                 &handoff_sender,
                 EmbeddedCleanupThreadBatch {
                     thread: second_thread,
+                    _mailbox: None,
                     joined: second_joined_thread,
                     joining: second_joining_thread,
                 },
@@ -1299,7 +1536,23 @@ mod tests {
             false
         }
 
-        let provider = myownmesh_core::FiniteResourceProvider::new(cleanup_reaper_control_grant(3));
+        let per_owner = myownmesh_services::ServiceCleanupOwner::planning_charge()
+            .expect("service cleanup root plan")
+            .checked_add(
+                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                    cleanup_storage_claim().expect("cleanup storage plan"),
+                )
+                .expect("normalized cleanup storage"),
+            )
+            .expect("complete added cleanup plan");
+        let grant = cleanup_reaper_control_grant(3)
+            .checked_add(
+                per_owner
+                    .checked_scale(2)
+                    .expect("two concrete cleanup owners"),
+            )
+            .expect("saturation cohort grant");
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
         let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
             .expect("the custodian saturation provider funds its process scope");
         let scope = myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(&port)
@@ -1316,6 +1569,7 @@ mod tests {
             scope
                 .acquire(worker_claim)
                 .expect("the first daemon cleanup owner is funded"),
+            scope.clone(),
             sender.clone(),
             std::sync::Arc::clone(&first_witness),
         )
@@ -1336,6 +1590,7 @@ mod tests {
             scope
                 .acquire(worker_claim)
                 .expect("the second daemon cleanup owner is funded"),
+            scope.clone(),
             sender.clone(),
             std::sync::Arc::clone(&second_witness),
         )
@@ -1988,11 +2243,67 @@ mod tests {
     #[tokio::test]
     async fn checked_network_startup_propagates_refusal_before_control_spawn() {
         let _fixture = crate::exclusive_connector_fixture().await;
-        let temp = tempfile::tempdir().expect("temporary startup state");
+        const CHILD_HOME: &str = "MYOWNMESH_EMBEDDED_NETWORK_REFUSAL_CHILD_HOME";
+        const SELECTOR: &str =
+            "embedded::tests::checked_network_startup_propagates_refusal_before_control_spawn";
+        const COMPLETED: &[u8] = b"typed-network-refusal/no-listener passed\n";
+
+        // The provider fixture lock does not serialize unrelated global-path
+        // readers. Set the custody home only on an exact-selector child, never
+        // in this test process's environment.
+        let Some(child_home) = std::env::var_os(CHILD_HOME) else {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+            }
+
+            let temp = tempfile::tempdir().expect("temporary daemon custody home");
+            // Stay inside the retained selector's 30-second process envelope,
+            // reserving its final two seconds for exact-child kill/reap.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(28);
+            let mut child = OwnedChild(
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", SELECTOR, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_HOME, temp.path())
+                    .env("MYOWNMESH_HOME", temp.path())
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .expect("isolated exact-selector child"),
+            );
+            let status = loop {
+                let status = child.0.try_wait().expect("observe exact child");
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "isolated startup child exceeded its absolute work deadline"
+                );
+                if let Some(status) = status {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            drop(child);
+            assert!(status.success(), "isolated startup child failed: {status}");
+            assert_eq!(
+                std::fs::read(temp.path().join("completed")).expect("child exercised the selector"),
+                COMPLETED,
+                "child completed the exact network refusal and no-listener assertions"
+            );
+            return;
+        };
+        assert!(
+            std::env::var_os("MYOWNMESH_HOME").as_ref() == Some(&child_home),
+            "child marker must match the isolated custody home"
+        );
+        let child_home = std::path::PathBuf::from(child_home);
         let mut cfg = myownmesh_core::MeshConfig {
-            identity_path: Some(temp.path().join("identity.json")),
+            identity_path: Some(child_home.join("identity.json")),
             daemon: myownmesh_core::config::DaemonConfig {
-                control_socket: Some(temp.path().join("daemon.sock")),
+                control_socket: Some(child_home.join("daemon.sock")),
                 ..Default::default()
             },
             ..Default::default()
@@ -2016,12 +2327,24 @@ mod tests {
                 );
             }
             Err(other) => panic!("startup returned the wrong typed error: {other}"),
-            Ok(_) => panic!("invalid configured network unexpectedly started"),
+            Ok(daemon) => {
+                let cleanup = daemon.shutdown().await;
+                panic!("invalid configured network unexpectedly started; shutdown: {cleanup:?}");
+            }
         }
         assert!(
-            !temp.path().join("daemon.sock").exists(),
+            !child_home.join("daemon.sock").exists(),
             "network startup refusal precedes control listener creation"
         );
+        // Witness only the original exact refusal and no-listener oracles.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(child_home.join("completed"))
+            .expect("new child refusal witness")
+            .write_all(COMPLETED)
+            .expect("write child refusal witness");
     }
 
     /// There is one connector-capable startup form, and it takes only the
@@ -2031,11 +2354,80 @@ mod tests {
     #[tokio::test]
     async fn the_connector_capable_daemon_starts_from_the_owner_policy_alone() {
         let _fixture = crate::exclusive_connector_fixture().await;
-        let temp = tempfile::tempdir().expect("temporary daemon state");
+        const CHILD_HOME: &str = "MYOWNMESH_EMBEDDED_POLICY_STARTUP_CHILD_HOME";
+        const SELECTOR: &str =
+            "embedded::tests::the_connector_capable_daemon_starts_from_the_owner_policy_alone";
+        const COMPLETED: &[u8] = b"startup/report/shutdown passed\n";
+
+        // The provider fixture lock does not serialize unrelated global-path
+        // readers. Set the custody home only on an exact-selector child, never
+        // in this test process's environment.
+        let Some(child_home) = std::env::var_os(CHILD_HOME) else {
+            struct OwnedChild(std::process::Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                        let _ = self.0.kill();
+                        let _ = self.0.wait();
+                    }
+                }
+            }
+
+            let temp = tempfile::tempdir().expect("temporary daemon custody home");
+            // Stay inside the retained selector's 30-second process envelope,
+            // reserving its final two seconds for exact-child kill/reap.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(28);
+            let mut child = OwnedChild(
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args(["--exact", SELECTOR, "--nocapture", "--test-threads=1"])
+                    .env(CHILD_HOME, temp.path())
+                    .env("MYOWNMESH_HOME", temp.path())
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .expect("isolated exact-selector child"),
+            );
+            let status = loop {
+                let status = child.0.try_wait().expect("observe exact child");
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "isolated startup child exceeded its absolute work deadline"
+                );
+                if let Some(status) = status {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            drop(child);
+            assert!(status.success(), "isolated startup child failed: {status}");
+            assert_eq!(
+                std::fs::read(temp.path().join("completed")).expect("child exercised the selector"),
+                COMPLETED,
+                "child completed the real startup, report and shutdown assertions"
+            );
+            return;
+        };
+        assert!(
+            std::env::var_os("MYOWNMESH_HOME").as_ref() == Some(&child_home),
+            "child marker must match the isolated custody home"
+        );
+        let child_home = std::path::PathBuf::from(child_home);
         let mut daemon_config = myownmesh_core::MeshConfig::default().daemon;
-        daemon_config.control_socket = Some(temp.path().join("daemon.sock"));
+        // GenericFilePath requires the native pipe prefix on Windows. The
+        // Unix private parent is created by the production owner-only adapter.
+        #[cfg(windows)]
+        let socket = std::path::PathBuf::from(format!(
+            r"\\.\pipe\myownmesh-embedded-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        #[cfg(not(windows))]
+        let socket = child_home.join("private").join("daemon.sock");
+        daemon_config.control_socket = Some(socket);
         let cfg = myownmesh_core::MeshConfig {
-            identity_path: Some(temp.path().join("identity.json")),
+            identity_path: Some(child_home.join("identity.json")),
             auto_update: myownmesh_core::AutoUpdateConfig {
                 enabled: false,
                 ..Default::default()
@@ -2056,6 +2448,16 @@ mod tests {
             .shutdown()
             .await
             .expect("connector-capable daemon shutdown succeeds");
+        // A successful child with zero selected tests cannot satisfy this
+        // freshly-created witness; write it only after awaited shutdown.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(child_home.join("completed"))
+            .expect("new child completion witness")
+            .write_all(COMPLETED)
+            .expect("write child completion witness");
     }
 
     /// A caller may destroy its current-thread runtime while the embedded
@@ -2186,6 +2588,10 @@ mod tests {
         });
         drop(observer);
 
+        // These observations are Port owners. Their queue backing is retained
+        // after worker join until the final observer is actually released.
+        drop(services);
+        drop(registry);
         assert_eq!(
             provider
                 .pressure(

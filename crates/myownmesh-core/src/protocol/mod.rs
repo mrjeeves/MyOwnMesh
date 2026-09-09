@@ -29,8 +29,6 @@
 //!   - `ping` / `pong` for keepalive
 //!   - `rpc_request` / `rpc_response` / `rpc_stream_chunk` /
 //!     `rpc_stream_end` for embedder-defined request/response calls
-//!   - `routed_application` for signed, context-bound application payloads
-//!     carried across the bounded topology-selected hop chain
 //!   - Application data over typed user-defined channels (see
 //!     [`crate::events`])
 //!
@@ -43,7 +41,6 @@
 
 pub mod application_flow;
 pub mod departure;
-pub mod endpoint_cipher;
 pub mod facts;
 pub mod features;
 pub mod handshake;
@@ -51,7 +48,6 @@ pub mod hub;
 pub mod hub_introduction;
 pub mod keepalive;
 pub mod parenting;
-pub mod relay;
 pub mod rpc;
 pub mod topology;
 
@@ -84,23 +80,17 @@ pub use parenting::{
     HubTreeAttachResponse, HubTreeTopologyKind, HUB_TREE_ATTACH_MAX_WIRE_BYTES,
     HUB_TREE_CONFIGURATION_DIGEST_DOMAIN, HUB_TREE_PRIMARY_DEPTH,
 };
-pub use relay::{
-    ClosedRelayControl, ClosedRelayData, ClosedRelayDataDirection, OpaqueRelayPacket, RelayKeyShare,
-};
 pub use rpc::{
     CapabilitiesUpdateMessage, CapabilityAdvert, RpcRequestMessage, RpcResponseMessage,
     RpcStreamChunkMessage, RpcStreamEndMessage,
 };
-pub use topology::{
-    ClosedRoutedPayload, EndpointCipherControl, RoutedApplicationEnvelope, RoutedApplicationError,
-    RoutedApplicationLimits, RoutedHop, ShelveMessage, UnshelveMessage,
-};
+pub use topology::{RoutedHop, ShelveMessage, UnshelveMessage};
 
 use serde::{Deserialize, Serialize};
 
 /// The exact largest frame the WebRTC receive callback can deliver. Semantic
 /// anti-entropy uses this existing protocol boundary, not an item count.
-pub(crate) const RECEIVE_FRAME_BYTES: usize = relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES as usize;
+pub(crate) const RECEIVE_FRAME_BYTES: usize = 65_535;
 
 /// Exactly how many bytes `value`'s compact JSON encoding occupies, counted
 /// without building it.
@@ -314,12 +304,7 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
             admission: FrameAdmission::Application,
             on_failure: FailurePolicy::DropFrame,
         },
-        // Routed application envelopes carry their own authenticated origin
-        // and bounded hop chain. They are still application traffic: the
-        // current authenticated carrier must be admitted before decoding or
-        // forwarding one.
-        "routed_application"
-        | "hub_advertisement"
+        "hub_advertisement"
         | "hub_discovery_request"
         | "hub_discovery_response"
         | "hub_tree_attach_request"
@@ -433,14 +418,6 @@ pub enum MeshMessage {
     /// Authenticated exact-session control. See [`SessionControl`] for why it
     /// has no target field and what a receiver may do with it.
     SessionControl(SessionControl),
-    /// Exact Closed relay route control. Every variant carries its complete
-    /// context, three-party identity, and session binding.
-    ClosedRelayControl(ClosedRelayControl),
-    /// Opaque ciphertext for one exact Closed relay route.
-    ClosedRelayData(ClosedRelayData),
-    /// Signed, context-bound application traffic carried across a bounded
-    /// topology-selected hop chain.
-    RoutedApplication(RoutedApplicationEnvelope),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),
@@ -637,12 +614,18 @@ mod tests {
                 on_failure: FailurePolicy::DropFrame,
             })
         );
+        let retired = br#"{"kind":"routed_application","payload":null}"#;
         assert_eq!(
-            classify_frame(br#"{"kind":"routed_application","payload":[}}"#),
+            classify_frame(retired),
             Some(ClassifiedFrame {
                 admission: FrameAdmission::Application,
                 on_failure: FailurePolicy::EndSession,
-            })
+            }),
+            "retired routed tags use the fail-closed unknown-kind policy"
+        );
+        assert!(
+            serde_json::from_slice::<MeshMessage>(retired).is_err(),
+            "retired routed tags are rejected by the current wire enum"
         );
         for fact_kind in ["fact", "fact_page", "proof_delivery", "proof_ack"] {
             assert_eq!(
@@ -685,7 +668,6 @@ mod tests {
             "rpc_stream_end",
             "channel_seq",
             "channel_ack",
-            "routed_application",
             "hub_introduction",
             "application_flow_control",
         ] {
@@ -705,52 +687,6 @@ mod tests {
         for kind in ["hello", "auth_response", "approve", "deny"] {
             assert_eq!(classify(kind).admission, FrameAdmission::Protocol);
         }
-    }
-
-    #[test]
-    fn routed_application_round_trips_as_application_and_rejects_unknown_fields() {
-        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
-        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
-        let origin = crate::semantic::DeviceId::from_public_key_bytes(
-            *origin_key.verifying_key().as_bytes(),
-        )
-        .expect("origin device id");
-        let destination = crate::semantic::DeviceId::from_public_key_bytes(
-            *destination_key.verifying_key().as_bytes(),
-        )
-        .expect("destination device id");
-        let payload = topology::ciphertext_payload_for_test(
-            crate::semantic::MeshContextId::from_bytes([23; 32]),
-            &origin,
-            &destination,
-            32,
-        );
-        let envelope = RoutedApplicationEnvelope::new(
-            crate::semantic::MeshContextId::from_bytes([23; 32]),
-            origin,
-            destination,
-            [24; 16],
-            1,
-            payload,
-            &origin_key,
-        )
-        .expect("routed envelope");
-        envelope.verify().expect("origin envelope verifies");
-
-        let message = MeshMessage::RoutedApplication(envelope.clone());
-        let encoded = serde_json::to_vec(&message).expect("routed message serializes");
-        assert!(String::from_utf8_lossy(&encoded).contains(r#""kind":"routed_application""#));
-        let decoded: MeshMessage =
-            serde_json::from_slice(&encoded).expect("routed message decodes");
-        let MeshMessage::RoutedApplication(decoded) = decoded else {
-            panic!("decoded message changed routed variant");
-        };
-        assert_eq!(decoded, envelope);
-        decoded.verify().expect("decoded envelope verifies");
-
-        let mut unknown = serde_json::to_value(MeshMessage::RoutedApplication(envelope)).unwrap();
-        unknown["unexpected"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<MeshMessage>(unknown).is_err());
     }
 
     /// Only the best-effort delivery is droppable, and the acknowledged one is

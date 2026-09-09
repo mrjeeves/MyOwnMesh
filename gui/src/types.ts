@@ -157,25 +157,6 @@ export interface TurnServerSnapshot {
   credential: string | null;
 }
 
-/** Closed-network member relay policy. Every bound is finite and selected in
- *  the daemon config; omission on a write lets the daemon apply its defaults. */
-export interface ClosedRelayPolicyConfig {
-  enabled: boolean;
-  max_allocations: number;
-  max_allocations_per_member: number;
-  max_pending_handshakes: number;
-  replay_window: number;
-  max_frame_ciphertext_bytes: number;
-  queue_items_per_direction: number;
-  queue_bytes_per_direction: number;
-  bandwidth_rate_bytes_per_second: number;
-  bandwidth_burst_bytes: number;
-  idle_timeout_ms: number;
-  max_lifetime_ms: number;
-  max_control_bytes: number;
-  shutdown_grace_ms: number;
-}
-
 /** Owner-selected bounds for the durable semantic fact graph. These values
  *  are persisted with each network and must survive GUI edits and settings
  *  sharing; they are not authority or membership controls. */
@@ -212,6 +193,19 @@ export interface SemanticPolicyConfig {
   emergency_reserve_bytes: number;
 }
 
+/** Setup-only Hub introduction limits; never authorize member payload transit. */
+export interface HubIntroductionPolicyConfig {
+  max_records: number;
+  max_waiters_per_target: number;
+  max_signaling_bytes: number;
+  max_candidates_per_attempt: number;
+  attempt_timeout_ms: number;
+  terminal_retention_ms: number;
+  max_transient_links: number;
+  idle_timeout_ms: number;
+  max_maintenance_per_tick: number;
+}
+
 export interface NetworkConfigInput {
   id: string;
   network_id: string;
@@ -221,7 +215,7 @@ export interface NetworkConfigInput {
   kind?: NetworkKind;
   topology?: TopologyMode;
   signaling?: SignalingConfig;
-  closed_relay?: ClosedRelayPolicyConfig;
+  introduction?: HubIntroductionPolicyConfig | null;
   semantic_policy?: SemanticPolicyConfig;
   stun_servers?: StunServer[];
   turn_servers?: TurnServer[];
@@ -239,7 +233,7 @@ export interface NetworkConfigSnapshot {
   kind: NetworkKind;
   topology: TopologyMode;
   signaling: SignalingConfigSnapshot;
-  closed_relay: ClosedRelayPolicyConfig;
+  introduction?: HubIntroductionPolicyConfig;
   semantic_policy: SemanticPolicyConfig;
   stun_servers: StunServer[];
   turn_servers: TurnServerSnapshot[];

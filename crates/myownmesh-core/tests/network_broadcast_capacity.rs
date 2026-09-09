@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use myownmesh_core::config::{ClosedRelayPolicyConfig, NetworkConfig};
+use myownmesh_core::config::NetworkConfig;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::resource::{FiniteResourceProvider, ResourceClaim, ResourceProviderPort};
 use myownmesh_core::{Error, Mesh, MeshConfig};
@@ -52,7 +52,6 @@ fn mesh_and_network_broadcaster_capacities_remain_distinct_config_fields() {
         event_capacity: 5,
         connection_trace_capacity: 7,
         scheduler: Default::default(),
-        closed_relay: ClosedRelayPolicyConfig::default(),
         ..NetworkConfig::from_network_id("capacity", "capacity")
     };
     let mesh_wire = serde_json::to_value(&mesh).expect("mesh config serializes");

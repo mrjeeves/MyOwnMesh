@@ -422,7 +422,8 @@ mod tests {
         };
         let resource_before = observed.in_use();
         for sample in [900, 100, 700, 300, 500, 1_100] {
-            let _ = peer.record_clock_skew_sample(sample);
+            let estimate = peer.record_clock_skew_sample(sample);
+            peer.clock_skew_ms = estimate;
         }
         assert_eq!(
             peer.clock_skew_samples.as_slice(),

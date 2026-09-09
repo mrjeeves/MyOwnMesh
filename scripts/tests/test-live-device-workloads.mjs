@@ -6,7 +6,7 @@ import { runFacts } from '../live-device-facts.mjs';
 import { runPayload } from '../live-device-payload.mjs';
 
 const key = char => char.repeat(51) + 'a';
-const A = key('a'), B = key('b'), D = key('c'), R = key('r');
+const A = key('a'), B = key('b'), D = key('c');
 const contextId = key('e');
 const identity = (count = 0) => ({ context_id: contextId,
   admitted_fact_count: count, unresolved_fact_count: 0,
@@ -296,42 +296,15 @@ test('receiver invalid, duplicate and busy callbacks do not create timing rows o
   } finally { ack.resolve(ok({ sent: true })); abort.abort(); await listener.cleanup(); }
 });
 
-test('opaque relay controller carries full 1024-byte bodies and closes both owners', async () => {
-  const queues = { a: [], b: [] }, waiters = new Map(), closed = [];
-  let maximumFrame = 0;
-  const make = (self, peer, destination) => context(async request => {
-    const tag = self === A ? 'a' : 'b';
-    const owner = { handle: tag, generation: 1, allocation_epoch: 1 };
-    const answer = (variant, data) => ok({ closed_relay: { [variant]: data } });
-    if (request.op === 'peers_list') return ok({ peers: [] });
-    if (request.op === 'closed_relay_open' || request.op === 'closed_relay_accept') {
-      return answer(request.op.endsWith('open') ? 'opened' : 'accepted', {
-        ...owner, network: 'test', peer, relay: R, session_id: Array(16).fill(1), max_frame_bytes: 16174 });
-    }
-    assert.equal(request.handle, tag);
-    if (request.op === 'closed_relay_send') {
-      maximumFrame = Math.max(maximumFrame, request.payload.length);
-      if (waiters.has(destination)) {
-        const resolve = waiters.get(destination); waiters.delete(destination); resolve(request.payload);
-      } else queues[destination].push(request.payload);
-      return answer('sent', { ...owner, bytes: request.payload.length });
-    }
-    if (request.op === 'closed_relay_recv') {
-      const bytes = queues[tag].length ? queues[tag].shift() : await new Promise(resolve => waiters.set(tag, resolve));
-      return answer('received', { ...owner, payload: bytes });
-    }
-    assert.equal(request.op, 'closed_relay_close');
-    closed.push(tag); return answer('closed', owner);
-  });
-  const listener = await runPayload(make(B, A, 'a'), payload('relay_echo_listen', A, { relay: R }));
-  const result = await runPayload(make(A, B, 'b'), payload('relay_echo_run', B, { relay: R }));
-  assert.equal(result.outcome, 'complete');
-  assert.equal(result.counts.received, 4);
-  assert(maximumFrame > 1024);
-  assert.equal((await listener.done).outcome, 'complete');
-  await listener.cleanup();
-  assert.deepEqual(closed.sort(), ['a', 'b']);
-  assert.equal(waiters.size, 0);
+test('retired member relay actions refuse before any IPC or subscription', async () => {
+  for (const action of ['relay_echo_run', 'relay_echo_listen']) {
+    let calls = 0;
+    const ctx = context(async () => { calls++; assert.fail('retired action reached IPC'); });
+    ctx.subscribe = async () => { calls++; assert.fail('retired action subscribed'); };
+    await assert.rejects(runPayload(ctx, payload(action, B)),
+      error => error.stage === 'preflight' && error.category === 'unsupported_payload_action');
+    assert.equal(calls, 0);
+  }
 });
 
 test('fact stream is finite, alternating, unique acknowledgements not assumed admissions', async () => {

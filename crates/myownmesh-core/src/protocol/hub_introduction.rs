@@ -123,12 +123,12 @@ pub enum IntroductionRefusal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HubIntroductionBody {
-    Request,
-    Accept,
+    Request {},
+    Accept {},
     Refuse {
         reason: IntroductionRefusal,
     },
-    Cancel,
+    Cancel {},
     Offer {
         #[serde(deserialize_with = "bounded_text::<_, 8192>")]
         sdp: String,
@@ -311,7 +311,7 @@ impl HubIntroductionEnvelope {
     pub fn request_digest(&self) -> Result<[u8; 32], HubIntroductionError> {
         self.validate_shape()?;
         self.validate_wire()?;
-        if !matches!(&self.body, HubIntroductionBody::Request) {
+        if !matches!(&self.body, HubIntroductionBody::Request {}) {
             return Err(HubIntroductionError::Challenge);
         }
         let bytes = self.origin_bytes()?;
@@ -450,17 +450,17 @@ impl HubIntroductionEnvelope {
                     && sdp_mid.as_ref().is_none_or(|v| bounded(v, 64))
                     && username_fragment.as_ref().is_none_or(|v| bounded(v, 64))
             }
-            HubIntroductionBody::Request | HubIntroductionBody::Accept => self.sequence == 0,
-            HubIntroductionBody::Refuse { .. } | HubIntroductionBody::Cancel => true,
+            HubIntroductionBody::Request {} | HubIntroductionBody::Accept {} => self.sequence == 0,
+            HubIntroductionBody::Refuse { .. } | HubIntroductionBody::Cancel {} => true,
         };
         if !valid {
             return Err(HubIntroductionError::Body);
         }
         match &self.body {
-            HubIntroductionBody::Request if self.challenge.is_some() => {
+            HubIntroductionBody::Request {} if self.challenge.is_some() => {
                 return Err(HubIntroductionError::Challenge)
             }
-            HubIntroductionBody::Request | HubIntroductionBody::Refuse { .. } => {}
+            HubIntroductionBody::Request {} | HubIntroductionBody::Refuse { .. } => {}
             _ if self.challenge.is_none() => return Err(HubIntroductionError::Challenge),
             _ => {}
         }
@@ -472,7 +472,7 @@ impl HubIntroductionEnvelope {
             HubIntroductionBody::Offer { .. }
                 | HubIntroductionBody::Answer { .. }
                 | HubIntroductionBody::Candidate { .. }
-                | HubIntroductionBody::Cancel
+                | HubIntroductionBody::Cancel {}
         ) && self.sequence == 0
         {
             return Err(HubIntroductionError::Coordinates);
@@ -638,7 +638,7 @@ mod tests {
             0,
             None,
             4,
-            HubIntroductionBody::Request,
+            HubIntroductionBody::Request {},
             &keys[0],
         )
         .unwrap();
@@ -705,7 +705,7 @@ mod tests {
                     0,
                     Some(challenge),
                     4,
-                    HubIntroductionBody::Accept,
+                    HubIntroductionBody::Accept {},
                     &keys[1],
                 )
                 .unwrap();
@@ -770,7 +770,7 @@ mod tests {
                 0,
                 None,
                 4,
-                HubIntroductionBody::Request,
+                HubIntroductionBody::Request {},
                 &key,
             )
             .unwrap(),
@@ -816,6 +816,21 @@ mod tests {
         let mut json = serde_json::to_value(&value).unwrap();
         json["payload"] = serde_json::json!("no application payload permitted");
         assert!(serde_json::from_value::<HubIntroductionEnvelope>(json).is_err());
+        for (op, body) in [
+            ("request", HubIntroductionBody::Request {}),
+            ("accept", HubIntroductionBody::Accept {}),
+            ("cancel", HubIntroductionBody::Cancel {}),
+        ] {
+            let encoded = serde_json::to_value(&body).unwrap();
+            assert_eq!(encoded, serde_json::json!({ "op": op }));
+            assert_eq!(
+                serde_json::from_value::<HubIntroductionBody>(encoded.clone()).unwrap(),
+                body
+            );
+            let mut with_extra = encoded;
+            with_extra["extra"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<HubIntroductionBody>(with_extra).is_err());
+        }
         value.sequence = 1;
         value.body = HubIntroductionBody::Offer {
             sdp: "x".repeat(HUB_INTRODUCTION_MAX_SDP_BYTES + 1),
@@ -919,7 +934,7 @@ mod tests {
                 0,
                 Some(binding),
                 4,
-                HubIntroductionBody::Accept,
+                HubIntroductionBody::Accept {},
                 &responder,
             )
             .unwrap()
@@ -1001,7 +1016,7 @@ mod tests {
                 sdp_mline_index: None,
                 username_fragment: None,
             },
-            HubIntroductionBody::Cancel,
+            HubIntroductionBody::Cancel {},
         ] {
             let message = HubIntroductionEnvelope::new(
                 request.context_id(),

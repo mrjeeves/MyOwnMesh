@@ -3,9 +3,8 @@
 //! engine; all per-peer state mutation is funneled through the
 //! command queue so the driver loop owns serial access.
 
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -1018,156 +1017,6 @@ pub(crate) struct DurableAdmissionBatch {
     pub(crate) delta: crate::semantic::SemanticDelta,
 }
 
-struct ClosedRelayPendingExpiryFuture {
-    state: Weak<NetworkState>,
-    session_id: [u8; 16],
-    allocation_epoch: u64,
-    timeout: tokio::time::Sleep,
-    cancelled: tokio::sync::futures::OwnedNotified,
-    // Keep the funded owner last so the waiter/timer fields are dropped
-    // before the shared control can release its provider reservation.
-    expiry: FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-}
-
-impl ClosedRelayPendingExpiryFuture {
-    fn new(
-        state: Weak<NetworkState>,
-        expiry: FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-        session_id: [u8; 16],
-        allocation_epoch: u64,
-        timeout: std::time::Duration,
-    ) -> Self {
-        let cancelled = expiry.cancelled_owned();
-        Self {
-            state,
-            session_id,
-            allocation_epoch,
-            timeout: tokio::time::sleep(timeout),
-            cancelled,
-            expiry,
-        }
-    }
-}
-
-/// One provider reservation owns the complete lifetime of a pending-expiry
-/// control: its control/wake allocations, the future allocation, and the
-/// registered task/handle representation.  The funded control is cloned into
-/// the pending guard, future, and root task entry; no clone acquires another
-/// lease, and no owner can release the lease before terminal observation.
-fn closed_relay_pending_expiry_claim(
-) -> std::result::Result<ResourceClaim, crate::runtime::relay::ClosedRelayRefusal> {
-    let accounted = std::mem::size_of::<super::closed_relay::ClosedRelayPendingExpiryControl>()
-        // The control owns this separate Notify allocation.
-        .checked_add(std::mem::size_of::<Notify>())
-        // FundedArc keeps the one reservation in its shared lease allocation.
-        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ResourceLease>()))
-        // Tokio's future allocation is mobile and outlives the pending slot.
-        .and_then(|bytes| bytes.checked_add(future_size::<ClosedRelayPendingExpiryFuture>()))
-        // The registered task/handle is retained while its fixed slot is
-        // mobile during observation; the root claim separately covers the
-        // resident expiry table backing.
-        .and_then(|bytes| {
-            bytes.checked_add(std::mem::size_of::<
-                super::closed_relay::ClosedRelayPendingExpiryTask,
-            >())
-        })
-        .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-    // Named retained allocations: control value, Notify value, the shared
-    // funding lease Arc, and the Tokio task allocation/registration.  Keep
-    // this arithmetic checked even though the current terms are constants:
-    // changing one term must fail closed rather than wrap the claim.
-    let opaque = 1usize
-        .checked_add(1) // Notify value Arc
-        .and_then(|count| count.checked_add(1)) // shared ResourceLease Arc
-        .and_then(|count| count.checked_add(1)) // Tokio task allocation
-        .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-    ResourceClaim::try_from_entries([
-        (
-            ResourceClass::AccountedMemoryBytes,
-            u64::try_from(accounted)
-                .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?,
-        ),
-        (ResourceClass::WorkerOrTask, 1),
-        (ResourceClass::CallbackOrScheduledWork, 1),
-        (
-            ResourceClass::OpaqueDependencyResidual,
-            u64::try_from(opaque)
-                .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?,
-        ),
-    ])
-    .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)
-}
-
-/// Transport-lab access to the production pending-expiry reservation formula.
-/// The fixture planner must price the same future/control/task custody before
-/// an expiry task is constructed; it must not duplicate its private type-size
-/// arithmetic in an integration test.
-#[cfg(feature = "transport-lab")]
-pub(crate) fn transport_lab_closed_relay_pending_expiry_claim() -> Result<ResourceClaim> {
-    closed_relay_pending_expiry_claim().map_err(|error| {
-        Error::Transport(format!(
-            "closed relay pending-expiry claim is not representable: {error}"
-        ))
-    })
-}
-
-/// Acquire the exact shared reservation before constructing the control or
-/// its `Notify`.  The production state and the bounded provider controls both
-/// use this helper, so a refusal is observed before any control/task object is
-/// allocated and the control itself has one funding owner for every clone.
-fn fund_closed_relay_pending_expiry(
-    acquire: impl FnOnce(ResourceClaim) -> std::result::Result<ResourceLease, ResourceUnavailable>,
-) -> std::result::Result<
-    FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-    crate::runtime::relay::ClosedRelayRefusal,
-> {
-    let claim = closed_relay_pending_expiry_claim()?;
-    let lease = acquire(claim).map_err(|_| crate::runtime::relay::ClosedRelayRefusal::QueueFull)?;
-    FundedArc::new(
-        super::closed_relay::ClosedRelayPendingExpiryControl::new(),
-        lease,
-    )
-    .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::QueueFull)
-}
-
-impl Future for ClosedRelayPendingExpiryFuture {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // Sleep is !Unpin; the future is pinned by Tokio for its lifetime.
-        let this = unsafe { self.get_unchecked_mut() };
-        let mut cancelled = unsafe { std::pin::Pin::new_unchecked(&mut this.cancelled) };
-        // Register before checking the latch: cancellation may happen
-        // between the atomic check and the first poll, and notify_waiters
-        // does not retain a wake for a waiter that has not registered yet.
-        cancelled.as_mut().enable();
-        if this.expiry.is_cancelled() || cancelled.poll(context).is_ready() {
-            return std::task::Poll::Ready(());
-        }
-        if unsafe { std::pin::Pin::new_unchecked(&mut this.timeout) }
-            .poll(context)
-            .is_ready()
-        {
-            if let Some(state) = this.state.upgrade() {
-                state.expire_closed_relay_pending(this.session_id, this.allocation_epoch);
-            }
-            return std::task::Poll::Ready(());
-        }
-        if this.expiry.is_cancelled() {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    }
-}
-
-fn future_size<F: Future<Output = ()>>() -> usize {
-    std::mem::size_of::<F>()
-}
-
 #[cfg(test)]
 struct DurableAdmissionActivityGuard<'a> {
     state: &'a NetworkState,
@@ -1200,7 +1049,6 @@ pub struct NetworkState {
     pub(super) hub_introductions: Option<Mutex<super::hub_introduction::HubIntroduction>>,
     // One fresh logical endpoint root per NetworkState, independent of the
     // forwarding carrier. Graph publication always precedes this mutex.
-    pub(super) endpoint_cipher: Option<Mutex<super::endpoint_cipher::EndpointCipherController>>,
     hub_signaling_carrier: Mutex<Option<super::signaling_ingress::HubSignalingCarrier>>,
     /// The one owner of session promotion for this network instance.
     ///
@@ -1227,7 +1075,6 @@ pub struct NetworkState {
     /// The one bounded route planner and replay owner for this network.
     /// Its child resource scope makes every retained replay identity part of
     /// this network's provider-funded lifetime rather than an unfunded cache.
-    pub(crate) routing: super::routing::RoutingState,
     pub(crate) hub_dial_cursor: AtomicUsize,
 
     /// Optional owner-funded hub advertisement scheduler. Spokes retain this
@@ -1278,17 +1125,6 @@ pub struct NetworkState {
     /// carrier/session identities are selectors and never become semantic
     /// authority.
     pub(crate) fact_graph: Arc<RwLock<crate::semantic::FactGraph>>,
-    /// The concrete provider-backed Closed relay runtime for this network
-    /// instance. It is created only after the verified Closed profile and
-    /// canonical local identity have been validated; disabled policy keeps
-    /// this port empty rather than exposing a compatibility runtime.
-    closed_relay_runtime: Option<crate::runtime::relay::ClosedRelayRuntime>,
-    /// One provider-funded root owns every fixed Closed-relay table and wake
-    /// object. Endpoint values retain only weak state references, preventing a
-    /// root/state cycle while keeping the physical slots stable.
-    closed_relay_root: Option<FundedArc<super::closed_relay::ClosedRelayEngineRoot>>,
-    /// Serializes expiry registration with shutdown's handle extraction.
-    closed_relay_pending_expiry_lifecycle: Mutex<()>,
     /// Production per-peer event pumps are retained by the network owner until
     /// their exact worker retirement path has completed.  Keeping the handles
     /// here prevents a pump's worker `Arc` (and its transport observation)
@@ -1746,27 +1582,6 @@ impl NetworkState {
         let semantic_policy = config
             .semantic_policy()
             .map_err(|error| Error::Network(format!("semantic policy rejected: {error}")))?;
-        let routing_policy_config = config
-            .routing_policy()
-            .map_err(|error| Error::Network(format!("routing policy rejected: {error}")))?;
-        let routing_policy = super::routing::RoutingPolicy::checked(
-            usize::try_from(routing_policy_config.max_next_hops).map_err(|_| {
-                Error::Network("routing policy max_next_hops does not fit usize".into())
-            })?,
-            usize::try_from(routing_policy_config.max_parallel_routes).map_err(|_| {
-                Error::Network("routing policy max_parallel_routes does not fit usize".into())
-            })?,
-            routing_policy_config.max_envelope_bytes,
-            usize::try_from(routing_policy_config.max_dedup_entries).map_err(|_| {
-                Error::Network("routing policy max_dedup_entries does not fit usize".into())
-            })?,
-            routing_policy_config.max_dedup_bytes,
-            u8::try_from(routing_policy_config.max_hop_budget).map_err(|_| {
-                Error::Network("routing policy max_hop_budget does not fit u8".into())
-            })?,
-        )
-        .map_err(|error| Error::Network(format!("routing policy rejected: {error}")))?;
-        let routing = super::routing::RoutingState::try_new(&local_resources, routing_policy)?;
         config
             .scheduler_policy()
             .map_err(|error| Error::Network(format!("scheduler policy rejected: {error}")))?;
@@ -1972,38 +1787,23 @@ impl NetworkState {
             ),
         };
         let demand_links = config
-            .application_transport
-            .map(|policy| DemandLinkPool::new(policy.introduction, local_resources.clone()))
+            .introduction
+            .map(|policy| DemandLinkPool::new(policy, local_resources.clone()))
             .transpose()?
             .map(Mutex::new);
         let hub_introductions = config
-            .application_transport
+            .introduction
             .map(|policy| {
                 let local = DeviceId::from_canonical_str(&local_device_id)
                     .map_err(|_| Error::Network("local introduction identity is invalid".into()))?;
                 super::hub_introduction::HubIntroduction::new(
-                    policy.introduction,
+                    policy,
                     local_resources.clone(),
                     mesh_context_id,
                     &local,
                 )
                 .map(Mutex::new)
                 .map_err(|error| Error::Network(format!("introduction root refused: {error}")))
-            })
-            .transpose()?;
-        let endpoint_cipher = config
-            .application_transport
-            .map(|policy| {
-                let local = DeviceId::from_canonical_str(&local_device_id)
-                    .map_err(|_| Error::Network("local endpoint identity is invalid".into()))?;
-                super::endpoint_cipher::EndpointCipherController::new(
-                    policy.endpoint_cipher,
-                    local_resources.clone(),
-                    mesh_context_id,
-                    &local,
-                )
-                .map(Mutex::new)
-                .map_err(|error| Error::Network(format!("endpoint cipher root refused: {error}")))
             })
             .transpose()?;
         let hub = match config.hub {
@@ -2079,52 +1879,6 @@ impl NetworkState {
             }
             None => (None, None),
         };
-        let (closed_relay_runtime, closed_relay_root) = if config.closed_relay.enabled {
-            let profile_is_supported = matches!(
-                verified_bootstrap.policy(),
-                crate::semantic::VerifiedProjectPolicy::Closed(policy)
-                    if policy.profile()
-                        == crate::semantic::ClosedProfileId::SingleRootSignedMemberLogV1
-            );
-            if !profile_is_supported {
-                return Err(Error::Network(
-                    "enabled closed relay requires the verified Closed SingleRootSignedMemberLogV1 policy"
-                        .into(),
-                ));
-            }
-            let local_device = crate::semantic::DeviceId::from_canonical_str(&local_device_id)
-                .map_err(|_| Error::Network("local identity is not a canonical DeviceId".into()))?;
-            let runtime_claim =
-                crate::runtime::relay::ClosedRelayRuntime::runtime_claim(&config.closed_relay)
-                    .map_err(|error| {
-                        Error::Network(format!("closed relay policy rejected: {error}"))
-                    })?;
-            let engine_root_claim =
-                super::closed_relay::ClosedRelayEngineRoot::root_claim(&config.closed_relay)
-                    .map_err(|error| {
-                        Error::Network(format!("closed relay engine root rejected: {error}"))
-                    })?;
-            // Both roots are admitted before either constructor can allocate
-            // its fixed tables or shared runtime state.
-            let runtime_funding = local_resources.acquire(runtime_claim)?;
-            let engine_root_funding = local_resources.acquire(engine_root_claim)?;
-            let runtime = crate::runtime::relay::ClosedRelayRuntime::new(
-                config.closed_relay.clone(),
-                local_device,
-                runtime_funding,
-            )
-            .map_err(|error| Error::Network(format!("closed relay policy rejected: {error}")))?;
-            let engine_root = super::closed_relay::ClosedRelayEngineRoot::new(
-                &config.closed_relay,
-                engine_root_funding,
-            )
-            .map_err(|error| {
-                Error::Network(format!("closed relay engine root rejected: {error}"))
-            })?;
-            (Some(runtime), Some(engine_root))
-        } else {
-            (None, None)
-        };
         let durable_root = instance_root
             .clone()
             .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
@@ -2178,12 +1932,10 @@ impl NetworkState {
             semantic_storage_claim,
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
-            routing,
             hub_dial_cursor: AtomicUsize::new(0),
             hub,
             demand_links,
             hub_introductions,
-            endpoint_cipher,
             hub_signaling_carrier: Mutex::new(None),
             parenting,
             _parenting_root_lease: parenting_root_lease,
@@ -2201,9 +1953,6 @@ impl NetworkState {
             peers: PeerRegistry::new(local_device_id),
             roster: RwLock::new(roster),
             fact_graph,
-            closed_relay_runtime,
-            closed_relay_root,
-            closed_relay_pending_expiry_lifecycle: Mutex::new(()),
             peer_event_pumps: Mutex::new(PeerEventPumpRegistry::new()),
             peer_event_pump_ready: Notify::new(),
             peer_event_pump_shutdown_waiting: Notify::new(),
@@ -2338,762 +2087,6 @@ impl NetworkState {
         self.verified_bootstrap.policy()
     }
 
-    /// The instance-owned Closed relay runtime, when the owner-selected
-    /// policy enabled it during construction. The runtime itself remains the
-    /// sole owner of relay allocation permits and queues.
-    pub(crate) fn closed_relay_runtime(
-        &self,
-    ) -> Option<&crate::runtime::relay::ClosedRelayRuntime> {
-        self.closed_relay_runtime.as_ref()
-    }
-
-    fn closed_relay_root(&self) -> Option<&super::closed_relay::ClosedRelayEngineRoot> {
-        self.closed_relay_root.as_deref()
-    }
-
-    fn closed_relay_root_handle(
-        &self,
-    ) -> Option<FundedArc<super::closed_relay::ClosedRelayEngineRoot>> {
-        self.closed_relay_root.clone()
-    }
-
-    pub(crate) fn insert_closed_relay_admission(
-        &self,
-        session_id: [u8; 16],
-        admission: super::closed_relay::ClosedRelayAdmission,
-    ) -> std::result::Result<
-        super::closed_relay::ClosedRelayGeneration,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .allocations
-            .lock()
-            .insert(session_id, admission)
-    }
-
-    pub(crate) fn begin_closed_relay_close(
-        &self,
-        record: super::closed_relay::ClosedRelayCloseRecord,
-    ) -> std::result::Result<bool, crate::runtime::relay::ClosedRelayRefusal> {
-        let session_id = record.session_id;
-        let has_allocation = self
-            .closed_relay_root()
-            .is_some_and(|root| root.allocations.lock().contains(session_id));
-        let has_pending = self
-            .closed_relay_root()
-            .is_some_and(|root| root.pending.lock().contains(session_id));
-        if !has_allocation && !has_pending {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-        }
-        let allocation_generation = record.allocation_generation.clone();
-        if has_allocation != allocation_generation.is_some() {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-        }
-        let inserted = self
-            .closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .closing
-            .lock()
-            .begin(record)?;
-        if !inserted {
-            return Ok(false);
-        }
-        if has_allocation {
-            // A match scrutinee's temporary guard would remain live in its
-            // error arm. Release allocation custody before cancelling the
-            // close record: stale-close cleanup takes closing -> allocations.
-            let wake_result = {
-                let root = self
-                    .closed_relay_root()
-                    .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-                root.allocations.lock().mark_closing_exact(
-                    session_id,
-                    allocation_generation
-                        .as_ref()
-                        .expect("allocation generation checked above"),
-                )
-            };
-            let wake = match wake_result {
-                Ok(wake) => wake,
-                Err(error) => {
-                    let _ = self.cancel_closed_relay_close(session_id);
-                    return Err(error);
-                }
-            };
-            if let Some(wake) = wake {
-                wake.request_close();
-            }
-        }
-        Ok(true)
-    }
-
-    pub(crate) fn closed_relay_generation(
-        &self,
-        session_id: [u8; 16],
-    ) -> Option<super::closed_relay::ClosedRelayGeneration> {
-        self.closed_relay_root()
-            .and_then(|root| root.allocations.lock().generation(session_id))
-    }
-
-    pub(crate) fn has_closed_relay_custody(&self, session_id: [u8; 16]) -> bool {
-        self.closed_relay_root().is_some_and(|root| {
-            root.allocations.lock().contains(session_id)
-                || root.pending.lock().contains(session_id)
-                || root.closing.lock().contains(session_id)
-        })
-    }
-
-    pub(crate) fn take_closed_relay_close(
-        &self,
-        session_id: [u8; 16],
-        opposite: &crate::semantic::DeviceId,
-        witness: &crate::runtime::session_broker::SessionValidityWitness,
-        allocation_epoch: u64,
-    ) -> Option<super::closed_relay::ClosedRelayCloseRecord> {
-        self.closed_relay_root()?.closing.lock().take(
-            session_id,
-            opposite,
-            witness,
-            allocation_epoch,
-        )
-    }
-
-    pub(crate) fn cancel_closed_relay_close(
-        &self,
-        session_id: [u8; 16],
-    ) -> Option<super::closed_relay::ClosedRelayCloseRecord> {
-        self.closed_relay_root()?.closing.lock().remove(session_id)
-    }
-
-    pub(crate) fn finish_closed_relay_checkout(
-        &self,
-        session_id: [u8; 16],
-        generation: super::closed_relay::ClosedRelayGeneration,
-        handle: crate::runtime::relay::ClosedRelayHandle,
-        terminal: super::closed_relay::ClosedRelayTerminalWitness,
-        lease: ResourceLease,
-        control: std::sync::Arc<super::closed_relay::ClosedRelayCheckoutControl>,
-    ) {
-        let settlement = self.closed_relay_root().and_then(|root| {
-            root.allocations
-                .lock()
-                .finish_checkout(session_id, generation, handle, terminal, lease, control)
-        });
-        if let Some(admission) = settlement {
-            let _ = super::closed_relay::settle_closed_relay(admission.handle, admission.terminal);
-            drop(admission.lease);
-        }
-    }
-
-    /// Forward one packet through the exact allocation generation and
-    /// direction. The generation and allocation epoch are checked while the
-    /// registry lock is held, so a successor cannot be substituted between
-    /// the caller's route validation and the synchronous queue operation.
-    pub(crate) fn forward_closed_relay(
-        &self,
-        session_id: [u8; 16],
-        generation: &super::closed_relay::ClosedRelayGeneration,
-        allocation_epoch: u64,
-        direction: crate::runtime::relay::RelayDirection,
-        packet: crate::protocol::OpaqueRelayPacket,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        let mut allocations = self
-            .closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .allocations
-            .lock();
-        let registry = &mut *allocations;
-        let Some((_, _, _, _, current_epoch)) =
-            registry.route_if_generation(session_id, generation)
-        else {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-        };
-        if current_epoch != allocation_epoch {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-        }
-        registry.forward(session_id, direction, packet)
-    }
-
-    /// Receive from one direction without holding the state mutex across the
-    /// runtime await. The exact slot remains present while its handle is
-    /// temporarily owned by this operation, so a concurrent successor cannot
-    /// be substituted under the same session id.
-    pub(crate) async fn recv_closed_relay(
-        self: &Arc<Self>,
-        session_id: [u8; 16],
-        direction: crate::runtime::relay::RelayDirection,
-    ) -> Option<(
-        crate::protocol::OpaqueRelayPacket,
-        crate::semantic::MeshContextId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        u64,
-        super::closed_relay::ClosedRelayGeneration,
-    )> {
-        let mut checkout = {
-            let mut allocations = self.closed_relay_root()?.allocations.lock();
-            allocations.take_checkout(self, session_id)?
-        };
-        let closing_control = std::sync::Arc::clone(checkout.control());
-        let closing_notified = closing_control.closing_notified();
-        tokio::pin!(closing_notified);
-        closing_notified.as_mut().enable();
-        let packet = if checkout.is_closing() {
-            None
-        } else {
-            tokio::select! {
-                packet = checkout.recv(direction) => match packet {
-                    Ok(packet) => packet,
-                    Err(_) => {
-                        checkout.control().request_close();
-                        None
-                    }
-                },
-                _ = &mut closing_notified => None,
-                _ = self.wait_for_shutdown() => None,
-            }
-        };
-        if packet.is_none() {
-            checkout.control().request_close();
-        }
-        if self.shutdown_requested.load(Ordering::Acquire) {
-            checkout.control().request_close();
-        }
-        packet.map(|packet| {
-            let (route, generation) = checkout.route_and_generation();
-            (
-                packet, route.0, route.1, route.2, route.3, route.4, generation,
-            )
-        })
-    }
-
-    pub(crate) fn closed_relay_route(
-        &self,
-        session_id: [u8; 16],
-    ) -> Option<(
-        crate::semantic::MeshContextId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        u64,
-    )> {
-        self.closed_relay_root()?
-            .allocations
-            .lock()
-            .route(session_id)
-    }
-
-    pub(crate) fn closed_relay_route_if_generation(
-        &self,
-        session_id: [u8; 16],
-        generation: &super::closed_relay::ClosedRelayGeneration,
-    ) -> Option<(
-        crate::semantic::MeshContextId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        crate::semantic::DeviceId,
-        u64,
-    )> {
-        self.closed_relay_root()?
-            .allocations
-            .lock()
-            .route_if_generation(session_id, generation)
-    }
-
-    pub(crate) fn retire_closed_relay_exact(
-        &self,
-        session_id: [u8; 16],
-        generation: &super::closed_relay::ClosedRelayGeneration,
-    ) -> std::result::Result<
-        crate::runtime::relay::ClosedRelayTerminal,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .allocations
-            .lock()
-            .retire_exact(session_id, generation)
-    }
-
-    /// Request terminal settlement under the exact allocation generation.
-    /// If a checkout currently owns the handle, the registry marks that slot
-    /// closing and wakes the checkout; its owner Drop then completes the same
-    /// generation's settlement without allowing successor substitution.
-    pub(crate) fn request_terminal_closed_relay_exact(
-        &self,
-        session_id: [u8; 16],
-        generation: &super::closed_relay::ClosedRelayGeneration,
-    ) -> std::result::Result<bool, crate::runtime::relay::ClosedRelayRefusal> {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .allocations
-            .lock()
-            .request_terminal_exact(session_id, generation)
-    }
-
-    /// Shutdown fence for the driver owner. Every immediately-owned slot is
-    /// settled once; checked-out slots remain for their owner Drop to return
-    /// or settle exact custody, while no lock is held across an await here.
-    pub(crate) fn settle_all_closed_relay(&self) -> usize {
-        self.closed_relay_root()
-            .map_or(0, |root| root.allocations.lock().settle_all())
-    }
-
-    /// Wait for every checked-out allocation owner to return its exact handle
-    /// and lease. The registry is only inspected synchronously; each await is
-    /// on an owned notification, never while its mutex is held.
-    async fn wait_closed_relay_checkouts(&self) {
-        loop {
-            let control = self
-                .closed_relay_root()
-                .and_then(|root| root.allocations.lock().checkout_control());
-            let Some(control) = control else {
-                return;
-            };
-            let finished = control.finished_notified();
-            tokio::pin!(finished);
-            finished.as_mut().enable();
-            if control.is_finished() {
-                continue;
-            }
-            finished.await;
-        }
-    }
-
-    pub(crate) fn cancel_all_closed_relay_pending(&self) -> usize {
-        self.closed_relay_root()
-            .map_or(0, |root| root.pending.lock().clear())
-    }
-
-    /// Retire every Closed-relay entry whose stored owner witness is no
-    /// longer the exact live installation. Device-id successors are never
-    /// substituted: each registry compares its retained witness/token before
-    /// removing custody, and allocation checkouts are explicitly woken.
-    pub(crate) fn settle_stale_closed_relay_owners(&self) -> usize {
-        let mut retired = 0;
-        if let Some(root) = self.closed_relay_root() {
-            retired += root.allocations.lock().retire_stale();
-        }
-        if let Some(root) = self.closed_relay_root() {
-            retired += root.pending.lock().remove_stale();
-        }
-        if let Some(root) = self.closed_relay_root() {
-            retired += root.closing.lock().remove_stale(self);
-        }
-        while let Some(session) = self
-            .closed_relay_root()
-            .and_then(|root| root.endpoints.lock().take_one_stale(self))
-        {
-            retired += 1;
-            session.cancel_consumer();
-        }
-        while let Some(session) = self
-            .closed_relay_root()
-            .and_then(|root| root.accepted.lock().take_one_stale(self))
-        {
-            retired += 1;
-            session.cancel_consumer();
-        }
-        retired
-    }
-
-    /// Reap at most one finished expiry task before acquiring a new shared
-    /// reservation. Extraction and table mutation are protected by the
-    /// lifecycle mutex, but polling, task destruction, and provider acquire
-    /// happen with every registry guard released.
-    fn reserve_pending_expiry_after_reap(
-        root: Option<&FundedArc<super::closed_relay::ClosedRelayEngineRoot>>,
-        lifecycle: &Mutex<()>,
-        acquire: impl FnOnce(ResourceClaim) -> std::result::Result<ResourceLease, ResourceUnavailable>,
-    ) -> std::result::Result<
-        FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        if let Some(root) = root {
-            let capacity = {
-                let _lifecycle = lifecycle.lock();
-                root.expiries.lock().capacity()
-            };
-            for slot in 0..capacity {
-                let extracted = {
-                    let _lifecycle = lifecycle.lock();
-                    root.expiries.lock().reserve(slot)
-                };
-                let Some(mut task) = extracted else {
-                    continue;
-                };
-                let waker = std::task::Waker::noop();
-                let mut context = std::task::Context::from_waker(waker);
-                match std::pin::Pin::new(&mut task.handle).poll(&mut context) {
-                    std::task::Poll::Ready(Ok(())) => {
-                        drop(task);
-                        let _lifecycle = lifecycle.lock();
-                        let _ = root.expiries.lock().release_reserved(slot);
-                        break;
-                    }
-                    std::task::Poll::Ready(Err(error)) => {
-                        tracing::warn!(%error, "closed relay pending expiry task failed");
-                        drop(task);
-                        let _lifecycle = lifecycle.lock();
-                        let _ = root.expiries.lock().release_reserved(slot);
-                        break;
-                    }
-                    std::task::Poll::Pending => {
-                        let restore_result = {
-                            let _lifecycle = lifecycle.lock();
-                            root.expiries.lock().restore(slot, task)
-                        };
-                        if let Err(task) = restore_result {
-                            task.handle.abort();
-                            drop(task);
-                            let _lifecycle = lifecycle.lock();
-                            let _ = root.expiries.lock().release_reserved(slot);
-                        }
-                    }
-                }
-            }
-        }
-        fund_closed_relay_pending_expiry(acquire)
-    }
-
-    pub(crate) fn arm_closed_relay_pending_expiry(
-        self: &Arc<Self>,
-        session_id: [u8; 16],
-        expiry: FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        let pending_timeout = self
-            .config
-            .read()
-            .closed_relay
-            .pending_handshake_timeout()
-            .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-        let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
-        let allocation_epoch = match self.closed_relay_pending_epoch(session_id) {
-            Some(epoch) => epoch,
-            None => {
-                expiry.cancel();
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-        };
-        let result = (|| {
-            let root = self.closed_relay_root().ok_or_else(|| {
-                expiry.cancel();
-                crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive
-            })?;
-            let mut tasks = root.expiries.lock();
-            if self.closed_relay_pending_epoch(session_id) != Some(allocation_epoch)
-                || self.shutdown_requested.load(Ordering::Acquire)
-                || tasks.is_full()
-            {
-                expiry.cancel();
-                Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)
-            } else {
-                let future_expiry = expiry.clone();
-                let state = Arc::downgrade(self);
-                let future = ClosedRelayPendingExpiryFuture::new(
-                    state,
-                    future_expiry,
-                    session_id,
-                    allocation_epoch,
-                    pending_timeout,
-                );
-                let task = tokio::spawn(future);
-                match tasks.insert(super::closed_relay::ClosedRelayPendingExpiryTask {
-                    handle: task,
-                    _funding: expiry,
-                }) {
-                    Ok(_) => Ok(()),
-                    Err(task) => {
-                        task.handle.abort();
-                        drop(task);
-                        Err(crate::runtime::relay::ClosedRelayRefusal::QueueFull)
-                    }
-                }
-            }
-        })();
-        if result.is_err() {
-            let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
-        }
-        result
-    }
-
-    fn expire_closed_relay_pending(&self, session_id: [u8; 16], allocation_epoch: u64) {
-        let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
-    }
-
-    fn take_closed_relay_pending_if_epoch(
-        &self,
-        session_id: [u8; 16],
-        allocation_epoch: u64,
-    ) -> Option<super::closed_relay::ClosedRelayPending> {
-        let root = self.closed_relay_root()?;
-        let mut pending = root.pending.lock();
-        if pending.epoch(session_id) != Some(allocation_epoch) {
-            return None;
-        }
-        pending.take(session_id)
-    }
-
-    pub(crate) fn insert_closed_relay_pending(
-        &self,
-        pending: super::closed_relay::ClosedRelayPending,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .pending
-            .lock()
-            .insert(pending)
-    }
-
-    pub(crate) fn take_closed_relay_pending(
-        &self,
-        session_id: [u8; 16],
-    ) -> Option<super::closed_relay::ClosedRelayPending> {
-        self.closed_relay_root()?.pending.lock().take(session_id)
-    }
-
-    pub(crate) fn closed_relay_pending_epoch(&self, session_id: [u8; 16]) -> Option<u64> {
-        self.closed_relay_root()
-            .and_then(|root| root.pending.lock().epoch(session_id))
-    }
-
-    pub(crate) fn take_closed_relay_pending_matching(
-        &self,
-        session_id: [u8; 16],
-        route: &crate::protocol::relay::ClosedRelayRoute,
-        target_witness: &crate::runtime::session_broker::SessionValidityWitness,
-    ) -> std::result::Result<
-        super::closed_relay::ClosedRelayPending,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .pending
-            .lock()
-            .take_matching(session_id, route, target_witness)
-    }
-
-    pub(crate) fn closed_relay_pending_authorization(
-        &self,
-        session_id: [u8; 16],
-        route: &crate::protocol::relay::ClosedRelayRoute,
-        target_witness: &crate::runtime::session_broker::SessionValidityWitness,
-    ) -> std::result::Result<
-        super::closed_relay::ClosedRelayAuthorization,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .pending
-            .lock()
-            .matching_authorization(session_id, route, target_witness)
-    }
-
-    pub(crate) fn insert_closed_relay_endpoint(
-        &self,
-        session: super::closed_relay::EndpointSession,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .endpoints
-            .lock()
-            .insert(session)
-    }
-
-    pub(crate) fn closed_relay_endpoint(
-        &self,
-        session_id: [u8; 16],
-    ) -> Option<super::closed_relay::EndpointSession> {
-        self.closed_relay_root()
-            .and_then(|root| root.endpoints.lock().find(session_id))
-    }
-
-    pub(crate) fn complete_closed_relay_endpoint(
-        &self,
-        session_id: [u8; 16],
-        route: &crate::protocol::relay::ClosedRelayRoute,
-        target_share: &crate::protocol::relay::RelayKeyShare,
-    ) -> std::result::Result<
-        super::closed_relay::EndpointSession,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        let session = self
-            .closed_relay_root()
-            .and_then(|root| root.endpoints.lock().find(session_id))
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
-        let metadata = session.metadata();
-        if metadata.context != route.context_id
-            || metadata.requester != route.requester
-            || metadata.relay != route.relay
-            || metadata.target != route.target
-            || metadata.session_id != route.session_id
-            || (metadata.allocation_epoch != 0
-                && metadata.allocation_epoch != route.allocation_epoch)
-        {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerMismatch);
-        }
-        session.complete(target_share)?;
-        session.set_allocation_epoch(route.allocation_epoch);
-        Ok(session)
-    }
-
-    pub(crate) fn deliver_closed_relay_endpoint(
-        &self,
-        session_id: [u8; 16],
-        route: &crate::protocol::relay::ClosedRelayRoute,
-        packet: crate::protocol::OpaqueRelayPacket,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        let session = self
-            .closed_relay_root()
-            .and_then(|root| root.endpoints.lock().find(session_id))
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
-        let metadata = session.metadata();
-        if metadata.context != route.context_id
-            || metadata.requester != route.requester
-            || metadata.relay != route.relay
-            || metadata.target != route.target
-            || metadata.session_id != route.session_id
-            || metadata.allocation_epoch != route.allocation_epoch
-        {
-            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerMismatch);
-        }
-        session.deliver(packet)
-    }
-
-    pub(crate) fn remove_closed_relay_endpoint(
-        &self,
-        session: &super::closed_relay::EndpointSession,
-    ) {
-        if let Some(root) = self.closed_relay_root() {
-            root.endpoints.lock().remove(session);
-            root.accepted.lock().remove(session);
-        }
-    }
-
-    pub(crate) fn enqueue_closed_relay_abandonment(
-        &self,
-        abandonment: super::closed_relay::ClosedRelayAbandonment,
-    ) {
-        let Some(root) = self.closed_relay_root() else {
-            return;
-        };
-        let mut abandonments = root.abandonments.lock();
-        if abandonments
-            .iter()
-            .any(|existing| existing.route.session_id == abandonment.route.session_id)
-        {
-            return;
-        }
-        let _ = abandonments.insert(abandonment);
-    }
-
-    pub(crate) fn cancel_all_unpulled_closed_relay(&self) -> usize {
-        let mut count = 0;
-        while let Some(session) = self
-            .closed_relay_root()
-            .and_then(|root| root.accepted.lock().take_one_unpulled_for_cancel())
-        {
-            count += 1;
-            session.cancel_consumer();
-        }
-        count
-    }
-
-    /// Move every endpoint node out of the registry and synchronously hand
-    /// its exact route to the bounded abandonment owner. This covers public
-    /// endpoint handles still held by callers as well as accepted sessions
-    /// already claimed from the target queue; no Arc-count guess or detached
-    /// Drop task is needed.
-    pub(crate) fn cancel_all_closed_relay_endpoints(&self) -> usize {
-        let mut count = 0;
-        while let Some(session) = self
-            .closed_relay_root()
-            .and_then(|root| root.endpoints.lock().take_one_for_cancel())
-        {
-            count += 1;
-            session.cancel_consumer();
-        }
-        count
-    }
-
-    pub(crate) async fn drain_closed_relay_abandonments(self: &Arc<Self>) {
-        loop {
-            let extracted = self.closed_relay_root_handle().and_then(|root| {
-                let extracted = {
-                    let mut abandonments = root.abandonments.lock();
-                    abandonments.reserve_any()
-                }?;
-                let (slot, value) = extracted;
-                Some(super::closed_relay::ClosedRelayAbandonmentReservation::new(
-                    root, slot, value,
-                ))
-            });
-            let Some(reservation) = extracted else {
-                return;
-            };
-            if super::closed_relay::settle_closed_relay_abandonment(self, reservation.value())
-                .await
-                .is_err()
-            {
-                // Dropping the root-pinned reservation restores the exact
-                // slot; the next engine boundary can retry without a
-                // detached task or a growing temporary queue.
-                return;
-            }
-            reservation.complete();
-        }
-    }
-
-    pub(crate) fn publish_closed_relay_target_accept(
-        &self,
-        session: super::closed_relay::EndpointSession,
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        self.closed_relay_root()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .accepted
-            .lock()
-            .publish(session)
-    }
-
-    pub(crate) async fn await_next_closed_relay_target_accept(
-        &self,
-    ) -> std::result::Result<
-        super::closed_relay::EndpointSession,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        loop {
-            if self.shutdown_requested.load(Ordering::Acquire) {
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-            let wake = {
-                let root = self
-                    .closed_relay_root()
-                    .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-                let mut registry = root.accepted.lock();
-                if let Some(session) = registry.take_next() {
-                    return Ok(session);
-                }
-                registry.wake()
-            };
-            let notified = wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.shutdown_requested.load(Ordering::Acquire) {
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = self.wait_for_shutdown() => {
-                    return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-                }
-            }
-        }
-    }
-
-    /// The exact authority root, when this state is backed by a Closed
-    /// bootstrap. Open profiles intentionally have no root authority.
     pub fn verified_authority_root(&self) -> Option<&str> {
         match self.verified_policy() {
             crate::semantic::VerifiedProjectPolicy::Open => None,
@@ -3808,12 +2801,6 @@ impl NetworkState {
         };
         let quantum = pool.lock().policy.max_maintenance_per_tick;
         let now = std::time::Instant::now();
-        if let Some(root) = self.endpoint_cipher.as_ref() {
-            // Same explicitly bounded maintenance opportunity; no per-epoch
-            // timer/task or renewed lifetime on a route change.
-            root.lock()
-                .expire(now, usize::try_from(quantum).unwrap_or(usize::MAX));
-        }
         for _ in 0..quantum {
             let expired = {
                 let mut controller = controller.lock();
@@ -4007,151 +2994,6 @@ impl NetworkState {
         Ok(self.local_resources.child()?)
     }
 
-    pub(super) fn acquire_application_work(
-        &self,
-        claim: ResourceClaim,
-    ) -> std::result::Result<ResourceLease, ResourceUnavailable> {
-        self.local_resources.acquire(claim)
-    }
-
-    /// A caller-selected endpoint is bounded temporary identity backing,
-    /// never a contribution to process-global semantic interner state.
-    pub(super) fn funded_endpoint_id(&self, spelling: &str) -> Result<(DeviceId, ResourceLease)> {
-        let claim = ResourceClaim::try_from_entries([
-            (
-                ResourceClass::AccountedMemoryBytes,
-                DeviceId::uninterned_backing_bytes() as u64,
-            ),
-            (ResourceClass::ParsingOrCpuWork, 52),
-            (ResourceClass::OpaqueDependencyResidual, 2),
-        ])
-        .map_err(|_| Error::Network("endpoint identity claim overflow".into()))?;
-        let work = self.local_resources.acquire(claim)?;
-        let id = DeviceId::from_canonical_str_uninterned(spelling)
-            .map_err(|_| Error::Network("endpoint identity is not canonical".into()))?;
-        Ok((id, work))
-    }
-
-    pub(super) fn queue_endpoint_controls(
-        &self,
-        output: super::endpoint_cipher::PreparedOutput<super::EndpointRoutedFrames>,
-    ) -> Result<()> {
-        self.cmd_tx
-            .send(NetworkCmd::EndpointControls(
-                super::command::EndpointControlTransfer {
-                    output,
-                    reply: None,
-                },
-            ))
-            .map_err(|error| error.into_admission_error().into())
-    }
-
-    pub(super) fn queue_endpoint_payload(
-        &self,
-        output: super::endpoint_cipher::PreparedOutput<super::EndpointRoutedFrames>,
-        reply: oneshot::Sender<Result<()>>,
-    ) -> Result<()> {
-        self.cmd_tx
-            .send(NetworkCmd::EndpointControls(
-                super::command::EndpointControlTransfer {
-                    output,
-                    reply: Some(reply),
-                },
-            ))
-            .map_err(|error| error.into_admission_error().into())
-    }
-
-    async fn ensure_endpoint_cipher_ready(&self, peer: &DeviceId) -> Result<()> {
-        let waiter = super::begin_endpoint_cipher_wait(self, peer)?;
-        loop {
-            let notified = waiter.notification().notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match waiter.phase(std::time::Instant::now()) {
-                super::endpoint_cipher::CipherPhase::Ready => {
-                    // Re-enter the controller after the wake. An inbound
-                    // reducer holds this lock through local confirmation queue
-                    // admission, so Ready cannot let caller data overtake it.
-                    return self.with_endpoint_cipher(peer, |root| {
-                        if root.current(waiter.ticket(), std::time::Instant::now()) {
-                            Ok(())
-                        } else {
-                            Err(super::endpoint_cipher::ControllerError::Stale)
-                        }
-                    });
-                }
-                super::endpoint_cipher::CipherPhase::Retired => {
-                    return Err(Error::Network("endpoint handshake retired".into()))
-                }
-                _ => {}
-            }
-            tokio::time::timeout_at(tokio::time::Instant::from_std(waiter.deadline()), notified)
-                .await
-                .map_err(|_| Error::Network("endpoint handshake deadline elapsed".into()))?;
-        }
-    }
-
-    /// Canonical logical endpoint admission. A caller needing a carrier must
-    /// enter its registry fence FIRST; effects here may not re-enter registry
-    /// or graph, retain either lock, or await. Synchronous queue admission is
-    /// the handoff; its owned funding survives subsequent native awaits.
-    pub(super) fn with_endpoint_cipher<T>(
-        &self,
-        peer: &DeviceId,
-        effect: impl FnOnce(
-            &mut super::endpoint_cipher::EndpointCipherController,
-        ) -> std::result::Result<T, super::endpoint_cipher::ControllerError>,
-    ) -> Result<T> {
-        let graph = self.fact_graph.read();
-        // The local identity was interned at NetworkState construction; the
-        // potentially cold remote identity stays borrowed from its funded
-        // caller/frame and never passes through the string wrapper.
-        let local = DeviceId::from_canonical_str(self.identity.public_id())
-            .map_err(|_| Error::Network("local endpoint identity invalid".into()))?;
-        if self.shutdown_requested.load(Ordering::Acquire)
-            || !super::governance::canonical_policy_admits_devices(
-                &self.verified_bootstrap,
-                &graph,
-                &local,
-                peer,
-            )
-        {
-            return Err(Error::Network("canonical endpoint policy refused".into()));
-        }
-        let root = self
-            .endpoint_cipher
-            .as_ref()
-            .ok_or_else(|| Error::Network("endpoint ciphertext transport is disabled".into()))?;
-        effect(&mut root.lock())
-            .map_err(|error| Error::Network(format!("endpoint ciphertext refused: {error}")))
-    }
-
-    pub(crate) fn acquire_closed_relay_lease(
-        &self,
-        claim: ResourceClaim,
-    ) -> std::result::Result<ResourceLease, ResourceUnavailable> {
-        self.local_resources.acquire(claim)
-    }
-
-    /// Reserve and construct the shared, provider-funded expiry control
-    /// before allocating its `Notify`.  Every subsequent lifetime owner only
-    /// clones this `FundedArc`; the reservation therefore spans pending,
-    /// future, registered-task, and observed-handle lifetimes.
-    pub(crate) fn reserve_closed_relay_pending_expiry(
-        &self,
-    ) -> std::result::Result<
-        FundedArc<super::closed_relay::ClosedRelayPendingExpiryControl>,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        let root = self.closed_relay_root_handle();
-        Self::reserve_pending_expiry_after_reap(
-            root.as_ref(),
-            &self.closed_relay_pending_expiry_lifecycle,
-            |claim| self.local_resources.acquire(claim),
-        )
-    }
-
-    /// Reached by every exact-session retirement site, after it has captured the
     /// owner and witness it will retire under and before it retires anything.
     ///
     /// In a production build this is an empty function over a field that does
@@ -4534,15 +3376,6 @@ impl NetworkState {
             // The graph write fence excludes concurrent epoch creation. This
             // fixture does not silently preserve keys across its special
             // restore/seed path or relax ordinary publication invalidation.
-            if state
-                .endpoint_cipher
-                .as_ref()
-                .is_some_and(|root| root.lock().has_epochs())
-            {
-                return Err(Error::Network(
-                    "semantic seed requires no retained endpoint epochs".into(),
-                ));
-            }
 
             // The fixture uses the same bounded semantic delta transaction as
             // production, grouping at most one ready-batch worth of rows per
@@ -4899,9 +3732,6 @@ impl NetworkState {
                 // An unknown durable outcome can replace this graph inside
                 // the same Arc. Invalidate before restore even if it later
                 // reports not-applied; local graph generation is not an epoch.
-                if let Some(root) = self.endpoint_cipher.as_ref() {
-                    root.lock().retire_all();
-                }
                 if self
                     .reconcile_unknown_admission(&mut live, &aggregate_delta, projection_commitment)
                     .is_none()
@@ -4924,13 +3754,6 @@ impl NetworkState {
             .collect();
         let provisional_removed = aggregate_delta.provisional_removed().to_vec();
         journal.commit();
-        if let Some(root) = self.endpoint_cipher.as_ref() {
-            // Use the complete impact union, not only final projection cells:
-            // revoke/readmit within one batch must permanently retire its old
-            // endpoint epoch. Empty duplicates and definite rollback skip this.
-            root.lock()
-                .invalidate_subjects(aggregate_delta.affected_subjects());
-        }
         live.retire_cold_history();
 
         {
@@ -8755,8 +7578,9 @@ impl NetworkState {
         if self.application_peer_needs_demand(peer) {
             // The caller retains its payload while the separately joined
             // connection lane works. No establishment await enters the serial
-            // supervisor. A failed introduction may still use a Ready encrypted
-            // route; no application bytes have been sent by the demand itself.
+            // supervisor. Demand either produces a direct WebRTC/TURN session
+            // for the caller's send or returns a refusal; it never carries
+            // application bytes through signaling or a fallback relay.
             match self.connect_peer_wait_inner(peer, false, true).await? {
                 ChannelDemandOutcome::Ready
                 | ChannelDemandOutcome::NoOwnedAttemptRefused
@@ -8779,8 +7603,9 @@ impl NetworkState {
                 .is_some()
         });
         if !directly_admitted {
-            let (endpoint, _identity_work) = self.funded_endpoint_id(peer)?;
-            self.ensure_endpoint_cipher_ready(&endpoint).await?;
+            return Err(Error::Network(
+                "application peer has no authenticated direct WebRTC session".into(),
+            ));
         }
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
@@ -9624,25 +8449,6 @@ impl NetworkState {
         };
     }
 
-    /// Return the accepted primary parent only while its exact promoted
-    /// session remains usable.  This is a routing preference, never an
-    /// authorization bypass: route admission and the send boundary each keep
-    /// their existing owner/session fences, and an absent parent leaves all
-    /// ordinary direct or alternate candidates available.
-    pub(crate) fn tree_preferred_parent_for_route(&self) -> Option<String> {
-        let relation = {
-            let mut parenting = self.parenting.as_ref()?.lock();
-            parenting.primary_parent_at_now().ok().flatten()?
-        };
-        let parent = DeviceId::from_public_key_bytes(relation.parent.as_bytes()).ok()?;
-        let owner = self.peers.owner(&parent.base32())?;
-        let coordinate = owner.binding_coordinate();
-        (coordinate.binding_namespace == relation.owner
-            && coordinate.binding_epoch == relation.owner_epoch
-            && self.peers.has_usable_authenticated_current(&owner))
-        .then(|| owner.device_id().to_owned())
-    }
-
     /// Read the bounded local parenting table without exposing authority or
     /// session state.  The handle-only transport-lab facade converts this
     /// tuple into its public fixed snapshot type.
@@ -9841,63 +8647,11 @@ impl NetworkState {
                 .lock()
                 .cancel_child_attach(&pending.witness, pending.ticket);
         }
-        // Drain public endpoint abandonments while peer owners and the relay
-        // carrier are still available for exact Close delivery/settlement.
-        self.log_shutdown_phase("pre-shutdown-relay-abandonment-begin");
-        self.cancel_all_closed_relay_endpoints();
-        self.cancel_all_unpulled_closed_relay();
-        self.drain_closed_relay_abandonments().await;
-        self.log_shutdown_phase("pre-shutdown-relay-abandonment-drained");
         self.log_shutdown_phase("before-request-shutdown");
         self.request_shutdown();
         self.log_shutdown_phase("after-request-shutdown");
         self.await_shutdown_mutations().await;
         self.log_shutdown_phase("mutations-drained");
-        self.settle_stale_closed_relay_owners();
-        self.cancel_all_closed_relay_pending();
-        self.log_shutdown_phase("relay-expiry-begin");
-        loop {
-            let extracted = {
-                let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
-                self.closed_relay_root_handle().and_then(|root| {
-                    let extracted = {
-                        let mut expiries = root.expiries.lock();
-                        expiries.reserve_any()
-                    }?;
-                    let (slot, task) = extracted;
-                    Some(super::closed_relay::ClosedRelayExpiryReservation::new(
-                        root, slot, task,
-                    ))
-                })
-            };
-            let Some(mut reservation) = extracted else {
-                break;
-            };
-            if let Err(error) = reservation.await_handle().await {
-                tracing::warn!(%error, "closed relay pending expiry task failed during shutdown");
-            }
-            reservation.complete();
-        }
-        self.log_shutdown_phase("relay-expiry-drained");
-        if let Some(root) = self.closed_relay_root() {
-            root.allocations.lock().request_close_all();
-        }
-        self.log_shutdown_phase("relay-checkout-begin");
-        self.wait_closed_relay_checkouts().await;
-        self.log_shutdown_phase("relay-checkout-drained");
-        self.cancel_all_closed_relay_endpoints();
-        self.cancel_all_unpulled_closed_relay();
-        self.log_shutdown_phase("relay-abandonment-begin");
-        self.drain_closed_relay_abandonments().await;
-        self.log_shutdown_phase("relay-abandonment-drained");
-        self.log_shutdown_phase("relay-drained");
-        self.settle_all_closed_relay();
-        if let Some(root) = self.closed_relay_root() {
-            root.closing.lock().clear();
-            root.endpoints.lock().clear();
-            root.accepted.lock().clear();
-            while root.abandonments.lock().take_any().is_some() {}
-        }
         self.cancel_all_recovery_demands();
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is
@@ -9931,7 +8685,7 @@ impl NetworkState {
             }
         }
         self.log_shutdown_phase("peer-retire-begin");
-        let retired = self.peers.retire_all();
+        let retired = self.peers.prepare_for_shutdown();
         for peer in &retired {
             self.settle_attempt(
                 &peer.attempt(),
@@ -9940,6 +8694,7 @@ impl NetworkState {
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, peer = %peer.device_id, "peer cleanup failed during shutdown");
             }
+            let _ = self.peers.complete_shutdown_peer(peer);
             if let Some(runtime) = runtime.as_ref() {
                 for token in peer.take_retired_dedup() {
                     runtime.forget_token(token);
@@ -10092,9 +8847,6 @@ impl NetworkState {
         // becomes permanently unavailable to stale state facades.
         let _publication = self.durable_publication_gate.lock();
         let mut semantic_graph = self.fact_graph.write();
-        if let Some(root) = self.endpoint_cipher.as_ref() {
-            root.lock().shutdown();
-        }
         semantic_graph.seal_live_checkpoint();
         let provisional = self.durable_provisional.lock().clone();
         if let Err(error) = self
@@ -10293,7 +9045,7 @@ impl NetworkState {
     pub(super) fn application_peer_needs_demand(&self, peer: &str) -> bool {
         let enabled = {
             let config = self.config.read();
-            config.application_transport.is_some()
+            config.introduction.is_some()
                 && matches!(
                     &config.topology,
                     TopologyMode::Star { .. }
@@ -10677,10 +9429,11 @@ impl NetworkState {
         )
         .map_err(|error| error.into_admission_error())?;
         cancellation.armed = true;
-        let introduction_timeout =
-            self.config.read().application_transport.map(|policy| {
-                std::time::Duration::from_millis(policy.introduction.attempt_timeout_ms)
-            });
+        let introduction_timeout = self
+            .config
+            .read()
+            .introduction
+            .map(|policy| std::time::Duration::from_millis(policy.attempt_timeout_ms));
         let received = if let Some(timeout) = introduction_timeout {
             match tokio::time::timeout(timeout, &mut rx).await {
                 Ok(received) => received,
@@ -10796,8 +9549,8 @@ impl NetworkState {
         let limit = self
             .config
             .read()
-            .application_transport
-            .map(|policy| policy.introduction.max_waiters_per_target);
+            .introduction
+            .map(|policy| policy.max_waiters_per_target);
         let mut waiters = self.connect_waiters.lock();
         if waiter.shared.cancelled.load(Ordering::Acquire) {
             return false;
@@ -11171,45 +9924,35 @@ mod introduction_settlement_controls {
     use super::*;
     use crate::resource::FiniteResourceProvider;
 
-    fn policy() -> crate::config::ApplicationTransportPolicyConfig {
-        crate::config::ApplicationTransportPolicyConfig {
-            introduction: crate::config::HubIntroductionPolicyConfig {
-                max_records: 2,
-                max_waiters_per_target: 2,
-                max_signaling_bytes: 65_536,
-                max_candidates_per_attempt: 2,
-                attempt_timeout_ms: 10_000,
-                terminal_retention_ms: 1_000,
-                max_transient_links: 2,
-                idle_timeout_ms: 1_000,
-                max_maintenance_per_tick: 2,
-            },
-            endpoint_cipher: crate::config::EndpointCipherPolicyConfig {
-                max_sessions: 1,
-                max_plaintext_bytes: 1024,
-                replay_window: 8,
-                max_age_ms: 10_000,
-            },
+    fn policy() -> crate::config::HubIntroductionPolicyConfig {
+        crate::config::HubIntroductionPolicyConfig {
+            max_records: 2,
+            max_waiters_per_target: 2,
+            max_signaling_bytes: 65_536,
+            max_candidates_per_attempt: 2,
+            attempt_timeout_ms: 10_000,
+            terminal_retention_ms: 1_000,
+            max_transient_links: 2,
+            idle_timeout_ms: 1_000,
+            max_maintenance_per_tick: 2,
         }
     }
 
     /// Explicit simultaneously retained owners: the two bounded controller
-    /// and demand entries, one unused cipher root, one external wire builder
-    /// plus its separately admitted verification, and one two-caller bucket.
+    /// and demand entries, one external wire builder plus its separately
+    /// admitted verification, and one two-caller bucket.
     /// Each raw acquisition is normalized separately; this is planning only.
     fn retained_plan(target: &str) -> ResourceClaim {
         let policy = policy();
         let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
         let bound = crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES;
         let controller = policy
-            .introduction
             .planned_records_claim(
                 HubIntroduction::root_claim().unwrap(),
                 HubIntroduction::entry_claim().unwrap(),
             )
             .unwrap();
         let links = policy
-            .introduction
             .planned_demand_links_claim(
                 DemandLinkPool::root_claim().unwrap(),
                 DemandLinkPool::entry_claim().unwrap(),
@@ -11218,7 +9961,6 @@ mod introduction_settlement_controls {
         [
             controller,
             links,
-            charge(super::super::endpoint_cipher::EndpointCipherController::root_claim().unwrap()),
             charge(crate::protocol::hub_introduction::introduction_work_claim(bound).unwrap()),
             charge(HubIntroduction::frame_work_claim(bound).unwrap()),
             NetworkState::connect_waiter_retained_claim_for_test(target),
@@ -11575,7 +10317,7 @@ mod introduction_settlement_controls {
             0,
             None,
             4,
-            HubIntroductionBody::Request,
+            HubIntroductionBody::Request {},
             state.identity.signing_key(),
         )
         .map_err(|_| Error::Network("signed request setup refused".into()))?;
@@ -11595,7 +10337,7 @@ mod introduction_settlement_controls {
             0,
             Some(challenge),
             4,
-            HubIntroductionBody::Accept,
+            HubIntroductionBody::Accept {},
             remote.signing_key(),
         )
         .map_err(|_| Error::Network("signed Accept setup refused".into()))?;
@@ -11754,7 +10496,7 @@ mod introduction_settlement_controls {
             0,
             None,
             4,
-            HubIntroductionBody::Request,
+            HubIntroductionBody::Request {},
             state.identity.signing_key(),
         )
         .map_err(|error| Error::Network(format!("fresh signed Request: {error}")))?;
@@ -11774,7 +10516,7 @@ mod introduction_settlement_controls {
             0,
             Some(challenge),
             4,
-            HubIntroductionBody::Accept,
+            HubIntroductionBody::Accept {},
             remote.signing_key(),
         )
         .map_err(|error| Error::Network(format!("fresh signed Accept: {error}")))?;
@@ -14191,527 +12933,5 @@ mod arc03_peer_registry_tests {
                 specialized_elapsed.as_nanos() as f64 / (count * rounds) as f64,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod closed_relay_expiry_funding_tests {
-    use super::*;
-    use crate::resource::{
-        FiniteResourceProvider, FundedArc, ResourceAuthorityClass, ResourceProviderPort,
-        ResourceUnavailable,
-    };
-    use std::future::Future;
-    use std::time::Duration;
-
-    fn exact_test_grant(claim: ResourceClaim) -> ResourceClaim {
-        claim
-            .checked_add(ResourceClaim::single(
-                ResourceClass::OpaqueDependencyResidual,
-                3,
-            ))
-            .expect("expiry fixture bookkeeping is representable")
-    }
-
-    fn test_port(
-        claim: ResourceClaim,
-    ) -> (
-        FiniteResourceProvider,
-        ResourceProviderPort,
-        crate::resource::ResourceScope,
-    ) {
-        let provider = FiniteResourceProvider::new(exact_test_grant(claim));
-        let port = ResourceProviderPort::new(provider.clone()).expect("process scope");
-        let process = port.process_scope();
-        let scope = port.create_scope(&process).expect("expiry child scope");
-        (provider, port, scope)
-    }
-
-    struct ComponentFixture {
-        provider: FiniteResourceProvider,
-        port: ResourceProviderPort,
-        root_scope: crate::resource::ResourceScope,
-        expiry_scope: crate::resource::ResourceScope,
-        root: FundedArc<super::super::closed_relay::ClosedRelayEngineRoot>,
-        lifecycle: Mutex<()>,
-        baseline: ResourceClaim,
-        expiry_claim: ResourceClaim,
-        expiry_charge: ResourceClaim,
-    }
-
-    impl ComponentFixture {
-        fn new(pending: usize) -> Self {
-            let profile = crate::config::ClosedRelayPolicyConfig {
-                enabled: true,
-                max_pending_handshakes: u64::try_from(pending)
-                    .expect("component pending capacity fits u64"),
-                ..Default::default()
-            };
-            let root_claim =
-                super::super::closed_relay::ClosedRelayEngineRoot::root_claim(&profile)
-                    .expect("component root claim");
-            let expiry_claim = closed_relay_pending_expiry_claim().expect("component expiry claim");
-            let root_charge = FiniteResourceProvider::reservation_planning_charge(root_claim)
-                .expect("component root reservation charge");
-            let expiry_charge = FiniteResourceProvider::reservation_planning_charge(expiry_claim)
-                .expect("component expiry reservation charge");
-            let scopes = FiniteResourceProvider::scope_planning_charge()
-                .checked_scale(3)
-                .expect("component process and two child scopes");
-            let grant = scopes
-                .checked_add(root_charge)
-                .and_then(|claim| {
-                    claim.checked_add(
-                        expiry_charge
-                            .checked_scale(u64::try_from(pending).expect("pending fits u64"))
-                            .expect("component expiry capacity"),
-                    )
-                })
-                .expect("component finite grant");
-            let provider = FiniteResourceProvider::new(grant);
-            let port =
-                ResourceProviderPort::new(provider.clone()).expect("component process scope");
-            let process = port.process_scope();
-            let root_scope = port.create_scope(&process).expect("component root scope");
-            let expiry_scope = port.create_scope(&process).expect("component expiry scope");
-            assert_eq!(provider.in_use(), scopes);
-            let root_funding = port
-                .acquire(&root_scope, ResourceAuthorityClass::Admitted, root_claim)
-                .expect("component root funding");
-            let root =
-                super::super::closed_relay::ClosedRelayEngineRoot::new(&profile, root_funding)
-                    .expect("component root");
-            let baseline = scopes
-                .checked_add(root_charge)
-                .expect("component root and scope baseline");
-            assert_eq!(provider.in_use(), baseline);
-            assert_eq!(provider.active_reservations(), 1);
-            assert_eq!(provider.active_scopes(), 3);
-            Self {
-                provider,
-                port,
-                root_scope,
-                expiry_scope,
-                root,
-                lifecycle: Mutex::new(()),
-                baseline,
-                expiry_claim,
-                expiry_charge,
-            }
-        }
-
-        fn reserve(
-            &self,
-        ) -> FundedArc<super::super::closed_relay::ClosedRelayPendingExpiryControl> {
-            let port = self.port.clone();
-            let scope = self.expiry_scope.clone();
-            NetworkState::reserve_pending_expiry_after_reap(
-                Some(&self.root),
-                &self.lifecycle,
-                move |claim| port.acquire(&scope, ResourceAuthorityClass::Admitted, claim),
-            )
-            .expect("component production reserve/reap path")
-        }
-
-        fn insert_task(
-            &self,
-            funding: FundedArc<super::super::closed_relay::ClosedRelayPendingExpiryControl>,
-            generation: u8,
-        ) -> usize {
-            let future = ClosedRelayPendingExpiryFuture::new(
-                Weak::new(),
-                funding.clone(),
-                [generation; 16],
-                u64::from(generation),
-                Duration::from_secs(3600),
-            );
-            let handle = tokio::spawn(future);
-            self.root
-                .expiries
-                .lock()
-                .insert(super::super::closed_relay::ClosedRelayPendingExpiryTask {
-                    handle,
-                    _funding: funding,
-                })
-                .unwrap_or_else(|task| {
-                    task._funding.cancel();
-                    task.handle.abort();
-                    panic!("component expiry slot must be available")
-                })
-        }
-
-        fn assert_phase(&self, expiries: usize) {
-            let expected = self
-                .baseline
-                .checked_add(
-                    self.expiry_charge
-                        .checked_scale(u64::try_from(expiries).expect("expiry count fits u64"))
-                        .expect("component phase expiry charge"),
-                )
-                .expect("component phase total");
-            assert_eq!(self.provider.in_use(), expected);
-            assert_eq!(self.provider.active_reservations(), 1 + expiries);
-            assert_eq!(self.provider.active_scopes(), 3);
-        }
-
-        fn assert_full_refusal(&self) {
-            let retained = self.provider.in_use();
-            let reservations = self.provider.active_reservations();
-            let scopes = self.provider.active_scopes();
-            let error = self
-                .port
-                .acquire(
-                    &self.expiry_scope,
-                    ResourceAuthorityClass::Admitted,
-                    self.expiry_claim,
-                )
-                .map(drop)
-                .expect_err("a new expiry must refuse until the registered task is reaped");
-            let ResourceUnavailable::Pressure(pressure) = error else {
-                panic!("expected capacity pressure, got {error:?}");
-            };
-            // This fixture exhausts the complete canonical grant. The provider
-            // visits AccountedMemoryBytes first, before opaque bookkeeping.
-            let dimension = ResourceClass::AccountedMemoryBytes;
-            assert_eq!(pressure.dimension, dimension);
-            assert_eq!(pressure.requested, self.expiry_charge.amount(dimension));
-            assert!(pressure.requested > 0);
-            assert_eq!(pressure.in_use, retained.amount(dimension));
-            assert_eq!(pressure.capacity, retained.amount(dimension));
-            assert_eq!(self.provider.in_use(), retained);
-            assert_eq!(self.provider.active_reservations(), reservations);
-            assert_eq!(self.provider.active_scopes(), scopes);
-        }
-
-        fn finish(self) {
-            assert_eq!(self.root.expiries.lock().len(), 0);
-            self.assert_phase(0);
-            let Self {
-                provider,
-                port,
-                root_scope,
-                expiry_scope,
-                root,
-                ..
-            } = self;
-            drop(root);
-            assert_eq!(provider.active_reservations(), 0);
-            assert_eq!(
-                provider.in_use(),
-                FiniteResourceProvider::scope_planning_charge()
-                    .checked_scale(3)
-                    .expect("remaining component scopes")
-            );
-            drop(root_scope);
-            drop(expiry_scope);
-            drop(port);
-            assert_eq!(provider.in_use(), ResourceClaim::ZERO);
-            assert_eq!(provider.active_reservations(), 0);
-            assert_eq!(provider.active_scopes(), 0);
-        }
-    }
-
-    #[test]
-    fn shared_expiry_claim_refuses_each_minus_one_before_control_allocation() {
-        let claim = closed_relay_pending_expiry_claim().expect("finite expiry claim");
-        for dimension in [
-            ResourceClass::AccountedMemoryBytes,
-            ResourceClass::WorkerOrTask,
-            ResourceClass::CallbackOrScheduledWork,
-            ResourceClass::OpaqueDependencyResidual,
-        ] {
-            let reduced = claim
-                .checked_sub(ResourceClaim::single(dimension, 1))
-                .expect("each selected expiry dimension is nonzero");
-            let (provider, port, scope) = test_port(reduced);
-            let before = provider.in_use();
-            let reservations_before = provider.active_reservations();
-            let scopes_before = provider.active_scopes();
-            let mut refused_dimension = None;
-            assert!(
-                fund_closed_relay_pending_expiry(|claim| {
-                    let result = port.acquire(&scope, ResourceAuthorityClass::Admitted, claim);
-                    if let Err(ResourceUnavailable::Pressure(pressure)) = &result {
-                        refused_dimension = Some(pressure.dimension);
-                    }
-                    result
-                })
-                .is_err(),
-                "minus-one {dimension:?} must refuse before control allocation"
-            );
-            assert_eq!(refused_dimension, Some(dimension));
-            assert_eq!(provider.in_use(), before);
-            assert_eq!(provider.active_reservations(), reservations_before);
-            assert_eq!(provider.active_scopes(), scopes_before);
-        }
-    }
-
-    #[tokio::test]
-    async fn expiry_future_completion_keeps_shared_claim_until_handle_observation() {
-        let claim = closed_relay_pending_expiry_claim().expect("finite expiry claim");
-        let expected_funded = FiniteResourceProvider::reservation_charge_for_test(claim)
-            .expect("canonical expiry reservation charge is representable");
-        let (provider, port, scope) = test_port(claim);
-        let before = provider.in_use();
-        let reservations_before = provider.active_reservations();
-        let scopes_before = provider.active_scopes();
-        let owner = fund_closed_relay_pending_expiry(|claim| {
-            port.acquire(&scope, ResourceAuthorityClass::Admitted, claim)
-        })
-        .expect("exact expiry reservation");
-        let pending = super::super::closed_relay::ClosedRelayPendingExpiry::new(owner.clone());
-        // Poll once to register the real OwnedNotified waiter, then cancel
-        // and poll that same future to settlement.  This is the post-waiter
-        // leg; the JoinHandle below exercises cancellation before its first
-        // poll as well.
-        let mut registered_future = Box::pin(ClosedRelayPendingExpiryFuture::new(
-            Weak::new(),
-            owner.clone(),
-            [0; 16],
-            1,
-            Duration::from_secs(3600),
-        ));
-        let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(waker);
-        assert!(registered_future.as_mut().poll(&mut context).is_pending());
-        owner.cancel();
-        assert!(registered_future.as_mut().poll(&mut context).is_ready());
-        drop(registered_future);
-        let future = ClosedRelayPendingExpiryFuture::new(
-            Weak::new(),
-            owner.clone(),
-            [0; 16],
-            1,
-            Duration::from_secs(3600),
-        );
-        let handle = tokio::spawn(future);
-        let mut registered = super::super::closed_relay::ClosedRelayPendingExpiryTask {
-            handle,
-            _funding: owner.clone(),
-        };
-        assert!(FundedArc::ptr_eq(&owner, &registered._funding));
-        owner.cancel();
-        drop(owner);
-        drop(pending);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !registered.handle.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled expiry future reaches finished state");
-        assert_eq!(
-            provider.in_use().checked_sub(before),
-            Ok(expected_funded),
-            "finished-but-unobserved task retains its canonical expiry claim"
-        );
-        assert_eq!(
-            provider.active_reservations(),
-            reservations_before + 1,
-            "finished-but-unobserved task retains one provider reservation"
-        );
-        assert_eq!(provider.active_scopes(), scopes_before);
-        (&mut registered.handle)
-            .await
-            .expect("cancelled expiry future reaches terminal observation");
-        assert_eq!(provider.in_use().checked_sub(before), Ok(expected_funded));
-        assert_eq!(provider.active_reservations(), reservations_before + 1);
-        drop(registered);
-        assert_eq!(provider.in_use(), before);
-        assert_eq!(provider.active_reservations(), reservations_before);
-        assert_eq!(provider.active_scopes(), scopes_before);
-
-        // The future itself is also a real owner: after the local handle is
-        // dropped, its final cancellation path must retain the reservation
-        // until that future is dropped.
-        let owner = fund_closed_relay_pending_expiry(|claim| {
-            port.acquire(&scope, ResourceAuthorityClass::Admitted, claim)
-        })
-        .expect("future-only expiry reservation");
-        let mut future = Box::pin(ClosedRelayPendingExpiryFuture::new(
-            Weak::new(),
-            owner.clone(),
-            [0; 16],
-            2,
-            Duration::from_secs(3600),
-        ));
-        drop(owner);
-        let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(waker);
-        assert!(future.as_mut().poll(&mut context).is_pending());
-        assert_eq!(
-            provider.in_use().checked_sub(before),
-            Ok(expected_funded),
-            "the sole future owner retains the canonical claim while Pending"
-        );
-        assert_eq!(provider.active_reservations(), reservations_before + 1);
-        assert_eq!(provider.active_scopes(), scopes_before);
-        future.as_ref().get_ref().expiry.cancel();
-        assert!(future.as_mut().poll(&mut context).is_ready());
-        assert_eq!(
-            provider.in_use().checked_sub(before),
-            Ok(expected_funded),
-            "the sole future owner retains the canonical claim while Ready"
-        );
-        assert_eq!(provider.active_reservations(), reservations_before + 1);
-        assert_eq!(provider.active_scopes(), scopes_before);
-        drop(future);
-        assert_eq!(provider.in_use(), before);
-        assert_eq!(provider.active_reservations(), reservations_before);
-        assert_eq!(provider.active_scopes(), scopes_before);
-    }
-
-    async fn component_slot_finished(fixture: &ComponentFixture, slot: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let finished = fixture
-                    .root
-                    .expiries
-                    .lock()
-                    .get(slot)
-                    .is_some_and(|task| task.handle.is_finished());
-                if finished {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("component expiry task reaches terminal state");
-    }
-
-    #[tokio::test]
-    async fn component_expiry_p1_reaps_before_new_acquire() {
-        let fixture = ComponentFixture::new(1);
-        let baseline = fixture.provider.in_use();
-        let first = fixture.reserve();
-        let first_slot = fixture.insert_task(first.clone(), 1);
-        assert_eq!(first_slot, 0);
-        first.cancel();
-        drop(first);
-        component_slot_finished(&fixture, first_slot).await;
-        fixture.assert_phase(1);
-
-        let retained = fixture.provider.in_use();
-        assert_eq!(
-            retained,
-            baseline
-                .checked_add(fixture.expiry_charge)
-                .expect("retained claim")
-        );
-        fixture.assert_full_refusal();
-
-        let second = fixture.reserve();
-        let second_slot = fixture.insert_task(second.clone(), 2);
-        assert_eq!(
-            second_slot, first_slot,
-            "the next production reservation reuses the observed physical slot"
-        );
-        second.cancel();
-        drop(second);
-        component_slot_finished(&fixture, second_slot).await;
-        fixture.assert_phase(1);
-
-        let third = fixture.reserve();
-        let third_slot = fixture.insert_task(third.clone(), 3);
-        assert_eq!(third_slot, first_slot);
-        third.cancel();
-        drop(third);
-        component_slot_finished(&fixture, third_slot).await;
-        fixture.assert_phase(1);
-
-        let final_owner = fixture.reserve();
-        drop(final_owner);
-        assert_eq!(fixture.root.expiries.lock().len(), 0);
-        assert_eq!(fixture.provider.in_use(), baseline);
-        fixture.finish();
-    }
-
-    #[tokio::test]
-    async fn component_expiry_p2_reaps_finished_high_preserves_live_low() {
-        let fixture = ComponentFixture::new(2);
-        let baseline = fixture.provider.in_use();
-
-        let low = fixture.reserve();
-        let low_slot = fixture.insert_task(low.clone(), 1);
-        assert_eq!(low_slot, 0);
-        drop(low);
-        let low_task_id = fixture
-            .root
-            .expiries
-            .lock()
-            .get(low_slot)
-            .expect("low task is registered")
-            .handle
-            .id();
-
-        let high = fixture.reserve();
-        let high_slot = fixture.insert_task(high.clone(), 2);
-        assert_eq!(high_slot, 1);
-        high.cancel();
-        drop(high);
-        component_slot_finished(&fixture, high_slot).await;
-        fixture.assert_phase(2);
-
-        let retained = fixture.provider.in_use();
-        assert_eq!(
-            retained,
-            baseline
-                .checked_add(
-                    fixture
-                        .expiry_charge
-                        .checked_scale(2)
-                        .expect("two expiry claims")
-                )
-                .expect("retained claims")
-        );
-        fixture.assert_full_refusal();
-        assert!(
-            fixture
-                .root
-                .expiries
-                .lock()
-                .get(low_slot)
-                .is_some_and(|task| !task.handle.is_finished()),
-            "the lower physical slot remains live"
-        );
-
-        let replacement = fixture.reserve();
-        {
-            let tasks = fixture.root.expiries.lock();
-            let low_task = tasks.get(low_slot).expect("exact live low task remains");
-            assert_eq!(low_task.handle.id(), low_task_id);
-            assert!(!low_task.handle.is_finished());
-            assert!(tasks.get(high_slot).is_none());
-        }
-        fixture.assert_phase(2);
-        let replacement_slot = fixture.insert_task(replacement.clone(), 3);
-        assert_eq!(
-            replacement_slot, high_slot,
-            "the reaper scans past a live low slot and reuses finished high"
-        );
-        replacement.cancel();
-        drop(replacement);
-        component_slot_finished(&fixture, replacement_slot).await;
-
-        let low_owner = fixture
-            .root
-            .expiries
-            .lock()
-            .get(low_slot)
-            .expect("live low task remains registered")
-            ._funding
-            .clone();
-        low_owner.cancel();
-        drop(low_owner);
-        component_slot_finished(&fixture, low_slot).await;
-
-        let cleanup_low = fixture.reserve();
-        drop(cleanup_low);
-        let cleanup_high = fixture.reserve();
-        drop(cleanup_high);
-        assert_eq!(fixture.root.expiries.lock().len(), 0);
-        assert_eq!(fixture.provider.in_use(), baseline);
-        fixture.finish();
     }
 }

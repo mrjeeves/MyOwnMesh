@@ -8,9 +8,9 @@ service, which is what makes a
 Cloudflare TURN, no public Nostr relay required: one always-on device
 (or a few) can supply every piece of plumbing a closed fleet needs.
 
-This page describes device-wide hosted services. A network-scoped Closed
-opaque member relay is a separate capability described below; it is not a
-hosted service endpoint and is not exposed as a public infrastructure URL.
+This page describes device-wide hosted services. TURN is the application-data
+relay service. A Hub provides discovery and endpoint setup; it does not forward
+application payloads through mesh sessions.
 
 Hosted-service adverts, presence, joins, leaves, reconnects, and listener
 health are runtime transport observations. They never enter the semantic
@@ -49,32 +49,13 @@ semantic facts; on Open they are authenticated only by the exact-context
 handshake and Device-key possession, while Closed admission still requires
 the current Closed governance projection.
 
-### Network-scoped Closed opaque member relay
+### Hubs and application transport
 
-The network-scoped relay is not a hosted service: it is configured in that
-network's `NetworkConfig.closed_relay`, not in the device-wide `services`
-block. It is not a public URL or a hosted-service toggle in the Services GUI
-or CLI.
-
-The two legs are independently discovered, endpoint-authenticated, and
-promoted. The endpoints then use exact route-bound `Open`, `Offer`, and
-`Accept` controls before sending opaque ciphertext through B. Every control
-and data message is checked against the complete context/requester/relay/
-target/session route before mutation or forwarding, and the profile bounds
-allocation, handshake, replay, frame, control, queue, bandwidth, lifetime,
-and shutdown work. B owns a provider-backed bounded two-direction queue and
-forwards ciphertext only; endpoint keys remain at A and C.
-
-Admission refusal constructs no relay state and preserves the pending
-handshake custody. Exact live allocation generations reject stale owners.
-`Close` marks the exact generation closing, forwards the canonical close once,
-and settles only after the opposite endpoint acknowledges. Persistent
-generation tombstones make duplicate terminal closes idempotent and prevent a
-delayed predecessor close from affecting a successor that reuses a session
-identifier. Shutdown wakes bounded waiters, settles endpoint, accepted,
-pending, closing, and allocation custody, and joins the owned tasks before
-completion. See [the V4 architecture](../ARCHITECTURE.md) for the complete
-route, cryptographic, and terminal-custody contract.
+A Hub helps endpoints discover each other and exchange connection-setup
+messages. Application traffic uses their authenticated WebRTC session, with
+TURN selected by ICE when required. A machine may host both a Hub and TURN;
+these are separate roles and protocols. Signaling never carries an application
+payload fallback, whether plaintext or encrypted.
 
 ### Signaling
 
@@ -230,66 +211,10 @@ Services live under `services` in `~/.myownmesh/config.json`:
 > defaults, so neither needs to appear in a hand-written config. They are
 > shown here for completeness.
 
-Closed relay policy is selected per network rather than under `services`:
-
-```json
-{
-  "version": 2,
-  "networks": [{
-    "id": "home",
-    "network_id": "my-cool-mesh",
-    "kind": "closed",
-    "semantic_policy": {
-      "max_fact_encoded_bytes": 65535,
-      "max_dependencies_per_fact": 64,
-      "max_authority_uses_per_fact": 32,
-      "max_authority_predecessors_per_use": 64,
-      "max_admitted_facts": 100000,
-      "max_admitted_bytes": 134217728,
-      "max_quarantined_facts": 4096,
-      "max_quarantined_bytes": 16777216,
-      "max_quarantined_facts_per_author": 256,
-      "max_quarantined_bytes_per_author": 4194304,
-      "max_retained_facts_per_author": 10000,
-      "max_retained_bytes_per_author": 16777216,
-      "max_dependency_edges": 1000000,
-      "max_ready_batch": 256,
-      "max_pending_proofs": 10000,
-      "max_pending_proof_bytes": 16777216,
-      "max_proof_records": 100000,
-      "max_proof_bytes": 67108864,
-      "max_proof_links": 100000,
-      "max_author_usage_rows": 100000,
-      "max_provisional_rows": 100000,
-      "max_transaction_dirty_main_pages": 1024,
-      "max_uncheckpointed_wal_frames": 1018,
-      "max_freelist_pages": 1024,
-      "max_fragmented_pages": 1024,
-      "max_main_journal_bytes": 8388608,
-      "max_database_bytes": 2147483648,
-      "max_wal_bytes": 8413072,
-      "wal_checkpoint_threshold_bytes": 4194192,
-      "emergency_reserve_bytes": 8388608
-    },
-    "closed_relay": { "enabled": true }
-  }]
-}
-```
-
-`semantic_policy` is the complete owner-selected semantic storage policy.
-Its logical named-file and lifecycle maxima cover the main database,
-`MainJournal`, WAL/SHM, dirty transactions, provisional state, and checkpoint
-frames, proof records/links, and per-author retention. The default
-`max_wal_bytes` reserves 1,018 retained frames plus one 1,024-page transaction;
-`wal_checkpoint_threshold_bytes` selects SQLite's automatic-checkpoint frame
-count. SQLite's default VFS owns locking, recovery, WAL reuse, and checkpoint
-execution. These are logical process-local reservations, not physical-capacity
-guarantees: an operating-system `ENOSPC` can still occur.
-
-The remaining `closed_relay` bounds are owner-selected finite values. A
-member is admitted as a relay only after the Closed projection and both
-endpoint session witnesses pass; this setting does not make an arbitrary
-device a relay.
+Configure client TURN URLs and credentials in each network's `turn_servers`.
+The optional `introduction` policy controls bounded Hub-assisted endpoint
+setup. Old `closed_relay`, `application_transport` and `routing_policy` keys
+are rejected.
 
 > Because TURN also serves STUN, the example above would try to bind both
 > on `3478` and the second would fail. Run one of them on `3478`, or give
@@ -353,9 +278,8 @@ endpoint URLs in a structured `services` blob inside its capability
 ```
 
 Hosted service adverts describe signaling, STUN, and TURN only. TURN
-advertises `turn_url` and `service:turn`; the network-scoped Closed member
-relay is negotiated from the Closed network policy and exact member/session
-witnesses instead of from a device-wide service advert.
+advertises `turn_url` and `service:turn`. Credentials remain local configuration
+and are not included in service adverts or presence records.
 
 A peer reads this with `ServiceAdvert::from_extra(...)` and can drop the
 URLs straight into its own network config.
@@ -375,10 +299,6 @@ instead of (or alongside) the public defaults:
 - **TURN** → add
   `{ "urls": ["turn:your-host:3478"], "username": "alice", "credential": "s3cret" }`
   to `turn_servers`.
-
-- **Closed member relay** → enable and bound `closed_relay` in the relevant
-  network configuration. It uses no public relay URL and is available only
-  to the exact authorized Closed members and promoted endpoint legs.
 
 In the GUI these live under a network's gear icon → **Settings**
 (signaling relays / STUN / TURN editors). Once every member points at one
@@ -487,7 +407,6 @@ WebSockets?), then **firewall** (is the port open?).
 | Piece | Location |
 |---|---|
 | Service config schema | `crates/myownmesh-core/src/config.rs` (`ServicesConfig`, `NodeServiceConfig`) |
-| Closed member relay policy/facade | `crates/myownmesh-core/src/{config.rs,engine/closed_relay.rs,handle.rs}` |
 | Service roles and advert | `crates/myownmesh-core/src/services/` |
 | STUN / TURN servers (+ bandwidth throttle) | `crates/myownmesh-services/` |
 | Intelligent signaling relay (presence / leave / limits) | `crates/myownmesh-signaling/src/server.rs` |

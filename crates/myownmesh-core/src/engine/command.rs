@@ -25,14 +25,6 @@ pub struct IntroductionWaitTransfer {
     pub(super) shared: crate::resource::FundedArc<super::state::ConnectWaitShared>,
 }
 
-/// The whole cipher preparation owns its retained output through the driver's
-/// terminal write. Neither the queue nor writer extracts uncharged packets.
-#[doc(hidden)]
-pub struct EndpointControlTransfer {
-    pub(super) output: super::endpoint_cipher::PreparedOutput<super::EndpointRoutedFrames>,
-    pub(super) reply: Option<oneshot::Sender<Result<()>>>,
-}
-
 /// The existing connection-work actor owns this negotiation after enqueue.
 /// Its token is never retained by the caller across wire publication.
 #[doc(hidden)]
@@ -132,6 +124,10 @@ impl Drop for OpaqueControlTransfer {
 /// General engine command queue entry. Application requests and network
 /// reconfiguration use this serialized path. Connector events remain on their
 /// bounded per-worker runtime path and do not enter this enum.
+// Opaque transfers intentionally remain inline: their worker, funded wire,
+// completion, and demand leases are already priced by their ownership paths;
+// boxing would change that inline layout and its existing mailbox accounting.
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkCmd {
     ReplayCapabilities {
         owner: PeerOwnerToken,
@@ -174,7 +170,6 @@ pub enum NetworkCmd {
     SettleIntroductionWait(IntroductionWaitTransfer),
     IntroducedSignaling(IntroducedSignaling),
     OpaqueControl(OpaqueControlTransfer),
-    EndpointControls(EndpointControlTransfer),
     OpaqueChange(OpaqueChangeTransfer),
     SendChannelReliable {
         peer: String,
@@ -233,7 +228,6 @@ unsafe impl ResourceMailboxItem for NetworkCmd {
             Self::IntroducedSignaling(signal) => signal.0.inbound().string_measure()?,
             // Wire and completion pointees own distinct admitted leases.
             Self::OpaqueControl(_) => (0, 0, 0),
-            Self::EndpointControls(_) => (0, 0, 0),
             Self::OpaqueChange(_) => (0, 0, 0),
             Self::DropPeer { device_id, reason } => {
                 let reason = match reason {
@@ -353,7 +347,6 @@ unsafe impl ResourceMailboxItem for NetworkCmd {
             Self::SettleIntroductionWait(_) => 0,
             Self::IntroducedSignaling(_) => 0,
             Self::OpaqueControl(_) => 0,
-            Self::EndpointControls(transfer) => usize::from(transfer.reply.is_some()),
             Self::OpaqueChange(_) => 1,
             Self::SendChannelReliable { .. }
             | Self::SendChannelFrame { .. }

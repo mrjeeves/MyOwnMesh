@@ -114,7 +114,7 @@ impl AdmittedApplicationFrame {
 /// that funds too little sees a refusal rather than a truncation.
 ///
 /// Until decoding identifies the message, this includes the fixed maximum
-/// routed/introduction identity backing, even for JSON without those fields.
+/// hub-introduction identity backing, even for JSON without those fields.
 /// Binary application units use this same conservative claim: their fixed
 /// header/body sharing is unchanged, but no cheaper byte-classified admission
 /// diverges from this length-only planner. It is not a minimal binary cost.
@@ -124,7 +124,8 @@ pub fn json_input_work_claim(
     AdmittedApplicationFrame::claim(max_frame_bytes)
 }
 
-/// Additional predecode backing for two endpoints and the bounded hop list.
+/// Additional predecode backing for two endpoints and the bounded
+/// hub-introduction hop list.
 ///
 /// Structural JSON already prices scalar fragments, escaped-string parser
 /// storage and inline DTO slots. It does not own these independent Arc/Box
@@ -138,9 +139,7 @@ pub fn json_input_work_claim(
 /// provider metadata or second lease. Later transaction work cannot replace
 /// this admission, which must precede the first serde-owned identity.
 fn frame_identity_decode_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
-    let max_hops = u64::from(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET).max(u64::from(
-        crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_HOPS,
-    ));
+    let max_hops = u64::from(crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_HOPS);
     let overflow = |dimension| ResourceClaimArithmeticError::Overflow { dimension };
     let count = max_hops
         .checked_add(2)
@@ -214,13 +213,10 @@ mod decode_fence_controls {
     fn identity_probes(message: &crate::protocol::MeshMessage) -> Vec<impl Fn() -> bool + 'static> {
         use crate::protocol::MeshMessage;
         let (source, destination, hops) = match message {
-            MeshMessage::RoutedApplication(value) => {
-                (value.origin(), value.destination(), value.hops())
-            }
             MeshMessage::HubIntroduction(value) => {
                 (value.source(), value.destination(), value.hops())
             }
-            _ => panic!("control requires a routed or introduction frame"),
+            _ => panic!("control requires an introduction frame"),
         };
         [source, destination]
             .into_iter()
@@ -231,14 +227,14 @@ mod decode_fence_controls {
 
     /// Only raw wire leaves this setup: all six signing-fixture identities
     /// have already lost their last strong owner before admission is tested.
-    fn cold_frame_wire(introduction: bool) -> Bytes {
-        use crate::protocol::{hub_introduction::*, topology::*, MeshMessage};
+    fn cold_frame_wire() -> Bytes {
+        use crate::protocol::{hub_introduction::*, MeshMessage};
         use crate::semantic::{DeviceId, MeshContextId};
         use sha2::{Digest, Sha256};
         let keys: [ed25519_dalek::SigningKey; 6] = std::array::from_fn(|index| {
             let mut hash = Sha256::new();
             hash.update(b"gateway-predecode-cold-identity-v1");
-            hash.update([u8::from(introduction), index as u8]);
+            hash.update([index as u8]);
             ed25519_dalek::SigningKey::from_bytes(&hash.finalize().into())
         });
         let device = |key: &ed25519_dalek::SigningKey| {
@@ -248,42 +244,22 @@ mod decode_fence_controls {
             DeviceId::from_canonical_str_uninterned(&spelling).unwrap()
         };
         let context = MeshContextId::from_bytes([119; 32]);
-        let message = if introduction {
-            let mut envelope = HubIntroductionEnvelope::new(
-                context,
-                device(&keys[0]),
-                device(&keys[1]),
-                [119; 16],
-                0,
-                None,
-                HUB_INTRODUCTION_MAX_HOPS,
-                HubIntroductionBody::Request,
-                &keys[0],
-            )
-            .unwrap();
-            for key in keys.iter().skip(2) {
-                envelope.append_hop(device(key), key).unwrap();
-            }
-            MeshMessage::HubIntroduction(envelope)
-        } else {
-            let source = device(&keys[0]);
-            let destination = device(&keys[1]);
-            let payload = ciphertext_payload_for_test(context, &source, &destination, 32);
-            let mut envelope = RoutedApplicationEnvelope::new(
-                context,
-                source,
-                destination,
-                [119; 16],
-                MAX_ROUTED_HOP_BUDGET,
-                payload,
-                &keys[0],
-            )
-            .unwrap();
-            for key in keys.iter().skip(2) {
-                envelope.append_hop(device(key), key).unwrap();
-            }
-            MeshMessage::RoutedApplication(envelope)
-        };
+        let mut envelope = HubIntroductionEnvelope::new(
+            context,
+            device(&keys[0]),
+            device(&keys[1]),
+            [119; 16],
+            0,
+            None,
+            HUB_INTRODUCTION_MAX_HOPS,
+            HubIntroductionBody::Request {},
+            &keys[0],
+        )
+        .unwrap();
+        for key in keys.iter().skip(2) {
+            envelope.append_hop(device(key), key).unwrap();
+        }
+        let message = MeshMessage::HubIntroduction(envelope);
         let probes = identity_probes(&message);
         assert_eq!(probes.len(), 6);
         let wire = Bytes::from(serde_json::to_vec(&message).unwrap());
@@ -295,30 +271,28 @@ mod decode_fence_controls {
 
     #[test]
     fn identity_predecode_pressure_refuses_old_and_one_work_unit_short_grants() {
-        for introduction in [false, true] {
-            let wire = cold_frame_wire(introduction);
-            let required = AdmittedApplicationFrame::claim(wire.len()).unwrap();
-            let short = required
-                .checked_sub(ResourceClaim::single(ResourceClass::ParsingOrCpuWork, 1))
-                .unwrap();
-            for budget in [structural_json_claim(wire.len()).unwrap(), short] {
-                let (session, provider) =
-                    session_and_provider_for_test(crate::runtime::runtime_for_test(), budget);
-                let baseline = provider.in_use();
-                assert_eq!(baseline.amount(ResourceClass::ParsingOrCpuWork), 0);
-                assert!(matches!(
-                    AdmittedApplicationFrame::admit(&session, wire.clone()),
-                    Err(GatewayRefusal::Pressure(_))
-                ));
-                // No DecodedApplicationFrame exists and admission contains no
-                // serde call; refused reservation leaves no parse custody.
-                assert_eq!(provider.in_use(), baseline);
-            }
+        let wire = cold_frame_wire();
+        let required = AdmittedApplicationFrame::claim(wire.len()).unwrap();
+        let short = required
+            .checked_sub(ResourceClaim::single(ResourceClass::ParsingOrCpuWork, 1))
+            .unwrap();
+        for budget in [structural_json_claim(wire.len()).unwrap(), short] {
+            let (session, provider) =
+                session_and_provider_for_test(crate::runtime::runtime_for_test(), budget);
+            let baseline = provider.in_use();
+            assert_eq!(baseline.amount(ResourceClass::ParsingOrCpuWork), 0);
+            assert!(matches!(
+                AdmittedApplicationFrame::admit(&session, wire.clone()),
+                Err(GatewayRefusal::Pressure(_))
+            ));
+            // No DecodedApplicationFrame exists and admission contains no
+            // serde call; refused reservation leaves no parse custody.
+            assert_eq!(provider.in_use(), baseline);
         }
     }
 
-    fn assert_cold_decode_custody(introduction: bool) {
-        let wire = cold_frame_wire(introduction);
+    fn assert_cold_decode_custody() {
+        let wire = cold_frame_wire();
         let claim = AdmittedApplicationFrame::claim(wire.len()).unwrap();
         let (session, provider) =
             session_and_provider_for_test(crate::runtime::runtime_for_test(), claim);
@@ -396,13 +370,8 @@ mod decode_fence_controls {
     }
 
     #[test]
-    fn cold_routed_decode_retains_prepaid_identity_backing_until_output_drop() {
-        assert_cold_decode_custody(false);
-    }
-
-    #[test]
     fn cold_introduction_decode_retains_prepaid_identity_backing_until_output_drop() {
-        assert_cold_decode_custody(true);
+        assert_cold_decode_custody();
     }
 
     #[test]
@@ -511,7 +480,6 @@ mod tests {
     #[test]
     fn application_identity_delta_and_length_planner_are_checked_and_identical() {
         let delta = frame_identity_decode_claim().unwrap();
-        assert_eq!(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET, 4);
         assert_eq!(
             crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_HOPS,
             4

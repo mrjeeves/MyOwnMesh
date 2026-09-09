@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 
-use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::info;
@@ -21,7 +20,7 @@ use crate::engine::state::{NetworkCmd, NetworkState};
 use crate::engine::{
     create_network_in_mesh_scope, import_network_in_mesh_scope, spawn_network_in_mesh_scope,
 };
-use crate::error::{ClosedRelayError, Error, Result};
+use crate::error::{Error, Result};
 use crate::events::{MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
@@ -63,7 +62,6 @@ pub struct ReconcileStatus {
     pub needs_restart: bool,
     pub network_id_changed: bool,
     pub signaling_changed: bool,
-    pub closed_relay_changed: bool,
     pub semantic_policy_changed: bool,
     pub scheduler_changed: bool,
     pub hub_policy_changed: bool,
@@ -520,70 +518,6 @@ pub struct SemanticAdmissionProfile {
     pub post_commit_broadcast: SemanticAdmissionPhaseTiming,
 }
 
-/// A move-only opaque endpoint channel for a Closed-member relay route.
-///
-/// The relay and session identifiers are descriptive metadata only. Endpoint
-/// key material, authenticated peer ownership, and the bounded relay route
-/// remain inside the engine; callers can only exchange plaintext through this
-/// handle and close the exact endpoint session that opened it.
-pub struct ClosedRelayChannel {
-    session: crate::engine::closed_relay::EndpointSession,
-    peer: String,
-    relay: String,
-    session_id: [u8; 16],
-}
-
-impl ClosedRelayChannel {
-    /// The remote endpoint's canonical device id.
-    pub fn peer_device_id(&self) -> &str {
-        &self.peer
-    }
-
-    /// The canonical device id of the member forwarding this route.
-    pub fn relay_device_id(&self) -> &str {
-        &self.relay
-    }
-
-    /// The opaque session coordinate assigned to this exact endpoint pair.
-    pub fn session_id(&self) -> [u8; 16] {
-        self.session_id
-    }
-
-    /// The exact allocation epoch captured by this endpoint session.
-    ///
-    /// This is an observation coordinate for replacement-generation controls,
-    /// not authority or key material.  A stale endpoint may still retain its
-    /// original number, which lets a caller prove that a later allocation did
-    /// not accept work from the earlier generation.
-    pub fn allocation_epoch(&self) -> u64 {
-        self.session.metadata().allocation_epoch
-    }
-
-    /// Encrypt and send one plaintext through the exact endpoint session.
-    pub async fn send(&self, plaintext: &[u8]) -> Result<()> {
-        self.session
-            .send(plaintext)
-            .await
-            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
-    }
-
-    /// Receive and decrypt one plaintext from the exact endpoint session.
-    pub async fn recv(&self) -> Result<Vec<u8>> {
-        self.session
-            .recv()
-            .await
-            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
-    }
-
-    /// Close this exact endpoint session and release its bounded custody.
-    pub async fn close(self) -> Result<()> {
-        self.session
-            .close()
-            .await
-            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
-    }
-}
-
 impl JoinedNetwork {
     /// Reset process-local aggregate admission phase counters for a scale
     /// measurement. This is deliberately hidden from the stable application
@@ -786,7 +720,6 @@ impl JoinedNetwork {
             needs_restart: crate::engine::reconcile::requires_restart(&current, next),
             network_id_changed: current.network_id != next.network_id,
             signaling_changed: current.signaling != next.signaling,
-            closed_relay_changed: current.closed_relay != next.closed_relay,
             semantic_policy_changed: current.semantic_policy != next.semantic_policy,
             scheduler_changed: current.scheduler != next.scheduler,
             hub_policy_changed: current.hub != next.hub,
@@ -1009,55 +942,6 @@ impl JoinedNetwork {
         witness: &crate::engine::transport_lab::TransportChannelWitness,
     ) {
         crate::engine::transport_lab::retire_transport_channel_for_lab(&self.state, witness).await;
-    }
-
-    /// Open an opaque endpoint channel from this member to `target` through
-    /// the exact authenticated member `relay`. The session coordinate is
-    /// generated here and never accepted from a caller, while the engine
-    /// retains endpoint keys and current-owner checks behind this facade.
-    pub async fn open_closed_relay(&self, relay: &str, target: &str) -> Result<ClosedRelayChannel> {
-        let relay = crate::semantic::DeviceId::from_canonical_str(relay)
-            .map_err(|_| Error::ClosedRelay(ClosedRelayError::InvalidPacket))?;
-        let target = crate::semantic::DeviceId::from_canonical_str(target)
-            .map_err(|_| Error::ClosedRelay(ClosedRelayError::InvalidPacket))?;
-        let mut session_id = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut session_id);
-        if session_id.iter().all(|byte| *byte == 0) {
-            return Err(Error::ClosedRelay(ClosedRelayError::InvalidPacket));
-        }
-        let session = crate::engine::closed_relay::open_endpoint(
-            &self.state,
-            relay.clone(),
-            target.clone(),
-            session_id,
-        )
-        .await
-        .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))?;
-        Ok(ClosedRelayChannel {
-            session,
-            peer: target.base32(),
-            relay: relay.base32(),
-            session_id,
-        })
-    }
-
-    /// Accept the next authenticated endpoint Offer delivered to this
-    /// network. The engine selects the exact bounded FIFO entry and supplies
-    /// its observed requester, relay, and session metadata; callers cannot
-    /// inject or reconstruct a route identifier.
-    pub async fn accept_closed_relay(&self) -> Result<ClosedRelayChannel> {
-        let session = self
-            .state
-            .await_next_closed_relay_target_accept()
-            .await
-            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))?;
-        let metadata = session.metadata();
-        Ok(ClosedRelayChannel {
-            session,
-            peer: metadata.requester.base32(),
-            relay: metadata.relay.base32(),
-            session_id: metadata.session_id,
-        })
     }
 
     /// Propose a canonical member/controller/owner grant.
@@ -1747,6 +1631,7 @@ pub struct PeerInfo {
     /// already sends (RTT-corrected median over a short window). `None`
     /// until its first inbound ping. The current status schema requires this
     /// field, including when its value is `None`.
+    #[serde(deserialize_with = "deserialize_required_clock_skew")]
     pub clock_skew_ms: Option<i64>,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
@@ -1808,6 +1693,15 @@ pub struct PeerInfo {
     /// describe what was tried, this describes what's in use. `None`
     /// until ICE reaches Connected/Completed.
     pub selected_pair: Option<SelectedCandidatePair>,
+}
+
+fn deserialize_required_clock_skew<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer)
 }
 
 /// Redacted, immutable description of the one authenticated wire profile.
@@ -1933,11 +1827,22 @@ mod tests {
             remote_candidates: IceCandidateStats::default(),
             selected_pair: None,
         };
-        let mut value = serde_json::to_value(snapshot).expect("peer snapshot serializes");
-        value
+        let serialized = serde_json::to_value(snapshot).expect("peer snapshot serializes");
+        let mut missing = serialized.clone();
+        missing
             .as_object_mut()
             .expect("peer snapshot is an object")
             .remove("clock_skew_ms");
-        assert!(serde_json::from_value::<PeerInfo>(value).is_err());
+        assert!(serde_json::from_value::<PeerInfo>(missing).is_err());
+
+        let parsed_null = serde_json::from_value::<PeerInfo>(serialized.clone())
+            .expect("explicit null clock skew remains valid");
+        assert_eq!(parsed_null.clock_skew_ms, None);
+
+        let mut numeric = serialized;
+        numeric["clock_skew_ms"] = serde_json::json!(17_i64);
+        let parsed_numeric =
+            serde_json::from_value::<PeerInfo>(numeric).expect("numeric clock skew remains valid");
+        assert_eq!(parsed_numeric.clock_skew_ms, Some(17));
     }
 }

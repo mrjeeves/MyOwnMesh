@@ -28,6 +28,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/webrtc-rs/webrtc/tree/master/turn"
 
 [features]
+custody-lab = []
 metrics = []
 
 [lib]

@@ -31,9 +31,121 @@ use crate::proto::channum::*;
 use crate::proto::data::*;
 use crate::proto::peeraddr::*;
 use crate::proto::*;
-use crate::resource::{ResourceAdmission, ResourceCharge, ResourceKind, ResourceLease};
+use crate::resource::{
+    CleanupFailure, CleanupStatus, CleanupTaskLayer, ResourceAdmission, ResourceCharge,
+    ResourceKind, ResourceLease,
+};
 
 const RTP_MTU: usize = 1500;
+
+#[cfg(test)]
+mod cleanup_controls {
+    use super::*;
+    use crate::resource::BoundedTestAdmission;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use stun::attributes::ATTR_USERNAME;
+
+    struct ClosingConn {
+        calls: Arc<AtomicUsize>,
+        failure: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Conn for ClosingConn {
+        async fn connect(&self, _: SocketAddr) -> util::Result<()> {
+            Ok(())
+        }
+        async fn recv(&self, _: &mut [u8]) -> util::Result<usize> {
+            Err(util::Error::Other("unused receive".into()))
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> util::Result<(usize, SocketAddr)> {
+            Err(util::Error::Other("unused receive".into()))
+        }
+        async fn send(&self, _: &[u8]) -> util::Result<usize> {
+            Err(util::Error::Other("unused send".into()))
+        }
+        async fn send_to(&self, _: &[u8], _: SocketAddr) -> util::Result<usize> {
+            Err(util::Error::Other("unused send".into()))
+        }
+        fn local_addr(&self) -> util::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+        async fn close(&self) -> util::Result<()> {
+            self.calls.fetch_add(1, Ordering::Release);
+            Err(util::Error::Other(self.failure.into()))
+        }
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn allocation_attempts_both_socket_closes_and_all_children_preserving_first_error() {
+        let record = CleanupStatus::charge().unwrap();
+        let limit = record.units + record.retained_bytes.div_ceil(1024) + 3;
+        let admission = Arc::new(BoundedTestAdmission::new(limit));
+        let cleanup = CleanupStatus::new(admission.as_ref()).unwrap();
+        let allocation_lease = admission
+            .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
+            .unwrap();
+        let first_lease = admission
+            .acquire(ResourceKind::Permission, ResourceCharge::units(1))
+            .unwrap();
+        let second_lease = admission
+            .acquire(ResourceKind::Permission, ResourceCharge::units(1))
+            .unwrap();
+        let control_calls = Arc::new(AtomicUsize::new(0));
+        let relay_calls = Arc::new(AtomicUsize::new(0));
+        let allocation = Allocation::new_with_admission(
+            Arc::new(ClosingConn {
+                calls: control_calls.clone(),
+                failure: "first control close",
+            }),
+            Arc::new(ClosingConn {
+                calls: relay_calls.clone(),
+                failure: "second relay close",
+            }),
+            "127.0.0.1:2".parse().unwrap(),
+            FiveTuple::default(),
+            Username::new(ATTR_USERNAME, "cleanup-control".into()),
+            Weak::new(),
+            None,
+            admission.clone(),
+            allocation_lease,
+            cleanup.clone(),
+        );
+        let (release, held) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            let _lease = first_lease;
+            panic!("injected allocation child panic");
+        });
+        let second = tokio::spawn(async move {
+            let _lease = second_lease;
+            let _ = held.await;
+        });
+        allocation.child_tasks.lock().await.extend([first, second]);
+        let allocation = Arc::new(allocation);
+        let closing_allocation = allocation.clone();
+        let close = tokio::spawn(async move { closing_allocation.close().await });
+        cleanup.wait_for_failure().await;
+        let pending = !close.is_finished();
+        let _ = release.send(());
+        let result = close.await;
+        let first_failure = cleanup.first();
+        let both_attempted =
+            control_calls.load(Ordering::Acquire) == 1 && relay_calls.load(Ordering::Acquire) == 1;
+        let no_children = allocation.child_tasks.lock().await.is_empty();
+        let original_error =
+            matches!(&result, Ok(Err(error)) if error.to_string().contains("first control close"));
+        drop((allocation, cleanup));
+        assert!(pending && both_attempted && no_children && original_error);
+        assert_eq!(first_failure, Some(CleanupFailure::ControlSocketClose));
+        assert_eq!(admission.remaining_for_test(), limit);
+    }
+}
 
 pub type AllocationMap = HashMap<FiveTuple, Arc<Allocation>>;
 
@@ -93,6 +205,7 @@ pub struct Allocation {
     resource_admission: Arc<dyn ResourceAdmission>,
     _allocation_lease: Option<Box<dyn ResourceLease>>,
     child_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    cleanup: CleanupStatus,
 }
 
 fn addr2ipfingerprint(addr: &SocketAddr) -> String {
@@ -111,6 +224,7 @@ impl Allocation {
         alloc_close_notify: Option<mpsc::Sender<AllocationInfo>>,
         resource_admission: Arc<dyn ResourceAdmission>,
         allocation_lease: Box<dyn ResourceLease>,
+        cleanup: CleanupStatus,
     ) -> Self {
         Allocation {
             protocol: PROTO_UDP,
@@ -131,6 +245,7 @@ impl Allocation {
             resource_admission,
             _allocation_lease: Some(allocation_lease),
             child_tasks: Mutex::new(Vec::new()),
+            cleanup,
         }
     }
 
@@ -148,6 +263,7 @@ impl Allocation {
         let lease = admission
             .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
             .expect("test admission");
+        let cleanup = CleanupStatus::new(admission.as_ref()).expect("test cleanup admission");
         Self::new_with_admission(
             turn_socket,
             relay_socket,
@@ -158,6 +274,7 @@ impl Allocation {
             alloc_close_notify,
             admission,
             lease,
+            cleanup,
         )
     }
 
@@ -192,8 +309,9 @@ impl Allocation {
             if permissions.contains_key(&fingerprint) {
                 p.stop();
                 drop(permissions);
-                let _ = task.await;
-                return Ok(());
+                self.cleanup
+                    .observe_join(task.await, CleanupTaskLayer::AllocationChild, false);
+                return self.cleanup.result();
             }
             permissions.insert(fingerprint, p);
         }
@@ -334,8 +452,15 @@ impl Allocation {
 
         log::trace!("allocation with {} closed!", self.five_tuple);
 
-        let _ = self.turn_socket.close().await;
-        let _ = self.relay_socket.close().await;
+        let mut first_error = self.cleanup.result().err();
+        if let Err(error) = self.turn_socket.close().await {
+            self.cleanup.record(CleanupFailure::ControlSocketClose);
+            first_error.get_or_insert(error.into());
+        }
+        if let Err(error) = self.relay_socket.close().await {
+            self.cleanup.record(CleanupFailure::RelaySocketClose);
+            first_error.get_or_insert(error.into());
+        }
 
         if let Some(notify_tx) = &self.alloc_close_notify {
             let _ = notify_tx
@@ -351,10 +476,11 @@ impl Allocation {
 
         let tasks = self.child_tasks.lock().await.drain(..).collect::<Vec<_>>();
         for task in tasks {
-            let _ = task.await;
+            self.cleanup
+                .observe_join(task.await, CleanupTaskLayer::AllocationChild, false);
         }
 
-        Ok(())
+        first_error.map_or_else(|| self.cleanup.result(), Err)
     }
 
     pub async fn start(
@@ -381,7 +507,11 @@ impl Allocation {
                         if let Some(allocs) = &allocations.upgrade(){
                             let mut allocs = allocs.lock().await;
                             if let Some(a) = allocs.remove(&five_tuple) {
-                                let _ = a.close().await;
+                                if let Err(error) = a.close().await {
+                                    if !matches!(error, Error::ErrClosed) {
+                                        a.cleanup.error(&error, CleanupFailure::AllocationClose);
+                                    }
+                                }
                             }
                         }
                         done = true;

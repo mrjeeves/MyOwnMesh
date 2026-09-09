@@ -18,10 +18,6 @@ path = "src/lib.rs"
 [features]
 default = []
 transport-lab = []
-# Bounded, runtime-gated timing evidence for the routed application path.
-# This is deliberately separate from `transport-lab`: the latter enables
-# native fixture markers that are not part of a field diagnostic binary.
-route-flow-diagnostics = []
 # Select the platform DNS-SD backend through the signaling crate. Kept
 # explicit so the default and no-default release boundaries remain unchanged.
 system-dnssd = ["myownmesh-signaling/system-dnssd"]
@@ -63,10 +59,6 @@ getrandom = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 hmac = { workspace = true }
-aes-gcm = { workspace = true }
-hkdf = { workspace = true }
-x25519-dalek = { workspace = true }
-zeroize = { workspace = true }
 data-encoding = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }

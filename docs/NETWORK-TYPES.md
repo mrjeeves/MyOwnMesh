@@ -65,18 +65,11 @@ invariance, exact Closed restart/reopen identity, deterministic fault/crash
 reconciliation, and terminal provider/resource baselines. Source or unit
 evidence alone is not a final compliance PASS.
 
-The bounded exception for a closed-member relay is an explicit three-party
-opaque endpoint session. A and B, then B and C, independently discover,
-authenticate, and promote their exact legs. The endpoints establish the
-route-bound `Open` / `Offer` / `Accept` sequence; A and C seal and open
-plaintext, while B forwards only opaque ciphertext under exact route,
-current-owner, and allocation-generation witnesses. The relay has no key
-material. Its pending allocations, packet bytes, queues, retention, and
-cleanup are finite under the configured `closed_relay` profile. A refusal
-preserves pending handshake custody, and terminal tombstones make duplicate
-or delayed predecessor `Close` controls harmless to successor generations.
-Shutdown wakes bounded waiters, settles every relay custody class, and joins
-owned tasks before completion.
+Open and Closed networks use the same application transport boundary: an
+authenticated endpoint-to-endpoint WebRTC session, using configured TURN when
+a direct ICE path is unavailable. Hubs help discover and introduce endpoints;
+they do not forward application plaintext or ciphertext. Closed authorization
+still comes from the canonical governance graph and endpoint admission.
 
 ## Removed legacy model
 

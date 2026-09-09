@@ -324,6 +324,18 @@ fn test_resource_pair() -> (
                 .expect("daemon test IPC task reservation is representable")
                 .checked_scale(TEST_IPC_TASKS)
                 .expect("daemon test IPC task cohort grant is representable");
+            // One process-owned route join worker, plus the actual separately
+            // acquired route custody reservations for the existing task cohort.
+            let ipc_route_custody = crate::ipc::clients::route_join_root_planning_charge()
+                .and_then(|root| {
+                    root.checked_add(
+                        crate::ipc::clients::route_custody_planning_charge()?
+                            .checked_scale(TEST_IPC_TASKS)
+                            .map_err(crate::ipc::clients::IpcAdmissionError::Claim)?,
+                    )
+                    .map_err(crate::ipc::clients::IpcAdmissionError::Claim)
+                })
+                .expect("daemon route terminal custody is representable");
             // Inbound control frames, buffered and funded as they are read.
             let control_inbound = myownmesh_core::ResourceClaim::try_from_entries([(
                 myownmesh_core::ResourceClass::AccountedMemoryBytes,
@@ -332,13 +344,35 @@ fn test_resource_pair() -> (
                     .expect("daemon test control inbound grant is representable"),
             )])
             .expect("daemon test control inbound claim is representable");
+            // One embedded daemon per active test worker. Standalone control
+            // fixtures fund their own outside root explicitly instead. These
+            // are the owning modules' exact added claims, not worker headroom.
+            let embedded_cleanup = myownmesh_services::ServiceCleanupOwner::planning_charge()
+                .expect("embedded service root plan")
+                .checked_add(
+                    myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                        crate::embedded::cleanup_storage_claim()
+                            .expect("embedded transfer storage"),
+                    )
+                    .expect("embedded transfer storage normalization"),
+                )
+                .and_then(|claim| claim.checked_scale(test_workers))
+                .expect("one embedded cleanup root per active test worker");
+            // The live-service runtime-destruction embedded control owns one
+            // STUN. Armed-startup/cancelled-shutdown now uses its own private
+            // Mesh/STUN provider, as do the hosted constructor controls.
+            let embedded_stun = myownmesh_services::StunServer::startup_planning_charge()
+                .expect("embedded live STUN constructor plan");
             let claim = structural
                 .checked_add(workload)
                 .and_then(|claim| claim.checked_add(json_input_work))
                 .and_then(|claim| claim.checked_add(ipc_mailboxes))
                 .and_then(|claim| claim.checked_add(ipc_registry))
                 .and_then(|claim| claim.checked_add(ipc_tasks))
+                .and_then(|claim| claim.checked_add(ipc_route_custody))
                 .and_then(|claim| claim.checked_add(control_inbound))
+                .and_then(|claim| claim.checked_add(embedded_cleanup))
+                .and_then(|claim| claim.checked_add(embedded_stun))
                 .expect("daemon test resource grant is representable");
             // Every live NetworkState retains one semantic database. Charge
             // the real default policy budget once per possible live owner and

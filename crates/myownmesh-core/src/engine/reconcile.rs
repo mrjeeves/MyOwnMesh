@@ -32,11 +32,9 @@
 //! - Optional Hub, tree and local-observation policies fix retained owner capacities.
 //!   Their changes, and topology changes involving a Hub/tree controller, also
 //!   require exact runtime replacement.
-//! - `application_transport` fixes introduction, demand-link and endpoint-epoch
-//!   lifetimes/capacities. Enabling, disabling or editing it replaces the exact
+//! - `introduction` fixes introduction and demand-link lifetimes/capacities.
+//!   Enabling, disabling or editing it replaces the exact
 //!   runtime; opaque-flow provider policy remains independent.
-//! - `routing_policy` owns the route planner/dedup envelope; `pinned_peers`
-//!   seeds a separate standing-dial set. Both need replacement, not a saved-only edit.
 //!
 //! Local record identity and bootstrap kind edits are refused by [`validate_update`].
 
@@ -50,30 +48,28 @@ use super::state::NetworkState;
 /// Returns `true` when the new config differs from the current one in a
 /// way that can't be applied to a running network — `network_id`
 /// (a different network), `signaling` (the relay set the Nostr driver
-/// is bound to), `closed_relay` (the provider-backed runtime profile),
+/// is bound to),
 /// `semantic_policy` (the admission/store resource envelope), or any
-/// construction-time routing, pin, scheduler or broadcast state. Changes to kind
+/// construction-time pin, scheduler or broadcast state. Changes to kind
 /// or record id also refuse hot application, but must pass [`validate_update`]
 /// before replacement (they are not permitted edits). STUN/TURN, unfunded topology,
 /// label, and auto-approve are all applied in place by [`apply_hot`]
 /// without dropping peers.
-/// Changes to `closed_relay` and `semantic_policy` require restart because
+/// Changes to `introduction` and `semantic_policy` require restart because
 /// their provider-backed/resource-accounting profiles are fixed when
 /// `NetworkState` is constructed.
 pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
     current.id != next.id
         || current.kind != next.kind
         || current.network_id != next.network_id
-        || current.routing_policy != next.routing_policy
         || current.pinned_peers != next.pinned_peers
         || current.signaling != next.signaling
-        || current.closed_relay != next.closed_relay
         || current.semantic_policy != next.semantic_policy
         || current.scheduler != next.scheduler
         || current.hub != next.hub
         || current.tree != next.tree
         || current.local_observations != next.local_observations
-        || current.application_transport != next.application_transport
+        || current.introduction != next.introduction
         || topology_requires_restart(current, &next.topology)
         || current.event_capacity != next.event_capacity
         || current.connection_trace_capacity != next.connection_trace_capacity
@@ -178,34 +174,23 @@ mod tests {
     }
 
     #[test]
-    fn routing_and_pin_edits_require_validated_replacement() {
+    fn pin_edits_require_validated_replacement() {
         let current = base_config();
-        let mut routing = current.clone();
-        routing.routing_policy.max_next_hops += 1;
         let mut pins = current.clone();
         pins.pinned_peers.push(peer_id());
-        for next in [&routing, &pins] {
-            validate_update(&current, next).expect("valid replacement config");
-            assert!(requires_restart(&current, next));
-            assert!(requires_restart(next, &current));
-            assert!(!requires_restart(next, next));
-        }
+        validate_update(&current, &pins).expect("valid replacement config");
+        assert!(requires_restart(&current, &pins));
+        assert!(requires_restart(&pins, &current));
+        assert!(!requires_restart(&pins, &pins));
 
         let state = super::super::build_test_state("reconcile-route-pins");
         let before = state.config.read().clone();
-        let route_owner = &state.routing as *const _;
-        let route_policy = state.routing.policy();
         let peer = peer_id();
         assert!(!state.is_sticky(&peer));
-        let mut next = before.clone();
-        next.routing_policy.max_next_hops += 1;
-        assert!(apply_hot(&state, next).is_err());
         let mut next = before.clone();
         next.pinned_peers.push(peer.clone());
         assert!(apply_hot(&state, next).is_err());
         assert_eq!(*state.config.read(), before);
-        assert_eq!(&state.routing as *const _, route_owner);
-        assert_eq!(state.routing.policy(), route_policy);
         assert!(!state.is_sticky(&peer));
     }
 
@@ -246,8 +231,6 @@ mod tests {
         let state = super::super::build_test_state("reconcile-invalid-policy");
         let before = state.config.read().clone();
         let topology = state.topology.read().clone();
-        let mut routing = before.clone();
-        routing.routing_policy.max_next_hops = 0;
         let mut scheduling = before.clone();
         scheduling.scheduler.heartbeat_interval_ms = 0;
         let mut capacity = before.clone();
@@ -256,7 +239,7 @@ mod tests {
         pins.pinned_peers.push("not-a-device-id".into());
         let mut duplicate_pins = before.clone();
         duplicate_pins.pinned_peers = vec![peer_id(), peer_id()];
-        for mut next in [routing, scheduling, capacity, pins, duplicate_pins] {
+        for mut next in [scheduling, capacity, pins, duplicate_pins] {
             next.label = "must-not-apply".into();
             assert!(validate_update(&before, &next).is_err());
             assert!(apply_hot(&state, next).is_err());
@@ -269,8 +252,6 @@ mod tests {
     fn every_hot_field_matches_full_config_without_owner_replacement() {
         let state = super::super::build_test_state("reconcile-full-hot-parity");
         let before = state.config.read().clone();
-        let route_owner = &state.routing as *const _;
-        let route_policy = state.routing.policy();
         let context = state.mesh_context_id();
         let mut next = before.clone();
         next.label = "hot parity".into();
@@ -288,8 +269,6 @@ mod tests {
         apply_hot(&state, next.clone()).expect("validated hot edit");
         assert_eq!(*state.config.read(), next);
         assert_eq!(*state.topology.read(), next.topology);
-        assert_eq!(&state.routing as *const _, route_owner);
-        assert_eq!(state.routing.policy(), route_policy);
         assert_eq!(state.mesh_context_id(), context);
         apply_hot(&state, before.clone()).expect("hot rollback");
         assert_eq!(*state.config.read(), before);
@@ -382,14 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn closed_relay_profile_changes_require_restart() {
-        let current = base_config();
-        let mut next = current.clone();
-        next.closed_relay.enabled = !current.closed_relay.enabled;
-        assert!(requires_restart(&current, &next));
-    }
-
-    #[test]
     fn construction_time_runtime_resources_require_exact_replacement() {
         let current = base_config();
 
@@ -411,93 +382,53 @@ mod tests {
     }
 
     #[test]
-    fn application_transport_edits_are_validated_exact_replacements() {
-        use crate::config::{
-            ApplicationTransportPolicyConfig, EndpointCipherPolicyConfig,
-            HubIntroductionPolicyConfig,
-        };
+    fn introduction_edits_are_validated_exact_replacements() {
+        use crate::config::HubIntroductionPolicyConfig;
         let current = base_config();
         let mut enabled = current.clone();
-        enabled.application_transport = Some(ApplicationTransportPolicyConfig {
-            introduction: HubIntroductionPolicyConfig {
-                max_records: 4,
-                max_waiters_per_target: 2,
-                max_signaling_bytes: 32_768,
-                max_candidates_per_attempt: 4,
-                attempt_timeout_ms: 1_000,
-                terminal_retention_ms: 2_000,
-                max_transient_links: 2,
-                idle_timeout_ms: 3_000,
-                max_maintenance_per_tick: 2,
-            },
-            endpoint_cipher: EndpointCipherPolicyConfig {
-                max_sessions: 4,
-                max_plaintext_bytes: 1_024,
-                replay_window: 64,
-                max_age_ms: 4_000,
-            },
+        enabled.introduction = Some(HubIntroductionPolicyConfig {
+            max_records: 4,
+            max_waiters_per_target: 2,
+            max_signaling_bytes: 32_768,
+            max_candidates_per_attempt: 4,
+            attempt_timeout_ms: 1_000,
+            terminal_retention_ms: 2_000,
+            max_transient_links: 2,
+            idle_timeout_ms: 3_000,
+            max_maintenance_per_tick: 2,
         });
         validate_update(&current, &enabled).expect("valid explicit replacement");
         assert!(requires_restart(&current, &enabled));
         assert!(requires_restart(&enabled, &current));
         assert!(!requires_restart(&enabled, &enabled));
-        for (section, fields) in [
-            (
-                "introduction",
-                &[
-                    "max_records",
-                    "max_waiters_per_target",
-                    "max_signaling_bytes",
-                    "max_candidates_per_attempt",
-                    "attempt_timeout_ms",
-                    "terminal_retention_ms",
-                    "max_transient_links",
-                    "idle_timeout_ms",
-                    "max_maintenance_per_tick",
-                ][..],
-            ),
-            (
-                "endpoint_cipher",
-                &[
-                    "max_sessions",
-                    "max_plaintext_bytes",
-                    "replay_window",
-                    "max_age_ms",
-                ][..],
-            ),
+        for field in [
+            "max_records",
+            "max_waiters_per_target",
+            "max_signaling_bytes",
+            "max_candidates_per_attempt",
+            "attempt_timeout_ms",
+            "terminal_retention_ms",
+            "max_transient_links",
+            "idle_timeout_ms",
+            "max_maintenance_per_tick",
         ] {
-            for field in fields {
-                let mut value =
-                    serde_json::to_value(enabled.application_transport.unwrap()).unwrap();
-                let old = value[section][*field].as_u64().unwrap();
-                value[section][*field] = serde_json::json!(old + 1);
-                let mut resized = enabled.clone();
-                resized.application_transport = Some(serde_json::from_value(value).unwrap());
-                validate_update(&enabled, &resized).expect("valid finite field edit");
-                assert!(requires_restart(&enabled, &resized), "{section}.{field}");
-                assert!(requires_restart(&resized, &enabled), "{section}.{field}");
-            }
+            let mut value = serde_json::to_value(enabled.introduction.unwrap()).unwrap();
+            let old = value[field].as_u64().unwrap();
+            value[field] = serde_json::json!(old + 1);
+            let mut resized = enabled.clone();
+            resized.introduction = Some(serde_json::from_value(value).unwrap());
+            validate_update(&enabled, &resized).expect("valid finite field edit");
+            assert!(requires_restart(&enabled, &resized), "{field}");
+            assert!(requires_restart(&resized, &enabled), "{field}");
         }
         let mut changed = enabled.clone();
-        changed
-            .application_transport
-            .as_mut()
-            .unwrap()
-            .introduction
-            .idle_timeout_ms += 1;
+        changed.introduction.as_mut().unwrap().idle_timeout_ms += 1;
         assert!(requires_restart(&enabled, &changed));
         validate_update(&enabled, &changed).expect("valid lifetime edit requires replacement");
-        changed
-            .application_transport
-            .as_mut()
-            .unwrap()
-            .endpoint_cipher
-            .max_plaintext_bytes = 0;
-        assert!(validate_update(&enabled, &changed).is_err());
-        let state = super::super::build_test_state("reconcile-application-transport");
+        let state = super::super::build_test_state("reconcile-introduction");
         let before = state.config.read().clone();
         let mut next = before.clone();
-        next.application_transport = enabled.application_transport;
+        next.introduction = enabled.introduction;
         assert!(apply_hot(&state, next).is_err());
         assert_eq!(
             *state.config.read(),

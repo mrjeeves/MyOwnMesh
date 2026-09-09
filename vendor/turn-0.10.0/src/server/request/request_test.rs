@@ -69,6 +69,8 @@ async fn test_allocation_lifetime_deletion_zero_lifetime() -> Result<()> {
         }),
         alloc_close_notify: None,
         resource_admission: Arc::new(crate::resource::UnboundedTestAdmission),
+        cleanup: crate::resource::CleanupStatus::new(&crate::resource::UnboundedTestAdmission)
+            .expect("test cleanup admission"),
     }));
 
     let socket = SocketAddr::new(IpAddr::from_str("127.0.0.1")?, 5000);
@@ -77,7 +79,18 @@ async fn test_allocation_lifetime_deletion_zero_lifetime() -> Result<()> {
 
     {
         let mut nonces = r.nonces.lock().await;
-        nonces.insert(STATIC_KEY.to_owned(), Instant::now());
+        let nonce = STATIC_KEY.to_owned();
+        let nonce_charge = ResourceCharge::with_bytes(
+            1,
+            u64::try_from(nonce.capacity()).map_err(|_| Error::ErrResourceAdmission)?,
+        );
+        let nonce_admission = crate::resource::BoundedTestAdmission::new(
+            nonce_charge.units + nonce_charge.retained_bytes.div_ceil(1024),
+        );
+        let nonce_lease = nonce_admission
+            .acquire(ResourceKind::Nonce, nonce_charge)
+            .map_err(|_| Error::ErrResourceAdmission)?;
+        nonces.insert(nonce, (Instant::now(), nonce_lease));
     }
 
     let five_tuple = FiveTuple {

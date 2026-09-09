@@ -1,5 +1,9 @@
 # MyOwnMesh fundamental hybrid networking architecture
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
+In the current model, packet-relay allocation means configured standard TURN, not a mesh-member payload service. Nostr/signaling relay terminology refers only to its bounded control carrier. Existing accounting-dimension names do not grant payload-forwarding authority.
+
 Status: owner-adopted V4 architecture, as amended by owner review.
 
 This document defines the smallest common architecture for MyOwnMesh discovery, durable mesh semantics, signaling, transport path construction, endpoint authentication, session recovery, and application data delivery.
@@ -39,7 +43,7 @@ The architecture has five cooperating mechanisms:
 
 1. **Durable semantic state** stores and derives long-lived Closed governance meaning. Open participation is runtime-only and does not enter this ledger; any reviewed application contract domain is separate from the base ledger.
 2. **Signaling** moves durable facts and ephemeral transport-control messages through any suitable signaling medium.
-3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. Configured Hub hints may introduce bounded demand, with direct endpoint connectivity preferred, TURN kept as a distinct ICE service, and any Hub fallback endpoint-encrypted or refused. The current remote-candidate planner is not a claim of automatic cross-family racing.
+3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. Configured Hub hints may introduce bounded endpoint demand, with native direct WebRTC preferred and configured standard TURN as the indirect packet carrier; Hubs never carry application payload. The current remote-candidate planner is not a claim of automatic cross-family racing.
 4. **Endpoint authentication and the session broker** promote a working channel into an application-usable peer session only after exact Device authentication and current mesh policy checks.
 5. **Applications** exchange payload only through a live authenticated session capability.
 
@@ -288,7 +292,7 @@ Ephemeral transport control:
     connect intent
     offers and answers
     candidates and candidate updates
-    relay requests and relay responses
+    bounded Hub introduction requests and responses; standard ICE setup control
     cancellation and recovery hints
 ```
 
@@ -319,7 +323,7 @@ An untrusted hint or partially authenticated signal may create only lease-backed
 ```text
 ConnectorCandidateCapability
 TransportHandle
-RelayAllocationToken
+TurnAllocationToken
 ConnectedChannelCapability
 TransportObservation
 ```
@@ -329,7 +333,7 @@ The connector may:
 - gather local and remote candidates;
 - probe addresses;
 - open or accept sockets;
-- allocate bounded TURN or member-relay state;
+- allocate bounded standard TURN state;
 - apply admitted queued remote ICE candidates through the bounded connector
   planner;
 - perform a transport handshake;
@@ -507,19 +511,14 @@ A connector profile defines the transport-specific work it performs, including:
 - live observations and failure reports;
 - resource claims.
 
-Profiles may include:
+Current application carriage is native WebRTC: direct LAN/ICE connectivity or
+configured standard TURN. STUN assists candidate discovery; it is not the
+indirect application-packet carrier.
 
-```text
-Direct LAN
-ICE with STUN and TURN
-Bounded encrypted Hub forwarding fallback
-Closed member relay
-QUIC-native transport
-Serial or radio transport
-Future non-IP transport
-```
-
-A common connector interface does not erase their real operational differences.
+Transport-independent semantics leave future connector research possible, but
+QUIC-native, serial/radio, and non-IP profiles are not implemented or authorized
+by this cutover. A common connector interface does not erase operational
+differences or admit an alternative custom payload tunnel.
 
 ## 6. Channel promotion and endpoint session
 
@@ -563,78 +562,51 @@ It is not reconstructed from stored records, a session number, a route identifie
 
 Every application send, receive, callback, and recovery action rechecks the live capability and current guards.
 
-## 7. Carriers and relays
+## 7. Endpoint carriers and Hub introduction
 
-A session may use:
+The current application-data path is native endpoint-authenticated WebRTC:
+direct where possible, otherwise configured standard TURN. Both preserve the
+same `AuthenticatedPeerSession(A, C)` relationship. TURN packet carriage
+changes latency, availability, cost, and metadata exposure; it does not make
+the TURN server the remote Device or application authority.
 
-```text
-DirectEndpointCarrier
-TurnCarrier
-HubEncryptedFallbackCarrier
-ClosedMemberRelayCarrier
-```
+Hubs consolidate discovery and bounded introduction. They do not carry
+application plaintext or ciphertext and cannot create an application session
+by introducing two endpoints. No custom encrypted route, Hub transit fallback,
+or Closed-member payload relay is permitted. If no authenticated direct/TURN
+path is usable, return the bounded unavailable/no-path result; never tunnel
+application data over signaling.
 
-All carriers preserve the same endpoint relationship:
+### 7.1 Configuration and infrastructure boundary
 
-```text
-AuthenticatedPeerSession(A, C)
-```
+The new optional configuration is
+`introduction: Option<HubIntroductionPolicyConfig>`. The removed fields
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy`, and removed wire messages, must refuse rather than
+silently retain old forwarding semantics.
 
-Carrier choice changes latency, loss, cost, metadata exposure, and availability. It does not change A or C's Device identity or application authority.
+TURN remains a distinct standard service when colocated with a Hub. Current
+service advertisements are URL-only; credentials are configured locally.
+Protected TURN credential distribution is not implemented. Bounded signaling
+setup/control and existing typed semantic-control remain permitted, but are
+not an application plaintext or ciphertext bus. Open/Closed governance,
+endpoint authentication, native opaque channels, realtime flows, and RPC
+retain their existing separation of authority.
 
-### 7.1 Bounded Hub introduction and encrypted transit fallback
+## 8. Endpoint close and infrastructure cleanup
 
-A configured Hub may introduce bounded endpoint demand; it is not an
-application payload owner, trust root, membership authority, permanent-peer
-grant, or veto over viable direct or alternate paths. A directly usable
-endpoint connection is preferred and TURN remains a distinct ICE service.
-Introduction may negotiate the direct endpoint channel without making the Hub
-a carrier.
+Endpoint channels and their native WebRTC/TURN work retain exact local
+ownership through shutdown. Cancellation or an expired wait does not prove
+native tasks joined, callbacks quiesced, or external TURN allocations released.
+Retire local endpoint capabilities and observe the owned terminal cleanup
+boundary before reporting completion; retain/report failures honestly.
 
-If residual Hub transit is selected, it is a separately bounded profile. The
-endpoints derive a fresh endpoint-to-endpoint E2E epoch bound to the exact mesh
-context and full endpoint keys before payload is usable. The Hub may
-copy/forward endpoint ciphertext and observe carrier metadata, but cannot
-decrypt or read application plaintext. If the E2E epoch cannot be established,
-refuse; never fall back to plaintext. This is the adopted architecture
-direction, not a shipped-process or qualification claim.
-
-### 7.2 Closed member relay
-
-The supported Closed member relay is an explicit three-party path, not an automatic A-C transport upgrade. A and B independently discover, endpoint-authenticate, and promote their exact leg; B and C do the same for their exact leg. B remains visibly Device B and is the local canonical relay member. Anonymous attestation is neither required nor desirable.
-
-After both legs are live, the endpoints establish one opaque session through B with the exact control sequence:
-
-```text
-A -> B: Open(context, requester=A, relay=B, target=C, session)
-B -> C: Offer(same route, requester share)
-C -> B: Accept(same route, target share)
-B <-> A/C: ClosedRelayData carrying opaque ciphertext
-A <-> C: endpoint-local seal/open over the opaque session
-```
-
-The route is the complete `(context, requester, relay, target, session)` tuple. Every control and data message is validated against that route before state mutation or forwarding. The endpoint key agreement uses signed ephemeral X25519, HKDF-SHA256, and AES-256-GCM with directional nonce and replay fences. Only A and C hold endpoint session cryptographic state; B forwards `OpaqueRelayPacket` values and cannot read A-C application plaintext.
-
-B's allocation is a provider-backed, move-only resource lease covering two bounded directional relay queues and their retained custody. Admission requires current Closed authorization, exact promoted A-B and B-C session witnesses, the local relay policy, and the exact route. The runtime rejects arbitrary host or port selectors, fanout, recursive relays, and replacement or stale owner generations. A refusal constructs no relay state; expiry, stale ownership, endpoint retirement, queue closure, and shutdown settle the exact allocation and wake bounded waiters.
-
-The relay may drop, delay, reorder, meter, or correlate opaque traffic and observe carrier metadata. Those are availability and metadata effects, not endpoint authority. This profile does not claim automatic candidate racing, relay-to-relay handoff, or a generic promoted A-C WebRTC channel: Open/Offer/Accept and the endpoint cryptographic session are required before application data is usable.
-
-## 8. Closed relay close and shutdown
-
-![Closed member relay explicit setup and terminal close](diagrams/04-closed-member-relay-handoff.svg)
-
-The route vocabulary is `protocol/relay.rs`. Runtime allocation and endpoint
-state are owned by `runtime/relay/mod.rs`; engine dispatch and current promoted
-leg witnesses are owned by `engine/closed_relay.rs` and
-`runtime/peer_session/slot.rs`. Application plaintext enters and leaves only at
-the A/C endpoint session. B's production path accepts and emits only route-bound
-control plus `OpaqueRelayPacket` ciphertext. `Close`, acknowledgement, exact
-generation settlement, waiter wakeup, and driver join are part of the same
-runtime owner rather than an external cleanup convention.
-
-Close is also explicit and route-bound. An endpoint sends `Close` through its exact promoted leg; B validates the authenticated sender and exact allocation generation, marks the slot closing, and forwards the canonical close once to the opposite endpoint. The opposite endpoint closes its exact local session and returns the acknowledgement through B. B settles the exact allocation, and the initiator becomes terminal. Duplicate close messages are idempotent for the same terminal tombstone and cannot affect a successor allocation with a reused session identifier.
-
-Shutdown uses the same exact-owner fence. It wakes pending Open/Offer/Accept waiters, checked-out receives, and relay queue operations; it then settles endpoint, accepted, pending, closing, and allocation custody before the driver join completes. No relay or endpoint handle remains usable after its exact owner, route, or generation is stale.
+The former route-bound Open/Offer/Accept/Close, opaque member allocation, and
+custom route cipher requirements are superseded, not a new cleanup mechanism.
+A new owned-native-runtime proposal is not adopted here: necessity, ownership,
+and qualification must be established before any such implementation claim.
+Historical relay runs remain records of their exact source, not tests of this
+cutover.
 
 ## 9. Reachability and freshness
 
@@ -680,7 +652,7 @@ The signaling and payload message spaces are disjoint.
 - A connector callback cannot directly deliver application payload before channel promotion.
 - Application payload requires a live `AuthenticatedPeerSession` capability.
 
-Physical multiplexing does not alter this rule. Signaling, relay control, endpoint authentication, and application packets may share a process, host, socket, or lower transport where a profile permits it, but immutable message classification, parser dispatch, keys, capabilities, queues, and effects remain non-substitutable.
+Physical multiplexing does not alter this rule. Signaling setup/control, endpoint authentication, and application packets may share a process, host, socket, or lower transport where a profile permits it, but immutable message classification, parser dispatch, keys, capabilities, queues, and effects remain non-substitutable.
 
 An intentional application intermediary is different. If B terminates an A-B application session, processes plaintext, and authors a new B-C application operation, B is an explicit application endpoint. That is not transparent MyOwnMesh relay behavior.
 
@@ -720,9 +692,9 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 6. **Projection is durable semantic derivation only.** It does not create or forecast routes.
 7. **No route ledger is required.** Candidate, route, channel, and handoff state are live connector state unless a separate application domain explicitly chooses otherwise.
 8. **A working socket is not a session.** Endpoint authentication, mesh policy, local principal, and resources are required for promotion.
-9. **Carrier is not peer identity.** Direct, TURN, bounded encrypted Hub forwarding, and Closed member relay preserve the same authenticated endpoint relationship.
-10. **No anonymous member relay.** A Closed member relay is visibly attributable to its Device identity.
-11. **No relay-authorized handoff.** Relays cannot add, select, or retire an application-usable channel.
+9. **Carrier is not peer identity.** Direct and configured standard TURN WebRTC preserve the same authenticated endpoint relationship.
+10. **No custom member payload relay.** Hubs and Open/Closed members do not forward application plaintext or ciphertext.
+11. **No infrastructure-authorized handoff.** TURN and Hub services cannot promote an application-usable endpoint channel.
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
 13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
 14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
@@ -743,7 +715,7 @@ Owner review must select and test:
 5. The supported signaling carriers and ephemeral transport-control schemas.
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
-8. Direct, TURN, bounded encrypted Hub-forwarding, and Closed member-relay requirements.
+8. Direct/configured standard TURN WebRTC and Hub discovery/introduction-only requirements.
 9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.

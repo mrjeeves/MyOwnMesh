@@ -50,6 +50,25 @@ REMOVED_COMPATIBILITY_FEATURE_MARKERS = (
     "legacy-media",
     "transport-v3",
     "protocol-v3",
+    "route-flow-diagnostics",
+)
+
+# Custom member/application relay surfaces, not standard TURN or Nostr relay
+# servers. RoutedHop remains a bounded introduction-control helper.
+CUSTOM_APPLICATION_RELAY_MARKERS = (
+    "ClosedRelayControl", "ClosedRelayData", "ClosedRelayPolicyConfig",
+    "ClosedRelayChannel", "ClosedRelayError", "open_closed_relay", "accept_closed_relay",
+    "ClosedRelayOpen", "ClosedRelayAccept", "ClosedRelaySend",
+    "ClosedRelayRecv", "ClosedRelayClose", "ClosedRelayState",
+    "ClosedRoutedPayload", "RoutedApplicationEnvelope", "RoutedApplicationError",
+    "RoutingPolicyConfig", "ApplicationTransportPolicyConfig",
+    "EndpointCipherControl", "EndpointCiphertext", "EndpointCipherPolicyConfig", "CiphertextPacket",
+    "closed_relay", "application_transport", "endpoint_cipher", "routing_policy",
+    "closed_relay_control", "closed_relay_data", "routed_application", "endpoint_ciphertext",
+    "closed_relay_open", "closed_relay_accept", "closed_relay_send",
+    "closed_relay_recv", "closed_relay_state", "closed_relay_close",
+    "send_routed_channel_frame", "queue_routed_channel_frame",
+    "route_flow", "route_trace_listen", "route-flow-diagnostics",
 )
 
 SERDE_ALIAS_RE = re.compile(
@@ -73,9 +92,9 @@ GRAPH_EXCLUDED_PARTS = {
 }
 
 CURRENT_MARKERS = (
-    "PROTOCOL_VERSION: u32 = 2",
-    "ClosedRelayControl",
-    "ClosedRelayData",
+    "PROTOCOL_VERSION: u32 = 3",
+    "HubIntroduction",
+    "TurnServer",
     "FactInventory",
     "FactRequest",
     "FactPageMessage",
@@ -114,10 +133,150 @@ def find_markers(label: str, text: str, markers: tuple[str, ...]) -> list[str]:
 
 def scan_source_text(label: str, text: str) -> None:
     found = find_markers(label, text, LEGACY_MARKERS)
+    production = production_rust_text(text, label) if label.endswith(".rs") else text
+    found.extend(find_markers(label, production, CUSTOM_APPLICATION_RELAY_MARKERS))
     if SERDE_ALIAS_RE.search(text):
         found.append("serde alias")
     if found:
         fail(f"{label} contains removed surface(s): {', '.join(found)}")
+
+
+def production_rust_text(text: str, label: str = "<Rust source>") -> str:
+    """Mask comments and unconditionally test-only items, not lab production.
+
+    Tokenize strings/raw strings atomically so quoted cfg/braces cannot hide
+    a following production item. Only cfg(test) or a direct test conjunct in
+    cfg(all(...)) is excluded; cfg(any(test, feature=...)) remains production.
+    This is a source absence guard, not a Rust compiler or runtime proof.
+    """
+    atom = re.compile(
+        r'//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>\#{0,255})"'
+        r'|(?:b|c)?"(?:\\.|[^"\\])*"'
+        r"|b?'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\])'"
+        r"|\s+|[A-Za-z_][A-Za-z_0-9]*|.", re.DOTALL,
+    )
+    tokens = []
+    masked = list(text)
+    cursor = 0
+
+    def syntax_fail(message: str, offset: int) -> None:
+        line = text.count("\n", 0, offset) + 1
+        column = offset - text.rfind("\n", 0, offset)
+        fail(f"{label}:{line}:{column} (character offset {offset}): {message}")
+
+    def mask(start: int, end: int) -> None:
+        for index in range(start, end):
+            if masked[index] != "\n":
+                masked[index] = " "
+
+    while cursor < len(text):
+        match = atom.match(text, cursor)
+        assert match is not None
+        value = match.group()
+        end = match.end()
+        if value == "/*":
+            depth = 1
+            while depth and end < len(text):
+                if text.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif text.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            if depth:
+                syntax_fail("unterminated Rust comment in source guard", cursor)
+            mask(cursor, end)
+        elif value.startswith("//"):
+            mask(cursor, end)
+        elif match.group("hashes") is not None:
+            terminator = '"' + match.group("hashes")
+            closing = text.find(terminator, end)
+            if closing < 0:
+                syntax_fail("unterminated Rust raw string in source guard", cursor)
+            end = closing + len(terminator)
+            tokens.append((cursor, end, text[cursor:end]))
+        elif not value.isspace():
+            tokens.append((cursor, end, value))
+        cursor = end
+
+    values = [token[2] for token in tokens]
+    index = 0
+    while index < len(tokens):
+        if values[index:index + 4] != ["#", "[", "cfg", "("]:
+            index += 1
+            continue
+        closing = index + 4
+        depth = 1
+        while closing < len(tokens) and depth:
+            depth += (values[closing] == "(") - (values[closing] == ")")
+            closing += 1
+        if depth or values[closing:closing + 1] != ["]"]:
+            syntax_fail("unbalanced Rust cfg in source guard", tokens[index][0])
+        condition = values[index + 4:closing - 1]
+        test_only = condition == ["test"]
+        if condition[:2] == ["all", "("] and condition[-1:] == [")"]:
+            argument, nesting = [], 0
+            for token in condition[2:-1] + [","]:
+                if token == "," and nesting == 0:
+                    test_only |= argument == ["test"]
+                    argument = []
+                else:
+                    argument.append(token)
+                    nesting += (token == "(") - (token == ")")
+        if not test_only:
+            index = closing + 1
+            continue
+        # Attributes also guard comma-terminated fields and arguments, not
+        # only items/statements. Stop at a top-level comma rather than eating
+        # the next production field or the enclosing body's closing token.
+        # Angle brackets are deliberately not guessed as type vs comparison:
+        # a generic comma can stop masking early, leaving the suffix checked.
+        end_index = closing + 1
+        stack = []
+        saw_body = False
+        pairs = {")": "(", "]": "[", "}": "{"}
+        enclosing_boundary = False
+        while end_index < len(tokens):
+            token = values[end_index]
+            if token in ("(", "[", "{"):
+                if token == "{" and not stack:
+                    saw_body = True
+                stack.append(token)
+            elif token in pairs:
+                if not stack and not saw_body:
+                    # The last cfg-gated parameter/field/argument need not
+                    # have a trailing comma. Match its actual enclosing
+                    # delimiter, which predates the attribute, and leave
+                    # that delimiter outside the mask. Do not treat an
+                    # arbitrary unmatched closer as a valid boundary.
+                    preceding = []
+                    for prior in reversed(values[:index]):
+                        if prior in pairs:
+                            preceding.append(pairs[prior])
+                        elif prior in ("(", "[", "{"):
+                            if not preceding:
+                                enclosing_boundary = prior == pairs[token]
+                                break
+                            if preceding.pop() != prior:
+                                break
+                    if enclosing_boundary:
+                        break
+                if not stack or stack.pop() != pairs[token]:
+                    syntax_fail("unbalanced test-only Rust item in source guard",
+                                tokens[end_index][0])
+                if saw_body and not stack:
+                    break
+            elif token in (";", ",") and not stack:
+                break
+            end_index += 1
+        if end_index == len(tokens):
+            syntax_fail("unterminated test-only Rust item in source guard",
+                        tokens[index][0])
+        mask(tokens[index][0], tokens[end_index][0 if enclosing_boundary else 1])
+        index = end_index if enclosing_boundary else end_index + 1
+    return "".join(masked)
 
 
 def _excluded_graph_path(source_root: pathlib.Path, path: pathlib.Path) -> bool:
@@ -177,7 +336,7 @@ def iter_graph_files(source_root: pathlib.Path):
 def scan_manifest_text(label: str, text: str) -> None:
     """Reject removed feature wiring while allowing explicit lab controls."""
 
-    found = find_markers(label, text, LEGACY_MARKERS)
+    found = find_markers(label, text, LEGACY_MARKERS + CUSTOM_APPLICATION_RELAY_MARKERS)
     if found:
         fail(f"{label} contains removed surface(s): {', '.join(found)}")
 

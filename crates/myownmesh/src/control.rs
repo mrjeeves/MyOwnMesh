@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::registry::{ClosedRelayRegistry, NetworkRegistry};
+use crate::registry::NetworkRegistry;
 use crate::services::ServiceManager;
 use crate::supervisor::RuntimeSupervisor;
 
@@ -710,7 +710,6 @@ async fn serve_with_hooks(
         abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
-        closed_relays: ClosedRelayRegistry::new(),
         services,
         clients,
         json_line_bytes,
@@ -960,10 +959,6 @@ async fn serve_with_hooks(
     if !owns_closing {
         shutdown_failures.push("control surface close was already claimed by another owner".into());
     }
-    if let Err(error) = state.closed_relays.shutdown_all().await {
-        warn!("closed relay capability shutdown failed: {error}");
-        shutdown_failures.push(format!("closed relay shutdown failed: {error}"));
-    }
     if owns_closing {
         match state.clients.finish_closed() {
             crate::ipc::Lifecycle::Closed => {}
@@ -1091,7 +1086,6 @@ struct ControlState {
     abnormal_connections: std::sync::atomic::AtomicUsize,
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
-    closed_relays: Arc<ClosedRelayRegistry>,
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
     realtime: RealtimeAdvert,
@@ -1136,7 +1130,9 @@ struct ControlState {
 /// need the same value, and a copy in each would be three things to keep in
 /// step with this struct.
 #[cfg(test)]
-pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
+pub(in crate::control) async fn joinless_control_state(
+    cleanup_port: myownmesh_services::ServiceCleanupPort,
+) -> Arc<ControlState> {
     let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
         myownmesh_core::MeshConfig::default(),
         Arc::new(myownmesh_core::Identity::ephemeral()),
@@ -1145,7 +1141,7 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
     .await
     .expect("the daemon test grant opens an infrastructure-only mesh");
     let registry = NetworkRegistry::new();
-    let services = ServiceManager::new(mesh.clone(), registry.clone());
+    let services = ServiceManager::new(mesh.clone(), registry.clone(), cleanup_port);
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .expect("the fixture grant issues the registry's scope"),
@@ -1157,7 +1153,6 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
-        closed_relays: ClosedRelayRegistry::new(),
         services,
         clients,
         realtime: RealtimeAdvert {
@@ -2393,79 +2388,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::ClosedRelayOpen {
-                network,
-                relay,
-                target,
-            } => {
-                let (reply, output) = dispatch::network::closed_relay_open(
-                    &state,
-                    &json_lines,
-                    network,
-                    relay,
-                    target,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay open response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::ClosedRelayAccept { network, wait_ms } => {
-                let (reply, output) =
-                    dispatch::network::closed_relay_accept(&state, &json_lines, network, wait_ms)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay accept response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::ClosedRelaySend { handle, payload } => {
-                let (reply, output) =
-                    dispatch::network::closed_relay_send(&state, &json_lines, handle, payload)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay send response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::ClosedRelayRecv { handle, wait_ms } => {
-                let (reply, output) =
-                    dispatch::network::closed_relay_recv(&state, &json_lines, handle, wait_ms)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay receive response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::ClosedRelayClose { handle } => {
-                let (reply, output) =
-                    dispatch::network::closed_relay_close(&state, &json_lines, handle).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay close response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::ClosedRelayState { handle } => {
-                let (reply, output) =
-                    dispatch::network::closed_relay_state(&state, &json_lines, handle).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("Closed relay state response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
             Request::NetworkRemove { network, purge } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("network remove result was not admitted")?;
@@ -3443,6 +3365,58 @@ mod request_wire_tests {
             );
         }
     }
+
+    #[test]
+    fn governance_requests_preserve_present_mfa_values_and_reject_malformed_values() {
+        let requests = [
+            (
+                r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+            (
+                r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+            (
+                r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+        ];
+
+        for (json, expected) in requests {
+            let request: Request = serde_json::from_str(json).expect("present MFA field parses");
+            let actual = match request {
+                Request::GovernanceProposeRoleGrant { mfa_code, .. }
+                | Request::GovernanceProposeRoleRevoke { mfa_code, .. }
+                | Request::GovernanceProposeEvict { mfa_code, .. } => mfa_code,
+                _ => panic!("fixture must decode as a governance proposal"),
+            };
+            assert_eq!(actual.as_deref(), expected);
+        }
+
+        for json in [
+            r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":7}"#,
+            r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":7}"#,
+            r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":7}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(json).is_err(),
+                "malformed MFA value must be refused"
+            );
+        }
+    }
 }
 
 /// What `serve` does with the connection tasks it accepted.
@@ -4106,15 +4080,13 @@ mod terminal_shutdown_tests {
             label: id.to_string(),
             kind: Default::default(),
             scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
-            routing_policy: myownmesh_core::config::RoutingPolicyConfig::default(),
             tree: None,
             hub: None,
             local_observations: None,
-            application_transport: None,
+            introduction: None,
             semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),
-            closed_relay: Default::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             pinned_peers: Vec::new(),
@@ -4167,200 +4139,210 @@ mod terminal_shutdown_tests {
         crate::ipc::ClientRegistry::over_grant(grant)
     }
 
-    #[tokio::test]
-    async fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let near_mesh = connector_mesh().await;
-        let far_mesh = connector_mesh().await;
-        let near = near_mesh
-            .join(network_config("near-control", "terminal-rpc-mesh"))
-            .await
-            .expect("near network joins");
-        let far = far_mesh
-            .join(network_config("far-control", "terminal-rpc-mesh"))
-            .await
-            .expect("far network joins");
-        let mut near_events = near_mesh.events();
-        let mut far_events = far_mesh.events();
-        let _local_broker = myownmesh_signaling::local::LocalBroker::new();
-        near.attach_local(&_local_broker);
-        far.attach_local(&_local_broker);
-        let near_device = near_mesh.device_id();
-        let far_device = far_mesh.device_id();
-        crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
-        crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
-        let (handler_entered_tx, handler_entered_rx) = tokio::sync::oneshot::channel();
-        let handler_entered = std::sync::Mutex::new(Some(handler_entered_tx));
-        let _parked_handler = far
-            .rpc()
-            .prepare_serve("park", move |_call| {
-                let entered = handler_entered
-                    .lock()
-                    .expect("the handler-entry witness is not poisoned")
-                    .take()
-                    .expect("the parked handler is entered exactly once");
-                entered
-                    .send(())
-                    .expect("the handler-entry witness remains observed");
-                async {
-                    std::future::pending::<Result<myownmesh_core::rpc::RpcResponse, String>>().await
-                }
-            })
-            .expect("the far gateway prepares the parked handler")
-            .commit()
-            .into_result()
-            .expect("the far gateway installs the parked handler");
-        let link = near.install_promoted_peer_over_real_link(&far).await;
-        let peer = link.peer_device_id().to_string();
+    #[test]
+    fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let _fixture = crate::exclusive_connector_fixture().await;
+                let near_mesh = connector_mesh().await;
+                let far_mesh = connector_mesh().await;
+                let near = near_mesh
+                    .join(network_config("near-control", "terminal-rpc-mesh"))
+                    .await
+                    .expect("near network joins");
+                let far = far_mesh
+                    .join(network_config("far-control", "terminal-rpc-mesh"))
+                    .await
+                    .expect("far network joins");
+                let mut near_events = near_mesh.events();
+                let mut far_events = far_mesh.events();
+                let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+                near.attach_local(&_local_broker);
+                far.attach_local(&_local_broker);
+                let near_device = near_mesh.device_id();
+                let far_device = far_mesh.device_id();
+                crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+                crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
+                let (handler_entered_tx, handler_entered_rx) = tokio::sync::oneshot::channel();
+                let handler_entered = std::sync::Mutex::new(Some(handler_entered_tx));
+                let _parked_handler = far
+                    .rpc()
+                    .prepare_serve("park", move |_call| {
+                        let entered = handler_entered
+                            .lock()
+                            .expect("the handler-entry witness is not poisoned")
+                            .take()
+                            .expect("the parked handler is entered exactly once");
+                        entered
+                            .send(())
+                            .expect("the handler-entry witness remains observed");
+                        async {
+                            std::future::pending::<
+                                    Result<myownmesh_core::rpc::RpcResponse, String>,
+                                >()
+                                .await
+                        }
+                    })
+                    .expect("the far gateway prepares the parked handler")
+                    .commit()
+                    .into_result()
+                    .expect("the far gateway installs the parked handler");
+                let link = near.install_promoted_peer_over_real_link(&far).await;
+                let peer = link.peer_device_id().to_string();
 
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (rpc_barrier, rpc_entered, rpc_release) = DispatchBarrier::paired();
-        let (shutdown_barrier, shutdown_owned, shutdown_release) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
-        let networks = NetworkRegistry::new();
-        assert!(
-            networks.insert(near, None).into_refusal().is_none(),
-            "the near network is reachable by the control registry"
-        );
-        let observed = networks
-            .get("near-control")
-            .expect("the inserted network is visible");
-        let services = ServiceManager::new(near_mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh: near_mesh,
-                registry: networks.clone(),
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                registry_override: Some(parked_rpc_registry()),
-                at_events_stream_entry: None,
-                before_rpc_call: Some(rpc_barrier),
-                before_begin_closing: Some(shutdown_barrier),
-                before_provisional_settle: None,
-                before_mfa_response_write: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is valid");
-        let stream = guarded("RPC client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (mut client_reader, mut client_writer) = stream.split();
-        let request = Request::RpcCall {
-            network: "near-control".to_string(),
-            peer: peer.clone(),
-            method: "park".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        let mut encoded = serde_json::to_vec(&request).expect("the RPC request encodes");
-        encoded.push(b'\n');
-        client_writer
-            .write_all(&encoded)
-            .await
-            .expect("the client sends the RPC");
-
-        // First establish that the real control connection decoded the
-        // request and reached the unary RPC boundary.  Releasing this barrier
-        // then lets the production call file its pending operation; the
-        // pending-count observation below is consequently a filed/withdrawn
-        // witness rather than a race with request parsing.
-        guarded("the RPC reaches its dispatch boundary", rpc_entered)
-            .await
-            .expect("the RPC dispatch barrier remains observed");
-        rpc_release
-            .send(())
-            .expect("the RPC dispatch barrier is still parked");
-
-        guarded("the RPC is filed under the promoted session", async {
-            loop {
-                if observed.pending_call_count_for_test(&peer) == Some(1) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        guarded("the remote parked handler is entered", handler_entered_rx)
-            .await
-            .expect("the far handler reports its first entry");
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
-        );
-        guarded(
-            "shutdown reaches parked-RPC withdrawal handoff",
-            shutdown_owned,
-        )
-        .await
-        .expect("shutdown reaches the pre-begin-closing ownership barrier");
-        assert_eq!(
-            observed.pending_call_count_for_test(&peer),
-            Some(1),
-            "the shutdown handoff is non-vacuous: the RPC is still filed"
-        );
-        shutdown_release
-            .send(())
-            .expect("the shutdown ownership barrier is still parked");
-        guarded("serve begins closing", clients.closing()).await;
-        guarded("the parked RPC is withdrawn", async {
-            loop {
-                if observed.pending_call_count_for_test(&peer) == Some(0) {
-                    break;
-                }
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (rpc_barrier, rpc_entered, rpc_release) = DispatchBarrier::paired();
+                let (shutdown_barrier, shutdown_owned, shutdown_release) =
+                    DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let networks = NetworkRegistry::new();
                 assert!(
-                    observed.pending_call_count_for_test(&peer).is_some(),
-                    "the promoted session must remain present while withdrawal is observed"
+                    networks.insert(near, None).into_refusal().is_none(),
+                    "the near network is reachable by the control registry"
                 );
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                let observed = networks
+                    .get("near-control")
+                    .expect("the inserted network is visible");
+                let services =
+                    ServiceManager::new(near_mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh: near_mesh,
+                        registry: networks.clone(),
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: Some(parked_rpc_registry()),
+                        at_events_stream_entry: None,
+                        before_rpc_call: Some(rpc_barrier),
+                        before_begin_closing: Some(shutdown_barrier),
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is valid");
+                let stream = guarded("RPC client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (mut client_reader, mut client_writer) = stream.split();
+                let request = Request::RpcCall {
+                    network: "near-control".to_string(),
+                    peer: peer.clone(),
+                    method: "park".to_string(),
+                    payload: serde_json::Value::Null,
+                };
+                let mut encoded = serde_json::to_vec(&request).expect("the RPC request encodes");
+                encoded.push(b'\n');
+                client_writer
+                    .write_all(&encoded)
+                    .await
+                    .expect("the client sends the RPC");
+
+                // First establish that the real control connection decoded the
+                // request and reached the unary RPC boundary.  Releasing this barrier
+                // then lets the production call file its pending operation; the
+                // pending-count observation below is consequently a filed/withdrawn
+                // witness rather than a race with request parsing.
+                guarded("the RPC reaches its dispatch boundary", rpc_entered)
+                    .await
+                    .expect("the RPC dispatch barrier remains observed");
+                rpc_release
+                    .send(())
+                    .expect("the RPC dispatch barrier is still parked");
+
+                guarded("the RPC is filed under the promoted session", async {
+                    loop {
+                        if observed.pending_call_count_for_test(&peer) == Some(1) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                guarded("the remote parked handler is entered", handler_entered_rx)
+                    .await
+                    .expect("the far handler reports its first entry");
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded(
+                    "shutdown reaches parked-RPC withdrawal handoff",
+                    shutdown_owned,
+                )
+                .await
+                .expect("shutdown reaches the pre-begin-closing ownership barrier");
+                assert_eq!(
+                    observed.pending_call_count_for_test(&peer),
+                    Some(1),
+                    "the shutdown handoff is non-vacuous: the RPC is still filed"
+                );
+                shutdown_release
+                    .send(())
+                    .expect("the shutdown ownership barrier is still parked");
+                guarded("serve begins closing", clients.closing()).await;
+                guarded("the parked RPC is withdrawn", async {
+                    loop {
+                        if observed.pending_call_count_for_test(&peer) == Some(0) {
+                            break;
+                        }
+                        assert!(
+                            observed.pending_call_count_for_test(&peer).is_some(),
+                            "the promoted session must remain present while withdrawal is observed"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                );
+                drop(client_writer);
+                let mut terminal = Vec::new();
+                guarded(
+                    "the socket reaches a typed terminal answer or EOF",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut terminal),
+                )
+                .await
+                .expect("the client reads the terminal socket state");
+                if !terminal.is_empty() {
+                    let response: Response = serde_json::from_slice(&terminal)
+                        .expect("a non-EOF terminal answer is a typed response");
+                    assert!(!response.ok, "a cancelled parked RPC cannot report success");
+                }
+                let _ = networks.shutdown_all().await;
+                let _ = link.retire().await;
+                drop(far);
+            },
         );
-        drop(client_writer);
-        let mut terminal = Vec::new();
-        guarded(
-            "the socket reaches a typed terminal answer or EOF",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut terminal),
-        )
-        .await
-        .expect("the client reads the terminal socket state");
-        if !terminal.is_empty() {
-            let response: Response = serde_json::from_slice(&terminal)
-                .expect("a non-EOF terminal answer is a typed response");
-            assert!(!response.ok, "a cancelled parked RPC cannot report success");
-        }
-        let _ = networks.shutdown_all().await;
-        let _ = link.retire().await;
-        drop(far);
     }
 
     /// A delivered streaming-RPC setup cannot strand its forwarder when the
@@ -4371,272 +4353,279 @@ mod terminal_shutdown_tests {
     /// chunk before that barrier is released; closing then makes the retained
     /// forwarder lose admission, so the event socket closes without forwarding
     /// that chunk and the registry/provider return to their exact baselines.
-    #[tokio::test]
-    async fn v4_r6_daemon_a_real_stream_settle_race_closes_without_forwarder() {
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let near_mesh = connector_mesh().await;
-        let far_mesh = connector_mesh().await;
-        let near = near_mesh
-            .join(network_config("near-stream-race", "terminal-stream-race"))
-            .await
-            .expect("near network joins");
-        let far = far_mesh
-            .join(network_config("far-stream-race", "terminal-stream-race"))
-            .await
-            .expect("far network joins");
-        let mut near_events = near_mesh.events();
-        let mut far_events = far_mesh.events();
-        let _local_broker = myownmesh_signaling::local::LocalBroker::new();
-        near.attach_local(&_local_broker);
-        far.attach_local(&_local_broker);
-        let near_device = near_mesh.device_id();
-        let far_device = far_mesh.device_id();
-        crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
-        crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
-        let link = near.install_promoted_peer_over_real_link(&far).await;
-        let peer = link.peer_device_id().to_string();
+    #[test]
+    fn v4_r6_daemon_a_real_stream_settle_race_closes_without_forwarder() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let _fixture = crate::exclusive_connector_fixture().await;
+                let near_mesh = connector_mesh().await;
+                let far_mesh = connector_mesh().await;
+                let near = near_mesh
+                    .join(network_config("near-stream-race", "terminal-stream-race"))
+                    .await
+                    .expect("near network joins");
+                let far = far_mesh
+                    .join(network_config("far-stream-race", "terminal-stream-race"))
+                    .await
+                    .expect("far network joins");
+                let mut near_events = near_mesh.events();
+                let mut far_events = far_mesh.events();
+                let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+                near.attach_local(&_local_broker);
+                far.attach_local(&_local_broker);
+                let near_device = near_mesh.device_id();
+                let far_device = far_mesh.device_id();
+                crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+                crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
+                let link = near.install_promoted_peer_over_real_link(&far).await;
+                let peer = link.peer_device_id().to_string();
 
-        let (remote_ready_tx, remote_ready_rx) = tokio::sync::oneshot::channel();
-        let remote_ready = Arc::new(std::sync::Mutex::new(Some(remote_ready_tx)));
-        let _stream_handler = far
-            .rpc()
-            .prepare_serve_stream("race-stream", {
-                let remote_ready = Arc::clone(&remote_ready);
-                move |_call| {
-                    let remote_ready = Arc::clone(&remote_ready);
-                    async move {
-                        let scope = crate::test_application_scope();
-                        let (tx, rx) = myownmesh_core::resource_mailbox(scope)
-                            .map_err(|_| "stream fixture mailbox was refused".to_owned())?;
-                        tx.send(myownmesh_core::rpc::RpcStreamItem::Chunk(
-                            serde_json::json!("must-not-forward"),
-                        ))
-                        .map_err(|_| "stream fixture chunk was refused".to_owned())?;
-                        tx.send(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
-                            .map_err(|_| "stream fixture end was refused".to_owned())?;
-                        if let Some(ready) = remote_ready
-                            .lock()
-                            .expect("the stream-ready witness is not poisoned")
-                            .take()
-                        {
-                            ready
-                                .send(())
-                                .expect("the stream-ready witness remains observed");
+                let (remote_ready_tx, remote_ready_rx) = tokio::sync::oneshot::channel();
+                let remote_ready = Arc::new(std::sync::Mutex::new(Some(remote_ready_tx)));
+                let _stream_handler = far
+                    .rpc()
+                    .prepare_serve_stream("race-stream", {
+                        let remote_ready = Arc::clone(&remote_ready);
+                        move |_call| {
+                            let remote_ready = Arc::clone(&remote_ready);
+                            async move {
+                                let scope = crate::test_application_scope();
+                                let (tx, rx) = myownmesh_core::resource_mailbox(scope)
+                                    .map_err(|_| "stream fixture mailbox was refused".to_owned())?;
+                                tx.send(myownmesh_core::rpc::RpcStreamItem::Chunk(
+                                    serde_json::json!("must-not-forward"),
+                                ))
+                                .map_err(|_| "stream fixture chunk was refused".to_owned())?;
+                                tx.send(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
+                                    .map_err(|_| "stream fixture end was refused".to_owned())?;
+                                if let Some(ready) = remote_ready
+                                    .lock()
+                                    .expect("the stream-ready witness is not poisoned")
+                                    .take()
+                                {
+                                    ready
+                                        .send(())
+                                        .expect("the stream-ready witness remains observed");
+                                }
+                                Ok(rx)
+                            }
                         }
-                        Ok(rx)
+                    })
+                    .expect("the far gateway prepares the streaming handler")
+                    .commit()
+                    .into_result()
+                    .expect("the far gateway installs the streaming handler");
+
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (settle_barrier, settle_entered, settle_release) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let registry = parked_rpc_stream_registry();
+                let registry_baseline = registry
+                    .in_use()
+                    .expect("the isolated streaming registry exposes its baseline");
+                let networks = NetworkRegistry::new();
+                assert!(
+                    networks.insert(near, None).into_refusal().is_none(),
+                    "the near network is reachable by the streaming control registry"
+                );
+                let networks_for_cleanup = networks.clone();
+                let services =
+                    ServiceManager::new(near_mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh: near_mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: Some(registry.clone()),
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: Some(settle_barrier),
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its streaming registry", registry_rx)
+                    .await
+                    .expect("serve publishes the isolated streaming registry");
+
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the streaming control socket path is valid");
+                let event_stream = guarded("event client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
                     }
-                }
-            })
-            .expect("the far gateway prepares the streaming handler")
-            .commit()
-            .into_result()
-            .expect("the far gateway installs the streaming handler");
+                })
+                .await;
+                let (event_reader, mut event_writer) = event_stream.split();
+                let mut event_reader = BufReader::new(event_reader);
+                event_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the event client sends its subscribe");
+                let mut event_ack = String::new();
+                guarded(
+                    "the event subscription is acked",
+                    event_reader.read_line(&mut event_ack),
+                )
+                .await
+                .expect("the event subscription answer arrives");
+                let event_ack: Response =
+                    serde_json::from_str(event_ack.trim()).expect("the event ack is a response");
+                assert!(
+                    event_ack.ok,
+                    "the event subscription succeeds: {:?}",
+                    event_ack.error
+                );
+                let event_data = event_ack.data.expect("the event ack carries data");
+                let client_id: crate::ipc::ClientId = serde_json::from_value(
+                    event_data
+                        .get("client_id")
+                        .cloned()
+                        .expect("the event ack carries the client id"),
+                )
+                .expect("the event client id has its wire shape");
+                let client_capability = event_data
+                    .get("client_capability")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("the event ack carries the client capability")
+                    .to_owned();
+                assert_eq!(clients.residue().clients, 1, "the event client is live");
 
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (settle_barrier, settle_entered, settle_release) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
-        let registry = parked_rpc_stream_registry();
-        let registry_baseline = registry
-            .in_use()
-            .expect("the isolated streaming registry exposes its baseline");
-        let networks = NetworkRegistry::new();
-        assert!(
-            networks.insert(near, None).into_refusal().is_none(),
-            "the near network is reachable by the streaming control registry"
-        );
-        let networks_for_cleanup = networks.clone();
-        let services = ServiceManager::new(near_mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh: near_mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
+                let command_stream = guarded("stream command client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (command_reader, mut command_writer) = command_stream.split();
+                let mut command_reader = BufReader::new(command_reader);
+                let request = Request::RpcCallStream {
+                    client_id,
+                    client_capability,
+                    network: "near-stream-race".to_owned(),
+                    peer,
+                    method: "race-stream".to_owned(),
+                    payload: serde_json::Value::Null,
+                };
+                let mut encoded =
+                    serde_json::to_vec(&request).expect("the streaming request encodes");
+                encoded.push(b'\n');
+                command_writer
+                    .write_all(&encoded)
+                    .await
+                    .expect("the command client sends the streaming request");
+
+                let mut setup_line = String::new();
+                guarded(
+                    "the streaming setup response arrives",
+                    command_reader.read_line(&mut setup_line),
+                )
+                .await
+                .expect("the setup response is delivered before provisional settle");
+                let setup: Response = serde_json::from_str(setup_line.trim())
+                    .expect("the streaming setup line is a response");
+                assert!(setup.ok, "the stream setup succeeds: {:?}", setup.error);
+                let request_id = setup
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("rpc_stream_started"))
+                    .and_then(|data| data.get("request_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .expect("the setup response carries the stream request id");
+                assert!(request_id.starts_with("ipc-stream-"));
+
+                guarded(
+                    "the production provisional-settle barrier arrives",
+                    settle_entered,
+                )
+                .await
+                .expect("the stream setup reaches the exact settle edge");
+                guarded("the remote stream queues its real chunk", remote_ready_rx)
+                    .await
+                    .expect("the remote handler queues the chunk before shutdown");
+                assert_eq!(
+                    clients.residue().clients,
+                    1,
+                    "the exact event client remains filed"
+                );
+                assert_eq!(
+                    clients.residue().live_tasks,
+                    3,
+                    "the two accepted socket tasks and the unsettled forwarder task are filed"
+                );
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("the streaming registry enters closing", clients.closing()).await;
+                settle_release
+                    .send(())
+                    .expect("the provisional-settle barrier is still waiting");
+                guarded("the real streaming control returns", serving)
+                    .await
+                    .expect("the streaming control task did not panic")
+                    .expect("the streaming control returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "the real stream race leaves no registry residue"
+                );
+                assert_eq!(
+                    registry
+                        .in_use()
+                        .expect("the isolated registry remains readable"),
+                    registry_baseline,
+                    "the real stream race releases every isolated registry lease"
+                );
+
+                drop(command_writer);
+                let mut command_tail = Vec::new();
+                guarded(
+                    "the command socket closes after setup",
+                    tokio::io::AsyncReadExt::read_to_end(&mut command_reader, &mut command_tail),
+                )
+                .await
+                .expect("the command socket reaches EOF");
+                drop(event_writer);
+                let mut event_tail = Vec::new();
+                guarded(
+                    "the event socket closes without forwarding a chunk",
+                    tokio::io::AsyncReadExt::read_to_end(&mut event_reader, &mut event_tail),
+                )
+                .await
+                .expect("the event socket reaches EOF");
+                assert!(
+                    !String::from_utf8_lossy(&event_tail).contains("rpc_call_stream_chunk"),
+                    "the queued chunk is not forwarded after Closing: {}",
+                    String::from_utf8_lossy(&event_tail)
+                );
+
+                let _ = networks_for_cleanup.shutdown_all().await;
+                let _ = link.retire().await;
+                drop(far);
             },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                registry_override: Some(registry.clone()),
-                at_events_stream_entry: None,
-                before_rpc_call: None,
-                before_begin_closing: None,
-                before_provisional_settle: Some(settle_barrier),
-                before_mfa_response_write: None,
-            },
-        ));
-        let clients = guarded("serve publishes its streaming registry", registry_rx)
-            .await
-            .expect("serve publishes the isolated streaming registry");
-
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the streaming control socket path is valid");
-        let event_stream = guarded("event client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (event_reader, mut event_writer) = event_stream.split();
-        let mut event_reader = BufReader::new(event_reader);
-        event_writer
-            .write_all(b"{\"op\":\"events_subscribe\"}\n")
-            .await
-            .expect("the event client sends its subscribe");
-        let mut event_ack = String::new();
-        guarded(
-            "the event subscription is acked",
-            event_reader.read_line(&mut event_ack),
-        )
-        .await
-        .expect("the event subscription answer arrives");
-        let event_ack: Response =
-            serde_json::from_str(event_ack.trim()).expect("the event ack is a response");
-        assert!(
-            event_ack.ok,
-            "the event subscription succeeds: {:?}",
-            event_ack.error
         );
-        let event_data = event_ack.data.expect("the event ack carries data");
-        let client_id: crate::ipc::ClientId = serde_json::from_value(
-            event_data
-                .get("client_id")
-                .cloned()
-                .expect("the event ack carries the client id"),
-        )
-        .expect("the event client id has its wire shape");
-        let client_capability = event_data
-            .get("client_capability")
-            .and_then(serde_json::Value::as_str)
-            .expect("the event ack carries the client capability")
-            .to_owned();
-        assert_eq!(clients.residue().clients, 1, "the event client is live");
-
-        let command_stream = guarded("stream command client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (command_reader, mut command_writer) = command_stream.split();
-        let mut command_reader = BufReader::new(command_reader);
-        let request = Request::RpcCallStream {
-            client_id,
-            client_capability,
-            network: "near-stream-race".to_owned(),
-            peer,
-            method: "race-stream".to_owned(),
-            payload: serde_json::Value::Null,
-        };
-        let mut encoded = serde_json::to_vec(&request).expect("the streaming request encodes");
-        encoded.push(b'\n');
-        command_writer
-            .write_all(&encoded)
-            .await
-            .expect("the command client sends the streaming request");
-
-        let mut setup_line = String::new();
-        guarded(
-            "the streaming setup response arrives",
-            command_reader.read_line(&mut setup_line),
-        )
-        .await
-        .expect("the setup response is delivered before provisional settle");
-        let setup: Response = serde_json::from_str(setup_line.trim())
-            .expect("the streaming setup line is a response");
-        assert!(setup.ok, "the stream setup succeeds: {:?}", setup.error);
-        let request_id = setup
-            .data
-            .as_ref()
-            .and_then(|data| data.get("rpc_stream_started"))
-            .and_then(|data| data.get("request_id"))
-            .and_then(serde_json::Value::as_str)
-            .expect("the setup response carries the stream request id");
-        assert!(request_id.starts_with("ipc-stream-"));
-
-        guarded(
-            "the production provisional-settle barrier arrives",
-            settle_entered,
-        )
-        .await
-        .expect("the stream setup reaches the exact settle edge");
-        guarded("the remote stream queues its real chunk", remote_ready_rx)
-            .await
-            .expect("the remote handler queues the chunk before shutdown");
-        assert_eq!(
-            clients.residue().clients,
-            1,
-            "the exact event client remains filed"
-        );
-        assert_eq!(
-            clients.residue().live_tasks,
-            3,
-            "the two accepted socket tasks and the unsettled forwarder task are filed"
-        );
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
-        );
-        guarded("the streaming registry enters closing", clients.closing()).await;
-        settle_release
-            .send(())
-            .expect("the provisional-settle barrier is still waiting");
-        guarded("the real streaming control returns", serving)
-            .await
-            .expect("the streaming control task did not panic")
-            .expect("the streaming control returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "the real stream race leaves no registry residue"
-        );
-        assert_eq!(
-            registry
-                .in_use()
-                .expect("the isolated registry remains readable"),
-            registry_baseline,
-            "the real stream race releases every isolated registry lease"
-        );
-
-        drop(command_writer);
-        let mut command_tail = Vec::new();
-        guarded(
-            "the command socket closes after setup",
-            tokio::io::AsyncReadExt::read_to_end(&mut command_reader, &mut command_tail),
-        )
-        .await
-        .expect("the command socket reaches EOF");
-        drop(event_writer);
-        let mut event_tail = Vec::new();
-        guarded(
-            "the event socket closes without forwarding a chunk",
-            tokio::io::AsyncReadExt::read_to_end(&mut event_reader, &mut event_tail),
-        )
-        .await
-        .expect("the event socket reaches EOF");
-        assert!(
-            !String::from_utf8_lossy(&event_tail).contains("rpc_call_stream_chunk"),
-            "the queued chunk is not forwarded after Closing: {}",
-            String::from_utf8_lossy(&event_tail)
-        );
-
-        let _ = networks_for_cleanup.shutdown_all().await;
-        let _ = link.retire().await;
-        drop(far);
     }
 
     /// A live `EventsSubscribe` ends with the runtime, and `serve` returns
@@ -4662,110 +4651,116 @@ mod terminal_shutdown_tests {
     /// them first would let the client's own close end the connection, and this
     /// control would then pass against a `serve` that cancelled nothing. End of
     /// file is read afterwards, as the witness that the daemon closed its end.
-    #[tokio::test]
-    async fn v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime() {
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+    #[test]
+    fn v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
+
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the client sends its subscribe");
+
+                // (1) The ack is the causal barrier: past it the connection is in the
+                // registry and parked in the stream loop.
+                let mut ack = String::new();
+                guarded(
+                    "the subscription is acked",
+                    client_reader.read_line(&mut ack),
+                )
+                .await
+                .expect("the daemon answers the subscribe");
+                let ack: Response =
+                    serde_json::from_str(ack.trim()).expect("the ack is a control response");
+                assert!(ack.ok, "the subscription succeeded: {:?}", ack.error);
+                let residue = clients.residue();
+                assert_eq!(residue.clients, 1, "non-vacuity: one live subscriber");
+                assert_eq!(residue.live_tasks, 1, "carried by one accepted task");
+                assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
+
+                // (2) The drain begins.
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("serve begins closing", clients.closing()).await;
+
+                // (3) And `serve` returns, which it cannot do with an accepted task
+                // still live.
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+
+                // (4) Holding nothing.
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "no client, flow, handler, subscription, pending call or task lease remains"
+                );
+
+                // The socket witness, read only now.
+                drop(client_writer);
+                let mut rest = Vec::new();
+                guarded(
+                    "the client's connection ended",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+                )
+                .await
+                .expect("the client's half reads to end");
             },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                registry_override: None,
-                at_events_stream_entry: None,
-                before_rpc_call: None,
-                before_begin_closing: None,
-                before_provisional_settle: None,
-                before_mfa_response_write: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
-
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(b"{\"op\":\"events_subscribe\"}\n")
-            .await
-            .expect("the client sends its subscribe");
-
-        // (1) The ack is the causal barrier: past it the connection is in the
-        // registry and parked in the stream loop.
-        let mut ack = String::new();
-        guarded(
-            "the subscription is acked",
-            client_reader.read_line(&mut ack),
-        )
-        .await
-        .expect("the daemon answers the subscribe");
-        let ack: Response =
-            serde_json::from_str(ack.trim()).expect("the ack is a control response");
-        assert!(ack.ok, "the subscription succeeded: {:?}", ack.error);
-        let residue = clients.residue();
-        assert_eq!(residue.clients, 1, "non-vacuity: one live subscriber");
-        assert_eq!(residue.live_tasks, 1, "carried by one accepted task");
-        assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
-
-        // (2) The drain begins.
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
         );
-        guarded("serve begins closing", clients.closing()).await;
-
-        // (3) And `serve` returns, which it cannot do with an accepted task
-        // still live.
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-
-        // (4) Holding nothing.
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "no client, flow, handler, subscription, pending call or task lease remains"
-        );
-
-        // The socket witness, read only now.
-        drop(client_writer);
-        let mut rest = Vec::new();
-        guarded(
-            "the client's connection ended",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
-        )
-        .await
-        .expect("the client's half reads to end");
     }
 
     /// A padded `EventsSubscribe` holds none of its line's parse capacity once
@@ -4801,148 +4796,154 @@ mod terminal_shutdown_tests {
     ///    registry;
     /// 3. and the connection is still a real one afterwards: the shutdown ends
     ///    it, `serve` returns, and the registry closes holding nothing.
-    #[tokio::test]
+    #[test]
     #[ignore = "reads the test binary's shared resource ledger and must run alone"]
-    async fn v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live() {
-        // Whitespace, so the line is long and the value it decodes to is empty:
-        // `events_subscribe` carries no fields at all, which is the asymmetry a
-        // client would reach for.
-        let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
-        // (1) Non-vacuity, taken from the same function the daemon admits with.
-        let padded_work =
-            myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
-                .expect("the padded line's claim is representable")
-                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
-        assert!(
-            padded_work > 0,
-            "non-vacuity: a padded line reserves parse capacity, so there is \
+    fn v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                // Whitespace, so the line is long and the value it decodes to is empty:
+                // `events_subscribe` carries no fields at all, which is the asymmetry a
+                // client would reach for.
+                let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
+                // (1) Non-vacuity, taken from the same function the daemon admits with.
+                let padded_work =
+                    myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
+                        .expect("the padded line's claim is representable")
+                        .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+                assert!(
+                    padded_work > 0,
+                    "non-vacuity: a padded line reserves parse capacity, so there is \
              something for the release below to be about"
-        );
+                );
 
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (barrier, live, resume) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (barrier, live, resume) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                registry_override: None,
-                at_events_stream_entry: Some(barrier),
-                before_rpc_call: None,
-                before_begin_closing: None,
-                before_provisional_settle: None,
-                before_mfa_response_write: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: Some(barrier),
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
 
-        // The reading to compare against: `serve` is up and listening, and no
-        // connection exists. Taken after the registry is published so the
-        // listener's own acquisitions are already in it.
-        let ledger = crate::test_resource_ledger();
-        let idle = ledger
-            .in_use()
-            .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+                // The reading to compare against: `serve` is up and listening, and no
+                // connection exists. Taken after the registry is published so the
+                // listener's own acquisitions are already in it.
+                let ledger = crate::test_resource_ledger();
+                let idle = ledger
+                    .in_use()
+                    .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
 
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(padded.as_bytes())
-            .await
-            .expect("the client sends its padded subscribe");
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(padded.as_bytes())
+                    .await
+                    .expect("the client sends its padded subscribe");
 
-        // (2) The daemon itself says when the stream is live, from the line
-        // between the ack and the first poll of the loop.
-        guarded("the subscription goes live", live)
-            .await
-            .expect("the connection task reached the stream barrier");
-        let residue = clients.residue();
-        assert_eq!(
-            residue.clients, 1,
-            "non-vacuity: the padded subscribe really is subscribed"
-        );
-        assert_eq!(
-            residue.live_tasks, 1,
-            "and its connection is a live accepted task"
-        );
-        assert_eq!(
-            residue.lifecycle,
-            crate::ipc::Lifecycle::Running,
-            "with nothing shutting down yet"
-        );
-        assert_eq!(
-            ledger
-                .in_use()
-                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
-            idle,
-            "the padded line's parse capacity is back where it was before this \
+                // (2) The daemon itself says when the stream is live, from the line
+                // between the ack and the first poll of the loop.
+                guarded("the subscription goes live", live)
+                    .await
+                    .expect("the connection task reached the stream barrier");
+                let residue = clients.residue();
+                assert_eq!(
+                    residue.clients, 1,
+                    "non-vacuity: the padded subscribe really is subscribed"
+                );
+                assert_eq!(
+                    residue.live_tasks, 1,
+                    "and its connection is a live accepted task"
+                );
+                assert_eq!(
+                    residue.lifecycle,
+                    crate::ipc::Lifecycle::Running,
+                    "with nothing shutting down yet"
+                );
+                assert_eq!(
+                    ledger
+                        .in_use()
+                        .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
+                    idle,
+                    "the padded line's parse capacity is back where it was before this \
              connection existed, while the stream it opened is live -- so the \
              connection kept none of it, and a client that subscribes and never \
              leaves pins none of it"
-        );
+                );
 
-        // (3) And it is a real connection, ended by the runtime rather than by
-        // its client. Both halves are held across `serving` deliberately: a
-        // control that dropped them first would let the client's own close stand
-        // in for the cancellation this asserts, and would pass against a `serve`
-        // that never cancelled anything.
-        resume.send(()).expect("the paused task is still waiting");
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
+                // (3) And it is a real connection, ended by the runtime rather than by
+                // its client. Both halves are held across `serving` deliberately: a
+                // control that dropped them first would let the client's own close stand
+                // in for the cancellation this asserts, and would pass against a `serve`
+                // that never cancelled anything.
+                resume.send(()).expect("the paused task is still waiting");
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("serve begins closing", clients.closing()).await;
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "and the padded subscriber left nothing behind"
+                );
+                // The socket witness, read only now: the client half was open the whole
+                // time, so end of file here is the daemon having closed its end.
+                drop(client_writer);
+                let mut rest = Vec::new();
+                guarded(
+                    "the client's connection ended",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+                )
+                .await
+                .expect("the client's half reads to end");
+            },
         );
-        guarded("serve begins closing", clients.closing()).await;
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "and the padded subscriber left nothing behind"
-        );
-        // The socket witness, read only now: the client half was open the whole
-        // time, so end of file here is the daemon having closed its end.
-        drop(client_writer);
-        let mut rest = Vec::new();
-        guarded(
-            "the client's connection ended",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
-        )
-        .await
-        .expect("the client's half reads to end");
     }
 
     /// A shutdown arriving while an `EventsSubscribe` is mid-commit loses
@@ -4976,137 +4977,143 @@ mod terminal_shutdown_tests {
     /// directory itself would exercise the refusal path on Unix hosts where
     /// that directory is group- or other-accessible, leaving the client to wait
     /// for a listener that was correctly never created.
-    #[tokio::test]
-    async fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let parent = directory.path().join("private");
-        let socket = parent.join("control.sock");
-        assert!(
-            !parent.exists(),
-            "non-vacuity: production must create and secure the socket parent"
-        );
-        let (barrier, arrived, release) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+    #[test]
+    fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let parent = directory.path().join("private");
+                let socket = parent.join("control.sock");
+                assert!(
+                    !parent.exists(),
+                    "non-vacuity: production must create and secure the socket parent"
+                );
+                let (barrier, arrived, release) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: Some(barrier),
-                registry: Some(registry_tx),
-                registry_override: None,
-                at_events_stream_entry: None,
-                before_rpc_call: None,
-                before_begin_closing: None,
-                before_provisional_settle: None,
-                before_mfa_response_write: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: Some(barrier),
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
 
-        // A real client, over the socket `serve` is really listening on.
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                // The listener binds inside the spawned `serve`, so the first
-                // connect can lose the race with it. Retrying is not a timing
-                // assumption — the hang guard is what fails if the listener
-                // never appears at all.
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(b"{\"op\":\"events_subscribe\"}\n")
-            .await
-            .expect("the client sends its subscribe");
+                // A real client, over the socket `serve` is really listening on.
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        // The listener binds inside the spawned `serve`, so the first
+                        // connect can lose the race with it. Retrying is not a timing
+                        // assumption — the hang guard is what fails if the listener
+                        // never appears at all.
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the client sends its subscribe");
 
-        // (1) The connection task is parked at the commit, holding an accepted
-        // `TaskAdmission`, with nothing filed in any table.
-        guarded("the subscribe reaches its commit", arrived)
-            .await
-            .expect("the connection task reached the barrier");
-        assert_eq!(
+                // (1) The connection task is parked at the commit, holding an accepted
+                // `TaskAdmission`, with nothing filed in any table.
+                guarded("the subscribe reaches its commit", arrived)
+                    .await
+                    .expect("the connection task reached the barrier");
+                assert_eq!(
             clients.residue(),
             crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Running).with_tasks(1),
             "nothing is filed yet, but the connection carrying the paused              subscribe is itself an accepted task and is counted as one"
         );
 
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
-        );
-        // Observed, not waited out: this resolves on the registry's own signal,
-        // which `begin_closing` publishes from inside `serve`'s terminal path.
-        // Past this line the drain has provably started.
-        guarded("serve begins closing", clients.closing()).await;
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                // Observed, not waited out: this resolves on the registry's own signal,
+                // which `begin_closing` publishes from inside `serve`'s terminal path.
+                // Past this line the drain has provably started.
+                guarded("serve begins closing", clients.closing()).await;
 
-        // (2) And `serve` has not returned, because a task it accepted is still
-        // alive.
-        assert!(
-            !serving.is_finished(),
-            "serve returned while a connection task it accepted was still live"
-        );
-        assert_eq!(clients.lifecycle(), crate::ipc::Lifecycle::Closing);
+                // (2) And `serve` has not returned, because a task it accepted is still
+                // alive.
+                assert!(
+                    !serving.is_finished(),
+                    "serve returned while a connection task it accepted was still live"
+                );
+                assert_eq!(clients.lifecycle(), crate::ipc::Lifecycle::Closing);
 
-        // (3) Released, the paused request is answered truthfully.
-        release.send(()).expect("the paused task is still waiting");
-        let mut answer = String::new();
-        guarded(
-            "the client is answered",
-            client_reader.read_line(&mut answer),
-        )
-        .await
-        .expect("the daemon answers on the still-open socket");
-        let answer: Response =
-            serde_json::from_str(answer.trim()).expect("the answer is a control response");
-        assert!(
-            !answer.ok,
-            "a subscription refused by the drain is not reported as one that succeeded"
-        );
-        assert!(
-            answer
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("closing")),
-            "and the client is told why: {:?}",
-            answer.error
-        );
+                // (3) Released, the paused request is answered truthfully.
+                release.send(()).expect("the paused task is still waiting");
+                let mut answer = String::new();
+                guarded(
+                    "the client is answered",
+                    client_reader.read_line(&mut answer),
+                )
+                .await
+                .expect("the daemon answers on the still-open socket");
+                let answer: Response =
+                    serde_json::from_str(answer.trim()).expect("the answer is a control response");
+                assert!(
+                    !answer.ok,
+                    "a subscription refused by the drain is not reported as one that succeeded"
+                );
+                assert!(
+                    answer
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("closing")),
+                    "and the client is told why: {:?}",
+                    answer.error
+                );
 
-        // (4) Only now does `serve` return, and it leaves nothing behind.
-        drop(client_writer);
-        drop(client_reader);
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "no client, flow, handler, subscription, pending call or task lease remains"
+                // (4) Only now does `serve` return, and it leaves nothing behind.
+                drop(client_writer);
+                drop(client_reader);
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "no client, flow, handler, subscription, pending call or task lease remains"
+                );
+            },
         );
     }
 }

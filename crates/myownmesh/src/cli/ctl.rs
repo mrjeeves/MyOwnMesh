@@ -50,7 +50,7 @@ pub enum CtlCmd {
     /// custody MFA that guards canonical authoring.
     #[command(subcommand)]
     Governance(GovernanceCmd),
-    /// Shipped Closed-network bootstrap and opaque-relay operations.
+    /// Shipped Closed-network bootstrap and semantic operations.
     #[command(subcommand)]
     Closed(ClosedCmd),
 }
@@ -78,30 +78,6 @@ pub enum ClosedCmd {
         #[arg(long)]
         semantic_policy: String,
     },
-    /// Open an opaque endpoint relay capability.
-    RelayOpen {
-        network: String,
-        relay: String,
-        target: String,
-    },
-    /// Accept one queued opaque endpoint relay offer.
-    RelayAccept {
-        network: String,
-        #[arg(long, default_value_t = 30_000)]
-        wait_ms: u64,
-    },
-    /// Send UTF-8 bytes through an opaque endpoint relay capability.
-    RelaySend { handle: String, payload: String },
-    /// Receive one opaque endpoint relay payload.
-    RelayRecv {
-        handle: String,
-        #[arg(long, default_value_t = 30_000)]
-        wait_ms: u64,
-    },
-    /// Consume and close one opaque endpoint relay capability.
-    RelayClose { handle: String },
-    /// Inspect one relay capability's generation/resource evidence.
-    RelayState { handle: String },
     /// Export one bounded page of canonical semantic facts.
     SemanticPage {
         network: String,
@@ -368,7 +344,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
                 policy,
             );
             config.kind = myownmesh_core::config::NetworkKind::Closed;
-            config.closed_relay.enabled = true;
             Request::NetworkCreateClosed { config }
         }
         CtlCmd::Closed(ClosedCmd::BootstrapExport { network }) => {
@@ -399,7 +374,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
                     policy,
                 );
                 config.kind = myownmesh_core::config::NetworkKind::Closed;
-                config.closed_relay.enabled = true;
                 config
             };
             Request::NetworkImportClosed {
@@ -408,27 +382,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
                 bootstrap,
             }
         }
-        CtlCmd::Closed(ClosedCmd::RelayOpen {
-            network,
-            relay,
-            target,
-        }) => Request::ClosedRelayOpen {
-            network,
-            relay,
-            target,
-        },
-        CtlCmd::Closed(ClosedCmd::RelayAccept { network, wait_ms }) => {
-            Request::ClosedRelayAccept { network, wait_ms }
-        }
-        CtlCmd::Closed(ClosedCmd::RelaySend { handle, payload }) => Request::ClosedRelaySend {
-            handle,
-            payload: payload.into_bytes(),
-        },
-        CtlCmd::Closed(ClosedCmd::RelayRecv { handle, wait_ms }) => {
-            Request::ClosedRelayRecv { handle, wait_ms }
-        }
-        CtlCmd::Closed(ClosedCmd::RelayClose { handle }) => Request::ClosedRelayClose { handle },
-        CtlCmd::Closed(ClosedCmd::RelayState { handle }) => Request::ClosedRelayState { handle },
         CtlCmd::Closed(ClosedCmd::SemanticPage {
             network,
             context_id,
@@ -1366,6 +1319,34 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[derive(clap::Parser, Debug)]
+    struct ClosedCommandParser {
+        #[command(subcommand)]
+        command: ClosedCmd,
+    }
+
+    #[test]
+    fn retired_member_relay_cli_commands_are_rejected() {
+        use clap::Parser;
+
+        for command in [
+            "relay-open",
+            "relay-accept",
+            "relay-send",
+            "relay-recv",
+            "relay-close",
+            "relay-state",
+        ] {
+            let error = ClosedCommandParser::try_parse_from(["closed", command]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        }
+        let retained =
+            ClosedCommandParser::try_parse_from(["closed", "bootstrap-export", "network"]).unwrap();
+        assert!(
+            matches!(retained.command, ClosedCmd::BootstrapExport { network } if network == "network")
+        );
+    }
 
     #[test]
     fn semantic_policy_input_is_complete_strict_and_checked() {

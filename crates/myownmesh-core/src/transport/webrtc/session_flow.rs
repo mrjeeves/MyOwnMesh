@@ -2431,8 +2431,6 @@ impl SessionRealtimeFlows {
                     )),
                     observation: None,
                     callback_work: None,
-                    #[cfg(feature = "route-flow-diagnostics")]
-                    route_flow_receipt: None,
                 },
                 reservation,
             )
@@ -3128,10 +3126,10 @@ mod tests {
     ///
     /// Three legs, and each one fails for a different omission.
     ///
-    /// **Direction.** An outbound open allocates three blocks and an inbound
+    /// **Direction.** An outbound open allocates four blocks and an inbound
     /// open allocates one, so the difference between what the two cost is
-    /// exactly the queue plus the queue's wake. Every other claim an open takes
-    /// is identical across the two — the names are the same length, both
+    /// exactly the queue, its wake, and its in-flight counter. Every other claim
+    /// an open takes is identical across the two — the names are the same length, both
     /// directions take the same `flow_claim`, and the map node is the same type
     /// — so that difference is the root arithmetic and nothing else. Omit the
     /// root claims entirely, or charge one direction-blind constant, and this
@@ -3189,15 +3187,16 @@ mod tests {
         let queue_blocks = u64::try_from(
             std::mem::size_of::<RealtimeFlowQueue<RealtimeSendUnit>>()
                 + std::mem::size_of::<LeasedWake>()
-                // Two `Arc`s, two counters apiece.
-                + 4 * std::mem::size_of::<usize>(),
+                + std::mem::size_of::<queue::InFlightCounter>()
+                // Three `Arc`s, two counters apiece.
+                + 6 * std::mem::size_of::<usize>(),
         )
-        .expect("two block sizes are representable");
+        .expect("three block sizes are representable");
         assert_eq!(
             (with_both - with_inbound) - (with_inbound - empty),
             queue_blocks,
-            "an outbound flow costs exactly two more blocks than an inbound \
-             one: its queue, and the wake that drives that queue's pump"
+            "an outbound flow costs exactly three more blocks than an inbound \
+             one: its queue, the pump's wake, and the in-flight counter"
         );
 
         // A wake outlives the flow that minted it, still paid for.

@@ -1,5 +1,7 @@
 # MyOwnMesh architecture owner playbook
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: execution and ownership contract for the adopted transport-independent
 hybrid networking architecture.
 
@@ -51,7 +53,7 @@ Everything else builds outward from that vertical slice.
 5. **One state class, one owner.** No `Arc<Mutex<GlobalState>>`, replacement engine grab bag, or global command/event enum.
 6. **Open remains open.** Resource control cannot become disguised admission.
 7. **Closed alone adds governance authorization.** Existing `auto_approve`, local roster mutation, or transport state cannot satisfy it.
-8. **No unbounded or plaintext ordinary mesh forwarding.** Any Hub fallback is an explicit bounded path carrying endpoint ciphertext or refusing; a Closed relay remains an exact allocation carrying opaque endpoint packets.
+8. **No custom mesh payload forwarding.** Hubs provide discovery/introduction only. Application data uses endpoint-authenticated WebRTC directly or through configured standard TURN, never Hub/member plaintext or ciphertext transit.
 9. **No translation layer owns product behavior.** Typed boundaries keep one state owner and expose only the capabilities required by their caller.
 10. **Do not invent numeric budgets.** Instrument the complete path, measure supported targets, and surface values for owner review.
 11. **Own properties, not magnitudes.** This package fixes the *properties* of resource ownership. Capacity magnitudes come from a named provider supplied by the deployment or embedder, never from a document, default, or library constant. A concrete provider's arbitration algorithm is that provider's policy, not a basal architectural requirement.
@@ -146,7 +148,6 @@ runtime/attempt
 runtime/session_broker
 runtime/peer_session
 runtime/reachability
-runtime/relay
 connector
 endpoint_auth
 capability
@@ -197,14 +198,14 @@ operation directly.
 | Session Broker | atomic promotion, current policy guard, principal binding, post-auth permits, capability minting | authenticated approval/policy result | packet loops, candidate gathering, durable governance |
 | Peer Session Node | authenticated channels, traffic/replay state, session data-plane capabilities, application queues, recovery and local path selection | peer state, heartbeat, ladder, reliable delivery, media-flow ownership | durable fact construction, global topology authority, codec or screen/camera/audio semantics |
 | Reachability Node | local signaling, candidate, channel, and session observations with local age | connection tracer, traffic recency, heartbeat, carrier diagnostics | participation or authorization |
-| Relay Node | exact route-bound generations, endpoint/accepted/pending/closing custody, and bounded opaque directional allocations and queues | `engine/closed_relay.rs`, `runtime/relay`, Closed network control path | endpoint keys, application parsing, fanout |
+| TURN infrastructure / Hub introduction | separately owned standard TURN service and bounded discovery/setup work | existing STUN/TURN services and Hub introduction adapters | custom member payload routes, endpoint route cipher, mesh authority |
 | Application Gateway | local principal, IPC connections, public handle leases, subscriptions | daemon control, `handle.rs`, GUI facade | internal SessionCapability construction, connector control |
 | Runtime Supervisor | node lifecycle and configuration routing | current driver/service manager | domain state or authorization decisions |
 
 ## 7. Closure and evidence gates
 
 The accepted owner graph is evaluated through atomic runtime, authority,
-durability, relay, resource, and release gates. The coverage checklist in 7.4
+durability, TURN, resource, and release gates. The coverage checklist in 7.4
 maps those concerns to the final owners; it does not create additional product
 variants or ownership paths.
 
@@ -220,7 +221,7 @@ authority path is retained for a caller that lacks a live session capability.
 Exit condition:
 
 ```text
-working direct, TURN, and any bounded encrypted Hub-fallback connectors preserve the same remote Device identity
+working direct and configured standard TURN WebRTC paths preserve the same remote Device identity
 exact endpoint authentication plus current policy and a local principal mint a live SessionCapability
 a generic MyOwnMesh application operation succeeds only through that session
 connected but unauthenticated channels deliver nothing
@@ -232,13 +233,13 @@ no pre-V4 authority path or mixed-version fallback remains
 no operation has an authority bypass
 ```
 
-### 7.2. Authority, durability, relay, and closure
+### 7.2. Authority, durability, TURN, and closure
 
 This gate covers typed durable-semantic and ephemeral-transport lanes, Open and
 Closed semantics with their governance rules, opaque infrastructure,
-bounded encrypted Hub-fallback and Closed-member relay profiles, durable store
+Hub discovery/introduction-only and standard TURN boundaries, durable store
 reopening/compaction, provider resource closure, and the release owner graph.
-Unbounded or plaintext ordinary forwarding, obsolete governance, dead APIs,
+All custom Hub/member application forwarding, obsolete governance, dead APIs,
 and parallel authority paths are absent. The
 closure gate in 7.3 makes these final-state requirements verifiable rather than
 asserted.
@@ -289,7 +290,7 @@ source.
 | Final area | Owner/disposition |
 | --- | --- |
 | Runtime foundation, Endpoint Auth, Session Broker, Attempt, Peer Session, Reachability, and Connector | Integrated owner graph; evidence is evaluated at the named runtime boundary. |
-| Typed signaling lanes, Open semantics, Closed semantics, relay profiles, durable persistence, and resource closure | Integrated authority/data-plane owners; no alternate authority or forwarding path. |
+| Typed signaling lanes, Open semantics, Closed semantics, TURN/introduction boundaries, durable persistence, and resource closure | Integrated authority/data-plane owners; no alternate authority or forwarding path. |
 | Release rollout, daemon, GUI, installer, updater, and platform behavior | Operational owners; platform evidence remains governed by the explicit release ledger. |
 | Causal-contract/application domains | Optional application-domain surface; outside the core completion gate. |
 
@@ -302,7 +303,7 @@ Require compile-fail or visibility tests proving:
 - application code cannot construct signaling records or connector control;
 - connector code cannot mint SessionCapability;
 - signaling code cannot deliver application data;
-- relay code cannot access endpoint traffic keys;
+- TURN service cannot acquire endpoint traffic keys; Hub/signaling code cannot carry application payload;
 - public IDs cannot reconstruct local capabilities;
 - durable semantic code imports no transport runtime.
 
@@ -312,7 +313,7 @@ Cover canonical encoding, signatures, exact context, Open self-participation, Cl
 
 ### 8.3 Deterministic networking simulation
 
-Build fakes for signaling carriers, connectors, connected channels, relay, time, entropy, resources, and fault injection. Exercise every callback order, duplicate, cancellation, crash boundary, and policy invalidation relevant to promotion and recovery.
+Build fakes for signaling carriers, connectors, connected channels, standard TURN, time, entropy, resources, and fault injection. Exercise every callback order, duplicate, cancellation, crash boundary, and policy invalidation relevant to promotion and recovery.
 
 ### 8.4 Real integration matrix
 
@@ -402,9 +403,9 @@ The architecture is complete when all of the following are true:
 7. durable semantics are transport-independent, while transport remains first-class;
 8. Open has no hidden sponsor or pair-permission gate;
 9. Closed alone carries governance authorization;
-10. unbounded or plaintext ordinary mesh-member payload forwarding is absent; only explicitly owned bounded encrypted Hub fallback and Closed-member relay profiles may forward endpoint ciphertext;
-11. relays use exact bounded opaque allocations;
-12. handoff is endpoint-driven, with no route ledger or relay-to-relay requirement;
+10. all custom Hub/member payload forwarding is absent, including ciphertext; direct/configured standard TURN WebRTC is the supported application path;
+11. standard TURN work has finite ownership/accounting and no mesh authority; deleted custom allocation semantics are not reused;
+12. recovery is endpoint-driven, with no custom route cipher, durable route ledger, or member-relay handoff requirement;
 13. reachability is useful local evidence, not authority;
 14. store opening restores durable state but no live networking capability;
 15. every protected resource family has a live lease, a named provider, typed pressure behavior, and an explicit exactness or residual classification, with the resource property gate satisfied and no arbitration algorithm required of a conforming provider;

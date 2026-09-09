@@ -45,8 +45,6 @@ function baseConfig() {
       max_transaction_dirty_main_pages max_uncheckpointed_wal_frames max_freelist_pages
       max_fragmented_pages max_main_journal_bytes max_live_checkpoint_bytes max_database_bytes
       max_wal_bytes wal_checkpoint_threshold_bytes emergency_reserve_bytes`, 65536),
-    routing_policy: { max_next_hops: 8, max_parallel_routes: 4, max_envelope_bytes: 65536,
-      max_dedup_entries: 4096, max_dedup_bytes: 4194304, max_hop_budget: 4 },
     scheduler: {
       ...numeric(`reactive_announce_min_interval_ms reoffer_min_interval_ms stale_inbound_timeout_ms
         probe_ttl_ms probe_resolve_timeout_ms skew_warn_ms skew_clear_ms handshake_timeout_ms
@@ -62,10 +60,7 @@ function baseConfig() {
       exploration_interval_ms: 4000, max_exploration_probes_per_pass: 1, max_exploration_peers_per_reply: 1,
       trickle_imin_ms: 4000, trickle_imax_ms: 8000, trickle_redundancy: 1,
       trickle_reset_window_ms: 8000, trickle_max_resets_per_window: 1 },
-    closed_relay: { enabled: false, ...numeric(`max_allocations max_allocations_per_member
-      max_pending_handshakes pending_handshake_timeout_ms replay_window max_frame_ciphertext_bytes
-      queue_items_per_direction queue_bytes_per_direction bandwidth_rate_bytes_per_second
-      bandwidth_burst_bytes idle_timeout_ms max_lifetime_ms max_control_bytes shutdown_grace_ms`, 64) },
+    introduction: null,
     signaling: { strategy: "none", mdns: true, servers: [], redundancy: 1, denylist: [],
       public_fallback: false,
       mdns_policy: numeric(`max_active_connections max_discovered_peers outbound_queue_capacity
@@ -197,9 +192,35 @@ test("planner refuses incomplete policies, pins, fast timers and unbounded confi
     (c) => { delete c.signaling.mdns_policy.max_discovered_peers; },
     (c) => { delete c.turn_servers; }, (c) => { c.pinned_peers = [key(8)]; },
     (c) => { c.hub.exploration_interval_ms = 20; }, (c) => { c.scheduler.state_watch_interval_ms = 5; },
-    (c) => { c.routing_policy.max_hop_budget = 5; },
+    (c) => { c.introduction = { max_records: 1 }; },
     (c) => { c.label = "x".repeat(4097); }, (c) => { c.self = c; },
     (c) => { Object.defineProperty(c, "label", { enumerable: true, get() { throw new Error("must not call"); } }); },
   ];
   for (const change of changes) { const request = input(); change(request.base_network_config); assert.throws(() => planScaleTopology(request), /scale topology:/); }
+});
+
+test("introduction policy is explicit and copied; removed application relay policies refuse", () => {
+  const omitted = input();
+  delete omitted.base_network_config.introduction;
+  assertManifest(planScaleTopology(omitted));
+  const request = input();
+  request.base_network_config.introduction = numeric(`max_records max_waiters_per_target
+    max_signaling_bytes max_candidates_per_attempt attempt_timeout_ms terminal_retention_ms
+    max_transient_links idle_timeout_ms max_maintenance_per_tick`, 1);
+  const plan = planScaleTopology(request);
+  for (const node of plan.nodes) {
+    assert.deepEqual(node.network_config.introduction, request.base_network_config.introduction);
+    assert.deepEqual(node.network_config.turn_servers, request.base_network_config.turn_servers);
+    assert.deepEqual(node.network_config.signaling, request.base_network_config.signaling);
+  }
+  for (const field of ["closed_relay", "application_transport", "endpoint_cipher", "routing_policy"]) {
+    const obsolete = input();
+    obsolete.base_network_config[field] = {};
+    assert.throws(() => planScaleTopology(obsolete), /exactly its explicit fields/);
+  }
+  for (const value of [0, -1, null]) {
+    const invalid = structuredClone(request);
+    invalid.base_network_config.introduction.max_records = value;
+    assert.throws(() => planScaleTopology(invalid), /safe unsigned integer/);
+  }
 });

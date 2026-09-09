@@ -25,6 +25,8 @@ fn new_test_manager() -> Manager {
         }),
         alloc_close_notify: None,
         resource_admission: Arc::new(crate::resource::UnboundedTestAdmission),
+        cleanup: crate::resource::CleanupStatus::new(&crate::resource::UnboundedTestAdmission)
+            .expect("test cleanup admission"),
     };
     Manager::new(config)
 }

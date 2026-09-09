@@ -19,9 +19,6 @@ publish = false
 # for the explicit integration controls and never enters release artifacts.
 default = []
 transport-lab = ["myownmesh-core/transport-lab"]
-# Forward only the bounded routed-flow evidence feature. It remains off in
-# ordinary daemon and release builds.
-route-flow-diagnostics = ["myownmesh-core/route-flow-diagnostics"]
 # Forward the opt-in system DNS-SD backend through core to signaling.
 system-dnssd = ["myownmesh-core/system-dnssd"]
 

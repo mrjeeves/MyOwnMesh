@@ -22,7 +22,9 @@ use myownmesh_core::{
     CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ResourceClaim, ResourceClass,
     ResourceLease, ServicesConfig,
 };
-use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
+use myownmesh_services::{
+    ServiceCleanupPort, StunServer, StunServerHandle, TurnServer, TurnServerHandle,
+};
 use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
 use myownmesh_signaling::{
     DedicatedTaskCustodian, TaskCustodian, TaskCustodyError, TaskReservation,
@@ -33,11 +35,83 @@ use tracing::{info, warn};
 
 use crate::registry::NetworkRegistry;
 
+/// One explicit, isolated test root and its two real scope records. This is
+/// not the daemon service grant and cannot fund a service's constructor entry.
+#[cfg(test)]
+pub(crate) fn test_cleanup_scope() -> (
+    myownmesh_core::LocalApplicationResourceScope,
+    myownmesh_core::FiniteResourceProvider,
+) {
+    let scopes = myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_scale(2)
+        .expect("two fixture scopes are representable");
+    let grant = myownmesh_services::ServiceCleanupOwner::planning_charge()
+        .expect("service root plan")
+        .checked_add(scopes)
+        .expect("service root and scopes");
+    let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+    let port =
+        myownmesh_core::ResourceProviderPort::new(provider.clone()).expect("fixture process scope");
+    let scope = myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(&port)
+        .expect("fixture cleanup application scope");
+    (scope, provider)
+}
+
+/// Test-only outside-runtime ownership. Even an assertion unwind first drops
+/// the caller runtime, then joins cleanup, before propagating that failure.
+/// The scope is supplied explicitly; this never creates a private owner grant.
+#[cfg(test)]
+pub(crate) fn with_service_cleanup<F, Fut>(
+    (scope, provider): (
+        myownmesh_core::LocalApplicationResourceScope,
+        myownmesh_core::FiniteResourceProvider,
+    ),
+    test: F,
+) -> Fut::Output
+where
+    F: FnOnce(ServiceCleanupPort) -> Fut,
+    Fut: std::future::Future,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the service fixture runtime is constructed");
+    let owner = myownmesh_services::ServiceCleanupOwner::new(scope)
+        .expect("the explicitly planned fixture cleanup root is funded");
+    let port = owner.port();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(test(port))
+    }));
+    drop(runtime);
+    let cleanup = owner.close_and_join();
+    let final_use = provider.in_use();
+    let value = match outcome {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert_eq!(
+        final_use,
+        ResourceClaim::ZERO,
+        "all private cleanup Port/scope/witness owners are released"
+    );
+    let report = cleanup.expect("the outside fixture service owner joins");
+    assert_eq!(
+        report.task_failures, 0,
+        "fixture service tasks settle cleanly"
+    );
+    assert_eq!(
+        report.worker_failures, 0,
+        "fixture service workers join cleanly"
+    );
+    value
+}
+
 /// Owns every running service handle and the config they were started
 /// from. Reconfiguration goes through [`ServiceManager::apply`].
 pub struct ServiceManager {
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
+    cleanup: ServiceCleanupPort,
     state: Mutex<ManagerState>,
 }
 
@@ -77,6 +151,8 @@ struct ManagerState {
     stun: Option<StunServerHandle>,
     turn: Option<TurnServerHandle>,
     signaling: Option<SignalingServerHandle>,
+    #[cfg(test)]
+    signaling_starts: u64,
 }
 
 /// Keeps the signaling task owner and its process-resource charge together.
@@ -266,15 +342,24 @@ impl ServiceManager {
         Ok(())
     }
 
-    pub fn new(mesh: MeshHandle, registry: Arc<NetworkRegistry>) -> Arc<Self> {
+    /// The caller retains the cleanup Owner outside the services' runtime;
+    /// this manager keeps only its non-joining admission Port.
+    pub fn new(
+        mesh: MeshHandle,
+        registry: Arc<NetworkRegistry>,
+        cleanup: ServiceCleanupPort,
+    ) -> Arc<Self> {
         Arc::new(Self {
             mesh,
             registry,
+            cleanup,
             state: Mutex::new(ManagerState {
                 config: ServicesConfig::default(),
                 stun: None,
                 turn: None,
                 signaling: None,
+                #[cfg(test)]
+                signaling_starts: 0,
             }),
         })
     }
@@ -355,7 +440,13 @@ impl ServiceManager {
             if run_standalone_stun {
                 stop_turn_before_standalone_stun(&mut g.turn, &mut failures).await;
                 if let Some(scope) = service_scope.clone() {
-                    match StunServer::start_with_resource_scope(&desired.stun, scope).await {
+                    match StunServer::start_with_resource_scope(
+                        &desired.stun,
+                        scope,
+                        self.cleanup.clone(),
+                    )
+                    .await
+                    {
                         Ok(h) => g.stun = Some(h),
                         Err(e) => {
                             warn!("STUN service failed to start: {e}");
@@ -381,7 +472,13 @@ impl ServiceManager {
             }
             if desired.turn.enabled {
                 if let Some(scope) = service_scope.clone() {
-                    match TurnServer::start_with_resource_scope(&desired.turn, scope).await {
+                    match TurnServer::start_with_resource_scope(
+                        &desired.turn,
+                        scope,
+                        self.cleanup.clone(),
+                    )
+                    .await
+                    {
                         Ok(h) => g.turn = Some(h),
                         Err(e) => {
                             warn!("TURN service failed to start: {e}");
@@ -414,7 +511,16 @@ impl ServiceManager {
                             )
                             .await
                             {
-                                Ok(h) => g.signaling = Some(h),
+                                Ok(h) => {
+                                    #[cfg(test)]
+                                    {
+                                        g.signaling_starts = g
+                                            .signaling_starts
+                                            .checked_add(1)
+                                            .expect("fixture signaling start census fits");
+                                    }
+                                    g.signaling = Some(h);
+                                }
                                 Err(error) => {
                                     warn!("signaling service failed to start: {error}");
                                     failures.push(format!("signaling start: {error}"));
@@ -986,6 +1092,101 @@ async fn leave_all(registry: &NetworkRegistry) -> Result<(), String> {
     }
 }
 
+// The process provider is installed once by Mesh. Each exact child owns its
+// provider and custody home; the parent never mutates process environment.
+#[cfg(test)]
+pub(crate) fn run_isolated_service_fixture(selector: &str, run: impl FnOnce()) {
+    const MARKER: &str = "MYOWNMESH_SERVICE_FIXTURE_CHILD";
+    const CHILD_HOME: &str = "MYOWNMESH_SERVICE_FIXTURE_HOME";
+    const COMPLETED: &[u8] = b"service fixture and outside cleanup completed";
+    if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(selector)) {
+        let home = std::env::var_os(CHILD_HOME).expect("child has an owned custody home");
+        assert!(
+            std::env::var_os("MYOWNMESH_HOME").as_ref() == Some(&home),
+            "child custody home must match its owned home"
+        );
+        run();
+        // Only the full fixture, including its outer owner join and assertions,
+        // can issue this fresh witness. An exact selector matching zero tests cannot.
+        let mut witness = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(std::path::Path::new(&home).join("completed"))
+            .expect("fresh child completion witness");
+        std::io::Write::write_all(&mut witness, COMPLETED).expect("write child completion");
+        return;
+    }
+
+    struct OwnedChild {
+        child: std::process::Child,
+        home: Option<tempfile::TempDir>,
+        reaped: bool,
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                let _ = self.child.kill();
+                if self.child.wait().is_ok() {
+                    self.reaped = true;
+                } else if let Some(home) = self.home.take() {
+                    // Do not remove a live child's custody path on failed reap.
+                    // The parent still fails; this is not detached-work success.
+                    let _ = home.keep();
+                }
+            }
+        }
+    }
+
+    let home = tempfile::tempdir().expect("owned service fixture home");
+    let completion = home.path().join("completed");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(28);
+    let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+        .env(MARKER, selector)
+        .env(CHILD_HOME, home.path())
+        .env("MYOWNMESH_HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn exact service fixture child");
+    let mut owned = OwnedChild {
+        child,
+        home: Some(home),
+        reaped: false,
+    };
+    let status = loop {
+        let observed = owned.child.try_wait().expect("observe owned child");
+        if observed.is_some() {
+            owned.reaped = true;
+        }
+        // Check after the observation too: a late successful exit is not PASS.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exact service fixture exceeded its 28-second work cutoff"
+        );
+        if let Some(status) = observed {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // Drop owns kill/reap on every error. The two seconds before the manager's
+    // 30-second envelope are a reserve, not a proof of an OS kill/join bound.
+    let witness = std::fs::read(completion);
+    let within_deadline = std::time::Instant::now() < deadline;
+    drop(owned);
+    assert!(
+        within_deadline,
+        "child completion observation exceeded the absolute work cutoff"
+    );
+    assert!(
+        status.success(),
+        "exact service fixture child failed: {status}"
+    );
+    assert_eq!(
+        witness.expect("child must complete the entire fixture"),
+        COMPLETED
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,334 +1295,420 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn status_waits_for_paused_apply_state_before_snapshot() {
-        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
-            MeshConfig::default(),
-            identity,
-            crate::test_resource_provider(),
-        )
-        .await
-        .expect("open infrastructure-only mesh");
-        let manager = ServiceManager::new(mesh, NetworkRegistry::new());
+    #[test]
+    fn status_waits_for_paused_apply_state_before_snapshot() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+                let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                    MeshConfig::default(),
+                    identity,
+                    crate::test_resource_provider(),
+                )
+                .await
+                .expect("open infrastructure-only mesh");
+                let manager =
+                    ServiceManager::new(mesh, NetworkRegistry::new(), cleanup_port.clone());
 
-        // `apply` and status_source share this state gate. Holding it models
-        // an apply paused before its registry snapshot: status must not
-        // publish a report until the same gate is released.
-        let apply_state = manager.state.lock().await;
-        let mut pending_status = Box::pin(manager.status_source());
-        tokio::select! {
-            biased;
-            _ = &mut pending_status => {
-                panic!("status crossed the paused apply state gate");
-            }
-            _ = tokio::task::yield_now() => {}
-        }
-        drop(apply_state);
-        let source = pending_status.await;
-        assert_eq!(source.captured.joined, manager.registry.joined_count());
-    }
-
-    #[tokio::test]
-    async fn infrastructure_runtime_rejects_later_node_enable_without_mutation() {
-        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
-            MeshConfig::default(),
-            identity,
-            crate::test_resource_provider(),
-        )
-        .await
-        .expect("open infrastructure-only mesh");
-        let registry = NetworkRegistry::new();
-        let manager = ServiceManager::new(mesh, registry);
-        let mut infrastructure = ServicesConfig::default();
-        infrastructure.node.enabled = false;
-        manager
-            .apply(infrastructure.clone())
-            .await
-            .expect("disable node participation");
-
-        let mut attempted = infrastructure;
-        attempted.node.enabled = true;
-        assert!(matches!(
-            manager.apply(attempted).await,
-            Err(ServicePolicyError::ConnectorPolicyRequired)
-        ));
-        assert!(!manager.current_config().await.node.enabled);
-    }
-
-    #[tokio::test]
-    async fn hosted_start_refusal_is_reported_and_retried_without_losing_successful_owner() {
-        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
-            MeshConfig::default(),
-            identity,
-            crate::test_resource_provider(),
-        )
-        .await
-        .expect("open infrastructure-only mesh");
-        let manager = ServiceManager::new(mesh, NetworkRegistry::new());
-
-        let mut desired = ServicesConfig::default();
-        desired.node.enabled = false;
-        desired.signaling.enabled = true;
-        desired.signaling.port = 0;
-        desired.turn.enabled = true;
-        desired.turn.bind = "not-an-ip".to_string();
-        let error = manager
-            .apply(desired.clone())
-            .await
-            .expect_err("a refused TURN start must not report success");
-        assert!(
-            error.to_string().contains("turn start"),
-            "the reconciliation identifies the refused service: {error}"
+                // `apply` and status_source share this state gate. Holding it models
+                // an apply paused before its registry snapshot: status must not
+                // publish a report until the same gate is released.
+                let apply_state = manager.state.lock().await;
+                let mut pending_status = Box::pin(manager.status_source());
+                tokio::select! {
+                    biased;
+                    _ = &mut pending_status => {
+                        panic!("status crossed the paused apply state gate");
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+                drop(apply_state);
+                let source = pending_status.await;
+                assert_eq!(source.captured.joined, manager.registry.joined_count());
+            },
         );
-        let status = manager.status().await;
-        assert!(status.signaling.enabled && status.signaling.running);
-        assert!(status.turn.enabled && !status.turn.running);
+    }
 
-        // The desired config remains the restart intent. Fixing only the
-        // refused field must retry TURN while retaining the already-running
-        // signaling owner rather than silently skipping either transition.
-        desired.turn.bind = "127.0.0.1".to_string();
-        let status = manager
-            .apply(desired)
-            .await
-            .expect("the same desired config retries the missing owner");
-        assert!(status.signaling.running && status.turn.running);
-        manager
-            .shutdown()
-            .await
-            .expect("successful owners are all consumed by shutdown");
+    #[test]
+    fn infrastructure_runtime_rejects_later_node_enable_without_mutation() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+                let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                    MeshConfig::default(),
+                    identity,
+                    crate::test_resource_provider(),
+                )
+                .await
+                .expect("open infrastructure-only mesh");
+                let registry = NetworkRegistry::new();
+                let manager = ServiceManager::new(mesh, registry, cleanup_port.clone());
+                let mut infrastructure = ServicesConfig::default();
+                infrastructure.node.enabled = false;
+                manager
+                    .apply(infrastructure.clone())
+                    .await
+                    .expect("disable node participation");
+
+                let mut attempted = infrastructure;
+                attempted.node.enabled = true;
+                assert!(matches!(
+                    manager.apply(attempted).await,
+                    Err(ServicePolicyError::ConnectorPolicyRequired)
+                ));
+                assert!(!manager.current_config().await.node.enabled);
+            },
+        );
+    }
+
+    #[test]
+    fn hosted_start_refusal_is_reported_and_retried_without_losing_successful_owner() {
+        const SELECTOR: &str = "services::tests::hosted_start_refusal_is_reported_and_retried_without_losing_successful_owner";
+        run_isolated_service_fixture(SELECTOR, || {
+            let mut desired = ServicesConfig::default();
+            desired.node.enabled = false;
+            desired.signaling.enabled = true;
+            desired.signaling.bind = "127.0.0.1".into();
+            desired.signaling.port = 0;
+            desired.signaling.limits.max_connections = 1; // zero clients in this fixture
+            desired.turn.enabled = true;
+            desired.turn.bind = "127.0.0.1".into();
+            desired.turn.port = 0;
+            let slots = SignalingServer::required_task_custody_slots(&desired.signaling.limits)
+                .expect("actual zero-client signaling custody plan");
+            let signaling = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                ResourceClaim::single(ResourceClass::WorkerOrTask, u64::try_from(slots).unwrap()),
+            )
+            .expect("signaling normalized custody");
+            let grant = TurnServer::startup_planning_charge(&desired.turn)
+                .expect("actual TURN config plan")
+                .checked_add(signaling)
+                .and_then(|c| {
+                    c.checked_add(
+                        myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                            .checked_scale(4)?,
+                    )
+                }) // process, Mesh, retained signaling apply, retry apply
+                .expect("exact hosted constructor cohort");
+            let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+            let resources = myownmesh_core::ResourceProviderPort::new(provider.clone())
+                .expect("hosted process scope");
+            with_service_cleanup(test_cleanup_scope(), |cleanup_port| async move {
+                let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                    MeshConfig::default(),
+                    Arc::new(myownmesh_core::Identity::ephemeral()),
+                    resources,
+                )
+                .await
+                .expect("open isolated infrastructure-only mesh");
+                let baseline = provider.in_use();
+                let manager = ServiceManager::new(mesh, NetworkRegistry::new(), cleanup_port);
+                desired.turn.bind = "not-an-ip".into();
+                let refused = manager.apply(desired.clone()).await;
+                let before = manager.status().await;
+                let before_starts = manager.state.lock().await.signaling_starts;
+                desired.turn.bind = "127.0.0.1".into();
+                let retried = manager.apply(desired).await;
+                let after_starts = manager.state.lock().await.signaling_starts;
+                let stopped = manager.shutdown().await;
+                let final_use = provider.in_use();
+                // All live services have been awaited before evaluating the
+                // discriminators. The outer harness joins even on an unwind.
+                let error = refused.expect_err("invalid TURN bind refuses");
+                assert!(
+                    matches!(&error, ServicePolicyError::Reconciliation(reason)
+                if reason.starts_with("turn start:") && !reason.contains(";")),
+                    "only the intended TURN start was refused: {error}"
+                );
+                assert!(before.signaling.enabled && before.signaling.running);
+                assert!(before.turn.enabled && !before.turn.running);
+                let after = retried.expect("correcting only TURN retries");
+                assert!(after.signaling.running && after.turn.running);
+                assert_eq!(
+                    before.signaling.listen, after.signaling.listen,
+                    "the same signaling listener remains"
+                );
+                assert_eq!(
+                    (before_starts, after_starts),
+                    (1, 1),
+                    "the actual successful signaling constructor ran once"
+                );
+                stopped.expect("successful owners are consumed by shutdown");
+                assert_eq!(
+                    final_use, baseline,
+                    "hosted service leases return to the equivalent baseline"
+                );
+            });
+        });
     }
 
     /// The manager owns the TURN/STUN hand-off as one transaction: the exact
     /// TURN control port is released and observed terminal before standalone
-    /// STUN can bind it.  The second half deliberately leaves only one worker
-    /// slot available after TURN stops, so the first STUN admission is a real
+    /// STUN can bind it. The second half stops TURN before arming pressure,
+    /// leaving one fewer worker than STUN's actual constructor requires. The
+    /// first STUN admission is therefore a real
     /// provider refusal; dropping that lease makes the retained desired config
     /// a successful retry. The control runs its provider-owning body in an
     /// exact-name child test process, because the daemon test provider is
     /// process-global and cannot be replaced after another mesh opens.
-    #[tokio::test]
-    async fn manager_turn_to_stun_releases_port_and_retries_after_underfunding() {
+    #[test]
+    fn manager_turn_to_stun_releases_port_and_retries_after_underfunding() {
         use std::net::SocketAddr;
 
-        if std::env::var_os("MYOWNMESH_ISOLATED_MANAGER_CONTROL").is_none() {
-            let executable = std::env::current_exe().expect("the test executable is available");
-            let status = std::process::Command::new(executable)
-                .args([
-                    "--exact",
-                    "services::tests::manager_turn_to_stun_releases_port_and_retries_after_underfunding",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("MYOWNMESH_ISOLATED_MANAGER_CONTROL", "1")
-                .status()
-                .expect("the isolated manager control can start its child test");
-            assert!(
-                status.success(),
-                "the isolated manager control child failed: {status}"
-            );
-            return;
-        }
+        run_isolated_service_fixture(
+            "services::tests::manager_turn_to_stun_releases_port_and_retries_after_underfunding",
+            || {
+                let mut turn = ServicesConfig::default();
+                turn.node.enabled = false;
+                turn.turn.enabled = true;
+                turn.turn.bind = "127.0.0.1".into();
+                turn.turn.port = 0;
+                turn.turn.public_ip = "127.0.0.1".into();
+                let turn_resources = TurnServer::startup_resource_plan(&turn.turn)
+                    .expect("actual TURN constructor plan");
+                let turn_plan = turn_resources.startup_peak;
+                let turn_ready = turn_resources.ready_retained;
+                assert_eq!(turn_plan, turn_ready.checked_add(turn_resources.transient_peak).unwrap(),
+            "TURN peak is the owning planner's independently normalized ready plus transient claims");
+                let stun_plan =
+                    StunServer::startup_planning_charge().expect("STUN constructor plan");
+                // The two services never overlap. Keep the per-dimension maximum,
+                // plus process/Mesh/two apply scopes (or pressure plus apply) and the
+                // pressure reservation's exact bookkeeping (no added worker slack).
+                let provider_grant =
+                    ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
+                        (class, turn_plan.amount(class).max(stun_plan.amount(class)))
+                    }))
+                    .and_then(|c| {
+                        c.checked_add(
+                            myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                                .checked_scale(4)?,
+                        )
+                    })
+                    .and_then(|c| {
+                        c.checked_add(
+                            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                                ResourceClaim::ZERO,
+                            )
+                            .expect("pressure reservation metadata"),
+                        )
+                    })
+                    .expect("the exact isolated constructor cohort is representable");
+                let provider = myownmesh_core::FiniteResourceProvider::new(provider_grant);
+                let resources = myownmesh_core::ResourceProviderPort::new(provider.clone())
+                    .expect("the isolated manager fixture funds its process scope");
+                with_service_cleanup(test_cleanup_scope(), |cleanup_port| async move {
+                    let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+                    let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                        MeshConfig::default(),
+                        identity,
+                        resources,
+                    )
+                    .await
+                    .expect("open infrastructure-only mesh");
+                    let baseline = provider.in_use();
+                    let manager =
+                        ServiceManager::new(mesh.clone(), NetworkRegistry::new(), cleanup_port);
 
-        let provider_grant = myownmesh_core::ResourceClaim::try_from_entries(
-            myownmesh_core::ResourceClass::ALL
-                .into_iter()
-                .map(|class| (class, 1_000_000)),
-        )
-        .expect("the isolated manager fixture grant is representable");
-        let provider = myownmesh_core::FiniteResourceProvider::new(provider_grant);
-        let resources = myownmesh_core::ResourceProviderPort::new(provider.clone())
-            .expect("the isolated manager fixture funds its process scope");
-        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
-            MeshConfig::default(),
-            identity,
-            resources,
-        )
-        .await
-        .expect("open infrastructure-only mesh");
-        let baseline = provider.in_use();
-        let manager = ServiceManager::new(mesh.clone(), NetworkRegistry::new());
+                    manager
+                        .apply(turn.clone())
+                        .await
+                        .expect("TURN binds its ephemeral control port");
+                    let turn_status = manager.status().await;
+                    let turn_port = turn_status
+                        .turn
+                        .listen
+                        .as_deref()
+                        .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                        .expect("TURN reports its actual control port")
+                        .port();
+                    assert!(turn_status.turn.running);
+                    let turn_live = provider.in_use();
+                    let turn_delta = turn_live
+                        .checked_sub(baseline)
+                        .expect("TURN live accounting is above the baseline");
+                    assert!(
+                        turn_delta != myownmesh_core::ResourceClaim::ZERO,
+                        "TURN owns a nonzero live provider delta"
+                    );
 
-        let mut turn = ServicesConfig::default();
-        turn.node.enabled = false;
-        turn.turn.enabled = true;
-        turn.turn.bind = "127.0.0.1".into();
-        turn.turn.port = 0;
-        turn.turn.public_ip = "127.0.0.1".into();
-        manager
-            .apply(turn.clone())
-            .await
-            .expect("TURN binds its ephemeral control port");
-        let turn_status = manager.status().await;
-        let turn_port = turn_status
-            .turn
-            .listen
-            .as_deref()
-            .and_then(|listen| listen.parse::<SocketAddr>().ok())
-            .expect("TURN reports its actual control port")
-            .port();
-        assert!(turn_status.turn.running);
-        let turn_live = provider.in_use();
-        let turn_delta = turn_live
-            .checked_sub(baseline)
-            .expect("TURN live accounting is above the baseline");
-        assert!(
-            turn_delta != myownmesh_core::ResourceClaim::ZERO,
-            "TURN owns a nonzero live provider delta"
-        );
+                    let mut stun = turn.clone();
+                    stun.turn.enabled = false;
+                    stun.stun.enabled = true;
+                    stun.stun.bind = "127.0.0.1".into();
+                    stun.stun.port = turn_port;
+                    manager
+                        .apply(stun.clone())
+                        .await
+                        .expect("the exact port hand-off binds STUN after TURN terminal");
+                    let handoff = manager.status().await;
+                    assert!(
+                        !handoff.turn.running,
+                        "TURN is terminal before the STUN bind"
+                    );
+                    assert!(handoff.stun.running);
+                    assert_eq!(
+                        handoff
+                            .stun
+                            .listen
+                            .as_deref()
+                            .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                            .expect("STUN reports its live listener")
+                            .port(),
+                        turn_port,
+                        "the STUN listener owns the exact former TURN port"
+                    );
+                    let stun_live = provider.in_use();
+                    let stun_delta = stun_live
+                        .checked_sub(baseline)
+                        .expect("STUN live accounting is above the baseline");
+                    assert!(
+                        stun_delta != myownmesh_core::ResourceClaim::ZERO,
+                        "STUN owns a nonzero live provider delta"
+                    );
+                    let service_scope_plan =
+                        myownmesh_core::FiniteResourceProvider::scope_planning_charge();
+                    assert_eq!(
+                        turn_delta,
+                        turn_ready.checked_add(service_scope_plan).unwrap(),
+                        "TURN owns its exact config-aware normalized constructor cohort"
+                    );
+                    assert_eq!(
+                        stun_delta,
+                        stun_plan.checked_add(service_scope_plan).unwrap(),
+                        "TURN is completely released before the exact STUN constructor cohort"
+                    );
 
-        let mut stun = turn.clone();
-        stun.turn.enabled = false;
-        stun.stun.enabled = true;
-        stun.stun.bind = "127.0.0.1".into();
-        stun.stun.port = turn_port;
-        manager
-            .apply(stun.clone())
-            .await
-            .expect("the exact port hand-off binds STUN after TURN terminal");
-        let handoff = manager.status().await;
-        assert!(
-            !handoff.turn.running,
-            "TURN is terminal before the STUN bind"
-        );
-        assert!(handoff.stun.running);
-        assert_eq!(
-            handoff
-                .stun
-                .listen
-                .as_deref()
-                .and_then(|listen| listen.parse::<SocketAddr>().ok())
-                .expect("STUN reports its live listener")
-                .port(),
-            turn_port,
-            "the STUN listener owns the exact former TURN port"
-        );
-        let stun_live = provider.in_use();
-        let stun_delta = stun_live
-            .checked_sub(baseline)
-            .expect("STUN live accounting is above the baseline");
-        assert!(
-            stun_delta != myownmesh_core::ResourceClaim::ZERO,
-            "STUN owns a nonzero live provider delta"
-        );
-        assert_eq!(
-            turn_delta.amount(myownmesh_core::ResourceClass::SocketOrHandle),
-            stun_delta.amount(myownmesh_core::ResourceClass::SocketOrHandle),
-            "both services own one control socket"
-        );
-        assert_eq!(
-            turn_delta.amount(myownmesh_core::ResourceClass::WorkerOrTask),
-            stun_delta.amount(myownmesh_core::ResourceClass::WorkerOrTask) + 2,
-            "the TURN-only worker ownership is released before STUN admission"
-        );
+                    let live_stun_port = handoff
+                        .stun
+                        .listen
+                        .as_deref()
+                        .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                        .expect("the running STUN endpoint is parseable")
+                        .port();
+                    let advert = build_capability_advert(
+                        &stun,
+                        RunningServicePorts {
+                            signaling: None,
+                            stun: Some(live_stun_port),
+                            turn: None,
+                        },
+                    );
+                    assert!(advert.tags.contains(&"service:stun".to_string()));
+                    let hosted = ServiceAdvert::from_extra(&advert.extra)
+                        .expect("the live STUN endpoint produces an advert");
+                    assert_eq!(
+                        hosted.stun_url.as_deref(),
+                        Some(format!("stun:127.0.0.1:{live_stun_port}").as_str())
+                    );
 
-        let live_stun_port = handoff
-            .stun
-            .listen
-            .as_deref()
-            .and_then(|listen| listen.parse::<SocketAddr>().ok())
-            .expect("the running STUN endpoint is parseable")
-            .port();
-        let advert = build_capability_advert(
-            &stun,
-            RunningServicePorts {
-                signaling: None,
-                stun: Some(live_stun_port),
-                turn: None,
+                    manager
+                        .shutdown()
+                        .await
+                        .expect("first hand-off shuts down cleanly");
+                    assert_eq!(
+                        provider.in_use(),
+                        baseline,
+                        "the first transition returns the provider to its baseline"
+                    );
+
+                    manager
+                        .apply(turn.clone())
+                        .await
+                        .expect("TURN restarts for the underfunded retry arm");
+                    let retry_turn_port = manager
+                        .status()
+                        .await
+                        .turn
+                        .listen
+                        .as_deref()
+                        .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                        .expect("the retry TURN listener reports its port")
+                        .port();
+                    manager
+                        .shutdown()
+                        .await
+                        .expect("TURN is terminal before pressure is armed");
+                    assert_eq!(
+                        provider.in_use(),
+                        baseline,
+                        "post-stop pressure starts at the equivalent baseline"
+                    );
+                    let held_scope = manager
+                        .mesh
+                        .local_application_resource_scope()
+                        .expect("the underfunding lease gets an owner scope");
+                    let available_workers = provider_grant
+                        .checked_sub(provider.in_use())
+                        .expect("the provider remains within its grant")
+                        .amount(myownmesh_core::ResourceClass::WorkerOrTask);
+                    let held_workers = available_workers
+                        .checked_sub(
+                            stun_plan
+                                .amount(ResourceClass::WorkerOrTask)
+                                .checked_sub(1)
+                                .expect("STUN needs workers"),
+                        )
+                        .expect("the exact grant admits a pressure arm one worker short of STUN");
+                    let held_lease = held_scope
+                        .acquire(myownmesh_core::ResourceClaim::single(
+                            myownmesh_core::ResourceClass::WorkerOrTask,
+                            held_workers,
+                        ))
+                        .expect("the fixture leaves exactly one fewer worker than STUN requires");
+
+                    let mut underfunded_stun = turn;
+                    underfunded_stun.turn.enabled = false;
+                    underfunded_stun.stun.enabled = true;
+                    underfunded_stun.stun.bind = "127.0.0.1".into();
+                    underfunded_stun.stun.port = retry_turn_port;
+                    let refusal = manager
+                        .apply(underfunded_stun.clone())
+                        .await
+                        .expect_err("underfunded STUN admission refuses after TURN stop");
+                    assert!(
+                        matches!(&refusal, ServicePolicyError::Reconciliation(reason)
+            if reason.starts_with("stun start:") && reason.contains("resource pressure in WorkerOrTask") && !reason.contains(";")),
+                        "only the intended STUN worker admission is refused: {refusal}"
+                    );
+                    assert_eq!(
+                        manager.current_config().await,
+                        underfunded_stun,
+                        "refused desired config is retained"
+                    );
+                    let refused = manager.status().await;
+                    assert!(!refused.turn.running && !refused.stun.running);
+
+                    drop(held_lease);
+                    drop(held_scope);
+                    let recovered = manager
+                        .apply(underfunded_stun)
+                        .await
+                        .expect("the retained desired STUN config retries after funding");
+                    assert!(!recovered.turn.running && recovered.stun.running);
+                    assert_eq!(
+                        recovered
+                            .stun
+                            .listen
+                            .as_deref()
+                            .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                            .expect("the recovered STUN listener reports its port")
+                            .port(),
+                        retry_turn_port
+                    );
+                    manager
+                        .shutdown()
+                        .await
+                        .expect("retry owner shuts down cleanly");
+                    assert_eq!(
+                        provider.in_use(),
+                        baseline,
+                        "the underfunded refusal and retry leave no provider residue"
+                    );
+                });
             },
-        );
-        assert!(advert.tags.contains(&"service:stun".to_string()));
-        let hosted = ServiceAdvert::from_extra(&advert.extra)
-            .expect("the live STUN endpoint produces an advert");
-        assert_eq!(
-            hosted.stun_url.as_deref(),
-            Some(format!("stun:127.0.0.1:{live_stun_port}").as_str())
-        );
-
-        manager
-            .shutdown()
-            .await
-            .expect("first hand-off shuts down cleanly");
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "the first transition returns the provider to its baseline"
-        );
-
-        manager
-            .apply(turn.clone())
-            .await
-            .expect("TURN restarts for the underfunded retry arm");
-        let retry_turn_port = manager
-            .status()
-            .await
-            .turn
-            .listen
-            .as_deref()
-            .and_then(|listen| listen.parse::<SocketAddr>().ok())
-            .expect("the retry TURN listener reports its port")
-            .port();
-        let held_scope = manager
-            .mesh
-            .local_application_resource_scope()
-            .expect("the underfunding lease gets an owner scope");
-        let available_workers = provider_grant
-            .checked_sub(provider.in_use())
-            .expect("the provider remains within its grant")
-            .amount(myownmesh_core::ResourceClass::WorkerOrTask);
-        let held_workers = available_workers
-            .checked_sub(1)
-            .expect("TURN leaves more than one worker slot available");
-        let held_lease = held_scope
-            .acquire(myownmesh_core::ResourceClaim::single(
-                myownmesh_core::ResourceClass::WorkerOrTask,
-                held_workers,
-            ))
-            .expect("the fixture can hold all but one worker slot");
-
-        let mut underfunded_stun = turn;
-        underfunded_stun.turn.enabled = false;
-        underfunded_stun.stun.enabled = true;
-        underfunded_stun.stun.bind = "127.0.0.1".into();
-        underfunded_stun.stun.port = retry_turn_port;
-        let refusal = manager
-            .apply(underfunded_stun.clone())
-            .await
-            .expect_err("underfunded STUN admission refuses after TURN stop");
-        assert!(refusal.to_string().contains("stun start"));
-        let refused = manager.status().await;
-        assert!(!refused.turn.running && !refused.stun.running);
-
-        drop(held_lease);
-        drop(held_scope);
-        let recovered = manager
-            .apply(underfunded_stun)
-            .await
-            .expect("the retained desired STUN config retries after funding");
-        assert!(!recovered.turn.running && recovered.stun.running);
-        assert_eq!(
-            recovered
-                .stun
-                .listen
-                .as_deref()
-                .and_then(|listen| listen.parse::<SocketAddr>().ok())
-                .expect("the recovered STUN listener reports its port")
-                .port(),
-            retry_turn_port
-        );
-        manager
-            .shutdown()
-            .await
-            .expect("retry owner shuts down cleanly");
-        assert_eq!(
-            provider.in_use(),
-            baseline,
-            "the underfunded refusal and retry leave no provider residue"
         );
     }
 
@@ -1431,34 +1718,41 @@ mod tests {
     /// Asserted on a real running manager rather than on the report type,
     /// because the claim is about what a daemon serving the control socket
     /// actually says, not about which fields a struct happens to declare.
-    #[tokio::test]
-    async fn a_running_daemon_reports_hosted_services_only() {
-        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
-        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
-            MeshConfig::default(),
-            identity,
-            crate::test_resource_provider(),
-        )
-        .await
-        .expect("open infrastructure-only mesh");
-        let manager = ServiceManager::new(mesh, NetworkRegistry::new());
+    #[test]
+    fn a_running_daemon_reports_hosted_services_only() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+                let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+                    MeshConfig::default(),
+                    identity,
+                    crate::test_resource_provider(),
+                )
+                .await
+                .expect("open infrastructure-only mesh");
+                let manager =
+                    ServiceManager::new(mesh, NetworkRegistry::new(), cleanup_port.clone());
 
-        let mut infrastructure = ServicesConfig::default();
-        infrastructure.node.enabled = false;
-        manager
-            .apply(infrastructure)
-            .await
-            .expect("an infrastructure-only config applies");
+                let mut infrastructure = ServicesConfig::default();
+                infrastructure.node.enabled = false;
+                manager
+                    .apply(infrastructure)
+                    .await
+                    .expect("an infrastructure-only config applies");
 
-        let status = serde_json::to_string(&manager.status().await).expect("status serializes");
-        assert!(
-            status.contains("\"signaling\"") && status.contains("\"turn\""),
-            "the status must still describe the services that do exist: {status}"
-        );
-        assert!(
-            !status.contains("application_payload_relay")
-                && !status.contains("member_payload_relay"),
-            "hosted-services status has no application-payload relay field: {status}"
+                let status =
+                    serde_json::to_string(&manager.status().await).expect("status serializes");
+                assert!(
+                    status.contains("\"signaling\"") && status.contains("\"turn\""),
+                    "the status must still describe the services that do exist: {status}"
+                );
+                assert!(
+                    !status.contains("application_payload_relay")
+                        && !status.contains("member_payload_relay"),
+                    "hosted-services status has no application-payload relay field: {status}"
+                );
+            },
         );
     }
 

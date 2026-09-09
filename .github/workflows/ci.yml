@@ -170,7 +170,7 @@ jobs:
   # handshake, the same behaviour over a real TURN relay, and one ignored native
   # connector lifecycle case. The direct and TURN controls also run in their
   # applicable suite-wide jobs; naming them here keeps these three integration
-  # paths separately visible without an exact-name parsing harness.
+  # paths separately visible. TURN controls also require exactly one test.
   integration:
     name: Direct, TURN and native connector integration
     runs-on: ubuntu-22.04
@@ -195,10 +195,15 @@ jobs:
             loopback_handshake_opens_data_channel -- --test-threads=1
 
       - name: TURN-relayed endpoint authentication
+        shell: bash
         run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
           cargo test -p myownmesh-services --test turn_webrtc_endpoint_auth \
             turn_selected_session_authenticates_endpoints_before_bidirectional_data \
-            -- --test-threads=1
+            -- --exact --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
 
       # This is the real Linux-only TURN departure control. The test starts
       # the repository's TURN service in-process, uses relay-only ICE, and is
@@ -206,10 +211,15 @@ jobs:
       # Keep the explicit ignored invocation here so Depart/DepartObserved is
       # exercised honestly without changing compile behavior on other hosts.
       - name: TURN-relayed authenticated departure
+        shell: bash
         run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
           cargo test -p myownmesh-services --test turn_peer_leave \
             authenticated_depart_observed_over_actual_turn \
-            -- --ignored --test-threads=1
+            -- --exact --ignored --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
 
       - name: Native connector replacement and cleanup
         run: |
@@ -240,7 +250,7 @@ jobs:
             trap 'rm -f "$log"' RETURN
             cargo test -p "$package" --locked --test "$target" "$@" \
               "$test_name" -- --exact --test-threads=1 2>&1 | tee "$log"
-            grep -Eq 'running [1-9][0-9]* test' "$log"
+            grep -Fxq 'running 1 test' "$log"
           }
           run_exact myownmesh-core protocol_cutover_absence \
             retired_lowercase_tags_fail_closed_at_mesh_message_decode
@@ -249,23 +259,27 @@ jobs:
           run_exact myownmesh-core network_broadcast_capacity \
             mesh_event_capacity_refuses_zero_and_too_large_before_side_effects
           run_exact myownmesh-core closed_relay_resource_accounting \
-            closed_relay_public_sizing_rejects_max_plus_one_and_preserves_baseline
+            closed_relay_resource_policy_is_not_deserializable_after_cutover
           run_exact myownmesh-core peer_event_pump_shutdown \
             shutdown_joins_a_late_peer_event_pump --features transport-lab
+          run_exact myownmesh-core hub_introduction \
+            coalesced_hub_introduction_creates_one_direct_endpoint_path --features transport-lab
+          run_exact myownmesh-core opaque_flows \
+            opaque_bytes_modes_reopen_bounds_and_stale_owner_use_real_session --features transport-lab
           run_exact myownmesh network_purge_r2 \
             purge_socket_success_deletes_exact_semantic_snapshot --features transport-lab
           run_exact myownmesh-services service_restart_custody \
             awaited_stun_stop_releases_exact_listener_for_immediate_restart
 
-      # Keep the two production-shaped Closed-member relay controls visible as
-      # exact selectors. The nonzero test-count assertion prevents a stale
+      # Keep rejection of the retired member application relay visible as
+      # exact selectors. The exact test-count assertion prevents a stale
       # symbol, feature gate, or renamed target from turning a skipped test
       # into a green command.
-      - name: Closed-member relay focused controls
+      - name: Retired member relay rejection controls
         shell: bash
         run: |
           set -euo pipefail
-          run_exact_relay() {
+          run_exact_rejection() {
             local target="$1"
             local test_name="$2"
             local log
@@ -275,10 +289,10 @@ jobs:
             grep -Fxq 'running 1 test' "$log"
             rm -f "$log"
           }
-          run_exact_relay closed_member_relay_production \
-            closed_members_relay_through_production_local_broker
-          run_exact_relay closed_member_opaque_relay \
-            closed_members_exchange_opaque_payloads_only_through_relay
+          run_exact_rejection closed_member_relay_production \
+            closed_member_relay_wire_and_config_names_are_not_compatibility_aliases
+          run_exact_rejection closed_member_opaque_relay \
+            retired_member_payload_variants_fail_closed_at_the_wire_boundary
 
   # Exercise the opt-in system DNS-SD backend separately from the embedded
   # default and the no-default release boundary.  The compatibility package

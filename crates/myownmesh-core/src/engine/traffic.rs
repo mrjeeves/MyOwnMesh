@@ -49,8 +49,7 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::HubTreeAttachRequest(_)
         | MeshMessage::HubTreeAttachResponse(_)
         | MeshMessage::HubIntroduction(_)
-        | MeshMessage::ApplicationFlowControl(_)
-        | MeshMessage::ClosedRelayControl(_) => FrameClass::Control,
+        | MeshMessage::ApplicationFlowControl(_) => FrameClass::Control,
         MeshMessage::Fact(_)
         | MeshMessage::FactPage(_)
         | MeshMessage::FactInventory(_)
@@ -60,8 +59,6 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
-        | MeshMessage::ClosedRelayData(_)
-        | MeshMessage::RoutedApplication(_)
         | MeshMessage::RpcRequest(_)
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)
@@ -223,36 +220,6 @@ mod tests {
             }),
             FrameClass::App
         );
-        let origin_key = SigningKey::from_bytes(&[31; 32]);
-        let destination_key = SigningKey::from_bytes(&[32; 32]);
-        let origin = crate::semantic::DeviceId::from_public_key_bytes(
-            *origin_key.verifying_key().as_bytes(),
-        )
-        .expect("origin device id");
-        let destination = crate::semantic::DeviceId::from_public_key_bytes(
-            *destination_key.verifying_key().as_bytes(),
-        )
-        .expect("destination device id");
-        let payload = crate::protocol::topology::ciphertext_payload_for_test(
-            crate::semantic::MeshContextId::from_bytes([33; 32]),
-            &origin,
-            &destination,
-            32,
-        );
-        let routed = crate::protocol::RoutedApplicationEnvelope::new(
-            crate::semantic::MeshContextId::from_bytes([33; 32]),
-            origin,
-            destination,
-            [34; 16],
-            1,
-            payload,
-            &origin_key,
-        )
-        .expect("routed application envelope");
-        assert_eq!(
-            class_of(&MeshMessage::RoutedApplication(routed)),
-            FrameClass::App
-        );
     }
 
     // BEGIN hub topology accounting controls
@@ -333,36 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_rpc_and_signed_routed_frames_keep_application_accounting() {
-        let key = SigningKey::from_bytes(&[44; 32]);
-        let destination_key = SigningKey::from_bytes(&[45; 32]);
-        let origin =
-            crate::semantic::DeviceId::from_public_key_bytes(key.verifying_key().to_bytes())
-                .expect("canonical origin");
-        let destination = crate::semantic::DeviceId::from_public_key_bytes(
-            destination_key.verifying_key().to_bytes(),
-        )
-        .expect("canonical destination");
-        let context = crate::semantic::MeshContextId::from_bytes([46; 32]);
-        // Ciphertext representation suffices for accounting; this is not an
-        // AEAD or native-delivery control. The route signature is genuine.
-        let payload = crate::protocol::topology::ciphertext_payload_for_test(
-            context,
-            &origin,
-            &destination,
-            32,
-        );
-        let routed = crate::protocol::RoutedApplicationEnvelope::new(
-            context,
-            origin,
-            destination,
-            [47; 16],
-            1,
-            payload,
-            &key,
-        )
-        .expect("signed routed envelope");
-        routed.verify().expect("genuine route signature");
+    fn channel_and_rpc_keep_application_accounting() {
         for message in [
             MeshMessage::Channel {
                 channel: "accounting".into(),
@@ -374,7 +312,6 @@ mod tests {
                 payload: serde_json::json!({"value": 1}),
                 streaming: false,
             }),
-            MeshMessage::RoutedApplication(routed),
         ] {
             assert_eq!(class_of(&message), FrameClass::App);
             assert!(matches!(

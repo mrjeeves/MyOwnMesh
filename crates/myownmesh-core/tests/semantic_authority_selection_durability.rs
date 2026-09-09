@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
-    SignalingConfig, TopologyMode, SQLITE_DEFAULT_PAGE_SIZE_BYTES,
+    NetworkConfig, NetworkKind, SemanticPolicyConfig, SignalingConfig, TopologyMode,
+    SQLITE_DEFAULT_PAGE_SIZE_BYTES,
 };
 use myownmesh_core::semantic::{
     Admission, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, FactId, MeshContextId,
@@ -33,8 +33,7 @@ const TOTAL_FACTS: usize = BEFORE_REOPEN_FACTS + 1;
 const MEMBERSHIP_BEFORE_REOPEN: usize = 16;
 const MEMBERSHIP_TOTAL_FACTS: usize = MEMBERSHIP_BEFORE_REOPEN + 1;
 const PAGE_FACTS: u32 = 3;
-const PAGE_BYTES: u32 =
-    myownmesh_core::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES as u32;
+const PAGE_BYTES: u32 = 65_535;
 static HOME_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct ScopedMeshHome {
@@ -125,17 +124,15 @@ fn config(name: &str) -> NetworkConfig {
         semantic_policy,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
-        routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
-        application_transport: None,
         tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         pinned_peers: Vec::new(),
         auto_approve: false,
-        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 

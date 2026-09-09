@@ -72,7 +72,6 @@ fn network(id: &str) -> NetworkConfig {
         ..SignalingConfig::default()
     };
     config.auto_approve = true;
-    config.application_transport = None;
     config
         .validate()
         .expect("opaque-flow network config validates");

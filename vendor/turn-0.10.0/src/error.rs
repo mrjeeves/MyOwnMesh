@@ -15,6 +15,8 @@ pub enum Error {
     ErrNoAvailableConns,
     #[error("resource admission refused")]
     ErrResourceAdmission,
+    #[error("TURN cleanup failed: {0:?}")]
+    Cleanup(crate::resource::CleanupFailure),
     #[error("turn: PacketConnConfig must have a non-nil Conn")]
     ErrConnUnset,
     #[error("turn: ListenerConfig must have a non-nil Listener")]
