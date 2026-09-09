@@ -293,7 +293,7 @@ pub mod transport_lab {
     }
 
     /// Drive the authenticated departure path for a transport-lab state.
-    #[cfg(all(test, feature = "transport-lab"))]
+    #[cfg(feature = "transport-lab")]
     pub async fn depart_for_lab(state: &Arc<NetworkState>) -> super::DepartureRunOutcome {
         super::depart_authenticated_sessions(state).await
     }
@@ -8516,14 +8516,14 @@ impl ChannelDisposition {
 /// followed by the exact logical wait for `DepartObserved` or session
 /// cancellation; there is no retry or timer. The witness makes a stale receipt
 /// unable to satisfy a replacement session.
-#[cfg(all(test, feature = "transport-lab"))]
+#[cfg(feature = "transport-lab")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DepartureRunOutcome {
     pub observed: usize,
     pub cancelled: usize,
 }
 
-#[cfg(not(all(test, feature = "transport-lab")))]
+#[cfg(not(feature = "transport-lab"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DepartureRunOutcome {
     pub(crate) observed: usize,

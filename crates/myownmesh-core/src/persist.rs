@@ -164,7 +164,7 @@ impl DirectoryCapability {
                 self.fd.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                mode as libc::mode_t,
+                mode as libc::mode_t as libc::c_uint,
             )
         };
         if raw < 0 {

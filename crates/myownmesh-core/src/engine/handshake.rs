@@ -795,12 +795,6 @@ pub async fn on_auth_response(
     let policy_admits = canonical_policy_admits_both(state, device_id);
     let open_participation = is_open_participation(state);
     let auto_approve = !open_participation && policy_admits && state.config.read().auto_approve;
-    // Presence is ephemeral; the Open policy gate is evaluated against this
-    // authenticated owner directly and never authors or forwards a durable
-    // participation fact. Re-run the canonical gate now that the owner is
-    // pending so the approval decision closes this ordering window.
-    reevaluate_after_role_grant(state, owner).await;
-
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "handshake",
@@ -830,6 +824,12 @@ pub async fn on_auth_response(
         verification_code,
         rostered,
     }));
+
+    // Publish authentication before this actor's reevaluation. That helper
+    // may synchronously complete promotion and emit Approved; keeping it
+    // after this event preserves proof-before-admission ordering for this
+    // reviewed actor path.
+    reevaluate_after_role_grant(state, owner).await;
 }
 
 pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {

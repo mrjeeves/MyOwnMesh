@@ -471,10 +471,10 @@ async fn subscribe_client(
 async fn identity(path: &Path, deadline: Instant) -> Result<String, String> {
     let response = request(path, json!({"op":"identity_show"}), deadline).await?;
     response
-        .pointer("/data/device_id")
+        .pointer("/data/pubkey")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "identity response has no device_id".to_owned())
+        .ok_or_else(|| "identity response has no pubkey".to_owned())
 }
 
 async fn wait_for_peer(path: &Path, peer: &str, deadline: Instant) -> Result<(), String> {
