@@ -64,6 +64,8 @@ pub struct PeerStateData {
     pub nonce_received: Option<String>,
     pub verification_code_sent: Option<String>,
     pub verification_code_received: Option<String>,
+    /// Last accepted data-channel frame or admitted current-session SRTP
+    /// sample. Media must count too: silence checks govern the whole transport.
     pub last_recv_at: Option<Instant>,
     pub last_ping_sent_at: Option<Instant>,
     /// Wall-clock of the most recent SDP offer we sent for this

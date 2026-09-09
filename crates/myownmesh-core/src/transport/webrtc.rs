@@ -2729,6 +2729,57 @@ mod tests {
     }
 
     #[test]
+    fn paced_repair_preserves_samples_under_bounded_reordering() {
+        use rand::{seq::SliceRandom, SeedableRng};
+
+        for seed in 0..64 {
+            let mut asm = H264AuAssembler::default();
+            let now = Instant::now();
+            let start = 65520u16;
+            asm.push_at(&rtp_pkt(start.wrapping_sub(1), 50, true, IDR_NAL), now)
+                .unwrap();
+            let mut packets = Vec::new();
+            let mut expected = Vec::new();
+            for picture in 0..4u32 {
+                for sample in 0..4u16 {
+                    let seq = start.wrapping_add(picture as u16 * 12 + sample * 3);
+                    let timestamp = 100 + picture * 3000;
+                    packets.push(rtp_pkt(seq, timestamp, false, FU_S));
+                    packets.push(rtp_pkt(seq.wrapping_add(1), timestamp, false, FU_M));
+                    packets.push(rtp_pkt(seq.wrapping_add(2), timestamp, true, FU_E));
+                    expected.push(timestamp);
+                }
+            }
+            packets.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+            let mut received = Vec::new();
+            for packet in &packets {
+                for event in asm
+                    .push_at(packet, now + Duration::from_millis(55))
+                    .unwrap()
+                {
+                    match event {
+                        H264AssemblyEvent::Sample(sample) => {
+                            assert_eq!(
+                                sample.data.as_ref(),
+                                [0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33],
+                                "seed {seed}"
+                            );
+                            received.push(sample.rtp_timestamp);
+                        }
+                        H264AssemblyEvent::Discontinuity { .. } => {
+                            panic!("premature loss for seed {seed}")
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                received, expected,
+                "seed {seed}; every packet arrived before the recovery deadline"
+            );
+        }
+    }
+
+    #[test]
     fn paced_repair_late_marker_does_not_restart_visible_hole_deadline() {
         let mut asm = H264AuAssembler::default();
         let now = Instant::now();
