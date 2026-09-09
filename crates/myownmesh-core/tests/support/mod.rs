@@ -307,6 +307,24 @@ pub fn test_transport() -> Transport {
         let grant = grant
             .checked_add(mdns_connection_pair)
             .expect("the fixture mDNS connection grant is representable");
+        // The transport-lab mDNS workload has two live network owners per
+        // test worker. Fund each owner's four startup reservations from the
+        // same policy/backend planners used by attachment, independently of
+        // the TCP pair above. No startup term is borrowed from connector slack.
+        #[cfg(feature = "transport-lab")]
+        let grant = {
+            let startup =
+                myownmesh_core::engine::transport_lab::mdns_startup_planning_claim_for_lab(
+                    &myownmesh_core::config::MdnsPolicyConfig::default(),
+                )
+                .expect("the configured mDNS startup reservations are representable");
+            let startup = startup
+                .checked_scale(application_scopes)
+                .expect("the two-owner mDNS startup workload is representable");
+            grant
+                .checked_add(startup)
+                .expect("the fixture mDNS startup grant combines without overflow")
+        };
         ResourceProviderPort::new(FiniteResourceProvider::new(grant))
             .expect("the fixture provider accounts for its process scope")
     });

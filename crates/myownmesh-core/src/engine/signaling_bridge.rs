@@ -1302,6 +1302,51 @@ pub fn mdns_connection_identity_planning_claim(
     crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
 }
 
+/// Plan the four retained startup reservations for one configured mDNS owner.
+/// Each lease includes its own provider bookkeeping before the claims are summed.
+/// This observes existing claims only; it neither acquires resources nor starts
+/// a driver. Connection, mailbox and application-scope funding remain separate.
+#[cfg(feature = "transport-lab")]
+pub fn mdns_startup_planning_claim_for_lab(
+    policy: &crate::config::MdnsPolicyConfig,
+) -> std::result::Result<ResourceClaim, crate::resource::ResourceUnavailable> {
+    let invalid_plan = || crate::resource::ResourceUnavailable::ProviderInvariant {
+        dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+    };
+    let limits = mdns_limits_from_policy(policy).ok_or_else(invalid_plan)?;
+    let backend = mdns_driver::driver::configured_discovery_backend();
+    let retention =
+        DiscoveryRetention::from_backend(limits.discovery, backend).map_err(mdns_planning_error)?;
+    let driver_plan = mdns_driver::driver::checked_driver_custody_plan(limits.discovery, backend)
+        .map_err(mdns_planning_error)?;
+    let custodian_plan =
+        mdns_custodian_plan(backend, retention, driver_plan).ok_or_else(invalid_plan)?;
+    let claims = [
+        SignalingTaskCustodian::bridge_claim(),
+        SignalingTaskCustodian::observer_claim()?,
+        MdnsTaskCustodian::provider_claim_with_plan(
+            retention.outer_driver_task_slots,
+            Some(custodian_plan),
+        )?,
+        mdns_discovery_claim(retention).map_err(mdns_planning_error)?,
+    ];
+    let mut total = ResourceClaim::ZERO;
+    for claim in claims {
+        let charge = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)?;
+        total = total.checked_add(charge).map_err(|error| {
+            crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: match error {
+                    crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                    | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                        dimension
+                    }
+                },
+            }
+        })?;
+    }
+    Ok(total)
+}
+
 impl AliasProvider for CoreMdnsAliasProvider {
     fn retain_discovery(
         &self,

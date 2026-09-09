@@ -187,6 +187,7 @@ pub mod transport_lab {
         ClosedRelayFixtureGrant, ClosedRelayFixtureWorkload, ClosedRelayPendingShareCapacities,
         ClosedRelayPendingShareCapacityWitness,
     };
+    pub use super::signaling_bridge::mdns_startup_planning_claim_for_lab;
     pub use super::state::NetworkState;
     pub use crate::semantic::store::SemanticCommitFaultForLab;
 
