@@ -277,7 +277,9 @@ async fn purge_socket_success_deletes_exact_semantic_store() {
         }
         Err(error) => error,
     };
-    let competing_writer_busy = competing_error.to_string().contains("WriterBusy");
+    let competing_writer_busy = competing_error
+        .to_string()
+        .contains("semantic snapshot writer is busy:");
     assert!(
         competing_writer_busy,
         "competing owner refusal preserves the exact writer fence: {competing_error}"
