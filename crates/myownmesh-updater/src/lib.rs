@@ -12,8 +12,11 @@
 //!   3. Writes `~/.myownmesh/updates/pending.json` so the next process
 //!      start applies them.
 //!
-//! On the next start, [`apply_pending_if_any`] atomically renames the
-//! staged binary over the running one and clears the marker. We never
+//! On the next start, [`apply_pending_if_any`] applies the daemon first, then
+//! the staged GUI, as individual replacements, not an atomic pair. A daemon
+//! apply failure leaves the marker for retry; a failed GUI replacement is
+//! retained in `pending.json` for a later launch without hiding daemon success.
+//! The marker is removed when no unresolved artifacts remain. We never
 //! restart a running daemon in place — that would yank the rug out from
 //! under in-flight connections. The model is "stage now, apply on next
 //! launch."
@@ -22,18 +25,17 @@
 //! are detected and skipped — the OS package manager owns versioning
 //! there.
 //!
-//! Both halves of a portable install are kept in lockstep: the
-//! `myownmesh` daemon binary *and*, when one is installed beside it, the
-//! `myownmesh-gui` desktop binary. Every release publishes a
-//! `myownmesh-gui-<platform>` archive next to the daemon's, so when we
-//! stage an update we stage both and the next launch swaps both — the
-//! GUI no longer drifts to an older version than the daemon it spawns. A
+//! Both halves of a portable install target the same release: the
+//! `myownmesh` daemon binary and an installed portable `myownmesh-gui`.
+//! GUI staging and replacement are best-effort, so the versions may differ
+//! until the GUI update succeeds; a missing GUI asset or staging failure
+//! does not block a daemon update. A
 //! headless box with no GUI installed just updates the daemon; a macOS
 //! `.app` / Linux `.deb` desktop bundle is owned by its own installer
 //! and is left alone (same rule as package-manager installs).
 //!
 //! An explicit `myownmesh update` (see [`update_now`]) does the whole
-//! thing in one shot — check, download, verify, apply both binaries —
+//! sequence in one invocation — check, download, verify, apply per artifact —
 //! mirroring MyOwnLLM's single `myownllm update` command.
 
 mod policy;
@@ -58,7 +60,9 @@ use policy::{compare_semver, policy_allows, ApplyPolicy};
 //   MYOWNMESH_RELEASE_URL_STABLE=https://example.com/releases/latest cargo build
 // At runtime, `auto_update.stable_url` / `beta_url` in config.json take
 // precedence (see `resolve_release_url`), so users can redirect without
-// rebuilding.
+// rebuilding. The feed must return GitHub release-shaped JSON. Changing
+// its URL does not change the embedded signing key; a different trust root
+// requires rebuilding with that key.
 // ---------------------------------------------------------------------------
 
 /// Resolved release feed URL for the stable channel.
@@ -258,7 +262,8 @@ pub enum UpdateNowOutcome {
     PackageManager,
     /// Already on the latest published version; nothing to do.
     UpToDate { current: String, latest: String },
-    /// Updated. `components` lists what was swapped (`daemon`, `gui`).
+    /// Updated. `components` lists only actual swaps (`daemon`, `gui`),
+    /// not all staged artifacts; optional GUI work can remain pending.
     Updated { to: String, components: Vec<String> },
 }
 
@@ -282,15 +287,41 @@ pub fn apply_pending_if_any() {
 
 /// Apply a staged update now, surfacing the result. Returns the version
 /// that was applied (the swap is on disk; it takes effect on the next
-/// process start), or `None` if there was nothing to apply.
+/// process start), or `None` if nothing needed replacement. Pending-only
+/// failure returns an error; daemon success with GUI pending returns its version.
 pub fn apply_now() -> Result<Option<String>> {
+    applied_version_outcome(apply_now_detailed())
+}
+
+fn applied_version_outcome(applied: Result<Option<AppliedUpdate>>) -> Result<Option<String>> {
+    Ok(applied?.map(|result| result.version))
+}
+
+#[derive(Debug)]
+struct AppliedUpdate {
+    version: String,
+    components: Vec<&'static str>,
+}
+
+fn apply_now_detailed() -> Result<Option<AppliedUpdate>> {
     cleanup_old_replaced_binary();
     apply_pending()
 }
 
-fn apply_pending() -> Result<Option<String>> {
+fn apply_pending() -> Result<Option<AppliedUpdate>> {
     let dir = myownmesh_core::dirs::updates_dir()?;
-    recover_pending_marker(&dir)?;
+    apply_pending_at(&dir, artifact_needs_apply, apply_one, record_gui_version)
+}
+
+// Keep path/target seams explicit so local controls exercise the same marker,
+// ordering and replacement results without changing process-global homes.
+fn apply_pending_at(
+    dir: &Path,
+    mut needs_apply: impl FnMut(ArtifactKind, &str) -> bool,
+    mut apply: impl FnMut(&StagedArtifact, &Path, &str) -> Result<bool>,
+    mut record_gui: impl FnMut(&str),
+) -> Result<Option<AppliedUpdate>> {
+    recover_pending_marker(dir)?;
     let pending = dir.join("pending.json");
     if !pending.exists() {
         return Ok(None);
@@ -324,17 +355,17 @@ fn apply_pending() -> Result<Option<String>> {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut remaining = Vec::new();
     for art in order {
-        if !artifact_needs_apply(art.kind, &target_version) {
+        if !needs_apply(art.kind, &target_version) {
             continue;
         }
-        match apply_one(art, &dir, &target_version) {
+        match apply(art, dir, &target_version) {
             Ok(true) => {
                 applied.push(art.kind.as_str());
                 // Stamp the GUI version so a current daemon can later tell
                 // the GUI is up to date (the GUI binary has no readable
                 // version of its own from here).
                 if art.kind == ArtifactKind::Gui {
-                    record_gui_version(&target_version);
+                    record_gui(&target_version);
                 }
             }
             Ok(false) => {} // nothing installed to replace (e.g. no GUI here)
@@ -355,16 +386,24 @@ fn apply_pending() -> Result<Option<String>> {
     } else {
         // Preserve unresolved optional artifacts for the next launch. The
         // daemon result is never hidden behind a best-effort GUI failure.
-        write_pending_marker(&target_version, &remaining)?;
+        write_pending_marker_at(&pending, &target_version, &remaining)?;
     }
     if applied.is_empty() {
+        if !remaining.is_empty() {
+            return Err(Error::msg(
+                "no staged artifacts were applied; unresolved GUI update remains pending",
+            ));
+        }
         return Ok(None);
     }
     tracing::info!(
         "self-update applied {target_version} ({})",
         applied.join("+")
     );
-    Ok(Some(target_version))
+    Ok(Some(AppliedUpdate {
+        version: target_version,
+        components: applied,
+    }))
 }
 
 /// Per-artifact downgrade guard: only swap a binary when `target_version`
@@ -599,7 +638,8 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
             }
         } else {
             // Stage the daemon (it's behind — we're past the up-to-date check) and
-            // the GUI beside it when that's behind too, so both land in lockstep.
+            // the GUI beside it when behind too. Each artifact is staged and
+            // applied independently; an optional GUI failure can leave drift.
             let mut want = vec![ArtifactKind::Daemon];
             if gui_needs_update(&latest) {
                 want.push(ArtifactKind::Gui);
@@ -619,11 +659,13 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
 /// the check interval (the user asked for it, so consent is implied) and
 /// runs even when background checks are disabled in config — but it still
 /// defers to the OS package manager, which owns versioning for those
-/// installs. Brings every installed half up to the latest release: the
+/// installs. Attempts each installed artifact against the latest release: the
 /// daemon if it's behind, and the GUI beside it if its version stamp is
 /// behind or unknown (the "daemon updated, GUI didn't" drift). Applies to
-/// disk immediately and reports what changed; the running processes keep
-/// their old code until restarted.
+/// disk per artifact and reports only actual swaps; optional GUI staging or
+/// replacement can fail independently, with failed replacements kept pending.
+/// If nothing was applied, returns an error rather than claiming an update.
+/// Running processes keep their old code until restarted.
 pub async fn update_now() -> Result<UpdateNowOutcome> {
     let au = load_valid_auto_update()?;
     if detect_install_kind() == InstallKind::PackageManager {
@@ -650,14 +692,23 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
         return Ok(UpdateNowOutcome::UpToDate { current, latest });
     }
 
-    let kinds = stage_release(&release, &latest, &want, &au).await?;
+    stage_release(&release, &latest, &want, &au).await?;
     // Apply right now rather than waiting for the next launch.
-    apply_now()?;
+    let outcome = applied_update_outcome(apply_now_detailed())?;
     stamp_check_now()?;
 
+    Ok(outcome)
+}
+
+fn applied_update_outcome(applied: Result<Option<AppliedUpdate>>) -> Result<UpdateNowOutcome> {
+    let applied = applied?
+        .filter(|result| !result.components.is_empty())
+        .ok_or_else(|| {
+            Error::msg("no staged artifacts were applied; inspect update status before retrying")
+        })?;
     Ok(UpdateNowOutcome::Updated {
-        to: latest,
-        components: kinds.iter().map(|k| k.as_str().to_string()).collect(),
+        to: applied.version,
+        components: applied.components.into_iter().map(str::to_owned).collect(),
     })
 }
 
@@ -701,9 +752,11 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 /// re-sending the whole config.
 ///
 /// `stable_url` / `beta_url` are the white-labelling hook: a vendor can
-/// point the same binary at their own release host at runtime. An empty
-/// string clears the override (revert to the build-time / GitHub
-/// default); a non-empty value pins that feed.
+/// point the same binary at a GitHub release-shaped JSON feed at runtime.
+/// The override preserves the embedded signing key and signature policy;
+/// a different trust root requires rebuilding the binary with that key.
+/// An empty string clears the override (revert to the build-time / GitHub
+/// default); a non-empty value pins that feed, not a new signing authority.
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdatePrefs {
     pub enabled: Option<bool>,
@@ -1010,8 +1063,9 @@ fn gui_exe_name() -> &'static str {
     }
 }
 
-/// Locate an installed `myownmesh-gui` binary so the updater can keep it
-/// in lockstep with the daemon. This is the *inverse* of the daemon's own
+/// Locate an installed `myownmesh-gui` binary so the updater can attempt
+/// the same release independently of the daemon. This is the *inverse* of
+/// the daemon's own
 /// `find_gui_binary` (in `crates/myownmesh/src/cli/gui.rs`) and looks in
 /// the same places, minus the dev-artefact fallback — we never swap a
 /// `cargo`/`tauri dev` build output from under a contributor:
@@ -1246,9 +1300,9 @@ fn basename(path: &str) -> &str {
 // Download, verify, extract, stage.
 // ---------------------------------------------------------------------------
 
-/// Which executable a staged artifact replaces. A release bumps the
-/// daemon and the GUI together, so an update stages one of each (when a
-/// GUI is installed) and the next launch applies both.
+/// Which executable a staged artifact replaces. Daemon and installed GUI
+/// artifacts target the same release, but staging and replacement outcomes
+/// are independent; a GUI failure must not be reported as a completed swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
     Daemon,
@@ -1297,9 +1351,10 @@ struct StagedArtifact {
     sha256: Option<String>,
 }
 
-/// A temporary pathname owned by one staging operation.  The guard makes
-/// every pre-marker failure remove only the file this operation created;
-/// `create_new` below ensures it can never consume a pre-planted pathname.
+/// A temporary pathname owned by one staging operation. Arm this guard only
+/// after `write_exclusive_bytes` succeeds: that helper handles its own write
+/// and sync failures, while this guard handles later failures without taking
+/// ownership of a pre-planted pathname refused by `create_new`.
 struct TempPathGuard {
     path: PathBuf,
     keep: bool,
@@ -1474,8 +1529,8 @@ fn stage_verified_binary(
     ensure_staging_parent(destination_dir, updates_root)?;
     let destination = destination_dir.join(binary_name);
     let temporary = randomized_temp_path(destination_dir, ".myownmesh-binary-", ".tmp");
-    let mut guard = TempPathGuard::new(temporary.clone());
     write_exclusive_bytes(&temporary, bytes)?;
+    let mut guard = TempPathGuard::new(temporary.clone());
     ensure_staging_parent(destination_dir, updates_root)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
         if metadata.file_type().is_symlink() || metadata.is_dir() {
@@ -1613,7 +1668,6 @@ async fn download_verify_stage(
 
     let archive_path = updates_dir.join(&asset_name);
     let part_path = randomized_temp_path(updates_dir, ".myownmesh-download-", ".part");
-    let mut part_guard = TempPathGuard::new(part_path.clone());
 
     let bytes = client
         .get(dl_url)
@@ -1623,6 +1677,7 @@ async fn download_verify_stage(
         .bytes()
         .await?;
     write_exclusive_bytes(&part_path, &bytes)?;
+    let mut part_guard = TempPathGuard::new(part_path.clone());
 
     // Integrity: a published checksum is mandatory. We never stage an
     // unverified binary — a missing sidecar used to fall through to a warning,
@@ -1793,13 +1848,22 @@ fn parse_pending_artifacts(doc: &Value) -> Result<Vec<StagedArtifact>> {
 fn write_pending_marker(version: &str, artifacts: &[StagedArtifact]) -> Result<()> {
     validate_safe_component(version, "release version")?;
     let pending_path = myownmesh_core::dirs::updates_dir()?.join("pending.json");
+    write_pending_marker_at(&pending_path, version, artifacts)
+}
+
+fn write_pending_marker_at(
+    pending_path: &Path,
+    version: &str,
+    artifacts: &[StagedArtifact],
+) -> Result<()> {
+    validate_safe_component(version, "release version")?;
     let parent = pending_path
         .parent()
         .ok_or_else(|| Error::msg("pending marker has no parent"))?;
     std::fs::create_dir_all(parent)?;
     let doc = pending_doc(version, artifacts)?;
     let temp_path = randomized_temp_path(parent, ".myownmesh-pending-", ".tmp");
-    write_pending_marker_with_temp(&pending_path, &doc, &temp_path)
+    write_pending_marker_with_temp(pending_path, &doc, &temp_path)
 }
 
 fn write_pending_marker_with_temp(
@@ -1807,8 +1871,8 @@ fn write_pending_marker_with_temp(
     doc: &Value,
     temp_path: &Path,
 ) -> Result<()> {
-    let mut temp_guard = TempPathGuard::new(temp_path.to_path_buf());
     write_exclusive_bytes(temp_path, serde_json::to_string_pretty(doc)?.as_bytes())?;
+    let mut temp_guard = TempPathGuard::new(temp_path.to_path_buf());
     #[cfg(windows)]
     {
         let backup_path = pending_backup_path(pending_path);
@@ -2438,6 +2502,153 @@ mod tests {
         assert!(pick_gui_asset(&a).is_none());
     }
 
+    // These controls share the actual pending-marker/apply/outcome path, not
+    // network staging or process-global install discovery. Target overrides
+    // are the existing explicit apply_one fixture seam; replacement itself
+    // uses the production digest checks and exclusive-temp atomic writer.
+    fn forced_gui_replacement_failure(daemon_wanted: bool, explicit_update: bool) {
+        // Separate fresh trees exercise each public entry point's actual
+        // conversion with a real apply result, without reconstructing errors.
+        let root = tempfile::tempdir().expect("owned update fixture");
+        let updates = root.path().join("updates");
+        let version = "9999.0.0";
+        let version_dir = updates.join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let daemon_target = root.path().join("installed-daemon");
+        std::fs::write(&daemon_target, b"old daemon").unwrap();
+        // A regular file where a parent directory is required forces an OS
+        // replacement failure on Unix and Windows without ACL/env overrides.
+        let blocked_parent = root.path().join("blocked-gui-parent");
+        std::fs::write(&blocked_parent, b"unchanged blocker").unwrap();
+        let gui_target = blocked_parent.join(gui_exe_name());
+        let gui_bytes = b"verified new GUI";
+        let daemon_bytes = b"verified new daemon";
+        let gui_staged = version_dir.join(gui_exe_name());
+        std::fs::write(&gui_staged, gui_bytes).unwrap();
+        let gui = StagedArtifact {
+            kind: ArtifactKind::Gui,
+            staged: gui_staged.clone(),
+            sha256: Some(sha256_bytes(gui_bytes)),
+        };
+        // GUI first in the marker discriminates the required daemon-first
+        // execution order as well as the staged-versus-applied outcome.
+        let mut artifacts = vec![gui.clone()];
+        if daemon_wanted {
+            let staged = version_dir.join(ArtifactKind::Daemon.bin_name());
+            std::fs::write(&staged, daemon_bytes).unwrap();
+            artifacts.push(StagedArtifact {
+                kind: ArtifactKind::Daemon,
+                staged,
+                sha256: Some(sha256_bytes(daemon_bytes)),
+            });
+        }
+        let marker = updates.join("pending.json");
+        write_pending_marker_at(&marker, version, &artifacts).unwrap();
+        let mut attempts = Vec::new();
+        let mut failures = Vec::new();
+        let mut gui_stamps = Vec::new();
+        let applied = apply_pending_at(
+            &updates,
+            |_, target| version_is_newer(target, Some("1.0.0")),
+            |artifact, directory, target_version| {
+                attempts.push(artifact.kind);
+                let target = if artifact.kind == ArtifactKind::Daemon {
+                    &daemon_target
+                } else {
+                    &gui_target
+                };
+                let result =
+                    apply_one_with_target(artifact, directory, target_version, Some(target), || {});
+                if let Err(error) = &result {
+                    failures.push((artifact.kind, error.to_string()));
+                }
+                result
+            },
+            |target| gui_stamps.push(target.to_string()),
+        );
+        assert_eq!(
+            attempts,
+            if daemon_wanted {
+                vec![ArtifactKind::Daemon, ArtifactKind::Gui]
+            } else {
+                vec![ArtifactKind::Gui]
+            }
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, ArtifactKind::Gui);
+        assert!(failures[0]
+            .1
+            .contains("cannot create exclusive updater temp"));
+        assert!(
+            gui_stamps.is_empty(),
+            "failed replacement must not advance GUI stamp"
+        );
+        assert_eq!(
+            std::fs::read(&blocked_parent).unwrap(),
+            b"unchanged blocker"
+        );
+        assert_eq!(std::fs::read(&gui_staged).unwrap(), gui_bytes);
+        let pending: Value =
+            serde_json::from_slice(&std::fs::read(&marker).expect("failed GUI marker remains"))
+                .unwrap();
+        assert_eq!(pending["version"], version);
+        let remaining = parse_pending_artifacts(&pending).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kind, ArtifactKind::Gui);
+        assert_eq!(remaining[0].staged, gui.staged);
+        assert_eq!(remaining[0].sha256, gui.sha256);
+        if !explicit_update {
+            let outcome = applied_version_outcome(applied);
+            if daemon_wanted {
+                assert_eq!(std::fs::read(&daemon_target).unwrap(), daemon_bytes);
+                assert_eq!(
+                    outcome.expect("daemon applied despite pending GUI"),
+                    Some(version.into())
+                );
+            } else {
+                assert_eq!(std::fs::read(&daemon_target).unwrap(), b"old daemon");
+                assert!(outcome
+                    .expect_err("apply_now must not flatten pending-only failure to None")
+                    .to_string()
+                    .contains("remains pending"));
+            }
+            return;
+        }
+        let outcome = applied_update_outcome(applied);
+        if daemon_wanted {
+            assert_eq!(std::fs::read(&daemon_target).unwrap(), daemon_bytes);
+            match outcome.expect("daemon really applied") {
+                UpdateNowOutcome::Updated { to, components } => {
+                    assert_eq!(to, version);
+                    assert_eq!(components, vec!["daemon".to_string()]);
+                }
+                other => panic!("unexpected actual apply outcome: {other:?}"),
+            }
+        } else {
+            assert_eq!(std::fs::read(&daemon_target).unwrap(), b"old daemon");
+            let error = outcome.expect_err("GUI-only failure must not report Updated(gui)");
+            assert!(error
+                .to_string()
+                .contains("no staged artifacts were applied"));
+        }
+    }
+
+    #[test]
+    fn update_now_daemon_applied_gui_failure_reports_only_daemon_and_keeps_pending() {
+        forced_gui_replacement_failure(true, false);
+        forced_gui_replacement_failure(true, true);
+    }
+
+    #[test]
+    fn update_now_gui_only_replacement_failure_is_not_updated_and_keeps_pending() {
+        forced_gui_replacement_failure(false, false);
+        forced_gui_replacement_failure(false, true);
+        // No marker/no swap remains None for apply_now, but never Updated
+        // for an explicit update_now that already attempted staging.
+        assert_eq!(applied_version_outcome(Ok(None)).unwrap(), None);
+        assert!(applied_update_outcome(Ok(None)).is_err());
+    }
+
     #[test]
     fn pending_doc_roundtrips_daemon_and_gui() {
         let digest = "a".repeat(64);
@@ -2629,6 +2840,30 @@ mod tests {
             b"attacker content"
         );
         assert!(!pending.exists(), "refused marker temp must not publish");
+    }
+
+    #[test]
+    fn marker_temp_is_removed_after_owned_publish_failure() {
+        let tmp = tempfile::tempdir().expect("temporary marker root");
+        let blocker = tmp.path().join("blocked-parent");
+        std::fs::write(&blocker, b"unchanged blocker").expect("block marker parent");
+        let pending = blocker.join("pending.json");
+        let temp = tmp.path().join(".myownmesh-pending-owned.tmp");
+        let doc = json!({ "version": "1.2.3", "artifacts": [] });
+
+        assert!(write_pending_marker_with_temp(&pending, &doc, &temp).is_err());
+        assert!(
+            !temp.exists(),
+            "owned temp must be removed after publish failure"
+        );
+        assert_eq!(
+            std::fs::read(&blocker).expect("blocker remains"),
+            b"unchanged blocker"
+        );
+        assert!(
+            !pending.exists(),
+            "failed publication must not create a marker"
+        );
     }
 
     #[cfg(unix)]

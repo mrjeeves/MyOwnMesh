@@ -61,7 +61,7 @@ async fn open_mesh(
 ```
 
 This uses the exact constructor in [`handle.rs`](../crates/myownmesh-core/src/handle.rs#L105-L115)
-and policy types in [`policy.rs`](../crates/myownmesh-core/src/runtime/attempt/policy.rs#L111-L145).
+and policy types in [`policy.rs`](../crates/myownmesh-core/src/runtime/attempt/policy.rs#L105-L133).
 The provider's grant is deployment policy; the library does not invent a
 capacity value. `ResourceClaim`, `FiniteResourceProvider`, and
 `ResourceProviderPort` are real public building blocks, but the dimensions and

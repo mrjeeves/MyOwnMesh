@@ -853,10 +853,11 @@ async fn mesh_governance_mfa_disable(
 
 // ---- self-update ------------------------------------------------------
 //
-// Thin pass-throughs to the daemon's updater. The daemon owns the actual
-// check / stage / apply (it's the process whose binary gets swapped — the
-// GUI is updated in lockstep beside it), so the GUI never touches the
-// updater crate directly; it just surfaces status and forwards intent.
+// Thin pass-throughs to the daemon's updater. The daemon is updated first;
+// GUI staging/application is best effort, and a failed staged GUI remains
+// pending for recovery or retry. The GUI never changes the embedded signing
+// trust root: an alternate release feed must provide compatible artifacts,
+// while changing the signing authority requires a rebuild.
 
 #[tauri::command]
 async fn update_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {

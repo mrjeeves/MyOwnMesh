@@ -54,7 +54,7 @@ the daemon binary and portable archive members for the seam.
 | Artifact | Where | Audience |
 |---|---|---|
 | `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` | [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases) | End users running the headless daemon; the self-updater consumes the same artifacts. |
-| `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. The self-updater keeps it in lockstep with the daemon (it swaps this binary too when one is installed beside `myownmesh`). Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
+| `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. The self-updater targets the same release for an installed portable GUI; GUI staging and replacement are best-effort, and a failed staged GUI replacement remains pending for retry. Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
 | Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app with full OS integration. |
 | Workspace source and manifests | Git tag `vX.Y.Z` | Embedders and source builders; registry publication is not implied by a tag. |
 
@@ -140,11 +140,15 @@ package manager stays the source of truth.
 ## What updates
 
 A release bumps the daemon (`myownmesh`) and the desktop GUI
-(`myownmesh-gui`) together. The self-updater keeps **both** current:
-when it stages an update it stages the GUI binary too, as long as one
-is installed beside the daemon (the portable `curl | sh` layout), and
-the next launch swaps both. This is what keeps the GUI's window title
-from lagging behind the daemon it spawns.
+(`myownmesh-gui`) together. The self-updater targets that release for the
+installed portable components, including a GUI beside the daemon (the
+portable `curl | sh` layout). GUI staging and replacement are best-effort:
+apply handles the daemon first, then the GUI, as individual replacements,
+not an atomic two-binary transaction. A daemon apply failure leaves the marker
+for retry; a failed staged GUI replacement is retained in `pending.json`
+for a later launch without hiding a successful daemon update. The marker
+is removed when no unresolved artifacts remain; version drift can persist
+until the GUI update succeeds.
 
 A headless box with no GUI updates the daemon alone. A full desktop
 bundle (macOS `.app` / `.dmg`, Linux `.deb` / `.AppImage`, Windows
@@ -157,8 +161,9 @@ rule as a package-manager install.
 myownmesh update
 ```
 
-Fetches the latest release and updates every installed portable component
-(daemon plus the adjacent GUI binary when present). It ignores the
+Fetches the latest release and attempts to update the installed portable components
+(daemon plus the adjacent GUI binary when present), with the same per-artifact
+failure and retry behavior above. It ignores the
 `auto_apply` policy and check interval for this explicit command, but still
 defers to the OS package manager. Restart MyOwnMesh afterwards to run the new
 binaries.

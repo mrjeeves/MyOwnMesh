@@ -38,6 +38,12 @@ required Actions secrets before cutting a release.
 
 ## Scope of this key
 
+Fresh installation through `scripts/install.sh` or `scripts/install.ps1` retains
+the GitHub TLS/account plus published SHA-256 trust model. Those scripts do not
+verify minisign signatures, so they do not establish signing-key provenance.
+This is separate from the compiled-key self-updater verification described here;
+publishing signatures does not imply that every installer consumes them.
+
 This key signs every published release payload, including the opaque Tauri
 installers. The self-updater consumes the signatures for the portable MyOwnMesh
 artifacts it downloads; Tauri installers are verified as release payloads but
@@ -52,7 +58,16 @@ not the same as a signed copy of it.
 
 ## Rotation
 
-Generate a new key, update both `MINISIGN_SECRET_KEY` and
-`MINISIGN_PUBLIC_KEY`, then cut a new release so the updater build receives the
-new `MYOWNMESH_RELEASE_PUBKEY`. Do not publish an artifact signed by a key that
-does not match the public key baked into the release build.
+Each updater build trusts one compiled `MYOWNMESH_RELEASE_PUBKEY`; there is no
+keyring or seamless in-band key rotation. An existing client trusting the old
+key rejects artifacts signed only by a new key, including a replacement updater
+that would trust the new key. Changing a feed URL or repository secret does not
+change the key already installed in clients.
+
+Direct rotation therefore requires manual reinstall or out-of-band distribution
+of the new-key build. Generate the new key, update both `MINISIGN_SECRET_KEY` and
+`MINISIGN_PUBLIC_KEY`, and rebuild with the matching `MYOWNMESH_RELEASE_PUBKEY`.
+New release artifacts must be signed by that matching key, but cannot be assumed
+to self-update old-key clients. The distribution path must establish its intended
+trust separately; the fresh installer model above does not supply signing-key
+provenance. No bridge release or additional trust mechanism is implemented here.

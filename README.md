@@ -39,6 +39,10 @@ The platform installer scripts can fetch a matching release artifact from
 [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases), verify its
 SHA-256 sidecar, and install the daemon and, when supplied, the GUI bundle.
 Exact artifact and platform availability is release-dependent.
+Fresh installation trusts GitHub TLS/account control and the published checksum;
+the installer scripts do not verify minisign signatures and therefore do not
+establish signing-key provenance. This is distinct from the compiled-key checks
+performed by the shipped self-updater; see [Release signing](RELEASE-SIGNING.md).
 
 ```sh
 # macOS / Linux
@@ -235,7 +239,7 @@ myownmesh ctl status       # query a running daemon
 myownmesh ctl networks list
 myownmesh ctl networks join <id>    # join a network (defaults) — persist + attach live
 myownmesh ctl networks leave <id>   # leave a network — detach + remove from config
-myownmesh update           # update everything now (daemon + GUI), then restart
+myownmesh update           # attempt portable updates, daemon first; restart afterwards
 myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config edit      # open ~/.myownmesh/config.json in $EDITOR
@@ -243,12 +247,17 @@ myownmesh install caddy <domain>    # TLS reverse proxy (Caddy) in front of the 
 myownmesh caddy path       # print the Caddyfile location to edit
 ```
 
-A bare `myownmesh update` fetches the latest release and updates the
-daemon **and** the desktop GUI together. The GUI ships as its own binary
-beside the daemon, so the self-updater swaps both; restart afterwards to
-run the new version. Everything the updater does is also a screen —
-Settings → Updates — including the release-feed URL, so you can point a
-fleet at your own release host (white-label) without rebuilding.
+A bare `myownmesh update` targets the latest release for installed portable
+components, applying the daemon first and the GUI separately, not atomically.
+GUI staging and replacement are best-effort; a failed staged GUI replacement
+remains pending for retry, so versions may differ until it succeeds. Restart
+afterwards to run the updated binaries. Package-manager installs and full
+desktop bundles remain owned by their package manager or installer.
+Settings → Updates includes the release-feed URL. A runtime mirror must serve
+GitHub-release-shaped JSON and artifacts signed by the updater's compiled trusted
+key; changing the URL does not change that key. A vendor signing key requires a
+rebuild, not merely a white-label URL override. See [Release signing](RELEASE-SIGNING.md)
+for the limits of key rotation.
 
 A bare `myownmesh` (no subcommand) opens the desktop GUI, which
 auto-spawns the daemon for you. On a headless box
@@ -274,7 +283,7 @@ source checkout.
 - **Node graph** — self at the centre, peers laid out by topology. Click a node (or pick it from the sidebar) for label / display suffix / RTT / capabilities; during pending approval the popup surfaces the per-session 6-char verification code as a tile for out-of-band confirmation.
 - **Approvals tab** (default in Settings) — pending peer requests from every joined network flatten into one list with Approve / Deny inline.
 - **Networks** — one home per network: Status · Settings (label, topology, signaling / STUN / TURN, auto-approve, export, remove) · Connections (live peer table) · Roster (approved devices + roles) · network policy controls. The per-network gear in the sidebar jumps straight here.
-- **Updates** — current version, the auto-update toggle and policy (channel + which version bumps apply on their own), any staged update, and the release-feed URL for white-labelling.
+- **Updates** — current version, the auto-update toggle and policy (channel + which version bumps apply on their own), any staged update, and a compatible release-feed mirror URL; the compiled signing trust key is unchanged.
 - **Activity** — unified event log: peer state transitions, phase changes, ICE / handshake / signaling diagnostics. Quiet toggle suppresses info-level chatter; warns and errors always land.
 
 Layout / wire protocol in [`gui/README.md`](gui/README.md).

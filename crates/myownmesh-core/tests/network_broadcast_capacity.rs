@@ -8,12 +8,26 @@ use std::sync::Arc;
 
 use myownmesh_core::config::NetworkConfig;
 use myownmesh_core::identity::Identity;
-use myownmesh_core::resource::{FiniteResourceProvider, ResourceClaim, ResourceProviderPort};
+use myownmesh_core::resource::{
+    FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
+};
 use myownmesh_core::{Error, Mesh, MeshConfig};
 
-fn no_side_effect_provider() -> ResourceProviderPort {
-    ResourceProviderPort::new(FiniteResourceProvider::new(ResourceClaim::ZERO))
-        .expect("zero fixture provider is structurally valid")
+#[path = "support/semantic_policy.rs"]
+mod semantic_policy;
+use semantic_policy::ordinary_semantic_policy;
+
+fn no_side_effect_provider() -> (ResourceProviderPort, FiniteResourceProvider) {
+    // The port's process scope has one opaque bookkeeping unit of its own;
+    // fund that exact provider construction charge while leaving every mesh
+    // admission dimension otherwise at zero.
+    let provider = FiniteResourceProvider::new(ResourceClaim::single(
+        ResourceClass::OpaqueDependencyResidual,
+        1,
+    ));
+    let resources = ResourceProviderPort::new(provider.clone())
+        .expect("one opaque bookkeeping unit funds the provider port");
+    (resources, provider)
 }
 
 async fn open_with_capacity(event_capacity: u64) -> myownmesh_core::Result<()> {
@@ -22,9 +36,23 @@ async fn open_with_capacity(event_capacity: u64) -> myownmesh_core::Result<()> {
         event_capacity,
         ..MeshConfig::default()
     };
-    Mesh::open_infrastructure_only_with_identity(config, identity, no_side_effect_provider())
+    let (resources, provider) = no_side_effect_provider();
+    let before = provider.in_use();
+    let result = Mesh::open_infrastructure_only_with_identity(config, identity, resources.clone())
         .await
-        .map(|_| ())
+        .map(|_| ());
+    assert_eq!(
+        provider.in_use(),
+        before,
+        "invalid event capacity must not install or consume provider resources"
+    );
+    drop(resources);
+    assert_eq!(
+        provider.in_use(),
+        ResourceClaim::ZERO,
+        "the retained provider port must release its bookkeeping scope"
+    );
+    result
 }
 
 #[tokio::test]
@@ -52,7 +80,11 @@ fn mesh_and_network_broadcaster_capacities_remain_distinct_config_fields() {
         event_capacity: 5,
         connection_trace_capacity: 7,
         scheduler: Default::default(),
-        ..NetworkConfig::from_network_id("capacity", "capacity")
+        ..NetworkConfig::from_network_id_with_semantic_policy(
+            "capacity",
+            "capacity",
+            ordinary_semantic_policy(),
+        )
     };
     let mesh_wire = serde_json::to_value(&mesh).expect("mesh config serializes");
     let network_wire = serde_json::to_value(&network).expect("network config serializes");

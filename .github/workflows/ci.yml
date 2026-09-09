@@ -266,10 +266,19 @@ jobs:
             coalesced_hub_introduction_creates_one_direct_endpoint_path --features transport-lab
           run_exact myownmesh-core opaque_flows \
             opaque_bytes_modes_reopen_bounds_and_stale_owner_use_real_session --features transport-lab
-          run_exact myownmesh network_purge_r2 \
-            purge_socket_success_deletes_exact_semantic_snapshot --features transport-lab
           run_exact myownmesh-services service_restart_custody \
             awaited_stun_stop_releases_exact_listener_for_immediate_restart
+
+      - name: Exact ignored semantic-store purge control
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/network-purge-r2.log"
+          cargo test -p myownmesh --locked --test network_purge_r2 --features transport-lab \
+            purge_socket_success_deletes_exact_semantic_store \
+            -- --exact --ignored --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
 
       # Keep rejection of the retired member application relay visible as
       # exact selectors. The exact test-count assertion prevents a stale

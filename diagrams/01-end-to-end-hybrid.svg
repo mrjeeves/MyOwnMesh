@@ -62,7 +62,7 @@
   <text class="small" x="1045" y="613" text-anchor="middle">ChannelInbound reaches the capability-bound EventsSubscribe client</text>
   <path class="edge" d="M355 512 L355 550"/><path class="edge" d="M1045 512 L1045 550"/>
   <path class="both" d="M640 587 L760 587"/>
-<text class="small" x="700" y="650" text-anchor="middle">Adopted Hub direction (not qualified by this LAN path): bounded demand; direct preferred, TURN distinct, endpoint-ciphertext fallback or refusal.</text>
+<text class="small" x="700" y="650" text-anchor="middle">Beyond this LAN path: bounded Hub setup only; data uses endpoint-authenticated WebRTC, direct or configured standard TURN, otherwise refused.</text>
 
   <text class="small" x="700" y="690" text-anchor="middle">Executable binding: scripts/run-production-e2e.py — shipped binaries, isolated homes, typed delivery, graceful owned shutdown</text>
 </svg>
