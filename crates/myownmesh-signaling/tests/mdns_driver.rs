@@ -40,7 +40,9 @@ fn reaper_custodian() -> std::sync::Arc<dyn TaskCustodian> {
 }
 
 #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
-fn backend_custodian() -> Option<std::sync::Arc<dyn TaskCustodian>> {
+fn backend_custodian(
+    _limits: myownmesh_signaling::mdns::discovery::DiscoveryLimits,
+) -> Option<std::sync::Arc<dyn TaskCustodian>> {
     let plan = myownmesh_signaling::mdns::discovery::checked_embedded_custody_plan()
         .expect("embedded custody plan is valid");
     assert_eq!(plan.observer_slots, 3);
@@ -51,8 +53,17 @@ fn backend_custodian() -> Option<std::sync::Arc<dyn TaskCustodian>> {
 }
 
 #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
-fn backend_custodian() -> Option<std::sync::Arc<dyn TaskCustodian>> {
-    None
+fn backend_custodian(
+    limits: myownmesh_signaling::mdns::discovery::DiscoveryLimits,
+) -> Option<std::sync::Arc<dyn TaskCustodian>> {
+    let capacity = limits
+        .max_resolve_owners
+        .checked_add(2)
+        .expect("system worker capacity fits");
+    Some(
+        DedicatedTaskCustodian::new(capacity).expect("system backend custodian starts")
+            as std::sync::Arc<dyn TaskCustodian>,
+    )
 }
 
 fn close_custodian(owner: &std::sync::Arc<dyn TaskCustodian>) {
@@ -543,7 +554,7 @@ fn discovery_retention_maps_each_backend_and_refusal_is_pre_backend() {
     let (_out_tx, out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (in_tx, _in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
     let driver_owner = driver_custodian();
-    let backend_owner = backend_custodian();
+    let backend_owner = backend_custodian(limits);
     let reaper_owner = reaper_custodian();
     let _custody = CustodianGuards(
         std::iter::once(driver_owner.clone())
@@ -591,7 +602,7 @@ async fn live_driver_releases_discovery_provider_baseline_after_stop() {
     let (_out_tx, out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (in_tx, _in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
     let driver_owner = driver_custodian();
-    let backend_owner = backend_custodian();
+    let backend_owner = backend_custodian(MdnsLimits::default().discovery);
     let reaper_owner = reaper_custodian();
     let _custody = CustodianGuards(
         std::iter::once(driver_owner.clone())
@@ -775,7 +786,7 @@ async fn two_drivers_discover_and_exchange() {
     let b_in = InboundSink::from_unbounded(b_in_tx);
 
     let a_owner = driver_custodian();
-    let a_backend_owner = backend_custodian();
+    let a_backend_owner = backend_custodian(MdnsLimits::default().discovery);
     let a_reaper_owner = reaper_custodian();
     let _a_custody = CustodianGuards(
         std::iter::once(a_owner.clone())
@@ -798,7 +809,7 @@ async fn two_drivers_discover_and_exchange() {
         }
     };
     let b_owner = driver_custodian();
-    let b_backend_owner = backend_custodian();
+    let b_backend_owner = backend_custodian(MdnsLimits::default().discovery);
     let b_reaper_owner = reaper_custodian();
     let _b_custody = CustodianGuards(
         std::iter::once(b_owner.clone())

@@ -77,7 +77,15 @@ fn backend_custodian() -> Option<Arc<dyn TaskCustodian>> {
 
 #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
 fn backend_custodian() -> Option<Arc<dyn TaskCustodian>> {
-    None
+    let capacity = myownmesh_signaling::mdns::driver::MdnsLimits::default()
+        .discovery
+        .max_resolve_owners
+        .checked_add(2)
+        .expect("system worker capacity fits");
+    Some(
+        DedicatedTaskCustodian::new(capacity).expect("system backend custodian starts")
+            as Arc<dyn TaskCustodian>,
+    )
 }
 
 struct CustodianGuards(Vec<Arc<dyn TaskCustodian>>);

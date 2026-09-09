@@ -7391,7 +7391,7 @@ impl NetworkState {
             .with_admitted_current_or_refused(
                 owner,
                 self.session_broker.as_ref(),
-                &self.network_id,
+                &self.mesh_context_id().to_string(),
                 |operation| Some(operation.capture_inbound_dispatch()),
                 |_| None,
             )
@@ -8528,7 +8528,7 @@ impl NetworkState {
             .with_live_session_flow(
                 owner,
                 self.session_broker.as_ref(),
-                &self.network_id,
+                &self.mesh_context_id().to_string(),
                 move |_session, flows, _live| flows.deliver_inbound(delivery),
             )
             .unwrap_or(false)
@@ -8612,7 +8612,7 @@ impl NetworkState {
             .with_live_session_flow_and_worker(
                 owner,
                 self.session_broker.as_ref(),
-                &self.network_id,
+                &self.mesh_context_id().to_string(),
                 effect,
             )
             .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
@@ -8636,7 +8636,7 @@ impl NetworkState {
             .with_live_session_flow(
                 owner,
                 self.session_broker.as_ref(),
-                &self.network_id,
+                &self.mesh_context_id().to_string(),
                 effect,
             )
             .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
@@ -8738,7 +8738,7 @@ impl NetworkState {
             .with_live_session_flow(
                 &owner,
                 self.session_broker.as_ref(),
-                &self.network_id,
+                &self.mesh_context_id().to_string(),
                 effect,
             )
             .unwrap_or(Err(RealtimeFlowError::SessionNotCurrent))
@@ -8768,11 +8768,17 @@ impl NetworkState {
                 }
             }
         }
-        if !self
-            .peers
-            .owner(peer)
-            .is_some_and(|owner| self.peers.has_usable_authenticated_current(&owner))
-        {
+        let directly_admitted = self.peers.owner(peer).is_some_and(|owner| {
+            self.peers
+                .with_live_session(
+                    &owner,
+                    self.session_broker.as_ref(),
+                    &self.mesh_context_id().to_string(),
+                    |_| (),
+                )
+                .is_some()
+        });
+        if !directly_admitted {
             let (endpoint, _identity_work) = self.funded_endpoint_id(peer)?;
             self.ensure_endpoint_cipher_ready(&endpoint).await?;
         }
