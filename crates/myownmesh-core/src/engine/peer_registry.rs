@@ -172,6 +172,18 @@ impl PeerBindingCoordinate {
 }
 
 impl PeerOwnerToken {
+    /// Allocation-free equality for an already captured installation and
+    /// optional worker. An unstamped token never equals a worker-stamped one.
+    /// This compares witnesses only; it does not establish current admission.
+    pub(crate) fn same_exact_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.installation, &other.installation)
+            && match (&self.worker, &other.worker) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub(crate) fn device_id(&self) -> &str {
         &self.peer.device_id
     }
@@ -504,7 +516,20 @@ impl PeerRegistry {
     /// or installation change; the bootstrap-bound FactGraph evaluator remains
     /// the sole authority for the decision.
     pub(super) fn routed_origin_policy_admits(&self, origin: &crate::semantic::DeviceId) -> bool {
-        self.policy_admits(origin)
+        let Some(bootstrap) = self.canonical_bootstrap.read().clone() else {
+            return false;
+        };
+        let Some(graph) = self.canonical_fact_graph.read().clone() else {
+            return false;
+        };
+        // This is the startup-owned local identity, not the cold routed key.
+        // Borrow origin unchanged so a wire check cannot populate the global
+        // interner before its endpoint signature/policy has been admitted.
+        let Ok(local) = crate::semantic::DeviceId::from_canonical_str(&self.local_device_id) else {
+            return false;
+        };
+        let graph = graph.read();
+        super::governance::canonical_policy_admits_devices(&bootstrap, &graph, &local, origin)
     }
 
     /// Bind the queue newly minted sessions are announced on.
@@ -1472,6 +1497,40 @@ impl PeerRegistry {
         })
     }
 
+    /// Admit a queued control on its originally captured authenticated channel.
+    /// No selected-channel lookup and no replacement logical witness is minted.
+    pub(super) fn admit_exact_channel_application_operation(
+        &self,
+        mut channel: ExactChannelOperation,
+    ) -> Option<AdmittedApplicationOperation> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(channel.owner().device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &channel.owner().installation)
+            || !channel.witness().is_live()
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.holds_promoted_session()
+            || !self.policy_admits(channel.owner().device_id())
+            || !peer.owns_authenticated_worker(channel.worker())
+            || peer.with_logical_session_state(|logical| {
+                channel.witness().same_validity(logical.validity())
+            }) != Some(true)
+        {
+            return None;
+        }
+        // ExactChannelOperation already carries the captured worker, while
+        // its logical owner is deliberately workerless. Stamp that SAME worker
+        // so begin() also rechecks channel ownership after its native permit
+        // acquisition. A preferred W1 is never substituted for an owned W0.
+        channel.logical.owner = channel
+            .logical
+            .owner
+            .for_worker(Arc::clone(&channel.worker));
+        Some(AdmittedApplicationOperation { channel })
+    }
+
     /// Run one realtime-flow operation against a live promoted session and a
     /// freshly acquired live connector incarnation.
     ///
@@ -1920,6 +1979,76 @@ impl PeerRegistry {
         replaced
     }
 
+    /// Install only a fresh, empty introduction placeholder. The caller funds
+    /// its peer/key/map backing before entry. This never displaces an owner or
+    /// promotes/authenticates a session; native construction happens later.
+    pub(super) fn introduction_placeholder_claim(
+        device_bytes: usize,
+    ) -> Result<crate::resource::ResourceClaim> {
+        let bytes = std::mem::size_of::<PeerConnection>()
+            .checked_add(std::mem::size_of::<PeerRegistryEntry>())
+            .and_then(|n| n.checked_add(device_bytes.checked_mul(2)?))
+            .and_then(|n| n.checked_add(32))
+            .ok_or_else(|| Error::Network("introduction peer backing overflow".into()))?;
+        crate::resource::ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                u64::try_from(bytes)
+                    .map_err(|_| Error::Network("introduction peer backing overflow".into()))?,
+            ),
+            // Two strings, exact 32-byte attempt, Arc connection/installation
+            // controls and the dependency-private map node representation.
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 6),
+        ])
+        .map_err(|_| Error::Network("introduction peer claim overflow".into()))
+    }
+
+    pub(super) fn install_unpromoted_if_absent(
+        &self,
+        peer: Arc<PeerConnection>,
+    ) -> Option<PeerOwnerToken> {
+        let _mutation = self.mutation.lock();
+        if self.peers.contains_key(&peer.device_id)
+            || peer.registry_retired()
+            || peer.has_current_worker()
+            || peer.holds_promoted_session()
+            || peer.has_authenticated_channel()
+            || peer.state.read().authenticated
+        {
+            return None;
+        }
+        let binding_epoch = self
+            .next_binding_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                if value == 0 || value == u64::MAX {
+                    None
+                } else {
+                    Some(value + 1)
+                }
+            })
+            .ok()?;
+        let installation = Arc::new(());
+        let owner = PeerOwnerToken {
+            peer: Arc::clone(&peer),
+            installation: Arc::clone(&installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch,
+            worker: None,
+        };
+        if let Some(runtime) = self.signaling_runtime.read().as_ref() {
+            peer.bind_signaling_runtime(runtime.clone());
+        }
+        self.peers.insert(
+            peer.device_id.clone(),
+            PeerRegistryEntry {
+                peer,
+                installation,
+                binding_epoch,
+            },
+        );
+        Some(owner)
+    }
+
     /// Compatibility projection for callers that only need the displaced
     /// connection. New replacement-aware callers should use
     /// [`Self::install_with_displaced_owner`].
@@ -2111,7 +2240,7 @@ impl PeerRegistry {
     /// Read the number of exact logical records currently holding a pending
     /// departure observation. This is an observation for shutdown controls;
     /// it does not admit, select, or retain any session.
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(super) fn pending_departure_count(&self) -> usize {
         let _mutation = self.mutation.lock();
         self.peers
@@ -2187,6 +2316,114 @@ impl PeerRegistry {
             operation: dispatch.logical_reply_operation(),
             defer_retirement,
         }
+    }
+
+    /// Remove one stamped demand-owned installation at the same mutation
+    /// fence as application admission. The caller's bounded eligibility
+    /// closure must retain its idle-use reservation and must not re-enter this
+    /// registry or await. It checks policy exclusions and actual queue state;
+    /// the token check here can never substitute a successor worker.
+    ///
+    /// Native close belongs to the returned peer's caller, outside this lock.
+    /// Existing general-purpose removal semantics are deliberately unchanged.
+    pub(super) fn remove_demand_owner_if(
+        &self,
+        owner: &PeerOwnerToken,
+        eligible: impl FnOnce(&Arc<PeerConnection>) -> bool,
+    ) -> Option<Arc<PeerConnection>> {
+        let stamped = owner.worker()?;
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !Arc::ptr_eq(&current.value().peer, owner.connection())
+            || current
+                .value()
+                .peer
+                .current_worker()
+                .is_none_or(|worker| !Arc::ptr_eq(&worker, stamped))
+            || current.value().peer.registry_retired()
+            || !eligible(&current.value().peer)
+        {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        Some(peer)
+    }
+
+    /// The callback acquires the existing demand-record lock, checks its full
+    /// ticket/generation, and stores detached custody before returning. This
+    /// fence intentionally does not use worker_matches/current_worker: W0 may
+    /// still be the unpromoted owner while an independent W1 is selected.
+    pub(super) fn with_introduction_installation(
+        &self,
+        owner: &PeerOwnerToken,
+        detach: impl FnOnce(&Arc<PeerConnection>) -> Option<bool>,
+    ) -> bool {
+        let _mutation = self.mutation.lock();
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return false;
+        };
+        let peer = &current.value().peer;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !Arc::ptr_eq(peer, owner.connection())
+            || peer.registry_retired()
+        {
+            return false;
+        }
+        // Some(false) still detached the exact failed worker, but preserves
+        // an independently pinned/infrastructure installation. The caller
+        // retains its eligibility guards through this synchronous removal.
+        let Some(may_remove) = detach(peer) else {
+            return false;
+        };
+        let remove = may_remove && peer.retire_empty_introduction_installation();
+        drop(current);
+        if remove {
+            // Still the same installation under the original mutation guard.
+            // No broad retire_connector: independent owners were excluded.
+            self.peers.remove(owner.device_id());
+        }
+        true
+    }
+
+    /// Cancel only the original introduction placeholder before it acquired
+    /// any worker or independent negotiation. The caller additionally proves
+    /// its original ticket/attempt synchronously, without re-entering this
+    /// registry. No successor, even on the same connection Arc, is removable.
+    pub(super) fn remove_unstarted_introduction_if(
+        &self,
+        owner: &PeerOwnerToken,
+        eligible: impl FnOnce(&Arc<PeerConnection>) -> bool,
+    ) -> Option<Arc<PeerConnection>> {
+        if owner.worker().is_some() {
+            return None;
+        }
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        let peer = &current.value().peer;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !Arc::ptr_eq(peer, owner.connection())
+            || peer.current_worker().is_some()
+            || peer.registry_retired()
+            || peer.holds_promoted_session()
+            || peer.has_authenticated_channel()
+            || peer.state.read().authenticated
+            || peer.unpromoted_offer_in_flight()
+            || peer.has_speculative()
+            || peer.endpoint_auth_task().is_some()
+            || peer.media_renegotiation_worker().is_some()
+            || !eligible(peer)
+        {
+            return None;
+        }
+        drop(current);
+        let (_, entry) = self.peers.remove(owner.device_id())?;
+        let peer = entry.peer;
+        peer.retire_connector();
+        Some(peer)
     }
 
     pub(super) fn remove_if_current_unpromoted(
@@ -2562,7 +2799,7 @@ impl AdmittedInboundApplicationOperation {
     pub(super) fn into_dispatch(
         self,
     ) -> (
-        crate::protocol::MeshMessage,
+        crate::application_gateway::DecodedApplicationMessage,
         crate::resource::ResourceClaim,
         crate::resource::ResourceLease,
         AdmittedInboundDispatch,
@@ -2730,6 +2967,15 @@ pub(super) struct AdmittedApplicationOperation {
 }
 
 impl AdmittedApplicationOperation {
+    /// Cite the channel already captured by admission. This does not select a
+    /// current worker or renew policy; begin still rechecks the same channel.
+    pub(super) fn captured_owner(&self) -> PeerOwnerToken {
+        self.channel
+            .logical
+            .owner
+            .for_worker(Arc::clone(&self.channel.worker))
+    }
+
     /// Send one serialized frame through the exact captured connector, then
     /// record it against the exact captured peer.
     ///
@@ -3102,10 +3348,7 @@ impl AdmittedRenegotiation {
         // Keep that fence through state settlement and worker-slot cleanup so
         // a callback cannot install a newer debt between those two writes.
         let _mutation = peers.mutation.lock();
-        let Some(peer) = peers.with_current_logical_locked(&self.channel.logical, Arc::clone)
-        else {
-            return None;
-        };
+        let peer = peers.with_current_logical_locked(&self.channel.logical, Arc::clone)?;
         let mut data = peer.state.write();
         data.media_reneg_inflight = false;
         match outcome {
@@ -3155,5 +3398,169 @@ impl AdmittedRenegotiation {
                 follow_up
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod introduction_vacant_install_controls {
+    use super::*;
+
+    #[test]
+    fn introduction_vacant_install_preserves_existing_owner_and_epoch() {
+        let registry = PeerRegistry::new("local".into());
+        let first = Arc::new(PeerConnection::new("target".into(), None));
+        let captured = registry
+            .install_unpromoted_if_absent(Arc::clone(&first))
+            .unwrap();
+        assert!(captured.worker().is_none());
+        assert!(!first.state.read().authenticated);
+        let epoch = registry.next_binding_epoch.load(Ordering::Acquire);
+        assert!(registry
+            .install_unpromoted_if_absent(Arc::clone(&first))
+            .is_none());
+        let newcomer = Arc::new(PeerConnection::new("target".into(), None));
+        assert!(registry.install_unpromoted_if_absent(newcomer).is_none());
+        assert_eq!(registry.next_binding_epoch.load(Ordering::Acquire), epoch);
+        assert!(registry
+            .owner("target")
+            .unwrap()
+            .same_exact_owner(&captured));
+        assert!(!first.registry_retired());
+    }
+
+    #[test]
+    fn introduction_vacant_install_refuses_retired_authenticated_and_exhausted() {
+        let registry = PeerRegistry::new("local".into());
+        let retired = Arc::new(PeerConnection::new("retired".into(), None));
+        retired.retire_connector();
+        assert!(registry.install_unpromoted_if_absent(retired).is_none());
+        // A negative precondition, not a fabricated authenticated session.
+        let diagnostic_auth = Arc::new(PeerConnection::new("auth".into(), None));
+        diagnostic_auth.state.write().authenticated = true;
+        assert!(registry
+            .install_unpromoted_if_absent(diagnostic_auth)
+            .is_none());
+        assert_eq!(registry.next_binding_epoch.load(Ordering::Acquire), 1);
+        registry
+            .next_binding_epoch
+            .store(u64::MAX, Ordering::Release);
+        assert!(registry
+            .install_unpromoted_if_absent(Arc::new(PeerConnection::new("exhausted".into(), None),))
+            .is_none());
+        assert!(!registry.contains_key("exhausted"));
+        assert_eq!(
+            registry.next_binding_epoch.load(Ordering::Acquire),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn introduction_vacant_install_never_replaces_a_successor() {
+        let registry = PeerRegistry::new("local".into());
+        let old = registry
+            .install_unpromoted_if_absent(Arc::new(PeerConnection::new("target".into(), None)))
+            .unwrap();
+        registry.install(Arc::new(PeerConnection::new("target".into(), None)));
+        let successor = registry.owner("target").unwrap();
+        assert!(!old.same_exact_owner(&successor));
+        let epoch = registry.next_binding_epoch.load(Ordering::Acquire);
+        assert!(registry
+            .install_unpromoted_if_absent(Arc::new(PeerConnection::new("target".into(), None),))
+            .is_none());
+        assert!(registry
+            .owner("target")
+            .unwrap()
+            .same_exact_owner(&successor));
+        assert_eq!(registry.next_binding_epoch.load(Ordering::Acquire), epoch);
+    }
+
+    #[test]
+    fn unstarted_cleanup_removes_only_original_matching_attempt() {
+        let registry = PeerRegistry::new("local".into());
+        let peer = Arc::new(PeerConnection::new("target".into(), None));
+        peer.adopt_attempt(&hex::encode([7u8; 16]));
+        let owner = registry
+            .install_unpromoted_if_absent(Arc::clone(&peer))
+            .unwrap();
+        let epoch = registry.next_binding_epoch.load(Ordering::Acquire);
+        assert!(registry
+            .remove_unstarted_introduction_if(&owner, |peer| {
+                peer.unstarted_introduction_matches(&[8; 16])
+            })
+            .is_none());
+        assert!(!peer.registry_retired());
+        assert!(registry.owner("target").unwrap().same_exact_owner(&owner));
+        let removed = registry
+            .remove_unstarted_introduction_if(&owner, |peer| {
+                peer.unstarted_introduction_matches(&[7; 16])
+            })
+            .expect("matching vacant construction is detached");
+        assert!(Arc::ptr_eq(&removed, &peer));
+        assert!(removed.registry_retired());
+        assert!(!registry.contains_key("target"));
+        assert_eq!(registry.next_binding_epoch.load(Ordering::Acquire), epoch);
+    }
+
+    #[test]
+    fn unstarted_cleanup_rejects_same_arc_reinstallation_and_auth_state() {
+        let registry = PeerRegistry::new("local".into());
+        let peer = Arc::new(PeerConnection::new("target".into(), None));
+        let original = registry
+            .install_unpromoted_if_absent(Arc::clone(&peer))
+            .unwrap();
+        // Diagnostic auth alone is a refusal, never a positive auth fixture.
+        peer.state.write().authenticated = true;
+        let called = std::cell::Cell::new(false);
+        assert!(registry
+            .remove_unstarted_introduction_if(&original, |_| {
+                called.set(true);
+                true
+            })
+            .is_none());
+        assert!(!called.get());
+        assert!(!peer.registry_retired());
+        peer.state.write().authenticated = false;
+        registry.install(Arc::clone(&peer));
+        let replacement = registry.owner("target").unwrap();
+        let epoch = registry.next_binding_epoch.load(Ordering::Acquire);
+        assert!(!original.same_exact_owner(&replacement));
+        assert!(registry
+            .remove_unstarted_introduction_if(&original, |_| {
+                called.set(true);
+                true
+            })
+            .is_none());
+        assert!(!called.get());
+        assert!(registry
+            .owner("target")
+            .unwrap()
+            .same_exact_owner(&replacement));
+        assert_eq!(registry.next_binding_epoch.load(Ordering::Acquire), epoch);
+    }
+
+    #[test]
+    fn unstarted_cleanup_old_ticket_cannot_remove_retagged_placeholder() {
+        let registry = PeerRegistry::new("local".into());
+        let peer = Arc::new(PeerConnection::new("target".into(), None));
+        peer.adopt_attempt(&hex::encode([7u8; 16]));
+        let original = registry
+            .install_unpromoted_if_absent(Arc::clone(&peer))
+            .unwrap();
+        registry
+            .with_current(&original, |peer| {
+                peer.adopt_attempt(&hex::encode([8u8; 16]));
+            })
+            .unwrap();
+        assert!(registry
+            .remove_unstarted_introduction_if(&original, |peer| {
+                peer.unstarted_introduction_matches(&[7; 16])
+            })
+            .is_none());
+        assert!(registry
+            .owner("target")
+            .unwrap()
+            .same_exact_owner(&original));
+        assert!(!peer.registry_retired());
+        assert!(peer.unstarted_introduction_matches(&[8; 16]));
     }
 }

@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ed25519_dalek::SigningKey;
+use myownmesh_core::protocol::endpoint_cipher::{
+    CiphertextPacket, EpochBinding, ENDPOINT_CIPHER_SUITE, ENDPOINT_CIPHER_VERSION,
+};
 use myownmesh_core::protocol::{ClosedRoutedPayload, MeshMessage, RoutedApplicationEnvelope};
 use myownmesh_core::semantic::{DeviceId, MeshContextId};
 use tokio::time::{sleep, timeout, Instant};
@@ -66,21 +69,28 @@ fn representative_routed_frame() -> Bytes {
         device(&destination_key),
         [45; 16],
         4,
-        ClosedRoutedPayload::ChannelFrame {
-            channel: "pilot10-perf".to_owned(),
-            payload: serde_json::json!({
-                "protocol": "myownmesh.live-payload.v1",
-                "network": "pilot10-open-tree-4cdc19e-c1",
-                "channel": "pilot10-perf",
-                "kind": "request",
-                "run_id": "sctp-delayed-ack-fragment-regression",
-                "seq": 0,
-                "body": "0123456789abcdef".repeat(64),
-            }),
+        ClosedRoutedPayload::EndpointCiphertext {
+            packet: CiphertextPacket {
+                binding: EpochBinding {
+                    version: ENDPOINT_CIPHER_VERSION,
+                    suite: ENDPOINT_CIPHER_SUITE,
+                    context: [44; 32],
+                    initiator: *origin_key.verifying_key().as_bytes(),
+                    responder: *destination_key.verifying_key().as_bytes(),
+                    epoch: [46; 16],
+                    introduction: None,
+                },
+                sender: *origin_key.verifying_key().as_bytes(),
+                sequence: 1,
+                // Representative opaque wire bytes, not a valid AEAD output.
+                // This SCTP-only control proves fragmentation/ACK behavior;
+                // it neither decrypts nor claims endpoint cipher admission.
+                ciphertext: vec![0x5a; 1_040],
+            },
         },
         &origin_key,
     )
-    .expect("the same-shaped routed workload envelope is valid");
+    .expect("the current ciphertext-shaped routed wire envelope is valid");
     envelope
         .append_hop(device(&forwarding_key), &forwarding_key)
         .expect("one native forwarding hop is valid");

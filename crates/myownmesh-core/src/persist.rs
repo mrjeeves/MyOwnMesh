@@ -533,7 +533,6 @@ mod windows_directory {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct FileDirectoryInformationHeader {
@@ -781,6 +780,9 @@ mod windows_directory {
         )
     }
 
+    // The access booleans mirror the native NtCreateFile boundary; bundling
+    // them would obscure the exact lease and reparse-point permissions.
+    #[allow(clippy::too_many_arguments)]
     fn open_relative_with_access(
         parent: Handle,
         name: &[u16],
@@ -868,8 +870,7 @@ mod windows_directory {
         };
         status_result(status, status_block.status)?;
         if raw.is_null() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Windows native roster open returned a null handle",
             ));
         }

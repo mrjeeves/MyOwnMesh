@@ -6,32 +6,30 @@
 
 use std::time::{Duration, Instant};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
-use hkdf::Hkdf;
 use parking_lot::Mutex;
 use rand_core::OsRng;
-use sha2::Sha256;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use x25519_dalek::{EphemeralSecret, PublicKey};
+use zeroize::Zeroize;
 
 use crate::config::ClosedRelayPolicyConfig;
 use crate::identity::Identity;
+#[cfg(test)]
+use crate::protocol::relay::ClosedRelayRoute;
 use crate::protocol::relay::{
-    ClosedRelayRoute, OpaqueRelayPacket, RelayKeyShare, OPAQUE_RELAY_NONCE_BYTES,
-    OPAQUE_RELAY_VERSION,
+    OpaqueRelayPacket, RelayKeyShare, OPAQUE_RELAY_NONCE_BYTES, OPAQUE_RELAY_VERSION,
 };
 use crate::resource::{
     FundedArc, ResourceAuthorityClass, ResourceClaim, ResourceClass, ResourceLease,
 };
+use crate::runtime::endpoint_cipher::{decrypt, derive_material, encrypt, ReplayWindow};
 use crate::runtime::session_broker::SessionValidityWitness;
 use crate::semantic::{DeviceId, MeshContextId};
 
 const AEAD_TAG_BYTES: usize = 16;
 const KEY_BYTES: usize = 32;
 const NONCE_PREFIX_BYTES: usize = 4;
-const DERIVED_BYTES: usize = KEY_BYTES * 2 + NONCE_PREFIX_BYTES * 2;
 // A canonical DeviceId and MeshContextId are 32 bytes encoded as lowercase
 // unpadded base32. This is a representation bound for retained route strings,
 // not a relay workload selector.
@@ -1060,9 +1058,7 @@ impl PendingEndpointKeyAgreement {
         push_field(&mut info, &second_id_bytes);
         info.extend_from_slice(first_key);
         info.extend_from_slice(second_key);
-        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
-        let mut material = [0u8; DERIVED_BYTES];
-        hk.expand(&info, &mut material)
+        let material = derive_material(shared.as_bytes(), &info)
             .map_err(|_| ClosedRelayRefusal::Crypto("HKDF expansion failed".into()))?;
         let first_key = &material[..KEY_BYTES];
         let second_key = &material[KEY_BYTES..KEY_BYTES * 2];
@@ -1128,6 +1124,7 @@ impl OpaqueRelaySession {
     /// Allocation generations remain the relay registry's exact fence, so an
     /// established route must carry a nonzero generation before this seam is
     /// usable for allocation admission.
+    #[cfg(test)]
     pub(crate) fn matches_route(&self, route: &ClosedRelayRoute) -> bool {
         route.validate().is_ok()
             && route.allocation_epoch != 0
@@ -1155,16 +1152,7 @@ impl OpaqueRelaySession {
         let local_id = self.local_id.base32();
         let peer_id = self.peer_id.base32();
         let aad = aad_for(&mesh, &self.session_id, &local_id, &peer_id, sequence);
-        let cipher = Aes256Gcm::new_from_slice(&self.send_key)
-            .map_err(|_| ClosedRelayRefusal::Crypto("invalid AES key".into()))?;
-        let ciphertext = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
+        let ciphertext = encrypt(&self.send_key, &nonce, &aad, plaintext)
             .map_err(|_| ClosedRelayRefusal::Crypto("AEAD seal failed".into()))?;
         let packet = OpaqueRelayPacket {
             version: OPAQUE_RELAY_VERSION,
@@ -1219,67 +1207,19 @@ impl OpaqueRelaySession {
             &packet.to,
             packet.sequence,
         );
-        let cipher = Aes256Gcm::new_from_slice(&self.recv_key)
-            .map_err(|_| ClosedRelayRefusal::Crypto("invalid AES key".into()))?;
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(&packet.nonce),
-                Payload {
-                    msg: &packet.ciphertext,
-                    aad: &aad,
-                },
-            )
+        let plaintext = decrypt(&self.recv_key, &packet.nonce, &aad, &packet.ciphertext)
             .map_err(|_| ClosedRelayRefusal::Crypto("AEAD open failed".into()))?;
         self.replay.record(packet.sequence);
         Ok(plaintext)
     }
 }
 
-struct ReplayWindow {
-    width: usize,
-    highest: Option<u64>,
-    seen: Vec<bool>,
-}
-
-impl ReplayWindow {
-    fn new(width: usize) -> Self {
-        Self {
-            width,
-            highest: None,
-            seen: vec![false; width],
-        }
-    }
-
-    fn can_accept(&self, sequence: u64) -> bool {
-        let Some(highest) = self.highest else {
-            return true;
-        };
-        if sequence > highest {
-            return true;
-        }
-        let delta = highest - sequence;
-        delta < self.width as u64 && !self.seen[delta as usize]
-    }
-
-    fn record(&mut self, sequence: u64) {
-        let Some(highest) = self.highest else {
-            self.highest = Some(sequence);
-            self.seen[0] = true;
-            return;
-        };
-        if sequence > highest {
-            let advance = sequence - highest;
-            if advance >= self.width as u64 {
-                self.seen.fill(false);
-            } else {
-                self.seen.rotate_right(advance as usize);
-                self.seen[..advance as usize].fill(false);
-            }
-            self.highest = Some(sequence);
-            self.seen[0] = true;
-        } else {
-            self.seen[(highest - sequence) as usize] = true;
-        }
+impl Drop for OpaqueRelaySession {
+    fn drop(&mut self) {
+        self.send_key.zeroize();
+        self.recv_key.zeroize();
+        self.send_prefix.zeroize();
+        self.recv_prefix.zeroize();
     }
 }
 

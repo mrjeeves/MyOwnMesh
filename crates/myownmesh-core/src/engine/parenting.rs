@@ -105,6 +105,8 @@ pub(super) struct ParentAttachRequest {
 }
 
 impl ParentAttachRequest {
+    // Keep each validated wire coordinate and configured role explicit at this boundary.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         context_id: [u8; 32],
         configuration_digest: [u8; 32],
@@ -167,12 +169,6 @@ pub(super) struct ParentAttachTicket {
     request_sequence: u64,
     relation_generation: u64,
     owner: ParentOwnerCoordinate,
-}
-
-impl ParentAttachTicket {
-    pub(super) fn request_key(&self) -> ParentDeviceKey {
-        self.key.child
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -945,6 +941,30 @@ impl<C: ParentingClock> ParentingState<C> {
         Ok(())
     }
 
+    /// Observe infrastructure retention for one exact installation owner.
+    /// Pending attachments count as well as accepted primary/backup links.
+    /// This grants no application authority and performs no expiry cleanup or
+    /// renewal. Callers must retain their owner/parenting fences through idle
+    /// retirement and conservatively retain the peer on a clock error.
+    pub(super) fn has_live_owner(
+        &mut self,
+        owner: &ParentOwnerWitness,
+    ) -> Result<bool, ParentingRefusal> {
+        let now = self.now()?;
+        let mut cursor = None;
+        for _ in 0..self.record_count {
+            let Some((key, relation)) = self.records.successor_after(cursor.as_ref()) else {
+                break;
+            };
+            cursor = Some(*key);
+            if relation.owner == owner.coordinate && relation.expires_at > now {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(super) fn primary_parent(&mut self) -> Option<ParentingRelationSnapshot> {
         self.primary_parent_at_now().ok().flatten()
     }
@@ -988,6 +1008,7 @@ impl<C: ParentingClock> ParentingState<C> {
     /// frame for this owner.  Leaves have exactly one accepted primary parent;
     /// roots and hubs may use only accepted child relations.  Pending,
     /// expired, or unrelated records never satisfy this gate.
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(super) fn allows_peer(&mut self, peer: ParentDeviceKey) -> bool {
         let Ok(now) = self.now() else {
             return false;
@@ -1045,6 +1066,7 @@ impl<C: ParentingClock> ParentingState<C> {
         self.remove_matching(|_, relation| relation.owner == owner.coordinate)
     }
 
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(super) fn retire_peer(&mut self, peer: ParentDeviceKey) -> Result<usize, ParentingRefusal> {
         self.remove_matching(|key, relation| {
             key.child == peer || relation.parent == peer || relation.owner.peer == peer
@@ -1190,6 +1212,184 @@ mod tests {
             .expect("derived valid owner key");
         let token = PeerOwnerToken::detached_for_control(&device.base32());
         ParentOwnerWitness::from_owner(&token).expect("owner witness")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RetentionSnapshot {
+        rows: Vec<(ParentingKey, ParentingRelation)>,
+        counts: (usize, usize, usize, usize),
+        next_generation: u64,
+        maintenance_cursor: Option<ParentingKey>,
+    }
+
+    fn retention_snapshot(state: &ParentingState<TestClock>) -> RetentionSnapshot {
+        let mut rows = Vec::new();
+        let mut cursor = None;
+        for _ in 0..state.record_count {
+            let Some((key, relation)) = state.records.successor_after(cursor.as_ref()) else {
+                break;
+            };
+            rows.push((*key, *relation));
+            cursor = Some(*key);
+        }
+        RetentionSnapshot {
+            rows,
+            counts: (
+                state.primary_children,
+                state.backup_children,
+                state.pending_count,
+                state.record_count,
+            ),
+            next_generation: state.next_relation_generation,
+            maintenance_cursor: state.maintenance_cursor,
+        }
+    }
+
+    #[test]
+    fn live_owner_observes_pending_primary_backup_without_mutation_or_renewal() {
+        for (kind, adopt, expected_state) in [
+            (
+                ParentingRelationKind::Primary,
+                false,
+                RelationState::Pending,
+            ),
+            (ParentingRelationKind::Primary, true, RelationState::Primary),
+            (ParentingRelationKind::Backup, true, RelationState::Backup),
+        ] {
+            let clock = TestClock::new(1);
+            let root = device(31);
+            let hub = device(32);
+            let (mut state, provider, scope) =
+                fixture(policy(hub, root, ParentingRole::Hub(1)), clock.clone());
+            let baseline = provider.in_use();
+            let baseline_reservations = provider.active_reservations();
+            let witness = owner(31);
+            assert!(!state.has_live_owner(&witness).expect("empty retention"));
+            let request = ParentAttachRequest::new(
+                [1; 32],
+                [2; 32],
+                1,
+                hub,
+                root,
+                ParentingRole::Hub(1),
+                ParentingRole::Root,
+                kind,
+            )
+            .expect("request");
+            let ticket = state
+                .begin_child_attach(&witness, request)
+                .expect("pending");
+            if adopt {
+                assert_eq!(
+                    state
+                        .adopt_response(
+                            &witness,
+                            &ticket,
+                            ParentAttachResponse::Accepted {
+                                request,
+                                relation_generation: 7
+                            }
+                        )
+                        .expect("adoption"),
+                    ParentAdoption::Accepted
+                );
+            }
+            let before = retention_snapshot(&state);
+            assert_eq!(before.rows.len(), 1);
+            assert_eq!(before.rows[0].1.state, expected_state);
+            let charged = provider.in_use();
+            let reservations = provider.active_reservations();
+            assert_ne!(charged, baseline);
+            assert_eq!(reservations, baseline_reservations + 1);
+            clock.set(2);
+            assert!(state.has_live_owner(&witness).expect("live exact owner"));
+            for coordinate in [
+                ParentOwnerCoordinate {
+                    binding_namespace: [9; 16],
+                    ..witness.coordinate
+                },
+                ParentOwnerCoordinate {
+                    binding_epoch: 1,
+                    ..witness.coordinate
+                },
+                ParentOwnerCoordinate {
+                    peer: device(33),
+                    ..witness.coordinate
+                },
+            ] {
+                assert!(!state
+                    .has_live_owner(&ParentOwnerWitness { coordinate })
+                    .expect("different owner"));
+            }
+            assert_eq!(state.last_now, Some(ParentingTick(2)));
+            assert_eq!(retention_snapshot(&state), before);
+            clock.set(10);
+            assert!(state.has_live_owner(&witness).expect("before expiry"));
+            clock.set(11);
+            assert!(!state.has_live_owner(&witness).expect("exact expiry"));
+            assert_eq!(
+                retention_snapshot(&state),
+                before,
+                "expiry observation neither renews nor reaps"
+            );
+            assert_eq!(provider.in_use(), charged);
+            assert_eq!(provider.active_reservations(), reservations);
+            clock.set(10);
+            assert!(matches!(
+                state.has_live_owner(&witness),
+                Err(ParentingRefusal::ClockRegression)
+            ));
+            assert_eq!(state.last_now, Some(ParentingTick(11)));
+            assert_eq!(retention_snapshot(&state), before);
+            assert_eq!(provider.in_use(), charged);
+            assert_eq!(provider.active_reservations(), reservations);
+            assert_eq!(state.retire_owner(&witness).expect("explicit retire"), 1);
+            assert_eq!(provider.in_use(), baseline);
+            assert_eq!(provider.active_reservations(), baseline_reservations);
+            drop(state);
+            drop(scope);
+            assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        }
+    }
+
+    #[test]
+    fn live_owner_finds_each_accepted_child_without_removing_other_relations() {
+        let clock = TestClock::new(1);
+        let root = device(34);
+        let (mut state, provider, scope) = fixture(policy(root, root, ParentingRole::Root), clock);
+        for (value, kind) in [
+            (35, ParentingRelationKind::Primary),
+            (36, ParentingRelationKind::Backup),
+        ] {
+            let request = ParentAttachRequest::new(
+                [1; 32],
+                [2; 32],
+                1,
+                device(value),
+                root,
+                ParentingRole::Hub(1),
+                ParentingRole::Root,
+                kind,
+            )
+            .expect("request");
+            assert!(matches!(
+                state.accept_request(&owner(value), request),
+                Ok(ParentAttachResponse::Accepted { .. })
+            ));
+        }
+        let before = retention_snapshot(&state);
+        assert_eq!(before.rows.len(), 2);
+        let charged = provider.in_use();
+        let reservations = provider.active_reservations();
+        assert!(state.has_live_owner(&owner(35)).expect("primary child"));
+        assert!(state.has_live_owner(&owner(36)).expect("backup child"));
+        assert!(!state.has_live_owner(&owner(37)).expect("absent child"));
+        assert_eq!(retention_snapshot(&state), before);
+        assert_eq!(provider.in_use(), charged);
+        assert_eq!(provider.active_reservations(), reservations);
+        drop(state);
+        drop(scope);
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
     }
 
     #[test]

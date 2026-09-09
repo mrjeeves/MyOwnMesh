@@ -39,7 +39,7 @@ The architecture has five cooperating mechanisms:
 
 1. **Durable semantic state** stores and derives long-lived Closed governance meaning. Open participation is runtime-only and does not enter this ledger; any reviewed application contract domain is separate from the base ledger.
 2. **Signaling** moves durable facts and ephemeral transport-control messages through any suitable signaling medium.
-3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. The current remote-candidate planner is not a cross-family direct/TURN/Closed-relay racer.
+3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. Configured Hub hints may introduce bounded demand, with direct endpoint connectivity preferred, TURN kept as a distinct ICE service, and any Hub fallback endpoint-encrypted or refused. The current remote-candidate planner is not a claim of automatic cross-family racing.
 4. **Endpoint authentication and the session broker** promote a working channel into an application-usable peer session only after exact Device authentication and current mesh policy checks.
 5. **Applications** exchange payload only through a live authenticated session capability.
 
@@ -512,7 +512,7 @@ Profiles may include:
 ```text
 Direct LAN
 ICE with STUN and TURN
-Generic opaque endpoint relay
+Bounded encrypted Hub forwarding fallback
 Closed member relay
 QUIC-native transport
 Serial or radio transport
@@ -570,7 +570,7 @@ A session may use:
 ```text
 DirectEndpointCarrier
 TurnCarrier
-GenericOpaqueRelayCarrier
+HubEncryptedFallbackCarrier
 ClosedMemberRelayCarrier
 ```
 
@@ -582,7 +582,24 @@ AuthenticatedPeerSession(A, C)
 
 Carrier choice changes latency, loss, cost, metadata exposure, and availability. It does not change A or C's Device identity or application authority.
 
-### 7.1 Closed member relay
+### 7.1 Bounded Hub introduction and encrypted transit fallback
+
+A configured Hub may introduce bounded endpoint demand; it is not an
+application payload owner, trust root, membership authority, permanent-peer
+grant, or veto over viable direct or alternate paths. A directly usable
+endpoint connection is preferred and TURN remains a distinct ICE service.
+Introduction may negotiate the direct endpoint channel without making the Hub
+a carrier.
+
+If residual Hub transit is selected, it is a separately bounded profile. The
+endpoints derive a fresh endpoint-to-endpoint E2E epoch bound to the exact mesh
+context and full endpoint keys before payload is usable. The Hub may
+copy/forward endpoint ciphertext and observe carrier metadata, but cannot
+decrypt or read application plaintext. If the E2E epoch cannot be established,
+refuse; never fall back to plaintext. This is the adopted architecture
+direction, not a shipped-process or qualification claim.
+
+### 7.2 Closed member relay
 
 The supported Closed member relay is an explicit three-party path, not an automatic A-C transport upgrade. A and B independently discover, endpoint-authenticate, and promote their exact leg; B and C do the same for their exact leg. B remains visibly Device B and is the local canonical relay member. Anonymous attestation is neither required nor desirable.
 
@@ -703,7 +720,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 6. **Projection is durable semantic derivation only.** It does not create or forecast routes.
 7. **No route ledger is required.** Candidate, route, channel, and handoff state are live connector state unless a separate application domain explicitly chooses otherwise.
 8. **A working socket is not a session.** Endpoint authentication, mesh policy, local principal, and resources are required for promotion.
-9. **Carrier is not peer identity.** Direct, TURN, and Closed member relay preserve the same authenticated endpoint relationship.
+9. **Carrier is not peer identity.** Direct, TURN, bounded encrypted Hub forwarding, and Closed member relay preserve the same authenticated endpoint relationship.
 10. **No anonymous member relay.** A Closed member relay is visibly attributable to its Device identity.
 11. **No relay-authorized handoff.** Relays cannot add, select, or retire an application-usable channel.
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
@@ -726,7 +743,7 @@ Owner review must select and test:
 5. The supported signaling carriers and ephemeral transport-control schemas.
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
-8. Direct, TURN, and Closed member-relay requirements.
+8. Direct, TURN, bounded encrypted Hub-forwarding, and Closed member-relay requirements.
 9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.

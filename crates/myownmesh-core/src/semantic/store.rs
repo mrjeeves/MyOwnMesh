@@ -295,6 +295,7 @@ impl RestoredSemanticState {
         &self.graph
     }
 
+    #[cfg(test)]
     pub fn provisional_custody(&self) -> &[ProvisionalCustody] {
         &self.provisional
     }
@@ -711,7 +712,10 @@ fn semantic_storage_worker_loop(
                     Err(error) => Err(error),
                 }
             } else {
-                operation(&store, connection.as_mut().expect("worker connection"))
+                match connection.as_mut() {
+                    Some(connection) => operation(&store, connection),
+                    None => Err(DurableStoreError::WorkerPanicked),
+                }
             };
             if result.is_ok() && reopen {
                 connection.take();
@@ -804,10 +808,10 @@ struct V4StoreAggregate {
     quarantined: Vec<SignedFact>,
     /// True when `facts` is stored in causal admission order. Older version-3
     /// databases did not record this marker and use the legacy rebuild.
-    admission_ordered: bool,
+    _admission_ordered: bool,
     /// Version-2 domain-separated Patricia-Merkle projection root.
-    projection_commitment: [u8; 32],
-    provisional: Vec<ProvisionalCustody>,
+    _projection_commitment: [u8; 32],
+    _provisional: Vec<ProvisionalCustody>,
     proofs: Vec<ProofRecord>,
 }
 
@@ -856,6 +860,21 @@ struct ProofUsage {
     pending_bytes: u64,
     generation: u64,
 }
+
+type SemanticUsageRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+);
+type AuthorUsageRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type ProofUsageRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type ProofRecordRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String);
+type AuthorUsageTableRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct SemanticDeltaPlan {
@@ -1225,7 +1244,7 @@ impl BootstrapStore {
 }
 
 impl DurableSemanticStore {
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     pub fn new(instance_root: impl Into<PathBuf>, local_slot: impl AsRef<str>) -> Self {
         Self::with_policy(instance_root, local_slot, SemanticPolicyConfig::default())
     }
@@ -1245,7 +1264,7 @@ impl DurableSemanticStore {
             path: directory.join(format!("{slot}-{SEMANTIC_DATABASE_FILE}")),
             lock_path: directory.join(format!("{slot}.lock")),
             process_gate: Arc::new(Mutex::new(())),
-            policy: policy,
+            policy,
             #[cfg(any(test, feature = "transport-lab"))]
             commit_injection: Arc::new(CommitInjectionControl::default()),
         }
@@ -1580,6 +1599,7 @@ impl DurableSemanticStore {
         self.pending_proof_records_connection(&connection, context_id)
     }
 
+    #[cfg(test)]
     fn proof_records_unlocked(
         &self,
         context_id: MeshContextId,
@@ -1588,6 +1608,7 @@ impl DurableSemanticStore {
         self.proof_records_connection(&connection, context_id)
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     fn proof_records_connection(
         &self,
         connection: &SemanticSqliteConnection,
@@ -2098,7 +2119,7 @@ impl DurableSemanticStore {
     where
         F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
     {
-        let mut snapshot = self.load_snapshot_connection(&connection, &self.path)?;
+        let mut snapshot = self.load_snapshot_connection(connection, &self.path)?;
         self.validate_aggregate_limits(&snapshot)?;
         if snapshot.context_id != context_id {
             return Err(DurableStoreError::ContextMismatch {
@@ -2114,7 +2135,7 @@ impl DurableSemanticStore {
         if previous_proofs == snapshot.proofs {
             return Ok(snapshot.proofs);
         }
-        self.preflight_capacity(&connection)?;
+        self.preflight_capacity(connection)?;
         let transaction = connection
             .transaction()
             .map_err(DurableStoreError::Sqlite)?;
@@ -2130,13 +2151,6 @@ impl DurableSemanticStore {
         )?;
         transaction.commit().map_err(DurableStoreError::Sqlite)?;
         Ok(snapshot.proofs)
-    }
-
-    fn read_snapshot(&self) -> Result<V4StoreAggregate, DurableStoreError> {
-        let connection = self.open_database(false)?;
-        let snapshot = self.load_snapshot_connection(&connection, &self.path)?;
-        self.validate_aggregate_limits(&snapshot)?;
-        Ok(snapshot)
     }
 
     fn ensure_pending_proof_index(connection: &Connection) -> Result<(), DurableStoreError> {
@@ -2382,16 +2396,7 @@ impl DurableSemanticStore {
         &self,
         connection: &SemanticSqliteConnection,
     ) -> Result<SemanticUsage, DurableStoreError> {
-        let values: (
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-        ) = connection
+        let values: SemanticUsageRow = connection
             .query_row(
                 "SELECT admitted_count,admitted_bytes,quarantined_count,
                         quarantined_bytes,dependency_edges,provisional_count,
@@ -2434,7 +2439,7 @@ impl DurableSemanticStore {
         connection: &SemanticSqliteConnection,
         author: [u8; 32],
     ) -> Result<Option<AuthorUsage>, DurableStoreError> {
-        let values: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = connection
+        let values: Option<AuthorUsageRow> = connection
             .query_row(
                 "SELECT retained_count,retained_bytes,quarantined_count,quarantined_bytes
                  FROM author_usage WHERE author=?",
@@ -2463,16 +2468,7 @@ impl DurableSemanticStore {
         &self,
         transaction: &SemanticSqliteTransaction<'_>,
     ) -> Result<SemanticUsage, DurableStoreError> {
-        let values: (
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-        ) = transaction
+        let values: SemanticUsageRow = transaction
             .query_row(
                 "SELECT admitted_count,admitted_bytes,quarantined_count,
                         quarantined_bytes,dependency_edges,provisional_count,
@@ -2514,16 +2510,7 @@ impl DurableSemanticStore {
         &self,
         connection: &Connection,
     ) -> Result<SemanticUsage, DurableStoreError> {
-        let values: (
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<u8>,
-        ) = connection
+        let values: SemanticUsageRow = connection
             .query_row(
                 "SELECT admitted_count,admitted_bytes,quarantined_count,
                         quarantined_bytes,dependency_edges,provisional_count,
@@ -2567,7 +2554,7 @@ impl DurableSemanticStore {
         connection: &Connection,
         author: [u8; 32],
     ) -> Result<Option<AuthorUsage>, DurableStoreError> {
-        let values: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = connection
+        let values: Option<AuthorUsageRow> = connection
             .query_row(
                 "SELECT retained_count,retained_bytes,quarantined_count,quarantined_bytes
                  FROM author_usage WHERE author=?",
@@ -2759,11 +2746,12 @@ impl DurableSemanticStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn read_proof_usage(
         &self,
         connection: &SemanticSqliteConnection,
     ) -> Result<ProofUsage, DurableStoreError> {
-        let values: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = connection
+        let values: ProofUsageRow = connection
             .query_row(
                 "SELECT total_count,total_bytes,total_links,pending_count,pending_bytes,generation
                  FROM proof_usage WHERE usage_id=1",
@@ -2794,7 +2782,7 @@ impl DurableSemanticStore {
         &self,
         connection: &rusqlite::Connection,
     ) -> Result<ProofUsage, DurableStoreError> {
-        let values: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = connection
+        let values: ProofUsageRow = connection
             .query_row(
                 "SELECT total_count,total_bytes,total_links,pending_count,pending_bytes,generation
                  FROM proof_usage WHERE usage_id=1",
@@ -2825,7 +2813,7 @@ impl DurableSemanticStore {
         &self,
         transaction: &SemanticSqliteTransaction<'_>,
     ) -> Result<ProofUsage, DurableStoreError> {
-        let values: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = transaction
+        let values: ProofUsageRow = transaction
             .query_row(
                 "SELECT total_count,total_bytes,total_links,pending_count,pending_bytes,generation
                  FROM proof_usage WHERE usage_id=1",
@@ -2857,7 +2845,7 @@ impl DurableSemanticStore {
         connection: &SemanticSqliteConnection,
         delivery_id: ProofDeliveryId,
     ) -> Result<Option<ProofRecord>, DurableStoreError> {
-        let values: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String)> = connection
+        let values: Option<ProofRecordRow> = connection
             .query_row(
                 "SELECT delivery_id,encoded,context_id,target,state
                  FROM proofs WHERE delivery_id=?",
@@ -2884,7 +2872,7 @@ impl DurableSemanticStore {
         transaction: &SemanticSqliteTransaction<'_>,
         delivery_id: ProofDeliveryId,
     ) -> Result<Option<ProofRecord>, DurableStoreError> {
-        let values: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String)> = transaction
+        let values: Option<ProofRecordRow> = transaction
             .query_row(
                 "SELECT delivery_id,encoded,context_id,target,state
                  FROM proofs WHERE delivery_id=?",
@@ -3150,6 +3138,7 @@ impl DurableSemanticStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_aggregate_limits(
         &self,
         snapshot: &V4StoreAggregate,
@@ -3235,14 +3224,14 @@ impl DurableSemanticStore {
         {
             return Err(DurableStoreError::LimitExceeded("fact retention"));
         }
-        if u64::try_from(snapshot.provisional.len())
+        if u64::try_from(snapshot._provisional.len())
             .map_err(|_| DurableStoreError::InvalidPolicy)?
             > self.policy.max_provisional_rows
         {
             return Err(DurableStoreError::LimitExceeded("provisional rows"));
         }
         if snapshot
-            .provisional
+            ._provisional
             .iter()
             .any(|claim| claim.owner != SEMANTIC_INGRESS_OWNER)
         {
@@ -3290,6 +3279,9 @@ impl DurableSemanticStore {
         Ok(())
     }
 
+    // This is the explicit admission-planning boundary: commitments, custody,
+    // and the bounded row override must be checked together before mutation.
+    #[allow(clippy::too_many_arguments)]
     fn plan_semantic_delta(
         &self,
         connection: &SemanticSqliteConnection,
@@ -3898,10 +3890,8 @@ impl DurableSemanticStore {
             return Err(DurableStoreError::LimitExceeded("author usage rows"));
         }
         usage.author_usage_rows = next_author_rows;
-        if !changed {
-            if stored_projection != projection_commitment {
-                return Err(DurableStoreError::DeltaConflict);
-            }
+        if !changed && stored_projection != projection_commitment {
+            return Err(DurableStoreError::DeltaConflict);
         }
         Ok(SemanticDeltaPlan {
             base_usage,
@@ -5085,7 +5075,7 @@ impl DurableSemanticStore {
         let mut next_dependency = dependency_rows
             .next()
             .map_err(DurableStoreError::Sqlite)?
-            .map(&decode_dependency)
+            .map(decode_dependency)
             .transpose()?;
         for fact in facts_by_id {
             let expected = canonical_dependencies(fact);
@@ -5110,7 +5100,7 @@ impl DurableSemanticStore {
                 next_dependency = dependency_rows
                     .next()
                     .map_err(DurableStoreError::Sqlite)?
-                    .map(&decode_dependency)
+                    .map(decode_dependency)
                     .transpose()?;
             }
             if actual != expected {
@@ -5181,7 +5171,7 @@ impl DurableSemanticStore {
                 Ok(ProvisionalCustody { fact_id, owner })
             })
             .collect::<Result<Vec<_>, DurableStoreError>>()?;
-        let proof_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String)> = bounded_query_collect(
+        let proof_rows: Vec<ProofRecordRow> = bounded_query_collect(
             connection,
             "SELECT delivery_id,encoded,context_id,target,state
                  FROM proofs ORDER BY delivery_id",
@@ -5399,53 +5389,54 @@ impl DurableSemanticStore {
                     reason: "semantic usage does not match normalized rows".into(),
                 });
             }
-            let author_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
-                bounded_query_collect(
-                    connection,
-                    "SELECT author,retained_count,retained_bytes,quarantined_count,quarantined_bytes
+            let author_rows: Vec<AuthorUsageTableRow> = bounded_query_collect(
+                connection,
+                "SELECT author,retained_count,retained_bytes,quarantined_count,quarantined_bytes
                      FROM author_usage ORDER BY author",
-                    [],
-                    self.policy.max_author_usage_rows,
-                    self.policy
-                        .max_author_usage_rows
-                        .checked_mul(64)
-                        .ok_or(DurableStoreError::InvalidPolicy)?,
-                    "author usage bytes",
-                    |row| {
-                        let author: Vec<u8> = row.get(0)?;
-                        let retained_count: Vec<u8> = row.get(1)?;
-                        let retained_bytes: Vec<u8> = row.get(2)?;
-                        let quarantined_count: Vec<u8> = row.get(3)?;
-                        let quarantined_bytes: Vec<u8> = row.get(4)?;
-                        let row_bytes = [
-                            author.len(),
-                            retained_count.len(),
-                            retained_bytes.len(),
-                            quarantined_count.len(),
-                            quarantined_bytes.len(),
-                        ]
-                        .into_iter()
-                        .try_fold(0u64, |total, length| -> rusqlite::Result<u64> {
+                [],
+                self.policy.max_author_usage_rows,
+                self.policy
+                    .max_author_usage_rows
+                    .checked_mul(64)
+                    .ok_or(DurableStoreError::InvalidPolicy)?,
+                "author usage bytes",
+                |row| {
+                    let author: Vec<u8> = row.get(0)?;
+                    let retained_count: Vec<u8> = row.get(1)?;
+                    let retained_bytes: Vec<u8> = row.get(2)?;
+                    let quarantined_count: Vec<u8> = row.get(3)?;
+                    let quarantined_bytes: Vec<u8> = row.get(4)?;
+                    let row_bytes = [
+                        author.len(),
+                        retained_count.len(),
+                        retained_bytes.len(),
+                        quarantined_count.len(),
+                        quarantined_bytes.len(),
+                    ]
+                    .into_iter()
+                    .try_fold(
+                        0u64,
+                        |total, length| -> rusqlite::Result<u64> {
                             total
                                 .checked_add(
-                                    u64::try_from(length).map_err(|_| {
-                                        rusqlite::Error::InvalidQuery
-                                    })?,
+                                    u64::try_from(length)
+                                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                                 )
                                 .ok_or(rusqlite::Error::InvalidQuery)
-                        })?;
-                        Ok((
-                            (
-                                author,
-                                retained_count,
-                                retained_bytes,
-                                quarantined_count,
-                                quarantined_bytes,
-                            ),
-                            row_bytes,
-                        ))
-                    },
-                )?;
+                        },
+                    )?;
+                    Ok((
+                        (
+                            author,
+                            retained_count,
+                            retained_bytes,
+                            quarantined_count,
+                            quarantined_bytes,
+                        ),
+                        row_bytes,
+                    ))
+                },
+            )?;
             if u64::try_from(author_rows.len()).map_err(|_| DurableStoreError::InvalidPolicy)?
                 > self.policy.max_author_usage_rows
             {
@@ -5538,6 +5529,7 @@ impl DurableSemanticStore {
         Ok(snapshot)
     }
 
+    #[cfg(test)]
     fn restore_unlocked(
         &self,
         bootstrap: &VerifiedBootstrap,
@@ -5974,7 +5966,7 @@ impl DurableSemanticStore {
             });
         }
 
-        let author_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+        let author_rows: Vec<AuthorUsageTableRow> =
             bounded_query_collect(
                 connection,
                 "SELECT author,retained_count,retained_bytes,quarantined_count,quarantined_bytes FROM author_usage ORDER BY author",
@@ -6512,6 +6504,11 @@ impl DurableSemanticOwner {
         })
     }
 
+    // The post-commit continuation remains fallible for test/lab outcome-unknown injection.
+    #[cfg_attr(
+        not(any(test, feature = "transport-lab")),
+        allow(clippy::bind_instead_of_map)
+    )]
     pub(crate) fn commit_semantic_delta(
         &self,
         context_id: MeshContextId,
@@ -6813,6 +6810,7 @@ impl DurableSemanticOwner {
         self.worker_call(true, true, true, |_store, _connection| Ok(()))
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn proof_records(
         &self,
         context_id: MeshContextId,
@@ -6888,6 +6886,7 @@ impl DurableSemanticWriter {
 }
 
 impl DurableSemanticStore {
+    #[cfg(test)]
     fn store_snapshot<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
     where
         I: IntoIterator<Item = ProvisionalCustody>,
@@ -7000,6 +6999,7 @@ impl DurableSemanticStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn checkpoint_and_compact(&self) -> Result<(), DurableStoreError> {
         let connection = self.open_database(false)?;
         self.checkpoint_and_compact_connection(&connection)
@@ -7033,9 +7033,9 @@ impl V4StoreAggregate {
             context_id,
             facts,
             quarantined,
-            admission_ordered,
-            projection_commitment,
-            provisional,
+            _admission_ordered: admission_ordered,
+            _projection_commitment: projection_commitment,
+            _provisional: provisional,
             proofs,
         };
         Ok(snapshot)
@@ -7933,8 +7933,10 @@ mod tests {
         graph.admit(root_fact_record).expect("root fact admits");
         graph.admit(first.clone()).expect("first quarantines");
         graph.admit(second.clone()).expect("second quarantines");
-        let mut policy = SemanticPolicyConfig::default();
-        policy.max_provisional_rows = 1;
+        let policy = SemanticPolicyConfig {
+            max_provisional_rows: 1,
+            ..SemanticPolicyConfig::default()
+        };
         let store = DurableSemanticStore::with_policy(&runtime_root, "provisional-cap", policy);
         assert!(matches!(
             store.commit(
@@ -7979,8 +7981,10 @@ mod tests {
         graph
             .admit(second.clone())
             .expect("second-author fact quarantines");
-        let mut policy = SemanticPolicyConfig::default();
-        policy.max_author_usage_rows = 1;
+        let policy = SemanticPolicyConfig {
+            max_author_usage_rows: 1,
+            ..SemanticPolicyConfig::default()
+        };
         let store = DurableSemanticStore::with_policy(&author_root, "author-cap", policy);
         assert!(matches!(
             store.commit(
@@ -8009,8 +8013,10 @@ mod tests {
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.admit(first.clone()).expect("first fact admits");
         graph.admit(grant.clone()).expect("grant admits");
-        let mut policy = SemanticPolicyConfig::default();
-        policy.max_proof_links = 1;
+        let policy = SemanticPolicyConfig {
+            max_proof_links: 1,
+            ..SemanticPolicyConfig::default()
+        };
         let store = DurableSemanticStore::with_policy(&root, "proof-link-cap", policy);
         store
             .commit(&graph, Vec::new())
@@ -9076,12 +9082,12 @@ mod tests {
             assert_eq!(unchanged.context_id, canonical.context_id);
             assert_eq!(unchanged.facts, canonical.facts);
             assert_eq!(unchanged.quarantined, canonical.quarantined);
-            assert_eq!(unchanged.admission_ordered, canonical.admission_ordered);
+            assert_eq!(unchanged._admission_ordered, canonical._admission_ordered);
             assert_eq!(
-                unchanged.projection_commitment,
-                canonical.projection_commitment
+                unchanged._projection_commitment,
+                canonical._projection_commitment
             );
-            assert_eq!(unchanged.provisional, canonical.provisional);
+            assert_eq!(unchanged._provisional, canonical._provisional);
             assert_eq!(unchanged.proofs, canonical.proofs);
         }
         connection

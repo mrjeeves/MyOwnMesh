@@ -310,8 +310,10 @@ fn scale_capacity_with_ready_batch(
         )
         .expect("scaled admitted fact bytes fit u64");
     let max_fact_encoded_bytes = first_fact_bytes.max(chained_fact_bytes);
-    let mut policy = SemanticPolicyConfig::default();
-    policy.max_fact_encoded_bytes = max_fact_encoded_bytes;
+    let mut policy = SemanticPolicyConfig {
+        max_fact_encoded_bytes,
+        ..SemanticPolicyConfig::default()
+    };
     policy.max_dependencies_per_fact = 1;
     policy.max_authority_uses_per_fact = 2;
     policy.max_authority_predecessors_per_use = 1;
@@ -376,10 +378,8 @@ fn scale_capacity_with_ready_batch(
     // The connector owner also admits the protocol's finite callback
     // envelope while each real fact is proposed.  Price the larger of that
     // protocol bound and the measured real fact, once per workload item.
-    let one_fact_resource_bytes = max_fact_encoded_bytes.max(
-        u64::try_from(myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES)
-            .expect("protocol callback envelope fits u64"),
-    );
+    let one_fact_resource_bytes = max_fact_encoded_bytes
+        .max(myownmesh_core::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES);
     let provider_per_class = one_fact_resource_bytes
         .checked_mul(scale_u64)
         .expect("scaled provider capacity fits u64");
@@ -544,6 +544,7 @@ fn closed_config(id: &str, scale: usize, capacity: ScaleCapacity) -> NetworkConf
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         scheduler: Default::default(),
         semantic_policy: semantic_policy(scale, capacity),
@@ -572,6 +573,7 @@ fn open_config(id: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         scheduler: Default::default(),
         semantic_policy: SemanticPolicyConfig::default(),
@@ -754,9 +756,7 @@ mod metric_controls {
 
     #[test]
     fn nearest_rank_percentiles_are_one_based() {
-        let samples: Vec<_> = (1..=10)
-            .map(|milliseconds| Duration::from_millis(milliseconds))
-            .collect();
+        let samples: Vec<_> = (1..=10).map(Duration::from_millis).collect();
         assert_eq!(percentile_ms_sorted(&samples, 50), 5.0);
         assert_eq!(percentile_ms_sorted(&samples, 95), 10.0);
         assert_eq!(percentile_ms_sorted(&samples, 99), 10.0);
@@ -768,7 +768,11 @@ mod metric_controls {
             MAX_TIMING_SAMPLES,
             SCALE_WINDOW_TARGETS * WINDOW_SAMPLE_LIMIT
         );
-        assert!(MAX_TIMING_SAMPLES <= 8_192);
+        const _: () = {
+            if MAX_TIMING_SAMPLES > 8_192 {
+                panic!("timing sample bound exceeds the fixed diagnostic ceiling");
+            }
+        };
     }
 }
 
@@ -1022,9 +1026,11 @@ async fn run_concurrent_producers(group_size: usize) -> myownmesh_core::Result<(
     );
     let mean_facts_per_durable_commit = group_size as f64 / durable_commit_count as f64;
     latencies.sort_unstable();
-    let throughput_per_sec = (elapsed_ms > 0.0)
-        .then(|| group_size as f64 * 1_000.0 / elapsed_ms)
-        .unwrap_or(0.0);
+    let throughput_per_sec = if elapsed_ms > 0.0 {
+        group_size as f64 * 1_000.0 / elapsed_ms
+    } else {
+        0.0
+    };
     let metrics = ConcurrentProducerMetrics {
         selector: "semantic_ledger_scale_concurrent_producers",
         group_size,
@@ -1166,9 +1172,11 @@ async fn run_group_commit_hotpath(group_size: usize) -> myownmesh_core::Result<(
         causal_journal_count,
         facts_per_durable_commit: group_size as f64 / durable_commit_count as f64,
         elapsed_ms,
-        throughput_per_sec: (elapsed_ms > 0.0)
-            .then(|| group_size as f64 * 1_000.0 / elapsed_ms)
-            .unwrap_or(0.0),
+        throughput_per_sec: if elapsed_ms > 0.0 {
+            group_size as f64 * 1_000.0 / elapsed_ms
+        } else {
+            0.0
+        },
         db_before,
         db_after,
         admission_phases,
@@ -1274,7 +1282,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let mut window_samples = Vec::with_capacity(WINDOW_SAMPLE_LIMIT.min(window_size));
     let mut bounded_samples = Vec::with_capacity(MAX_TIMING_SAMPLES.min(timed_admissions));
     let mut tail_evidence = None;
-    let mut no_op_evidence = None;
+    let no_op_evidence;
     // Failure diagnostics are deliberately opt-in: normal successful scale
     // admissions must not pay a filesystem walk.  When enabled for a
     // reproduction run, retain the pre-call footprint so the error reports
@@ -1581,7 +1589,11 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     });
     let process_scope_cpu_time_ms = initial_cpu_time_ms.and_then(|before| {
         process_cpu_time_ms().and_then(|after| {
-            (before.is_finite() && after.is_finite() && after >= before).then(|| after - before)
+            if before.is_finite() && after.is_finite() && after >= before {
+                Some(after - before)
+            } else {
+                None
+            }
         })
     });
     let process_rss_after_workload_bytes = process_vmrss_bytes();
@@ -1638,9 +1650,11 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let admission_p50_ms = percentile_ms_sorted(&bounded_samples, 50);
     let admission_p95_ms = percentile_ms_sorted(&bounded_samples, 95);
     let admission_p99_ms = percentile_ms_sorted(&bounded_samples, 99);
-    let admissions_per_sec = (admission_total_ms > 0.0)
-        .then(|| timed_admissions as f64 * 1_000.0 / admission_total_ms)
-        .unwrap_or(0.0);
+    let admissions_per_sec = if admission_total_ms > 0.0 {
+        timed_admissions as f64 * 1_000.0 / admission_total_ms
+    } else {
+        0.0
+    };
     let early_window_average_ms_per_admission = window_evidence
         .first()
         .map(|window| window.average_admission_ms);

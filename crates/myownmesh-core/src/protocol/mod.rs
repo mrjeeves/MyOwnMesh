@@ -41,17 +41,23 @@
 //! protocol. `hello.features` carries only the closed endpoint-authentication
 //! profile required before any post-active frame is admitted.
 
+pub mod application_flow;
 pub mod departure;
+pub mod endpoint_cipher;
 pub mod facts;
 pub mod features;
 pub mod handshake;
 pub mod hub;
+pub mod hub_introduction;
 pub mod keepalive;
 pub mod parenting;
 pub mod relay;
 pub mod rpc;
 pub mod topology;
 
+pub use application_flow::{
+    ApplicationFlowControl, ApplicationFlowCoordinate, ApplicationFlowMode,
+};
 pub use departure::{
     DepartureCorrelation, DepartureCorrelationError, DEPARTURE_CORRELATION_BYTES,
     DEPARTURE_CORRELATION_WIRE_CHARS,
@@ -68,6 +74,10 @@ pub use hub::{
     configuration_digest, HubAdvertisement, HubDiscoveryRequest, HubDiscoveryResponse,
     HubTrickleProfile, HUB_CONFIGURATION_DIGEST_DOMAIN, HUB_DISCOVERY_HARD_MAX_PEERS,
 };
+pub use hub_introduction::{
+    HubIntroductionBody, HubIntroductionEnvelope, HubIntroductionError, IntroductionChallenge,
+    IntroductionRefusal,
+};
 pub use keepalive::{PingMessage, PongMessage};
 pub use parenting::{
     hub_tree_configuration_digest, HubTreeAttachRejection, HubTreeAttachRequest,
@@ -82,7 +92,7 @@ pub use rpc::{
     RpcStreamChunkMessage, RpcStreamEndMessage,
 };
 pub use topology::{
-    ClosedRoutedPayload, RoutedApplicationEnvelope, RoutedApplicationError,
+    ClosedRoutedPayload, EndpointCipherControl, RoutedApplicationEnvelope, RoutedApplicationError,
     RoutedApplicationLimits, RoutedHop, ShelveMessage, UnshelveMessage,
 };
 
@@ -246,6 +256,12 @@ pub(crate) struct ClassifiedFrame {
 /// downgraded. A default of `DropFrame` would silently make some future
 /// completion-bearing variant lose its caller.
 pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
+    if application_flow::is_application_flow_frame(bytes) {
+        return Some(ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        });
+    }
     const PREFIX: &[u8] = br#"{"kind":""#;
     const MAX_KIND_BYTES: usize = 32;
     let rest = bytes.strip_prefix(PREFIX)?;
@@ -410,6 +426,10 @@ pub enum MeshMessage {
     HubTreeAttachRequest(HubTreeAttachRequest),
     /// Direct shallow hub-tree relation result bound to one request.
     HubTreeAttachResponse(HubTreeAttachResponse),
+    /// Bounded signed solicitation carried only by promoted current owners.
+    HubIntroduction(HubIntroductionEnvelope),
+    /// Negotiation of opaque logical flows on this exact promoted session.
+    ApplicationFlowControl(ApplicationFlowControl),
     /// Authenticated exact-session control. See [`SessionControl`] for why it
     /// has no target field and what a receiver may do with it.
     SessionControl(SessionControl),
@@ -666,6 +686,8 @@ mod tests {
             "channel_seq",
             "channel_ack",
             "routed_application",
+            "hub_introduction",
+            "application_flow_control",
         ] {
             assert_eq!(
                 classify(kind).admission,
@@ -697,16 +719,19 @@ mod tests {
             *destination_key.verifying_key().as_bytes(),
         )
         .expect("destination device id");
+        let payload = topology::ciphertext_payload_for_test(
+            crate::semantic::MeshContextId::from_bytes([23; 32]),
+            &origin,
+            &destination,
+            32,
+        );
         let envelope = RoutedApplicationEnvelope::new(
             crate::semantic::MeshContextId::from_bytes([23; 32]),
             origin,
             destination,
             [24; 16],
             1,
-            ClosedRoutedPayload::ChannelFrame {
-                channel: "protocol-test".into(),
-                payload: serde_json::json!({"probe": true}),
-            },
+            payload,
             &origin_key,
         )
         .expect("routed envelope");
@@ -774,6 +799,21 @@ mod tests {
     fn unknown_kind_is_refused() {
         let raw = r#"{"kind":"definitely_not_a_real_kind","whatever":1}"#;
         assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
+    }
+
+    #[test]
+    fn binary_flow_classifier_never_grants_pre_auth_or_json_interpretation() {
+        assert_eq!(
+            classify_frame(b"MOMF\x01\xff{not-json"),
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Application,
+                on_failure: FailurePolicy::EndSession,
+            })
+        );
+        assert_eq!(classify_frame(b"MOM"), None);
+        // Classification admits no body; the fixed binary decoder must still
+        // reject this malformed header under the exact promoted owner.
+        assert!(application_flow::decode_application_flow(b"MOMF\x01\xff{not-json", 100).is_err());
     }
 
     #[test]

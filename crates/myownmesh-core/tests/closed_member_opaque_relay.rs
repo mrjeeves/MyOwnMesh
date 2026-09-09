@@ -549,7 +549,7 @@ fn connector_policy(
             share_identity,
             share_context,
             share_peer,
-            DeviceId::from_canonical_str(&session_identity)
+            DeviceId::from_canonical_str(session_identity)
                 .expect("relay id is canonical for the share witness"),
             [0x51; 16],
             &share_profile,
@@ -704,6 +704,7 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::Star { hub: relay.into() },

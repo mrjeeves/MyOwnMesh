@@ -22,6 +22,11 @@ pub struct StandDown {
     pub proof: FactId,
 }
 
+pub(crate) type ProjectionCheckpointParts = (
+    Vec<(ExclusiveCell, CellProjection)>,
+    Vec<(DeviceId, StandDown)>,
+);
+
 const PROJECTION_COMMITMENT_DOMAIN: &[u8] = b"myownmesh-v4/projection-patricia-merkle/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,14 +249,17 @@ pub(crate) struct ProjectionDelta {
 }
 
 impl ProjectionDelta {
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn base_generation(&self) -> u64 {
         self.base_generation
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn base_commitment(&self) -> [u8; 32] {
         self.base_commitment
     }
@@ -378,12 +386,7 @@ fn is_ancestor_within(
 }
 
 impl Projection {
-    pub(crate) fn checkpoint_parts(
-        &self,
-    ) -> (
-        Vec<(ExclusiveCell, CellProjection)>,
-        Vec<(DeviceId, StandDown)>,
-    ) {
+    pub(crate) fn checkpoint_parts(&self) -> ProjectionCheckpointParts {
         (
             self.cells
                 .iter()
@@ -472,6 +475,7 @@ impl Projection {
     /// updated in place without cloning the full projection. The resulting
     /// root is checked against the delta, so a stale or reordered durable
     /// update cannot silently publish a different projection.
+    #[cfg(test)]
     pub(crate) fn apply_delta(
         self,
         delta: &ProjectionDelta,
@@ -496,10 +500,7 @@ impl Projection {
                     cells.remove(cell);
                 }
             }
-            commitment = commitment.apply(
-                cell_key(cell),
-                value.as_ref().map(|value| cell_value(value)),
-            );
+            commitment = commitment.apply(cell_key(cell), value.as_ref().map(cell_value));
         }
         let stand_down = Arc::make_mut(&mut next.stand_down);
         for (target, value) in &delta.stand_down {
@@ -511,10 +512,8 @@ impl Projection {
                     stand_down.remove(target);
                 }
             }
-            commitment = commitment.apply(
-                stand_down_key(target),
-                value.as_ref().map(|value| stand_down_value(value)),
-            );
+            commitment =
+                commitment.apply(stand_down_key(target), value.as_ref().map(stand_down_value));
         }
         if commitment.root() != delta.commitment {
             return None;
@@ -559,20 +558,16 @@ impl Projection {
         }
         let mut commitment = (*self.commitment).clone();
         for (cell, value) in previous_cells {
-            commitment = commitment.apply(
-                cell_key(cell),
-                value.as_ref().map(|value| cell_value(value)),
-            );
+            commitment = commitment.apply(cell_key(cell), value.as_ref().map(cell_value));
         }
         for (target, value) in previous_stand_down {
-            commitment = commitment.apply(
-                stand_down_key(target),
-                value.as_ref().map(|value| stand_down_value(value)),
-            );
+            commitment =
+                commitment.apply(stand_down_key(target), value.as_ref().map(stand_down_value));
         }
         self.commitment = Arc::new(commitment);
     }
 
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn delta_from(
         &self,
         previous: &Self,

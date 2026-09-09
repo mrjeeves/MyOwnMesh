@@ -24,6 +24,10 @@ use super::*;
 ///
 /// `None` is ordinary, not an error: a flow closed before negotiation reached
 /// the native layer has nothing outstanding.
+// Each variant is an owned terminal handoff with its own funded custody. A
+// Box here would change the close/drop ownership boundary rather than merely
+// improve layout.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RealtimeFlowRemains {
     /// The retirement owner for a transceiver still to be stopped.
     ///
@@ -88,6 +92,10 @@ impl RealtimeFlowEnd {
     /// that block's own funding with it, so what the watcher holds stays paid
     /// for until the watcher itself lets go.
     pub(super) fn watch(&self) -> Arc<LeasedWake> {
+        Arc::clone(&self.0)
+    }
+
+    pub(super) fn notify(&self) -> Arc<LeasedWake> {
         Arc::clone(&self.0)
     }
 }
@@ -188,9 +196,19 @@ pub(in crate::transport::webrtc) struct RealtimeInboundAttachment {
 pub(crate) struct RealtimeFlow {
     pub(super) port: RealtimeFlowPort,
     label: RealtimeFlowLabel,
-    encoding: RealtimeEncoding,
+    pub(super) kind: RealtimeFlowKind,
     direction: RealtimeDirection,
     pub(super) queue: FlowQueue,
+    pub(super) opaque_pending: Option<OpaqueFlowPending>,
+    /// A Change which has been prepared but not yet committed by the
+    /// authenticated control transaction.  It lives on the flow record rather
+    /// than in a session-side map, so close/replacement cannot accidentally
+    /// commit a successor with the same label.
+    pub(super) opaque_pending_change: Option<OpaqueFlowPendingChange>,
+    /// One owner-funded local application claim on an opaque record. Remote
+    /// Open creates the record without this lease; a local application must
+    /// claim that exact record before its handle can be minted.
+    pub(super) opaque_application_claim: Option<crate::resource::ResourceLease>,
     /// Dropped with this flow, waking whatever was reading for it.
     pub(super) end: RealtimeFlowEnd,
     /// What this flow's close will leave for its caller to finish.
@@ -212,13 +230,99 @@ pub(crate) struct RealtimeFlow {
     incarnation: Arc<crate::connector::ConnectorIncarnation>,
 }
 
+/// Readiness state for one logical opaque Open/Accept transaction. The record
+/// owns this state; the wake is borrowed from the flow's already-funded end
+/// signal, so pending negotiation adds no allocation or parallel registry.
+pub(crate) struct OpaqueFlowPending {
+    pub(crate) coordinate: crate::protocol::ApplicationFlowCoordinate,
+    pub(crate) mode: crate::realtime::OpaqueFlowMode,
+    pub(crate) max_unit_bytes: usize,
+    pub(crate) ready: bool,
+}
+
+/// The staged scalar state for one exact flow-record Change.  It contains no
+/// label copy; its shared marker carries the operation's funding and is also
+/// held by the caller token, so either owner may outlive the other safely.
+pub(super) struct OpaqueFlowPendingChange {
+    pub(super) previous: crate::protocol::ApplicationFlowCoordinate,
+    pub(super) coordinate: crate::protocol::ApplicationFlowCoordinate,
+    pub(super) opener_direction: crate::realtime::RealtimeFlowDirection,
+    pub(super) mode: crate::realtime::OpaqueFlowMode,
+    pub(super) max_unit_bytes: usize,
+    pub(super) active: Arc<OpaqueChangeMarker>,
+    pub(super) confirmed: bool,
+}
+
+/// A move-only citation of one prepared Change.  The weak record identity is
+/// checked again at commit/rollback, preventing a label ABA from applying a
+/// delayed control to a successor flow.
+pub(crate) struct OpaqueFlowChange {
+    pub(super) identity: RealtimeFlowIdentity,
+    pub(super) previous: crate::protocol::ApplicationFlowCoordinate,
+    pub(super) coordinate: crate::protocol::ApplicationFlowCoordinate,
+    pub(super) opener_direction: crate::realtime::RealtimeFlowDirection,
+    pub(super) mode: crate::realtime::OpaqueFlowMode,
+    pub(super) max_unit_bytes: usize,
+    pub(super) active: Arc<OpaqueChangeMarker>,
+    pub(super) finished: bool,
+}
+
+impl Drop for OpaqueFlowChange {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.active.cancel();
+        }
+    }
+}
+
 impl RealtimeFlow {
     pub(crate) fn label(&self) -> &RealtimeFlowLabel {
         &self.label
     }
 
-    pub(crate) fn encoding(&self) -> &RealtimeEncoding {
-        &self.encoding
+    pub(crate) fn encoding(&self) -> Option<&RealtimeEncoding> {
+        match &self.kind {
+            RealtimeFlowKind::Rtp(encoding) => Some(encoding),
+            RealtimeFlowKind::Opaque { .. } => None,
+        }
+    }
+
+    pub(crate) fn opaque_mode(&self) -> Option<crate::realtime::OpaqueFlowMode> {
+        match &self.kind {
+            RealtimeFlowKind::Rtp(_) => None,
+            RealtimeFlowKind::Opaque { mode, .. } => Some(*mode),
+        }
+    }
+
+    pub(crate) fn opaque_max_unit_bytes(&self) -> Option<usize> {
+        match &self.kind {
+            RealtimeFlowKind::Rtp(_) => None,
+            RealtimeFlowKind::Opaque { max_unit_bytes, .. } => Some(*max_unit_bytes),
+        }
+    }
+
+    pub(crate) fn opaque_coordinate(&self) -> Option<crate::protocol::ApplicationFlowCoordinate> {
+        match &self.kind {
+            RealtimeFlowKind::Rtp(_) => None,
+            RealtimeFlowKind::Opaque { coordinate, .. } => Some(*coordinate),
+        }
+    }
+
+    pub(crate) fn opaque_opener_direction(&self) -> Option<crate::realtime::RealtimeFlowDirection> {
+        match &self.kind {
+            RealtimeFlowKind::Rtp(_) => None,
+            RealtimeFlowKind::Opaque {
+                opener_direction, ..
+            } => Some(*opener_direction),
+        }
+    }
+
+    pub(crate) fn opaque_is_ready(&self) -> Option<bool> {
+        self.opaque_mode()
+            .map(|_| match self.opaque_pending.as_ref() {
+                Some(pending) => pending.ready,
+                None => true,
+            })
     }
 
     pub(crate) fn direction(&self) -> RealtimeDirection {
@@ -328,11 +432,14 @@ impl RealtimeFlow {
 /// go back with it. A name is in use exactly when a flow of this session is
 /// keyed by it, which is one fact in one place rather than two that agree until
 /// they do not.
-pub(super) fn open_session_flow(
+fn open_flow(
     session: &impl RealtimeSessionBinding,
     live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
     registry: &Arc<RealtimeFlowRegistry>,
-    spec: RealtimeFlowSpec,
+    direction: RealtimeDirection,
+    name: RealtimeFlowName,
+    kind: RealtimeFlowKind,
+    opaque_application_claim: Option<crate::resource::ResourceLease>,
 ) -> FlowResult<(RealtimeFlow, crate::resource::ResourceLease)> {
     // Same acquisition rule as the send-time gate: `live` is the worker's own
     // `Option`, which is `None` once the connector has retired. A flow can
@@ -354,12 +461,12 @@ pub(super) fn open_session_flow(
     // this session paid for these bytes; every use of the flow behind it is
     // re-gated by `port_if_current`, so nothing downstream may treat possession
     // of a label as authority to move anything.
-    let label = RealtimeFlowLabel::mint(spec.name.clone(), registry)?;
+    let label = RealtimeFlowLabel::mint(name, registry)?;
     // The checked forms deliberately, not the `Option` twins: those are
     // `#[cfg(test)]` or discard the reason, and a refused open is worth
     // knowing the cause of even where this layer answers one variant for all
     // of them.
-    let port = match spec.direction {
+    let port = match direction {
         RealtimeDirection::Outbound => registry.open_outbound_flow_checked(),
         RealtimeDirection::Inbound => registry.open_inbound_flow_checked(),
     };
@@ -393,23 +500,103 @@ pub(super) fn open_session_flow(
     // minted before the refusal are all dropped with this frame, and each of
     // those drops is what releases its own funding.
     let end = RealtimeFlowEnd::mint(registry)?;
-    let queue = match spec.direction {
-        RealtimeDirection::Outbound => FlowQueue::Outbound(RealtimeFlowQueue::mint(registry)?),
-        RealtimeDirection::Inbound => FlowQueue::Inbound,
+    let queue = match &kind {
+        RealtimeFlowKind::Opaque { .. } if direction == RealtimeDirection::Outbound => {
+            FlowQueue::OpaqueOutbound(RealtimeFlowQueue::mint(registry)?)
+        }
+        RealtimeFlowKind::Opaque { .. } => FlowQueue::Inbound,
+        RealtimeFlowKind::Rtp(_) if direction == RealtimeDirection::Outbound => {
+            FlowQueue::Outbound(RealtimeFlowQueue::mint(registry)?)
+        }
+        RealtimeFlowKind::Rtp(_) => FlowQueue::Inbound,
+    };
+    let opaque_pending = match &kind {
+        RealtimeFlowKind::Opaque {
+            coordinate,
+            mode,
+            max_unit_bytes,
+            opener_direction: _,
+            ..
+        } => Some(OpaqueFlowPending {
+            coordinate: *coordinate,
+            mode: *mode,
+            max_unit_bytes: *max_unit_bytes,
+            ready: false,
+        }),
+        RealtimeFlowKind::Rtp(_) => None,
     };
     Ok((
         RealtimeFlow {
             port,
             label,
-            encoding: spec.encoding,
-            direction: spec.direction,
+            kind,
+            direction,
             queue,
+            opaque_pending,
+            opaque_pending_change: None,
+            opaque_application_claim,
             end,
             native: RealtimeFlowRemains::None,
             incarnation: Arc::clone(incarnation),
         },
         map_entry,
     ))
+}
+
+pub(super) fn open_session_flow(
+    session: &impl RealtimeSessionBinding,
+    live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+    registry: &Arc<RealtimeFlowRegistry>,
+    spec: RealtimeFlowSpec,
+) -> FlowResult<(RealtimeFlow, crate::resource::ResourceLease)> {
+    open_flow(
+        session,
+        live,
+        registry,
+        spec.direction,
+        spec.name,
+        RealtimeFlowKind::Rtp(spec.encoding),
+        None,
+    )
+}
+
+pub(super) fn open_opaque_flow(
+    session: &impl RealtimeSessionBinding,
+    live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+    registry: &Arc<RealtimeFlowRegistry>,
+    spec: OpaqueFlowSpec,
+    coordinate: crate::protocol::ApplicationFlowCoordinate,
+    application_claim: Option<crate::resource::ResourceLease>,
+) -> FlowResult<(RealtimeFlow, crate::resource::ResourceLease)> {
+    open_flow(
+        session,
+        live,
+        registry,
+        spec.direction,
+        spec.name,
+        RealtimeFlowKind::Opaque {
+            mode: spec.mode,
+            max_unit_bytes: spec.max_unit_bytes,
+            coordinate,
+            opener_direction: spec.opener_direction,
+        },
+        application_claim,
+    )
+}
+
+/// The provider-specific kind of a logical flow.  Keeping this beside the
+/// existing flow record means opaque and RTP flows share identity, labels,
+/// leases, and close semantics without teaching the generic registry about
+/// codecs or introducing a second map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RealtimeFlowKind {
+    Rtp(RealtimeEncoding),
+    Opaque {
+        mode: crate::realtime::OpaqueFlowMode,
+        max_unit_bytes: usize,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+    },
 }
 
 /// What an application asks for when opening a flow.
@@ -422,5 +609,20 @@ pub(crate) struct RealtimeFlowSpec {
     /// Raw and unleased, because at this point nothing has agreed to keep it.
     /// The leased label is minted from it only once the session has accepted
     /// the name.
+    pub(crate) name: RealtimeFlowName,
+}
+
+/// Provider-local view of the generic opaque-flow request. The name and
+/// direction use the existing leased flow machinery; only the wire mode and
+/// negotiated body ceiling differ. Provider-neutral callers use
+/// [`crate::realtime::OpaqueFlowOpen`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpaqueFlowSpec {
+    pub(crate) direction: RealtimeDirection,
+    /// Direction in the opener's coordinate system. For a remote Open this
+    /// differs from the local flow direction.
+    pub(crate) opener_direction: crate::realtime::RealtimeFlowDirection,
+    pub(crate) mode: crate::realtime::OpaqueFlowMode,
+    pub(crate) max_unit_bytes: usize,
     pub(crate) name: RealtimeFlowName,
 }

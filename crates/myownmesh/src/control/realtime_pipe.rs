@@ -459,7 +459,7 @@ where
 
     let mut probe = [0u8; 1];
     loop {
-        let arrival = tokio::select! {
+        let arrival = match tokio::select! {
             biased;
             // The client never writes on an inbound pipe, so any completed read
             // — a stray byte, or normally EOF — means it is gone. Biased first
@@ -467,6 +467,15 @@ where
             // an idle session that may never produce another unit.
             _ = reader.read(&mut probe) => return Ok(()),
             arrival = net.recv_webrtc_realtime_any(inbound) => arrival,
+        } {
+            Ok(arrival) => arrival,
+            Err(refusal) => {
+                warn!(%peer, code = refusal.code(), "realtime inbound head is not RTP; closing pipe");
+                return Err(anyhow::anyhow!(
+                    "realtime inbound receive refused by core: {}",
+                    refusal.code()
+                ));
+            }
         };
         let Some(arrival) = arrival else {
             debug!(%peer, "realtime inbound stream ended (session over)");

@@ -35,6 +35,126 @@ pub struct ClockSkewSamples {
 
 pub(super) const SKEW_WINDOW: usize = 5;
 
+/// Application-use accounting for one demand-owned exact connection. The
+/// NetworkState entry owns the peer token and funding; this inline state is
+/// neither a peer selector nor a second session/flow registry. Heartbeats and
+/// discovery never call it. Reserving retirement fences subsequent app work
+/// while the caller checks the exact session's real queues and flow owners.
+pub(super) struct DemandLinkActivity {
+    active: u64,
+    last_use: Instant,
+    retiring: bool,
+}
+
+impl DemandLinkActivity {
+    pub(super) fn new(now: Instant) -> Self {
+        Self {
+            active: 0,
+            last_use: now,
+            retiring: false,
+        }
+    }
+
+    pub(super) fn begin(&mut self, now: Instant) -> bool {
+        if self.retiring || now < self.last_use {
+            return false;
+        }
+        let Some(active) = self.active.checked_add(1) else {
+            return false;
+        };
+        self.active = active;
+        self.last_use = now;
+        true
+    }
+
+    pub(super) fn finish(&mut self, now: Instant) {
+        // An unpaired finish must not make a busy connection appear idle.
+        if self.active == 0 {
+            self.retiring = true;
+            return;
+        }
+        self.active -= 1;
+        if now < self.last_use {
+            self.retiring = true;
+        } else {
+            self.last_use = now;
+        }
+    }
+
+    pub(super) fn reserve_idle(&mut self, now: Instant, idle: std::time::Duration) -> bool {
+        if idle.is_zero() || self.retiring || self.active != 0 {
+            return false;
+        }
+        let Some(elapsed) = now.checked_duration_since(self.last_use) else {
+            return false;
+        };
+        if elapsed < idle {
+            return false;
+        }
+        self.retiring = true;
+        true
+    }
+
+    pub(super) fn cancel_idle(&mut self) {
+        // Only an exact reservation guard may undo its own idle reservation.
+        self.retiring = false;
+    }
+
+    pub(super) fn idle_reserved(&self) -> bool {
+        self.retiring && self.active == 0
+    }
+}
+
+#[cfg(test)]
+mod demand_link_activity_controls {
+    use super::DemandLinkActivity;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn demand_idle_requires_zero_use_and_exact_deadline() {
+        let start = Instant::now();
+        let idle = Duration::from_secs(4);
+        let mut activity = DemandLinkActivity::new(start);
+        assert!(activity.begin(start));
+        assert!(!activity.reserve_idle(start + idle, idle));
+        activity.finish(start + idle);
+        assert!(!activity.reserve_idle(start + idle + idle - Duration::from_millis(1), idle));
+        assert!(activity.reserve_idle(start + idle + idle, idle));
+        assert!(activity.idle_reserved());
+        assert!(!activity.begin(start + idle + idle));
+        activity.cancel_idle();
+        assert!(!activity.idle_reserved());
+        assert!(activity.begin(start + idle + idle));
+    }
+
+    #[test]
+    fn demand_activity_refuses_clock_regression_and_count_exhaustion() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(1);
+        let mut activity = DemandLinkActivity::new(later);
+        assert!(!activity.begin(start));
+        assert!(!activity.reserve_idle(start, Duration::from_secs(1)));
+        activity.active = u64::MAX;
+        assert!(!activity.begin(later));
+        assert!(!activity.reserve_idle(later + Duration::from_secs(10), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn independent_demand_owner_never_inherits_old_activity() {
+        let start = Instant::now();
+        let idle = Duration::from_secs(1);
+        let mut old = DemandLinkActivity::new(start);
+        let mut successor = DemandLinkActivity::new(start);
+        assert!(old.begin(start));
+        assert!(successor.begin(start));
+        old.finish(start);
+        assert!(old.reserve_idle(start + idle, idle));
+        assert!(old.idle_reserved());
+        assert!(!successor.idle_reserved());
+        assert!(!successor.reserve_idle(start + idle, idle));
+    }
+}
+
 impl Default for ClockSkewSamples {
     fn default() -> Self {
         Self {
@@ -378,6 +498,71 @@ pub(super) struct SpeculativeRetirement {
     pub(super) additional_dedup: PromotedDedupSet,
 }
 
+/// Fixed terminal cause; never retains a transport error string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IntroductionTerminalDisposition {
+    Denied,
+    AuthFailed,
+    IceFailed,
+    UserLeft,
+    TopologyPruned,
+    HeartbeatTimeout,
+    TransportError,
+}
+
+impl IntroductionTerminalDisposition {
+    pub(super) fn from_drop_reason(reason: &crate::events::DropReason) -> Self {
+        use crate::events::DropReason;
+        match reason {
+            DropReason::Denied => Self::Denied,
+            DropReason::AuthFailed => Self::AuthFailed,
+            DropReason::IceFailed => Self::IceFailed,
+            DropReason::UserLeft => Self::UserLeft,
+            DropReason::TopologyPruned => Self::TopologyPruned,
+            DropReason::HeartbeatTimeout => Self::HeartbeatTimeout,
+            DropReason::TransportError { .. } => Self::TransportError,
+        }
+    }
+}
+
+/// Inline custody in the existing demand record, not a ClosingWorker entry.
+/// All backing remains owned until native AND engine receiver have joined.
+pub(super) struct IntroducedRetirement {
+    pub(super) worker: Arc<WebRtcConnectorWorker>,
+    pub(super) terminal: Option<IntroductionTerminalDisposition>,
+    authenticated_channel: Option<crate::endpoint_auth::AuthenticatedChannelCapability>,
+    auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
+    dedup: Option<DedupToken>,
+    additional_dedup: PromotedDedupSet,
+}
+
+impl IntroducedRetirement {
+    #[cfg(test)]
+    pub(super) fn authenticated_custody_for_test(&self) -> bool {
+        self.authenticated_channel
+            .as_ref()
+            .is_some_and(|capability| {
+                self.worker
+                    .matches_connector_identity_for_retirement(capability.record().connector())
+                    && capability.belongs_to(capability.record().connector())
+            })
+            && self.auth.as_ref().is_some_and(|task| {
+                task.is_retired()
+                    && self
+                        .worker
+                        .matches_connector_identity_for_retirement(task.incarnation())
+            })
+    }
+
+    pub(super) fn release_after_join(self, peer: &PeerConnection) {
+        peer.release_dedup_custody(self.dedup, self.additional_dedup.drain_tokens());
+        drop(self.auth);
+        // The real connected handoff is not dropped to initiate cleanup: it
+        // remains here until the caller has joined native AND engine pump.
+        drop(self.authenticated_channel);
+    }
+}
+
 pub(super) struct DedupDrain {
     primary: Option<DedupToken>,
     additional: PromotedDedupDrain,
@@ -452,6 +637,22 @@ impl PeerConnection {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntroductionBackingPhase {
+    InUse,
+    Retiring,
+    Reusable,
+    Unusable,
+}
+
+/// Funds the retained peer/registry storage even between native attempts.
+/// A full ticket, not its generation-free wire correlation, names each use.
+struct IntroductionBacking {
+    lease: crate::resource::ResourceLease,
+    ticket: Option<super::hub_introduction::IntroductionTicket>,
+    phase: IntroductionBackingPhase,
+}
+
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
@@ -513,6 +714,9 @@ pub struct PeerConnection {
     /// attempt, resource, or application authority.
     pub epoch: u64,
     unpromoted_offer_in_flight: AtomicBool,
+    // Present only for demand-created placeholders. Its backing remains
+    // funded while any captured owner/worker task retains this connection.
+    _introduction_backing: Mutex<Option<IntroductionBacking>>,
 }
 
 /// Exact-owner witness for one legacy untrusted-signaling mutation.
@@ -860,6 +1064,127 @@ impl PeerConnection {
             .map(|owner| Arc::clone(&owner.worker))
     }
 
+    /// Called only under the registry installation fence and then the demand
+    /// record lock. Never consults the selected promoted channel or takes a
+    /// successor's correlation. Negotiation/promotion winning first refuses
+    /// this terminal transition without modifying any owner.
+    pub(super) fn detach_failed_introduction(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> Option<IntroducedRetirement> {
+        self.detach_introduction(worker, ticket, None)
+    }
+
+    /// Only the caller's explicit exact-owner terminal fence may use this
+    /// sibling. Controller expiry/Terminal is not permission to take a live
+    /// authenticated capability.
+    pub(super) fn detach_terminal_introduction(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+        ticket: super::hub_introduction::IntroductionTicket,
+        terminal: IntroductionTerminalDisposition,
+    ) -> Option<IntroducedRetirement> {
+        self.detach_introduction(worker, ticket, Some(terminal))
+    }
+
+    fn detach_introduction(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+        ticket: super::hub_introduction::IntroductionTicket,
+        terminal: Option<IntroductionTerminalDisposition>,
+    ) -> Option<IntroducedRetirement> {
+        let attempt = self.attempt.read();
+        if !ticket.matches_attempt(&attempt)
+            || self.registry_retired()
+            || self.unpromoted_offer_in_flight()
+            || self.promoted_session.contains_worker(worker)
+        {
+            return None;
+        }
+        let mut backing = self._introduction_backing.lock();
+        let backing = backing.as_mut().filter(|backing| {
+            backing.ticket == Some(ticket) && backing.phase == IntroductionBackingPhase::InUse
+        })?;
+        let mut capability = self.authenticated_channel.lock();
+        if terminal.is_some() {
+            if capability.as_ref().is_some_and(|capability| {
+                !worker.matches_connector_identity_for_retirement(capability.record().connector())
+                    || !capability.belongs_to(capability.record().connector())
+            }) {
+                return None;
+            }
+        } else if capability.as_ref().is_some_and(|capability| {
+            worker
+                .live_connector_incarnation()
+                .as_ref()
+                .is_some_and(|incarnation| capability.belongs_to(incarnation))
+        }) {
+            return None;
+        }
+        let mut slot = self.unpromoted_connector.lock();
+        if !slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.worker, worker))
+        {
+            return None;
+        }
+        let mut auth = self.endpoint_auth.lock();
+        if auth.as_ref().is_some_and(|task| {
+            if terminal.is_some() {
+                !worker.matches_connector_identity_for_retirement(task.incarnation())
+            } else {
+                !worker.owns_endpoint_auth(task)
+            }
+        }) {
+            return None;
+        }
+        // Retire the actual task while its installation is still excluded;
+        // no later authentication result can promote this detached worker.
+        if let Some(task) = auth.as_ref() {
+            task.retire();
+        }
+        let detached = IntroducedRetirement {
+            terminal,
+            authenticated_channel: if terminal.is_some() {
+                capability.take()
+            } else {
+                None
+            },
+            worker: slot
+                .take()
+                .expect("exact unpromoted slot was checked")
+                .worker,
+            auth: auth.take(),
+            dedup: self.attempt_dedup.lock().take(),
+            additional_dedup: std::mem::replace(
+                &mut *self.additional_attempt_dedup.lock(),
+                PromotedDedupSet::new(),
+            ),
+        };
+        backing.phase = IntroductionBackingPhase::Retiring;
+        detached.worker.retire();
+        Some(detached)
+    }
+
+    /// Removing an empty installation is optional. Independent promoted,
+    /// speculative, negotiating, closing, or media owners always preserve it.
+    pub(super) fn retire_empty_introduction_installation(&self) -> bool {
+        if self.current_unpromoted_worker().is_some()
+            || self.holds_promoted_session()
+            || self.has_speculative()
+            || self.closing_workers.lock().any(|_| true)
+            || self.unpromoted_offer_in_flight()
+            || self.endpoint_auth.lock().is_some()
+            || self.authenticated_channel.lock().is_some()
+            || self.media_renegotiation_worker.lock().is_some()
+        {
+            return false;
+        }
+        self.registry_retired.store(true, Ordering::Release);
+        true
+    }
+
     /// Adopt the offerer's correlation for this attempt.
     ///
     /// The offering side mints; the answering side adopts, so one attempt has
@@ -1070,9 +1395,9 @@ impl PeerConnection {
         workers
     }
 
-    #[cfg(test)]
+    /// Read-only presence check over the existing funded speculative owners.
     pub(super) fn has_speculative(&self) -> bool {
-        !self.speculative.lock().is_empty()
+        self.speculative.lock().any(|_| true)
     }
 
     pub(super) fn speculative_is_exact(
@@ -1458,6 +1783,23 @@ impl PeerConnection {
     }
 
     pub(super) fn new(device_id: String, worker: Option<Arc<WebRtcConnectorWorker>>) -> Self {
+        Self::new_with_attempt(device_id, worker, mint_attempt(), None)
+    }
+
+    pub(super) fn new_introduction(
+        device_id: String,
+        attempt: String,
+        backing: crate::resource::ResourceLease,
+    ) -> Self {
+        Self::new_with_attempt(device_id, None, attempt, Some(backing))
+    }
+
+    fn new_with_attempt(
+        device_id: String,
+        worker: Option<Arc<WebRtcConnectorWorker>>,
+        attempt: String,
+        backing: Option<crate::resource::ResourceLease>,
+    ) -> Self {
         Self {
             device_id,
             state: RwLock::new(PeerStateData::default()),
@@ -1470,14 +1812,213 @@ impl PeerConnection {
             media_renegotiation_worker: Mutex::new(None),
             endpoint_auth: Mutex::new(None),
             authenticated_channel: Mutex::new(None),
-            attempt: RwLock::new(mint_attempt()),
+            attempt: RwLock::new(attempt),
             attempt_dedup: Mutex::new(None),
             additional_attempt_dedup: Mutex::new(PromotedDedupSet::new()),
             promoted_session: crate::runtime::peer_session::PromotedSessionSlot::new(),
             registry_retired: AtomicBool::new(false),
             epoch: DIAGNOSTIC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             unpromoted_offer_in_flight: AtomicBool::new(false),
+            _introduction_backing: Mutex::new(backing.map(|lease| IntroductionBacking {
+                lease,
+                ticket: None,
+                phase: IntroductionBackingPhase::InUse,
+            })),
         }
+    }
+
+    /// Only a freshly installed empty placeholder may acquire this worker.
+    /// The registry's exact-current fence must surround this synchronous call.
+    pub(super) fn attach_introduction_worker(
+        &self,
+        worker: Arc<WebRtcConnectorWorker>,
+        ticket: Option<super::hub_introduction::IntroductionTicket>,
+    ) -> bool {
+        if self.registry_retired()
+            || self.holds_promoted_session()
+            || self.has_authenticated_channel()
+            || self.state.read().authenticated
+        {
+            return false;
+        }
+        let attempt = self.attempt.read();
+        let backing = self._introduction_backing.lock();
+        if !backing.as_ref().is_some_and(|backing| {
+            backing.ticket == ticket
+                && backing.phase == IntroductionBackingPhase::InUse
+                && ticket.is_none_or(|ticket| ticket.matches_attempt(&attempt))
+        }) {
+            return false;
+        }
+        let mut slot = self.unpromoted_connector.lock();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(UnpromotedConnector { worker });
+        true
+    }
+
+    /// Bind a never-published placeholder to the constructor's full ticket.
+    /// Raw legacy test placeholders stay unbound and cannot become reusable.
+    pub(super) fn bind_initial_introduction(
+        &self,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> bool {
+        if self.registry_retired()
+            || self.state.read().authenticated
+            || !self.introduction_is_empty()
+        {
+            return false;
+        }
+        let attempt = self.attempt.read();
+        if !ticket.matches_attempt(&attempt) {
+            return false;
+        }
+        let mut backing = self._introduction_backing.lock();
+        let Some(backing) = backing.as_mut().filter(|backing| {
+            backing.ticket.is_none() && backing.phase == IntroductionBackingPhase::InUse
+        }) else {
+            return false;
+        };
+        backing.ticket = Some(ticket);
+        true
+    }
+
+    pub(super) fn introduction_ticket_matches(
+        &self,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> bool {
+        let attempt = self.attempt.read();
+        ticket.matches_attempt(&attempt)
+            && self
+                ._introduction_backing
+                .lock()
+                .as_ref()
+                .is_some_and(|backing| {
+                    backing.ticket == Some(ticket)
+                        && backing.phase == IntroductionBackingPhase::InUse
+                })
+    }
+
+    /// Caller holds the registry mutation fence; nothing here selects a new
+    /// owner. Any independent native/session/media/closing work forbids reset.
+    fn introduction_is_empty(&self) -> bool {
+        self.current_unpromoted_worker().is_none()
+            && !self.holds_promoted_session()
+            && !self.has_speculative()
+            && !self.closing_workers.lock().any(|_| true)
+            && self.closing_waiters.lock().is_empty()
+            && !self.unpromoted_offer_in_flight()
+            && self.endpoint_auth.lock().is_none()
+            && self.authenticated_channel.lock().is_none()
+            && self.media_renegotiation_worker.lock().is_none()
+    }
+
+    /// Only the exact joined demand-record transaction may call this. The
+    /// original backing NEVER leaves the retained installation here. Failed
+    /// native/join outcomes clear old truth but cannot authorize fresh reuse.
+    pub(super) fn finish_retained_introduction(
+        &self,
+        ticket: super::hub_introduction::IntroductionTicket,
+        reusable: bool,
+    ) -> bool {
+        if self.registry_retired() || !self.introduction_is_empty() {
+            return false;
+        }
+        let attempt = self.attempt.read();
+        if !ticket.matches_attempt(&attempt) {
+            return false;
+        }
+        let mut backing = self._introduction_backing.lock();
+        let Some(backing) = backing.as_mut().filter(|backing| {
+            backing.ticket == Some(ticket) && backing.phase == IntroductionBackingPhase::Retiring
+        }) else {
+            return false;
+        };
+        drop(attempt); // registry mutation still excludes attempt replacement
+        let mut old = {
+            let mut data = self.state.write();
+            std::mem::replace(
+                &mut *data,
+                PeerStateData {
+                    status: PeerStatus::Offline,
+                    ..PeerStateData::default()
+                },
+            )
+        };
+        // Hello's strings and other retained representation must die BEFORE
+        // their lease, whose field precedes those strings in PeerStateData.
+        let hello_retention = old.hello_retention.take();
+        drop(old);
+        drop(hello_retention);
+        backing.phase = if reusable {
+            IntroductionBackingPhase::Reusable
+        } else {
+            IntroductionBackingPhase::Unusable
+        };
+        true
+    }
+
+    /// Additional attempt proof for the registry's atomic no-worker cleanup.
+    /// The registry checks lifecycle/installation while holding its mutation
+    /// fence; this reads the original bounded correlation without cloning it.
+    pub(super) fn unstarted_introduction_matches(&self, introduction_id: &[u8; 16]) -> bool {
+        let attempt = self.attempt.read();
+        let mut expected = [0u8; 32];
+        hex::encode_to_slice(introduction_id, &mut expected).is_ok()
+            && attempt.as_bytes() == expected.as_slice()
+    }
+
+    /// Adopt only discovery-only or exactly joined reusable storage under the
+    /// registry fence. Return old funding until displaced ownership is gone.
+    // Return the original move-only lease on refusal; boxing would add unfunded storage.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn adopt_empty_introduction(
+        &self,
+        ticket: super::hub_introduction::IntroductionTicket,
+        backing: crate::resource::ResourceLease,
+    ) -> std::result::Result<
+        (
+            Option<AttemptDisplacement>,
+            Option<crate::resource::ResourceLease>,
+        ),
+        crate::resource::ResourceLease,
+    > {
+        if self.registry_retired()
+            || !self.introduction_is_empty()
+            || self.state.read().authenticated
+        {
+            return Err(backing);
+        }
+        let mut attempt = self.attempt.write();
+        let mut retained = self._introduction_backing.lock();
+        if retained.as_ref().is_some_and(|previous| {
+            previous.phase != IntroductionBackingPhase::Reusable || previous.ticket == Some(ticket)
+        }) {
+            return Err(backing);
+        }
+        // Incoming funding is owned before the fresh attempt allocation. Keep
+        // old storage funded until the caller disposes displaced ownership.
+        let previous = retained.replace(IntroductionBacking {
+            lease: backing,
+            ticket: Some(ticket),
+            phase: IntroductionBackingPhase::InUse,
+        });
+        *attempt = ticket.attempt(); // one owned encoding, no borrowed-copy buffer
+        drop(attempt);
+        if previous.is_some() {
+            self.state.write().status = PeerStatus::Sighted;
+        }
+        let displaced = AttemptDisplacement {
+            dedup: self.attempt_dedup.lock().take(),
+            additional_dedup: std::mem::replace(
+                &mut *self.additional_attempt_dedup.lock(),
+                PromotedDedupSet::new(),
+            ),
+            retired_dedup: DetachedDedupSet::new(),
+        };
+        drop(retained);
+        Ok((Some(displaced), previous.map(|previous| previous.lease)))
     }
 
     pub(super) fn begin_unpromoted_negotiation(&self) -> bool {
@@ -1690,6 +2231,30 @@ impl PeerConnection {
         self.registry_retired.load(Ordering::Acquire)
     }
 
+    /// Final synchronous idle check, called only under the registry mutation
+    /// fence with the exact demand worker and an exclusive use reservation.
+    /// Do not equate an empty flow map with joined native tails: the provider
+    /// includes its outstanding funded pumps/retirement owners in quiescence.
+    pub(super) fn demand_queues_quiescent(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
+        if self.promoted_channel_count() != 1
+            || self.unpromoted_connector.lock().is_some()
+            || self.has_speculative()
+            || self.has_pending_media_renegotiation()
+            || self.closing_workers.lock().any(|_| true)
+        {
+            return false;
+        }
+        if self.with_live_session_state(|_session, app| {
+            app.pending() == 0 && app.rpc_mut().pending_is_empty()
+        }) != Some(true)
+        {
+            return false;
+        }
+        self.with_live_session_flow_and_exact_worker(worker, |_session, flows, _live, _worker| {
+            flows.is_quiescent()
+        }) == Some(true)
+    }
+
     pub(super) fn install_endpoint_auth(
         &self,
         task: Arc<crate::endpoint_auth::EndpointAuthTask>,
@@ -1824,6 +2389,87 @@ impl PeerConnection {
         }
         self.retain_closing_worker(Arc::clone(&removed.worker));
         Some(removed)
+    }
+
+    /// Observe the actual typed acquisition result without restoring a work
+    /// scope withdrawn by the authenticated handoff's ordinary Drop.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn reserve_closing_entry_for_test(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+    ) -> std::result::Result<ResourceLease, crate::resource::ResourceUnavailable> {
+        worker.reserve_attempt_work(
+            AttemptOwnerSet::<ClosingWorker>::entry_claim()
+                .expect("closing owner node claim is representable"),
+        )
+    }
+
+    /// Distinct finite-pressure control BEFORE an owned connected handoff
+    /// drops. It must not be described as promoted-channel removal pressure.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn retain_closing_worker_under_pressure_for_test(
+        &self,
+        worker: &Arc<WebRtcConnectorWorker>,
+    ) -> std::result::Result<(ResourceLease, crate::resource::ResourcePressure), &'static str> {
+        let pressure = (|| {
+            use crate::resource::{FiniteResourceProvider, ResourceUnavailable};
+            let entry = AttemptOwnerSet::<ClosingWorker>::entry_claim()
+                .map_err(|_| "closing entry claim overflow")?;
+            let charge = FiniteResourceProvider::reservation_charge_for_test(entry)
+                .map_err(|_| "closing entry reservation overflow")?;
+            let record = FiniteResourceProvider::reservation_charge_for_test(ResourceClaim::ZERO)
+                .map_err(|_| "seal reservation overflow")?;
+            // Prove this exact acquisition could succeed before applying the
+            // seal. No permanent fixture grant or production claim changes.
+            drop(
+                worker
+                    .reserve_attempt_work(entry)
+                    .map_err(|_| "closing entry already unavailable before pressure")?,
+            );
+            let free = match worker.reserve_attempt_work(ResourceClaim::single(
+                ResourceClass::AccountedMemoryBytes,
+                u64::MAX,
+            )) {
+                Err(ResourceUnavailable::Pressure(pressure))
+                    if pressure.dimension == ResourceClass::AccountedMemoryBytes =>
+                {
+                    pressure
+                        .capacity
+                        .checked_sub(pressure.in_use)
+                        .ok_or("pressure usage exceeds capacity")?
+                }
+                _ => return Err("memory probe did not report finite pressure"),
+            };
+            let leave = charge
+                .amount(ResourceClass::AccountedMemoryBytes)
+                .checked_sub(1)
+                .ok_or("closing entry has no accounted byte")?;
+            let seal_bytes = free
+                .checked_sub(leave)
+                .and_then(|amount| {
+                    amount.checked_sub(record.amount(ResourceClass::AccountedMemoryBytes))
+                })
+                .ok_or("insufficient slack for exact pressure seal")?;
+            let seal = worker
+                .reserve_attempt_work(ResourceClaim::single(
+                    ResourceClass::AccountedMemoryBytes,
+                    seal_bytes,
+                ))
+                .map_err(|_| "reported slack could not fund the seal")?;
+            match worker.reserve_attempt_work(entry) {
+                Err(ResourceUnavailable::Pressure(pressure))
+                    if pressure.dimension == ResourceClass::AccountedMemoryBytes
+                        && pressure.capacity.checked_sub(pressure.in_use) == Some(leave) =>
+                {
+                    Ok((seal, pressure))
+                }
+                _ => Err("exact closing entry did not refuse at one byte short"),
+            }
+        })();
+        // Exercise the unchanged real acquisition/fallback even if test
+        // preparation failed; the caller still awaits original cleanup.
+        self.retain_closing_worker(Arc::clone(worker));
+        pressure
     }
 
     pub(super) fn take_attempt_displacement(&self) -> AttemptDisplacement {
@@ -2019,7 +2665,6 @@ impl PeerConnection {
             .is_some_and(|owner| owner.worker.live_connector_incarnation().is_some())
     }
 
-    #[cfg(test)]
     pub(super) fn promoted_channel_count(&self) -> usize {
         self.promoted_session.channel_count()
     }

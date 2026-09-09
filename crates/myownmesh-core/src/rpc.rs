@@ -2071,6 +2071,12 @@ impl SessionRpcState {
         }
     }
 
+    /// Read the exact session's existing pending map under its logical-session
+    /// fence. This is only a quiescence observation, never a settling path.
+    pub(crate) fn pending_is_empty(&self) -> bool {
+        self.pending.len() == 0
+    }
+
     /// Whether an operation of `class` is pending under `request_id`, without
     /// removing or otherwise touching it.
     ///
@@ -4375,6 +4381,37 @@ mod session_ownership_tests {
         let funded = rx.await.expect("the caller is still waiting");
         let response = funded.into_result().expect("a body, not an error");
         assert_eq!(response.body, serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn pending_quiescence_observation_preserves_exact_requests() {
+        let session = session();
+        let mut pending = SessionRpcState::new();
+        assert!(pending.pending_is_empty());
+        let (tx_a, rx_a) = oneshot::channel();
+        let first = pending
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx_a))
+            .expect("existing session funds the first request");
+        let (tx_b, rx_b) = oneshot::channel();
+        let second = pending
+            .register_local_request("peer-under-test", &session, PendingEntry::Single(tx_b))
+            .expect("existing session funds the second request");
+        assert!(!pending.pending_is_empty());
+        assert!(
+            !pending.pending_is_empty(),
+            "observation does not consume state"
+        );
+        assert!(pending.still_holds(&first));
+        assert!(pending.still_holds(&second));
+        pending.abandon_local_request(&first);
+        assert!(
+            !pending.pending_is_empty(),
+            "the other exact request is live"
+        );
+        assert!(rx_a.await.is_err());
+        pending.abandon_local_request(&second);
+        assert!(pending.pending_is_empty());
+        assert!(rx_b.await.is_err());
     }
 
     #[tokio::test]

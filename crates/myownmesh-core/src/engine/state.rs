@@ -78,8 +78,7 @@ use crate::semantic::DeviceId;
 use crate::topology::Topology;
 use crate::transport::webrtc::{
     RealtimeDirection, RealtimeFlowError, RealtimeFlowName, RealtimeFlowRemains,
-    RealtimeFlowSetIdentity, RealtimeFlowSpec, RealtimeRecvUnit, RealtimeSendUnit,
-    SessionRealtimeFlows,
+    RealtimeFlowSetIdentity, RealtimeFlowSpec, RealtimeSendUnit, SessionRealtimeFlows,
 };
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
@@ -104,6 +103,9 @@ use super::signaling_ingress::EphemeralIngress;
 use crate::semantic::store::{AdmissionPhase, AdmissionPhaseGuard};
 use crate::semantic::store::{DurableSemanticOwner, DurableSemanticStore, ProvisionalCustody};
 use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
+
+#[cfg(feature = "transport-lab")]
+pub(crate) type ParentingSnapshotForLab = (Option<[u8; 32]>, usize, usize, u64);
 
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
@@ -344,6 +346,31 @@ pub(super) fn speculative_promotion_item_charge_for_test(correlation: &str) -> R
 ///
 /// Awaits, so every caller is outside the fence before it runs. Nothing here is
 /// retried, timed or generation-checked.
+fn opaque_wire_mode(mode: crate::realtime::OpaqueFlowMode) -> crate::protocol::ApplicationFlowMode {
+    match mode {
+        crate::realtime::OpaqueFlowMode::ReliableOrdered => {
+            crate::protocol::ApplicationFlowMode::ReliableOrdered
+        }
+        crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits } => {
+            crate::protocol::ApplicationFlowMode::PartialUnordered { max_retransmits }
+        }
+    }
+}
+
+fn opaque_local_mode(
+    mode: crate::protocol::ApplicationFlowMode,
+) -> std::result::Result<crate::realtime::OpaqueFlowMode, RealtimeFlowError> {
+    match mode {
+        crate::protocol::ApplicationFlowMode::ReliableOrdered => {
+            Ok(crate::realtime::OpaqueFlowMode::ReliableOrdered)
+        }
+        crate::protocol::ApplicationFlowMode::PartialUnordered { max_retransmits: 0 } => {
+            Ok(crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits: 0 })
+        }
+        _ => Err(RealtimeFlowError::FlowRefused),
+    }
+}
+
 async fn retire_realtime_remains(
     worker: &Arc<crate::transport::WebRtcConnectorWorker>,
     remains: RealtimeFlowRemains,
@@ -426,6 +453,247 @@ pub(super) struct ConnectWaitShared {
     id: u64,
     device_id: String,
     cancelled: AtomicBool,
+    introduction: Mutex<Option<IntroductionWaitBinding>>,
+    outcome: Mutex<ChannelDemandOutcome>,
+    settlement_queued: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IntroductionWaitBinding {
+    ticket: super::hub_introduction::IntroductionTicket,
+    deadline: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelDemandOutcome {
+    Ready,
+    NoOwnedAttemptRefused,
+    FailedSettlementJoined,
+    TerminalRefused,
+    Unsettled,
+}
+
+/// Funding and activity for links created by admitted application demand.
+/// This table cannot create or authorize a peer: the only session identity it
+/// retains is the token minted by the existing peer registry.
+struct DemandOwnedLink {
+    owner: PeerOwnerToken,
+    introduction: super::hub_introduction::IntroductionTicket,
+    generation: u64,
+    activity: super::connection::DemandLinkActivity,
+    settlement: IntroductionSettlementPhase,
+    detached: Option<super::connection::IntroducedRetirement>,
+    pump: Option<JoinHandle<()>>,
+    pump_registered: bool,
+    pump_joined: Option<bool>,
+    native_closed: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IntroductionSettlementPhase {
+    Active,
+    Queued,
+    Joining,
+    Failed,
+}
+
+/// A move-out reservation, not a second owner registry. On cancellation the
+/// still-joinable handle goes back to the SAME funded record before its phase
+/// becomes eligible for another command or shutdown's synchronous drain.
+struct IntroductionJoinReservation<'a> {
+    pool: &'a Mutex<DemandLinkPool>,
+    key: [u8; 32],
+    ticket: super::hub_introduction::IntroductionTicket,
+    generation: u64,
+    pump: Option<JoinHandle<()>>,
+}
+
+impl Drop for IntroductionJoinReservation<'_> {
+    fn drop(&mut self) {
+        let mut pool = self.pool.lock();
+        let link = pool
+            .links
+            .get_mut(&self.key)
+            .filter(|link| link.introduction == self.ticket && link.generation == self.generation)
+            .expect("a joining introduction retains its original funded record");
+        if let Some(pump) = self.pump.take() {
+            assert!(
+                link.pump.is_none(),
+                "one introduction has one receiver pump"
+            );
+            link.pump = Some(pump);
+        }
+        if link.settlement == IntroductionSettlementPhase::Joining {
+            link.settlement = IntroductionSettlementPhase::Active;
+        }
+    }
+}
+
+struct DemandLinkPool {
+    links: LeasedMap<[u8; 32], DemandOwnedLink>,
+    reserved: usize,
+    next_generation: u64,
+    cursor: Option<[u8; 32]>,
+    policy: crate::config::HubIntroductionPolicyConfig,
+    resources: LocalApplicationResourceScope,
+    _root: ResourceLease,
+}
+
+impl DemandLinkPool {
+    fn root_claim() -> Result<ResourceClaim> {
+        ResourceClaim::try_from_entries([(
+            ResourceClass::AccountedMemoryBytes,
+            std::mem::size_of::<Self>() as u64,
+        )])
+        .map_err(|_| Error::Network("demand link root claim overflow".into()))
+    }
+
+    fn entry_claim() -> Result<ResourceClaim> {
+        LeasedMap::<[u8; 32], DemandOwnedLink>::entry_claim()
+            .map_err(|_| Error::Network("demand link entry claim overflow".into()))
+    }
+
+    fn new(
+        policy: crate::config::HubIntroductionPolicyConfig,
+        resources: LocalApplicationResourceScope,
+    ) -> Result<Self> {
+        let policy = policy.checked()?;
+        let root = resources.acquire(Self::root_claim()?)?;
+        Ok(Self {
+            links: LeasedMap::new(),
+            reserved: 0,
+            next_generation: 1,
+            cursor: None,
+            policy,
+            resources,
+            _root: root,
+        })
+    }
+}
+
+/// A link slot is reserved before native construction. Cancellation returns
+/// both the finite slot and the real map-entry funding; no placeholder peer
+/// or permanent configuration pin is manufactured by this reservation.
+pub(super) struct DemandLinkReservation<'a> {
+    pool: &'a Mutex<DemandLinkPool>,
+    entry: Option<ResourceLease>,
+}
+
+impl DemandLinkReservation<'_> {
+    /// Called only for the freshly created, exact current worker, before its
+    /// first offer. Existing/borrowed usable peers must never be adopted.
+    pub(super) fn bind(
+        mut self,
+        owner: PeerOwnerToken,
+        introduction: super::hub_introduction::IntroductionTicket,
+        now: std::time::Instant,
+    ) -> Result<()> {
+        let key = DeviceId::canonical_key_bytes(owner.device_id())
+            .map_err(|_| Error::Network("demand owner is not canonical".into()))?;
+        let mut pool = self.pool.lock();
+        if pool.links.get(&key).is_some() || owner.worker().is_none() {
+            return Err(Error::Network("demand owner is not a fresh worker".into()));
+        }
+        let generation = pool.next_generation;
+        if generation == 0 {
+            return Err(Error::Network("demand link generation exhausted".into()));
+        }
+        pool.next_generation = generation.checked_add(1).unwrap_or(0);
+        let entry = self
+            .entry
+            .take()
+            .expect("reservation retains its one map lease");
+        pool.reserved -= 1;
+        pool.links
+            .insert(
+                key,
+                DemandOwnedLink {
+                    owner,
+                    introduction,
+                    generation,
+                    activity: super::connection::DemandLinkActivity::new(now),
+                    settlement: IntroductionSettlementPhase::Active,
+                    detached: None,
+                    pump: None,
+                    pump_registered: false,
+                    pump_joined: None,
+                    native_closed: None,
+                },
+                entry,
+            )
+            .map_err(|_| Error::Network("demand link insertion refused".into()))
+    }
+}
+
+impl Drop for DemandLinkReservation<'_> {
+    fn drop(&mut self) {
+        if self.entry.is_some() {
+            let mut pool = self.pool.lock();
+            pool.reserved -= 1;
+        }
+    }
+}
+
+/// One caller-held operation, charged by its existing command/flow owner.
+/// Its fixed-size guard updates only the generation captured at admission.
+pub(super) struct DemandLinkUse<'a> {
+    pool: &'a Mutex<DemandLinkPool>,
+    key: [u8; 32],
+    generation: u64,
+}
+
+impl Drop for DemandLinkUse<'_> {
+    fn drop(&mut self) {
+        if let Some(link) = self.pool.lock().links.get_mut(&self.key) {
+            if link.generation == self.generation {
+                link.activity.finish(std::time::Instant::now());
+            }
+        }
+    }
+}
+
+/// A single maintenance pass owns this exact idle reservation. Cancellation
+/// may reopen only that record, never an installation which reused its key.
+struct DemandIdleReservation<'a> {
+    pool: &'a Mutex<DemandLinkPool>,
+    key: [u8; 32],
+    generation: u64,
+}
+
+impl Drop for DemandIdleReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(link) = self.pool.lock().links.get_mut(&self.key) {
+            if link.generation == self.generation {
+                link.activity.cancel_idle();
+            }
+        }
+    }
+}
+
+/// The same exact-generation use carried by an admitted responder task.
+/// The caller prices this inline value before constructing it; the Arc shares
+/// the existing network root and creates no allocation or second link table.
+pub(super) struct OwnedDemandLinkUse {
+    state: Arc<NetworkState>,
+    key: [u8; 32],
+    generation: u64,
+}
+
+impl Drop for OwnedDemandLinkUse {
+    fn drop(&mut self) {
+        let Some(pool) = self.state.demand_links.as_ref() else {
+            return;
+        };
+        if let Some(link) = pool.lock().links.get_mut(&self.key) {
+            if link.generation == self.generation {
+                link.activity.finish(std::time::Instant::now());
+            }
+        }
+    }
+}
+
+fn same_demand_owner(left: &PeerOwnerToken, right: &PeerOwnerToken) -> bool {
+    left.same_exact_owner(right)
 }
 
 impl ConnectWaitShared {
@@ -465,13 +733,24 @@ impl ConnectWaitShared {
             id,
             device_id,
             cancelled: AtomicBool::new(false),
+            introduction: Mutex::new(None),
+            outcome: Mutex::new(ChannelDemandOutcome::Unsettled),
+            settlement_queued: AtomicBool::new(false),
         }
     }
 }
 
 pub struct ConnectWaiterRegistration {
-    pub(super) reply: oneshot::Sender<Result<()>>,
+    reply: Mutex<Option<oneshot::Sender<Result<()>>>>,
     pub(super) shared: FundedArc<ConnectWaitShared>,
+}
+
+impl ConnectWaiterRegistration {
+    pub(super) fn finish(&self, result: Result<()>) {
+        if let Some(reply) = self.reply.lock().take() {
+            let _ = reply.send(result);
+        }
+    }
 }
 
 pub(super) struct ConnectWaitCancellation<'a> {
@@ -917,6 +1196,12 @@ pub struct NetworkState {
     pub transport: Transport,
     resource_scope: NetworkInstanceResourceScope,
     local_resources: LocalApplicationResourceScope,
+    demand_links: Option<Mutex<DemandLinkPool>>,
+    pub(super) hub_introductions: Option<Mutex<super::hub_introduction::HubIntroduction>>,
+    // One fresh logical endpoint root per NetworkState, independent of the
+    // forwarding carrier. Graph publication always precedes this mutex.
+    pub(super) endpoint_cipher: Option<Mutex<super::endpoint_cipher::EndpointCipherController>>,
+    hub_signaling_carrier: Mutex<Option<super::signaling_ingress::HubSignalingCarrier>>,
     /// The one owner of session promotion for this network instance.
     ///
     /// `None` when the process owner installed no resource provider. That is
@@ -957,7 +1242,7 @@ pub struct NetworkState {
     parenting_local: Option<super::parenting::ParentDeviceKey>,
     parenting_root: Option<super::parenting::ParentDeviceKey>,
     parenting_hubs: Box<[DeviceId]>,
-    parenting_backup_candidates: u32,
+    _parenting_backup_candidates: u32,
     parenting_digest: Option<[u8; 32]>,
     parenting_role: Option<super::parenting::ParentingRole>,
     parenting_next_sequence: AtomicU64,
@@ -971,7 +1256,7 @@ pub struct NetworkState {
     _parenting_root_lease: Option<ResourceLease>,
     /// Optional node-local observation aggregate. It is diagnostic-only and
     /// cannot affect semantic admission, routing, or wire behavior.
-    pub(crate) local_observation: Option<
+    local_observation: Option<
         Mutex<
             super::local_observation::LocalObservationGraph<
                 super::local_observation::MonotonicObservationClock,
@@ -1395,40 +1680,6 @@ impl NetworkState {
         Ok(list)
     }
 
-    /// Construct state below an existing Mesh runtime observation scope.
-    ///
-    /// The entry point for every construction. There used to be a `new` above
-    /// this that acquired the global scopes itself and delegated here; nothing
-    /// called it once the raw signaling surface stopped being public, because
-    /// both real paths ([`super::spawn_network`] and its in-scope sibling)
-    /// already hold the scopes they want this state to live under. Reaching for
-    /// the global root inside a constructor was the thing that made it a
-    /// convenience rather than a seam.
-    #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn new_in_mesh_scope(
-        config: NetworkConfig,
-        identity: Arc<Identity>,
-        transport: Transport,
-        verified_bootstrap: crate::semantic::VerifiedBootstrap,
-        mesh_scope: &MeshRuntimeResourceScope,
-        local_resources: &LocalApplicationResourceScope,
-    ) -> Result<(
-        Arc<Self>,
-        ResourceMailboxReceiver<EphemeralIngress>,
-        ResourceMailboxReceiver<NetworkCmd>,
-    )> {
-        Self::new_in_mesh_scope_with_instance_root(
-            config,
-            identity,
-            transport,
-            verified_bootstrap,
-            mesh_scope,
-            local_resources,
-            None,
-        )
-    }
-
     #[allow(clippy::type_complexity)]
     pub(crate) fn new_in_mesh_scope_with_instance_root(
         config: NetworkConfig,
@@ -1720,6 +1971,41 @@ impl NetworkState {
                 None,
             ),
         };
+        let demand_links = config
+            .application_transport
+            .map(|policy| DemandLinkPool::new(policy.introduction, local_resources.clone()))
+            .transpose()?
+            .map(Mutex::new);
+        let hub_introductions = config
+            .application_transport
+            .map(|policy| {
+                let local = DeviceId::from_canonical_str(&local_device_id)
+                    .map_err(|_| Error::Network("local introduction identity is invalid".into()))?;
+                super::hub_introduction::HubIntroduction::new(
+                    policy.introduction,
+                    local_resources.clone(),
+                    mesh_context_id,
+                    &local,
+                )
+                .map(Mutex::new)
+                .map_err(|error| Error::Network(format!("introduction root refused: {error}")))
+            })
+            .transpose()?;
+        let endpoint_cipher = config
+            .application_transport
+            .map(|policy| {
+                let local = DeviceId::from_canonical_str(&local_device_id)
+                    .map_err(|_| Error::Network("local endpoint identity is invalid".into()))?;
+                super::endpoint_cipher::EndpointCipherController::new(
+                    policy.endpoint_cipher,
+                    local_resources.clone(),
+                    mesh_context_id,
+                    &local,
+                )
+                .map(Mutex::new)
+                .map_err(|error| Error::Network(format!("endpoint cipher root refused: {error}")))
+            })
+            .transpose()?;
         let hub = match config.hub {
             Some(policy) => {
                 let local_device = crate::semantic::DeviceId::from_canonical_str(&local_device_id)
@@ -1733,7 +2019,7 @@ impl NetworkState {
                     local_device,
                     &local_resources,
                 )?
-                .map(|controller| Mutex::new(controller))
+                .map(Mutex::new)
             }
             None => None,
         };
@@ -1895,12 +2181,16 @@ impl NetworkState {
             routing,
             hub_dial_cursor: AtomicUsize::new(0),
             hub,
+            demand_links,
+            hub_introductions,
+            endpoint_cipher,
+            hub_signaling_carrier: Mutex::new(None),
             parenting,
             _parenting_root_lease: parenting_root_lease,
             parenting_local,
             parenting_root,
             parenting_hubs,
-            parenting_backup_candidates,
+            _parenting_backup_candidates: parenting_backup_candidates,
             parenting_digest,
             parenting_role,
             parenting_next_sequence: AtomicU64::new(1),
@@ -2512,7 +2802,7 @@ impl NetworkState {
                 let task = tokio::spawn(future);
                 match tasks.insert(super::closed_relay::ClosedRelayPendingExpiryTask {
                     handle: task,
-                    funding: expiry,
+                    _funding: expiry,
                 }) {
                     Ok(_) => Ok(()),
                     Err(task) => {
@@ -2823,8 +3113,1017 @@ impl NetworkState {
         self.resource_scope.peer_connection_scope()
     }
 
+    pub(super) fn reserve_introduction_placeholder(&self, target: &str) -> Result<ResourceLease> {
+        Ok(self
+            .local_resources
+            .acquire(PeerRegistry::introduction_placeholder_claim(target.len())?)?)
+    }
+
+    pub(super) fn reserve_demand_link(&self) -> Result<DemandLinkReservation<'_>> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err(Error::Network("network is shutting down".into()));
+        }
+        let pool = self
+            .demand_links
+            .as_ref()
+            .ok_or_else(|| Error::Network("application introduction is disabled".into()))?;
+        let entry = {
+            let mut state = pool.lock();
+            let total = state
+                .links
+                .len()
+                .checked_add(state.reserved)
+                .ok_or_else(|| Error::Network("demand link count overflow".into()))?;
+            let limit = usize::try_from(state.policy.max_transient_links)
+                .map_err(|_| Error::Network("demand link limit is unrepresentable".into()))?;
+            if total >= limit {
+                return Err(Error::Network("demand link capacity refused".into()));
+            }
+            let entry = state.resources.acquire(DemandLinkPool::entry_claim()?)?;
+            state.reserved += 1;
+            entry
+        };
+        Ok(DemandLinkReservation {
+            pool,
+            entry: Some(entry),
+        })
+    }
+
+    pub(super) fn begin_demand_link_use(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Result<Option<DemandLinkUse<'_>>> {
+        let Some(pool) = self.demand_links.as_ref() else {
+            return Ok(None);
+        };
+        let key = DeviceId::canonical_key_bytes(owner.device_id())
+            .map_err(|_| Error::Network("application peer is not canonical".into()))?;
+        let mut state = pool.lock();
+        let Some(link) = state.links.get_mut(&key) else {
+            return Ok(None);
+        };
+        if !same_demand_owner(&link.owner, owner) {
+            // A new, independently installed connection is borrowed. An old
+            // demand entry cannot take ownership of it or reset its activity.
+            return Ok(None);
+        }
+        if !link.activity.begin(std::time::Instant::now()) {
+            return Err(Error::Network("demand connection is retiring".into()));
+        }
+        Ok(Some(DemandLinkUse {
+            pool,
+            key,
+            generation: link.generation,
+        }))
+    }
+
+    pub(super) fn forget_demand_link(&self, owner: &PeerOwnerToken) {
+        let Some(pool) = self.demand_links.as_ref() else {
+            return;
+        };
+        let Ok(key) = DeviceId::canonical_key_bytes(owner.device_id()) else {
+            return;
+        };
+        let mut pool = pool.lock();
+        if pool.links.get(&key).is_some_and(|link| {
+            same_demand_owner(&link.owner, owner)
+                && link.settlement == IntroductionSettlementPhase::Active
+                && link.detached.is_none()
+                && link.pump.is_none()
+                && link.pump_registered
+                && link.pump_joined.is_some()
+        }) {
+            pool.links.remove(&key);
+        }
+    }
+
+    /// Called inside the handler's exact logical-session admission, after
+    /// funding its task and before it can be queued or invoke application code.
+    pub(super) fn begin_owned_demand_link_use(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+    ) -> Result<Option<OwnedDemandLinkUse>> {
+        let Some(pool) = self.demand_links.as_ref() else {
+            return Ok(None);
+        };
+        let key = DeviceId::canonical_key_bytes(owner.device_id())
+            .map_err(|_| Error::Network("application peer is not canonical".into()))?;
+        let mut pool = pool.lock();
+        let Some(link) = pool.links.get_mut(&key) else {
+            return Ok(None);
+        };
+        if !same_demand_owner(&link.owner, owner) {
+            return Ok(None);
+        }
+        if !link.activity.begin(std::time::Instant::now()) {
+            return Err(Error::Network("demand connection is retiring".into()));
+        }
+        Ok(Some(OwnedDemandLinkUse {
+            state: Arc::clone(self),
+            key,
+            generation: link.generation,
+        }))
+    }
+
+    pub(super) fn introduction_native_owner(
+        &self,
+        target: &str,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> Option<PeerOwnerToken> {
+        let key = DeviceId::canonical_key_bytes(target).ok()?;
+        let pool = self.demand_links.as_ref()?.lock();
+        let entry = pool.links.get(&key)?;
+        (entry.introduction == ticket).then(|| entry.owner.clone())
+    }
+
+    pub(super) fn queue_failed_introduction(
+        &self,
+        key: [u8; 32],
+        ticket: super::hub_introduction::IntroductionTicket,
+        generation: u64,
+    ) {
+        let Some(pool) = self.demand_links.as_ref() else {
+            return;
+        };
+        let mut pool = pool.lock();
+        let Some(link) = pool.links.get_mut(&key).filter(|link| {
+            link.introduction == ticket
+                && link.generation == generation
+                && link.settlement == IntroductionSettlementPhase::Active
+        }) else {
+            return;
+        };
+        // Holding the record lock makes successful mailbox admission and its
+        // phase publication one transition to the consumer. A refused enqueue
+        // leaves the original record eligible for the next bounded tick.
+        if self
+            .connection_cmd_tx
+            .send(NetworkCmd::SettleIntroduction {
+                key,
+                ticket,
+                generation,
+            })
+            .is_ok()
+        {
+            link.settlement = IntroductionSettlementPhase::Queued;
+        }
+    }
+
+    pub(super) fn queue_introduction_ticket(
+        &self,
+        target: &str,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) {
+        if let (Some(pool), Ok(key)) = (
+            self.demand_links.as_ref(),
+            DeviceId::canonical_key_bytes(target),
+        ) {
+            let generation = pool
+                .lock()
+                .links
+                .get(&key)
+                .filter(|link| link.introduction == ticket)
+                .map(|link| link.generation);
+            if let Some(generation) = generation {
+                self.queue_failed_introduction(key, ticket, generation);
+                return;
+            }
+        }
+        let mut waiters = self.connect_waiters.lock();
+        let Some(bucket) = waiters.get_mut(target) else {
+            return;
+        };
+        for waiter in bucket.waiters.iter_mut() {
+            if waiter
+                .shared
+                .introduction
+                .lock()
+                .as_ref()
+                .is_some_and(|binding| binding.ticket == ticket)
+            {
+                if !waiter.shared.settlement_queued.load(Ordering::Acquire)
+                    && self
+                        .connection_cmd_tx
+                        .send(NetworkCmd::SettleIntroductionWait(
+                            super::command::IntroductionWaitTransfer {
+                                shared: waiter.shared.clone(),
+                            },
+                        ))
+                        .is_ok()
+                {
+                    waiter
+                        .shared
+                        .settlement_queued
+                        .store(true, Ordering::Release);
+                }
+                return;
+            }
+        }
+    }
+
+    pub(super) async fn settle_introduction_wait(
+        &self,
+        wait: super::command::IntroductionWaitTransfer,
+    ) {
+        use super::hub_introduction::IntroductionLifetime;
+        let Some(_permit) = self.try_admit_shutdown_mutation() else {
+            return;
+        };
+        let Some(binding) = *wait.shared.introduction.lock() else {
+            return;
+        };
+        wait.shared
+            .settlement_queued
+            .store(false, Ordering::Release);
+        let Some(controller) = self.hub_introductions.as_ref() else {
+            return;
+        };
+        let never_bound = {
+            let mut controller = controller.lock();
+            match controller.lifetime(binding.ticket, std::time::Instant::now()) {
+                IntroductionLifetime::Live { .. } => return,
+                IntroductionLifetime::Elapsed { .. } => {
+                    controller.failed(binding.ticket);
+                }
+                IntroductionLifetime::Terminal { .. } => {}
+                IntroductionLifetime::Missing => {
+                    drop(controller);
+                    self.resolve_introduction_waiters(
+                        &wait.shared.device_id,
+                        binding.ticket,
+                        false,
+                    );
+                    return;
+                }
+            }
+            // The same controller guard terminalizes before checking its
+            // historical native binding. This actor serializes constructors;
+            // no future BeginIntroducedPeer can start this terminal ticket.
+            controller.native_was_bound(binding.ticket) == Some(false)
+        };
+        if never_bound {
+            self.resolve_bound_connect_waiters(
+                &wait.shared.device_id,
+                binding.ticket,
+                ChannelDemandOutcome::NoOwnedAttemptRefused,
+            );
+            return;
+        }
+        let record = self.demand_links.as_ref().and_then(|pool| {
+            let key = DeviceId::canonical_key_bytes(&wait.shared.device_id).ok()?;
+            pool.lock()
+                .links
+                .get(&key)
+                .filter(|link| link.introduction == binding.ticket)
+                .map(|link| (key, link.generation))
+        });
+        if let Some((key, generation)) = record {
+            self.settle_failed_introduction(key, binding.ticket, generation)
+                .await;
+        } else {
+            self.resolve_introduction_waiters(&wait.shared.device_id, binding.ticket, false);
+        }
+    }
+
+    /// Registry -> protection -> demand -> connection is the shared terminal
+    /// order. Protection survives callback return and optional installation
+    /// removal. No lock escapes this synchronous function.
+    fn claim_introduction_retirement(
+        &self,
+        owner: &PeerOwnerToken,
+        key: [u8; 32],
+        ticket: super::hub_introduction::IntroductionTicket,
+        generation: u64,
+        terminal: Option<super::connection::IntroductionTerminalDisposition>,
+    ) -> bool {
+        let Some(pool) = self.demand_links.as_ref() else {
+            return false;
+        };
+        let already_detached = pool.lock().links.get(&key).is_some_and(|link| {
+            link.introduction == ticket
+                && link.generation == generation
+                && same_demand_owner(&link.owner, owner)
+                && link.detached.is_some()
+        });
+        // The first detach owns the cause, including ordinary expiry. Its
+        // retirement EOF cannot replace that cause or resolve a successor.
+        {
+            let mut protection = None;
+            let detached = already_detached
+                || self.peers.with_introduction_installation(owner, |peer| {
+                    let sticky = self.sticky_peers.lock();
+                    let config = self.config.read();
+                    let topology = self.topology_impl.read();
+                    let mut parenting = self.parenting.as_ref().map(|parenting| parenting.lock());
+                    let relation_retained = if let Some(parenting) = parenting.as_mut() {
+                        match super::parenting::ParentOwnerWitness::from_owner(owner) {
+                            Ok(witness) => parenting.has_live_owner(&witness).unwrap_or(true),
+                            Err(_) => true,
+                        }
+                    } else {
+                        false
+                    };
+                    let may_remove = !sticky.contains(owner.device_id())
+                        && !config.pinned_peers.iter().any(|id| id == owner.device_id())
+                        && !topology.edge(self.identity.public_id(), owner.device_id(), &[])
+                        && !relation_retained;
+                    protection = Some((sticky, config, topology, parenting));
+                    let mut pool = pool.lock();
+                    let link = pool.links.get_mut(&key).filter(|link| {
+                        link.introduction == ticket
+                            && link.generation == generation
+                            && same_demand_owner(&link.owner, owner)
+                            && matches!(
+                                link.settlement,
+                                IntroductionSettlementPhase::Active
+                                    | IntroductionSettlementPhase::Queued
+                            )
+                    })?;
+                    let worker = owner.worker()?;
+                    if link.detached.is_some() {
+                        return Some(false);
+                    }
+                    let detached = match terminal {
+                        Some(terminal) => {
+                            peer.detach_terminal_introduction(worker, ticket, terminal)
+                        }
+                        None => peer.detach_failed_introduction(worker, ticket),
+                    }?;
+                    link.detached = Some(detached);
+                    Some(may_remove)
+                });
+            drop(protection);
+            detached
+        }
+    }
+
+    /// Claim an explicit terminal synchronously, then ask the existing actor
+    /// to join it. An unclaimed terminal retains the caller's exact fallback
+    /// path; only custody actually transferred here may consume the request.
+    pub(super) fn request_failed_introduction(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: Option<&str>,
+        reason: &crate::events::DropReason,
+    ) -> bool {
+        let (Some(pool), Some(controller), Ok(key)) = (
+            self.demand_links.as_ref(),
+            self.hub_introductions.as_ref(),
+            DeviceId::canonical_key_bytes(owner.device_id()),
+        ) else {
+            return false;
+        };
+        let exact = pool
+            .lock()
+            .links
+            .get(&key)
+            .filter(|link| {
+                same_demand_owner(&link.owner, owner)
+                    && correlation.is_none_or(|attempt| link.introduction.matches_attempt(attempt))
+            })
+            .map(|link| (link.introduction, link.generation));
+        let Some((ticket, generation)) = exact else {
+            return false;
+        };
+        if !self.claim_introduction_retirement(
+            owner,
+            key,
+            ticket,
+            generation,
+            Some(super::connection::IntroductionTerminalDisposition::from_drop_reason(reason)),
+        ) {
+            // Promotion winning the registry fence is handled by the caller's
+            // existing exact channel-terminal path, never swallowed here.
+            return false;
+        }
+        controller.lock().failed(ticket);
+        self.queue_failed_introduction(key, ticket, generation);
+        true
+    }
+
+    /// Called by the constructor guard only for a record already bound to its
+    /// exact worker. Locals (including an unspawned receiver) have unwound;
+    /// either its registered pump is retained, or no pump was constructed.
+    pub(super) fn cancel_bound_introduction_construction(
+        &self,
+        owner: &PeerOwnerToken,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> bool {
+        let (Some(pool), Ok(key)) = (
+            self.demand_links.as_ref(),
+            DeviceId::canonical_key_bytes(owner.device_id()),
+        ) else {
+            return false;
+        };
+        let mut pool = pool.lock();
+        let Some(link) = pool
+            .links
+            .get_mut(&key)
+            .filter(|link| link.introduction == ticket && same_demand_owner(&link.owner, owner))
+        else {
+            return false;
+        };
+        if !link.pump_registered {
+            link.pump_registered = true;
+            link.pump_joined = Some(true);
+        }
+        true
+    }
+
+    pub(super) async fn settle_failed_introduction(
+        &self,
+        key: [u8; 32],
+        ticket: super::hub_introduction::IntroductionTicket,
+        generation: u64,
+    ) {
+        let Some(_permit) = self.try_admit_shutdown_mutation() else {
+            return;
+        };
+        self.settle_failed_introduction_inner(key, ticket, generation)
+            .await;
+    }
+
+    /// Shutdown calls this only after mutation permits have drained and the
+    /// actor's cancellation reservations have restored their record custody.
+    async fn settle_failed_introduction_inner(
+        &self,
+        key: [u8; 32],
+        ticket: super::hub_introduction::IntroductionTicket,
+        generation: u64,
+    ) {
+        use super::hub_introduction::IntroductionLifetime;
+        let (Some(pool), Some(controller)) =
+            (self.demand_links.as_ref(), self.hub_introductions.as_ref())
+        else {
+            return;
+        };
+        let lifetime = controller
+            .lock()
+            .lifetime(ticket, std::time::Instant::now());
+        let owner = {
+            let mut pool = pool.lock();
+            let Some(link) = pool
+                .links
+                .get_mut(&key)
+                .filter(|link| link.introduction == ticket && link.generation == generation)
+            else {
+                return;
+            };
+            if link.settlement == IntroductionSettlementPhase::Queued {
+                link.settlement = IntroductionSettlementPhase::Active;
+            }
+            if link.settlement != IntroductionSettlementPhase::Active
+                || !link.pump_registered
+                || (!matches!(
+                    lifetime,
+                    IntroductionLifetime::Elapsed { .. } | IntroductionLifetime::Terminal { .. }
+                ) && link.detached.is_none()
+                    && link
+                        .owner
+                        .worker()
+                        .is_none_or(|worker| worker.live_connector_incarnation().is_some()))
+            {
+                return;
+            }
+            link.owner.clone()
+        };
+        let already_detached = pool.lock().links.get(&key).is_some_and(|link| {
+            link.introduction == ticket && link.generation == generation && link.detached.is_some()
+        });
+        // Promotion is independently authenticated authority; Terminal alone
+        // can never classify a successful introduction as a failed attempt.
+        if !already_detached && self.peers.has_usable_authenticated_current(&owner) {
+            self.resolve_bound_connect_waiters(
+                owner.device_id(),
+                ticket,
+                ChannelDemandOutcome::Ready,
+            );
+            return;
+        }
+        let detached_here = already_detached
+            || self.claim_introduction_retirement(&owner, key, ticket, generation, None);
+        if !detached_here {
+            // Busy, promoted, replaced, or unknown is NOT clean fallback and
+            // does not authorize closing whichever worker now uses the key.
+            self.resolve_introduction_waiters(owner.device_id(), ticket, false);
+            // Ordinary replacement may already have permanently retired W0.
+            // Joining that captured retired worker is safe; starting close on
+            // a still-live/reused worker is not. This path never reports clean
+            // fallback even if the old native and receiver joins succeed.
+            if owner
+                .worker()
+                .is_none_or(|worker| worker.live_connector_incarnation().is_some())
+            {
+                return;
+            }
+        }
+        controller.lock().failed(ticket);
+        let (worker, native_closed, mut reservation) = {
+            let mut pool_guard = pool.lock();
+            let Some(link) = pool_guard.links.get_mut(&key).filter(|link| {
+                link.introduction == ticket
+                    && link.generation == generation
+                    && link.settlement == IntroductionSettlementPhase::Active
+            }) else {
+                return;
+            };
+            let Some(worker) = link
+                .detached
+                .as_ref()
+                .map(|detached| &detached.worker)
+                .or_else(|| link.owner.worker())
+            else {
+                return;
+            };
+            let worker = Arc::clone(worker);
+            link.settlement = IntroductionSettlementPhase::Joining;
+            (
+                worker,
+                link.native_closed,
+                IntroductionJoinReservation {
+                    pool,
+                    key,
+                    ticket,
+                    generation,
+                    pump: link.pump.take(),
+                },
+            )
+        };
+        let native_ok = match native_closed {
+            Some(ok) => ok,
+            None => worker.retire_and_close().await.is_ok(),
+        };
+        pool.lock()
+            .links
+            .get_mut(&key)
+            .expect("joining record retains its native custody")
+            .native_closed = Some(native_ok);
+        if let Some(pump) = reservation.pump.as_mut() {
+            let joined = pump.await.is_ok();
+            reservation.pump.take();
+            pool.lock()
+                .links
+                .get_mut(&key)
+                .expect("joining record retains its receiver custody")
+                .pump_joined = Some(joined);
+        }
+        let joined_ok = pool
+            .lock()
+            .links
+            .get(&key)
+            .is_some_and(|link| link.pump_joined == Some(true));
+        let terminal = {
+            let mut pool = pool.lock();
+            let link = pool
+                .links
+                .get_mut(&key)
+                .expect("terminal join retains its record through token release");
+            link.settlement = IntroductionSettlementPhase::Failed;
+            let terminal = link
+                .detached
+                .as_ref()
+                .and_then(|detached| detached.terminal);
+            if let Some(detached) = link.detached.take() {
+                detached.release_after_join(owner.connection());
+            }
+            terminal
+        };
+        // Failed is non-requeueable and forget_demand_link cannot remove it.
+        // Drop may restore Joining, never Failed; no await follows this point.
+        drop(reservation);
+        // Failed native cleanup retains its provider's conservative failed
+        // ledger. It never becomes permission to send through fallback.
+        let clean = detached_here
+            && native_ok
+            && joined_ok
+            && !self.shutdown_requested.load(Ordering::Acquire);
+        // Registry -> exact demand record -> connection, never pool -> registry.
+        // The record protects the full generation while the original joined
+        // retained installation is reset. Independent/successor owners refuse
+        // reset; a missing old installation still releases only its own row.
+        self.peers.with_introduction_installation(&owner, |peer| {
+            let mut pool = pool.lock();
+            let link = pool.links.get(&key).filter(|link| {
+                link.introduction == ticket
+                    && link.generation == generation
+                    && same_demand_owner(&link.owner, &owner)
+                    && link.settlement == IntroductionSettlementPhase::Failed
+                    && link.detached.is_none()
+                    && link.native_closed == Some(native_ok)
+                    && link.pump_joined.is_some()
+            })?;
+            let _ = link;
+            if detached_here {
+                peer.finish_retained_introduction(ticket, clean);
+            }
+            // Publish reusable and vacate its original demand slot under the
+            // same fence, before a fresh Begin can acquire either one.
+            pool.links.remove(&key);
+            Some(false)
+        });
+        self.resolve_bound_connect_waiters(
+            owner.device_id(),
+            ticket,
+            if !clean {
+                ChannelDemandOutcome::Unsettled
+            } else if terminal.is_some() {
+                ChannelDemandOutcome::TerminalRefused
+            } else {
+                ChannelDemandOutcome::FailedSettlementJoined
+            },
+        );
+        let mut pool = pool.lock();
+        if pool.links.get(&key).is_some_and(|link| {
+            link.introduction == ticket
+                && link.generation == generation
+                && same_demand_owner(&link.owner, &owner)
+                && link.settlement == IntroductionSettlementPhase::Failed
+        }) {
+            pool.links.remove(&key);
+        }
+    }
+
+    /// Join an introduced receiver after an existing owner has already
+    /// completed native retirement. Cancellation restores the same handle;
+    /// neither ordinary peer cleanup nor shutdown may drop it by map removal.
+    async fn join_introduction_pump_after_native(&self, owner: &PeerOwnerToken) -> bool {
+        let (Some(pool), Ok(key)) = (
+            self.demand_links.as_ref(),
+            DeviceId::canonical_key_bytes(owner.device_id()),
+        ) else {
+            return true;
+        };
+        let mut reservation = {
+            let mut guard = pool.lock();
+            let Some(link) = guard
+                .links
+                .get_mut(&key)
+                .filter(|link| same_demand_owner(&link.owner, owner))
+            else {
+                return true;
+            };
+            if link.settlement == IntroductionSettlementPhase::Joining || !link.pump_registered {
+                return false;
+            }
+            link.settlement = IntroductionSettlementPhase::Joining;
+            IntroductionJoinReservation {
+                pool,
+                key,
+                ticket: link.introduction,
+                generation: link.generation,
+                pump: link.pump.take(),
+            }
+        };
+        if let Some(pump) = reservation.pump.as_mut() {
+            let ok = pump.await.is_ok();
+            reservation.pump.take();
+            pool.lock()
+                .links
+                .get_mut(&key)
+                .expect("receiver join retains its record")
+                .pump_joined = Some(ok);
+        }
+        let ok = pool
+            .lock()
+            .links
+            .get(&key)
+            .is_some_and(|link| link.pump_joined == Some(true));
+        drop(reservation);
+        ok
+    }
+
+    /// Advance bounded monotonic record maintenance without collecting a peer
+    /// vector or retaining a registry guard. Expiry cancels only its original
+    /// ticket; caller-held connect waiters have their own bounded deadline.
+    /// Native retirement is a separate exact-owner operation, never a lookup
+    /// of whichever peer happens to reuse an expired target's name.
+    pub(super) async fn maintain_hub_introductions(self: &Arc<Self>) {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let (Some(controller), Some(pool)) =
+            (self.hub_introductions.as_ref(), self.demand_links.as_ref())
+        else {
+            return;
+        };
+        let quantum = pool.lock().policy.max_maintenance_per_tick;
+        let now = std::time::Instant::now();
+        if let Some(root) = self.endpoint_cipher.as_ref() {
+            // Same explicitly bounded maintenance opportunity; no per-epoch
+            // timer/task or renewed lifetime on a route change.
+            root.lock()
+                .expire(now, usize::try_from(quantum).unwrap_or(usize::MAX));
+        }
+        for _ in 0..quantum {
+            let expired = {
+                let mut controller = controller.lock();
+                controller.poll_expired(now).and_then(|ticket| {
+                    controller
+                        .coordinates(ticket)
+                        .map(|coordinates| (ticket, coordinates))
+                })
+            };
+            if let Some((ticket, coordinates)) = expired {
+                let local = DeviceId::canonical_key_bytes(self.identity.public_id()).ok();
+                let key = if local == Some(coordinates.source) {
+                    coordinates.destination
+                } else {
+                    coordinates.source
+                };
+                let generation = pool
+                    .lock()
+                    .links
+                    .get(&key)
+                    .filter(|link| link.introduction == ticket)
+                    .map(|link| link.generation);
+                if let Some(generation) = generation {
+                    self.queue_failed_introduction(key, ticket, generation);
+                }
+            }
+            let next = {
+                let mut pool = pool.lock();
+                let next = pool
+                    .links
+                    .successor_after(pool.cursor.as_ref())
+                    .map(|(key, link)| {
+                        (
+                            *key,
+                            link.owner.clone(),
+                            link.introduction,
+                            link.generation,
+                            link.detached.is_some(),
+                        )
+                    });
+                pool.cursor = next.as_ref().map(|(key, _, _, _, _)| *key);
+                next
+            };
+            let Some((key, owner, ticket, generation, detached)) = next else {
+                continue;
+            };
+            if detached {
+                // Explicit terminal custody survives controller pruning and
+                // cannot be reinterpreted as a successor's Ready state.
+                self.queue_failed_introduction(key, ticket, generation);
+            } else if self.peers.has_usable_authenticated_current(&owner) {
+                // Promotion is already proved by the existing peer registry;
+                // this only settles its old signaling transaction. It does
+                // not grant authority or move the link's last-app-use clock.
+                controller.lock().promoted(ticket);
+                self.retire_idle_demand_link(&owner).await;
+            } else if matches!(
+                controller.lock().lifetime(ticket, now),
+                super::hub_introduction::IntroductionLifetime::Elapsed { .. }
+                    | super::hub_introduction::IntroductionLifetime::Terminal { .. }
+            ) {
+                self.queue_failed_introduction(key, ticket, generation);
+            }
+        }
+    }
+
+    async fn retire_idle_demand_link(self: &Arc<Self>, owner: &PeerOwnerToken) {
+        let (Some(pool), Some(worker)) = (self.demand_links.as_ref(), owner.worker()) else {
+            return;
+        };
+        let Ok(key) = DeviceId::canonical_key_bytes(owner.device_id()) else {
+            return;
+        };
+        let reservation = {
+            let mut state = pool.lock();
+            let idle = std::time::Duration::from_millis(state.policy.idle_timeout_ms);
+            let Some(link) = state.links.get_mut(&key) else {
+                return;
+            };
+            if !same_demand_owner(&link.owner, owner)
+                || !link.activity.reserve_idle(std::time::Instant::now(), idle)
+            {
+                return;
+            }
+            DemandIdleReservation {
+                pool,
+                key,
+                generation: link.generation,
+            }
+        };
+        // This async read is of the captured worker, not a peer-label lookup.
+        // The exclusive activity reservation forbids new application work
+        // while the native buffered amounts are sampled.
+        let native_timeout = match self.config.read().scheduler_policy() {
+            Ok(policy) => std::time::Duration::from_millis(policy.peer_send_timeout_ms),
+            Err(_) => return,
+        };
+        if !matches!(
+            tokio::time::timeout(native_timeout, worker.native_application_backlog_empty()).await,
+            Ok(true)
+        ) {
+            return;
+        }
+        let removed = {
+            // Keep the pin/topology guards until the registry has detached the
+            // exact entry, not merely until its eligibility callback returns.
+            let mut protection = None;
+            let removed = self.peers.remove_demand_owner_if(owner, |peer| {
+                if self.shutdown_requested.load(Ordering::Acquire) {
+                    return false;
+                }
+                let sticky = self.sticky_peers.lock();
+                let config = self.config.read();
+                let topology = self.topology_impl.read();
+                let mut parenting = self.parenting.as_ref().map(|parenting| parenting.lock());
+                let relation_retained = if let Some(parenting) = parenting.as_mut() {
+                    match super::parenting::ParentOwnerWitness::from_owner(owner) {
+                        Ok(witness) => parenting.has_live_owner(&witness).unwrap_or(true),
+                        Err(_) => true,
+                    }
+                } else {
+                    false
+                };
+                let excluded = sticky.contains(owner.device_id())
+                    || config.pinned_peers.iter().any(|id| id == owner.device_id())
+                    || topology.edge(self.identity.public_id(), owner.device_id(), &[])
+                    || relation_retained;
+                protection = Some((sticky, config, topology, parenting));
+                if excluded {
+                    return false;
+                }
+                let state = pool.lock();
+                let reserved = state.links.get(&key).is_some_and(|link| {
+                    link.generation == reservation.generation
+                        && same_demand_owner(&link.owner, owner)
+                        && link.activity.idle_reserved()
+                });
+                if !reserved || !peer.demand_queues_quiescent(worker) {
+                    return false;
+                }
+                // Advisory only and still under the exact admitted owner
+                // fence. This hook never re-enters the peer registry.
+                self.note_hub_authenticated_owner_change(owner);
+                true
+            });
+            drop(protection);
+            removed
+        };
+        let Some(removed) = removed else {
+            return;
+        };
+        self.forget_demand_link(owner);
+        drop(reservation);
+        // The existing cleanup path owns and joins all original native close
+        // work. Topology pruning records no reconnect intent or fresh demand.
+        super::finish_drop_peer(
+            self,
+            owner.device_id(),
+            crate::events::DropReason::TopologyPruned,
+            Some(removed),
+        )
+        .await;
+        self.join_introduction_pump_after_native(owner).await;
+        self.forget_demand_link(owner);
+    }
+
+    pub(super) fn demand_link_protects_peer(
+        &self,
+        peer: &Arc<super::connection::PeerConnection>,
+    ) -> bool {
+        let Ok(key) = DeviceId::canonical_key_bytes(&peer.device_id) else {
+            return false;
+        };
+        let owner = self
+            .demand_links
+            .as_ref()
+            .and_then(|pool| pool.lock().links.get(&key).map(|entry| entry.owner.clone()));
+        let Some(owner) = owner else {
+            return false;
+        };
+        if !Arc::ptr_eq(owner.connection(), peer) {
+            return false;
+        }
+        match (owner.worker(), peer.current_worker()) {
+            (Some(expected), Some(current)) => Arc::ptr_eq(expected, &current),
+            _ => false,
+        }
+    }
+
     pub(crate) fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
         Ok(self.local_resources.child()?)
+    }
+
+    pub(super) fn acquire_application_work(
+        &self,
+        claim: ResourceClaim,
+    ) -> std::result::Result<ResourceLease, ResourceUnavailable> {
+        self.local_resources.acquire(claim)
+    }
+
+    /// A caller-selected endpoint is bounded temporary identity backing,
+    /// never a contribution to process-global semantic interner state.
+    pub(super) fn funded_endpoint_id(&self, spelling: &str) -> Result<(DeviceId, ResourceLease)> {
+        let claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                DeviceId::uninterned_backing_bytes() as u64,
+            ),
+            (ResourceClass::ParsingOrCpuWork, 52),
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+        .map_err(|_| Error::Network("endpoint identity claim overflow".into()))?;
+        let work = self.local_resources.acquire(claim)?;
+        let id = DeviceId::from_canonical_str_uninterned(spelling)
+            .map_err(|_| Error::Network("endpoint identity is not canonical".into()))?;
+        Ok((id, work))
+    }
+
+    pub(super) fn queue_endpoint_controls(
+        &self,
+        output: super::endpoint_cipher::PreparedOutput<super::EndpointRoutedFrames>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(NetworkCmd::EndpointControls(
+                super::command::EndpointControlTransfer {
+                    output,
+                    reply: None,
+                },
+            ))
+            .map_err(|error| error.into_admission_error().into())
+    }
+
+    pub(super) fn queue_endpoint_payload(
+        &self,
+        output: super::endpoint_cipher::PreparedOutput<super::EndpointRoutedFrames>,
+        reply: oneshot::Sender<Result<()>>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(NetworkCmd::EndpointControls(
+                super::command::EndpointControlTransfer {
+                    output,
+                    reply: Some(reply),
+                },
+            ))
+            .map_err(|error| error.into_admission_error().into())
+    }
+
+    async fn ensure_endpoint_cipher_ready(&self, peer: &DeviceId) -> Result<()> {
+        let waiter = super::begin_endpoint_cipher_wait(self, peer)?;
+        loop {
+            let notified = waiter.notification().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match waiter.phase(std::time::Instant::now()) {
+                super::endpoint_cipher::CipherPhase::Ready => {
+                    // Re-enter the controller after the wake. An inbound
+                    // reducer holds this lock through local confirmation queue
+                    // admission, so Ready cannot let caller data overtake it.
+                    return self.with_endpoint_cipher(peer, |root| {
+                        if root.current(waiter.ticket(), std::time::Instant::now()) {
+                            Ok(())
+                        } else {
+                            Err(super::endpoint_cipher::ControllerError::Stale)
+                        }
+                    });
+                }
+                super::endpoint_cipher::CipherPhase::Retired => {
+                    return Err(Error::Network("endpoint handshake retired".into()))
+                }
+                _ => {}
+            }
+            tokio::time::timeout_at(tokio::time::Instant::from_std(waiter.deadline()), notified)
+                .await
+                .map_err(|_| Error::Network("endpoint handshake deadline elapsed".into()))?;
+        }
+    }
+
+    /// Canonical logical endpoint admission. A caller needing a carrier must
+    /// enter its registry fence FIRST; effects here may not re-enter registry
+    /// or graph, retain either lock, or await. Synchronous queue admission is
+    /// the handoff; its owned funding survives subsequent native awaits.
+    pub(super) fn with_endpoint_cipher<T>(
+        &self,
+        peer: &DeviceId,
+        effect: impl FnOnce(
+            &mut super::endpoint_cipher::EndpointCipherController,
+        ) -> std::result::Result<T, super::endpoint_cipher::ControllerError>,
+    ) -> Result<T> {
+        let graph = self.fact_graph.read();
+        // The local identity was interned at NetworkState construction; the
+        // potentially cold remote identity stays borrowed from its funded
+        // caller/frame and never passes through the string wrapper.
+        let local = DeviceId::from_canonical_str(self.identity.public_id())
+            .map_err(|_| Error::Network("local endpoint identity invalid".into()))?;
+        if self.shutdown_requested.load(Ordering::Acquire)
+            || !super::governance::canonical_policy_admits_devices(
+                &self.verified_bootstrap,
+                &graph,
+                &local,
+                peer,
+            )
+        {
+            return Err(Error::Network("canonical endpoint policy refused".into()));
+        }
+        let root = self
+            .endpoint_cipher
+            .as_ref()
+            .ok_or_else(|| Error::Network("endpoint ciphertext transport is disabled".into()))?;
+        effect(&mut root.lock())
+            .map_err(|error| Error::Network(format!("endpoint ciphertext refused: {error}")))
     }
 
     pub(crate) fn acquire_closed_relay_lease(
@@ -3232,6 +4531,18 @@ impl NetworkState {
                 ));
             }
             state.ensure_durable_owner_mutation_allowed()?;
+            // The graph write fence excludes concurrent epoch creation. This
+            // fixture does not silently preserve keys across its special
+            // restore/seed path or relax ordinary publication invalidation.
+            if state
+                .endpoint_cipher
+                .as_ref()
+                .is_some_and(|root| root.lock().has_epochs())
+            {
+                return Err(Error::Network(
+                    "semantic seed requires no retained endpoint epochs".into(),
+                ));
+            }
 
             // The fixture uses the same bounded semantic delta transaction as
             // production, grouping at most one ready-batch worth of rows per
@@ -3349,171 +4660,6 @@ impl NetworkState {
         self.durable_semantic_owner
             .arm_commit_injection(fault)
             .map_err(|error| Error::Network(format!("semantic commit fault arm: {error}")))
-    }
-
-    /// Admit one canonical fact through a journal under the publication gate.
-    /// The journal's tentative graph mutation is invisible to readers while
-    /// this write lock is held; a durable failure consumes the journal's exact
-    /// rollback before the lock is released. Quarantined facts are persisted as
-    /// unresolved dependencies with one exact custody claim; they are not
-    /// projected or advertised until a later parent admission resolves them.
-    pub(crate) fn admit_fact_durably(
-        &self,
-        fact: crate::semantic::SignedFact,
-    ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
-        self.admit_fact_durably_with_delta(fact)
-            .map(|(admission, changed, _delta)| (admission, changed))
-    }
-
-    pub(crate) fn admit_fact_durably_with_delta(
-        &self,
-        fact: crate::semantic::SignedFact,
-    ) -> Result<(
-        crate::semantic::Admission,
-        Vec<crate::semantic::SignedFact>,
-        crate::semantic::SemanticDelta,
-    )> {
-        // Open presence is deliberately not a semantic ledger.  Keep this
-        // invariant at the state boundary as well as in FactGraph validation
-        // so a reconnect/leave or future ingress caller cannot reach the
-        // durable owner before the policy refusal is observed.
-        if matches!(
-            self.verified_bootstrap.policy(),
-            crate::semantic::VerifiedProjectPolicy::Open
-        ) {
-            return Err(Error::Other(
-                "Open networks do not admit durable semantic facts".into(),
-            ));
-        }
-        #[cfg(feature = "transport-lab")]
-        let publication_phase =
-            AdmissionPhaseGuard::new(AdmissionPhase::PublicationGraphReplayColdLookup);
-        let _publication = self.durable_publication_gate.lock();
-        let mut live = self.fact_graph.write();
-        self.ensure_durable_owner_mutation_allowed()?;
-        if live.get(&fact.id).is_none() {
-            if let Some(existing) = self
-                .durable_semantic_owner
-                .admitted_fact(fact.id)
-                .map_err(|error| Error::Network(format!("durable fact lookup: {error}")))?
-            {
-                if existing == fact {
-                    return Ok((
-                        crate::semantic::Admission::AlreadyPresent,
-                        Vec::new(),
-                        crate::semantic::SemanticDelta::default(),
-                    ));
-                }
-                return Err(Error::Other(format!(
-                    "semantic fact rejected: duplicate fact id {}",
-                    fact.id
-                )));
-            }
-        }
-        let dependency_roots = crate::semantic::causal::dependencies(&fact);
-        let needs_cold_history = dependency_roots.iter().any(|id| live.get(id).is_none());
-        let mut history_roots = live
-            .selector_provenance_history_roots(std::slice::from_ref(&fact))
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        if needs_cold_history {
-            history_roots.extend(dependency_roots);
-        }
-        // A new typed selector can require retired ancestry even when all of
-        // its immediate dependencies are resident. Resolve both needs under
-        // the same publication/owner fence before opening the journal.
-        let causal_history = if history_roots.is_empty() {
-            Vec::new()
-        } else {
-            self.admitted_semantic_causal_history(history_roots.into_iter().collect())?
-        };
-        let expected_base_projection = live.projection_commitment_root();
-        #[cfg(feature = "transport-lab")]
-        drop(publication_phase);
-        #[cfg(feature = "transport-lab")]
-        let causal_phase = AdmissionPhaseGuard::new(AdmissionPhase::CausalJournalApply);
-        let journal = if causal_history.is_empty() {
-            live.admit_journaled(fact)
-        } else {
-            live.admit_journaled_with_history(fact, causal_history)
-        }
-        .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
-        #[cfg(feature = "transport-lab")]
-        drop(causal_phase);
-        let admission = journal.admission().clone();
-        if matches!(admission, crate::semantic::Admission::AlreadyPresent) {
-            journal.commit();
-            live.retire_cold_history();
-            return Ok((
-                admission,
-                Vec::new(),
-                crate::semantic::SemanticDelta::default(),
-            ));
-        }
-
-        let provisional_additions: Vec<ProvisionalCustody> = journal
-            .delta()
-            .provisional_added()
-            .iter()
-            .copied()
-            .map(|fact_id| ProvisionalCustody::new(fact_id, "semantic-ingress"))
-            .collect();
-        let projection_commitment = journal.graph().projection_commitment_root();
-        if let Err(error) = self.durable_semantic_owner.commit_semantic_delta(
-            self.mesh_context_id,
-            journal.delta(),
-            expected_base_projection,
-            projection_commitment,
-            &provisional_additions,
-        ) {
-            if matches!(
-                &error,
-                crate::semantic::store::DurableStoreError::OutcomeUnknown
-            ) {
-                let delta = journal.delta().clone();
-                // Do not claim rollback across an ambiguous COMMIT. Release
-                // the journal borrow, then replace the tentative graph with
-                // the exact durable reopen result when it is available.
-                journal.commit();
-                if self
-                    .reconcile_unknown_admission(&mut live, &delta, projection_commitment)
-                    .is_none()
-                {
-                    self.shutdown_requested.store(true, Ordering::Release);
-                }
-            } else {
-                journal.rollback();
-            }
-            return Err(Error::Network(format!("semantic delta commit: {error}")));
-        }
-
-        let changed_admitted = journal
-            .delta()
-            .rows()
-            .iter()
-            .filter(|row| row.status() == crate::semantic::SemanticFactStatus::Admitted)
-            .map(|row| row.fact().clone())
-            .collect();
-        let semantic_delta = journal.delta().clone();
-        let provisional_removed = journal.delta().provisional_removed().to_vec();
-        journal.commit();
-        live.retire_cold_history();
-
-        {
-            let mut provisional = self.durable_provisional.lock();
-            for fact_id in provisional_removed {
-                provisional.retain(|claim| claim.fact_id != fact_id);
-            }
-            for claim in &provisional_additions {
-                if !provisional
-                    .iter()
-                    .any(|current| current.fact_id == claim.fact_id)
-                {
-                    provisional.push(claim.clone());
-                }
-            }
-        }
-        Ok((admission, changed_admitted, semantic_delta))
     }
 
     /// Admit one policy-bounded request through the existing single-writer
@@ -3750,6 +4896,12 @@ impl NetworkState {
                 crate::semantic::store::DurableStoreError::OutcomeUnknown
             ) {
                 journal.commit();
+                // An unknown durable outcome can replace this graph inside
+                // the same Arc. Invalidate before restore even if it later
+                // reports not-applied; local graph generation is not an epoch.
+                if let Some(root) = self.endpoint_cipher.as_ref() {
+                    root.lock().retire_all();
+                }
                 if self
                     .reconcile_unknown_admission(&mut live, &aggregate_delta, projection_commitment)
                     .is_none()
@@ -3772,6 +4924,13 @@ impl NetworkState {
             .collect();
         let provisional_removed = aggregate_delta.provisional_removed().to_vec();
         journal.commit();
+        if let Some(root) = self.endpoint_cipher.as_ref() {
+            // Use the complete impact union, not only final projection cells:
+            // revoke/readmit within one batch must permanently retire its old
+            // endpoint epoch. Empty duplicates and definite rollback skip this.
+            root.lock()
+                .invalidate_subjects(aggregate_delta.affected_subjects());
+        }
         live.retire_cold_history();
 
         {
@@ -3826,15 +4985,6 @@ impl NetworkState {
         *live = restored_graph;
         *self.durable_provisional.lock() = restored_provisional;
         Some(applied)
-    }
-
-    pub(crate) async fn admit_fact_durably_async(
-        self: &Arc<Self>,
-        fact: crate::semantic::SignedFact,
-    ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
-        self.admit_fact_durably_with_delta_async(fact)
-            .await
-            .map(|(admission, changed, _delta)| (admission, changed))
     }
 
     #[cfg(test)]
@@ -5131,9 +6281,10 @@ impl NetworkState {
     /// The identity disambiguates several fixtures that intentionally share a
     /// network id; counts expose custody at the exact await without retaining
     /// any history or changing shutdown behavior.
-    fn log_shutdown_phase(&self, phase: &'static str) {
+    fn log_shutdown_phase(&self, _phase: &'static str) {
         #[cfg(feature = "transport-lab")]
         {
+            let phase = _phase;
             let shutdown_mutations = *self.shutdown_mutations.lock();
             let shutdown_tasks = self
                 .shutdown_tasks
@@ -6226,6 +7377,856 @@ impl NetworkState {
         }
     }
 
+    /// Capture the existing exact promoted logical session before preparing
+    /// a control. The subsequent flow fence also checks this witness is live;
+    /// a replacement between captures cannot inherit the operation.
+    fn opaque_control_dispatch(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> std::result::Result<
+        super::peer_registry::AdmittedInboundDispatch,
+        crate::realtime::RealtimeRefusal,
+    > {
+        self.peers
+            .with_admitted_current_or_refused(
+                owner,
+                self.session_broker.as_ref(),
+                &self.network_id,
+                |operation| Some(operation.capture_inbound_dispatch()),
+                |_| None,
+            )
+            .flatten()
+            .ok_or(crate::realtime::RealtimeRefusal::SessionNotCurrent)
+    }
+
+    /// Called while the caller holds its exact flow fence. Every control uses
+    /// this one FIFO; no caller awaits native I/O under that fence. Failure
+    /// returns before label release, so a new Open cannot overtake a Close
+    /// which was never admitted.
+    fn queue_opaque_control(
+        self: &Arc<Self>,
+        dispatch: super::peer_registry::AdmittedInboundDispatch,
+        worker: Arc<crate::transport::WebRtcConnectorWorker>,
+        wire: crate::application_gateway::FundedOpaqueControl,
+        completion: FundedArc<super::command::OpaqueControlCompletion>,
+    ) -> std::result::Result<(), RealtimeFlowError> {
+        // A queued Close still uses the exact link after its flow record is
+        // gone. Carry activity through the command's actual terminal write;
+        // a map-empty snapshot must not retire it while cleanup is queued.
+        let demand_use = self
+            .begin_owned_demand_link_use(&dispatch.owner().for_worker(Arc::clone(&worker)))
+            .map_err(|_| RealtimeFlowError::SessionNotCurrent)?;
+        self.cmd_tx
+            .send(NetworkCmd::OpaqueControl(
+                super::command::OpaqueControlTransfer {
+                    dispatch,
+                    worker,
+                    wire,
+                    completion,
+                    _demand_use: demand_use,
+                },
+            ))
+            .map_err(|_| RealtimeFlowError::FlowRefused)
+    }
+
+    /// Reduce an already-decoded control on the same serial peer event pump.
+    /// Every mutation re-enters the original logical/session/worker fence;
+    /// responses enter the one command writer without awaiting it here.
+    pub(super) async fn on_opaque_control(
+        self: &Arc<Self>,
+        dispatch: &super::peer_registry::AdmittedInboundDispatch,
+        control: crate::protocol::ApplicationFlowControl,
+    ) {
+        use crate::application_gateway::{FundedOpaqueControl, OpaqueControlView};
+        use crate::protocol::application_flow::ApplicationFlowRefusal;
+        use crate::protocol::ApplicationFlowControl as Control;
+        use crate::realtime::RealtimeFlowDirection::{Inbound, Outbound};
+        if control.validate().is_err() {
+            return;
+        }
+        let logical = dispatch.logical_reply_operation();
+        let mut failed_write_admission = false;
+        // Capturing a response does not refresh the input's logical witness.
+        let response_dispatch = self
+            .peers
+            .with_same_session(dispatch.logical_reply_operation(), |operation| {
+                operation.capture_inbound_dispatch()
+            });
+        let Some(response_dispatch) = response_dispatch else {
+            return;
+        };
+        let mut response_dispatch = Some(response_dispatch);
+        let respond =
+            |worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+             view: OpaqueControlView<'_>,
+             response_dispatch: &mut Option<super::peer_registry::AdmittedInboundDispatch>,
+             failed: &mut bool| {
+                let result = (|| {
+                    let wire = FundedOpaqueControl::encode(&self.local_resources, &view)
+                        .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                    let completion =
+                        super::command::OpaqueControlCompletion::new(&self.local_resources)
+                            .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                    self.queue_opaque_control(
+                        response_dispatch
+                            .take()
+                            .ok_or(RealtimeFlowError::FlowRefused)?,
+                        Arc::clone(worker),
+                        wire,
+                        completion,
+                    )
+                })();
+                if result.is_err() {
+                    *failed = true;
+                }
+                result
+            };
+        let result = self.with_owned_realtime_flows_and_worker(
+            dispatch.owner(),
+            |session, flows, live, worker| {
+                if !logical.witness().is_live() {
+                    return Err(RealtimeFlowError::SessionNotCurrent);
+                }
+                match control {
+                    Control::Open {
+                        coordinate,
+                        label,
+                        direction,
+                        mode,
+                        max_body_bytes,
+                    } => {
+                        let local_mode = match opaque_local_mode(mode) {
+                            Ok(mode) => mode,
+                            Err(_) => {
+                                respond(
+                                    worker,
+                                    OpaqueControlView::Refuse {
+                                        coordinate,
+                                        reason: ApplicationFlowRefusal::UnsupportedMode,
+                                    },
+                                    &mut response_dispatch,
+                                    &mut failed_write_admission,
+                                )?;
+                                return Ok(None);
+                            }
+                        };
+                        if !worker.opaque_native_mode_ready(local_mode) {
+                            respond(
+                                worker,
+                                OpaqueControlView::Refuse {
+                                    coordinate,
+                                    reason: ApplicationFlowRefusal::NotAdmitted,
+                                },
+                                &mut response_dispatch,
+                                &mut failed_write_admission,
+                            )?;
+                            return Ok(None);
+                        }
+                        // The decoded frame still funds the borrowed label. The
+                        // response encoding is acquired before any retained copy.
+                        let accepted = FundedOpaqueControl::encode(
+                            &self.local_resources,
+                            &OpaqueControlView::Accept {
+                                coordinate,
+                                label: &label,
+                                direction,
+                                mode,
+                                max_body_bytes,
+                            },
+                        )
+                        .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                        let completion =
+                            super::command::OpaqueControlCompletion::new(&self.local_resources)
+                                .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                        let spec = crate::transport::webrtc::OpaqueFlowSpec {
+                            direction: match direction {
+                                Inbound => RealtimeDirection::Outbound,
+                                Outbound => RealtimeDirection::Inbound,
+                            },
+                            opener_direction: direction,
+                            mode: local_mode,
+                            max_unit_bytes: usize::try_from(max_body_bytes)
+                                .map_err(|_| RealtimeFlowError::FlowRefused)?,
+                            name: RealtimeFlowName::new(label)
+                                .ok_or(RealtimeFlowError::FlowRefused)?,
+                        };
+                        let name = match flows.open_opaque_with_coordinate(
+                            session,
+                            Some(live),
+                            spec,
+                            coordinate,
+                            None,
+                        ) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                respond(
+                                    worker,
+                                    OpaqueControlView::Refuse {
+                                        coordinate,
+                                        reason: ApplicationFlowRefusal::NotAdmitted,
+                                    },
+                                    &mut response_dispatch,
+                                    &mut failed_write_admission,
+                                )?;
+                                return Ok(None);
+                            }
+                        };
+                        // Remote Open creates transport state only. It does not
+                        // attach an app claim, sender handle or outbound pump.
+                        let commit = (|| {
+                            self.queue_opaque_control(
+                                response_dispatch
+                                    .take()
+                                    .ok_or(RealtimeFlowError::FlowRefused)?,
+                                Arc::clone(worker),
+                                accepted,
+                                completion,
+                            )?;
+                            flows.accept_opaque(
+                                session,
+                                Some(live),
+                                &name,
+                                coordinate,
+                                local_mode,
+                                max_body_bytes as usize,
+                            )
+                        })();
+                        if let Err(error) = commit {
+                            failed_write_admission = true;
+                            drop(flows.close(session, Some(live), &name));
+                            return Err(error);
+                        }
+                        Ok(None)
+                    }
+                    Control::Accept {
+                        coordinate,
+                        label,
+                        direction,
+                        mode,
+                        max_body_bytes,
+                    } => {
+                        let local_mode = opaque_local_mode(mode)?;
+                        if !worker.opaque_native_mode_ready(local_mode) {
+                            return Err(RealtimeFlowError::FlowRefused);
+                        }
+                        let name = match flows.opaque_name_for_control(coordinate, direction) {
+                            Some(name) => name,
+                            None => {
+                                let previous = crate::protocol::ApplicationFlowCoordinate {
+                                    flow_id: coordinate.flow_id,
+                                    generation: coordinate
+                                        .generation
+                                        .checked_sub(1)
+                                        .ok_or(RealtimeFlowError::FlowRefused)?,
+                                };
+                                let name = flows
+                                    .opaque_name_for_control(previous, direction)
+                                    .ok_or(RealtimeFlowError::SessionNotCurrent)?;
+                                if name.as_bytes() != label.as_slice()
+                                    || flows.opaque_is_claimed(&name) != Some(true)
+                                {
+                                    return Err(RealtimeFlowError::FlowRefused);
+                                }
+                                flows.confirm_opaque_change(
+                                    session,
+                                    Some(live),
+                                    &name,
+                                    previous,
+                                    coordinate,
+                                    direction,
+                                    local_mode,
+                                    max_body_bytes as usize,
+                                )?;
+                                return Ok(None);
+                            }
+                        };
+                        if name.as_bytes() != label.as_slice()
+                            || flows.opaque_is_claimed(&name) != Some(true)
+                            || flows.opaque_ready(&name, coordinate) != Some(false)
+                        {
+                            return Err(RealtimeFlowError::FlowRefused);
+                        }
+                        flows.accept_opaque(
+                            session,
+                            Some(live),
+                            &name,
+                            coordinate,
+                            local_mode,
+                            max_body_bytes as usize,
+                        )?;
+                        Ok(None)
+                    }
+                    Control::Close {
+                        coordinate,
+                        direction,
+                    } => {
+                        let Some(name) = flows.opaque_name_for_control(coordinate, direction)
+                        else {
+                            return Ok(None);
+                        };
+                        let remains = flows.close(session, Some(live), &name)?;
+                        Ok(Some((Arc::clone(worker), remains)))
+                    }
+                    Control::Refuse { coordinate, .. } => {
+                        // Refuse carries no direction. An ambiguous coordinate
+                        // cannot authorize choosing either existing record.
+                        let inbound = flows.opaque_name_for_control(coordinate, Inbound);
+                        let outbound = flows.opaque_name_for_control(coordinate, Outbound);
+                        let name = match (inbound, outbound) {
+                            (Some(name), None) | (None, Some(name)) => name,
+                            _ => return Ok(None),
+                        };
+                        if flows.opaque_is_claimed(&name) != Some(true) {
+                            return Ok(None);
+                        }
+                        let remains =
+                            flows.cancel_opaque(session, Some(live), &name, coordinate)?;
+                        Ok(Some((Arc::clone(worker), remains)))
+                    }
+                    Control::Change {
+                        previous_generation,
+                        coordinate,
+                        label,
+                        direction,
+                        mode,
+                        max_body_bytes,
+                    } => {
+                        let previous = crate::protocol::ApplicationFlowCoordinate {
+                            flow_id: coordinate.flow_id,
+                            generation: previous_generation,
+                        };
+                        let local_mode = opaque_local_mode(mode)?;
+                        let Some(name) = flows.opaque_name_for_control(previous, direction) else {
+                            return Ok(None);
+                        };
+                        // This two-message Change is initiated by the actual sender.
+                        // A receiver can install its new bound before Accept without
+                        // emitting data across an independently ordered native lane.
+                        // Receiver-initiated Change needs another phase and is not
+                        // silently represented by this wire transaction.
+                        if name.as_bytes() != label.as_slice()
+                            || !worker.opaque_native_mode_ready(local_mode)
+                            || flows
+                                .opaque_name_for_coordinate(previous, direction, local_mode, 0)
+                                .is_none()
+                        {
+                            respond(
+                                worker,
+                                OpaqueControlView::Refuse {
+                                    coordinate,
+                                    reason: ApplicationFlowRefusal::NotAdmitted,
+                                },
+                                &mut response_dispatch,
+                                &mut failed_write_admission,
+                            )?;
+                            return Ok(None);
+                        }
+                        let mut change = match flows.prepare_opaque_change(
+                            session,
+                            Some(live),
+                            &name,
+                            previous,
+                            coordinate,
+                            direction,
+                            local_mode,
+                            max_body_bytes as usize,
+                        ) {
+                            Ok(change) => change,
+                            Err(_) => {
+                                respond(
+                                    worker,
+                                    OpaqueControlView::Refuse {
+                                        coordinate,
+                                        reason: ApplicationFlowRefusal::NotAdmitted,
+                                    },
+                                    &mut response_dispatch,
+                                    &mut failed_write_admission,
+                                )?;
+                                return Ok(None);
+                            }
+                        };
+                        let result = (|| {
+                            respond(
+                                worker,
+                                OpaqueControlView::Accept {
+                                    coordinate,
+                                    label: &label,
+                                    direction,
+                                    mode,
+                                    max_body_bytes,
+                                },
+                                &mut response_dispatch,
+                                &mut failed_write_admission,
+                            )?;
+                            flows.confirm_opaque_change(
+                                session,
+                                Some(live),
+                                &name,
+                                previous,
+                                coordinate,
+                                direction,
+                                local_mode,
+                                max_body_bytes as usize,
+                            )?;
+                            flows.commit_opaque_change(session, Some(live), &name, &mut change)
+                        })();
+                        if result.is_err() {
+                            // If Accept was admitted, rollback is not evidence that
+                            // the peer kept its predecessor. Retire this exact
+                            // logical session after releasing all flow locks.
+                            failed_write_admission = true;
+                            let _ = flows.rollback_opaque_change(
+                                session,
+                                Some(live),
+                                &name,
+                                &mut change,
+                            );
+                            return Err(RealtimeFlowError::FlowRefused);
+                        }
+                        Ok(None)
+                    }
+                }
+            },
+        );
+        if failed_write_admission {
+            super::finish_exact_logical_retirement(self, logical).await;
+        } else if let Ok(Some((worker, remains))) = result {
+            retire_realtime_remains(&worker, remains).await;
+        }
+    }
+
+    /// Negotiate one data-only flow without awaiting inside the network
+    /// supervisor. The existing provider record is both the pending transaction
+    /// and the sole eventual application claim; no second label table exists.
+    pub(crate) async fn open_opaque_flow(
+        self: &Arc<Self>,
+        peer: &str,
+        open: &crate::realtime::OpaqueFlowOpen,
+    ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
+    {
+        use crate::application_gateway::{FundedOpaqueControl, OpaqueControlView};
+        use crate::realtime::{RealtimeFlowDirection, RealtimeRefusal as Refusal};
+        if !open.is_well_formed()
+            || matches!(open.mode,
+            crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits } if max_retransmits != 0)
+        {
+            return Err(Refusal::ProviderConfigurationInvalid);
+        }
+        if self.application_peer_needs_demand(peer) {
+            // Explicit caller demand, outside the serial command supervisor.
+            // The request stays caller-owned; no payload/flow registry exists
+            // before the ordinary authenticated connection completes.
+            self.connect_peer_wait(peer, false)
+                .await
+                .map_err(|_| Refusal::SessionNotCurrent)?;
+        }
+        let owner = self.peers.owner(peer).ok_or(Refusal::SessionNotCurrent)?;
+        let dispatch = self.opaque_control_dispatch(&owner)?;
+        let logical = dispatch.logical_reply_operation();
+        let completion = super::command::OpaqueControlCompletion::new(&self.local_resources)?;
+        // Fund the borrowed DTO's requested name copy before converting it to
+        // the provider's validated request. Provider admission separately owns
+        // the persistent label/map/flow backing.
+        let input_claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(open.label.len()).map_err(|_| Refusal::FlowRefused)?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .map_err(|_| Refusal::FlowRefused)?;
+        let _input = self
+            .local_resources
+            .acquire(input_claim)
+            .map_err(|_| Refusal::FlowRefused)?;
+        let spec = crate::transport::webrtc::OpaqueFlowSpec::try_from(open.clone())?;
+        let mut dispatch = Some(dispatch);
+        let prepared =
+            self.with_owned_realtime_flows_and_worker(&owner, |session, flows, live, worker| {
+                if !logical.witness().is_live() {
+                    return Err(RealtimeFlowError::SessionNotCurrent);
+                }
+                if !worker.opaque_native_mode_ready(open.mode) {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+                let demand_use = self
+                    .begin_demand_link_use(&owner.for_worker(Arc::clone(worker)))
+                    .map_err(|_| RealtimeFlowError::SessionNotCurrent)?;
+                let (name, claimed) = flows.prepare_or_claim_opaque(session, Some(live), spec)?;
+                let result = (|| {
+                    let coordinate = flows
+                        .opaque_coordinate(&name)
+                        .ok_or(RealtimeFlowError::FlowRefused)?;
+                    let flow = flows
+                        .flow_identity(&name)
+                        .ok_or(RealtimeFlowError::FlowRefused)?;
+                    if !claimed {
+                        let wire = FundedOpaqueControl::encode(
+                            &self.local_resources,
+                            &OpaqueControlView::Open {
+                                coordinate,
+                                label: &open.label,
+                                direction: open.direction,
+                                mode: opaque_wire_mode(open.mode),
+                                max_body_bytes: open.max_unit_bytes,
+                            },
+                        )
+                        .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                        self.queue_opaque_control(
+                            dispatch.take().ok_or(RealtimeFlowError::FlowRefused)?,
+                            Arc::clone(worker),
+                            wire,
+                            completion.clone(),
+                        )?;
+                    }
+                    Ok((
+                        name.clone(),
+                        coordinate,
+                        flow,
+                        flows.identity(),
+                        Arc::clone(worker),
+                        session.validity_witness(),
+                        claimed,
+                        demand_use,
+                    ))
+                })();
+                if result.is_err() {
+                    drop(flows.close(session, Some(live), &name));
+                }
+                result
+            })?;
+        let (name, coordinate, flow, flow_set, worker, validity, claimed, _demand_use) = prepared;
+        let handle = crate::realtime::RealtimeFlowHandle::new(
+            owner.for_worker(Arc::clone(&worker)),
+            flow_set,
+            flow,
+            name,
+            Arc::downgrade(self),
+        );
+        // From this point cancellation drops this exact handle and queues its
+        // reciprocal Close through the same writer. It never retries an Open.
+        let wait = async {
+            if !claimed {
+                completion.wait().await?;
+            }
+            loop {
+                let pending = self
+                    .with_owned_realtime_flows(handle.owner(), |_session, flows, _live| {
+                        Self::handle_names_live_flow(flows, &handle)?;
+                        match flows.opaque_ready(handle.name(), coordinate) {
+                            Some(true) => Ok(None),
+                            Some(false) => flows
+                                .opaque_pending_wait(handle.name(), coordinate)
+                                .map(Some)
+                                .ok_or(RealtimeFlowError::FlowRefused),
+                            None => Err(RealtimeFlowError::SessionNotCurrent),
+                        }
+                    })
+                    .map_err(Refusal::from)?;
+                let Some(pending) = pending else {
+                    break;
+                };
+                let notified = pending.wait();
+                tokio::pin!(notified);
+                // Register the provider wake BEFORE rechecking readiness.
+                // notify_waiters does not retain a permit for a future which
+                // has not yet been polled.
+                let already_notified = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(notified.as_mut(), cx).is_ready(),
+                    )
+                })
+                .await;
+                let ready = self
+                    .with_owned_realtime_flows(handle.owner(), |_session, flows, _live| {
+                        Self::handle_names_live_flow(flows, &handle)?;
+                        flows
+                            .opaque_ready(handle.name(), coordinate)
+                            .ok_or(RealtimeFlowError::SessionNotCurrent)
+                    })
+                    .map_err(Refusal::from)?;
+                if ready {
+                    break;
+                }
+                if !already_notified {
+                    notified.await;
+                }
+            }
+            if open.direction == RealtimeFlowDirection::Outbound {
+                self.with_owned_realtime_flows_and_worker(
+                    handle.owner(),
+                    |session, flows, live, worker| {
+                        Self::handle_names_live_flow(flows, &handle)?;
+                        let (pump, retired) =
+                            flows.attach_opaque_pump(session, Some(live), handle.name())?;
+                        worker.spawn_opaque_outbound_pump(pump, retired);
+                        Ok(())
+                    },
+                )
+                .map_err(Refusal::from)?;
+            }
+            Ok(())
+        };
+        let timeout = std::time::Duration::from_millis(
+            self.config
+                .read()
+                .scheduler_policy()
+                .map_err(|_| Refusal::FlowRefused)?
+                .offer_build_timeout_ms,
+        );
+        let result = tokio::select! {
+            biased;
+            () = validity.revoked() => Err(Refusal::SessionNotCurrent),
+            result = tokio::time::timeout(timeout, wait) => result.unwrap_or(Err(Refusal::FlowRefused)),
+        };
+        result?;
+        // Readiness can disappear while a confirmation or pump is queued.
+        // Re-enter the same handle fence; never resolve a replacement lane.
+        self.with_owned_realtime_flows_and_worker(
+            handle.owner(),
+            |_session, flows, _live, worker| {
+                Self::handle_names_live_flow(flows, &handle)?;
+                if !worker.opaque_native_mode_ready(open.mode) {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+                Ok(())
+            },
+        )
+        .map_err(Refusal::from)?;
+        Ok(handle)
+    }
+
+    /// Change a quiescent sender's ceiling on the same exact flow. Other DTO
+    /// fields must match; no codec, mode or direction transition is inferred.
+    /// Queue admission transfers the token to the existing connection actor.
+    pub(crate) async fn change_opaque_flow(
+        self: &Arc<Self>,
+        handle: &crate::realtime::RealtimeFlowHandle,
+        open: &crate::realtime::OpaqueFlowOpen,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        use crate::application_gateway::{FundedOpaqueControl, OpaqueControlView};
+        use crate::realtime::{RealtimeFlowDirection, RealtimeRefusal as Refusal};
+        if !open.is_well_formed()
+            || open.direction != RealtimeFlowDirection::Outbound
+            || open.label.as_slice() != handle.name().as_bytes()
+        {
+            return Err(Refusal::FlowRefused);
+        }
+        let dispatch = self.opaque_control_dispatch(handle.owner())?;
+        let logical = dispatch.logical_reply_operation();
+        let completion = super::command::OpaqueControlCompletion::new(&self.local_resources)?;
+        let duration = std::time::Duration::from_millis(
+            self.config
+                .read()
+                .scheduler_policy()
+                .map_err(|_| Refusal::FlowRefused)?
+                .offer_build_timeout_ms,
+        );
+        let deadline = std::time::Instant::now()
+            .checked_add(duration)
+            .ok_or(Refusal::FlowRefused)?;
+        // One retained command label and one transient exact-record lookup.
+        // Every clone is made only after this requested-capacity reservation.
+        let name_claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                (open.label.len() as u64)
+                    .checked_mul(2)
+                    .ok_or(Refusal::FlowRefused)?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+        .map_err(|_| Refusal::FlowRefused)?;
+        let name_work = self
+            .local_resources
+            .acquire(name_claim)
+            .map_err(|_| Refusal::FlowRefused)?;
+        let (reply, receive) = oneshot::channel();
+        self.with_owned_realtime_flows_and_worker(
+            handle.owner(),
+            |session, flows, live, worker| {
+                Self::handle_names_live_flow(flows, handle)?;
+                if !logical.witness().is_live() || !worker.opaque_native_mode_ready(open.mode) {
+                    return Err(RealtimeFlowError::SessionNotCurrent);
+                }
+                let previous = flows
+                    .opaque_coordinate(handle.name())
+                    .ok_or(RealtimeFlowError::FlowRefused)?;
+                let direction = flows
+                    .opaque_opener_direction(handle.name())
+                    .ok_or(RealtimeFlowError::FlowRefused)?;
+                if flows
+                    .opaque_name_for_coordinate(previous, direction, open.mode, 0)
+                    .is_some()
+                {
+                    return Err(RealtimeFlowError::FlowRefused); // actual local Inbound
+                }
+                let coordinate = crate::protocol::ApplicationFlowCoordinate {
+                    flow_id: previous.flow_id,
+                    generation: previous
+                        .generation
+                        .checked_add(1)
+                        .ok_or(RealtimeFlowError::FlowRefused)?,
+                };
+                let wire = FundedOpaqueControl::encode(
+                    &self.local_resources,
+                    &OpaqueControlView::Change {
+                        previous_generation: previous.generation,
+                        coordinate,
+                        label: &open.label,
+                        direction,
+                        mode: opaque_wire_mode(open.mode),
+                        max_body_bytes: open.max_unit_bytes,
+                    },
+                )
+                .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                let demand_use = self
+                    .begin_owned_demand_link_use(&handle.owner().for_worker(Arc::clone(worker)))
+                    .map_err(|_| RealtimeFlowError::SessionNotCurrent)?;
+                let change = flows.prepare_opaque_change(
+                    session,
+                    Some(live),
+                    handle.name(),
+                    previous,
+                    coordinate,
+                    direction,
+                    open.mode,
+                    open.max_unit_bytes as usize,
+                )?;
+                let transfer = super::command::OpaqueChangeTransfer {
+                    dispatch,
+                    worker: Arc::clone(worker),
+                    name: handle.name().clone(),
+                    change,
+                    wire,
+                    completion,
+                    deadline,
+                    reply,
+                    _name_work: name_work,
+                    _demand_use: demand_use,
+                };
+                match self
+                    .connection_cmd_tx
+                    .send(NetworkCmd::OpaqueChange(transfer))
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let NetworkCmd::OpaqueChange(mut transfer) = error.into_value() else {
+                            unreachable!()
+                        };
+                        let _ = flows.rollback_opaque_change(
+                            session,
+                            Some(live),
+                            &transfer.name,
+                            &mut transfer.change,
+                        );
+                        Err(RealtimeFlowError::FlowRefused)
+                    }
+                }
+            },
+        )?;
+        receive.await.map_err(|_| Refusal::SessionNotCurrent)?
+    }
+
+    pub(super) async fn run_opaque_change(
+        self: &Arc<Self>,
+        transfer: super::command::OpaqueChangeTransfer,
+    ) {
+        use crate::realtime::RealtimeRefusal as Refusal;
+        let super::command::OpaqueChangeTransfer {
+            dispatch,
+            worker,
+            name,
+            mut change,
+            wire,
+            completion,
+            deadline,
+            reply,
+            _name_work,
+            _demand_use,
+        } = transfer;
+        let logical = dispatch.logical_reply_operation();
+        let owner = dispatch.owner().for_worker(Arc::clone(&worker));
+        if reply.is_closed() || std::time::Instant::now() >= deadline {
+            let _ = self.with_owned_realtime_flows(&owner, |session, flows, live| {
+                flows.rollback_opaque_change(session, Some(live), &name, &mut change)
+            });
+            let _ = reply.send(Err(Refusal::FlowRefused));
+            return;
+        }
+        // Arming outside locks covers actor cancellation after publication.
+        // The caller owns no token and cannot silently roll back this phase.
+        let mut terminal = super::OpaqueControlWriteGuard {
+            state: self,
+            failed: Some(logical),
+        };
+        let published = self.with_owned_realtime_flows(&owner, |_session, flows, _live| {
+            if flows.opaque_change_wait(&name, &change).is_none() {
+                return Err(RealtimeFlowError::SessionNotCurrent);
+            }
+            self.queue_opaque_control(dispatch, Arc::clone(&worker), wire, completion.clone())
+        });
+        if published.is_err() {
+            let _ = self.with_owned_realtime_flows(&owner, |session, flows, live| {
+                flows.rollback_opaque_change(session, Some(live), &name, &mut change)
+            });
+            terminal.failed = None; // no wire was admitted
+            let _ = reply.send(Err(Refusal::FlowRefused));
+            return;
+        }
+        let transaction = async {
+            completion.wait().await?;
+            loop {
+                let waiting = self
+                    .with_owned_realtime_flows(&owner, |session, flows, live| {
+                        if let Some(waiting) = flows.opaque_change_wait(&name, &change) {
+                            return Ok(Some(waiting));
+                        }
+                        flows.commit_opaque_change(session, Some(live), &name, &mut change)?;
+                        Ok(None)
+                    })
+                    .map_err(Refusal::from)?;
+                let Some(waiting) = waiting else {
+                    return Ok(());
+                };
+                let notified = waiting.wait();
+                tokio::pin!(notified);
+                let already = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(notified.as_mut(), cx).is_ready(),
+                    )
+                })
+                .await;
+                let committed = self
+                    .with_owned_realtime_flows(&owner, |session, flows, live| {
+                        if flows.opaque_change_wait(&name, &change).is_some() {
+                            return Ok(false);
+                        }
+                        flows.commit_opaque_change(session, Some(live), &name, &mut change)?;
+                        Ok(true)
+                    })
+                    .map_err(Refusal::from)?;
+                if committed {
+                    return Ok(());
+                }
+                if !already {
+                    notified.await;
+                }
+            }
+        };
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), transaction)
+            .await
+            .unwrap_or(Err(Refusal::FlowRefused));
+        if result.is_ok() {
+            terminal.failed = None;
+        } else if let Some(logical) = terminal.failed.take() {
+            super::finish_exact_logical_retirement(self, logical).await;
+        }
+        let _ = reply.send(result);
+        // Provider token, command label and link activity remain owned through
+        // final commit or joined exact-session teardown, including lost reply.
+    }
+
     /// Hand one unit to the outbound flow a handle names.
     ///
     /// Takes the connector's unit, already converted at the public boundary:
@@ -6249,6 +8250,62 @@ impl NetworkState {
             flows.send(session, Some(live), handle.name(), unit)
         })
         .map_err(Into::into)
+    }
+
+    /// Admit one opaque unit to the existing exact flow queue. Success is
+    /// local queue custody, not a native write or remote acknowledgement.
+    /// The owned provider pump retains output funding through its native send.
+    pub(crate) fn send_opaque(
+        &self,
+        handle: &crate::realtime::RealtimeFlowHandle,
+        bytes: Bytes,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        let _use = self
+            .begin_demand_link_use(handle.owner())
+            .map_err(|_| crate::realtime::RealtimeRefusal::SessionNotCurrent)?;
+        self.with_owned_realtime_flows(handle.owner(), |session, flows, live| {
+            Self::handle_names_live_flow(flows, handle)?;
+            flows.send_opaque(session, Some(live), handle.name(), bytes)
+        })
+        .map_err(Into::into)
+    }
+
+    pub(super) fn deliver_opaque_application_unit(
+        &self,
+        owner: &PeerOwnerToken,
+        coordinate: crate::protocol::application_flow::ApplicationFlowCoordinate,
+        direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        bytes: Bytes,
+    ) -> bool {
+        let Ok(_use) = self.begin_demand_link_use(owner) else {
+            return false;
+        };
+        self.with_owned_realtime_flows(owner, |_session, flows, _live| {
+            Ok(flows.deliver_opaque(coordinate, direction, mode, bytes))
+        })
+        .unwrap_or(false)
+    }
+
+    /// The one existing reader owns both RTP and opaque queue custody. It
+    /// cannot be reacquired by peer/label after a session replacement.
+    pub(crate) async fn recv_opaque(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> std::result::Result<
+        Option<crate::realtime::OpaqueInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        inbound.next_opaque().await
+    }
+
+    /// The tagged reader consumes either kind exactly once and retains the
+    /// provider's funded arrival through the caller's terminal handoff.
+    pub(crate) async fn recv_realtime_arrival(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> Option<crate::transport::webrtc::RealtimeInboundArrival> {
+        inbound.next_arrival().await
     }
 
     /// Close one flow and retire the native half it was standing on.
@@ -6279,7 +8336,7 @@ impl NetworkState {
     /// closing A cannot close B after an immediate reuse of A's label: the
     /// identities travelled with the handle, and B's flow is a different record.
     pub(crate) async fn close_realtime_negotiated(
-        &self,
+        self: &Arc<Self>,
         mut handle: crate::realtime::RealtimeFlowHandle,
     ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
         // Before anything, and unconditionally. This call is the close, so the
@@ -6288,6 +8345,11 @@ impl NetworkState {
         // refusal path there is nothing to close: every way this refuses is a
         // way the flow was already not ours.
         handle.disarm();
+        if self.handle_is_opaque(&handle) {
+            let (worker, remains, completion) = self.close_opaque_local(&handle)?;
+            retire_realtime_remains(&worker, remains).await;
+            return completion.wait().await;
+        }
         let (worker, remains) = self.with_owned_realtime_flows_and_worker(
             handle.owner(),
             |session, flows, live, worker| {
@@ -6312,7 +8374,16 @@ impl NetworkState {
     /// Every refusal is discarded, because each one means the flow is already
     /// gone: a stale owner, a session that has been replaced, a label closed and
     /// reopened. There is no caller left to tell, and nothing here to undo.
-    pub(crate) fn abandon_realtime_flow(&self, handle: &crate::realtime::RealtimeFlowHandle) {
+    pub(crate) fn abandon_realtime_flow(
+        self: &Arc<Self>,
+        handle: &crate::realtime::RealtimeFlowHandle,
+    ) {
+        if self.handle_is_opaque(handle) {
+            // The command, not this caller, owns the exact control write. Its
+            // admission precedes freeing the label even when no caller waits.
+            drop(self.close_opaque_local(handle));
+            return;
+        }
         // Dropped, not ignored: this value *is* the retirement, and naming it
         // is how that reads as the retirement happening rather than as a result
         // being thrown away.
@@ -6322,6 +8393,90 @@ impl NetworkState {
                 flows.close(session, Some(live), handle.name())
             }),
         );
+    }
+
+    fn handle_is_opaque(&self, handle: &crate::realtime::RealtimeFlowHandle) -> bool {
+        self.with_owned_realtime_flows(handle.owner(), |_session, flows, _live| {
+            Self::handle_names_live_flow(flows, handle)?;
+            Ok(flows.opaque_coordinate(handle.name()).is_some())
+        })
+        .unwrap_or(false)
+    }
+
+    fn close_opaque_local(
+        self: &Arc<Self>,
+        handle: &crate::realtime::RealtimeFlowHandle,
+    ) -> std::result::Result<
+        (
+            Arc<crate::transport::WebRtcConnectorWorker>,
+            RealtimeFlowRemains,
+            FundedArc<super::command::OpaqueControlCompletion>,
+        ),
+        crate::realtime::RealtimeRefusal,
+    > {
+        use crate::application_gateway::{FundedOpaqueControl, OpaqueControlView};
+        let dispatch = self.opaque_control_dispatch(handle.owner())?;
+        let logical = dispatch.logical_reply_operation();
+        let mut failed_cleanup = false;
+        let result = self.with_owned_realtime_flows_and_worker(
+            handle.owner(),
+            |session, flows, live, worker| {
+                Self::handle_names_live_flow(flows, handle)?;
+                if !logical.witness().is_live() {
+                    return Err(RealtimeFlowError::SessionNotCurrent);
+                }
+                let coordinate = flows
+                    .opaque_coordinate(handle.name())
+                    .ok_or(RealtimeFlowError::SessionNotCurrent)?;
+                let direction = flows
+                    .opaque_opener_direction(handle.name())
+                    .ok_or(RealtimeFlowError::SessionNotCurrent)?;
+                let admitted = (|| {
+                    let completion =
+                        super::command::OpaqueControlCompletion::new(&self.local_resources)
+                            .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                    let wire = FundedOpaqueControl::encode(
+                        &self.local_resources,
+                        &OpaqueControlView::Close {
+                            coordinate,
+                            direction,
+                        },
+                    )
+                    .map_err(|_| RealtimeFlowError::FlowRefused)?;
+                    self.queue_opaque_control(
+                        dispatch,
+                        Arc::clone(worker),
+                        wire,
+                        completion.clone(),
+                    )?;
+                    Ok(completion)
+                })();
+                let completion = match admitted {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        failed_cleanup = true;
+                        return Err(error);
+                    }
+                };
+                // Still under the same mutation/flow fence: no later same-label
+                // Open can be inserted before the Close which is now in the FIFO.
+                let remains = match flows.close(session, Some(live), handle.name()) {
+                    Ok(remains) => remains,
+                    Err(error) => {
+                        failed_cleanup = true;
+                        return Err(error);
+                    }
+                };
+                Ok((Arc::clone(worker), remains, completion))
+            },
+        );
+        if failed_cleanup {
+            // The label was never released. Retire only the captured logical
+            // session outside its fence, so provider refusal cannot orphan a
+            // reciprocal record and then admit a successor on that session.
+            self.peers.retire_exact_session(logical);
+        }
+        result.map_err(Into::into)
     }
 
     /// Whether that handle still names a usable flow.
@@ -6420,17 +8575,17 @@ impl NetworkState {
     /// so its queue was, so the reader is done. There is no retirement event to
     /// consume; a caller that gets `None` closes.
     ///
-    /// What leaves this bridge is a copy of the label's bytes, made once. The
-    /// leased label stays inside the connector, because a consumer holding one
-    /// would be an untracked holder of the session's lease — and the copy is
-    /// taken in the form the caller publishes, so the name is not allocated
-    /// twice on the way out.
+    /// The provider's guarded arrival crosses this bridge unchanged. An
+    /// opaque head is a typed refusal without dequeue, not a terminal stream
+    /// and not a label/body copy whose original custody has already ended.
     pub(crate) async fn next_realtime_arrival(
         &self,
         inbound: &crate::realtime::RealtimeInboundStream,
-    ) -> Option<(Vec<u8>, RealtimeRecvUnit)> {
-        let (label, unit) = inbound.reader().next().await?;
-        Some((label.name().as_bytes().to_vec(), unit))
+    ) -> std::result::Result<
+        Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        inbound.reader().next_rtp().await
     }
 
     /// The worker-lending fence, entered against an owner the caller already
@@ -6597,6 +8752,30 @@ impl NetworkState {
         channel: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
+        if self.application_peer_needs_demand(peer) {
+            // The caller retains its payload while the separately joined
+            // connection lane works. No establishment await enters the serial
+            // supervisor. A failed introduction may still use a Ready encrypted
+            // route; no application bytes have been sent by the demand itself.
+            match self.connect_peer_wait_inner(peer, false, true).await? {
+                ChannelDemandOutcome::Ready
+                | ChannelDemandOutcome::NoOwnedAttemptRefused
+                | ChannelDemandOutcome::FailedSettlementJoined => {}
+                ChannelDemandOutcome::Unsettled | ChannelDemandOutcome::TerminalRefused => {
+                    return Err(Error::Network(
+                        "application demand has not completed exact settlement".into(),
+                    ))
+                }
+            }
+        }
+        if !self
+            .peers
+            .owner(peer)
+            .is_some_and(|owner| self.peers.has_usable_authenticated_current(&owner))
+        {
+            let (endpoint, _identity_work) = self.funded_endpoint_id(peer)?;
+            self.ensure_endpoint_cipher_ready(&endpoint).await?;
+        }
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(NetworkCmd::SendChannelFrame {
@@ -6828,7 +9007,7 @@ impl NetworkState {
                     let Ok(key) = DeviceId::from_canonical_str(owner.device_id()) else {
                         return;
                     };
-                    if !recipient_after.as_ref().is_some_and(|after| &key <= after) {
+                    if recipient_after.as_ref().is_none_or(|after| &key > after) {
                         return;
                     }
                     let prefix_len = selected
@@ -7314,18 +9493,14 @@ impl NetworkState {
                     crate::protocol::HubTreeAttachRejection::UnsupportedDepth,
                 ));
             };
-            let Some(local) = self.parenting_local else {
-                return None;
-            };
+            let local = self.parenting_local?;
             let Ok(local_device) = DeviceId::from_canonical_str(self.identity.public_id()) else {
                 return None;
             };
             if request.parent() != &local_device {
                 return None;
             }
-            let Some(parent_role) = self.parenting_role else {
-                return None;
-            };
+            let parent_role = self.parenting_role?;
             let Ok(witness) = super::parenting::ParentOwnerWitness::from_owner(owner) else {
                 return None;
             };
@@ -7411,9 +9586,7 @@ impl NetworkState {
             if !matches {
                 return None;
             }
-            let Some(pending) = self.parenting_pending.lock().take() else {
-                return None;
-            };
+            let pending = self.parenting_pending.lock().take()?;
             let internal = match response.relation_generation() {
                 Some(generation) => super::parenting::ParentAttachResponse::Accepted {
                     request: pending.request,
@@ -7445,15 +9618,6 @@ impl NetworkState {
         };
     }
 
-    pub(crate) fn tree_allows_peer(&self, peer: &DeviceId) -> bool {
-        let Some(parenting) = self.parenting.as_ref() else {
-            return false;
-        };
-        parenting
-            .lock()
-            .allows_peer(super::parenting::ParentDeviceKey::from_device(peer))
-    }
-
     /// Return the accepted primary parent only while its exact promoted
     /// session remains usable.  This is a routing preference, never an
     /// authorization bypass: route admission and the send boundary each keep
@@ -7477,9 +9641,7 @@ impl NetworkState {
     /// session state.  The handle-only transport-lab facade converts this
     /// tuple into its public fixed snapshot type.
     #[cfg(feature = "transport-lab")]
-    pub(crate) fn parenting_snapshot_for_lab(
-        &self,
-    ) -> Option<(Option<[u8; 32]>, usize, usize, u64)> {
+    pub(crate) fn parenting_snapshot_for_lab(&self) -> Option<ParentingSnapshotForLab> {
         self.parenting.as_ref().map(|parenting| {
             let mut parenting = parenting.lock();
             let snapshot = parenting.snapshot_for_lab();
@@ -7516,7 +9678,7 @@ impl NetworkState {
     pub(crate) fn advance_parenting_clock_and_snapshot_for_lab(
         &self,
         delta_ms: u64,
-    ) -> Result<Option<(Option<[u8; 32]>, usize, usize, u64)>> {
+    ) -> Result<Option<ParentingSnapshotForLab>> {
         let Some(parenting) = self.parenting.as_ref() else {
             return Err(Error::Network(
                 "HubTree parenting clock is unavailable".into(),
@@ -7545,6 +9707,25 @@ impl NetworkState {
         self.hub
             .as_ref()
             .map(|controller| controller.lock().discovery_diagnostics())
+    }
+
+    /// Notify the optional advertisement clock of a genuine local owner
+    /// transition. The caller must already hold the exact current admitted
+    /// owner fence; this method deliberately never re-enters the registry.
+    /// A refused reset cannot veto promotion, retirement, or application work.
+    pub(crate) fn note_hub_authenticated_owner_change(&self, owner: &PeerOwnerToken) {
+        if let Some(controller) = self.hub.as_ref() {
+            let _ = controller
+                .lock()
+                .note_local_authenticated_owner_change(owner);
+        }
+    }
+
+    /// Called only after a genuine locally committed topology change.
+    pub(crate) fn note_hub_local_topology_change(&self) {
+        if let Some(controller) = self.hub.as_ref() {
+            let _ = controller.lock().note_local_topology_change();
+        }
     }
 
     pub(crate) fn retire_parenting_owner(&self, owner: &PeerOwnerToken) {
@@ -7716,6 +9897,33 @@ impl NetworkState {
         // finished releasing its exact de-duplication custody.  The field is
         // cleared only after this is the last shutdown consumer of it.
         let runtime = self.signaling_runtime();
+        // The connection actor has been dropped before this function runs.
+        // Its move-out reservations have restored any exact introduced pump.
+        // First resume detached/failed introductions while registry identity
+        // and the signaling token owner are still present.
+        if let (Some(pool), Some(controller)) =
+            (self.demand_links.as_ref(), self.hub_introductions.as_ref())
+        {
+            let mut cursor = None;
+            loop {
+                let next = pool
+                    .lock()
+                    .links
+                    .successor_after(cursor.as_ref())
+                    .map(|(key, link)| {
+                        (*key, link.introduction, link.generation, link.owner.clone())
+                    });
+                let Some((key, ticket, generation, owner)) = next else {
+                    break;
+                };
+                cursor = Some(key);
+                if !self.peers.has_usable_authenticated_current(&owner) {
+                    controller.lock().failed(ticket);
+                    self.settle_failed_introduction_inner(key, ticket, generation)
+                        .await;
+                }
+            }
+        }
         self.log_shutdown_phase("peer-retire-begin");
         let retired = self.peers.retire_all();
         for peer in &retired {
@@ -7764,6 +9972,64 @@ impl NetworkState {
                 tracing::warn!(%error, "peer event pump failed during shutdown");
             }
         }
+        // Original registration completion publishes either into that Vec or
+        // directly into an exact demand record under its SAME lifecycle lock.
+        // With registration now closed there can be no late record handoff.
+        if let Some(pool) = self.demand_links.as_ref() {
+            loop {
+                let next = pool
+                    .lock()
+                    .links
+                    .successor_after(None)
+                    .map(|(key, link)| (*key, link.owner.clone(), link.introduction));
+                let Some((key, owner, ticket)) = next else {
+                    break;
+                };
+                // close_waiter itself starts native close; it is NOT a passive
+                // observation. Global shutdown has retired its owned peers
+                // above. A still-live reused/successor-owned worker is not ours
+                // to close merely because an old demand record names it.
+                if let Some(worker) = owner.worker() {
+                    if worker.live_connector_incarnation().is_some() {
+                        self.resolve_introduction_waiters(owner.device_id(), ticket, false);
+                        tracing::warn!("shutdown retains an unsettled introduction with a live successor worker");
+                        return;
+                    }
+                    let _ = worker.retire_and_close().await;
+                }
+                let _ = self.join_introduction_pump_after_native(&owner).await;
+                // A failed JoinHandle result is still a terminal join. An
+                // absent handle with NO terminal result is not. Never clear
+                // such a record merely because shutdown attempted the join.
+                let terminal = pool.lock().links.get(&key).is_some_and(|link| {
+                    same_demand_owner(&link.owner, &owner)
+                        && link.introduction == ticket
+                        && link.pump_registered
+                        && link.pump.is_none()
+                        && link.pump_joined.is_some()
+                        && link.settlement != IntroductionSettlementPhase::Joining
+                });
+                if !terminal {
+                    self.resolve_introduction_waiters(owner.device_id(), ticket, false);
+                    tracing::warn!(
+                        "shutdown retains introduction custody without a terminal receiver join"
+                    );
+                    return;
+                }
+                {
+                    let mut guard = pool.lock();
+                    if let Some(link) = guard.links.get_mut(&key) {
+                        if let Some(detached) = link.detached.take() {
+                            detached.release_after_join(owner.connection());
+                        }
+                    }
+                }
+                // Shutdown, stale ownership, or any error never authorizes
+                // fallback even when shutdown's eventual joins succeeded.
+                self.resolve_introduction_waiters(owner.device_id(), ticket, false);
+                pool.lock().links.remove(&key);
+            }
+        }
         self.log_shutdown_phase("event-pump-drained");
         drop(retired);
         drop(runtime);
@@ -7791,7 +10057,7 @@ impl NetworkState {
                 break;
             };
             while let Some(waiter) = bucket.waiters.pop_front() {
-                let _ = waiter.reply.send(Err(Error::Network(format!(
+                waiter.finish(Err(Error::Network(format!(
                     "connect {peer}: network shut down"
                 ))));
             }
@@ -7800,6 +10066,16 @@ impl NetworkState {
             drop(peer);
         }
         self.application_gateway.close();
+        if let Some(controller) = self.hub_introductions.as_ref() {
+            controller.lock().shutdown();
+        }
+        drop(self.hub_signaling_carrier.lock().take());
+        if let Some(pool) = self.demand_links.as_ref() {
+            // In-flight guards retain their exact caller/worker custody. They
+            // cannot update a removed generation or adopt a successor.
+            let links = std::mem::take(&mut pool.lock().links);
+            drop(links);
+        }
         if let Some(graph) = self.local_observation.as_ref() {
             let _ = graph.lock().retire_owner();
         }
@@ -7810,6 +10086,9 @@ impl NetworkState {
         // becomes permanently unavailable to stale state facades.
         let _publication = self.durable_publication_gate.lock();
         let mut semantic_graph = self.fact_graph.write();
+        if let Some(root) = self.endpoint_cipher.as_ref() {
+            root.lock().shutdown();
+        }
         semantic_graph.seal_live_checkpoint();
         let provisional = self.durable_provisional.lock().clone();
         if let Err(error) = self
@@ -7898,6 +10177,44 @@ impl NetworkState {
         }
     }
 
+    /// Complete an introduced pump registration directly into its existing
+    /// demand record. The pending count is decremented under the SAME lifecycle
+    /// lock as this transfer; shutdown cannot miss both owners in between.
+    /// A non-introduced owner leaves the original registration unchanged.
+    pub(super) fn finish_introduced_pump_registration(
+        &self,
+        owner: &PeerOwnerToken,
+        pump: JoinHandle<()>,
+    ) -> std::result::Result<(), JoinHandle<()>> {
+        let (Some(pool), Ok(key)) = (
+            self.demand_links.as_ref(),
+            DeviceId::canonical_key_bytes(owner.device_id()),
+        ) else {
+            return Err(pump);
+        };
+        let mut lifecycle = self.peer_event_pumps.lock();
+        let mut pool = pool.lock();
+        let Some(link) = pool
+            .links
+            .get_mut(&key)
+            .filter(|link| same_demand_owner(&link.owner, owner) && !link.pump_registered)
+        else {
+            return Err(pump);
+        };
+        assert!(lifecycle.pending_registrations > 0);
+        assert!(
+            !lifecycle.closed,
+            "pending registration precedes lifecycle close"
+        );
+        link.pump = Some(pump);
+        link.pump_registered = true;
+        lifecycle.pending_registrations -= 1;
+        drop(pool);
+        drop(lifecycle);
+        self.peer_event_pump_ready.notify_waiters();
+        Ok(())
+    }
+
     /// Transport-lab-only access to the production peer-pump registration
     /// fence. The integration control uses the same begin/finish ownership
     /// path as the engine and cannot install an unregistered worker.
@@ -7967,6 +10284,26 @@ impl NetworkState {
         }
     }
 
+    pub(super) fn application_peer_needs_demand(&self, peer: &str) -> bool {
+        let enabled = {
+            let config = self.config.read();
+            config.application_transport.is_some()
+                && matches!(
+                    &config.topology,
+                    TopologyMode::Star { .. }
+                        | TopologyMode::Hubs { .. }
+                        | TopologyMode::HubTree { .. }
+                )
+        };
+        enabled
+            && !self
+                .peers
+                .owner(peer)
+                .is_some_and(|owner| self.peers.has_usable_authenticated_current(&owner))
+    }
+
+    // Refusal returns the original funded command and waiter custody, without a new box.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn request_connect_peer(
         &self,
         device_id: String,
@@ -7980,13 +10317,331 @@ impl NetworkState {
         })
     }
 
+    pub(super) fn queue_introduced_peer(
+        &self,
+        device_id: String,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> Result<()> {
+        self.connection_cmd_tx
+            .send(NetworkCmd::BeginIntroducedPeer { device_id, ticket })
+            .map_err(|error| Error::from(error.into_admission_error()))
+    }
+
+    pub(super) fn queue_introduction_signal(&self, signal: EphemeralIngress) -> Result<()> {
+        self.connection_cmd_tx
+            .send(NetworkCmd::IntroducedSignaling(
+                super::command::IntroducedSignaling(signal),
+            ))
+            .map_err(|error| Error::from(error.into_admission_error()))
+    }
+
+    /// One advisory route over the configured sparse infrastructure. Retained
+    /// scratch is funded before building the bounded candidate spelling list;
+    /// no directory sighting creates a connector or an authorization here.
+    pub(super) fn introduction_carrier(
+        &self,
+        target: &str,
+        excluded: Option<&PeerOwnerToken>,
+    ) -> Option<PeerOwnerToken> {
+        let eligible = |id: &str| {
+            let owner = self.peers.owner(id)?;
+            let owner = self.peers.capture_current_worker_owner(&owner)?;
+            if excluded.is_some_and(|previous| previous.device_id() == id)
+                || !self.peers.has_usable_authenticated_current(&owner)
+            {
+                return None;
+            }
+            Some(owner)
+        };
+        if let Some(direct) = eligible(target) {
+            return Some(direct);
+        }
+        let config = self.config.read();
+        let (root, hubs): (Option<&String>, &[String]) = match &config.topology {
+            TopologyMode::HubTree { root, hubs, .. } => (Some(root), hubs),
+            TopologyMode::Hubs { hubs, .. } => (None, hubs),
+            TopologyMode::Star { hub } => (Some(hub), &[]),
+            _ => return None,
+        };
+        let count = hubs.len().checked_add(usize::from(root.is_some()))?;
+        let mut string_bytes = 0usize;
+        let mut max_string = 0usize;
+        for id in root.into_iter().chain(hubs.iter()) {
+            let length = id.len();
+            string_bytes = string_bytes.checked_add(length)?;
+            max_string = max_string.max(length);
+        }
+        let bytes = count
+            .checked_add(1)?
+            .checked_mul(std::mem::size_of::<String>())?
+            .checked_add(string_bytes)?
+            .checked_add(max_string)?;
+        let claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(bytes).ok()?,
+            ),
+            (
+                ResourceClass::OpaqueDependencyResidual,
+                u64::try_from(count.checked_add(3)?).ok()?,
+            ),
+        ])
+        .ok()?;
+        let _scratch = self.local_resources.acquire(claim).ok()?;
+        let mut connected = Vec::with_capacity(count);
+        for id in root.into_iter().chain(hubs.iter()) {
+            if eligible(id.as_str()).is_some() {
+                connected.push(id.clone());
+            }
+        }
+        let selected =
+            self.topology_impl
+                .read()
+                .next_hops(self.identity.public_id(), target, &connected, 1);
+        selected.first().and_then(|id| eligible(id))
+    }
+
+    pub(super) fn introduction_work(&self) -> Result<ResourceLease> {
+        let claim = crate::protocol::hub_introduction::introduction_work_claim(
+            crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES,
+        )
+        .map_err(|_| Error::Network("introduction work shape refused".into()))?;
+        Ok(self.local_resources.acquire(claim)?)
+    }
+
+    pub(super) async fn send_introduction_body(
+        self: &Arc<Self>,
+        ticket: super::hub_introduction::IntroductionTicket,
+        body: crate::protocol::HubIntroductionBody,
+        native: Option<&PeerOwnerToken>,
+    ) -> Result<()> {
+        let _work = self.introduction_work()?;
+        let controller = self
+            .hub_introductions
+            .as_ref()
+            .ok_or_else(|| Error::Network("application introduction disabled".into()))?;
+        let (carrier, envelope) = {
+            let mut intro = controller.lock();
+            let coords = intro
+                .coordinates(ticket)
+                .ok_or_else(|| Error::Network("introduction ticket is stale".into()))?;
+            let local = self.identity.signing_key().verifying_key().to_bytes();
+            let reverse = coords.destination == local;
+            if !reverse && coords.source != local {
+                return Err(Error::Network(
+                    "introduction is not locally originated".into(),
+                ));
+            }
+            let (source, destination) = if reverse {
+                (coords.destination, coords.source)
+            } else {
+                (coords.source, coords.destination)
+            };
+            let sequence = intro
+                .next_sequence(ticket)
+                .ok_or_else(|| Error::Network("introduction sequence exhausted".into()))?;
+            // These coordinates can come from a previously unknown remote
+            // Request. Reconstruct only frame-owned backing under _work,
+            // never process-global interner occupancy.
+            let bounded_id = |key: &[u8; 32]| -> Result<DeviceId> {
+                let mut spelling = [0u8; 52];
+                data_encoding::BASE32_NOPAD.encode_mut(key, &mut spelling);
+                spelling.make_ascii_lowercase();
+                DeviceId::from_canonical_str_uninterned(
+                    std::str::from_utf8(&spelling)
+                        .map_err(|_| Error::Network("introduction identity invalid".into()))?,
+                )
+                .map_err(|_| Error::Network("introduction identity invalid".into()))
+            };
+            let envelope = crate::protocol::HubIntroductionEnvelope::new(
+                self.mesh_context_id(),
+                bounded_id(&source)?,
+                bounded_id(&destination)?,
+                coords.introduction_id,
+                sequence,
+                coords.challenge,
+                crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_HOPS,
+                body,
+                self.identity.signing_key(),
+            )
+            .map_err(|_| Error::Network("introduction encoding refused".into()))?;
+            intro
+                .observe_outbound(ticket, native, &envelope, std::time::Instant::now())
+                .map_err(|_| Error::Network("introduction outbound refused".into()))?;
+            let carrier = intro
+                .route(ticket, reverse)
+                .ok_or_else(|| Error::Network("introduction has no captured route".into()))?;
+            (carrier, envelope)
+        };
+        let result = match envelope.encode_complete() {
+            Ok(bytes) => {
+                super::send_application_bytes_inner(
+                    self,
+                    &carrier,
+                    Bytes::from(bytes),
+                    super::traffic::FrameClass::Control,
+                )
+                .await
+            }
+            Err(_) => Err(Error::Network("introduction wire refused".into())),
+        };
+        if result.is_err() {
+            controller.lock().failed(ticket);
+        }
+        // No reroute/resequence after an ambiguous write. The work lease is
+        // held through encoding and the terminal native enqueue result.
+        result
+    }
+
+    /// Interception is by a retained exact attempt record, not hex spelling.
+    /// A matching terminal/refused attempt is still consumed, so it can never
+    /// leak into Nostr/mDNS fanout after local introduction cancellation.
+    pub(crate) async fn try_send_hub_introduction_signal(
+        self: &Arc<Self>,
+        outbound: &SignalingOutbound,
+    ) -> bool {
+        use crate::protocol::HubIntroductionBody;
+        let (target, attempt, native) = match outbound {
+            SignalingOutbound::Offer {
+                device_id,
+                attempt,
+                owner,
+                ..
+            }
+            | SignalingOutbound::Answer {
+                device_id,
+                attempt,
+                owner,
+                ..
+            }
+            | SignalingOutbound::Candidate {
+                device_id,
+                attempt,
+                owner,
+                ..
+            } => (device_id.as_str(), attempt.as_str(), owner.as_ref()),
+            _ => return false,
+        };
+        let Some(controller) = self.hub_introductions.as_ref() else {
+            return false;
+        };
+        let Some(ticket) = controller.lock().ticket_for_attempt(target, attempt) else {
+            return false;
+        };
+        let Some(native) = native else {
+            controller.lock().failed(ticket);
+            return true;
+        };
+        // The controller retains the original installation before native
+        // construction. Only this demand's captured stamped worker may emit
+        // its negotiation; a later worker on the same connection is not a
+        // refinement of the old demand, even when its attempt text matches.
+        if !self
+            .introduction_native_owner(target, ticket)
+            .is_some_and(|captured| captured.same_exact_owner(native))
+            || self
+                .peers
+                .with_current_transport_worker(native, |_| ())
+                .is_none()
+        {
+            controller.lock().failed(ticket);
+            return true;
+        }
+        let Ok(_translation) = self.introduction_work() else {
+            controller.lock().failed(ticket);
+            return true;
+        };
+        let representable = match outbound {
+            SignalingOutbound::Offer { sdp, .. } | SignalingOutbound::Answer { sdp, .. } => {
+                sdp.len() <= crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_SDP_BYTES
+            }
+            SignalingOutbound::Candidate { candidate, .. } => {
+                candidate.candidate.len()
+                    <= crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_CANDIDATE_BYTES
+                    && candidate
+                        .sdp_mid
+                        .as_ref()
+                        .is_none_or(|value| value.len() <= 64)
+                    && candidate
+                        .username_fragment
+                        .as_ref()
+                        .is_none_or(|value| value.len() <= 64)
+            }
+            _ => false,
+        };
+        if !representable {
+            controller.lock().failed(ticket);
+            return true;
+        }
+        let body = match outbound {
+            SignalingOutbound::Offer { sdp, .. } => HubIntroductionBody::Offer { sdp: sdp.clone() },
+            SignalingOutbound::Answer { sdp, .. } => {
+                HubIntroductionBody::Answer { sdp: sdp.clone() }
+            }
+            SignalingOutbound::Candidate { candidate, .. } => {
+                hub_introduction_candidate_body(candidate)
+            }
+            _ => return true,
+        };
+        let _ = self
+            .send_introduction_body(ticket, body, Some(native))
+            .await;
+        true
+    }
+
+    pub(super) fn deliver_introduction_signal(
+        self: &Arc<Self>,
+        ticket: super::hub_introduction::IntroductionTicket,
+        carrier: &PeerOwnerToken,
+        frame: &crate::protocol::HubIntroductionEnvelope,
+    ) -> bool {
+        let Some(controller) = self.hub_introductions.as_ref() else {
+            return false;
+        };
+        let mut attached = self.hub_signaling_carrier.lock();
+        if attached.is_none() {
+            *attached = super::signaling_ingress::HubSignalingCarrier::new(self);
+        }
+        let Some(bridge) = attached.as_ref() else {
+            return false;
+        };
+        matches!(
+            bridge.admit(
+                self,
+                &mut controller.lock(),
+                ticket,
+                carrier,
+                frame,
+                std::time::Instant::now()
+            ),
+            super::signaling_ingress::Delivered::Accepted
+        )
+    }
+
     /// Deliberately dial one peer and resolve when the link reaches
     /// ACTIVE (or fail with the terminal reason). `sticky` records a
     /// standing dial: the engine re-dials on every announce and holds a
     /// never-expiring reconnect intent — the "support session" contract
-    /// on a Silent network. The returned future is bounded only by the
-    /// caller's own timeout.
+    /// on a Silent network. With application introduction enabled, the local
+    /// policy bounds the wait as well as any earlier caller cancellation.
     pub async fn connect_peer_wait(&self, device_id: &str, sticky: bool) -> Result<()> {
+        match self
+            .connect_peer_wait_inner(device_id, sticky, false)
+            .await?
+        {
+            ChannelDemandOutcome::Ready => Ok(()),
+            _ => Err(Error::Network(
+                "connection demand did not become ready".into(),
+            )),
+        }
+    }
+
+    async fn connect_peer_wait_inner(
+        &self,
+        device_id: &str,
+        sticky: bool,
+        settlement_required: bool,
+    ) -> Result<ChannelDemandOutcome> {
         let id = next_non_wrapping(&self.next_connect_waiter)
             .ok_or_else(|| Error::Network("connect waiter identity exhausted".into()))?;
         let shared_lease = self
@@ -8005,22 +10660,63 @@ impl NetworkState {
             shared,
             armed: false,
         };
-        let (reply, rx) = oneshot::channel();
+        let (reply, mut rx) = oneshot::channel();
         self.request_connect_peer(
             device_id.to_string(),
             sticky,
             Some(ConnectWaiterRegistration {
-                reply,
+                reply: Mutex::new(Some(reply)),
                 shared: cancellation.shared.clone(),
             }),
         )
         .map_err(|error| error.into_admission_error())?;
         cancellation.armed = true;
-        let result = rx
-            .await
-            .map_err(|_| Error::Network("engine dropped the connect wait".into()))?;
+        let introduction_timeout =
+            self.config.read().application_transport.map(|policy| {
+                std::time::Duration::from_millis(policy.introduction.attempt_timeout_ms)
+            });
+        let received = if let Some(timeout) = introduction_timeout {
+            match tokio::time::timeout(timeout, &mut rx).await {
+                Ok(received) => received,
+                Err(_) => {
+                    let binding = *cancellation.shared.introduction.lock();
+                    if !settlement_required || binding.is_none() {
+                        return Err(Error::Network(
+                            "application connection demand expired".into(),
+                        ));
+                    }
+                    let binding = binding.expect("bound settlement caller was checked");
+                    // A command may have waited for the actor before binding.
+                    // Never expire that shared ticket at this caller's earlier
+                    // timeout: retain its original, unrenewed deadline.
+                    tokio::select! {
+                        received = &mut rx => received,
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(binding.deadline)) => {
+                            self.connection_cmd_tx.send(NetworkCmd::SettleIntroductionWait(
+                                super::command::IntroductionWaitTransfer {
+                                    shared: cancellation.shared.clone(),
+                                },
+                            )).map_err(|error| error.into_admission_error())?;
+                            rx.await
+                        }
+                    }
+                }
+            }
+        } else {
+            rx.await
+        };
+        let result =
+            received.map_err(|_| Error::Network("engine dropped the connect wait".into()))?;
         cancellation.armed = false;
-        result
+        if result.is_ok() {
+            return Ok(ChannelDemandOutcome::Ready);
+        }
+        let outcome = *cancellation.shared.outcome.lock();
+        match outcome {
+            ChannelDemandOutcome::NoOwnedAttemptRefused
+            | ChannelDemandOutcome::FailedSettlementJoined => Ok(outcome),
+            _ => result.map(|()| ChannelDemandOutcome::Ready),
+        }
     }
 
     /// Retain a frame for acknowledged delivery to `peer` — see
@@ -8033,6 +10729,9 @@ impl NetworkState {
         channel: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
+        if self.application_peer_needs_demand(peer) {
+            self.connect_peer_wait(peer, false).await?;
+        }
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(NetworkCmd::SendChannelReliable {
@@ -8080,15 +10779,32 @@ impl NetworkState {
         self.reconnect_intents.lock().remove(device_id);
     }
 
-    /// Park a waiter to be resolved when `device_id` reaches ACTIVE.
+    /// Park a waiter to be resolved when `device_id` reaches ACTIVE. False
+    /// means cancellation or funding/capacity refused before registration;
+    /// an attached request must not proceed to create native demand then.
     pub(crate) fn register_connect_waiter(
         &self,
         device_id: &str,
         waiter: ConnectWaiterRegistration,
-    ) {
+    ) -> bool {
+        let limit = self
+            .config
+            .read()
+            .application_transport
+            .map(|policy| policy.introduction.max_waiters_per_target);
         let mut waiters = self.connect_waiters.lock();
         if waiter.shared.cancelled.load(Ordering::Acquire) {
-            return;
+            return false;
+        }
+        if limit.is_some_and(|limit| {
+            waiters.get(device_id).is_some_and(|bucket| {
+                u64::try_from(bucket.waiters.len()).map_or(true, |count| count >= limit)
+            })
+        }) {
+            waiter.finish(Err(Error::Network(
+                "application connection waiter capacity exhausted".into(),
+            )));
+            return false;
         }
         let queue_node = match self.local_resources.acquire(
             LeasedQueue::<ConnectWaiterRegistration>::entry_claim()
@@ -8096,8 +10812,8 @@ impl NetworkState {
         ) {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = waiter.reply.send(Err(Error::ResourceUnavailable(error)));
-                return;
+                waiter.finish(Err(Error::ResourceUnavailable(error)));
+                return false;
             }
         };
         let fresh_bucket = if waiters.contains_key(device_id) {
@@ -8115,16 +10831,16 @@ impl NetworkState {
                 .ok()
             });
             let Some(name_claim) = name_claim else {
-                let _ = waiter.reply.send(Err(Error::Network(
+                waiter.finish(Err(Error::Network(
                     "connect waiter peer identity is not representable".into(),
                 )));
-                return;
+                return false;
             };
             let name_lease = match self.local_resources.acquire(name_claim) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    let _ = waiter.reply.send(Err(Error::ResourceUnavailable(error)));
-                    return;
+                    waiter.finish(Err(Error::ResourceUnavailable(error)));
+                    return false;
                 }
             };
             let node_claim = LeasedMap::<String, ConnectWaiterBucket>::entry_claim()
@@ -8132,8 +10848,8 @@ impl NetworkState {
             let node = match self.local_resources.acquire(node_claim) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    let _ = waiter.reply.send(Err(Error::ResourceUnavailable(error)));
-                    return;
+                    waiter.finish(Err(Error::ResourceUnavailable(error)));
+                    return false;
                 }
             };
             Some((name_lease, node))
@@ -8143,7 +10859,7 @@ impl NetworkState {
         // it cannot be followed by an insertion, and if registration wins,
         // the cancellation path removes the entry after this lock is freed.
         if waiter.shared.cancelled.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         if let Some((name_lease, node)) = fresh_bucket {
             waiters
@@ -8164,6 +10880,7 @@ impl NetworkState {
             .push(waiter, queue_node);
         #[cfg(test)]
         self.connect_waiter_registered.notify_waiters();
+        true
     }
 
     fn cancel_connect_waiter(&self, device_id: &str, id: u64) {
@@ -8174,6 +10891,125 @@ impl NetworkState {
                 waiters.remove(device_id);
             }
         }
+    }
+
+    /// Bind registrations before the Request can leave the local actor. A
+    /// previously bound caller is never rebound to a successor ticket.
+    pub(super) fn bind_introduction_waiters(
+        &self,
+        device_id: &str,
+        ticket: super::hub_introduction::IntroductionTicket,
+    ) -> Result<()> {
+        use super::hub_introduction::IntroductionLifetime;
+        let deadline = {
+            let root = self
+                .hub_introductions
+                .as_ref()
+                .ok_or_else(|| Error::Network("introduction root is absent".into()))?;
+            let root = root.lock();
+            let coordinates = root
+                .coordinates(ticket)
+                .ok_or_else(|| Error::Network("introduction ticket is not current".into()))?;
+            let local = DeviceId::canonical_key_bytes(self.identity.public_id()).ok();
+            let target = DeviceId::canonical_key_bytes(device_id).ok();
+            if !((local == Some(coordinates.source) && target == Some(coordinates.destination))
+                || (local == Some(coordinates.destination) && target == Some(coordinates.source)))
+            {
+                return Err(Error::Network(
+                    "waiter does not name this introduction endpoint".into(),
+                ));
+            }
+            match root.lifetime(ticket, std::time::Instant::now()) {
+                IntroductionLifetime::Live { deadline } => deadline,
+                _ => {
+                    return Err(Error::Network(
+                        "introduction is not live before waiter binding".into(),
+                    ))
+                }
+            }
+        };
+        if let Some(bucket) = self.connect_waiters.lock().get_mut(device_id) {
+            for waiter in bucket.waiters.iter_mut() {
+                let mut binding = waiter.shared.introduction.lock();
+                if binding.is_none() && !waiter.shared.cancelled.load(Ordering::Acquire) {
+                    *binding = Some(IntroductionWaitBinding { ticket, deadline });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn resolve_introduction_waiters(
+        &self,
+        device_id: &str,
+        ticket: super::hub_introduction::IntroductionTicket,
+        clean: bool,
+    ) {
+        self.resolve_bound_connect_waiters(
+            device_id,
+            ticket,
+            if clean {
+                ChannelDemandOutcome::FailedSettlementJoined
+            } else {
+                ChannelDemandOutcome::Unsettled
+            },
+        );
+    }
+
+    fn resolve_bound_connect_waiters(
+        &self,
+        device_id: &str,
+        ticket: super::hub_introduction::IntroductionTicket,
+        outcome: ChannelDemandOutcome,
+    ) {
+        let mut waiters = self.connect_waiters.lock();
+        if let Some(bucket) = waiters.get_mut(device_id) {
+            for waiter in bucket.waiters.iter_mut() {
+                if waiter
+                    .shared
+                    .introduction
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|binding| binding.ticket == ticket)
+                {
+                    *waiter.shared.outcome.lock() = outcome;
+                    waiter.finish(if outcome == ChannelDemandOutcome::Ready {
+                        Ok(())
+                    } else {
+                        Err(Error::Network(
+                            "exact introduction terminal settlement".into(),
+                        ))
+                    });
+                }
+            }
+            bucket
+                .waiters
+                .retain(|waiter| waiter.reply.lock().is_some());
+            if bucket.waiters.is_empty() {
+                waiters.remove(device_id);
+            }
+        }
+    }
+
+    /// Invoked inside the caller's already-held exact authenticated registry
+    /// fence. This hook performs no registry lookup or admission of its own.
+    pub(super) fn resolve_authenticated_connect_waiters(&self, owner: &PeerOwnerToken) {
+        let ticket = self.demand_links.as_ref().and_then(|pool| {
+            let key = DeviceId::canonical_key_bytes(owner.device_id()).ok()?;
+            let pool = pool.lock();
+            pool.links
+                .get(&key)
+                .filter(|link| same_demand_owner(&link.owner, owner) && link.detached.is_none())
+                .map(|link| link.introduction)
+        });
+        if let Some(ticket) = ticket {
+            self.resolve_bound_connect_waiters(
+                owner.device_id(),
+                ticket,
+                ChannelDemandOutcome::Ready,
+            );
+        }
+        self.resolve_connect_waiters(owner.device_id(), None);
     }
 
     #[cfg(test)]
@@ -8281,7 +11117,7 @@ impl NetworkState {
         )
         .expect("an admitted test waiter allocation is never speculative");
         let registration = ConnectWaiterRegistration {
-            reply,
+            reply: Mutex::new(Some(reply)),
             shared: shared.clone(),
         };
         let cancellation = ConnectWaitCancellation {
@@ -8292,23 +11128,2385 @@ impl NetworkState {
         (registration, cancellation)
     }
 
-    /// Resolve every waiter parked on `device_id`. `error == None`
-    /// resolves Ok; otherwise each waiter gets the reason.
+    /// Legacy ordinary-connect completion applies only to unbound waiters.
+    /// An introduction needs its exact ticket and terminal ownership proof.
     pub(crate) fn resolve_connect_waiters(&self, device_id: &str, error: Option<&str>) {
-        let bucket = self.connect_waiters.lock().remove(device_id);
-        let Some(mut bucket) = bucket else { return };
-        while let Some(waiter) = bucket.waiters.pop_front() {
+        let mut waiters = self.connect_waiters.lock();
+        let Some(bucket) = waiters.get_mut(device_id) else {
+            return;
+        };
+        for waiter in bucket.waiters.iter_mut() {
+            if waiter.shared.introduction.lock().is_some() {
+                continue;
+            }
             let result = match error {
                 None => Ok(()),
                 Some(e) => Err(Error::Network(format!("connect {device_id}: {e}"))),
             };
-            let _ = waiter.reply.send(result);
+            waiter.finish(result);
+        }
+        bucket
+            .waiters
+            .retain(|waiter| waiter.reply.lock().is_some());
+        if bucket.waiters.is_empty() {
+            waiters.remove(device_id);
         }
     }
 
     /// True when this network uses local `Silent` connection policy.
     pub fn is_silent(&self) -> bool {
         matches!(self.config.read().kind, crate::config::NetworkKind::Silent)
+    }
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+mod introduction_settlement_controls {
+    use super::super::hub_introduction::{HubIntroduction, IntroductionLifetime};
+    use super::*;
+    use crate::resource::FiniteResourceProvider;
+
+    fn policy() -> crate::config::ApplicationTransportPolicyConfig {
+        crate::config::ApplicationTransportPolicyConfig {
+            introduction: crate::config::HubIntroductionPolicyConfig {
+                max_records: 2,
+                max_waiters_per_target: 2,
+                max_signaling_bytes: 65_536,
+                max_candidates_per_attempt: 2,
+                attempt_timeout_ms: 10_000,
+                terminal_retention_ms: 1_000,
+                max_transient_links: 2,
+                idle_timeout_ms: 1_000,
+                max_maintenance_per_tick: 2,
+            },
+            endpoint_cipher: crate::config::EndpointCipherPolicyConfig {
+                max_sessions: 1,
+                max_plaintext_bytes: 1024,
+                replay_window: 8,
+                max_age_ms: 10_000,
+            },
+        }
+    }
+
+    /// Explicit simultaneously retained owners: the two bounded controller
+    /// and demand entries, one unused cipher root, one external wire builder
+    /// plus its separately admitted verification, and one two-caller bucket.
+    /// Each raw acquisition is normalized separately; this is planning only.
+    fn retained_plan(target: &str) -> ResourceClaim {
+        let policy = policy();
+        let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
+        let bound = crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES;
+        let controller = policy
+            .introduction
+            .planned_records_claim(
+                HubIntroduction::root_claim().unwrap(),
+                HubIntroduction::entry_claim().unwrap(),
+            )
+            .unwrap();
+        let links = policy
+            .introduction
+            .planned_demand_links_claim(
+                DemandLinkPool::root_claim().unwrap(),
+                DemandLinkPool::entry_claim().unwrap(),
+            )
+            .unwrap();
+        [
+            controller,
+            links,
+            charge(super::super::endpoint_cipher::EndpointCipherController::root_claim().unwrap()),
+            charge(crate::protocol::hub_introduction::introduction_work_claim(bound).unwrap()),
+            charge(HubIntroduction::frame_work_claim(bound).unwrap()),
+            NetworkState::connect_waiter_retained_claim_for_test(target),
+            charge(ConnectWaitShared::claim(target).unwrap()),
+            charge(LeasedQueue::<ConnectWaiterRegistration>::entry_claim().unwrap()),
+        ]
+        .into_iter()
+        .try_fold(ResourceClaim::ZERO, |sum, next| sum.checked_add(next))
+        .unwrap()
+    }
+
+    const AUTH_LOCAL_BINDING: &str = "intro-local-fp";
+    const AUTH_REMOTE_BINDING: &str = "intro-remote-fp";
+
+    /// Test-only local exchange ledger, independent of controller wire work.
+    /// Context/record strings and the task Arc stay charged through teardown;
+    /// scratch is a conservative simultaneous envelope of the three sequential
+    /// transcript builds and their bounded encoding/verification temporaries.
+    /// No second native handoff, identity backing, or inline demand capability
+    /// is charged here. The capability Box below is the actual temporary
+    /// PeerProofAcceptance box, not the eventual inline record storage.
+    fn authenticated_fixture_claim() -> ResourceClaim {
+        let ids = 3usize * 52; // canonical base32 mesh + two raw Device IDs
+        let fields = [
+            52usize,
+            "ed25519-dtls-v1".len(),
+            "initiator".len(),
+            52,
+            52,
+            52,
+            52,
+            AUTH_LOCAL_BINDING.len(),
+            AUTH_REMOTE_BINDING.len(),
+        ];
+        let transcript = fields.into_iter().fold(
+            crate::endpoint_auth::ENDPOINT_AUTH_DOMAIN_TAG.len(),
+            |sum, len| sum + len + len.to_string().len() + 1,
+        );
+        let retained = std::mem::size_of::<crate::endpoint_auth::EndpointAuthTask>()
+            + 2 * std::mem::size_of::<usize>() // Arc strong/weak counters
+            + ids * 2 + AUTH_LOCAL_BINDING.len() + AUTH_REMOTE_BINDING.len()
+            + 2 * 52 + 103 + 2 * 52; // local/peer draw, cached proof, two digests
+        let scratch = std::mem::size_of::<crate::endpoint_auth::AuthenticatedChannelCapability>()
+            + 2 * 52 // uppercase/lowercase mesh rendering before context copies it
+            + 4 * 52 + 32 // peer draw/canonical decode and verification clones
+            + 4 * 103 + 64 + 52 + 32 // proof copies, case conversion, signature/key decode
+            + 52 // digest uppercase encoding before lowercase output
+            + 3 * transcript + 3; // Vec old+new growth bound and decimal prefix
+                                  // At most one allocation per extend/push plus one decimal string per
+                                  // field: 1 + 9*4 per transcript, three sequential builds. Remaining
+                                  // named mesh/binding/context/task/draw/parser/clone/sign/verify/record/
+                                  // digest/box allocations: 2+2+3+1+2+2+5+1+3+2+6+3+4+1 = 37.
+                                  // Two draws, two signatures, verification/key validation and one
+                                  // digest add seven opaque operations; no expanded-key erasure claim.
+        ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                (retained + scratch) as u64,
+            ),
+            (
+                ResourceClass::ParsingOrCpuWork,
+                (3 * transcript + retained + scratch) as u64,
+            ),
+            (
+                ResourceClass::OpaqueDependencyResidual,
+                3 * (1 + 9 * 4) + 37 + 7,
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn configure_carrier_topology(state: &NetworkState, hub: &str) {
+        let mode = crate::config::TopologyMode::Star {
+            hub: hub.to_owned(),
+        };
+        *state.topology_impl.write() = crate::topology::from_mode(&mode);
+        state.config.write().topology = mode;
+    }
+
+    fn admit_carrier(state: &NetworkState, carrier: &PeerOwnerToken) -> Result<()> {
+        state
+            .peers
+            .with_admitted_current(
+                carrier,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+                |_| (),
+            )
+            .ok_or_else(|| Error::Network("actual carrier promotion/admission refused".into()))
+    }
+
+    struct PumpTerminalGate {
+        entered: AtomicBool,
+        opened: AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+
+    impl PumpTerminalGate {
+        fn claim() -> ResourceClaim {
+            fn tail_bytes<F: std::future::Future<Output = ()>>(
+                _: impl FnOnce(FundedArc<PumpTerminalGate>) -> F,
+            ) -> usize {
+                std::mem::size_of::<F>()
+            }
+            let bytes = std::mem::size_of::<Self>()
+                .checked_add(tail_bytes(hold_pump_terminal))
+                .unwrap();
+            ResourceClaim::try_from_entries([
+                // Gate backing plus the actual additional terminal future
+                // retained inside the existing spawned receiver task.
+                (ResourceClass::AccountedMemoryBytes, bytes as u64),
+                // FundedArc's dependency-private control/value metadata.
+                (ResourceClass::OpaqueDependencyResidual, 1),
+            ])
+            .unwrap()
+        }
+
+        async fn hold(&self) {
+            self.entered.store(true, Ordering::Release);
+            self.changed.notify_waiters();
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.opened.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        async fn wait_entered(&self) {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn open(&self) {
+            self.opened.store(true, Ordering::Release);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn hold_pump_terminal(gate: FundedArc<PumpTerminalGate>) {
+        gate.hold().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opens an actual local carrier; run in the isolated native harness"]
+    async fn introduction_two_waiters_one_cancel_preserves_ticket_deadline_and_sticky_demand() {
+        let target_identity = crate::identity::Identity::ephemeral();
+        let target = target_identity.public_id();
+        let (state, signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-two-waiters",
+                None,
+                2,
+                Some(retained_plan(target)),
+                None,
+                Some(policy()),
+            );
+        let carrier_identity = crate::identity::Identity::ephemeral();
+        configure_carrier_topology(&state, carrier_identity.public_id());
+        let fixture =
+            super::super::insert_promoted_peer(&state, carrier_identity.public_id()).await;
+        let worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(carrier_identity.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&worker));
+        let (reply0, mut received0) = oneshot::channel();
+        let (reply1, mut received1) = oneshot::channel();
+        let (waiter0, cancel0) = state.connect_waiter_registration_for_test(target, 70, reply0);
+        let (waiter1, mut cancel1) = state.connect_waiter_registration_for_test(target, 71, reply1);
+        let shared = waiter1.shared.clone();
+        let observations = (|| -> Result<_> {
+            admit_carrier(&state, &carrier)?;
+            let remote = DeviceId::from_canonical_str(target)
+                .map_err(|_| Error::Network("valid fixture target required".into()))?;
+            let root = state.hub_introductions.as_ref().unwrap();
+            let admitted = root
+                .lock()
+                .begin_demand(&remote, &carrier, std::time::Instant::now())
+                .map_err(|_| Error::Network("real controller demand refused".into()))?;
+            if !state.register_connect_waiter(target, waiter0)
+                || !state.register_connect_waiter(target, waiter1)
+            {
+                return Err(Error::Network(
+                    "two genuine waiters must be admitted".into(),
+                ));
+            }
+            state.bind_introduction_waiters(target, admitted.ticket)?;
+            let original = root
+                .lock()
+                .lifetime(admitted.ticket, std::time::Instant::now());
+            let coalesced = root
+                .lock()
+                .begin_demand(&remote, &carrier, std::time::Instant::now())
+                .map_err(|_| Error::Network("coalesced demand refused".into()))?;
+            state.bind_introduction_waiters(target, coalesced.ticket)?;
+            state.add_sticky(target);
+            Ok((
+                admitted.ticket,
+                original,
+                coalesced.coalesced,
+                coalesced.ticket == admitted.ticket,
+            ))
+        })();
+        let first_was_waiting = matches!(
+            received0.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        drop(received0);
+        drop(cancel0);
+        let one_left = state.connect_waiter_count_for_test(target) == 1;
+        let canceled_only = first_was_waiting
+            && matches!(
+                received1.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            );
+        let followup: Result<_> = async {
+            let (ticket, original, _, _) = observations
+                .as_ref()
+                .map_err(|_| Error::Network("initial waiter setup refused".into()))?;
+            let root = state.hub_introductions.as_ref().unwrap();
+            let unchanged = root.lock().lifetime(*ticket, std::time::Instant::now()) == *original;
+            root.lock().failed(*ticket);
+            let remote = DeviceId::from_canonical_str(target)
+                .map_err(|_| Error::Network("valid successor target required".into()))?;
+            let successor = root
+                .lock()
+                .begin_demand(&remote, &carrier, std::time::Instant::now())
+                .map_err(|_| Error::Network("successor demand setup refused".into()))?;
+            let (reply2, mut received2) = oneshot::channel();
+            let (waiter2, mut cancel2) =
+                state.connect_waiter_registration_for_test(target, 72, reply2);
+            let shared2 = waiter2.shared.clone();
+            let registered2 = state.register_connect_waiter(target, waiter2);
+            let bound2 = state
+                .bind_introduction_waiters(target, successor.ticket)
+                .is_ok();
+            let successor_lifetime = root
+                .lock()
+                .lifetime(successor.ticket, std::time::Instant::now());
+            // Legacy label cleanup and the OLD terminal must not resolve the
+            // newly bound caller, nor rebind the earlier surviving caller.
+            state.resolve_connect_waiters(target, Some("stale label terminal"));
+            state
+                .settle_introduction_wait(super::super::command::IntroductionWaitTransfer {
+                    shared: shared.clone(),
+                })
+                .await;
+            let ended = matches!(received1.try_recv(), Ok(Err(_)))
+                && *shared.outcome.lock() == ChannelDemandOutcome::NoOwnedAttemptRefused;
+            let preserved = registered2
+                && bound2
+                && successor.ticket != *ticket
+                && shared
+                    .introduction
+                    .lock()
+                    .is_some_and(|binding| binding.ticket == *ticket)
+                && shared2
+                    .introduction
+                    .lock()
+                    .is_some_and(|binding| binding.ticket == successor.ticket)
+                && matches!(
+                    received2.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                )
+                && root
+                    .lock()
+                    .lifetime(successor.ticket, std::time::Instant::now())
+                    == successor_lifetime;
+            root.lock().failed(successor.ticket);
+            state
+                .settle_introduction_wait(super::super::command::IntroductionWaitTransfer {
+                    shared: shared2.clone(),
+                })
+                .await;
+            let successor_ended = matches!(received2.try_recv(), Ok(Err(_)));
+            cancel2.armed = false;
+            drop((received2, cancel2, shared2));
+            cancel1.armed = false;
+            Ok((
+                unchanged,
+                ended,
+                state.is_sticky(target),
+                preserved && successor_ended,
+            ))
+        }
+        .await;
+        drop((received1, cancel1, shared));
+        let close = worker.retire_and_close().await;
+        state.shutdown().await;
+        drop((carrier, worker, fixture, commands, signals, state));
+        let (ticket, original, coalesced, same_ticket) =
+            observations.expect("fixture body admitted");
+        let (same_deadline, terminal_outcome, sticky_survives, stale_preserved) =
+            followup.expect("successor waiter body admitted");
+        let _ = ticket;
+        assert!(matches!(original, IntroductionLifetime::Live { .. }));
+        assert!(coalesced && same_ticket && one_left && canceled_only && same_deadline);
+        assert!(terminal_outcome && sticky_survives && stale_preserved && close.is_ok());
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(provider.in_use(), provider.retained_after_failed_cleanup());
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+    }
+
+    fn prepare_native_settlement_fixture(
+        state: &Arc<NetworkState>,
+        remote: &crate::identity::Identity,
+        hub: &crate::identity::Identity,
+        carrier: &PeerOwnerToken,
+        worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+        registration: ConnectWaiterRegistration,
+        authenticated: bool,
+    ) -> Result<(
+        PeerOwnerToken,
+        super::super::hub_introduction::IntroductionTicket,
+        [u8; 32],
+        u64,
+    )> {
+        use super::super::hub_introduction::IntroductionAction;
+        use crate::protocol::{HubIntroductionBody, HubIntroductionEnvelope};
+        admit_carrier(state, carrier)?;
+        let _wire_work = state.introduction_work()?;
+        let local_id = DeviceId::from_canonical_str(state.identity.public_id()).unwrap();
+        let remote_id = DeviceId::from_canonical_str(remote.public_id()).unwrap();
+        let hub_id = DeviceId::from_canonical_str(hub.public_id()).unwrap();
+        let root = state.hub_introductions.as_ref().unwrap();
+        let now = std::time::Instant::now();
+        let ticket = root
+            .lock()
+            .begin_demand(&remote_id, carrier, now)
+            .map_err(|_| Error::Network("controller demand setup refused".into()))?
+            .ticket;
+        let coordinates = root.lock().coordinates(ticket).unwrap();
+        let request = HubIntroductionEnvelope::new(
+            state.mesh_context_id(),
+            local_id.clone(),
+            remote_id.clone(),
+            coordinates.introduction_id,
+            0,
+            None,
+            4,
+            HubIntroductionBody::Request,
+            state.identity.signing_key(),
+        )
+        .map_err(|_| Error::Network("signed request setup refused".into()))?;
+        root.lock()
+            .observe_outbound(ticket, None, &request, now)
+            .map_err(|_| Error::Network("actual request observation refused".into()))?;
+        let challenge = crate::protocol::hub_introduction::IntroductionChallenge {
+            request_hash: request.request_digest().unwrap(),
+            responder_challenge: [0x53; 32],
+        };
+        drop(request); // one externally retained wire owner, not two
+        let mut accept = HubIntroductionEnvelope::new(
+            state.mesh_context_id(),
+            remote_id.clone(),
+            local_id,
+            coordinates.introduction_id,
+            0,
+            Some(challenge),
+            4,
+            HubIntroductionBody::Accept,
+            remote.signing_key(),
+        )
+        .map_err(|_| Error::Network("signed Accept setup refused".into()))?;
+        accept
+            .append_hop(hub_id, hub.signing_key())
+            .map_err(|_| Error::Network("actual Hub hop setup refused".into()))?;
+        if !matches!(super::super::receive_current_hub_introduction(
+            state, root, carrier, &accept, None),
+            Some(IntroductionAction::BeginOffer(current)) if current == ticket)
+        {
+            return Err(Error::Network(
+                "real challenge/Accept controller path refused".into(),
+            ));
+        }
+        let backing = state.reserve_introduction_placeholder(remote.public_id())?;
+        let peer = Arc::new(super::super::connection::PeerConnection::new_introduction(
+            remote.public_id().to_owned(),
+            ticket.attempt(),
+            backing,
+        ));
+        if !peer.bind_initial_introduction(ticket) {
+            return Err(Error::Network(
+                "original full ticket binding refused".into(),
+            ));
+        }
+        let owner = state
+            .peers
+            .install_unpromoted_if_absent(Arc::clone(&peer))
+            .ok_or_else(|| Error::Network("fresh original installation refused".into()))?;
+        root.lock()
+            .bind_native_owner(ticket, &owner)
+            .map_err(|_| Error::Network("original native binding refused".into()))?;
+        if state.peers.with_current(&owner, |peer| {
+            peer.attach_introduction_worker(Arc::clone(worker), Some(ticket))
+        }) != Some(true)
+        {
+            return Err(Error::Network("original W0 attach refused".into()));
+        }
+        let owner = owner.for_worker(Arc::clone(worker));
+        state
+            .reserve_demand_link()?
+            .bind(owner.clone(), ticket, now)?;
+        let handoff = match worker.confirm_data_channel_open() {
+            crate::transport::DataChannelOpenOwnership::Connected(handoff) => handoff,
+            _ => return Err(Error::Network("real connected handoff refused".into())),
+        };
+        if authenticated {
+            // One real handoff, one actual task, and its issued capability.
+            // The channel binding and peer proof are generated locally by
+            // this fixture: this is NOT a remote/native auth qualification.
+            let binding = crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
+                AUTH_LOCAL_BINDING,
+                AUTH_REMOTE_BINDING,
+            )
+            .ok_or_else(|| Error::Network("fixture binding missing".into()))?;
+            let context = crate::endpoint_auth::EndpointAuthContext::new(
+                &state.mesh_context_id().base32(),
+                state.identity.public_id(),
+                remote.public_id(),
+                binding,
+            )
+            .map_err(|_| Error::Network("fixture context refused".into()))?;
+            let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+                context,
+                handoff
+                    .into_generic()
+                    .ok_or_else(|| Error::Network("connected handoff became stale".into()))?,
+                crate::endpoint_auth::LocalIdentitySigner::for_identity(Arc::clone(
+                    &state.identity,
+                )),
+            ));
+            if !peer.install_endpoint_auth(Arc::clone(&task)) {
+                return Err(Error::Network("original auth task install refused".into()));
+            }
+            let contribution = crate::endpoint_auth::PeerContribution::from_wire(
+                crate::endpoint_auth::LocalContribution::generate().as_str(),
+            )
+            .map_err(|_| Error::Network("fixture contribution refused".into()))?;
+            task.accept_peer_hello(contribution.clone())
+                .map_err(|_| Error::Network("original task Hello refused".into()))?;
+            let proof = crate::endpoint_auth::peer_proof_for_test(
+                &task,
+                &contribution,
+                remote.signing_key(),
+            );
+            let capability = task
+                .accept_peer_proof(&proof)
+                .map_err(|_| Error::Network("original task proof refused".into()))?
+                .into_promoted()
+                .ok_or_else(|| Error::Network("original task did not issue a capability".into()))?;
+            if !peer.install_authenticated_channel(&task, capability) {
+                return Err(Error::Network(
+                    "same task-issued capability install refused".into(),
+                ));
+            }
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = super::super::connection::PeerStatus::PendingApproval;
+        } else {
+            let task = Arc::new(crate::endpoint_auth::task_for_test(
+                handoff
+                    .into_generic()
+                    .ok_or_else(|| Error::Network("connected handoff became stale".into()))?,
+            ));
+            if !peer.install_endpoint_auth(task) {
+                return Err(Error::Network(
+                    "pending exact auth task was not installed".into(),
+                ));
+            }
+        }
+        if !state.register_connect_waiter(remote.public_id(), registration) {
+            return Err(Error::Network("genuine waiter admission refused".into()));
+        }
+        state.bind_introduction_waiters(remote.public_id(), ticket)?;
+        let key = remote_id.as_bytes();
+        let generation = state
+            .demand_links
+            .as_ref()
+            .unwrap()
+            .lock()
+            .links
+            .get(&key)
+            .unwrap()
+            .generation;
+        Ok((owner, ticket, key, generation))
+    }
+
+    /// A fresh, independently signed transaction, without installing a peer.
+    /// The caller must drive BeginIntroducedPeer through the actual actor.
+    fn prepare_reuse_ticket(
+        state: &Arc<NetworkState>,
+        remote: &crate::identity::Identity,
+        hub: &crate::identity::Identity,
+        carrier: &PeerOwnerToken,
+    ) -> Result<super::super::hub_introduction::IntroductionTicket> {
+        use super::super::hub_introduction::IntroductionAction;
+        use crate::protocol::{HubIntroductionBody, HubIntroductionEnvelope};
+        admit_carrier(state, carrier)?;
+        let _wire_work = state.introduction_work()?;
+        let local = DeviceId::from_canonical_str(state.identity.public_id()).unwrap();
+        let remote_id = DeviceId::from_canonical_str(remote.public_id()).unwrap();
+        let hub_id = DeviceId::from_canonical_str(hub.public_id()).unwrap();
+        let root = state.hub_introductions.as_ref().unwrap();
+        let now = std::time::Instant::now();
+        let ticket = root
+            .lock()
+            .begin_demand(&remote_id, carrier, now)
+            .map_err(|error| Error::Network(format!("fresh demand setup: {error}")))?
+            .ticket;
+        let coordinates = root.lock().coordinates(ticket).unwrap();
+        let request = HubIntroductionEnvelope::new(
+            state.mesh_context_id(),
+            local.clone(),
+            remote_id.clone(),
+            coordinates.introduction_id,
+            0,
+            None,
+            4,
+            HubIntroductionBody::Request,
+            state.identity.signing_key(),
+        )
+        .map_err(|error| Error::Network(format!("fresh signed Request: {error}")))?;
+        root.lock()
+            .observe_outbound(ticket, None, &request, now)
+            .map_err(|error| Error::Network(format!("fresh Request observation: {error}")))?;
+        let challenge = crate::protocol::hub_introduction::IntroductionChallenge {
+            request_hash: request.request_digest().unwrap(),
+            responder_challenge: [0x74; 32],
+        };
+        drop(request); // same single external wire-owner envelope as W0 setup
+        let mut accept = HubIntroductionEnvelope::new(
+            state.mesh_context_id(),
+            remote_id,
+            local,
+            coordinates.introduction_id,
+            0,
+            Some(challenge),
+            4,
+            HubIntroductionBody::Accept,
+            remote.signing_key(),
+        )
+        .map_err(|error| Error::Network(format!("fresh signed Accept: {error}")))?;
+        accept
+            .append_hop(hub_id, hub.signing_key())
+            .map_err(|error| Error::Network(format!("fresh signed Hub hop: {error}")))?;
+        if !matches!(super::super::receive_current_hub_introduction(
+            state, root, carrier, &accept, None),
+            Some(IntroductionAction::BeginOffer(current)) if current == ticket)
+        {
+            return Err(Error::Network(
+                "fresh challenge/Accept setup refused".into(),
+            ));
+        }
+        Ok(ticket)
+    }
+
+    #[derive(Debug)]
+    struct ProtectedReuseObservations {
+        sticky: bool,
+        pinned: bool,
+        registered: bool,
+        claimed: bool,
+        native_pending: bool,
+        native_entered: bool,
+        native_custody: bool,
+        pump_entered: bool,
+        pump_custody: bool,
+        terminal_refused: bool,
+        old_joined: bool,
+        tokens_released: bool,
+        old_task_released: bool,
+        installation_retained: bool,
+        old_truth_cleared: bool,
+        ticket_distinct: bool,
+        fresh_preflight: bool,
+        actor_drained: bool,
+        new_worker: bool,
+        new_binding: bool,
+        new_truth: bool,
+        fresh_lifetime: IntroductionLifetime,
+    }
+
+    #[tokio::test]
+    #[ignore = "protected genuine-capability Deny followed by fresh signed BeginIntroducedPeer; isolated native harness"]
+    async fn protected_authenticated_introduction_reuses_retained_installation() {
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
+        // Carrier, retained original W0 wrapper, and actual fresh W1. The
+        // existing three-connector planner accounts these concrete holders.
+        // Two placeholder leases overlap: the retained installation and the
+        // newly reserved replacement backing. Each is separately normalized.
+        let placeholder =
+            PeerRegistry::introduction_placeholder_claim(remote.public_id().len()).unwrap();
+        let retained = [
+            retained_plan(remote.public_id()),
+            charge(PumpTerminalGate::claim()),
+            charge(authenticated_fixture_claim()),
+            charge(placeholder),
+            charge(placeholder),
+        ]
+        .into_iter()
+        .try_fold(ResourceClaim::ZERO, |sum, next| sum.checked_add(next))
+        .unwrap();
+        let (state, mut signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-protected-reuse",
+                None,
+                3,
+                Some(retained),
+                None,
+                Some(policy()),
+            );
+        let auth_work = state
+            .local_resources
+            .acquire(authenticated_fixture_claim())
+            .unwrap();
+        let terminal_gate = FundedArc::new(
+            PumpTerminalGate {
+                entered: AtomicBool::new(false),
+                opened: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
+            },
+            state
+                .local_resources
+                .acquire(PumpTerminalGate::claim())
+                .unwrap(),
+        )
+        .unwrap();
+        let fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        configure_carrier_topology(&state, hub.public_id());
+        let hub_worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&hub_worker));
+        let runtime = super::super::signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state.local_application_resource_scope().unwrap(),
+        );
+        state.publish_signaling_runtime(&runtime);
+        let ingress = super::super::signaling_ingress::SignalingRuntime::attach(
+            &runtime,
+            super::super::signaling_ingress::SignalingCarrier::Nostr,
+        );
+        let (reply, mut received) = oneshot::channel();
+        let (registration, mut cancellation) =
+            state.connect_waiter_registration_for_test(remote.public_id(), 90, reply);
+        let shared = registration.shared.clone();
+        let mut original = None;
+        let mut native_gate = None;
+        let mut successor = None;
+        let observations = async {
+            let (worker, events) = state.transport.open_connector_peer(
+                crate::transport::Role::Answerer, &[], &[], state.peer_connection_resource_scope(),
+            ).await.map_err(|error| Error::Network(format!("W0 native setup: {error}")))?;
+            let worker = Arc::new(worker);
+            original = Some(Arc::clone(&worker));
+            native_gate = Some(worker.install_native_close_gate_for_test());
+            let gate = native_gate.as_ref().unwrap();
+            let (owner, ticket, key, _) = prepare_native_settlement_fixture(
+                &state, &remote, &hub, &carrier, &worker, registration, true,
+            )?;
+            let task = owner.connection().endpoint_auth_task()
+                .ok_or_else(|| Error::Network("genuine task setup missing".into()))?;
+            let task_weak = Arc::downgrade(&task);
+            drop(task);
+            state.add_sticky(remote.public_id());
+            let sticky = state.is_sticky(remote.public_id());
+            let pinned = state.config.read().pinned_peers.iter().any(|id| id == remote.public_id());
+            if !state.begin_peer_event_pump_registration() {
+                drop(events);
+                return Err(Error::Network("original pump registration setup refused".into()));
+            }
+            let pump = super::super::spawn_peer_event_pump_with_terminal(
+                Arc::clone(&state), remote.public_id().to_owned(), Arc::clone(&worker),
+                events, Some(owner.clone()), hold_pump_terminal(terminal_gate.clone()),
+            );
+            if let Err(pump) = state.finish_introduced_pump_registration(&owner, pump) {
+                gate.open();
+                terminal_gate.open();
+                let _ = worker.retire_and_close().await;
+                state.finish_peer_event_pump_registration(pump).await;
+                return Err(Error::Network("exact pump transfer setup refused".into()));
+            }
+            let registered = state.demand_links.as_ref().unwrap().lock().links.get(&key)
+                .is_some_and(|link| link.pump_registered && link.pump.is_some());
+            let attempt = ticket.attempt();
+            let candidate = myownmesh_signaling::SignalingMessage::Candidate {
+                peer_id: remote.public_id().to_owned(), offer_id: attempt.clone(),
+                candidate: "candidate:reuse 1 udp 2113937151 192.0.2.1 5000 typ host".into(),
+                sdp_mid: Some("0".into()), sdp_mline_index: Some(0), username_fragment: None,
+            };
+            if !ingress.deliver(ingress.directed(remote.public_id().to_owned(), candidate)) {
+                return Err(Error::Network("real Candidate ingress setup refused".into()));
+            }
+            let token = signals.try_recv().and_then(|delivery| delivery.value().dedup_token())
+                .ok_or_else(|| Error::Network("real Candidate token setup missing".into()))?;
+            let weak = token.weak();
+            let retained_token = state.peers.with_current(&owner, |peer| {
+                if peer.holds_promoted_session() || peer.attempt() != attempt
+                    || !peer.current_worker().is_some_and(|current| Arc::ptr_eq(&current, &worker)) {
+                    return false;
+                }
+                peer.retain_current_dedup(token);
+                true
+            }) == Some(true) && weak.strong_count() == 1;
+            if !retained_token {
+                return Err(Error::Network("exact unpromoted token insertion setup refused".into()));
+            }
+            super::super::handshake::on_deny(
+                &state, &owner, crate::protocol::DenyMessage { reason: None },
+            ).await;
+            let claimed = state.demand_links.as_ref().unwrap().lock().links.get(&key)
+                .is_some_and(|link| link.introduction == ticket
+                    && link.detached.as_ref().is_some_and(|detached|
+                        detached.authenticated_custody_for_test()
+                        && detached.terminal == Some(super::super::connection::IntroductionTerminalDisposition::Denied)));
+            let receiver = state.take_connection_cmd_rx()
+                .ok_or_else(|| Error::Network("actual connection actor receiver missing".into()))?;
+            let actor = super::super::supervisor::run_connection_commands(Arc::clone(&state), receiver);
+            tokio::pin!(actor);
+            let native_pending = futures::poll!(&mut actor).is_pending();
+            let native_entered = tokio::time::timeout(
+                std::time::Duration::from_secs(10), gate.wait_for_entry(),
+            ).await.is_ok();
+            let native_custody = weak.strong_count() == 1 && task_weak.strong_count() > 0
+                && runtime.remembers_attempt_for_test(&attempt);
+            gate.open();
+            let pump_entered = tokio::select! {
+                _ = &mut actor => false,
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), terminal_gate.wait_entered()) => result.is_ok(),
+            };
+            let native_closed = worker.retire_and_close().await.is_ok();
+            let pump_custody = pump_entered && native_closed && weak.strong_count() == 1
+                && task_weak.strong_count() > 0
+                && state.demand_links.as_ref().unwrap().lock().links.get(&key)
+                    .is_some_and(|link| link.detached.is_some() && link.pump_joined.is_none());
+            terminal_gate.open();
+            if !native_pending || !native_entered || !pump_entered {
+                return Err(Error::Network(format!("W0 gate setup failed: pending={native_pending} native={native_entered} pump={pump_entered}")));
+            }
+            let reply = tokio::select! {
+                reply = &mut received => reply,
+                _ = &mut actor => return Err(Error::Network("actor ended before Deny completion".into())),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) =>
+                    return Err(Error::Network("Deny settlement did not resolve its waiter".into())),
+            };
+            let terminal_refused = matches!(reply, Ok(Err(_)))
+                && *shared.outcome.lock() == ChannelDemandOutcome::TerminalRefused;
+            let old_joined = !state.demand_links.as_ref().unwrap().lock().links.contains_key(&key)
+                && gate.entries() == 1;
+            let tokens_released = weak.strong_count() == 0 && !runtime.remembers_attempt_for_test(&attempt);
+            let old_task_released = task_weak.strong_count() == 0;
+            let mut old_truth_cleared = false;
+            let installation_retained = state.peers.with_introduction_installation(&owner, |peer| {
+                let empty = !peer.has_current_worker() && !peer.has_authenticated_channel()
+                    && peer.endpoint_auth_task().is_none() && !peer.holds_promoted_session();
+                let data = peer.state.read();
+                old_truth_cleared = !data.authenticated && !data.local_approve_sent
+                    && !data.remote_approve_seen && !data.data_channel_open
+                    && data.hello_retention.is_none()
+                    && data.verification_code_sent.is_none() && data.verification_code_received.is_none()
+                    && data.session_started_at.is_none() && data.handshake_started_at.is_none()
+                    && empty
+                    && matches!(data.status, super::super::connection::PeerStatus::Sighted
+                        | super::super::connection::PeerStatus::Offline);
+                Some(false)
+            });
+            let fresh = prepare_reuse_ticket(&state, &remote, &hub, &carrier)?;
+            let root = state.hub_introductions.as_ref().unwrap();
+            let ticket_distinct = fresh != ticket && fresh.attempt() != attempt;
+            // Probe the EXACT pre-adoption claims together after W0 joins.
+            // A refusal here is setup/funding failure, never the reuse red.
+            {
+                let work = state.introduction_work().map_err(|error|
+                    Error::Network(format!("fresh work preflight: {error}")))?;
+                let slot = state.reserve_demand_link().map_err(|error|
+                    Error::Network(format!("fresh demand-slot preflight: {error}")))?;
+                let backing = state.reserve_introduction_placeholder(remote.public_id()).map_err(|error|
+                    Error::Network(format!("fresh placeholder preflight: {error}")))?;
+                let target = DeviceId::from_canonical_str(remote.public_id()).unwrap();
+                if !state.peers.routed_origin_policy_admits(&target)
+                    || !root.lock().is_current(fresh, std::time::Instant::now()) {
+                    return Err(Error::Network("fresh canonical/lifetime preflight refused".into()));
+                }
+                drop((backing, slot, work));
+            }
+            state.connection_cmd_tx.send(NetworkCmd::BeginIntroducedPeer {
+                device_id: remote.public_id().to_owned(), ticket: fresh,
+            }).map_err(|error| Error::Network(format!("fresh Begin command admission: {}", error.into_admission_error())))?;
+            state.connection_cmd_tx.close();
+            actor.await; // both actual commands finished, not a direct adopt call
+            let mut new_worker = false;
+            let mut new_truth = false;
+            let same_installation = state.peers.with_introduction_installation(&owner, |peer| {
+                successor = peer.current_worker();
+                new_worker = successor.as_ref().is_some_and(|w1|
+                    !Arc::ptr_eq(w1, &worker) && w1.live_connector_incarnation().is_some())
+                    && peer.attempt() == fresh.attempt();
+                let unauthenticated = !peer.has_authenticated_channel()
+                    && peer.endpoint_auth_task().is_none() && !peer.holds_promoted_session();
+                let data = peer.state.read();
+                new_truth = !data.authenticated && !data.local_approve_sent && !data.remote_approve_seen
+                    && !data.data_channel_open && unauthenticated
+                    && matches!(data.status, super::super::connection::PeerStatus::Sighted
+                        | super::super::connection::PeerStatus::Handshaking);
+                Some(false)
+            });
+            let new_binding = same_installation && state.demand_links.as_ref().unwrap().lock().links.get(&key)
+                .is_some_and(|link| link.introduction == fresh && link.pump_registered
+                    && link.owner.worker().zip(successor.as_ref())
+                        .is_some_and(|(bound, w1)| Arc::ptr_eq(bound, w1)));
+            Ok(ProtectedReuseObservations {
+                sticky: sticky && state.is_sticky(remote.public_id()),
+                pinned: pinned && state.config.read().pinned_peers.iter().any(|id| id == remote.public_id()),
+                registered, claimed, native_pending, native_entered, native_custody,
+                pump_entered, pump_custody, terminal_refused, old_joined, tokens_released,
+                old_task_released, installation_retained, old_truth_cleared, ticket_distinct,
+                fresh_preflight: true, actor_drained: true, new_worker, new_binding, new_truth,
+                fresh_lifetime: root.lock().lifetime(fresh, std::time::Instant::now()),
+            })
+        }.await;
+        // No failed observation can bypass original or fresh native ownership.
+        // The actor future above has ended/dropped before shutdown resumes its
+        // exact record-owned joins. Keep all event receivers and roots alive.
+        if let Some(gate) = native_gate.as_ref() {
+            gate.open();
+        }
+        terminal_gate.open();
+        state.connection_cmd_tx.close();
+        let original_close = if let Some(worker) = original.as_ref() {
+            worker.retire_and_close().await.is_ok()
+        } else {
+            true
+        };
+        let successor_close = if let Some(worker) = successor.as_ref() {
+            worker.retire_and_close().await.is_ok()
+        } else {
+            true
+        };
+        state.shutdown().await;
+        let carrier_close = hub_worker.retire_and_close().await;
+        cancellation.armed = false;
+        drop((
+            received,
+            cancellation,
+            shared,
+            ingress,
+            runtime,
+            commands,
+            signals,
+            carrier,
+            hub_worker,
+            fixture,
+            original,
+            successor,
+            native_gate,
+            terminal_gate,
+        ));
+        drop(state);
+        drop(auth_work);
+        assert!(original_close && successor_close && carrier_close.is_ok(),
+            "owned cleanup: original={original_close} successor={successor_close} carrier={carrier_close:?}; setup_error={:?}", observations.as_ref().err());
+        assert_eq!(
+            provider.active_reservations(),
+            0,
+            "setup_error={:?}",
+            observations.as_ref().err()
+        );
+        assert_eq!(
+            provider.active_scopes(),
+            0,
+            "setup_error={:?}",
+            observations.as_ref().err()
+        );
+        assert_eq!(
+            provider.in_use(),
+            ResourceClaim::ZERO,
+            "setup_error={:?}",
+            observations.as_ref().err()
+        );
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO,
+            "setup_error={:?}",
+            observations.as_ref().err()
+        );
+        let observed = observations
+            .expect("protected reuse setup/actor/funding failed, not the target reuse assertion");
+        assert!(
+            observed.sticky
+                && observed.pinned
+                && observed.registered
+                && observed.claimed
+                && observed.native_pending
+                && observed.native_entered
+                && observed.native_custody
+                && observed.pump_entered
+                && observed.pump_custody
+                && observed.terminal_refused
+                && observed.old_joined
+                && observed.tokens_released
+                && observed.old_task_released
+                && observed.installation_retained
+                && observed.ticket_distinct
+                && observed.fresh_preflight
+                && observed.actor_drained,
+            "protected W0/fresh transaction prerequisites: {observed:?}"
+        );
+        assert!(observed.old_truth_cleared && observed.new_worker && observed.new_binding && observed.new_truth
+            && matches!(observed.fresh_lifetime, IntroductionLifetime::Live { .. }),
+            "fresh BeginIntroducedPeer must reuse the protected SAME installation without old authentication: {observed:?}");
+    }
+
+    /// Boundary companion: the unchanged protected-reuse test drives the
+    /// actual Begin actor. Here the adoption/attachment interval is deliberately
+    /// held open to run the REAL old constructor Drop against the new ticket.
+    #[tokio::test]
+    #[ignore = "real joined W0, funded readoption, stale constructor and exact W1 attachment"]
+    async fn stale_introduction_constructor_preserves_readopted_ticket_and_worker() {
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
+        let placeholder =
+            PeerRegistry::introduction_placeholder_claim(remote.public_id().len()).unwrap();
+        let retained = [
+            retained_plan(remote.public_id()),
+            charge(authenticated_fixture_claim()),
+            charge(placeholder),
+            charge(placeholder),
+        ]
+        .into_iter()
+        .try_fold(ResourceClaim::ZERO, |sum, next| sum.checked_add(next))
+        .unwrap();
+        let (state, signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-stale-constructor",
+                None,
+                3,
+                Some(retained),
+                None,
+                Some(policy()),
+            );
+        let auth_work = state
+            .local_resources
+            .acquire(authenticated_fixture_claim())
+            .unwrap();
+        let fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        configure_carrier_topology(&state, hub.public_id());
+        let hub_worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&hub_worker));
+        let (reply, mut received) = oneshot::channel();
+        let (registration, mut cancellation) =
+            state.connect_waiter_registration_for_test(remote.public_id(), 91, reply);
+        let shared = registration.shared.clone();
+        let mut original = None;
+        let mut successor = None;
+        let observations: Result<_> = async {
+            let (w0, events0) = state
+                .transport
+                .open_connector_peer(
+                    crate::transport::Role::Answerer,
+                    &[],
+                    &[],
+                    state.peer_connection_resource_scope(),
+                )
+                .await?;
+            let w0 = Arc::new(w0);
+            original = Some(Arc::clone(&w0));
+            let (owner0, ticket0, key, generation0) = prepare_native_settlement_fixture(
+                &state,
+                &remote,
+                &hub,
+                &carrier,
+                &w0,
+                registration,
+                true,
+            )?;
+            let unstarted_owner = state
+                .peers
+                .owner(remote.public_id())
+                .ok_or_else(|| Error::Network("original installation missing".into()))?;
+            state.add_sticky(remote.public_id());
+            super::super::spawn_registered_peer_event_pump(
+                &state,
+                Arc::clone(&state),
+                remote.public_id().to_owned(),
+                Arc::clone(&w0),
+                events0,
+                Some(owner0.clone()),
+            )
+            .await;
+            super::super::handshake::on_deny(
+                &state,
+                &owner0,
+                crate::protocol::DenyMessage { reason: None },
+            )
+            .await;
+            state.connection_cmd_tx.close();
+            let receiver = state
+                .take_connection_cmd_rx()
+                .ok_or_else(|| Error::Network("actual actor receiver missing".into()))?;
+            super::super::supervisor::run_connection_commands(Arc::clone(&state), receiver).await;
+            let joined = matches!(received.try_recv(), Ok(Err(_)))
+                && *shared.outcome.lock() == ChannelDemandOutcome::TerminalRefused
+                && state
+                    .demand_links
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .links
+                    .get(&key)
+                    .is_none();
+            let old_constructor_retired = !owner0.connection().introduction_ticket_matches(ticket0);
+            let ticket1 = prepare_reuse_ticket(&state, &remote, &hub, &carrier)?;
+            let incoming = state.reserve_introduction_placeholder(remote.public_id())?;
+            let with_two_backings = provider.in_use();
+            let (displaced, old_backing) = state
+                .peers
+                .with_current(&unstarted_owner, |peer| {
+                    peer.adopt_empty_introduction(ticket1, incoming)
+                })
+                .ok_or_else(|| Error::Network("same installation adoption fence refused".into()))?
+                .map_err(|_| Error::Network("joined storage readoption refused".into()))?;
+            let old_charge = old_backing.as_ref().map(|lease| lease.claim());
+            let two_backings_held = old_backing.is_some() && provider.in_use() == with_two_backings;
+            if let Some(displaced) = displaced {
+                super::super::forget_displacement(&state, displaced);
+            }
+            drop(old_backing);
+            let released = with_two_backings.checked_sub(provider.in_use());
+            let expected_release = old_charge
+                .map(|claim| FiniteResourceProvider::reservation_planning_charge(claim).unwrap());
+            let exchanged = released.ok() == expected_release && expected_release.is_some();
+            let root = state.hub_introductions.as_ref().unwrap();
+            let lifetime1 = root.lock().lifetime(ticket1, std::time::Instant::now());
+            {
+                let permit = state
+                    .try_admit_shutdown_mutation()
+                    .ok_or_else(|| Error::Network("constructor control permit refused".into()))?;
+                drop(super::super::IntroductionConstruction {
+                    state: &state,
+                    permit: &permit,
+                    owner: unstarted_owner.clone(),
+                    ticket: ticket0,
+                    armed: true,
+                });
+            }
+            let stale_drop_refused = state.peers.with_current(&unstarted_owner, |peer| {
+                peer.introduction_ticket_matches(ticket1)
+                    && !peer.introduction_ticket_matches(ticket0)
+            }) == Some(true)
+                && root.lock().lifetime(ticket1, std::time::Instant::now()) == lifetime1;
+            root.lock()
+                .bind_native_owner(ticket1, &unstarted_owner)
+                .map_err(|_| Error::Network("fresh native binding refused".into()))?;
+            let (w1, events1) = state
+                .transport
+                .open_connector_peer(
+                    crate::transport::Role::Answerer,
+                    &[],
+                    &[],
+                    state.peer_connection_resource_scope(),
+                )
+                .await?;
+            let w1 = Arc::new(w1);
+            successor = Some(Arc::clone(&w1));
+            let stale_attach_refused = state.peers.with_current(&unstarted_owner, |peer| {
+                !peer.attach_introduction_worker(Arc::clone(&w1), Some(ticket0))
+            }) == Some(true);
+            let attached = state.peers.with_current(&unstarted_owner, |peer| {
+                peer.attach_introduction_worker(Arc::clone(&w1), Some(ticket1))
+            }) == Some(true);
+            let owner1 = unstarted_owner.for_worker(Arc::clone(&w1));
+            state.reserve_demand_link()?.bind(
+                owner1.clone(),
+                ticket1,
+                std::time::Instant::now(),
+            )?;
+            super::super::spawn_registered_peer_event_pump(
+                &state,
+                Arc::clone(&state),
+                remote.public_id().to_owned(),
+                Arc::clone(&w1),
+                events1,
+                Some(owner1.clone()),
+            )
+            .await;
+            state
+                .settle_failed_introduction(key, ticket0, generation0)
+                .await;
+            let preserved = state.peers.with_current(&owner1, |peer| {
+                peer.introduction_ticket_matches(ticket1)
+                    && !peer.has_authenticated_channel()
+                    && !peer.state.read().authenticated
+            }) == Some(true)
+                && state
+                    .demand_links
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .links
+                    .get(&key)
+                    .is_some_and(|link| link.introduction == ticket1)
+                && state.is_sticky(remote.public_id())
+                && state
+                    .config
+                    .read()
+                    .pinned_peers
+                    .iter()
+                    .any(|id| id == remote.public_id());
+            Ok((
+                joined,
+                old_constructor_retired,
+                two_backings_held,
+                exchanged,
+                stale_drop_refused,
+                stale_attach_refused,
+                attached,
+                preserved,
+                ticket0 != ticket1,
+            ))
+        }
+        .await;
+        state.connection_cmd_tx.close();
+        let original_close = if let Some(worker) = original.as_ref() {
+            worker.retire_and_close().await.is_ok()
+        } else {
+            true
+        };
+        let successor_close = if let Some(worker) = successor.as_ref() {
+            worker.retire_and_close().await.is_ok()
+        } else {
+            true
+        };
+        state.shutdown().await;
+        let carrier_close = hub_worker.retire_and_close().await;
+        cancellation.armed = false;
+        drop((
+            received,
+            cancellation,
+            shared,
+            commands,
+            signals,
+            carrier,
+            hub_worker,
+            fixture,
+            original,
+            successor,
+        ));
+        drop(state);
+        drop(auth_work);
+        assert!(
+            original_close && successor_close && carrier_close.is_ok(),
+            "native cleanup; setup={:?}",
+            observations.as_ref().err()
+        );
+        assert_eq!(
+            provider.active_reservations(),
+            0,
+            "setup={:?}",
+            observations.as_ref().err()
+        );
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+        let (
+            joined,
+            retired,
+            held,
+            exchanged,
+            drop_refused,
+            attach_refused,
+            attached,
+            preserved,
+            distinct,
+        ) = observations.expect("actual joined-original and fresh-adoption setup");
+        assert!(joined && retired && held && exchanged && drop_refused && attach_refused && attached && preserved && distinct,
+            "joined={joined} retired={retired} held={held} exchanged={exchanged} drop_refused={drop_refused} attach_refused={attach_refused} attached={attached} preserved={preserved} distinct={distinct}");
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AuthenticatedTerminalControl {
+        Deny,
+        ControllerTerminalThenDeny,
+        RetiredClosed,
+        QueueRefused,
+        ReplacementAfterClaim,
+    }
+
+    async fn native_settlement_control(expired: bool, native_failure: bool, cancel_actor: bool) {
+        native_settlement_control_with_terminal(expired, native_failure, cancel_actor, None).await;
+    }
+
+    async fn native_settlement_control_with_terminal(
+        expired: bool,
+        native_failure: bool,
+        cancel_actor: bool,
+        explicit: Option<AuthenticatedTerminalControl>,
+    ) {
+        eprintln!("settlement-stage: entry expired={expired} native_failure={native_failure} cancel_actor={cancel_actor}");
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let (state, mut signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-native-settlement",
+                None,
+                // Only the successor discriminator owns a third simultaneous
+                // actual connector (carrier + original W0 + replacement W1).
+                if explicit == Some(AuthenticatedTerminalControl::ReplacementAfterClaim) {
+                    3
+                } else {
+                    2
+                },
+                Some(
+                    retained_plan(remote.public_id())
+                        .checked_add(
+                            FiniteResourceProvider::reservation_planning_charge(
+                                PumpTerminalGate::claim(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap()
+                        .checked_add(if explicit.is_some() {
+                            FiniteResourceProvider::reservation_planning_charge(
+                                authenticated_fixture_claim(),
+                            )
+                            .unwrap()
+                        } else {
+                            ResourceClaim::ZERO
+                        })
+                        .unwrap(),
+                ),
+                None,
+                Some(policy()),
+            );
+        let auth_work = if explicit.is_some() {
+            Some(
+                state
+                    .local_resources
+                    .acquire(authenticated_fixture_claim())
+                    .expect("named local exchange work is admitted before task construction"),
+            )
+        } else {
+            None
+        };
+        let terminal_gate = FundedArc::new(
+            PumpTerminalGate {
+                entered: AtomicBool::new(false),
+                opened: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
+            },
+            state
+                .local_resources
+                .acquire(PumpTerminalGate::claim())
+                .unwrap(),
+        )
+        .unwrap();
+        let fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        eprintln!("settlement-stage: carrier-ready");
+        configure_carrier_topology(&state, hub.public_id());
+        let hub_worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&hub_worker));
+        let (worker, events) = state
+            .transport
+            .open_connector_peer(
+                crate::transport::Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the named fixture profile admits the original W0");
+        eprintln!("settlement-stage: original-worker-ready");
+        let worker = Arc::new(worker);
+        let gate = worker.install_native_close_gate_for_test();
+        if native_failure {
+            gate.inject_close_failure();
+        }
+        let runtime = super::super::signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state.local_application_resource_scope().unwrap(),
+        );
+        state.publish_signaling_runtime(&runtime);
+        let ingress = super::super::signaling_ingress::SignalingRuntime::attach(
+            &runtime,
+            super::super::signaling_ingress::SignalingCarrier::Nostr,
+        );
+        let (reply, mut received) = oneshot::channel();
+        let (registration, mut cancellation) =
+            state.connect_waiter_registration_for_test(remote.public_id(), 80, reply);
+        let shared = registration.shared.clone();
+        let setup = prepare_native_settlement_fixture(
+            &state,
+            &remote,
+            &hub,
+            &carrier,
+            &worker,
+            registration,
+            explicit.is_some(),
+        );
+        match &setup {
+            Ok(_) => eprintln!("settlement-stage: setup-ok"),
+            Err(error) => eprintln!("settlement-stage: setup-error {error}"),
+        }
+        let mut observations = None;
+        let mut authenticated_observations = None;
+        let mut successor = None;
+        let mut successor_observed =
+            explicit != Some(AuthenticatedTerminalControl::ReplacementAfterClaim);
+        let mut registration_observed = !cancel_actor;
+        let mut pump_boundary_observed = cancel_actor;
+        let mut duplicate_observed = cancel_actor;
+        if let Ok((owner, ticket, key, generation)) = &setup {
+            if state.begin_peer_event_pump_registration() {
+                let (pending, before_handles) = state.peer_event_pump_counts_for_test();
+                let held_terminal = terminal_gate.clone();
+                let pump = super::super::spawn_peer_event_pump_with_terminal(
+                    Arc::clone(&state),
+                    remote.public_id().to_owned(),
+                    Arc::clone(&worker),
+                    events,
+                    Some(owner.clone()),
+                    hold_pump_terminal(held_terminal),
+                );
+                let transferred = match state.finish_introduced_pump_registration(owner, pump) {
+                    Ok(()) => true,
+                    Err(pump) => {
+                        state.finish_peer_event_pump_registration(pump).await;
+                        false
+                    }
+                };
+                let (after_pending, after_handles) = state.peer_event_pump_counts_for_test();
+                registration_observed = transferred
+                    && pending == 1
+                    && after_pending == 0
+                    && before_handles == after_handles
+                    && state
+                        .demand_links
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .links
+                        .get(key)
+                        .is_some_and(|link| link.pump_registered && link.pump.is_some());
+            } else {
+                super::super::spawn_registered_peer_event_pump(
+                    &state,
+                    Arc::clone(&state),
+                    remote.public_id().to_owned(),
+                    Arc::clone(&worker),
+                    events,
+                    Some(owner.clone()),
+                )
+                .await;
+            }
+            eprintln!(
+                "settlement-stage: pump-registration-complete observed={registration_observed}"
+            );
+            let attempt = ticket.attempt();
+            let candidate = myownmesh_signaling::SignalingMessage::Candidate {
+                peer_id: remote.public_id().to_owned(),
+                offer_id: attempt.clone(),
+                candidate: "candidate:settlement 1 udp 2113937151 192.0.2.1 5000 typ host".into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            };
+            let admitted =
+                ingress.deliver(ingress.directed(remote.public_id().to_owned(), candidate));
+            let token = if admitted {
+                signals
+                    .try_recv()
+                    .and_then(|delivery| delivery.value().dedup_token())
+            } else {
+                None
+            };
+            let weak = token.as_ref().map(|token| token.weak());
+            let retained = token.is_some_and(|token| {
+                state.peers.with_current(owner, |peer| {
+                    if peer.holds_promoted_session()
+                        || peer.attempt() != attempt
+                        || !peer
+                            .current_worker()
+                            .is_some_and(|current| Arc::ptr_eq(&current, &worker))
+                    {
+                        return false;
+                    }
+                    peer.retain_current_dedup(token);
+                    true
+                }) == Some(true)
+            }) && weak.as_ref().is_some_and(|weak| weak.strong_count() == 1);
+            let deadline = shared.introduction.lock().unwrap().deadline;
+            if expired {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                state.maintain_hub_introductions().await;
+            } else if explicit.is_none()
+                || explicit == Some(AuthenticatedTerminalControl::ControllerTerminalThenDeny)
+            {
+                state
+                    .hub_introductions
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .failed(*ticket);
+            }
+            if let Some(disposition) = explicit {
+                // A controller tombstone/deadline is not explicit terminal
+                // authority over a genuinely authenticated unpromoted W0.
+                let protected =
+                    !state.claim_introduction_retirement(owner, *key, *ticket, *generation, None)
+                        && state.peers.with_current(owner, |peer| {
+                            peer.has_authenticated_channel()
+                                && !peer.holds_promoted_session()
+                                && peer.state.read().status
+                                    == super::super::connection::PeerStatus::PendingApproval
+                                && worker.live_connector_incarnation().is_some()
+                        }) == Some(true);
+                if disposition == AuthenticatedTerminalControl::QueueRefused {
+                    // Real closed-mailbox refusal: accepted commands, if any,
+                    // still belong to the original receiver until teardown.
+                    state.connection_cmd_tx.close();
+                }
+                let retired_before = if disposition == AuthenticatedTerminalControl::RetiredClosed {
+                    let task_retired =
+                        owner.connection().endpoint_auth_task().is_some_and(|task| {
+                            task.retire();
+                            task.is_retired()
+                                && worker
+                                    .matches_connector_identity_for_retirement(task.incarnation())
+                                && !task.belongs_to(task.incarnation())
+                        });
+                    worker.retire();
+                    super::super::drop_peer_if_current(
+                        &state,
+                        owner,
+                        crate::events::DropReason::TransportError {
+                            message: "fixture original connector closed".into(),
+                        },
+                    )
+                    .await;
+                    task_retired
+                } else {
+                    super::super::handshake::on_deny(
+                        &state,
+                        owner,
+                        crate::protocol::DenyMessage { reason: None },
+                    )
+                    .await;
+                    true
+                };
+                let expected_cause = if disposition == AuthenticatedTerminalControl::RetiredClosed {
+                    super::super::connection::IntroductionTerminalDisposition::TransportError
+                } else {
+                    super::super::connection::IntroductionTerminalDisposition::Denied
+                };
+                let claimed = retired_before
+                    && state
+                        .demand_links
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .links
+                        .get(key)
+                        .is_some_and(|link| {
+                            link.introduction == *ticket
+                                && link.generation == *generation
+                                && link.detached.as_ref().is_some_and(|detached| {
+                                    detached.terminal == Some(expected_cause)
+                                        && detached.authenticated_custody_for_test()
+                                })
+                                && link.settlement
+                                    == if disposition == AuthenticatedTerminalControl::QueueRefused
+                                    {
+                                        IntroductionSettlementPhase::Active
+                                    } else {
+                                        IntroductionSettlementPhase::Queued
+                                    }
+                        });
+                let duplicate_kept_cause = state.request_failed_introduction(
+                    owner,
+                    Some(&attempt),
+                    &crate::events::DropReason::HeartbeatTimeout,
+                ) && state
+                    .demand_links
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .links
+                    .get(key)
+                    .and_then(|link| link.detached.as_ref())
+                    .is_some_and(|detached| detached.terminal == Some(expected_cause));
+                // Exact original installation, not a selected successor.
+                let promotion_refused = state
+                    .peers
+                    .with_admitted_current(
+                        owner,
+                        state.session_broker.as_ref(),
+                        &state.mesh_context_id().to_string(),
+                        |_| (),
+                    )
+                    .is_none();
+                authenticated_observations = Some((
+                    protected,
+                    claimed && duplicate_kept_cause,
+                    promotion_refused,
+                    false,
+                ));
+                if disposition == AuthenticatedTerminalControl::ReplacementAfterClaim {
+                    let replacement =
+                        super::super::insert_promoted_peer(&state, remote.public_id()).await;
+                    let w1 = replacement.peer.current_worker().unwrap();
+                    let owner1 = state
+                        .peers
+                        .owner(remote.public_id())
+                        .unwrap()
+                        .for_worker(Arc::clone(&w1));
+                    let admitted = admit_carrier(&state, &owner1).is_ok();
+                    // An incorrect generation cannot start the old native
+                    // close or acquire the live replacement installation.
+                    state
+                        .settle_failed_introduction(
+                            *key,
+                            *ticket,
+                            generation.checked_add(1).unwrap(),
+                        )
+                        .await;
+                    successor_observed = admitted
+                        && gate.entries() == 0
+                        && !owner.same_exact_owner(&owner1)
+                        && !Arc::ptr_eq(&worker, &w1)
+                        && state.request_failed_introduction(
+                            owner,
+                            Some(&attempt),
+                            &crate::events::DropReason::Denied,
+                        )
+                        && state.peers.has_usable_authenticated_current(&owner1);
+                    successor = Some((replacement, w1, owner1));
+                }
+                state.connection_cmd_tx.close();
+            }
+            let actor_receiver = if cancel_actor
+                || (explicit.is_some()
+                    && explicit != Some(AuthenticatedTerminalControl::QueueRefused))
+            {
+                if explicit.is_none() {
+                    state.queue_failed_introduction(*key, *ticket, *generation);
+                }
+                Some(
+                    state
+                        .take_connection_cmd_rx()
+                        .expect("control owns the actual connection actor"),
+                )
+            } else {
+                None
+            };
+            let finish = async {
+                if let Some(receiver) = actor_receiver {
+                    super::super::supervisor::run_connection_commands(Arc::clone(&state), receiver)
+                        .await;
+                } else {
+                    // Closed-admission companion drives the same settlement
+                    // handler directly; it does not pretend a refused command
+                    // ran. The canceled-actor companion covers shutdown drain.
+                    state
+                        .settle_failed_introduction(*key, *ticket, *generation)
+                        .await;
+                }
+            };
+            tokio::pin!(finish);
+            eprintln!("settlement-stage: before-first-poll");
+            let was_pending = futures::poll!(&mut finish).is_pending();
+            eprintln!("settlement-stage: after-first-poll pending={was_pending}");
+            let entered =
+                tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_for_entry())
+                    .await
+                    .is_ok();
+            eprintln!("settlement-stage: native-gate-wait entered={entered}");
+            let scope_refusal = owner
+                .connection()
+                .reserve_closing_entry_for_test(&worker)
+                .err();
+            let no_entry = owner.connection().retired_worker_count_for_test() == 0;
+            let held = weak.as_ref().is_some_and(|weak| weak.strong_count() == 1)
+                && runtime.remembers_attempt_for_test(&attempt);
+            let waiter_pending = matches!(
+                received.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            );
+            let no_current =
+                if explicit == Some(AuthenticatedTerminalControl::ReplacementAfterClaim) {
+                    // The replacement is intentionally current; ORIGINAL W0 is
+                    // no longer current, and cannot be lifted to successor Ready.
+                    state.peers.with_current(owner, |_| ()).is_none()
+                } else {
+                    state.peers.owner(remote.public_id()).is_none()
+                };
+            if let Some((_, _, _, custody)) = authenticated_observations.as_mut() {
+                *custody = state
+                    .demand_links
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .links
+                    .get(key)
+                    .and_then(|link| link.detached.as_ref())
+                    .is_some_and(|detached| detached.authenticated_custody_for_test());
+            }
+            if !cancel_actor {
+                gate.open();
+                eprintln!("settlement-stage: native-gate-open");
+                let reached = tokio::select! {
+                    _ = &mut finish => false,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(10),
+                        terminal_gate.wait_entered()) => result.is_ok(),
+                };
+                eprintln!("settlement-stage: terminal-gate-wait reached={reached}");
+                let native_terminal = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    worker.retire_and_close(),
+                )
+                .await
+                .is_ok();
+                eprintln!(
+                    "settlement-stage: independent-native-completion returned={native_terminal}"
+                );
+                let still_joining = if reached {
+                    futures::poll!(&mut finish).is_pending()
+                } else {
+                    false
+                };
+                pump_boundary_observed = reached
+                    && native_terminal
+                    && still_joining
+                    && matches!(
+                        received.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    )
+                    && weak.as_ref().is_some_and(|weak| weak.strong_count() == 1)
+                    && state
+                        .demand_links
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .links
+                        .get(key)
+                        .is_some_and(|link| link.detached.is_some() && link.pump_joined.is_none());
+                if let Some((_, _, _, custody)) = authenticated_observations.as_mut() {
+                    *custody &= state
+                        .demand_links
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .links
+                        .get(key)
+                        .and_then(|link| link.detached.as_ref())
+                        .is_some_and(|detached| detached.authenticated_custody_for_test());
+                }
+                terminal_gate.open();
+                eprintln!("settlement-stage: terminal-gate-open");
+                if reached {
+                    eprintln!("settlement-stage: before-finish");
+                    finish.await;
+                    eprintln!("settlement-stage: after-finish");
+                    let before = *shared.outcome.lock();
+                    state.queue_failed_introduction(*key, *ticket, *generation);
+                    state.maintain_hub_introductions().await;
+                    state
+                        .settle_failed_introduction(*key, *ticket, *generation)
+                        .await;
+                    duplicate_observed = gate.entries() == 1
+                        && *shared.outcome.lock() == before
+                        && state
+                            .demand_links
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .links
+                            .get(key)
+                            .is_none();
+                }
+            }
+            observations = Some((
+                retained,
+                was_pending,
+                entered,
+                scope_refusal,
+                no_entry,
+                held,
+                waiter_pending,
+                no_current,
+                weak,
+                attempt,
+            ));
+            // In the cancellation branch the actual pinned future (not just
+            // its Pin reference) drops at this lexical boundary, before open.
+        } else {
+            drop(events);
+            gate.open();
+        }
+        eprintln!("settlement-stage: body-ended");
+        if let Some((_, w1, owner1)) = successor.as_ref() {
+            successor_observed &= state.peers.has_usable_authenticated_current(owner1)
+                && w1.live_connector_incarnation().is_some();
+        }
+        let restored = !cancel_actor
+            || setup.as_ref().is_ok_and(|(_, ticket, key, generation)| {
+                state
+                    .demand_links
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .links
+                    .get(key)
+                    .is_some_and(|link| {
+                        link.introduction == *ticket
+                            && link.generation == *generation
+                            && link.settlement == IntroductionSettlementPhase::Active
+                            && link.detached.is_some()
+                            && (explicit.is_none()
+                                || link.detached.as_ref().is_some_and(|detached| {
+                                    detached.authenticated_custody_for_test()
+                                }))
+                            && link.pump.is_some()
+                    })
+            });
+        gate.open();
+        terminal_gate.open();
+        eprintln!("settlement-stage: before-original-close");
+        let original_close = worker.retire_and_close().await;
+        eprintln!(
+            "settlement-stage: after-original-close error={}",
+            original_close.is_err()
+        );
+        eprintln!("settlement-stage: before-state-shutdown");
+        state.shutdown().await;
+        eprintln!("settlement-stage: after-state-shutdown");
+        let successor_close_ok = if let Some((_, w1, _)) = successor.as_ref() {
+            w1.retire_and_close().await.is_ok()
+        } else {
+            true
+        };
+        let outcome = *shared.outcome.lock();
+        let ended = matches!(received.try_recv(), Ok(Err(_)));
+        cancellation.armed = false;
+        let native_once = gate.entries() == 1;
+        let token_released =
+            observations
+                .as_ref()
+                .is_some_and(|(_, _, _, _, _, _, _, _, weak, attempt)| {
+                    weak.as_ref().is_some_and(|weak| weak.strong_count() == 0)
+                        && !runtime.remembers_attempt_for_test(attempt)
+                });
+        let scope_refusal = observations
+            .as_mut()
+            .and_then(|observation| observation.3.take());
+        eprintln!("settlement-stage: before-carrier-close");
+        let carrier_close = hub_worker.retire_and_close().await;
+        eprintln!(
+            "settlement-stage: after-carrier-close error={}",
+            carrier_close.is_err()
+        );
+        eprintln!("settlement-stage: before-fixture-drop");
+        drop((
+            received,
+            cancellation,
+            shared,
+            ingress,
+            runtime,
+            commands,
+            signals,
+            carrier,
+            hub_worker,
+            fixture,
+            worker,
+            gate,
+            terminal_gate,
+            setup,
+            successor,
+        ));
+        drop(state);
+        drop(auth_work);
+        eprintln!("settlement-stage: after-fixture-drop");
+        let (
+            retained,
+            pending,
+            entered,
+            _,
+            no_entry,
+            held,
+            waiter_pending,
+            no_current,
+            weak,
+            attempt,
+        ) = observations.expect("actual original introduction setup completed");
+        drop((weak, attempt));
+        assert!(
+            retained && pending && entered && no_entry && held && waiter_pending && no_current,
+            "retained={retained} pending={pending} entered={entered} no_entry={no_entry} held={held} waiter_pending={waiter_pending} no_current={no_current}"
+        );
+        assert!(
+            matches!(
+                scope_refusal,
+                Some(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::WorkerOrTask,
+                })
+            ),
+            "exact withdrawn-work-scope refusal: {scope_refusal:?}"
+        );
+        assert!(
+            ended
+                && native_once
+                && token_released
+                && restored
+                && registration_observed
+                && pump_boundary_observed
+                && duplicate_observed,
+            "ended={ended} native_once={native_once} token_released={token_released} restored={restored} registration_observed={registration_observed} pump_boundary_observed={pump_boundary_observed} duplicate_observed={duplicate_observed}"
+        );
+        assert_eq!(
+            outcome,
+            if native_failure || cancel_actor {
+                ChannelDemandOutcome::Unsettled
+            } else if explicit.is_some() {
+                ChannelDemandOutcome::TerminalRefused
+            } else {
+                ChannelDemandOutcome::FailedSettlementJoined
+            }
+        );
+        if explicit.is_some() {
+            let (protected, claimed, promotion_refused, custody) = authenticated_observations
+                .expect("real authenticated original was installed and terminal was exercised");
+            assert!(protected && claimed && promotion_refused && custody,
+                "protected={protected} claimed={claimed} promotion_refused={promotion_refused} custody={custody}");
+            assert!(
+                successor_observed && successor_close_ok,
+                "successor_observed={successor_observed} successor_close_ok={successor_close_ok}"
+            );
+        }
+        assert_eq!(original_close.is_err(), native_failure);
+        assert!(
+            carrier_close.is_ok(),
+            "captured carrier close: {carrier_close:?}"
+        );
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        let failed = provider.retained_after_failed_cleanup();
+        assert_eq!(provider.in_use(), failed);
+        assert_eq!(failed == ResourceClaim::ZERO, !native_failure);
+    }
+
+    #[tokio::test]
+    #[ignore = "opens native W0/carrier and observes the original deadline; isolated harness"]
+    async fn expired_introduction_joins_native_and_engine_pump_before_fallback() {
+        native_settlement_control(true, false, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opens native W0/carrier; isolated harness"]
+    async fn already_terminal_introduction_keeps_tokens_without_closing_entry() {
+        native_settlement_control(false, false, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opens native W0/carrier with post-native failure; isolated harness"]
+    async fn failed_introduction_native_error_refuses_fallback_and_retains_failed_ledger() {
+        native_settlement_control(false, true, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opens native W0/carrier and cancels actor work; isolated harness"]
+    async fn canceled_introduction_settlement_restores_record_for_shutdown_drain() {
+        native_settlement_control(false, false, true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "genuine original capability, Deny actor, native and engine-pump gates"]
+    async fn authenticated_unpromoted_deny_joins_before_terminal_refusal() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::Deny),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "controller Terminal alone preserves genuine capability until actual Deny"]
+    async fn authenticated_unpromoted_controller_terminal_preserves_until_deny() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::ControllerTerminalThenDeny),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "genuine original capability survives retirement identity; isolated native harness"]
+    async fn authenticated_retired_closed_keeps_exact_terminal_custody() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::RetiredClosed),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "original deadline is observed without retiring live authenticated W0"]
+    async fn authenticated_unpromoted_expiry_preserves_until_explicit_deny() {
+        native_settlement_control_with_terminal(
+            true,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::Deny),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "reported native error, not physical native failure; isolated native harness"]
+    async fn authenticated_unpromoted_deny_error_never_allows_fallback() {
+        native_settlement_control_with_terminal(
+            false,
+            true,
+            false,
+            Some(AuthenticatedTerminalControl::Deny),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "actual actor cancellation restores genuine capability for shutdown join"]
+    async fn authenticated_unpromoted_deny_actor_cancel_restores_custody() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            true,
+            Some(AuthenticatedTerminalControl::Deny),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "closed mailbox refusal followed by shared settlement handler, not accepted actor work"]
+    async fn authenticated_unpromoted_deny_queue_refusal_retains_custody() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::QueueRefused),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "three named native owners; exact W0 terminal and independent promoted W1"]
+    async fn authenticated_terminal_join_preserves_replacement_installation() {
+        native_settlement_control_with_terminal(
+            false,
+            false,
+            false,
+            Some(AuthenticatedTerminalControl::ReplacementAfterClaim),
+        )
+        .await;
+    }
+
+    /// The opposite linearization from the detached-before-promotion controls:
+    /// a real logical promotion wins on the original introduced installation.
+    /// This is the existing exact channel-terminal path, not an assertion that
+    /// its ClosingWorker entry always admits or that it uses detached custody.
+    #[tokio::test]
+    #[ignore = "actual introduced task/capability promoted before exact Deny"]
+    async fn authenticated_promotion_before_deny_keeps_original_channel_terminal() {
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let plan = retained_plan(remote.public_id())
+            .checked_add(
+                FiniteResourceProvider::reservation_planning_charge(authenticated_fixture_claim())
+                    .unwrap(),
+            )
+            .unwrap();
+        let (state, signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-promotion-before-deny",
+                None,
+                2,
+                Some(plan),
+                None,
+                Some(policy()),
+            );
+        let auth_work = state
+            .local_resources
+            .acquire(authenticated_fixture_claim())
+            .unwrap();
+        let fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        configure_carrier_topology(&state, hub.public_id());
+        let hub_worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&hub_worker));
+        let (worker, events) = state
+            .transport
+            .open_connector_peer(
+                crate::transport::Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("named original W0 slot");
+        let worker = Arc::new(worker);
+        let (reply, mut received) = oneshot::channel();
+        let (registration, mut cancellation) =
+            state.connect_waiter_registration_for_test(remote.public_id(), 81, reply);
+        let shared = registration.shared.clone();
+        let setup = prepare_native_settlement_fixture(
+            &state,
+            &remote,
+            &hub,
+            &carrier,
+            &worker,
+            registration,
+            true,
+        );
+        let mut observations = None;
+        if let Ok((owner, ticket, key, generation)) = &setup {
+            let registered = if state.begin_peer_event_pump_registration() {
+                let pump = super::super::spawn_peer_event_pump(
+                    Arc::clone(&state),
+                    remote.public_id().to_owned(),
+                    Arc::clone(&worker),
+                    events,
+                    Some(owner.clone()),
+                );
+                match state.finish_introduced_pump_registration(owner, pump) {
+                    Ok(()) => true,
+                    Err(pump) => {
+                        state.finish_peer_event_pump_registration(pump).await;
+                        false
+                    }
+                }
+            } else {
+                drop(events);
+                false
+            };
+            owner.connection().state.write().status = super::super::connection::PeerStatus::Active;
+            let promoted = admit_carrier(&state, owner).is_ok()
+                && owner.connection().holds_promoted_session()
+                && state.peers.has_usable_authenticated_current(owner);
+            let unclaimed = !state.request_failed_introduction(
+                owner,
+                Some(&ticket.attempt()),
+                &crate::events::DropReason::Denied,
+            );
+            let intact = state
+                .demand_links
+                .as_ref()
+                .unwrap()
+                .lock()
+                .links
+                .get(key)
+                .is_some_and(|link| {
+                    link.introduction == *ticket
+                        && link.generation == *generation
+                        && link.detached.is_none()
+                        && link.settlement == IntroductionSettlementPhase::Active
+                })
+                && worker.live_connector_incarnation().is_some()
+                && state.peers.has_usable_authenticated_current(owner);
+            super::super::handshake::on_deny(
+                &state,
+                owner,
+                crate::protocol::DenyMessage { reason: None },
+            )
+            .await;
+            let terminal = !state.peers.has_usable_authenticated_current(owner)
+                && worker.live_connector_incarnation().is_none();
+            observations = Some((registered, promoted, unclaimed, intact, terminal));
+        } else {
+            drop(events);
+        }
+        // Never assert before every original native/engine/fixture owner has
+        // completed. Shutdown owns the registered original receiver join.
+        let close = worker.retire_and_close().await;
+        state.shutdown().await;
+        let hub_close = hub_worker.retire_and_close().await;
+        let ended = matches!(received.try_recv(), Ok(Err(_)));
+        let no_fallback = *shared.outcome.lock() == ChannelDemandOutcome::Unsettled;
+        let drained = state.demand_links.as_ref().unwrap().lock().links.len() == 0;
+        cancellation.armed = false;
+        drop((
+            received,
+            cancellation,
+            shared,
+            commands,
+            signals,
+            carrier,
+            hub_worker,
+            fixture,
+            worker,
+            setup,
+        ));
+        drop(state);
+        drop(auth_work);
+        let (registered, promoted, unclaimed, intact, terminal) =
+            observations.expect("actual introduced auth setup");
+        assert!(registered && promoted && unclaimed && intact && terminal,
+            "registered={registered} promoted={promoted} unclaimed={unclaimed} intact={intact} terminal={terminal}");
+        assert!(
+            ended && no_fallback && drained,
+            "ended={ended} no_fallback={no_fallback} drained={drained}"
+        );
+        assert!(
+            close.is_ok() && hub_close.is_ok(),
+            "original={close:?} carrier={hub_close:?}"
+        );
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(provider.in_use(), provider.retained_after_failed_cleanup());
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+    }
+
+    /// Exact registry/slot boundary control, not a fabricated unpromoted W0
+    /// coexisting with a selected promoted W1 in the single unpromoted slot.
+    /// Promotion of W0 wins first (L1), then a real different installation W1
+    /// wins; the old ticket may detach neither. All three native owners have
+    /// named simultaneous profile slots and remain held through cleanup.
+    #[tokio::test]
+    #[ignore = "opens actual carrier/W0/W1; isolated native harness"]
+    async fn failed_introduction_detach_preserves_promoted_and_replacement_owners() {
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let (state, signals, commands, provider, _) =
+            super::super::build_test_state_parts_metered_with_application(
+                "intro-detach-successors",
+                None,
+                3,
+                Some(retained_plan(remote.public_id())),
+                None,
+                Some(policy()),
+            );
+        configure_carrier_topology(&state, hub.public_id());
+        let carrier_fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        let carrier_worker = carrier_fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&carrier_worker));
+        let first = super::super::insert_promoted_peer(&state, remote.public_id()).await;
+        let w0 = first.peer.current_worker().unwrap();
+        let owner0 = state
+            .peers
+            .owner(remote.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&w0));
+        let setup: Result<_> = (|| {
+            admit_carrier(&state, &carrier)?;
+            let remote_id = DeviceId::from_canonical_str(remote.public_id())
+                .map_err(|_| Error::Network("valid target required".into()))?;
+            let root = state.hub_introductions.as_ref().unwrap();
+            let ticket = root
+                .lock()
+                .begin_demand(&remote_id, &carrier, std::time::Instant::now())
+                .map_err(|_| Error::Network("original ticket admission refused".into()))?
+                .ticket;
+            first.peer.adopt_attempt(&ticket.attempt());
+            admit_carrier(&state, &owner0)?; // actual promotion wins before failure
+            root.lock().failed(ticket);
+            Ok(ticket)
+        })();
+        let mut unexpected = None;
+        let promoted_refused = setup.as_ref().is_ok_and(|ticket| {
+            !state.peers.with_introduction_installation(&owner0, |peer| {
+                unexpected = peer.detach_failed_introduction(&w0, *ticket);
+                unexpected.as_ref().map(|_| false)
+            }) && state.peers.has_usable_authenticated_current(&owner0)
+        });
+        let replacement = super::super::insert_promoted_peer(&state, remote.public_id()).await;
+        let w1 = replacement.peer.current_worker().unwrap();
+        let owner1 = state
+            .peers
+            .owner(remote.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&w1));
+        let successor_admitted = admit_carrier(&state, &owner1);
+        let mut stale_callback_ran = false;
+        let replacement_refused = setup.as_ref().is_ok_and(|ticket| {
+            !state.peers.with_introduction_installation(&owner0, |peer| {
+                stale_callback_ran = true;
+                peer.detach_failed_introduction(&w0, *ticket)
+                    .map(|detached| {
+                        unexpected = Some(detached);
+                        false
+                    })
+            })
+        });
+        let survived = !owner0.same_exact_owner(&owner1)
+            && !Arc::ptr_eq(&w0, &w1)
+            && state.peers.has_usable_authenticated_current(&owner1)
+            && w1.live_connector_incarnation().is_some();
+        let close0 = w0.retire_and_close().await;
+        state.shutdown().await;
+        let close1 = w1.retire_and_close().await;
+        let carrier_close = carrier_worker.retire_and_close().await;
+        drop((first, replacement, carrier_fixture));
+        if let Some(detached) = unexpected.take() {
+            detached.release_after_join(owner0.connection());
+        }
+        drop((
+            owner0,
+            owner1,
+            carrier,
+            w0,
+            w1,
+            carrier_worker,
+            commands,
+            signals,
+            state,
+        ));
+        setup.expect("actual ticket and first promotion admitted");
+        successor_admitted.expect("actual replacement promotion admitted");
+        assert!(promoted_refused && replacement_refused && !stale_callback_ran && survived);
+        assert!(close0.is_ok() && close1.is_ok() && carrier_close.is_ok());
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(provider.in_use(), provider.retained_after_failed_cleanup());
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            ResourceClaim::ZERO
+        );
+    }
+}
+
+/// Called only after the existing introduction translation work is admitted.
+/// Native ICE represents absent optional metadata with either None or Some("");
+/// the strict signed Hub body uses None. Preserve every nonempty value (even a
+/// conflicting credential) and the exact candidate line/index for native checks.
+fn hub_introduction_candidate_body(
+    candidate: &crate::transport::LocalIceCandidate,
+) -> crate::protocol::HubIntroductionBody {
+    crate::protocol::HubIntroductionBody::Candidate {
+        candidate: candidate.candidate.clone(),
+        sdp_mid: candidate
+            .sdp_mid
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        sdp_mline_index: candidate.sdp_mline_index,
+        username_fragment: candidate
+            .username_fragment
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned(),
     }
 }
 
@@ -8321,6 +13519,245 @@ pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod introduction_candidate_translation_tests {
+    use super::hub_introduction_candidate_body;
+    use crate::protocol::hub_introduction::{
+        HubIntroductionBody, HubIntroductionEnvelope, HubIntroductionError, IntroductionChallenge,
+    };
+    use crate::semantic::{DeviceId, MeshContextId};
+    use crate::transport::LocalIceCandidate;
+    use ed25519_dalek::SigningKey;
+
+    fn bundled_candidate() -> LocalIceCandidate {
+        use webrtc::ice_transport::{
+            ice_candidate::RTCIceCandidate, ice_candidate_type::RTCIceCandidateType,
+            ice_protocol::RTCIceProtocol,
+        };
+        // Actual bundled serializer, without sockets, gathering, or native tasks.
+        let init = RTCIceCandidate {
+            foundation: "1".into(),
+            priority: 2_130_706_431,
+            address: "127.0.0.1".into(),
+            port: 5000,
+            protocol: RTCIceProtocol::Udp,
+            typ: RTCIceCandidateType::Host,
+            component: 1,
+            ..Default::default()
+        }
+        .to_json()
+        .expect("bounded host candidate serializes");
+        LocalIceCandidate {
+            candidate: init.candidate,
+            sdp_mid: init.sdp_mid,
+            sdp_mline_index: init.sdp_mline_index,
+            username_fragment: init.username_fragment,
+        }
+    }
+
+    fn envelope(
+        body: HubIntroductionBody,
+    ) -> Result<HubIntroductionEnvelope, HubIntroductionError> {
+        let key = SigningKey::from_bytes(&[31; 32]);
+        let other = SigningKey::from_bytes(&[32; 32]);
+        // Wire-shape/signature fixture, not a live controller's admitted challenge.
+        HubIntroductionEnvelope::new(
+            MeshContextId::from_bytes([33; 32]),
+            DeviceId::from_public_key_bytes(key.verifying_key().to_bytes()).unwrap(),
+            DeviceId::from_public_key_bytes(other.verifying_key().to_bytes()).unwrap(),
+            [34; 16],
+            2,
+            Some(IntroductionChallenge {
+                request_hash: [35; 32],
+                responder_challenge: [36; 32],
+            }),
+            4,
+            body,
+            &key,
+        )
+    }
+
+    #[test]
+    fn bundled_native_empty_mid_normalizes_into_signed_hub_candidate() {
+        let candidate = bundled_candidate();
+        assert_eq!(candidate.sdp_mid.as_deref(), Some(""));
+        assert_eq!(candidate.sdp_mline_index, Some(0));
+        assert_eq!(candidate.username_fragment, None);
+        assert!(!candidate.candidate.is_empty());
+        let original = candidate.clone();
+        let unnormalized = HubIntroductionBody::Candidate {
+            candidate: candidate.candidate.clone(),
+            sdp_mid: candidate.sdp_mid.clone(),
+            sdp_mline_index: candidate.sdp_mline_index,
+            username_fragment: candidate.username_fragment.clone(),
+        };
+        assert_eq!(
+            envelope(unnormalized),
+            Err(HubIntroductionError::Body),
+            "control exposes the original production adapter mismatch"
+        );
+        let body = hub_introduction_candidate_body(&candidate);
+        assert_eq!(
+            body,
+            HubIntroductionBody::Candidate {
+                candidate: candidate.candidate.clone(),
+                sdp_mid: None,
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            }
+        );
+        assert_eq!(
+            candidate, original,
+            "borrowed native input remains unchanged"
+        );
+        let signed = envelope(body.clone()).unwrap();
+        let bytes = signed.encode_complete().unwrap();
+        let decoded: crate::protocol::MeshMessage = serde_json::from_slice(&bytes).unwrap();
+        let crate::protocol::MeshMessage::HubIntroduction(decoded) = decoded else {
+            panic!("complete envelope must remain an introduction");
+        };
+        decoded
+            .verify_for_previous_hop(signed.source(), signed.context_id())
+            .unwrap();
+        decoded
+            .validate_challenge_binding(signed.challenge().unwrap())
+            .unwrap();
+        assert_eq!(decoded.body(), &body);
+        assert_eq!(
+            decoded.sequence(),
+            2,
+            "wire sequence only, not controller advancement"
+        );
+        assert_eq!(decoded.encode_complete().unwrap(), bytes);
+    }
+
+    #[test]
+    fn hub_candidate_translation_preserves_nonempty_and_missing_metadata() {
+        let mut candidate = bundled_candidate();
+        candidate.candidate.push_str(" ufrag line-credential");
+        candidate.sdp_mid = Some("audio-0".into());
+        candidate.sdp_mline_index = Some(7);
+        candidate.username_fragment = Some("different-structured-credential".into());
+        let original = candidate.clone();
+        assert_eq!(
+            hub_introduction_candidate_body(&candidate),
+            HubIntroductionBody::Candidate {
+                candidate: candidate.candidate.clone(),
+                sdp_mid: candidate.sdp_mid.clone(),
+                sdp_mline_index: Some(7),
+                username_fragment: candidate.username_fragment.clone(),
+            },
+            "conflicting nonempty metadata is preserved for native credential refusal"
+        );
+        assert_eq!(candidate, original);
+        for optional in [None, Some(String::new())] {
+            candidate.sdp_mid = optional.clone();
+            candidate.username_fragment = optional;
+            candidate.sdp_mline_index = None;
+            assert_eq!(
+                hub_introduction_candidate_body(&candidate),
+                HubIntroductionBody::Candidate {
+                    candidate: candidate.candidate.clone(),
+                    sdp_mid: None,
+                    sdp_mline_index: None,
+                    username_fragment: None,
+                },
+                "normalization never invents a location or credential"
+            );
+        }
+    }
+
+    #[test]
+    fn hub_candidate_translation_keeps_strict_metadata_and_body_limits() {
+        let mut candidate = bundled_candidate();
+        candidate.sdp_mid = Some("m".repeat(64));
+        candidate.username_fragment = Some("u".repeat(64));
+        let maximum_metadata = hub_introduction_candidate_body(&candidate);
+        assert_eq!(
+            envelope(maximum_metadata.clone()).unwrap().body(),
+            &maximum_metadata
+        );
+        candidate.sdp_mid = Some("m".repeat(65));
+        assert_eq!(
+            envelope(hub_introduction_candidate_body(&candidate)),
+            Err(HubIntroductionError::Body)
+        );
+        candidate.sdp_mid = Some("m".repeat(64));
+        candidate.username_fragment = Some("u".repeat(65));
+        assert_eq!(
+            envelope(hub_introduction_candidate_body(&candidate)),
+            Err(HubIntroductionError::Body)
+        );
+        candidate.username_fragment = None;
+        candidate.candidate = "c".repeat(2048);
+        assert!(envelope(hub_introduction_candidate_body(&candidate)).is_ok());
+        candidate.candidate.push('c');
+        assert_eq!(
+            envelope(hub_introduction_candidate_body(&candidate)),
+            Err(HubIntroductionError::Body)
+        );
+        candidate.candidate.clear();
+        assert_eq!(
+            envelope(hub_introduction_candidate_body(&candidate)),
+            Err(HubIntroductionError::Body),
+            "empty required candidate text is not repaired or accepted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opaque_control_funding_tests {
+    #[tokio::test]
+    async fn opaque_control_output_and_completion_keep_disjoint_funding_until_last_owner() {
+        let (state, _signaling, command_rx, provider, _grant) =
+            crate::engine::build_test_state_parts_metered("opaque-control-custody", None, 2, None);
+        state.park_command_receiver_for_test(command_rx);
+        let baseline = provider.in_use();
+        let completion =
+            super::super::command::OpaqueControlCompletion::new(&state.local_resources).unwrap();
+        let caller = completion.clone();
+        let completion_charge = provider.in_use();
+        assert_ne!(completion_charge, baseline);
+        let wire = crate::application_gateway::FundedOpaqueControl::encode(
+            &state.local_resources,
+            &crate::application_gateway::OpaqueControlView::Close {
+                coordinate: crate::protocol::ApplicationFlowCoordinate {
+                    flow_id: 1,
+                    generation: 1,
+                },
+                direction: crate::realtime::RealtimeFlowDirection::Outbound,
+            },
+        )
+        .unwrap();
+        assert_ne!(provider.in_use(), completion_charge);
+        let decoded: crate::protocol::MeshMessage = serde_json::from_slice(wire.bytes()).unwrap();
+        assert!(matches!(
+            decoded,
+            crate::protocol::MeshMessage::ApplicationFlowControl(
+                crate::protocol::ApplicationFlowControl::Close { .. }
+            )
+        ));
+        completion.finish(Ok(()));
+        drop(completion);
+        assert_ne!(
+            provider.in_use(),
+            baseline,
+            "caller and output still own their real leases"
+        );
+        drop(wire);
+        assert_eq!(
+            provider.in_use(),
+            completion_charge,
+            "output charge leaves independently"
+        );
+        assert_eq!(caller.wait().await, Ok(()));
+        drop(caller);
+        let released = provider.in_use() == baseline;
+        state.shutdown().await;
+        assert!(released);
+    }
 }
 
 #[cfg(test)]
@@ -8798,10 +14235,12 @@ mod closed_relay_expiry_funding_tests {
 
     impl ComponentFixture {
         fn new(pending: usize) -> Self {
-            let mut profile = crate::config::ClosedRelayPolicyConfig::default();
-            profile.enabled = true;
-            profile.max_pending_handshakes =
-                u64::try_from(pending).expect("component pending capacity fits u64");
+            let profile = crate::config::ClosedRelayPolicyConfig {
+                enabled: true,
+                max_pending_handshakes: u64::try_from(pending)
+                    .expect("component pending capacity fits u64"),
+                ..Default::default()
+            };
             let root_claim =
                 super::super::closed_relay::ClosedRelayEngineRoot::root_claim(&profile)
                     .expect("component root claim");
@@ -8886,10 +14325,10 @@ mod closed_relay_expiry_funding_tests {
                 .lock()
                 .insert(super::super::closed_relay::ClosedRelayPendingExpiryTask {
                     handle,
-                    funding,
+                    _funding: funding,
                 })
                 .unwrap_or_else(|task| {
-                    task.funding.cancel();
+                    task._funding.cancel();
                     task.handle.abort();
                     panic!("component expiry slot must be available")
                 })
@@ -9042,9 +14481,9 @@ mod closed_relay_expiry_funding_tests {
         let handle = tokio::spawn(future);
         let mut registered = super::super::closed_relay::ClosedRelayPendingExpiryTask {
             handle,
-            funding: owner.clone(),
+            _funding: owner.clone(),
         };
-        assert!(FundedArc::ptr_eq(&owner, &registered.funding));
+        assert!(FundedArc::ptr_eq(&owner, &registered._funding));
         owner.cancel();
         drop(owner);
         drop(pending);
@@ -9255,7 +14694,7 @@ mod closed_relay_expiry_funding_tests {
             .lock()
             .get(low_slot)
             .expect("live low task remains registered")
-            .funding
+            ._funding
             .clone();
         low_owner.cancel();
         drop(low_owner);

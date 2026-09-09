@@ -962,6 +962,218 @@ pub enum NetworkKind {
     Silent,
 }
 
+/// Explicit limits for solicited introductions and demand-owned direct links.
+/// These are workload/lifetime limits, never provider grants or peer authority.
+/// Active introductions, reverse breadcrumbs and replay tombstones share one
+/// record pool. Existing connection waiters and signaling queues keep their
+/// existing owners; this policy does not create parallel registries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HubIntroductionPolicyConfig {
+    pub max_records: u64,
+    pub max_waiters_per_target: u64,
+    /// Cumulative complete signaling bytes admitted/forwarded per attempt.
+    /// This is not a retained-buffer size or an RSS/storage estimate.
+    pub max_signaling_bytes: u64,
+    pub max_candidates_per_attempt: u64,
+    pub attempt_timeout_ms: u64,
+    pub terminal_retention_ms: u64,
+    pub max_transient_links: u64,
+    pub idle_timeout_ms: u64,
+    pub max_maintenance_per_tick: u64,
+}
+
+impl HubIntroductionPolicyConfig {
+    /// Check the same explicit inputs subsequently consumed by runtime owners.
+    /// A successful check does not reserve resources; actual entry/work claims
+    /// still require provider admission before retention or native work.
+    pub fn checked(self) -> Result<Self> {
+        for (field, value) in [
+            ("max_records", self.max_records),
+            ("max_waiters_per_target", self.max_waiters_per_target),
+            (
+                "max_candidates_per_attempt",
+                self.max_candidates_per_attempt,
+            ),
+            ("max_transient_links", self.max_transient_links),
+            ("max_maintenance_per_tick", self.max_maintenance_per_tick),
+        ] {
+            checked_application_count(value, field)?;
+        }
+        if self.max_signaling_bytes == 0 {
+            return Err(Error::Config(
+                "introduction signaling budget must be nonzero".into(),
+            ));
+        }
+        self.max_records
+            .checked_mul(self.max_waiters_per_target)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value <= isize::MAX as usize)
+            .ok_or_else(|| Error::Config("introduction waiter workload overflows".into()))?;
+        self.max_records
+            .checked_mul(self.max_candidates_per_attempt)
+            .ok_or_else(|| Error::Config("introduction candidate workload overflows".into()))?;
+        self.max_records
+            .checked_mul(self.max_signaling_bytes)
+            .ok_or_else(|| Error::Config("introduction signaling workload overflows".into()))?;
+        for (field, value) in [
+            ("attempt_timeout_ms", self.attempt_timeout_ms),
+            ("terminal_retention_ms", self.terminal_retention_ms),
+            ("idle_timeout_ms", self.idle_timeout_ms),
+        ] {
+            checked_application_duration(value, field)?;
+        }
+        self.attempt_timeout_ms
+            .checked_add(self.terminal_retention_ms)
+            .filter(|value| *value <= i64::MAX as u64)
+            .ok_or_else(|| Error::Config("introduction terminal deadline overflows".into()))?;
+        Ok(self)
+    }
+
+    /// Plan the introduction controller and its shared bounded record pool.
+    /// The implementation supplies raw intrinsic claims for its actual layout.
+    /// Each acquisition has its own provider reservation charge; the existing
+    /// application scope is not charged again here. This plan is not itself a
+    /// lease to acquire in addition to the individual runtime reservations.
+    pub fn planned_records_claim(
+        self,
+        root: ResourceClaim,
+        entry: ResourceClaim,
+    ) -> Result<ResourceClaim> {
+        self.checked()?;
+        planned_application_reservations(root, entry, self.max_records)
+    }
+
+    /// Plan the separately owned demand-link pool using its actual raw root
+    /// and entry shapes. Native connector work and existing waiter/queue
+    /// leases remain separately admitted by their existing owners.
+    pub fn planned_demand_links_claim(
+        self,
+        root: ResourceClaim,
+        entry: ResourceClaim,
+    ) -> Result<ResourceClaim> {
+        self.checked()?;
+        planned_application_reservations(root, entry, self.max_transient_links)
+    }
+}
+
+/// Explicit routed endpoint-encryption limits. These do not authorize a peer
+/// or change Closed relay policy. All phases of one epoch share its finite
+/// lifetime, and route changes cannot restart replay or nonce state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCipherPolicyConfig {
+    pub max_sessions: u64,
+    /// Complete encrypted inner application message, including channel/name
+    /// framing, not just the caller's body bytes. The wire owner supplies the
+    /// outer signed-envelope ceiling used below.
+    pub max_plaintext_bytes: u64,
+    pub replay_window: u64,
+    pub max_age_ms: u64,
+}
+
+impl EndpointCipherPolicyConfig {
+    pub fn checked(self) -> Result<Self> {
+        checked_application_count(self.max_sessions, "cipher max_sessions")?;
+        let plaintext = checked_application_count(self.max_plaintext_bytes, "cipher plaintext")?;
+        let replay = checked_application_count(self.replay_window, "cipher replay window")?;
+        if plaintext > crate::protocol::topology::max_routed_plaintext_bytes()
+            || replay > crate::protocol::endpoint_cipher::MAX_REPLAY_WINDOW
+        {
+            return Err(Error::Config(
+                "endpoint cipher exceeds its representation bounds".into(),
+            ));
+        }
+        checked_application_duration(self.max_age_ms, "cipher max_age_ms")?;
+        Ok(self)
+    }
+
+    /// Registry-root, per-entry and per-epoch/key allocations are distinct
+    /// reservations. The caller supplies exact disjoint raw claims from their owners;
+    /// the entry claim must exclude backing already funded by the epoch claim.
+    /// returned planning totals mint no capacity and must not be reserved a
+    /// second time alongside actual entries. Wire/work/queues remain separate.
+    pub fn planned_epochs_claim(
+        self,
+        registry_root: ResourceClaim,
+        registry_entry: ResourceClaim,
+        epoch: ResourceClaim,
+    ) -> Result<ResourceClaim> {
+        self.checked()?;
+        let registry =
+            planned_application_reservations(registry_root, registry_entry, self.max_sessions)?;
+        let epochs = application_reservation_claim(epoch)?
+            .checked_scale(self.max_sessions)
+            .map_err(|_| Error::Config("endpoint cipher epoch plan overflows".into()))?;
+        registry
+            .checked_add(epochs)
+            .map_err(|_| Error::Config("endpoint cipher registry plan overflows".into()))
+    }
+}
+
+/// Opt-in introduction and encrypted routed-message behavior. `None` on a
+/// network disables these additions and supplies no default production grant.
+/// Opaque byte flows are independent: they reuse the existing realtime
+/// provider policy, negotiated unit limit and provider-backed queue leases.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationTransportPolicyConfig {
+    pub introduction: HubIntroductionPolicyConfig,
+    pub endpoint_cipher: EndpointCipherPolicyConfig,
+}
+
+impl ApplicationTransportPolicyConfig {
+    pub fn checked(self) -> Result<Self> {
+        self.introduction.checked()?;
+        self.endpoint_cipher.checked()?;
+        Ok(self)
+    }
+}
+
+fn application_reservation_claim(raw: ResourceClaim) -> Result<ResourceClaim> {
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(raw)
+        .map_err(|_| Error::Config("application transport reservation plan overflows".into()))
+}
+
+fn planned_application_reservations(
+    root: ResourceClaim,
+    entry: ResourceClaim,
+    count: u64,
+) -> Result<ResourceClaim> {
+    let root = application_reservation_claim(root)?;
+    let entries = application_reservation_claim(entry)?
+        .checked_scale(count)
+        .map_err(|_| Error::Config("application transport record plan overflows".into()))?;
+    root.checked_add(entries)
+        .map_err(|_| Error::Config("application transport root plan overflows".into()))
+}
+
+fn checked_application_count(value: u64, field: &str) -> Result<usize> {
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0 && *value <= isize::MAX as usize)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "application transport {field} is not representable"
+            ))
+        })
+}
+
+fn checked_application_duration(value: u64, field: &str) -> Result<Duration> {
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(Error::Config(format!(
+            "application transport {field} is invalid"
+        )));
+    }
+    let duration = Duration::from_millis(value);
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| {
+            Error::Config(format!("application transport {field} deadline overflows"))
+        })?;
+    Ok(duration)
+}
+
 /// Owner-selected policy for the engine's time-based safety net.
 ///
 /// These values are persisted with the network rather than kept as process
@@ -1581,7 +1793,7 @@ impl SemanticPolicyConfig {
             workload.max_main_journal_bytes,
             workload.max_live_checkpoint_bytes,
         ];
-        if values.iter().any(|value| *value == 0)
+        if values.contains(&0)
             || workload.max_fact_encoded_bytes > self.max_fact_encoded_bytes
             || workload.max_admitted_facts > self.max_admitted_facts
             || workload.max_quarantined_facts > self.max_quarantined_facts
@@ -1879,6 +2091,11 @@ pub struct NetworkConfig {
     /// authority and is never consulted by semantic admission or routing.
     #[serde(default)]
     pub local_observations: Option<LocalObservationPolicyConfig>,
+    /// Explicit introduction and encrypted routed-message policy. Every edit
+    /// requires exact runtime replacement; no saved-only or hot capacity edit.
+    /// This does not gate independently provider-admitted opaque byte flows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_transport: Option<ApplicationTransportPolicyConfig>,
     #[serde(default)]
     pub signaling: SignalingConfig,
     /// Closed-member opaque relay policy for this network. It is a network
@@ -2004,6 +2221,7 @@ impl NetworkConfig {
             hub: None,
             tree: None,
             local_observations: None,
+            application_transport: None,
             signaling: Default::default(),
             closed_relay: ClosedRelayPolicyConfig::default(),
             stun_servers: default_stun_servers(),
@@ -2026,6 +2244,9 @@ impl NetworkConfig {
     /// process-wide timing constants.
     pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
         self.validate_topology()?;
+        if let Some(application) = self.application_transport {
+            application.checked()?;
+        }
         match (&self.topology, self.tree) {
             (TopologyMode::HubTree { .. }, None) => {
                 return Err(Error::Config(
@@ -3032,6 +3253,248 @@ mod tests {
             .expect("constructor network config serializes")
     }
 
+    fn application_transport_fixture() -> ApplicationTransportPolicyConfig {
+        ApplicationTransportPolicyConfig {
+            introduction: HubIntroductionPolicyConfig {
+                max_records: 4,
+                max_waiters_per_target: 2,
+                max_signaling_bytes: 32_768,
+                max_candidates_per_attempt: 4,
+                attempt_timeout_ms: 1_000,
+                terminal_retention_ms: 2_000,
+                max_transient_links: 2,
+                idle_timeout_ms: 3_000,
+                max_maintenance_per_tick: 2,
+            },
+            endpoint_cipher: EndpointCipherPolicyConfig {
+                max_sessions: 4,
+                max_plaintext_bytes: 1_024,
+                replay_window: 64,
+                max_age_ms: 4_000,
+            },
+        }
+    }
+
+    #[test]
+    fn application_transport_requires_explicit_complete_policy_and_round_trips() {
+        let mut network = NetworkConfig::from_network_id("app-policy", "app-policy-net");
+        let disabled = serde_json::to_value(&network).unwrap();
+        assert!(disabled.get("application_transport").is_none());
+        assert!(serde_json::from_value::<NetworkConfig>(disabled)
+            .unwrap()
+            .application_transport
+            .is_none());
+        let policy = application_transport_fixture();
+        network.application_transport = Some(policy);
+        network.validate().expect("complete explicit profile");
+        let mut encoded = serde_json::to_value(&network).unwrap();
+        let decoded: NetworkConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.application_transport, Some(policy));
+        encoded["application_transport"]["introduction"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_signaling_bytes");
+        assert!(serde_json::from_value::<NetworkConfig>(encoded).is_err());
+        let mut encoded = serde_json::to_value(policy).unwrap();
+        encoded["endpoint_cipher"]["grant"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<ApplicationTransportPolicyConfig>(encoded).is_err());
+    }
+
+    #[test]
+    fn introduction_policy_checks_zero_max_plus_one_and_workload_overflow() {
+        let valid = application_transport_fixture().introduction;
+        assert_eq!(valid.checked().unwrap(), valid);
+        for field in [
+            "max_records",
+            "max_waiters_per_target",
+            "max_signaling_bytes",
+            "max_candidates_per_attempt",
+            "attempt_timeout_ms",
+            "terminal_retention_ms",
+            "max_transient_links",
+            "idle_timeout_ms",
+            "max_maintenance_per_tick",
+        ] {
+            let mut value = serde_json::to_value(valid).unwrap();
+            value[field] = serde_json::json!(0);
+            let invalid: HubIntroductionPolicyConfig = serde_json::from_value(value).unwrap();
+            assert!(invalid.checked().is_err(), "zero {field}");
+        }
+        let mut exact = valid;
+        exact.max_transient_links = isize::MAX as u64;
+        assert!(exact.checked().is_ok());
+        exact.max_transient_links += 1;
+        assert!(exact.checked().is_err());
+        let mut exact = valid;
+        exact.max_records = 1;
+        exact.max_transient_links = 1;
+        exact.max_waiters_per_target = isize::MAX as u64;
+        assert!(exact.checked().is_ok());
+        exact.max_waiters_per_target += 1;
+        assert!(exact.checked().is_err());
+        let mut overflow = valid;
+        overflow.max_signaling_bytes = u64::MAX;
+        assert!(overflow.checked().is_err());
+        overflow = valid;
+        overflow.attempt_timeout_ms = u64::MAX;
+        assert!(overflow.checked().is_err());
+    }
+
+    #[test]
+    fn cipher_policy_uses_exact_wire_and_replay_bounds() {
+        let mut exact = application_transport_fixture().endpoint_cipher;
+        exact.max_plaintext_bytes = crate::protocol::topology::max_routed_plaintext_bytes() as u64;
+        exact.replay_window = crate::protocol::endpoint_cipher::MAX_REPLAY_WINDOW as u64;
+        assert!(exact.checked().is_ok());
+        let mut invalid = exact;
+        invalid.max_plaintext_bytes += 1;
+        assert!(invalid.checked().is_err());
+        invalid = exact;
+        invalid.replay_window += 1;
+        assert!(invalid.checked().is_err());
+        for field in [
+            "max_sessions",
+            "max_plaintext_bytes",
+            "replay_window",
+            "max_age_ms",
+        ] {
+            let mut value = serde_json::to_value(exact).unwrap();
+            value[field] = serde_json::json!(0);
+            let invalid: EndpointCipherPolicyConfig = serde_json::from_value(value).unwrap();
+            assert!(invalid.checked().is_err(), "zero {field}");
+        }
+        invalid = exact;
+        invalid.max_age_ms = u64::MAX;
+        assert!(invalid.checked().is_err());
+        let mut network = NetworkConfig::from_network_id("app-invalid", "app-invalid-net");
+        let mut policy = application_transport_fixture();
+        policy.endpoint_cipher = invalid;
+        network.application_transport = Some(policy);
+        assert!(network.validate().is_err());
+    }
+
+    #[test]
+    fn application_claim_plans_price_distinct_reservations_and_refuse_overflow() {
+        use crate::resource::FiniteResourceProvider;
+        // Synthetic raw claims discriminate planner arithmetic, not private
+        // production object sizes or a deployable provider budget.
+        let root = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 17);
+        let entry = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 23);
+        let epoch = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, 31);
+        let reservation =
+            |claim| FiniteResourceProvider::reservation_planning_charge(claim).unwrap();
+        let policy = application_transport_fixture();
+        let introduction = policy
+            .introduction
+            .planned_records_claim(root, entry)
+            .unwrap();
+        assert_eq!(
+            introduction,
+            reservation(root)
+                .checked_add(
+                    reservation(entry)
+                        .checked_scale(policy.introduction.max_records)
+                        .unwrap(),
+                )
+                .unwrap()
+        );
+        assert_ne!(
+            introduction,
+            reservation(
+                root.checked_add(
+                    entry
+                        .checked_scale(policy.introduction.max_records)
+                        .unwrap(),
+                )
+                .unwrap()
+            )
+        );
+        let demand = policy
+            .introduction
+            .planned_demand_links_claim(root, entry)
+            .unwrap();
+        assert_eq!(
+            demand,
+            reservation(root)
+                .checked_add(
+                    reservation(entry)
+                        .checked_scale(policy.introduction.max_transient_links)
+                        .unwrap(),
+                )
+                .unwrap()
+        );
+        let cipher = policy
+            .endpoint_cipher
+            .planned_epochs_claim(root, entry, epoch)
+            .unwrap();
+        assert_eq!(
+            cipher,
+            reservation(root)
+                .checked_add(
+                    reservation(entry)
+                        .checked_add(reservation(epoch))
+                        .unwrap()
+                        .checked_scale(policy.endpoint_cipher.max_sessions)
+                        .unwrap(),
+                )
+                .unwrap()
+        );
+        let excessive = ResourceClaim::single(ResourceClass::AccountedMemoryBytes, u64::MAX);
+        assert!(policy
+            .introduction
+            .planned_records_claim(excessive, entry)
+            .is_err());
+        assert!(policy
+            .endpoint_cipher
+            .planned_epochs_claim(root, entry, excessive)
+            .is_err());
+        let multiply_overflow = ResourceClaim::single(ResourceClass::QueuedBytes, u64::MAX / 2);
+        assert!(policy
+            .introduction
+            .planned_records_claim(root, multiply_overflow)
+            .is_err());
+        assert!(policy
+            .introduction
+            .planned_demand_links_claim(root, excessive)
+            .is_err());
+        assert!(policy
+            .endpoint_cipher
+            .planned_epochs_claim(root, entry, multiply_overflow)
+            .is_err());
+
+        // Only the standalone provider's process scope is added here. The
+        // production planners reuse an already funded application scope.
+        let grant = introduction
+            .checked_add(FiniteResourceProvider::scope_planning_charge())
+            .unwrap();
+        let port =
+            crate::resource::ResourceProviderPort::new(FiniteResourceProvider::new(grant)).unwrap();
+        let scope = port.process_scope();
+        let authority = crate::resource::ResourceAuthorityClass::Admitted;
+        let retained_root = port.acquire(&scope, authority, root).unwrap();
+        let mut entries = Vec::new();
+        for _ in 0..policy.introduction.max_records {
+            entries.push(port.acquire(&scope, authority, entry).unwrap());
+        }
+        assert!(
+            port.acquire(&scope, authority, entry).is_err(),
+            "exact max+1 refused"
+        );
+        drop(entries.pop());
+        entries.push(
+            port.acquire(&scope, authority, entry)
+                .expect("released entry is reusable"),
+        );
+        drop(entries);
+        drop(retained_root);
+        let restored_root = port.acquire(&scope, authority, root).unwrap();
+        let restored_entries = (0..policy.introduction.max_records)
+            .map(|_| port.acquire(&scope, authority, entry).unwrap())
+            .collect::<Vec<_>>();
+        drop(restored_entries);
+        drop(restored_root);
+    }
+
     #[test]
     fn scheduler_policy_rejects_zero_overflow_and_bad_order() {
         let valid = SchedulerPolicyConfig::default();
@@ -3249,7 +3712,7 @@ mod tests {
         );
         assert_eq!(envelope.wal_hard_frames, SQLITE_SHM_FIRST_CHUNK_FRAMES + 1);
         assert_eq!(envelope.shm_bytes, SQLITE_SHM_CHUNK_BYTES * 2);
-        let mut threshold = policy.clone();
+        let mut threshold = policy;
         threshold.wal_checkpoint_threshold_bytes = envelope.wal_checkpoint_bytes + 1;
         assert!(threshold
             .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
@@ -3265,9 +3728,11 @@ mod tests {
             .checked_storage_envelope(u64::MAX, policy.storage_workload())
             .is_err());
 
-        let mut overflow = SemanticPolicyConfig::default();
-        overflow.max_database_bytes = u64::MAX;
-        overflow.emergency_reserve_bytes = u64::MAX;
+        let overflow = SemanticPolicyConfig {
+            max_database_bytes: u64::MAX,
+            emergency_reserve_bytes: u64::MAX,
+            ..SemanticPolicyConfig::default()
+        };
         assert!(overflow
             .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, overflow.storage_workload(),)
             .is_err());

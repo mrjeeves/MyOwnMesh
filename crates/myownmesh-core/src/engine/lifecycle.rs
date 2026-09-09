@@ -698,22 +698,6 @@ fn checked_page_limit(value: u32, name: &str) -> Result<usize> {
     Ok(value)
 }
 
-#[cfg(test)]
-mod semantic_page_tests {
-    use super::checked_page_limit;
-
-    #[test]
-    fn page_limits_are_nonzero_and_protocol_bounded() {
-        let protocol_limit = crate::protocol::RECEIVE_FRAME_BYTES as u32;
-        assert!(checked_page_limit(0, "max_facts").is_err());
-        assert_eq!(
-            checked_page_limit(protocol_limit, "max_encoded_bytes").unwrap(),
-            crate::protocol::RECEIVE_FRAME_BYTES
-        );
-        assert!(checked_page_limit(protocol_limit + 1, "max_facts").is_err());
-    }
-}
-
 /// Import one bounded canonical page through the same durable reducer used by
 /// authenticated wire delivery.  The page's provider lease remains held
 /// through preflight, reduction, and exact retention checks.
@@ -1039,4 +1023,20 @@ fn import_local_bootstrap(
         .import_expected(&expected, record)
         .map_err(|error| bootstrap_error("importing", error))?;
     ensure_bootstrap_for_config(config, imported)
+}
+
+#[cfg(test)]
+mod semantic_page_tests {
+    use super::checked_page_limit;
+
+    #[test]
+    fn page_limits_are_nonzero_and_protocol_bounded() {
+        let protocol_limit = crate::protocol::RECEIVE_FRAME_BYTES as u32;
+        assert!(checked_page_limit(0, "max_facts").is_err());
+        assert_eq!(
+            checked_page_limit(protocol_limit, "max_encoded_bytes").unwrap(),
+            crate::protocol::RECEIVE_FRAME_BYTES
+        );
+        assert!(checked_page_limit(protocol_limit + 1, "max_facts").is_err());
+    }
 }

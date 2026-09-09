@@ -201,6 +201,7 @@ fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),

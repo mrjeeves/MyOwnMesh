@@ -719,18 +719,14 @@ impl ClientRegistry {
         // retention with the flow's own strings, the node lease after the drain
         // node it funds has been freed. If the install refuses, this drops with
         // the closure that never ran.
-        let cleanup = match crate::ipc::LeasedList::<(
-            String,
-            myownmesh_core::realtime::RealtimeFlowHandle,
-            ResourceLease,
-        )>::node_claim()
-        .map_err(IpcAdmissionError::Claim)
-        .and_then(|claim| {
-            self.inner
-                .resources
-                .acquire(claim)
-                .map_err(IpcAdmissionError::Resources)
-        }) {
+        let cleanup = match crate::ipc::LeasedList::<OwnedRealtimeFlow>::node_claim()
+            .map_err(IpcAdmissionError::Claim)
+            .and_then(|claim| {
+                self.inner
+                    .resources
+                    .acquire(claim)
+                    .map_err(IpcAdmissionError::Resources)
+            }) {
             Ok(cleanup) => cleanup,
             Err(reason) => {
                 return Err(Box::new(RealtimeFlowRejected {
@@ -743,9 +739,10 @@ impl ClientRegistry {
             owner,
             LeasedMap::<String, OwnedRealtimeFlow>::entry_claim(),
             retained,
+            funded_record_retained::<RealtimeFlowSlot>(),
             flow,
-            |flow, entry, retained| {
-                owner.register_realtime_flow(network, flow, entry, retained, cleanup)
+            |flow, entry, retained, slot| {
+                owner.register_realtime_flow(network, flow, entry, retained, slot, cleanup)
             },
         )
         .map_err(|(flow, reason)| Box::new(RealtimeFlowRejected { flow, reason }))
@@ -755,9 +752,11 @@ impl ClientRegistry {
     /// of this registry — under one acquisition of the tables, so a disconnect
     /// cannot land between the check and the install.
     ///
-    /// `install` receives the funding for the one table entry it files. The
-    /// lease is acquired inside the seam rather than before it, so a value that
-    /// is never installed is never funded either.
+    /// `install` receives the funding for the table entry it files, the
+    /// capability/network retention stored with that value, and the separate
+    /// funded flow slot that can outlive the row during an in-flight Change.
+    /// All three leases are acquired inside the seam rather than before it, so
+    /// a value that is never installed is never funded either.
     ///
     /// Both failures hand `value` straight back, because the caller's obligation
     /// is the same in both: nothing was installed, and whatever `value` holds is
@@ -778,8 +777,9 @@ impl ClientRegistry {
         owner: &FundedArc<ClientHandle>,
         entry_claim: Result<ResourceClaim, ResourceClaimArithmeticError>,
         retained_claim: Result<ResourceClaim, ResourceClaimArithmeticError>,
+        slot_claim: Result<ResourceClaim, ResourceClaimArithmeticError>,
         value: T,
-        install: impl FnOnce(T, ResourceLease, ResourceLease) -> R,
+        install: impl FnOnce(T, ResourceLease, ResourceLease, ResourceLease) -> R,
     ) -> Result<R, (T, RegistrationError)> {
         let tables = self.inner.tables.lock();
         // Same acquisition as the liveness check below, so "the runtime is still
@@ -811,17 +811,23 @@ impl ClientRegistry {
             Ok(entry) => entry,
             Err(refusal) => return Err((value, refusal.into())),
         };
-        // Two leases because they are stored in two places: the node lease goes
-        // to the map and dies with the node, while the retained lease goes
+        // Three leases because they are stored in three places: the node lease
+        // goes to the map and dies with the node, the retained lease goes
         // inside the value so it survives `pop_first_entry` and travels with
-        // the owned key. Both are acquired before either is stored, so a
-        // refusal of the second installs nothing.
+        // the owned key, and the slot lease backs the FundedArc that may be
+        // held by an in-flight Change after the row is removed. All are
+        // acquired before either is stored, so a refusal of any one installs
+        // nothing.
         let retained = match acquire(retained_claim) {
             Ok(retained) => retained,
             Err(refusal) => return Err((value, refusal.into())),
         };
+        let slot = match acquire(slot_claim) {
+            Ok(slot) => slot,
+            Err(refusal) => return Err((value, refusal.into())),
+        };
         // Still holding the tables, which is the whole point of taking them.
-        Ok(install(value, entry, retained))
+        Ok(install(value, entry, retained, slot))
     }
 
     /// Remove one exact connection owner, all its claims and subscriptions,

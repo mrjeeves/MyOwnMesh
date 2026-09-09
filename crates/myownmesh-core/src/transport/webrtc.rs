@@ -45,6 +45,7 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
@@ -118,8 +119,8 @@ mod session_flow;
 /// and is published from there; the DTOs exist only to cross the application
 /// boundary and have no business inside the flow set.
 pub use provider::{
-    WebRtcRealtimeFlowOpen, WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit,
-    WebRtcRealtimeOutboundUnit,
+    RealtimeInboundArrival, WebRtcRealtimeFlowOpen, WebRtcRealtimeInboundArrival,
+    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit,
 };
 /// The connector's own short spelling of the profile.
 ///
@@ -133,6 +134,19 @@ pub use provider::{
 /// would be four names that document an expectation rather than a use.
 use session_flow::RealtimeProfile;
 pub use session_flow::WebRtcRtpKind;
+/// The per-session flow vocabulary, and nothing else from that module.
+///
+/// A re-export rather than `pub(crate) mod`: the engine stores the flow set in
+/// the promoted-session bundle and converts the rest at its DTO boundary, but
+/// `RealtimeFlow` and `RealtimeFlowPort` must stay unreachable from outside the
+/// connector. Widening the module would have exposed both.
+pub(crate) use session_flow::{
+    OpaqueFlowChange, OpaqueFlowSpec, OpaqueOutboundPump, OpaqueOutboundUnit, OpaquePumpStep,
+    RealtimeDirection, RealtimeEncoding, RealtimeFlowError, RealtimeFlowIdentity,
+    RealtimeFlowLabel, RealtimeFlowRemains, RealtimeFlowSetIdentity, RealtimeFlowSpec,
+    RealtimeInboundArrivals, RealtimeRecvUnit, RealtimeSendUnit, RealtimeTrackIdentity,
+    SessionRealtimeFlows,
+};
 /// The application's real-time configuration, and only that.
 ///
 /// One of two public re-exports from this module. `crates/myownmesh` is a
@@ -161,18 +175,6 @@ pub use session_flow::{
     RealtimeFraming as WebRtcRealtimeFraming, RealtimeProfile as WebRtcRealtimeProfile,
     RealtimeProfileError as WebRtcRealtimeProfileError,
     RealtimeRtcpFeedback as WebRtcRealtimeRtcpFeedback,
-};
-/// The per-session flow vocabulary, and nothing else from that module.
-///
-/// A re-export rather than `pub(crate) mod`: the engine stores the flow set in
-/// the promoted-session bundle and converts the rest at its DTO boundary, but
-/// `RealtimeFlow` and `RealtimeFlowPort` must stay unreachable from outside the
-/// connector. Widening the module would have exposed both.
-pub(crate) use session_flow::{
-    RealtimeDirection, RealtimeEncoding, RealtimeFlowError, RealtimeFlowIdentity,
-    RealtimeFlowLabel, RealtimeFlowRemains, RealtimeFlowSetIdentity, RealtimeFlowSpec,
-    RealtimeInboundArrivals, RealtimeRecvUnit, RealtimeSendUnit, RealtimeTrackIdentity,
-    SessionRealtimeFlows,
 };
 mod unit_assembly;
 use callback::*;
@@ -251,6 +253,120 @@ pub(crate) fn is_virtual_interface(name: &str) -> bool {
 /// channels (e.g. browser-initiated debug) don't get routed into
 /// the mesh frame path.
 pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
+const OPAQUE_RELIABLE_DATA_CHANNEL_LABEL: &str = "myownmesh-opaque-reliable";
+const OPAQUE_PARTIAL_DATA_CHANNEL_LABEL: &str = "myownmesh-opaque-partial";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpaqueNativeLaneMode {
+    ReliableOrdered,
+    PartialUnordered,
+}
+
+impl OpaqueNativeLaneMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ReliableOrdered => OPAQUE_RELIABLE_DATA_CHANNEL_LABEL,
+            Self::PartialUnordered => OPAQUE_PARTIAL_DATA_CHANNEL_LABEL,
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            OPAQUE_RELIABLE_DATA_CHANNEL_LABEL => Some(Self::ReliableOrdered),
+            OPAQUE_PARTIAL_DATA_CHANNEL_LABEL => Some(Self::PartialUnordered),
+            _ => None,
+        }
+    }
+
+    const fn mode_tag(self) -> u8 {
+        match self {
+            Self::ReliableOrdered => 0,
+            Self::PartialUnordered => 1,
+        }
+    }
+
+    /// Validate the native channel's negotiated reliability, rather than
+    /// trusting its label.  A label is application data; these getters are
+    /// the provider's authenticated lane provenance.
+    fn matches_channel(self, channel: &RTCDataChannel) -> bool {
+        opaque_native_parameters_match(
+            self,
+            channel.ordered(),
+            channel.max_retransmits(),
+            channel.max_packet_lifetime(),
+        )
+    }
+}
+
+/// The provider's fixed reliability contract, factored so its source-level
+/// controls can exercise every mismatch without fabricating a native channel.
+fn opaque_native_parameters_match(
+    mode: OpaqueNativeLaneMode,
+    ordered: bool,
+    max_retransmits: Option<u16>,
+    max_packet_lifetime: Option<u16>,
+) -> bool {
+    match mode {
+        OpaqueNativeLaneMode::ReliableOrdered => {
+            ordered && max_retransmits.is_none() && max_packet_lifetime.is_none()
+        }
+        OpaqueNativeLaneMode::PartialUnordered => {
+            !ordered && max_retransmits == Some(0) && max_packet_lifetime.is_none()
+        }
+    }
+}
+
+impl From<OpaqueNativeLaneMode> for crate::realtime::OpaqueFlowMode {
+    fn from(mode: OpaqueNativeLaneMode) -> Self {
+        match mode {
+            OpaqueNativeLaneMode::ReliableOrdered => Self::ReliableOrdered,
+            // The provider's fixed partial lane intentionally supports only
+            // the explicitly negotiated zero-retransmit profile.
+            OpaqueNativeLaneMode::PartialUnordered => Self::PartialUnordered { max_retransmits: 0 },
+        }
+    }
+}
+
+struct OpaqueNativeLane {
+    channel: Arc<RTCDataChannel>,
+    _lease: crate::resource::ResourceLease,
+}
+
+#[derive(Default)]
+struct OpaqueNativeLanes {
+    reliable: Option<OpaqueNativeLane>,
+    partial: Option<OpaqueNativeLane>,
+}
+
+impl OpaqueNativeLanes {
+    fn get(&self, mode: OpaqueNativeLaneMode) -> Option<&OpaqueNativeLane> {
+        match mode {
+            OpaqueNativeLaneMode::ReliableOrdered => self.reliable.as_ref(),
+            OpaqueNativeLaneMode::PartialUnordered => self.partial.as_ref(),
+        }
+    }
+
+    fn insert(&mut self, mode: OpaqueNativeLaneMode, lane: OpaqueNativeLane) -> bool {
+        let slot = match mode {
+            OpaqueNativeLaneMode::ReliableOrdered => &mut self.reliable,
+            OpaqueNativeLaneMode::PartialUnordered => &mut self.partial,
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(lane);
+        true
+    }
+}
+
+fn opaque_native_lane_claim(
+) -> std::result::Result<crate::resource::ResourceClaim, ResourceUnavailable> {
+    RealtimeFlowRegistry::flow_root_claim(size_of::<OpaqueNativeLane>())
+}
+
+fn opaque_frame_matches_lane(bytes: &Bytes, mode: OpaqueNativeLaneMode) -> bool {
+    bytes.len() > 5 && bytes.as_ref()[5] == mode.mode_tag()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeDataChannelAdmission {
@@ -299,6 +415,13 @@ pub enum TransportEvent {
     DataChannelOpen,
     /// Inbound application frame.
     Message(Bytes),
+    /// Inbound application-owned opaque-flow frame. The mode is stamped by
+    /// the authenticated native lane callback; it is provenance, not a value
+    /// learned from the untrusted frame header.
+    ApplicationFlowMessage {
+        mode: crate::realtime::OpaqueFlowMode,
+        bytes: Bytes,
+    },
     /// Data channel closed (peer initiated or local error).
     DataChannelClosed,
     /// The local track set changed (a media lane opened or closed) and
@@ -1082,6 +1205,10 @@ pub(crate) struct RealtimeInboundRetirement {
     /// `None` once submitted or once taken by an explicit close, which is what
     /// makes the slot fund exactly one submission.
     slot: Option<crate::resource::ResourceLease>,
+    /// Shared flow-set witness retained by the actual cleanup owner until the
+    /// native retirement reaches a terminal result, even if the close waiter
+    /// is dropped.
+    tail: Option<session_flow::RealtimeNativeTail>,
 }
 
 impl RealtimeInboundRetirement {
@@ -1099,6 +1226,11 @@ impl RealtimeInboundRetirement {
         // connector for an empty seat.
         self.slot = None;
         Arc::clone(&self.identity)
+    }
+
+    fn attach_native_tail(&mut self, tail: session_flow::RealtimeNativeTail) {
+        debug_assert!(self.tail.is_none(), "inbound retirement received two tails");
+        self.tail = Some(tail);
     }
 
     /// Which token this retirement is for, for controls that need to say *which*
@@ -1144,6 +1276,7 @@ impl Drop for RealtimeInboundRetirement {
             return;
         };
         let identity = Arc::clone(&self.identity);
+        let tail = self.tail.take();
         let failed = Arc::clone(&tracks);
         let failed_identity = Arc::clone(&identity);
         // Synchronous. The executor owns the thread and the runtime that will
@@ -1152,7 +1285,10 @@ impl Drop for RealtimeInboundRetirement {
         // from a runtime that is itself shutting down.
         let submitted = self.submission.submit_subordinate(
             slot,
-            Box::pin(async move { tracks.stop_claimed(&identity).await }),
+            Box::pin(async move {
+                let _tail = tail;
+                tracks.stop_claimed(&identity).await;
+            }),
             Box::new(|| {}),
             Box::new(move |reason| {
                 // The executor refused or died, so this transceiver will not be
@@ -1462,6 +1598,7 @@ impl RealtimeSessionTracks {
             tracks: Some(Arc::downgrade(self)),
             submission,
             slot: Some(slot),
+            tail: None,
         }
     }
 
@@ -2066,6 +2203,7 @@ impl ConnectorEventMailboxes {
         let class = ConnectorCallbackClass::for_event(&event);
         let (payload_bytes, retained_slack) = match &event {
             TransportEvent::Message(bytes) => (bytes.len(), 0),
+            TransportEvent::ApplicationFlowMessage { bytes, .. } => (bytes.len(), 0),
             // The payload lease it carries bounds *registry* retention; this
             // bounds the callback pump's own class budget, which is what
             // decides whether the event is admitted to the callback queue at
@@ -2368,12 +2506,15 @@ impl ConnectorEventSink {
     }
 
     async fn emit_data_channel(&self, event: TransportEvent) -> bool {
-        let endpoint_protocol = matches!(&event, TransportEvent::Message(_));
+        let endpoint_protocol = matches!(
+            &event,
+            TransportEvent::Message(_) | TransportEvent::ApplicationFlowMessage { .. }
+        );
         let result = self.try_emit_data_channel(event).await;
         self.finish_data_channel_insert(endpoint_protocol, result)
     }
 
-    #[cfg(feature = "route-flow-diagnostics")]
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
     async fn emit_observed_message(
         &self,
         bytes: Bytes,
@@ -2445,6 +2586,50 @@ impl ConnectorEventSink {
                 },
                 message_kind,
             );
+            Ok(result)
+        }
+    }
+
+    /// Enter a native opaque-lane callback. The lane mode is supplied by the
+    /// callback installation that authenticated the native channel; the frame
+    /// header is checked before this function is called and cannot select its
+    /// own reliability semantics.
+    fn begin_application_flow_callback(
+        &self,
+        mode: crate::realtime::OpaqueFlowMode,
+        bytes: Bytes,
+        callback_observation: &Option<CallbackObservationLease>,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<ConnectorCallbackInsertResult, CallbackProducerOverload>,
+    > + Send
+           + 'static {
+        let _keep_callback_observation = callback_observation;
+        let admitted = match self.begin_native_callback_operation_with_payload(
+            ConnectorCallbackClass::EndpointData,
+            bytes.len(),
+            0,
+        ) {
+            Ok(work) => Ok((self.clone(), work, bytes)),
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "refusing native opaque-flow callback under resource pressure"
+                );
+                drop(bytes);
+                Err(error)
+            }
+        };
+        async move {
+            let (tx, _callback_work, bytes) = admitted?;
+            let result = tx
+                .emit_inner(
+                    TransportEvent::ApplicationFlowMessage { mode, bytes },
+                    true,
+                    #[cfg(feature = "route-flow-diagnostics")]
+                    None,
+                )
+                .await;
+            let _accepted = tx.finish_data_channel_insert(true, result);
             Ok(result)
         }
     }
@@ -2664,6 +2849,7 @@ impl ConnectorEventSink {
         let callback_class = ConnectorCallbackClass::for_event(&event);
         let (payload_bytes, retained_slack) = match &event {
             TransportEvent::Message(bytes) => (bytes.len(), 0),
+            TransportEvent::ApplicationFlowMessage { bytes, .. } => (bytes.len(), 0),
             // Same reasoning as the other admission site: charged here as well
             // as against its payload lease, because the two bound different
             // resources.
@@ -2692,7 +2878,9 @@ impl ConnectorEventSink {
             }
         };
         let family = match &event {
-            TransportEvent::Message(_) => PreAuthResourceFamily::FrameBytes,
+            TransportEvent::Message(_) | TransportEvent::ApplicationFlowMessage { .. } => {
+                PreAuthResourceFamily::FrameBytes
+            }
             TransportEvent::RealtimeUnit(_) => PreAuthResourceFamily::MediaQuarantine,
             _ => PreAuthResourceFamily::ConnectorSpecificWork,
         };
@@ -3155,10 +3343,6 @@ enum DataChannelOpenTransition {
 pub(crate) struct RemoteDescriptionApplyReport {
     pub(crate) queued_candidate_count: usize,
     pub(crate) candidate_failure_count: usize,
-    /// The exact number of admitted candidates was also the parallelism bound:
-    /// every candidate already owns its queue/attempt leases, so no hidden
-    /// scheduler cap is introduced between admission and native application.
-    pub(crate) candidate_parallelism_bound: usize,
 }
 
 /// One remote candidate paired with the observation that follows its owner.
@@ -4625,7 +4809,9 @@ impl ConnectorOwnership {
             // match rather than an inference about a caller.
             (
                 ConnectorAuthorityState::Awaiting { liveness, .. },
-                TransportEvent::Message(_) | TransportEvent::RealtimeUnit(_),
+                TransportEvent::Message(_)
+                | TransportEvent::ApplicationFlowMessage { .. }
+                | TransportEvent::RealtimeUnit(_),
             ) => {
                 let _ = liveness;
                 false
@@ -5048,10 +5234,7 @@ fn observe_callback_if(
         #[cfg(feature = "transport-lab")]
         {
             let id = NEXT_CALLBACK_OBSERVATION_ID.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "[transport-lab] callback-observation constructed id={} site={}",
-                id, site
-            );
+            eprintln!("[transport-lab] callback-observation constructed id={id} site={site}");
             CallbackObservationLease {
                 id,
                 site,
@@ -5515,6 +5698,56 @@ impl WebRtcConnectorWorker {
         self.session.realtime_tracks.stop_claimed(identity).await;
     }
 
+    /// Forward the exact persistent-lane readiness read to engine callers.
+    /// Logical flow readiness cannot substitute for the native channel's
+    /// current ready state when completing an Open/Accept transaction.
+    pub(crate) fn opaque_native_mode_ready(&self, mode: crate::realtime::OpaqueFlowMode) -> bool {
+        self.session.opaque_native_mode_ready(mode)
+    }
+
+    /// Observe actual native application backlog after the caller has
+    /// released the flow-set lock and reserved its retirement operation.
+    pub(crate) async fn native_application_backlog_empty(&self) -> bool {
+        self.session.native_application_backlog_empty().await
+    }
+
+    /// Start the single persistent-lane pump claimed by one exact opaque flow.
+    /// The pump owns each dequeued unit until the native write resolves and
+    /// reports completion through the flow's captured native remainder.
+    pub(crate) fn spawn_opaque_outbound_pump(
+        &self,
+        pump: OpaqueOutboundPump,
+        retired: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let session = Arc::clone(&self.session);
+        let incarnation = Arc::clone(&self.ownership.incarnation);
+        let close_owner = Arc::clone(&self.close_owner);
+        let task = tokio::spawn(async move {
+            loop {
+                match pump.next() {
+                    OpaquePumpStep::Unit(unit) => {
+                        if !incarnation.is_active() {
+                            pump.mark_failed();
+                            break;
+                        }
+                        if !pump
+                            .native_write_finished(session.send_opaque_native(unit).await.is_ok())
+                        {
+                            // A failed native write is terminal for this
+                            // logical queue.  Keep later sends from being
+                            // accepted behind a pump that cannot drain them.
+                            break;
+                        }
+                    }
+                    OpaquePumpStep::Empty => pump.ready().await,
+                    OpaquePumpStep::Closed => break,
+                }
+            }
+            let _ = retired.send(());
+        });
+        close_owner.retain_transport_task(task);
+    }
+
     /// The retirement this connector will honour for one token, for the flow
     /// that is about to be bound to it.
     ///
@@ -5624,6 +5857,19 @@ impl WebRtcConnectorWorker {
         &self,
     ) -> Option<&Arc<crate::connector::ConnectorIncarnation>> {
         self.ownership.live_connector_incarnation()
+    }
+
+    /// Whether `incarnation` names this worker's exact connector identity.
+    ///
+    /// This is deliberately an identity-only predicate.  Retirement callers
+    /// establish the lifecycle/terminal fence separately; consulting the
+    /// worker's liveness here would reject the historical identity that the
+    /// terminal custody path must still be able to match.
+    pub(crate) fn matches_connector_identity_for_retirement(
+        &self,
+        incarnation: &Arc<crate::connector::ConnectorIncarnation>,
+    ) -> bool {
+        self.ownership.incarnation.generic().is_same(incarnation)
     }
 
     fn admitted(
@@ -5956,7 +6202,6 @@ impl WebRtcConnectorWorker {
             return Ok(RemoteDescriptionApplyReport {
                 queued_candidate_count,
                 candidate_failure_count,
-                candidate_parallelism_bound: 0,
             });
         }
 
@@ -6092,7 +6337,6 @@ impl WebRtcConnectorWorker {
         Ok(RemoteDescriptionApplyReport {
             queued_candidate_count,
             candidate_failure_count,
-            candidate_parallelism_bound: queued_candidate_count,
         })
     }
 
@@ -7600,6 +7844,7 @@ impl Transport {
                 close_owner: callback_close_owner,
             };
             let data_channel = Arc::new(SyncMutex::new(None::<Arc<RTCDataChannel>>));
+            let opaque_data_channels = Arc::new(SyncMutex::new(OpaqueNativeLanes::default()));
 
             // Built before the callbacks so the `on_track` handler and the
             // session share one object rather than two that could diverge.
@@ -7635,7 +7880,9 @@ impl Transport {
                 &pc,
                 &event_sink,
                 &data_channel,
+                &opaque_data_channels,
                 resource_scope.clone(),
+                work_resource_scope.clone(),
                 Arc::clone(&realtime_tracks),
             );
 
@@ -7666,11 +7913,77 @@ impl Transport {
                     resource_scope.as_ref(),
                 );
                 *data_channel.lock() = Some(dc);
+
+                if matches!(
+                    callback_policy.realtime(),
+                    RealtimeConnectorPolicy::Enabled
+                ) {
+                    // Opaque capabilities are fixed native lanes, established
+                    // with the initial offer. Logical application flows later
+                    // multiplex on these lanes and never allocate channels of
+                    // their own. Each lane's wrapper is funded before the native
+                    // object is created and retained until peer teardown.
+                    let Some(scope) = work_resource_scope.as_ref() else {
+                        return Err(Error::Transport(
+                            "enabled opaque lanes require a connector work scope".to_string(),
+                        ));
+                    };
+                    for mode in [
+                    OpaqueNativeLaneMode::ReliableOrdered,
+                    OpaqueNativeLaneMode::PartialUnordered,
+                    ] {
+                    let claim = opaque_native_lane_claim().map_err(|error| {
+                        Error::Transport(format!("opaque native lane claim overflowed: {error:?}"))
+                    })?;
+                    let lease = scope
+                        .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
+                        .map_err(Error::ResourceUnavailable)?;
+                    let init = match mode {
+                        OpaqueNativeLaneMode::ReliableOrdered => RTCDataChannelInit {
+                            ordered: Some(true),
+                            ..Default::default()
+                        },
+                        OpaqueNativeLaneMode::PartialUnordered => RTCDataChannelInit {
+                            ordered: Some(false),
+                            max_retransmits: Some(0),
+                            ..Default::default()
+                        },
+                    };
+                    let lane = pc
+                        .create_data_channel(mode.label(), Some(init))
+                        .await
+                        .map_err(|e| Error::Transport(format!("create opaque data channel: {e}")))?;
+                    if !mode.matches_channel(&lane) {
+                        return Err(Error::Transport(
+                            "created opaque native data-channel reliability disagrees with its fixed lane"
+                                .to_string(),
+                        ));
+                    }
+                    install_opaque_data_channel_handlers(
+                        lane.clone(),
+                        event_sink.clone(),
+                        resource_scope.as_ref(),
+                        mode,
+                    );
+                    if !opaque_data_channels.lock().insert(
+                        mode,
+                        OpaqueNativeLane {
+                            channel: lane,
+                            _lease: lease,
+                        },
+                    ) {
+                        return Err(Error::Transport(
+                            "duplicate opaque native lane during construction".to_string(),
+                        ));
+                    }
+                }
+                }
             }
 
             let session = PeerSession {
                 pc,
                 data_channel,
+                opaque_data_channels,
                 realtime_profile,
                 realtime_tracks,
                 _events_tx: event_sink,
@@ -7805,7 +8118,9 @@ fn register_callbacks(
     pc: &Arc<RTCPeerConnection>,
     events_tx: &ConnectorEventSink,
     data_channel: &Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
+    opaque_data_channels: &Arc<SyncMutex<OpaqueNativeLanes>>,
     resource_scope: Option<PeerConnectionResourceScope>,
+    work_resource_scope: Option<ConnectorWorkResourceScope>,
     realtime_tracks: Arc<RealtimeSessionTracks>,
 ) {
     // Local ICE candidate gathered — ship via signaling.
@@ -7924,7 +8239,9 @@ fn register_callbacks(
     {
         let tx = events_tx.clone();
         let dc_slot = data_channel.clone();
+        let opaque_slots = opaque_data_channels.clone();
         let handler_scope = resource_scope.clone();
+        let handler_work_scope = work_resource_scope.clone();
         let callback_observation =
             observe_callback_if(resource_scope.as_ref(), "data-channel-arrival");
         pc.on_data_channel(Box::new(move |dc| {
@@ -7943,12 +8260,64 @@ fn register_callbacks(
                 };
             let tx = tx.clone();
             let dc_slot = dc_slot.clone();
+            let opaque_slots = opaque_slots.clone();
             let handler_scope = handler_scope.clone();
+            let handler_work_scope = handler_work_scope.clone();
             Box::pin(async move {
                 let _callback_work = callback_work;
                 let Some(_operation) = tx.operation_fence.try_enter() else {
                     return;
                 };
+                if let Some(mode) = OpaqueNativeLaneMode::from_label(dc.label()) {
+                    let Some(scope) = handler_work_scope.as_ref() else {
+                        tx.structural_violation(
+                            "opaque native data-channel arrived without connector funding",
+                        );
+                        return;
+                    };
+                    if !mode.matches_channel(&dc) {
+                        tx.structural_violation(
+                            "opaque native data-channel reliability disagrees with its fixed lane",
+                        );
+                        return;
+                    }
+                    let claim = match opaque_native_lane_claim() {
+                        Ok(claim) => claim,
+                        Err(_) => {
+                            tx.structural_violation("opaque native data-channel claim overflowed");
+                            return;
+                        }
+                    };
+                    let lease = match scope
+                        .acquire(crate::resource::ResourceAuthorityClass::Admitted, claim)
+                    {
+                        Ok(lease) => lease,
+                        Err(_) => {
+                            tx.structural_violation(
+                                "opaque native data-channel refused by connector funding",
+                            );
+                            return;
+                        }
+                    };
+                    let installed = opaque_slots.lock().insert(
+                        mode,
+                        OpaqueNativeLane {
+                            channel: dc.clone(),
+                            _lease: lease,
+                        },
+                    );
+                    if !installed {
+                        tx.structural_violation("duplicate opaque native data-channel");
+                        return;
+                    }
+                    install_opaque_data_channel_handlers(
+                        dc.clone(),
+                        tx,
+                        handler_scope.as_ref(),
+                        mode,
+                    );
+                    return;
+                }
                 {
                     let mut slot = dc_slot.lock();
                     match admit_native_data_channel(dc.label(), slot.is_some()) {
@@ -8205,6 +8574,85 @@ fn install_data_channel_handlers(
             Box::pin(async move {
                 let _callback_work = callback_work;
                 warn!("data channel error: {err}");
+                tx.emit_data_channel(TransportEvent::DataChannelClosed)
+                    .await;
+            })
+        }));
+    }
+}
+
+/// Install handlers for one authenticated persistent opaque lane. Its mode is
+/// captured from the native channel label/negotiation, so a frame header cannot
+/// claim a different reliability class. Lane lifecycle is connector lifecycle:
+/// if a native lane closes, the existing data-channel close path retires the
+/// session rather than silently leaving logical flows stranded.
+fn install_opaque_data_channel_handlers(
+    dc: Arc<RTCDataChannel>,
+    tx: ConnectorEventSink,
+    resource_scope: Option<&PeerConnectionResourceScope>,
+    mode: OpaqueNativeLaneMode,
+) {
+    {
+        let tx = tx.clone();
+        let callback_observation = observe_callback_if(resource_scope, "opaque-lane-close");
+        dc.on_close(Box::new(move || {
+            let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing opaque-lane close callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _callback_work = callback_work;
+                tx.emit_data_channel(TransportEvent::DataChannelClosed)
+                    .await;
+            })
+        }));
+    }
+    {
+        let tx = tx.clone();
+        let callback_observation = observe_callback_if(resource_scope, "opaque-lane-message");
+        dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            if !opaque_frame_matches_lane(&msg.data, mode) {
+                tx.structural_violation("opaque native frame mode disagrees with its lane");
+                return Box::pin(async {});
+            }
+            let callback =
+                tx.begin_application_flow_callback(mode.into(), msg.data, &callback_observation);
+            Box::pin(async move {
+                let _ = callback.await;
+            })
+        }));
+    }
+    {
+        let tx = tx.clone();
+        let callback_observation = observe_callback_if(resource_scope, "opaque-lane-error");
+        dc.on_error(Box::new(move |err| {
+            let _keep_callback_observation = &callback_observation;
+            let callback_work =
+                match tx.begin_native_callback_operation(ConnectorCallbackClass::Control) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "refusing opaque-lane error callback under resource pressure"
+                        );
+                        tx.retire_after_callback_violation();
+                        return Box::pin(async {});
+                    }
+                };
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _callback_work = callback_work;
+                warn!("opaque data channel error: {err}");
                 tx.emit_data_channel(TransportEvent::DataChannelClosed)
                     .await;
             })
@@ -9187,6 +9635,7 @@ fn sdp_ice_credentials_owned(
 pub struct PeerSession {
     pc: Arc<RTCPeerConnection>,
     data_channel: Arc<SyncMutex<Option<Arc<RTCDataChannel>>>>,
+    opaque_data_channels: Arc<SyncMutex<OpaqueNativeLanes>>,
     /// The application's registered codecs, retained past media-engine
     /// construction.
     ///
@@ -9268,6 +9717,116 @@ impl PeerSession {
     /// (open and `on_open` fired).
     pub async fn has_data_channel(&self) -> bool {
         self.data_channel.lock().is_some()
+    }
+
+    /// Return the authenticated persistent native lane for an opaque mode.
+    ///
+    /// The lane is retained by this exact peer session and is never created by
+    /// a logical flow open. Partial reliability is intentionally fixed at zero
+    /// retransmits; other values are refused by the provider DTO conversion.
+    pub(crate) fn opaque_native_lane(
+        &self,
+        mode: crate::realtime::OpaqueFlowMode,
+    ) -> Option<Arc<RTCDataChannel>> {
+        let mode = match mode {
+            crate::realtime::OpaqueFlowMode::ReliableOrdered => {
+                OpaqueNativeLaneMode::ReliableOrdered
+            }
+            crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits: 0 } => {
+                OpaqueNativeLaneMode::PartialUnordered
+            }
+            crate::realtime::OpaqueFlowMode::PartialUnordered { .. } => return None,
+        };
+        self.opaque_data_channels
+            .lock()
+            .get(mode)
+            .map(|lane| Arc::clone(&lane.channel))
+    }
+
+    /// Read actual native readiness for the fixed persistent lane. Logical
+    /// flow readiness is not enough: an Open/Accept may only expose a handle
+    /// once the represented channel itself is open.
+    pub(crate) fn opaque_native_mode_ready(&self, mode: crate::realtime::OpaqueFlowMode) -> bool {
+        self.opaque_native_lane(mode)
+            .is_some_and(|channel| channel.ready_state() == RTCDataChannelState::Open)
+    }
+
+    /// Write one already-admitted opaque unit to its persistent native lane.
+    ///
+    /// The unit carries the queue/output lease, so moving it into this future
+    /// keeps the provider custody live until the native write resolves. The
+    /// frame coordinate and negotiated body ceiling come from the current flow
+    /// record; callers cannot supply a replacement coordinate or silently use
+    /// the other lane's reliability mode.
+    pub(crate) async fn send_opaque_native(&self, unit: OpaqueOutboundUnit) -> Result<usize> {
+        let channel = self
+            .opaque_native_lane(unit.mode)
+            .ok_or_else(|| Error::Transport("opaque native lane unavailable".to_string()))?;
+        let frame_bytes = crate::protocol::application_flow::APPLICATION_FLOW_HEADER_BYTES
+            .checked_add(unit.data.len())
+            .ok_or_else(|| Error::Transport("opaque frame size overflowed".to_string()))?;
+        // The body lease belongs to the logical flow. This separate operation
+        // lease prices the encoded MOMF Vec (and its owned provider metadata)
+        // before `encode_application_flow` allocates it; it remains live until
+        // the native send future has completed.
+        let frame_claim = RealtimeFlowRegistry::output_claim(frame_bytes)
+            .map_err(|error| Error::Transport(format!("opaque frame claim: {error}")))?;
+        let Some(work_scope) = self.work_resource_scope.as_ref() else {
+            return Err(Error::Transport(
+                "opaque frame has no connector work scope to fund".to_string(),
+            ));
+        };
+        let _frame_lease = work_scope
+            .acquire(
+                crate::resource::ResourceAuthorityClass::Speculative,
+                frame_claim,
+            )
+            .map_err(|error| Error::Transport(format!("opaque frame lease: {error}")))?;
+        let wire = crate::protocol::application_flow::encode_application_flow(
+            unit.coordinate,
+            unit.direction,
+            match unit.mode {
+                crate::realtime::OpaqueFlowMode::ReliableOrdered => {
+                    crate::protocol::application_flow::ApplicationFlowMode::ReliableOrdered
+                }
+                crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits } => {
+                    crate::protocol::application_flow::ApplicationFlowMode::PartialUnordered {
+                        max_retransmits,
+                    }
+                }
+            },
+            &unit.data,
+            unit.max_unit_bytes,
+        )
+        .map_err(|error| Error::Transport(format!("opaque frame encoding refused: {error}")))?;
+        let wire = Bytes::from(wire);
+        let sent = channel
+            .send(&wire)
+            .await
+            .map_err(|error| Error::Transport(format!("opaque data-channel send: {error}")))?;
+        drop(unit);
+        Ok(sent)
+    }
+
+    /// Read the native application backlog for idle-retirement planning.
+    ///
+    /// This observes actual SCTP buffered bytes on the ordinary application
+    /// channel and both persistent opaque lanes. Logical flow queues and their
+    /// leases are checked separately by the flow-set owner.
+    pub(crate) async fn native_application_backlog_empty(&self) -> bool {
+        let channels = [
+            self.data_channel.lock().clone(),
+            self.opaque_native_lane(crate::realtime::OpaqueFlowMode::ReliableOrdered),
+            self.opaque_native_lane(crate::realtime::OpaqueFlowMode::PartialUnordered {
+                max_retransmits: 0,
+            }),
+        ];
+        for channel in channels.into_iter().flatten() {
+            if channel.buffered_amount().await != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Build an offer SDP. Offerer-only (answerer never calls this).
@@ -20613,6 +21172,7 @@ mod tests {
     /// admission fence is allowed to bind.
     async fn v4_arc03h_close_wins_before_connector_naming() {
         let owner = test_resource_owner(1, 4);
+        let owner_observation = owner.clone();
         let scope = ProcessResourceRoot::isolated()
             .mesh_runtime_scope()
             .network_instance_scope()
@@ -20620,7 +21180,7 @@ mod tests {
         let transport = Transport::new()
             .expect("test transport")
             .with_connector_resource_scope(owner, test_generic_realtime_webrtc_profile(4));
-        let (worker, _events) = transport
+        let (worker, events) = transport
             .open_connector_peer(Role::Answerer, &[], &[], scope)
             .await
             .expect("real-time connector is constructed");
@@ -20629,19 +21189,93 @@ mod tests {
             _ => panic!("live connector produces one Endpoint Auth handoff"),
         };
         let task = task_from_handoff(handoff);
-        assert!(
-            worker.live_connector_incarnation().is_some(),
-            "non-vacuity — a live connector really can be named"
-        );
-        assert!(worker.owns_endpoint_auth(&task));
+        let exact_incarnation = worker
+            .live_connector_incarnation()
+            .cloned()
+            .expect("non-vacuity: the connector exposes its live identity");
+        let foreign_incarnation = crate::connector::ConnectorIncarnation::new();
+        let exact_strong_count = Arc::strong_count(&exact_incarnation);
+        let report_before_identity = owner_observation.report();
+        let live_identity_before = worker.live_connector_incarnation().is_some();
+        let mut exact_identity_before = true;
+        let mut foreign_identity_before = true;
+        for _ in 0..3 {
+            exact_identity_before = worker
+                .matches_connector_identity_for_retirement(&exact_incarnation)
+                && exact_identity_before;
+            foreign_identity_before = !worker
+                .matches_connector_identity_for_retirement(&foreign_incarnation)
+                && foreign_identity_before;
+        }
+        let exact_strong_count_unchanged_before =
+            Arc::strong_count(&exact_incarnation) == exact_strong_count;
+        let report_after_identity = owner_observation.report();
+        let identity_reads_preserve_owner_state = report_before_identity.active_candidates
+            == report_after_identity.active_candidates
+            && report_before_identity.failed_cleanup_candidates
+                == report_after_identity.failed_cleanup_candidates
+            && report_before_identity.accounting_poisoned
+                == report_after_identity.accounting_poisoned;
+        let owns_endpoint_auth_before = worker.owns_endpoint_auth(&task);
 
         worker.retire();
-        assert!(worker.live_connector_incarnation().is_none());
-        assert!(!worker.owns_endpoint_auth(&task));
-        worker
-            .retire_and_close()
-            .await
-            .expect("native peer closes through its exact owner");
+        let live_identity_after = worker.live_connector_incarnation().is_none();
+        task.retire();
+        let task_identity_matches_after_retire =
+            worker.matches_connector_identity_for_retirement(task.incarnation());
+        let task_belongs_after_retire = task.belongs_to(task.incarnation());
+        let retired_strong_count = Arc::strong_count(&exact_incarnation);
+        let report_before_retired_identity = owner_observation.report();
+        let mut exact_identity_after = true;
+        let mut foreign_identity_after = true;
+        for _ in 0..3 {
+            exact_identity_after = worker
+                .matches_connector_identity_for_retirement(&exact_incarnation)
+                && exact_identity_after;
+            foreign_identity_after = !worker
+                .matches_connector_identity_for_retirement(&foreign_incarnation)
+                && foreign_identity_after;
+        }
+        let exact_strong_count_unchanged_after =
+            Arc::strong_count(&exact_incarnation) == retired_strong_count;
+        let report_after_retired_identity = owner_observation.report();
+        let retired_identity_reads_preserve_owner_state = report_before_retired_identity
+            .active_candidates
+            == report_after_retired_identity.active_candidates
+            && report_before_retired_identity.failed_cleanup_candidates
+                == report_after_retired_identity.failed_cleanup_candidates
+            && report_before_retired_identity.accounting_poisoned
+                == report_after_retired_identity.accounting_poisoned;
+        let owns_endpoint_auth_after = worker.owns_endpoint_auth(&task);
+        let close_result = worker.retire_and_close().await;
+        drop(task);
+        drop(events);
+        drop(worker);
+        drop(transport);
+        drop(exact_incarnation);
+        drop(foreign_incarnation);
+        let final_report = owner_observation.report();
+        assert!(live_identity_before);
+        assert!(exact_identity_before);
+        assert!(foreign_identity_before);
+        assert!(exact_strong_count_unchanged_before);
+        assert!(owns_endpoint_auth_before);
+        assert!(live_identity_after);
+        assert!(exact_identity_after);
+        assert!(foreign_identity_after);
+        assert!(exact_strong_count_unchanged_after);
+        assert!(task_identity_matches_after_retire);
+        assert!(!task_belongs_after_retire);
+        assert!(!owns_endpoint_auth_after);
+        assert!(identity_reads_preserve_owner_state);
+        assert!(retired_identity_reads_preserve_owner_state);
+        assert!(
+            close_result.is_ok(),
+            "native peer closes through its exact owner"
+        );
+        assert_eq!(final_report.active_candidates, 0);
+        assert_eq!(final_report.failed_cleanup_candidates, 0);
+        assert!(!final_report.accounting_poisoned);
     }
 
     /// A real-time unit is admitted only while the session that could have
@@ -20722,5 +21356,70 @@ mod tests {
             .retire_and_close()
             .await
             .expect("native peer closes through its exact owner");
+    }
+
+    #[test]
+    fn v4_opaque_partial_request_rejects_nonzero_retransmit_profile() {
+        let request = crate::realtime::OpaqueFlowOpen::new(
+            b"unsupported-partial".to_vec(),
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits: 1 },
+            128,
+        )
+        .expect("the label and body are representable; the mode is the rejected part");
+        assert!(matches!(
+            OpaqueFlowSpec::try_from(request),
+            Err(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)
+        ));
+    }
+
+    #[test]
+    fn v4_opaque_native_lane_parameter_predicate_rejects_mismatch() {
+        // This is a deterministic source-level control for the predicate used
+        // by both real RTCDataChannel creation and the incoming callback. The
+        // callback/runtime controls remain responsible for exercising actual
+        // native getter values.
+        assert!(opaque_native_parameters_match(
+            OpaqueNativeLaneMode::ReliableOrdered,
+            true,
+            None,
+            None,
+        ));
+        assert!(!opaque_native_parameters_match(
+            OpaqueNativeLaneMode::ReliableOrdered,
+            false,
+            None,
+            None,
+        ));
+        assert!(!opaque_native_parameters_match(
+            OpaqueNativeLaneMode::ReliableOrdered,
+            true,
+            Some(0),
+            None,
+        ));
+        assert!(!opaque_native_parameters_match(
+            OpaqueNativeLaneMode::ReliableOrdered,
+            true,
+            None,
+            Some(1),
+        ));
+        assert!(opaque_native_parameters_match(
+            OpaqueNativeLaneMode::PartialUnordered,
+            false,
+            Some(0),
+            None,
+        ));
+        assert!(!opaque_native_parameters_match(
+            OpaqueNativeLaneMode::PartialUnordered,
+            false,
+            Some(1),
+            None,
+        ));
+        assert!(!opaque_native_parameters_match(
+            OpaqueNativeLaneMode::PartialUnordered,
+            false,
+            Some(0),
+            Some(1),
+        ));
     }
 }

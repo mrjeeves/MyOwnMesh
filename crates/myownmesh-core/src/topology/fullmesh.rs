@@ -44,7 +44,7 @@ impl Topology for FullMeshSelector {
             }
             if selected
                 .as_ref()
-                .map_or(true, |current: &String| peer.as_str() < current.as_str())
+                .is_none_or(|current: &String| peer.as_str() < current.as_str())
             {
                 selected = Some(peer.clone());
             }
@@ -94,7 +94,7 @@ mod tests {
     fn bounded_next_hops_refuses_zero_and_deduplicates_large_input() {
         let sel = FullMeshSelector;
         let connected: Vec<String> = std::iter::once("peer-a".to_string())
-            .chain(std::iter::repeat("peer-a".to_string()).take(100_000))
+            .chain(std::iter::repeat_n("peer-a".to_string(), 100_000))
             .chain(std::iter::once("self".to_string()))
             .collect();
         assert!(sel.next_hops("self", "peer-a", &connected, 0).is_empty());

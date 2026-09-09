@@ -85,6 +85,7 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
         tree: None,
         hub: None,
         local_observations: None,
+        application_transport: None,
         semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),

@@ -893,6 +893,11 @@ pub(crate) fn registry_fixture_claim(
         .checked_add(planned(
             LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?,
         ))?
+        .checked_add(planned(realtime_flow_retained(
+            REALTIME_CAPABILITY_BYTES,
+            &"x".repeat(coordinate),
+        )?))?
+        .checked_add(planned(funded_record_retained::<RealtimeFlowSlot>()?))?
         .checked_add(planned(pending_cancellation_claim()?))?;
     // The off-node half, priced from the same helpers the registry charges
     // with. A `PendingKey` carries four coordinates and a `ClaimKey` two, and
@@ -941,6 +946,43 @@ pub use identity::{ClaimKey, ClientCapability, ClientId, RealtimeFlowCapability}
 /// The network travels with the handle because closing needs a `JoinedNetwork`
 /// to close *through*, and asking the client which network its own flow is on
 /// would be taking a routing decision from the party being authorized.
+/// The one exact flow handle held by a client capability.
+///
+/// The asynchronous mutex is deliberately inside the already-funded slot:
+/// synchronous pipes use `try_lock`, while Change and close retain this guard
+/// across their own await.  The registry table mutex is never held across an
+/// await, and no raw pointer or second flow authority is needed.
+pub(crate) struct RealtimeFlowSlot {
+    handle: tokio::sync::Mutex<Option<myownmesh_core::realtime::RealtimeFlowHandle>>,
+}
+
+impl RealtimeFlowSlot {
+    fn new(flow: myownmesh_core::realtime::RealtimeFlowHandle) -> Self {
+        Self {
+            handle: tokio::sync::Mutex::new(Some(flow)),
+        }
+    }
+
+    pub(crate) async fn change_opaque(
+        &self,
+        network: &myownmesh_core::JoinedNetwork,
+        open: &myownmesh_core::realtime::OpaqueFlowOpen,
+    ) -> Result<(), myownmesh_core::realtime::RealtimeRefusal> {
+        // Change is one bounded operation, not a queue of requests behind the
+        // exact capability.  Close may await the guard during teardown, but a
+        // concurrent second Change must refuse immediately rather than outlive
+        // the caller's request deadline or race a later close/successor.
+        let guard = self
+            .handle
+            .try_lock()
+            .map_err(|_| myownmesh_core::realtime::RealtimeRefusal::FlowRefused)?;
+        let flow = guard
+            .as_ref()
+            .ok_or(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)?;
+        network.change_opaque_flow(flow, open).await
+    }
+}
+
 pub(crate) struct OwnedRealtimeFlow {
     /// The node this flow will occupy in the disconnect drain's list.
     ///
@@ -950,12 +992,9 @@ pub(crate) struct OwnedRealtimeFlow {
     /// builds no node.
     cleanup: Option<ResourceLease>,
     network: String,
-    flow: Option<myownmesh_core::realtime::RealtimeFlowHandle>,
-    /// The capability key's bytes and this network name's, funded together and
-    /// released when this value drops — which, taken out through
-    /// `pop_first_entry`, is after the owned key has gone wherever it is going.
-    /// The node lease cannot carry this: it ends inside the removal call. It is
-    /// last so it outlives the values whose retained allocation it funds.
+    flow: FundedArc<RealtimeFlowSlot>,
+    /// The capability key and network string remain funded with the owned row;
+    /// only the separate slot lease may outlive this row during Change.
     _retained: ResourceLease,
 }
 
@@ -965,13 +1004,14 @@ impl OwnedRealtimeFlow {
     }
 
     pub(crate) async fn close_through(
-        mut self,
+        self,
         network: &myownmesh_core::JoinedNetwork,
     ) -> Result<(), myownmesh_core::realtime::RealtimeRefusal> {
-        let flow = self
-            .flow
+        let mut guard = self.flow.handle.lock().await;
+        let flow = guard
             .take()
-            .expect("an owned realtime flow is consumed only once");
+            .ok_or(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)?;
+        drop(guard);
         network.close_realtime(flow).await
     }
 }
@@ -1170,6 +1210,10 @@ impl ClientHandle {
         self.capability.expose()
     }
 
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
     pub(crate) const fn capability_encoded_len() -> usize {
         ClientCapability::ENCODED_LEN
     }
@@ -1288,9 +1332,12 @@ impl ClientHandle {
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
         entry: ResourceLease,
         retained: ResourceLease,
+        slot: ResourceLease,
         cleanup: ResourceLease,
     ) -> RealtimeFlowCapability {
         let capability = RealtimeFlowCapability::mint();
+        let flow = FundedArc::new(RealtimeFlowSlot::new(flow), slot)
+            .expect("an admitted realtime-flow slot lease may be shared");
         self.realtime_flows
             .lock()
             .insert(
@@ -1298,7 +1345,7 @@ impl ClientHandle {
                 OwnedRealtimeFlow {
                     cleanup: Some(cleanup),
                     network,
-                    flow: Some(flow),
+                    flow,
                     _retained: retained,
                 },
                 entry,
@@ -1337,8 +1384,25 @@ impl ClientHandle {
         if owned.network != network {
             return None;
         }
-        let flow = owned.flow.as_ref()?;
+        let slot = owned.flow.clone();
+        drop(flows);
+        let guard = slot.handle.try_lock().ok()?;
+        let flow = guard.as_ref()?;
         Some(effect(flow))
+    }
+
+    /// Capture the funded slot for one exact capability without retaining the
+    /// table mutex.  The caller must keep the authenticated client handle and
+    /// use the returned slot's guarded operation; removing the row concurrently
+    /// cannot invalidate this slot or create a successor alias.
+    pub(crate) fn realtime_flow_slot(
+        &self,
+        capability: &str,
+        network: &str,
+    ) -> Option<FundedArc<RealtimeFlowSlot>> {
+        let flows = self.realtime_flows.lock();
+        let owned = flows.get(capability)?;
+        (owned.network == network).then(|| owned.flow.clone())
     }
 
     /// Take one of this client's flows out, for a close that will consume it.

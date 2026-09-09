@@ -541,6 +541,10 @@ pub(super) enum OperationReplyData {
         flow_label: String,
         capability: String,
     },
+    OpaqueChanged {
+        flow_capability: String,
+        max_unit_bytes: u32,
+    },
     Closed,
     RpcStreamStarted(String),
     ServicesStatus(crate::services::ServicesReport),
@@ -745,6 +749,10 @@ fn serialize_operation_reply<S: serde::Serializer>(
                     flow_label: &'a str,
                     flow_capability: &'a str,
                 },
+                OpaqueChanged {
+                    flow_capability: &'a str,
+                    max_unit_bytes: u32,
+                },
                 Closed {
                     closed: bool,
                 },
@@ -808,6 +816,13 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 } => OperationField::RealtimeOpened {
                     flow_label,
                     flow_capability: capability,
+                },
+                OperationReplyData::OpaqueChanged {
+                    flow_capability,
+                    max_unit_bytes,
+                } => OperationField::OpaqueChanged {
+                    flow_capability,
+                    max_unit_bytes: *max_unit_bytes,
                 },
                 OperationReplyData::Closed => OperationField::Closed { closed: true },
                 OperationReplyData::RpcStreamStarted(request_id) => {

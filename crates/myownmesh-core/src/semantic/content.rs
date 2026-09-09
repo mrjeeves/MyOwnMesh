@@ -196,6 +196,73 @@ impl AuthorityLineage {
 }
 
 impl DeviceId {
+    /// Validate a wire identity without allocating or consulting the interner.
+    ///
+    /// Input length is checked before scanning. Scratch is fixed: two 52-byte
+    /// encoding buffers and one 32-byte key, plus Ed25519 validation's bounded
+    /// arithmetic. Accepted spellings and key validation match the ordinary
+    /// constructor; errors here are static rather than allocated descriptions.
+    pub(crate) fn canonical_key_bytes(value: &str) -> Result<[u8; 32], &'static str> {
+        if value.len() != 52 {
+            return Err("DeviceId must contain exactly 52 canonical base32 bytes");
+        }
+        let mut upper = [0u8; 52];
+        for (encoded, byte) in upper.iter_mut().zip(value.bytes()) {
+            if !matches!(byte, b'a'..=b'z' | b'2'..=b'7') {
+                return Err("DeviceId must use lowercase unpadded base32");
+            }
+            *encoded = byte.to_ascii_uppercase();
+        }
+        let mut key = [0u8; 32];
+        let decoded = BASE32_NOPAD
+            .decode_mut(&upper, &mut key)
+            .map_err(|_| "DeviceId is not canonical base32")?;
+        if decoded != key.len() {
+            return Err("DeviceId must decode to 32 bytes");
+        }
+        let mut canonical = [0u8; 52];
+        BASE32_NOPAD.encode_mut(&key, &mut canonical);
+        canonical.make_ascii_lowercase();
+        if canonical.as_slice() != value.as_bytes() {
+            return Err("DeviceId is not the canonical base32 spelling");
+        }
+        VerifyingKey::from_bytes(&key).map_err(|_| "invalid Ed25519 public key")?;
+        Ok(key)
+    }
+
+    /// Construct frame-owned identity backing, never global interner state.
+    ///
+    /// Callers admit the backing and surrounding frame work before this call
+    /// and retain that funding through every clone of the returned identity.
+    /// Malformed input is rejected before either heap allocation is made.
+    pub(crate) fn from_canonical_str_uninterned(value: &str) -> Result<Self, &'static str> {
+        let bytes = Self::canonical_key_bytes(value)?;
+        Ok(Self(Arc::new(DeviceIdInner {
+            bytes,
+            canonical: Box::<str>::from(value),
+        })))
+    }
+
+    /// Logical backing bytes for one uninterned identity's two allocations.
+    ///
+    /// Includes private inner layout, Arc strong/weak counters and the exact
+    /// 52-byte string. Excludes the containing DeviceId pointer (already in the
+    /// caller's DTO), allocator overhead, provider reservation bookkeeping and
+    /// stack scratch. The caller separately prices two allocation residuals.
+    /// This is not an RSS measurement or a lease acquisition.
+    pub(crate) const fn uninterned_backing_bytes() -> usize {
+        std::mem::size_of::<DeviceIdInner>()
+            + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+            + 52
+    }
+
+    /// Test-only observation; drop the probe to release its weak Arc tail.
+    #[cfg(test)]
+    pub(crate) fn backing_liveness_for_test(&self) -> impl Fn() -> bool + 'static {
+        let weak = Arc::downgrade(&self.0);
+        move || weak.strong_count() != 0
+    }
+
     pub fn from_public_key_bytes(bytes: [u8; 32]) -> Result<Self, String> {
         VerifyingKey::from_bytes(&bytes)
             .map_err(|error| format!("invalid Ed25519 public key: {error}"))?;
@@ -636,10 +703,6 @@ impl Encoder {
         self.bytes.extend_from_slice(value.as_bytes());
     }
 
-    pub(crate) fn bool(&mut self, value: bool) {
-        self.bytes.push(u8::from(value));
-    }
-
     pub(crate) fn id(&mut self, value: FactId) {
         self.bytes.extend_from_slice(value.as_bytes());
     }
@@ -690,6 +753,190 @@ mod tests {
         assert!(DeviceId::from_canonical_str(&canonical.to_uppercase()).is_err());
         assert!(DeviceId::from_canonical_str(&format!("{canonical}-label")).is_err());
         assert!(DeviceId::from_canonical_str(&format!("{canonical}=")).is_err());
+    }
+
+    #[test]
+    fn bounded_device_validation_matches_ordinary_canonical_acceptance() {
+        for seed in [11, 37, 91, 173] {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let key = signing.verifying_key().to_bytes();
+            let canonical = BASE32_NOPAD.encode(&key).to_ascii_lowercase();
+            assert_eq!(DeviceId::canonical_key_bytes(&canonical), Ok(key));
+            let owned = DeviceId::from_canonical_str_uninterned(&canonical).unwrap();
+            assert_eq!(owned, DeviceId::from_canonical_str(&canonical).unwrap());
+            let mut bad_tail = canonical.clone();
+            bad_tail.replace_range(51..52, "b");
+            for invalid in [
+                String::new(),
+                canonical[..51].to_owned(),
+                format!("{canonical}a"),
+                canonical.to_ascii_uppercase(),
+                format!("{canonical}="),
+                format!("{canonical}-label"),
+                format!(" {}", &canonical[1..]),
+                format!("0{}", &canonical[1..]),
+                format!("é{}", &canonical[2..]),
+                bad_tail,
+                "a".repeat(4_096),
+            ] {
+                assert!(DeviceId::canonical_key_bytes(&invalid).is_err());
+                assert!(DeviceId::from_canonical_str_uninterned(&invalid).is_err());
+                assert!(DeviceId::from_canonical_str(&invalid).is_err());
+            }
+        }
+        // Exercise canonical base32 which fails the same Ed25519 validation,
+        // without assuming a particular repeated-byte key is invalid.
+        let invalid_key = (0u8..=255)
+            .map(|byte| [byte; 32])
+            .find(|key| VerifyingKey::from_bytes(key).is_err())
+            .expect("the finite corpus includes an invalid compressed point");
+        let encoded = BASE32_NOPAD.encode(&invalid_key).to_ascii_lowercase();
+        assert!(DeviceId::canonical_key_bytes(&encoded).is_err());
+        assert!(DeviceId::from_canonical_str_uninterned(&encoded).is_err());
+        assert!(DeviceId::from_canonical_str(&encoded).is_err());
+    }
+
+    #[test]
+    fn uninterned_identity_preserves_order_hash_serde_and_fact_bytes() {
+        use std::collections::hash_map::DefaultHasher;
+        let mut ordinary = Vec::new();
+        let mut uninterned = Vec::new();
+        for seed in [19, 41, 83] {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let key = signing.verifying_key().to_bytes();
+            let spelling = BASE32_NOPAD.encode(&key).to_ascii_lowercase();
+            let owned = DeviceId::from_canonical_str_uninterned(&spelling).unwrap();
+            let interned = DeviceId::from_canonical_str(&spelling).unwrap();
+            assert!(!Arc::ptr_eq(&owned.0, &interned.0));
+            assert!(Arc::ptr_eq(
+                &interned.0,
+                &DeviceId::from_public_key_bytes(key).unwrap().0,
+            ));
+            assert_eq!(owned, interned);
+            let mut owned_hash = DefaultHasher::new();
+            let mut interned_hash = DefaultHasher::new();
+            owned.hash(&mut owned_hash);
+            interned.hash(&mut interned_hash);
+            assert_eq!(owned_hash.finish(), interned_hash.finish());
+            assert_eq!(
+                serde_json::to_vec(&owned).unwrap(),
+                serde_json::to_vec(&interned).unwrap()
+            );
+            let decoded: DeviceId =
+                serde_json::from_str(&serde_json::to_string(&owned).unwrap()).unwrap();
+            assert!(
+                Arc::ptr_eq(&decoded.0, &interned.0),
+                "ordinary serde still interns"
+            );
+            ordinary.push(interned);
+            uninterned.push(owned);
+        }
+        ordinary.sort();
+        uninterned.sort();
+        assert_eq!(ordinary, uninterned);
+        let content = |ids: &[DeviceId]| {
+            super::super::FactContent::new(
+                FactDomain::Governance,
+                super::super::MeshContextId::from_bytes([29; 32]),
+                FactBody::RoleGrant {
+                    target: ids[1].clone(),
+                    role: Role::Member,
+                },
+                ids[0].clone(),
+                vec![],
+            )
+        };
+        let ordinary_fact = content(&ordinary);
+        let owned_fact = content(&uninterned);
+        assert_eq!(
+            ordinary_fact.canonical_bytes(),
+            owned_fact.canonical_bytes()
+        );
+        assert_eq!(
+            FactId::from_content(&ordinary_fact),
+            FactId::from_content(&owned_fact)
+        );
+        assert_eq!(
+            serde_json::to_vec(&ordinary_fact).unwrap(),
+            serde_json::to_vec(&owned_fact).unwrap()
+        );
+    }
+
+    #[test]
+    fn fresh_uninterned_identity_drops_without_an_interner_owner() {
+        // Build the spelling directly from a signing key: no ordinary DeviceId
+        // constructor or deserializer pre-interns this control's target.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[181; 32]);
+        let spelling = BASE32_NOPAD
+            .encode(&signing.verifying_key().to_bytes())
+            .to_ascii_lowercase();
+        let owned = DeviceId::from_canonical_str_uninterned(&spelling).unwrap();
+        assert_eq!(Arc::strong_count(&owned.0), 1);
+        assert_eq!(
+            Arc::weak_count(&owned.0),
+            0,
+            "constructor retained no weak interner entry"
+        );
+        let probe = owned.backing_liveness_for_test();
+        let clone = owned.clone();
+        drop(owned);
+        assert!(probe());
+        drop(clone);
+        assert!(!probe());
+        drop(probe);
+    }
+
+    #[test]
+    fn uninterned_backing_is_prefunded_and_releases_at_final_custody_drop() {
+        use crate::resource::{
+            FiniteResourceProvider, ResourceAuthorityClass, ResourceClaim, ResourceClass,
+            ResourceProviderPort,
+        };
+        let raw = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(DeviceId::uninterned_backing_bytes()).unwrap(),
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 2),
+        ])
+        .unwrap();
+        let grant = FiniteResourceProvider::scope_planning_charge()
+            .checked_add(FiniteResourceProvider::reservation_planning_charge(raw).unwrap())
+            .unwrap();
+        let provider = FiniteResourceProvider::new(grant);
+        let port = ResourceProviderPort::new(provider.clone()).unwrap();
+        let scope = port.process_scope();
+        let baseline = provider.in_use();
+        let lease = port
+            .acquire(&scope, ResourceAuthorityClass::Admitted, raw)
+            .unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[193; 32]);
+        let spelling = BASE32_NOPAD
+            .encode(&signing.verifying_key().to_bytes())
+            .to_ascii_lowercase();
+        let owned = DeviceId::from_canonical_str_uninterned(&spelling).unwrap();
+        let probe = owned.backing_liveness_for_test();
+        assert_eq!(provider.in_use(), grant);
+        assert_eq!(owned.0.canonical.len(), 52);
+        assert_eq!(
+            DeviceId::uninterned_backing_bytes(),
+            std::mem::size_of::<DeviceIdInner>()
+                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+                + 52
+        );
+        assert!(port
+            .acquire(&scope, ResourceAuthorityClass::Admitted, raw)
+            .is_err());
+        drop(owned);
+        assert!(!probe());
+        assert_eq!(
+            provider.in_use(),
+            grant,
+            "funding remains through the weak allocation tail"
+        );
+        drop(probe);
+        drop(lease);
+        assert_eq!(provider.in_use(), baseline);
     }
 
     #[test]

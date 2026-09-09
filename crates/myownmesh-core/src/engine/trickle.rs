@@ -74,6 +74,7 @@ pub(super) enum TrickleDeadline {
     IntervalEnd(u64),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TrickleReset {
     Accepted,
@@ -145,50 +146,51 @@ impl TrickleTimer {
         Ok(timer)
     }
 
-    pub(super) fn policy(&self) -> TricklePolicy {
-        self.policy
-    }
-
     pub(super) fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[cfg(test)]
     pub(super) fn interval_start_ms(&self) -> u64 {
         self.interval_start_ms
     }
 
+    #[cfg(test)]
     pub(super) fn interval_end_ms(&self) -> u64 {
         self.interval_end_ms
     }
 
+    #[cfg(test)]
     pub(super) fn transmit_at_ms(&self) -> u64 {
         self.transmit_at_ms
     }
 
+    #[cfg(test)]
     pub(super) fn interval_ms(&self) -> u64 {
         self.interval_ms
     }
 
-    pub(super) fn consistent_count(&self) -> u32 {
-        self.consistent_count
-    }
-
+    #[cfg(test)]
     pub(super) fn was_transmitted(&self) -> bool {
         self.transmitted
     }
 
+    #[cfg(test)]
     pub(super) fn was_suppressed(&self) -> bool {
         self.suppressed
     }
 
+    #[cfg(test)]
     pub(super) fn repair_needed(&self) -> bool {
         self.repair_needed
     }
 
+    #[cfg(test)]
     pub(super) fn resets_in_window(&self) -> u32 {
         self.resets_in_window
     }
 
+    #[cfg(test)]
     pub(super) fn next_deadline(&self) -> Option<TrickleDeadline> {
         if self.retired {
             return None;
@@ -202,6 +204,7 @@ impl TrickleTimer {
 
     /// Return false for a wake belonging to a retired or superseded timer
     /// generation.  Adapters can use this as a stale-wake fence.
+    #[cfg(test)]
     pub(super) fn accepts_generation(&self, generation: u64) -> bool {
         !self.retired && self.generation == generation
     }
@@ -209,6 +212,7 @@ impl TrickleTimer {
     /// Count one authenticated, protocol-defined consistent observation.
     /// The adapter is responsible for authentication and digest comparison;
     /// this method never ingests a packet or makes an authority decision.
+    #[cfg(test)]
     pub(super) fn observe_consistent(&mut self) -> Result<(), TrickleError> {
         if self.retired {
             return Err(TrickleError::Retired);
@@ -220,6 +224,7 @@ impl TrickleTimer {
     /// Process one authenticated inconsistent observation.  At Imin the RFC
     /// rule leaves the interval in place.  A reset-budget refusal also leaves
     /// the schedule in place but retains `repair_needed` for the adapter.
+    #[cfg(test)]
     pub(super) fn observe_inconsistent(
         &mut self,
         now_ms: u64,
@@ -269,9 +274,32 @@ impl TrickleTimer {
         self.begin_interval(now_ms, self.policy.imin_ms, rng)
     }
 
-    /// Clear the repair marker only after the caller has durably published
-    /// the new advertised state.  A timer decision alone is not publication
-    /// success.
+    /// Admit local change resets against the existing fixed-window budget.
+    /// Work on a value copy so overflow/refusal cannot partly reset a timer.
+    /// A budget refusal retains the repair obligation without postponing t.
+    pub(super) fn bounded_local_change(
+        &mut self,
+        now_ms: u64,
+        rng: &mut impl RngCore,
+    ) -> Result<bool, TrickleError> {
+        if self.retired {
+            return Err(TrickleError::Retired);
+        }
+        let mut next = *self;
+        next.check_now(now_ms)?;
+        if !next.consume_reset_budget(now_ms) {
+            next.repair_needed = true;
+            *self = next;
+            return Ok(false);
+        }
+        next.local_change(now_ms, rng)?;
+        *self = next;
+        Ok(true)
+    }
+
+    /// Clear the repair marker after the caller records a successful local
+    /// advertisement handoff. This is not remote receipt or recipient coverage;
+    /// a timer decision alone is not a successful handoff either.
     pub(super) fn acknowledge_repair(&mut self) -> Result<(), TrickleError> {
         if self.retired {
             return Err(TrickleError::Retired);
@@ -342,6 +370,7 @@ impl TrickleTimer {
     }
 
     /// Retire this generation.  No later poll or observation can mutate it.
+    #[cfg(test)]
     pub(super) fn retire(&mut self) -> Result<u64, TrickleError> {
         if self.retired {
             return Ok(self.generation);
@@ -743,5 +772,37 @@ mod tests {
         assert!(timer.repair_needed());
         timer.acknowledge_repair().unwrap();
         assert!(!timer.repair_needed());
+    }
+
+    #[test]
+    fn bounded_local_change_refuses_invalid_time_and_overflow_without_partial_reset() {
+        let mut rng = SequenceRng { next: 0 };
+        let mut timer = TrickleTimer::start(policy(1), 10, &mut rng).unwrap();
+        let before = timer;
+        assert_eq!(
+            timer.bounded_local_change(9, &mut rng),
+            Err(TrickleError::ClockWentBackwards)
+        );
+        assert_eq!(timer, before);
+        assert_eq!(
+            timer.bounded_local_change(u64::MAX, &mut rng),
+            Err(TrickleError::ClockOverflow)
+        );
+        assert_eq!(timer, before);
+        timer.generation = u64::MAX;
+        let before = timer;
+        assert_eq!(
+            timer.bounded_local_change(11, &mut rng),
+            Err(TrickleError::GenerationOverflow)
+        );
+        assert_eq!(timer, before);
+        timer.generation = 1;
+        timer.retire().unwrap();
+        let before = timer;
+        assert_eq!(
+            timer.bounded_local_change(11, &mut rng),
+            Err(TrickleError::Retired)
+        );
+        assert_eq!(timer, before);
     }
 }

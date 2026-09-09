@@ -107,6 +107,17 @@ pub(super) fn canonical_policy_admits_from(
     let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
         return false;
     };
+    canonical_policy_admits_devices(bootstrap, graph, &local, &remote)
+}
+
+/// Evaluate already-owned canonical identities without interning or retaining
+/// them. The caller supplies the same bootstrap and graph policy fence.
+pub(super) fn canonical_policy_admits_devices(
+    bootstrap: &crate::semantic::VerifiedBootstrap,
+    graph: &crate::semantic::FactGraph,
+    local: &DeviceId,
+    remote: &DeviceId,
+) -> bool {
     if graph.context_id() != bootstrap.context_id() {
         return false;
     }
@@ -114,13 +125,13 @@ pub(super) fn canonical_policy_admits_from(
         return false;
     }
     let evaluator = graph.evaluator();
-    if evaluator.is_stood_down(&local) || evaluator.is_stood_down(&remote) {
+    if evaluator.is_stood_down(local) || evaluator.is_stood_down(remote) {
         return false;
     }
     match bootstrap.policy() {
         crate::semantic::VerifiedProjectPolicy::Open => true,
         crate::semantic::VerifiedProjectPolicy::Closed(_) => {
-            evaluator.admits_closed_session(&local, &remote)
+            evaluator.admits_closed_session(local, remote)
         }
     }
 }
@@ -297,7 +308,7 @@ fn apply_canonical_projection_delta_with_projection(
     apply_canonical_projection_delta_with_projection_and_save(
         state,
         delta,
-        |roster, affected_keys| crate::roster::save_affected(roster, affected_keys),
+        crate::roster::save_affected,
     )
 }
 
@@ -936,16 +947,18 @@ pub(super) async fn acknowledge_proof_delivery(
 /// Carry the bootstrap root's initial member grant to the exact authenticated
 /// installation that is still waiting for approval.  This is deliberately a
 /// governance-only pre-admission seam: a pending peer receives one
-/// self-authenticating canonical fact, never application, inventory, request,
-/// or realtime traffic.  The owner and worker are captured together, and the
-/// worker's structural send claim is held until the exact bytes settle.
+/// self-authenticating canonical fact in an exact-context FactPage, never
+/// application, inventory, request, or realtime traffic. The captured owner
+/// and worker use the admitted pending semantic lane and its bounded send claim.
+/// This is one send attempt, not a remote ACK; failure neither retries the
+/// write nor undoes the committed grant or its local approval reevaluation.
 async fn send_pending_role_grant(
     state: &Arc<EngineState>,
     target: &str,
     fact: &SignedFact,
 ) -> Option<PeerOwnerToken> {
     let owner = state.peers.owner(target)?;
-    let (owner, worker) = state
+    let owner = state
         .peers
         .with_current(&owner, |peer| {
             let data = peer.state.read();
@@ -953,34 +966,16 @@ async fn send_pending_role_grant(
                 return None;
             }
             let worker = peer.current_worker()?;
-            Some((owner.for_worker(Arc::clone(&worker)), worker))
+            Some(owner.for_worker(worker))
         })
         .flatten()?;
-    let bytes = match serde_json::to_vec(&MeshMessage::Fact(fact.clone())) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!("unable to encode pending RoleGrant for {target}: {error}"),
-            );
-            return None;
-        }
-    };
-    let Ok(claim) = crate::application_gateway::structural_json_claim(bytes.len()) else {
-        return None;
-    };
-    let Ok(_lease) = worker.reserve_attempt_work(claim) else {
-        return None;
-    };
     state.peers.get_if_current(&owner)?;
-    match worker.send_owned(bytes::Bytes::from(bytes)).await {
-        Ok(_) => Some(owner),
-        Err(error) => {
-            tracing::debug!(peer = %target, %error, "pending RoleGrant send failed");
-            Some(owner)
-        }
+    if let Err(error) =
+        super::send_pending_semantic_facts(state, &owner, std::slice::from_ref(fact)).await
+    {
+        tracing::debug!(peer = %target, %error, "pending RoleGrant send failed");
     }
+    Some(owner)
 }
 
 /// Ask the exact current pending installation to run the ordinary approval
@@ -1329,6 +1324,203 @@ pub(super) async fn deny_if_evicted(
 #[cfg(test)]
 mod governance_projection_controls {
     use super::*;
+
+    fn policy_device(key: &ed25519_dalek::SigningKey) -> DeviceId {
+        let canonical = data_encoding::BASE32_NOPAD
+            .encode(key.verifying_key().as_bytes())
+            .to_ascii_lowercase();
+        DeviceId::from_canonical_str_uninterned(&canonical).expect("frame-owned canonical identity")
+    }
+
+    fn assert_policy_parity(
+        bootstrap: &crate::semantic::VerifiedBootstrap,
+        graph: &crate::semantic::FactGraph,
+        local: &DeviceId,
+        remote: &DeviceId,
+        expected: bool,
+    ) {
+        // Exercise borrowed frame-owned identities before the compatibility
+        // wrapper performs its intentionally unchanged ordinary interning.
+        assert_eq!(
+            canonical_policy_admits_devices(bootstrap, graph, local, remote),
+            expected
+        );
+        assert_eq!(
+            canonical_policy_admits_from(bootstrap, graph, local, remote),
+            expected
+        );
+    }
+
+    fn signed_policy_fact(
+        graph: &crate::semantic::FactGraph,
+        key: &ed25519_dalek::SigningKey,
+        body: FactBody,
+    ) -> SignedFact {
+        let author = policy_device(key);
+        let witness = graph.authoring_witness(&body, &author);
+        let content =
+            FactContent::from_authoring_witness(graph, body, &witness, std::iter::empty());
+        SignedFact::sign(content, key).expect("real policy fact signs")
+    }
+
+    fn admit_policy_fact(
+        graph: &mut crate::semantic::FactGraph,
+        key: &ed25519_dalek::SigningKey,
+        body: FactBody,
+    ) -> FactId {
+        let fact = signed_policy_fact(graph, key, body);
+        let id = fact.id;
+        assert_eq!(graph.admit(fact), Ok(crate::semantic::Admission::Inserted));
+        id
+    }
+
+    #[test]
+    fn canonical_policy_typed_open_parity_and_string_validation() {
+        let bootstrap = crate::semantic::VerifiedBootstrap::open("typed-policy-open").unwrap();
+        let graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        let local = policy_device(&ed25519_dalek::SigningKey::from_bytes(&[0xb1; 32]));
+        let remote = policy_device(&ed25519_dalek::SigningKey::from_bytes(&[0xb2; 32]));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, true);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, true);
+        assert_policy_parity(&bootstrap, &graph, &local, &local, false);
+        let foreign = crate::semantic::VerifiedBootstrap::open("typed-policy-foreign").unwrap();
+        assert_ne!(bootstrap.context_id(), foreign.context_id());
+        assert_policy_parity(&foreign, &graph, &local, &remote, false);
+        for invalid in [
+            String::new(),
+            local.to_ascii_uppercase(),
+            format!("{local}-label"),
+        ] {
+            assert!(!canonical_policy_admits_from(
+                &bootstrap, &graph, &invalid, &remote
+            ));
+            assert!(!canonical_policy_admits_from(
+                &bootstrap, &graph, &remote, &invalid
+            ));
+        }
+        // Open has no durable fact domain; do not manufacture an Open graph
+        // stand-down projection through a test-only authority bypass.
+    }
+
+    #[test]
+    fn canonical_policy_typed_closed_parity_role_and_stand_down() {
+        let root_key = ed25519_dalek::SigningKey::from_bytes(&[0xb3; 32]);
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[0xb4; 32]);
+        let member_key = ed25519_dalek::SigningKey::from_bytes(&[0xb5; 32]);
+        let local = policy_device(&root_key);
+        let remote = policy_device(&other_key);
+        let member = policy_device(&member_key);
+        let bootstrap = crate::semantic::VerifiedBootstrap::create_closed(
+            "typed-policy-closed",
+            vec![root_key.clone()],
+            [0xb6; 32],
+        )
+        .unwrap();
+        let mut graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::RoleGrant {
+                target: remote.clone(),
+                role: crate::semantic::Role::Member,
+            },
+        );
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, true);
+        assert_policy_parity(&bootstrap, &graph, &local, &local, false);
+        assert_policy_parity(&bootstrap, &graph, &local, &member, false);
+        assert_policy_parity(&bootstrap, &graph, &member, &local, false);
+        let foreign = crate::semantic::VerifiedBootstrap::create_closed(
+            "typed-policy-closed",
+            vec![root_key.clone()],
+            [0xb7; 32],
+        )
+        .unwrap();
+        assert_ne!(bootstrap.context_id(), foreign.context_id());
+        assert_policy_parity(&foreign, &graph, &local, &remote, false);
+        admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::RoleGrant {
+                target: member.clone(),
+                role: crate::semantic::Role::Member,
+            },
+        );
+        assert_policy_parity(&bootstrap, &graph, &local, &member, true);
+        assert_policy_parity(&bootstrap, &graph, &member, &local, true);
+        assert!(!graph.evaluator().is_stood_down(&remote));
+
+        // Match the real causal evaluator proof chain: same-target eviction,
+        // authorized member attestation, root-authored proof, then the
+        // target's own acknowledgement of that proof. Empty or invented
+        // evidence cannot reach signing/admission.
+        let proposal = admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::Evict {
+                target: remote.clone(),
+            },
+        );
+        let attestation = admit_policy_fact(
+            &mut graph,
+            &member_key,
+            FactBody::Attestation {
+                target: remote.clone(),
+                proposal,
+                decision: crate::semantic::AttestationDecision::Evict,
+                signer: member.clone(),
+                contributions: Vec::new(),
+            },
+        );
+        let proof = admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::EvictionProof {
+                target: remote.clone(),
+                evidence: vec![attestation],
+            },
+        );
+        // The proof already stands the target down; SelfStandDown does not
+        // newly revoke an otherwise admitted endpoint.
+        assert!(graph.evaluator().is_stood_down(&remote));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, false);
+        assert!(matches!(
+            &graph.get(&proof).expect("eviction proof was admitted").content.body,
+            FactBody::EvictionProof { target, evidence }
+                if target == &remote && evidence.as_slice() == [attestation]
+        ));
+        let stand_down = signed_policy_fact(
+            &graph,
+            &other_key,
+            FactBody::SelfStandDown {
+                device_id: remote.clone(),
+                evidence: vec![proof],
+            },
+        );
+        let stand_down_id = stand_down.id;
+        assert!(graph.get(&stand_down_id).is_none());
+        // Compare the complete existing persistence representation, including
+        // signed bodies, quarantine, indexes, counters, revisions, generation
+        // and projection. This in-memory fixture performs no SQLite writes.
+        let before = serde_json::to_vec(&graph.live_checkpoint()).expect("checkpoint encodes");
+        assert_eq!(
+            graph.admit(stand_down),
+            Err(crate::semantic::SemanticError::NoOp(
+                "stand-down is already effective"
+            ))
+        );
+        assert!(graph.get(&stand_down_id).is_none());
+        assert_eq!(
+            serde_json::to_vec(&graph.live_checkpoint()).expect("checkpoint encodes"),
+            before
+        );
+        assert!(!graph.evaluator().is_stood_down(&local));
+        assert!(graph.evaluator().is_stood_down(&remote));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, false);
+        assert_policy_parity(&bootstrap, &graph, &local, &member, true);
+    }
 
     static CONCURRENT_LANE_FIXTURE: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);

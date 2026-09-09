@@ -1471,6 +1471,7 @@ dependencies = [
  "tracing-subscriber",
  "webrtc",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

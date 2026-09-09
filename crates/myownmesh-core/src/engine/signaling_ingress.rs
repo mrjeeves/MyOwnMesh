@@ -62,7 +62,7 @@ use crate::runtime::peer_session::DedupToken;
 
 /// Which carrier observed a signaling message.
 ///
-/// **Bounded provenance, and the bound is the point.** A closed set of three
+/// **Bounded provenance, and the bound is the point.** A closed set of four
 /// unit variants: it records that a message arrived over the LAN rather than a
 /// relay, and nothing else. No relay URL, no socket, no address, no key and no
 /// peer-supplied string, so it cannot grow into a second identity for a device.
@@ -78,6 +78,9 @@ pub(crate) enum SignalingCarrier {
     Nostr,
     /// The LAN mDNS driver.
     Mdns,
+    /// Signed endpoint introduction over an already promoted mesh carrier.
+    /// This transports native signaling only, never application authority.
+    Hub,
 }
 
 impl SignalingCarrier {
@@ -88,6 +91,7 @@ impl SignalingCarrier {
             Self::Local => "local",
             Self::Nostr => "nostr",
             Self::Mdns => "mdns",
+            Self::Hub => "hub",
         }
     }
 
@@ -106,7 +110,7 @@ impl SignalingCarrier {
         match self {
             #[cfg(any(test, feature = "transport-lab"))]
             Self::Local => false,
-            Self::Nostr | Self::Mdns => true,
+            Self::Nostr | Self::Mdns | Self::Hub => true,
         }
     }
 }
@@ -735,6 +739,27 @@ pub(crate) struct CarrierObservation {
     instance: CarrierInstance,
     signal: EphemeralSignal,
     body: ObservationBody,
+    hub: Option<HubIngressWitness>,
+}
+
+pub(crate) struct HubIngressWitness {
+    ticket: super::hub_introduction::IntroductionTicket,
+    carrier: super::peer_registry::WeakPeerOwnerToken,
+}
+
+impl HubIngressWitness {
+    pub(crate) fn ticket(&self) -> super::hub_introduction::IntroductionTicket {
+        self.ticket
+    }
+
+    /// Recheck the original carrier after each asynchronous native boundary.
+    /// This is move-only provenance, not ownership or a device-id lookup.
+    /// The caller must separately recheck the ticket's original deadline.
+    pub(crate) fn is_current(&self, state: &NetworkState) -> bool {
+        self.carrier
+            .upgrade()
+            .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner))
+    }
 }
 
 /// What the carrier actually reported. Private: the parse below is the only
@@ -866,6 +891,7 @@ impl CarrierObservation {
             instance,
             signal,
             body,
+            hub,
         } = self;
         let (inbound, attribution) = match body {
             ObservationBody::Presence {
@@ -891,6 +917,7 @@ impl CarrierObservation {
             attribution,
             inbound,
             dedup: None,
+            hub,
         }
     }
 }
@@ -908,6 +935,7 @@ pub(crate) struct EphemeralIngress {
     attribution: CarrierAttribution,
     inbound: SignalingInbound,
     dedup: Option<DedupToken>,
+    hub: Option<HubIngressWitness>,
 }
 
 /// Redacting, and the derive it replaces was the reason.
@@ -938,6 +966,23 @@ impl std::fmt::Debug for EphemeralIngress {
 }
 
 impl EphemeralIngress {
+    /// Engine rechecks this exact carrier AND the returned ticket at dequeue,
+    /// before any asynchronous offer/answer work can begin. Non-Hub inputs
+    /// preserve their existing carrier policy.
+    pub(crate) fn introduction_ticket(
+        &self,
+    ) -> Option<super::hub_introduction::IntroductionTicket> {
+        self.hub.as_ref().map(|witness| witness.ticket)
+    }
+
+    pub(crate) fn introduction_carrier_is_current(&self, state: &NetworkState) -> bool {
+        match (&self.hub, self.carrier) {
+            (Some(witness), SignalingCarrier::Hub) => witness.is_current(state),
+            (None, SignalingCarrier::Hub) => false,
+            (None, _) => true,
+            _ => false,
+        }
+    }
     /// Which carrier observed it.
     pub(crate) fn carrier(&self) -> SignalingCarrier {
         self.carrier
@@ -979,9 +1024,12 @@ impl EphemeralIngress {
         &self.inbound
     }
 
-    /// Take the parsed input, dropping the provenance.
-    pub(crate) fn into_inbound(self) -> SignalingInbound {
-        self.inbound
+    /// Move the admitted input and its exact Hub witness together. The engine
+    /// keeps the witness across native awaits; ordinary carriers return None.
+    pub(crate) fn into_inbound_with_introduction(
+        self,
+    ) -> (SignalingInbound, Option<HubIngressWitness>) {
+        (self.inbound, self.hub)
     }
 
     pub(crate) fn dedup_token(&self) -> Option<DedupToken> {
@@ -1020,6 +1068,7 @@ impl EphemeralIngress {
             instance: CarrierInstance(0),
             signal,
             body,
+            hub: None,
         }
         .into_ingress()
     }
@@ -1087,10 +1136,11 @@ unsafe impl ResourceMailboxItem for EphemeralIngress {
     fn measured_claim(
         &self,
     ) -> std::result::Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
-        // Carrier, instance, signal and attribution are `Copy` and field-less or
-        // a counter: they reach nothing, allocate nothing, and their inline bytes
-        // are already inside `size_of::<Self>()`. So the measurement is the
-        // inbound value's, priced against this type's own footprint.
+        // Scalar provenance and the optional introduction ticket/weak exact
+        // carrier witness are inline in size_of::<Self>(). Cloning a weak
+        // witness allocates no new backing storage and grants no authority;
+        // the existing peer/session owners retain their own resource custody.
+        // Dynamic retained strings are the inbound value's own measurement.
         let measure = self.inbound.string_measure()?;
         MailboxMeasurement::from_parts(measure.0, measure.1, measure.2)
     }
@@ -1586,6 +1636,9 @@ impl SignalingRuntime {
     /// once cannot both pass the check, which is the exact case a reservation
     /// would otherwise be needed for.
     fn deliver(&self, observation: CarrierObservation) -> Delivered {
+        if observation.carrier == SignalingCarrier::Hub && observation.hub.is_none() {
+            return Delivered::Refused;
+        }
         // The carrier value is still raw here. Admit its bounded temporary
         // representation before parsing it into an engine value; pressure
         // therefore refuses before any parse/reducer hand-off.
@@ -1817,6 +1870,133 @@ pub(crate) struct CarrierAttach {
 /// provenance, and exact carrier-emission custody.
 pub(crate) struct EphemeralTransportPort;
 
+/// A single network-owned introduction carrier. It borrows the existing
+/// SignalingRuntime mailbox/dedup path; no direct SignalingInbound injection.
+pub(crate) struct HubSignalingCarrier {
+    runtime: Arc<SignalingRuntime>,
+    instance: CarrierInstance,
+}
+
+impl HubSignalingCarrier {
+    pub(crate) fn new(state: &Arc<NetworkState>) -> Option<Self> {
+        let runtime = state.signaling_runtime()?;
+        let instance = CarrierInstance(next_non_wrapping(&runtime.instances)?);
+        // No Nostr/mDNS publication guard or extra Arc allocation: the mesh
+        // introduction record already owns exact carrier/attempt lifecycle.
+        // Only the existing runtime's admitted delivery/dedup port is reused.
+        Some(Self { runtime, instance })
+    }
+
+    /// Caller holds the introduction controller only for this synchronous
+    /// transfer, never across native work. Both current-carrier and one-shot
+    /// accepted-frame custody are checked here before domain delivery.
+    pub(crate) fn admit(
+        &self,
+        state: &Arc<NetworkState>,
+        controller: &mut super::hub_introduction::HubIntroduction,
+        ticket: super::hub_introduction::IntroductionTicket,
+        carrier: &super::peer_registry::PeerOwnerToken,
+        frame: &crate::protocol::hub_introduction::HubIntroductionEnvelope,
+        now: std::time::Instant,
+    ) -> Delivered {
+        use crate::protocol::hub_introduction::HubIntroductionBody;
+        if !state.peers.has_usable_authenticated_current(carrier)
+            || &**frame.destination() != state.identity.public_id()
+            || frame.context_id() != state.mesh_context_id()
+        {
+            return Delivered::Refused;
+        }
+        // Exact borrowed measurement, BEFORE cloning any carrier strings.
+        let source: &str = frame.source().as_ref();
+        let attempt_bytes = [b'0'; 32];
+        let attempt_shape = std::str::from_utf8(&attempt_bytes).expect("ASCII shape");
+        let base = [Some(source), Some(source), Some(attempt_shape)];
+        let extra = match frame.body() {
+            HubIntroductionBody::Offer { sdp } | HubIntroductionBody::Answer { sdp } => {
+                [Some(sdp.as_str()), None, None]
+            }
+            HubIntroductionBody::Candidate {
+                candidate,
+                sdp_mid,
+                username_fragment,
+                ..
+            } => [
+                Some(candidate.as_str()),
+                sdp_mid.as_deref(),
+                username_fragment.as_deref(),
+            ],
+            _ => return Delivered::Refused,
+        };
+        let Ok((bytes, _, allocations)) = strings_measure(base.into_iter().chain(extra).flatten())
+        else {
+            return Delivered::Unavailable;
+        };
+        let Some(bytes) = bytes.checked_add(std::mem::size_of::<CarrierObservation>()) else {
+            return Delivered::Unavailable;
+        };
+        let Ok(claim) = ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                bytes as u64,
+            ),
+            (
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                allocations as u64,
+            ),
+        ]) else {
+            return Delivered::Unavailable;
+        };
+        let Ok(_translation) = self.runtime.scope.acquire(claim) else {
+            return Delivered::Unavailable;
+        };
+        if controller.take_signal(ticket, carrier, frame, now).is_err() {
+            return Delivered::Refused;
+        }
+        let peer_id = source.to_owned();
+        let offer_id = ticket.attempt();
+        let message = match frame.body() {
+            HubIntroductionBody::Offer { sdp } => SignalingMessage::Offer {
+                peer_id,
+                offer_id,
+                sdp: sdp.clone(),
+            },
+            HubIntroductionBody::Answer { sdp } => SignalingMessage::Answer {
+                peer_id,
+                offer_id,
+                sdp: sdp.clone(),
+            },
+            HubIntroductionBody::Candidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                username_fragment,
+            } => SignalingMessage::Candidate {
+                peer_id,
+                offer_id,
+                candidate: candidate.clone(),
+                sdp_mid: sdp_mid.clone(),
+                sdp_mline_index: *sdp_mline_index,
+                username_fragment: username_fragment.clone(),
+            },
+            _ => return Delivered::Refused,
+        };
+        let observation = CarrierObservation {
+            carrier: SignalingCarrier::Hub,
+            instance: self.instance,
+            signal: admit(&message),
+            body: ObservationBody::Directed {
+                from: source.to_owned(),
+                message,
+            },
+            hub: Some(HubIngressWitness {
+                ticket,
+                carrier: carrier.downgrade(),
+            }),
+        };
+        self.runtime.deliver(observation)
+    }
+}
+
 impl EphemeralTransportPort {
     /// Admit an already carrier-owned observation before domain parsing.
     pub(crate) fn admit(attach: &CarrierAttach, observation: CarrierObservation) -> Delivered {
@@ -1877,6 +2057,7 @@ impl CarrierAttach {
             instance: self.instance,
             signal,
             body,
+            hub: None,
         }
     }
 
@@ -2062,11 +2243,147 @@ fn dedup_key(ingress: &EphemeralIngress, plan: &DedupKeyPlan<'_>) -> Option<Dedu
 pub(super) mod tests {
     use super::*;
 
-    const EVERY_CARRIER: [SignalingCarrier; 3] = [
+    const EVERY_CARRIER: [SignalingCarrier; 4] = [
         SignalingCarrier::Local,
         SignalingCarrier::Nostr,
         SignalingCarrier::Mdns,
+        SignalingCarrier::Hub,
     ];
+
+    #[test]
+    fn ordinary_ingress_move_has_no_introduction_witness() {
+        let attach = lone_attach(SignalingCarrier::Nostr);
+        let ingress = attach
+            .directed("peer-a".into(), offer("ordinary"))
+            .into_ingress();
+        let (inbound, witness) = ingress.into_inbound_with_introduction();
+        assert!(witness.is_none());
+        assert!(matches!(inbound, SignalingInbound::Offer { .. }));
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens one promoted local link; run explicitly in the isolated native harness"]
+    async fn hub_ingress_moved_witness_rechecks_revocation_and_replacement() {
+        use crate::config::HubIntroductionPolicyConfig;
+        use crate::engine::hub_introduction::HubIntroduction;
+        use crate::semantic::DeviceId;
+        let state = crate::engine::build_test_state("hub-witness-near");
+        let far = crate::engine::build_test_state("hub-witness-far");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let link = tokio::time::timeout_at(
+            deadline,
+            crate::engine::install_promoted_session_over_real_link(&state, &far),
+        )
+        .await
+        .expect("bounded promoted carrier");
+        let owner = state
+            .peers
+            .owner(link.peer_device_id())
+            .expect("installed carrier");
+        let owner = owner.for_worker(owner.connection().current_worker().expect("carrier worker"));
+        let funded = funded(|_| 1_000_000);
+        let local =
+            DeviceId::from_canonical_str(state.identity.public_id()).expect("canonical local id");
+        let target_key = ed25519_dalek::SigningKey::from_bytes(&[93; 32]);
+        let target =
+            DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes()).unwrap();
+        let mut controller = HubIntroduction::new(
+            HubIntroductionPolicyConfig {
+                max_records: 1,
+                max_waiters_per_target: 1,
+                max_signaling_bytes: 16_384,
+                max_candidates_per_attempt: 2,
+                attempt_timeout_ms: 1_000,
+                terminal_retention_ms: 100,
+                max_transient_links: 1,
+                idle_timeout_ms: 1_000,
+                max_maintenance_per_tick: 1,
+            },
+            funded.scope.clone(),
+            state.mesh_context_id(),
+            &local,
+        )
+        .unwrap();
+        let ticket = controller
+            .begin_demand(&target, &owner, std::time::Instant::now())
+            .unwrap()
+            .ticket;
+        // This control isolates the admitted value's ownership transfer. It
+        // uses the real mailbox and a genuinely promoted carrier, but does not
+        // claim to exercise the separate signed challenge/Offer parser.
+        let observation = CarrierObservation {
+            carrier: SignalingCarrier::Hub,
+            instance: CarrierInstance(1),
+            signal: EphemeralSignal::ConnectIntent,
+            body: ObservationBody::Directed {
+                from: target.to_string(),
+                message: SignalingMessage::Offer {
+                    peer_id: target.to_string(),
+                    offer_id: ticket.attempt(),
+                    sdp: "witness-transfer-only".into(),
+                },
+            },
+            hub: Some(HubIngressWitness {
+                ticket,
+                carrier: owner.downgrade(),
+            }),
+        };
+        assert_eq!(funded.runtime.deliver(observation), Delivered::Accepted);
+        let mut rx = funded.rx;
+        let delivered = rx.try_recv().expect("admitted ingress reaches mailbox");
+        let current_before_dequeue = delivered.value().introduction_carrier_is_current(&state);
+        let mut observed = [false; 5];
+        // Retention stays inside the same consuming terminal-effect seam used
+        // by the engine. Only scalar observations escape this closure.
+        delivered
+            .run_terminal_effect(|ingress| async {
+                let (inbound, witness) = ingress.into_inbound_with_introduction();
+                let witness = witness.expect("move retains original Hub witness");
+                let same_ticket = witness.ticket() == ticket;
+                tokio::task::yield_now().await;
+                let current_after_await = witness.is_current(&state);
+                owner.connection().revoke_promoted_session();
+                let accepted_after_revoke = witness.is_current(&state);
+                state
+                    .peers
+                    .install(Arc::new(crate::engine::connection::PeerConnection::new(
+                        owner.device_id().to_string(),
+                        None,
+                    )));
+                let accepted_after_replace = witness.is_current(&state);
+                observed = [
+                    same_ticket,
+                    current_after_await,
+                    accepted_after_revoke,
+                    accepted_after_replace,
+                    matches!(inbound, SignalingInbound::Offer { .. }),
+                ];
+                drop((inbound, witness));
+            })
+            .await;
+        drop((owner, rx));
+        controller.shutdown();
+        drop(controller);
+        let provider = funded.provider.clone();
+        drop((funded.runtime, funded.scope));
+        let close_outcomes = tokio::time::timeout_at(deadline, link.close_outcomes())
+            .await
+            .expect("bounded link cleanup");
+        tokio::time::timeout_at(deadline, async {
+            state.shutdown().await;
+            far.shutdown().await;
+        })
+        .await
+        .expect("bounded joined state cleanup");
+        assert!(tokio::time::Instant::now() < deadline);
+        assert!(close_outcomes.iter().all(Result::is_ok));
+        assert!(current_before_dequeue && observed[0] && observed[1] && observed[4]);
+        assert!(!observed[2] && !observed[3]);
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+    }
 
     fn offer(sdp: &str) -> SignalingMessage {
         offer_with_id("offer-1", sdp)
@@ -2176,7 +2493,7 @@ pub(super) mod tests {
     /// # Scope, because the obvious reading is wider than the truth
     ///
     /// This is a rule about values that reach [`parse_directed`]. Offer, answer
-    /// and candidate reach it from all three carriers, so there it is the live
+    /// and candidate reach it from all carrier shapes, so there it is the live
     /// behaviour everywhere. A directed announce or leave reaches it from
     /// `LocalBroker` alone — the two network drivers normalize those into their
     /// own presence and withdrawal reports first, and what *they* attribute is

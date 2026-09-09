@@ -152,6 +152,7 @@ fn config(id: &str, turn_url: String) -> NetworkConfig {
         tree: None,
         hub: None,
         local_observations: None,
+        application_transport: None,
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),
         stun_servers: Vec::new(),

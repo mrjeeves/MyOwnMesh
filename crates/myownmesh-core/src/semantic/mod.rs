@@ -198,7 +198,7 @@ pub struct SemanticStateIdentity {
     projection_commitment: [u8; 32],
     state_commitment: [u8; 32],
     #[serde(skip)]
-    funding: Option<std::sync::Arc<crate::resource::ResourceLease>>,
+    _funding: Option<std::sync::Arc<crate::resource::ResourceLease>>,
 }
 
 impl SemanticStateIdentity {
@@ -236,7 +236,7 @@ impl SemanticStateIdentity {
             unresolved_fact_count,
             projection_commitment,
             state_commitment,
-            funding: Some(std::sync::Arc::new(funding)),
+            _funding: Some(std::sync::Arc::new(funding)),
         }
     }
 }

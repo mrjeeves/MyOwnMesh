@@ -25,5 +25,6 @@
   <path class="edge dash" d="M1175 198V395"/>
   <text class="s" x="1210" y="302">current semantic guard</text>
   <text class="s" x="690" y="548" text-anchor="middle">Direct, TURN, or Closed member relay changes the carrier owner and observations—not endpoint identity or application authority.</text>
+<text class="s" x="690" y="568" text-anchor="middle">Adopted Hub direction (not qualified by this LAN path): a Hub may copy endpoint ciphertext/metadata but cannot decrypt/read plaintext; E2E failure is refusal.</text>
   <text class="s" x="690" y="615" text-anchor="middle">The executable LAN profile selects mDNS + direct WebRTC; it does not imply that offline fact media can carry an interactive session.</text>
 </svg>

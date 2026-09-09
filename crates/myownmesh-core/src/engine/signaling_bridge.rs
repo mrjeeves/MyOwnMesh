@@ -2496,6 +2496,13 @@ fn spawn_fanout(
             // never owns a translated allocation of its own and has no reason
             // to hold the delivered value away from what funds it.
             let msg = delivery.value();
+            // Introduction-owned attempts never also fan out to Nostr/mDNS.
+            // True includes stale/expired/refused intro writes; only a value
+            // with no intro custody may use the ordinary carrier selection.
+            // The delivery retains its funded payload throughout this await.
+            if state.try_send_hub_introduction_signal(msg).await {
+                continue;
+            }
             let recovery_id = match msg {
                 SignalingOutbound::RecoveryAnnounce { id } => Some(*id),
                 _ => None,

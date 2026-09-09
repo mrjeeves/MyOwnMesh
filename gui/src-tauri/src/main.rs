@@ -1117,7 +1117,6 @@ fn main() {
                                         );
                                     }
                                     startup.complete(StartupOutcome::Owned);
-                                    return;
                                 }
                             }
                         } else {

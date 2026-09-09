@@ -93,6 +93,12 @@ pub enum Request {
     SemanticStateIdentity {
         network: String,
     },
+    /// Render a bounded diagnostic view of the newest facts retained in
+    /// the live hot-history cache.
+    SemanticRecentFacts {
+        network: String,
+        request: serde_json::Value,
+    },
     NetworkRemove {
         network: String,
         #[serde(default)]
@@ -265,6 +271,43 @@ pub enum Request {
         #[serde(default)]
         flow_capability: Option<String>,
     },
+    OpaqueFlowOpen {
+        network: String,
+        peer: String,
+        label: Vec<u8>,
+        client_id: String,
+        client_capability: String,
+        direction: RealtimeFlowDirection,
+        mode: OpaqueFlowMode,
+        max_unit_bytes: u32,
+    },
+    OpaqueFlowChange {
+        network: String,
+        label: Vec<u8>,
+        client_id: String,
+        client_capability: String,
+        flow_capability: String,
+        direction: RealtimeFlowDirection,
+        mode: OpaqueFlowMode,
+        max_unit_bytes: u32,
+    },
+    OpaqueFlowClose {
+        client_id: String,
+        client_capability: String,
+        flow_capability: String,
+    },
+    OpaquePipe {
+        direction: RealtimePipeDirection,
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_capability: Option<String>,
+        #[serde(default)]
+        flow_capability: Option<String>,
+    },
 
     // ---- closed-network governance --------------------------------
     GovernanceProposeRoleGrant {
@@ -368,6 +411,7 @@ impl Request {
                 | Self::NetworkBootstrapExport { .. }
                 | Self::SemanticFactPageExport { .. }
                 | Self::SemanticStateIdentity { .. }
+                | Self::SemanticRecentFacts { .. }
                 | Self::ServicesStatus
                 | Self::EventsSubscribe
                 | Self::TraceSubscribe { .. }
@@ -401,6 +445,14 @@ pub(crate) enum RealtimeFlowDirection {
 pub(crate) enum RealtimePipeDirection {
     Outbound,
     Inbound,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OpaqueFlowMode {
+    ReliableOrdered,
+    PartialUnordered { max_retransmits: u16 },
 }
 
 #[allow(dead_code)]
@@ -987,6 +1039,7 @@ mod tests {
             "network_bootstrap_export",
             "semantic_fact_page_export",
             "semantic_state_identity",
+            "semantic_recent_facts",
             "services_status",
             "events_subscribe",
             "trace_subscribe",
@@ -995,7 +1048,7 @@ mod tests {
             "update_status",
         ];
         let requests = fixture_requests();
-        assert_eq!(requests.len(), 63);
+        assert_eq!(requests.len(), 68);
         for request in requests {
             let encoded = serde_json::to_value(&request).expect("request serializes");
             let tag = encoded
@@ -1036,7 +1089,7 @@ mod tests {
             },
             Request::NetworkImportClosed {
                 config: serde_json::json!({"id":"local","network_id":"net"}),
-                expected_context_id: serde_json::json!([0; 32]),
+                expected_context_id: serde_json::json!(vec![0u8; 32]),
                 bootstrap: serde_json::json!({}),
             },
             Request::NetworkBootstrapExport {
@@ -1052,6 +1105,10 @@ mod tests {
             },
             Request::SemanticStateIdentity {
                 network: "net".into(),
+            },
+            Request::SemanticRecentFacts {
+                network: "net".into(),
+                request: serde_json::json!({"max_facts":1,"max_encoded_bytes":1024}),
             },
             Request::NetworkRemove {
                 network: "net".into(),
@@ -1200,6 +1257,39 @@ mod tests {
                 client_capability: Some("cap".into()),
                 flow_capability: None,
             },
+            Request::OpaqueFlowOpen {
+                network: "net".into(),
+                peer: "peer".into(),
+                label: vec![0xff, 0x00, 0x7f],
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                direction: RealtimeFlowDirection::Outbound,
+                mode: OpaqueFlowMode::PartialUnordered { max_retransmits: 3 },
+                max_unit_bytes: 1024,
+            },
+            Request::OpaqueFlowChange {
+                network: "net".into(),
+                label: vec![0xff, 0x00, 0x7f],
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                flow_capability: "flow".into(),
+                direction: RealtimeFlowDirection::Outbound,
+                mode: OpaqueFlowMode::PartialUnordered { max_retransmits: 3 },
+                max_unit_bytes: 2048,
+            },
+            Request::OpaqueFlowClose {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                flow_capability: "flow".into(),
+            },
+            Request::OpaquePipe {
+                direction: RealtimePipeDirection::Inbound,
+                network: "net".into(),
+                peer: Some("peer".into()),
+                client_id: Some("c1".into()),
+                client_capability: Some("cap".into()),
+                flow_capability: None,
+            },
             Request::GovernanceProposeRoleGrant {
                 network: "net".into(),
                 target: "peer".into(),
@@ -1294,6 +1384,7 @@ mod tests {
             "semantic_fact_page_export",
             "semantic_fact_page_import",
             "semantic_state_identity",
+            "semantic_recent_facts",
             "network_remove",
             "forget_all_networks",
             "factory_reset",
@@ -1320,6 +1411,10 @@ mod tests {
             "realtime_flow_open",
             "realtime_flow_close",
             "realtime_pipe",
+            "opaque_flow_open",
+            "opaque_flow_change",
+            "opaque_flow_close",
+            "opaque_pipe",
             "governance_propose_role_grant",
             "governance_propose_role_revoke",
             "governance_propose_evict",

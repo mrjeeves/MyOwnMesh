@@ -1736,6 +1736,189 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 result?;
                 break;
             }
+            Request::OpaquePipe {
+                direction,
+                network,
+                peer,
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                let plan = match opaque_pipe::opaque_pipe_binding_plan(
+                    direction,
+                    &network,
+                    peer.as_deref(),
+                    flow_capability.as_deref(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(message) => {
+                        let resp = PreparedReply::StaticError(message);
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Prepared(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    }
+                };
+                let pipe_owner = {
+                    let (Some(client_id), Some(capability)) =
+                        (client_id, client_capability.as_deref())
+                    else {
+                        match write_static_error(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            "opaque_pipe requires client_id and client_capability: the pipe \
+                             is owned by the client that opened the exact flow",
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    let Some(owner) = state.clients.authenticate(client_id, capability) else {
+                        match write_static_error(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            "invalid local client authority",
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    owner
+                };
+                let lengths = plan.retained_lengths();
+                let bound = Retained::admit_building(lengths, &json_lines, || plan.build())?;
+                drop((network, peer, client_capability, flow_capability, decoded));
+                let cancel = ConnectionCancel::owned_by(&state.clients, &pipe_owner);
+                let Some(net) = state.registry.get(bound.network()) else {
+                    let text = PreparedText::acquiring(
+                        format!("unknown network: {}", bound.network()),
+                        &json_lines,
+                    )
+                    .context("opaque pipe unknown-network refusal was not admitted")?;
+                    let resp = PreparedReply::Error(text);
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Prepared(&resp),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let inbound_stream = match &*bound {
+                    opaque_pipe::OpaquePipeBinding::Inbound { peer, .. } => {
+                        match net.realtime_inbound(peer) {
+                            Some(stream) => Some(stream),
+                            None => {
+                                match write_static_error(
+                                    &mut writer,
+                                    &json_lines,
+                                    &cancel,
+                                    "no inbound opaque stream for the current peer session, or a \
+                                 live opaque pipe already holds it",
+                                )
+                                .await?
+                                {
+                                    Wrote::Sent => continue,
+                                    Wrote::Ended => break,
+                                }
+                            }
+                        }
+                    }
+                    opaque_pipe::OpaquePipeBinding::Outbound {
+                        network,
+                        flow_capability,
+                    } => {
+                        if pipe_owner
+                            .with_realtime_flow(flow_capability, network, |_flow| ())
+                            .is_none()
+                        {
+                            match write_static_error(
+                                &mut writer,
+                                &json_lines,
+                                &cancel,
+                                "unknown opaque flow_capability on this network: it was never \
+                                 issued to this client, or it has already been closed",
+                            )
+                            .await?
+                            {
+                                Wrote::Sent => continue,
+                                Wrote::Ended => break,
+                            }
+                        }
+                        None
+                    }
+                };
+                let ack = PreparedReply::Bool {
+                    key: "opaque_pipe",
+                    value: true,
+                };
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Prepared(&ack),
+                )
+                .await?
+                {
+                    Wrote::Sent => {}
+                    Wrote::Ended => break,
+                }
+                let pipe = async {
+                    match (inbound_stream, &*bound) {
+                        (
+                            None,
+                            opaque_pipe::OpaquePipeBinding::Outbound {
+                                network,
+                                flow_capability,
+                            },
+                        ) => {
+                            opaque_pipe::run_opaque_outbound_pipe(
+                                &net,
+                                &pipe_owner,
+                                flow_capability,
+                                network,
+                                reader.frames(),
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        (Some(stream), opaque_pipe::OpaquePipeBinding::Inbound { .. }) => {
+                            opaque_pipe::run_opaque_inbound_pipe(
+                                &net,
+                                &stream,
+                                &mut writer,
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        _ => Ok(()),
+                    }
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Ok(()),
+                    result = pipe => result,
+                };
+                result?;
+                break;
+            }
             Request::Status => {
                 let (reply, output) = dispatch::network::node_status(&state, &json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
@@ -1832,6 +2015,99 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 match write_variable(&mut writer, &json_lines, &cancel, variable)
                     .await
                     .context("realtime response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowOpen {
+                network,
+                peer,
+                label,
+                client_id,
+                client_capability,
+                direction,
+                mode,
+                max_unit_bytes,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow operation result was not admitted")?;
+                let (variable, provisional) = dispatch::opaque::flow_open(
+                    &state,
+                    owner,
+                    dispatch::opaque::FlowOpen {
+                        network,
+                        peer,
+                        label,
+                        direction,
+                        mode,
+                        max_unit_bytes,
+                    },
+                    client_id,
+                    client_capability,
+                )
+                .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
+                match wrote.context("opaque flow response line was not admitted")? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowChange {
+                network,
+                label,
+                client_id,
+                client_capability,
+                flow_capability,
+                direction,
+                mode,
+                max_unit_bytes,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow change result was not admitted")?;
+                let variable = dispatch::opaque::flow_change(
+                    &state,
+                    owner,
+                    dispatch::opaque::FlowChange {
+                        network,
+                        label,
+                        direction,
+                        mode,
+                        max_unit_bytes,
+                    },
+                    client_id,
+                    client_capability,
+                    flow_capability,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("opaque flow change response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowClose {
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow operation result was not admitted")?;
+                let variable = dispatch::opaque::flow_close(
+                    &state,
+                    owner,
+                    client_id,
+                    client_capability,
+                    flow_capability,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("opaque flow close response line was not admitted")?
                 {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -2784,6 +3060,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
 /// It decides nothing about admission — the binding is checked before either
 /// pump starts, and every refusal it can meet comes from core.
 mod handoff;
+mod opaque_pipe;
 mod realtime_pipe;
 
 #[cfg(test)]
@@ -3833,6 +4110,7 @@ mod terminal_shutdown_tests {
             tree: None,
             hub: None,
             local_observations: None,
+            application_transport: None,
             semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),

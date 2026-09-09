@@ -61,6 +61,32 @@ edges rather than 12,497,500 full-mesh edges. These are test inputs and
 arithmetic bounds, not product defaults or 5,000-device network measurements.
 The Hub tier itself is still full mesh. Selecting every member as a hub does
 not scale; each hub also needs capacity for its assigned spokes.
+That full tier is a property of the legacy configured `Hubs` selector, not a
+universal requirement for every Hub-introduction path or for every active
+application pair.
+
+### Hub/application demand direction
+
+The configured Hub set is a sparse directory and forwarding preference, not a
+permanent all-to-all connection plan. A real application request introduces
+bounded, coalesced endpoint demand: prefer a directly usable authenticated
+endpoint connection and use configured TURN as a distinct ICE service when the
+direct path is unsuitable. A Hub introduction negotiates endpoint connectivity;
+it does not own application payload.
+
+Only a separately bounded residual Hub-transit fallback carries endpoint
+ciphertext. Its endpoints derive a fresh endpoint-to-endpoint E2E epoch bound
+to the exact mesh context and full endpoint keys; the Hub may copy/forward that
+ciphertext and observe metadata, but cannot decrypt or read application
+plaintext. If the epoch cannot be established, the operation refuses; there is
+no plaintext compatibility fallback. A Hub receives no membership authority or
+permission to veto an independently viable direct or alternate route.
+
+This avoids unavoidable all-pairs maintained links, but all-pairs active
+application demand can still produce quadratic endpoint sessions. The
+direction is an architecture contract, not a shipped-feature or qualification
+claim; exact implementation and evidence remain governed by the current
+head's ownership and qualification records.
 
 The optional Hub maintenance policy bounds parallel dials and work per pass.
 Rotation through eligible work must prevent a repeatedly unavailable early
@@ -73,8 +99,12 @@ consistency digest binds the network context through its envelope and binds
 the canonical Hub set, redundancy, and scheduler profile through a
 domain-separated digest. It is not a semantic commitment. The receiver checks
 the exact current authenticated owner, configured Hub eligibility, context,
-and replay sequence before allowing an advertisement to influence suppression.
-Remote configuration is never installed from an advertisement.
+and replay sequence before accepting a notice and advancing its replay cursor.
+Remote configuration is never installed from an advertisement. All per-origin
+unicast notices are excluded from consistency suppression and reset. The
+adapter uses randomized doubling cadence and a bounded genuine local reset
+budget; this makes no broadcast-density claim. Solicited lookup, introduction,
+ICE, authentication, ACK, and close operations are outside this mechanism.
 
 These advertisements are not forwarded and do not carry transferable
 signatures or address authority. Their authenticity comes from the existing
@@ -104,11 +134,12 @@ role, never a semantic authority. The longest primary route is
 leaf -> hub -> root -> hub -> leaf, within the existing four-hop envelope.
 Deeper trees require separate protocol work; increasing the TTL silently is
 not an implementation of this contract. The legacy Hubs mode above remains
-unchanged. The bounded local runtime controls now pass authenticated attachment,
-bidirectional four-hop delivery, lower-ranked fallback, discovery and accepted
-relation expiry. See [the local verification record](qualification/graph-hub-local-evidence.md)
-for exact source/binary evidence and limits. Pushed-head audit and operator
-approval remain separate; no shipped-process or field qualification follows.
+unchanged. The existing local control record reports PASS for authenticated
+attachment, bidirectional four-hop delivery, lower-ranked fallback, discovery,
+and accepted relation expiry at its cited historical source. That evidence is
+not current-head qualification; the new Hub introduction and endpoint-cipher
+overlay remain unqualified. See [the local verification record](qualification/graph-hub-local-evidence.md)
+for exact source/binary evidence and limits.
 
 The tree is a preferred sparse route, not an exclusive connectivity or
 permission hierarchy. A hub can refuse resources or forwarding service that
@@ -148,12 +179,13 @@ does not automatically create a permanent connection.
 ## Research used and deliberate boundaries
 
 Chris Paul's uNET work separates knowing about an endpoint from maintaining a
-connection to it. Its parent selection, backup relationships, and next-hop
-state provide useful design guidance for sparse connectivity. Here, stable
-device keys remain independent of locators, while existing authenticated
-admission replaces the patent's trust machinery. The operator has confirmed
-permission to use the applicable uNET mechanisms. This is a technical design
-reference, not a separate patent-clearance opinion.
+connection to it. Its parent selection, backup relationships, next-hop state,
+and already-connected sibling shortcuts provide useful design guidance for
+sparse connectivity. Here, stable device keys remain independent of locators,
+while bounded demand introduction and existing authenticated admission replace
+the patent's trust machinery. The operator has confirmed permission to use the
+applicable uNET mechanisms. This is a technical design reference, not a
+separate patent-clearance opinion.
 [uNET architecture patent](https://patents.google.com/patent/US20160182350A1/en)
 
 Trickle contributes randomized interval scheduling, redundancy suppression,

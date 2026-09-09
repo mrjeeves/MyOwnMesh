@@ -23,8 +23,8 @@ use crate::persist::DirectoryCapability;
 
 #[cfg(test)]
 thread_local! {
-    static AUTHORIZED_DEVICES_LINEAR_SCAN_COUNT: Cell<usize> = Cell::new(0);
-    static AUTHORIZED_DEVICES_REBUILD_COUNT: Cell<usize> = Cell::new(0);
+    static AUTHORIZED_DEVICES_LINEAR_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+    static AUTHORIZED_DEVICES_REBUILD_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Version of the keyed, non-authoritative projection records.  The former
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     #[test]
-    fn load_orders_reordered_directory_entries_by_canonical_device_id() {
+    fn load_orders_reordered_directory_entries_by_device_id() {
         let root = tempfile::tempdir().expect("roster metadata root");
         let directory = root.path().join("rosters").join("net-order");
         std::fs::create_dir_all(&directory).expect("keyed roster directory");

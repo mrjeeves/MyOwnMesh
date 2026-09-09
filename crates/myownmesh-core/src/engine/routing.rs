@@ -91,8 +91,18 @@ impl RoutingPolicy {
         if max_parallel_routes > max_next_hops {
             return Err(RoutePolicyRefusal::InconsistentParallelism);
         }
-        let max_payload_bytes =
+        let max_wire_bytes =
             usize::try_from(max_envelope_bytes).map_err(|_| RoutePolicyRefusal::Overflow)?;
+        if max_wire_bytes > crate::protocol::RECEIVE_FRAME_BYTES {
+            return Err(RoutePolicyRefusal::ProtocolLimits(
+                RoutedApplicationError::WireTooLarge,
+            ));
+        }
+        // The configured cap bounds the complete MeshMessage representation.
+        // Ciphertext has a separate protocol ceiling; envelope metadata is not
+        // payload permission. A small wire cap may admit no useful message.
+        let max_payload_bytes =
+            max_wire_bytes.min(crate::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES);
         let _ = RoutedApplicationLimits::checked(max_payload_bytes, max_hop_budget)
             .map_err(RoutePolicyRefusal::ProtocolLimits)?;
         Ok(Self {
@@ -129,9 +139,11 @@ impl RoutingPolicy {
         self.max_hop_budget
     }
 
-    fn protocol_limits(self) -> RoutedApplicationLimits {
+    pub(super) fn protocol_limits(self) -> RoutedApplicationLimits {
         RoutedApplicationLimits::checked(
-            usize::try_from(self.max_envelope_bytes).expect("checked routing policy fits usize"),
+            usize::try_from(self.max_envelope_bytes)
+                .expect("checked routing policy fits usize")
+                .min(crate::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES),
             self.max_hop_budget,
         )
         .expect("checked routing policy satisfies protocol limits")
@@ -188,6 +200,7 @@ impl RoutePlan {
         &self.next_hops
     }
 
+    #[cfg(test)]
     pub(crate) const fn outgoing_ttl(&self) -> u8 {
         self.outgoing_ttl
     }
@@ -201,6 +214,7 @@ impl RoutePlan {
 /// snapshot of candidates that passed the peer-registry's exact promoted,
 /// authenticated and approved-session predicate.  Dispatch checks that
 /// predicate again immediately before the actual send.
+#[cfg(test)]
 pub(crate) fn plan_next_hops(
     topology: &dyn Topology,
     self_id: &str,
@@ -220,6 +234,7 @@ pub(crate) fn plan_next_hops(
     )
 }
 
+#[cfg(test)]
 fn plan_next_hops_with_local_origin(
     topology: &dyn Topology,
     self_id: &str,
@@ -241,6 +256,8 @@ fn plan_next_hops_with_local_origin(
     )
 }
 
+// Keep captured routing inputs explicit; no new aggregate ownership or allocation.
+#[allow(clippy::too_many_arguments)]
 fn plan_next_hops_with_local_origin_and_tree_parent(
     topology: &dyn Topology,
     self_id: &str,
@@ -361,6 +378,9 @@ impl RoutingState {
     /// protocol verifier and captured-hop check precede replay custody.  A
     /// relay plan is computed before its key is retained, so no-route does not
     /// poison a later retry.
+    #[cfg(all(test, feature = "transport-lab"))]
+    // Mirrors the production captured-hop admission boundary without a parent override.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_captured_previous_hop<C, P>(
         &self,
         local_id: &DeviceId,
@@ -389,6 +409,8 @@ impl RoutingState {
         )
     }
 
+    // Captured identity, policy closure, signer and routing view stay separate and borrowed.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_captured_previous_hop_with_tree_parent<C, P>(
         &self,
         local_id: &DeviceId,
@@ -407,7 +429,7 @@ impl RoutingState {
     {
         validate_routed_envelope(&envelope, captured_previous_hop, context_id, self.policy)?;
         let encoded_len = envelope
-            .encoded_len()
+            .complete_encoded_len()
             .ok_or(RouteRefusal::Envelope(RoutedApplicationError::Encoding))?;
         if u64::try_from(encoded_len).map_err(|_| RouteRefusal::AccountingOverflow)?
             > self.policy.max_envelope_bytes()
@@ -446,7 +468,7 @@ impl RoutingState {
             .append_hop_with_limits(local_id.clone(), signing_key, self.policy.protocol_limits())
             .map_err(RouteRefusal::Envelope)?;
         let encoded_len = envelope
-            .encoded_len()
+            .complete_encoded_len()
             .ok_or(RouteRefusal::Envelope(RoutedApplicationError::Encoding))?;
         if u64::try_from(encoded_len).map_err(|_| RouteRefusal::AccountingOverflow)?
             > self.policy.max_envelope_bytes()
@@ -574,7 +596,7 @@ impl RoutingState {
 /// This is a test-only view of the same two private map-node claims acquired
 /// by `admit_replay`; callers cannot substitute a layout-compatible proxy for
 /// either production key type.
-#[cfg(all(test, feature = "route-flow-diagnostics"))]
+#[cfg(test)]
 pub(super) fn replay_entry_reservation_charge_for_test() -> crate::resource::ResourceClaim {
     let key_claim = LeasedMap::<RouteKey, RouteGeneration>::entry_claim()
         .expect("the production replay-key map-node claim is representable");
@@ -642,12 +664,14 @@ pub(crate) trait ExactApprovedSessionProvider: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RouteSendError {
     /// The exact approved session was already closed before a write began.
+    #[cfg(test)]
     #[error("approved session closed")]
     Closed,
     /// The exact approved session refused before a write began.
     #[error("approved session refused routed application frame")]
     Refused,
     /// A legacy generic send failure; conservatively treated as uncertain.
+    #[cfg(test)]
     #[error("approved session send failed")]
     Failed,
     /// The write boundary was crossed, but delivery cannot be established.
@@ -668,7 +692,52 @@ pub(crate) struct RouteDispatchReport {
 type RouteSendFuture = Pin<Box<dyn Future<Output = Result<(), RouteSendError>> + Send>>;
 
 fn send_routed_to_session(session: Arc<dyn ExactApprovedSession>, frame: Bytes) -> RouteSendFuture {
-    Box::pin(async move { session.send_routed(frame).await })
+    Box::pin(run_routed_to_session(session, frame))
+}
+
+async fn run_routed_to_session(
+    session: Arc<dyn ExactApprovedSession>,
+    frame: Bytes,
+) -> Result<(), RouteSendError> {
+    session.send_routed(frame).await
+}
+
+/// Public future/value backing plus explicitly opaque futures-util task-node
+/// bookkeeping. Native session futures have a separate concrete owner claim.
+/// This is a requested-capacity claim, not an allocator/RSS measurement.
+pub(crate) fn dispatch_work_claim(
+    window: usize,
+) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    use crate::resource::{ResourceClaim, ResourceClaimArithmeticError, ResourceClass};
+    fn future_bytes<F: Future>(_: impl FnOnce(Arc<dyn ExactApprovedSession>, Bytes) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    let overflow = || ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    };
+    let one = future_bytes(run_routed_to_session)
+        .checked_add(std::mem::size_of::<RouteSendFuture>())
+        .ok_or_else(overflow)?;
+    let memory = one
+        .checked_mul(window)
+        .and_then(|bytes| {
+            bytes.checked_add(std::mem::size_of::<FuturesUnordered<RouteSendFuture>>())
+        })
+        .ok_or_else(overflow)?;
+    let opaque = window
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(overflow)?;
+    ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            u64::try_from(memory).map_err(|_| overflow())?,
+        ),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            u64::try_from(opaque).map_err(|_| overflow())?,
+        ),
+    ])
 }
 
 /// Dispatch all finite plan futures concurrently and drain them to completion.
@@ -676,6 +745,18 @@ fn send_routed_to_session(session: Arc<dyn ExactApprovedSession>, frame: Bytes) 
 /// candidate or carrier-only peer cannot become an application capability.
 pub(crate) async fn dispatch_routed_frame(
     plan: RoutePlan,
+    frame: Bytes,
+    sessions: &dyn ExactApprovedSessionProvider,
+) -> RouteDispatchReport {
+    dispatch_borrowed_routed_frame(&plan, frame, sessions).await
+}
+
+/// The encrypted output owner retains its plan and backing through terminal
+/// sends. Borrow that plan rather than cloning it out of a funding guard.
+/// Bytes clones below share the same guarded allocation; no retry/resequence
+/// behavior differs from the ordinary owned-plan entry point.
+pub(crate) async fn dispatch_borrowed_routed_frame(
+    plan: &RoutePlan,
     frame: Bytes,
     sessions: &dyn ExactApprovedSessionProvider,
 ) -> RouteDispatchReport {
@@ -707,10 +788,12 @@ pub(crate) async fn dispatch_routed_frame(
                 report.delivered = report.delivered.saturating_add(1);
                 succeeded = true;
             }
+            #[cfg(test)]
             Err(RouteSendError::Closed) => {
                 report.unavailable = report.unavailable.saturating_add(1)
             }
             Err(RouteSendError::Refused) => report.refused = report.refused.saturating_add(1),
+            #[cfg(test)]
             Err(RouteSendError::Failed) => {
                 report.failed = report.failed.saturating_add(1);
                 uncertain = true;
@@ -746,6 +829,114 @@ mod tests {
     use data_encoding::BASE32_NOPAD;
     use ed25519_dalek::SigningKey;
     use std::collections::HashSet;
+
+    #[test]
+    fn default_config_preserves_complete_wire_and_distinct_payload_limits() {
+        let config = crate::config::RoutingPolicyConfig::default()
+            .checked()
+            .expect("the default network configuration is valid");
+        let policy = RoutingPolicy::checked(
+            usize::try_from(config.max_next_hops).unwrap(),
+            usize::try_from(config.max_parallel_routes).unwrap(),
+            config.max_envelope_bytes,
+            usize::try_from(config.max_dedup_entries).unwrap(),
+            config.max_dedup_bytes,
+            u8::try_from(config.max_hop_budget).unwrap(),
+        )
+        .expect("the real default config must convert to routing policy at join");
+        assert_eq!(policy.max_envelope_bytes(), 65_535);
+        assert_eq!(policy.protocol_limits().max_payload_bytes, 40_000);
+        assert_eq!(policy.protocol_limits().max_hop_budget, 4);
+        assert_eq!(
+            RoutedApplicationLimits::checked(40_001, 4),
+            Err(RoutedApplicationError::InvalidLimits)
+        );
+
+        let origin_key = SigningKey::from_bytes(&[31; 32]);
+        let destination_key = SigningKey::from_bytes(&[32; 32]);
+        let origin =
+            DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes()).unwrap();
+        let destination =
+            DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes()).unwrap();
+        let context = MeshContextId::from_bytes([33; 32]);
+        // Wire-only ciphertext shape: this control does not assert AEAD validity.
+        for (bytes, accepted) in [(40_000, true), (40_001, false)] {
+            let result = RoutedApplicationEnvelope::new_with_limits(
+                context,
+                origin.clone(),
+                destination.clone(),
+                [34; 16],
+                4,
+                crate::protocol::topology::ciphertext_payload_for_test(
+                    context,
+                    &origin,
+                    &destination,
+                    bytes,
+                ),
+                &origin_key,
+                policy.protocol_limits(),
+            );
+            if accepted {
+                let envelope = result.expect("ciphertext at its separate cap fits complete wire");
+                assert!(envelope.complete_encoded_len().unwrap() <= 65_535);
+                validate_routed_envelope(&envelope, &origin, context, policy).unwrap();
+            } else {
+                // The packet's intrinsic cap is checked before the stricter
+                // optional routing payload ceiling.
+                assert!(matches!(
+                    result,
+                    Err(RoutedApplicationError::InvalidCiphertext)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn routing_complete_wire_policy_boundaries_and_hop_limits_are_independent() {
+        assert_eq!(
+            RoutingPolicy::checked(1, 1, 0, 1, 1, 4),
+            Err(RoutePolicyRefusal::Zero)
+        );
+        for wire in [1, 40_000, 40_001, 65_535] {
+            let policy = RoutingPolicy::checked(1, 1, wire, 1, 1, 4).unwrap();
+            assert_eq!(policy.max_envelope_bytes(), wire);
+            assert_eq!(
+                policy.protocol_limits().max_payload_bytes,
+                usize::try_from(wire).unwrap().min(40_000)
+            );
+        }
+        for wire in [65_536, u64::MAX] {
+            assert!(RoutingPolicy::checked(1, 1, wire, 1, 1, 4).is_err());
+        }
+        assert_eq!(
+            RoutingPolicy::checked(1, 1, 65_535, 1, 1, 0),
+            Err(RoutePolicyRefusal::Zero)
+        );
+        for hops in [5, u8::MAX] {
+            assert_eq!(
+                RoutingPolicy::checked(1, 1, 65_535, 1, 1, hops),
+                Err(RoutePolicyRefusal::ProtocolLimits(
+                    RoutedApplicationError::InvalidLimits
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn routed_dispatch_work_prices_actual_future_backing_and_checked_window() {
+        use crate::resource::ResourceClass;
+        let none = dispatch_work_claim(0).unwrap();
+        let one = dispatch_work_claim(1).unwrap();
+        let two = dispatch_work_claim(2).unwrap();
+        let dimension = ResourceClass::AccountedMemoryBytes;
+        assert!(one.amount(dimension) > none.amount(dimension));
+        assert_eq!(
+            two.amount(dimension) - one.amount(dimension),
+            one.amount(dimension) - none.amount(dimension)
+        );
+        assert_eq!(two.amount(ResourceClass::OpaqueDependencyResidual), 5);
+        assert!(dispatch_work_claim(usize::MAX).is_err());
+    }
 
     fn canonical_key(seed: u8) -> String {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -1187,16 +1378,21 @@ mod dispatch_controls {
         let destination =
             DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
                 .expect("destination id");
+        let context = MeshContextId::from_bytes([3; 32]);
+        // Routing controls exercise signed wire custody, not endpoint AEAD.
+        let payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &origin,
+            &destination,
+            32,
+        );
         RoutedApplicationEnvelope::new(
-            MeshContextId::from_bytes([3; 32]),
+            context,
             origin,
             destination,
             [4; 16],
             2,
-            crate::protocol::ClosedRoutedPayload::ChannelFrame {
-                channel: "route-test".to_owned(),
-                payload: serde_json::json!({"value": "payload"}),
-            },
+            payload,
             &origin_key,
         )
         .expect("valid routed envelope")
@@ -1443,22 +1639,37 @@ mod replay_controls {
             destination.clone(),
             [11; 16],
             2,
-            crate::protocol::ClosedRoutedPayload::ChannelFrame {
-                channel: "route-size".to_owned(),
-                payload: serde_json::json!({"value": "bounded"}),
-            },
+            crate::protocol::topology::ciphertext_payload_for_test(
+                MeshContextId::from_bytes([10; 32]),
+                &origin,
+                &destination,
+                32,
+            ),
             &origin_key,
         )
         .expect("envelope");
-        let initial = u64::try_from(envelope.encoded_len().expect("initial encoding"))
+        let initial = u64::try_from(envelope.complete_encoded_len().expect("initial encoding"))
             .expect("initial length");
+        assert_eq!(initial as usize, envelope.encode_complete().unwrap().len());
+        assert!(
+            initial as usize > envelope.encoded_len().unwrap(),
+            "the complete MeshMessage wrapper is part of the configured cap"
+        );
         let limits = RoutedApplicationLimits::checked(initial as usize, 2).expect("limits");
         let mut grown_envelope = envelope.clone();
         grown_envelope
             .append_hop_with_limits(local.clone(), &local_key, limits)
             .expect("hop growth");
-        let grown = u64::try_from(grown_envelope.encoded_len().expect("grown encoding"))
-            .expect("grown length");
+        let grown = u64::try_from(
+            grown_envelope
+                .complete_encoded_len()
+                .expect("grown encoding"),
+        )
+        .expect("grown length");
+        assert_eq!(
+            grown as usize,
+            grown_envelope.encode_complete().unwrap().len()
+        );
         assert!(grown > initial);
 
         let early_provider = FiniteResourceProvider::new(scope_grant(None));
@@ -1512,7 +1723,7 @@ mod replay_controls {
         let port = ResourceProviderPort::new(provider.clone()).expect("process scope");
         let local_scope =
             LocalApplicationResourceScope::transport_lab_child_of(&port).expect("local scope");
-        let policy = RoutingPolicy::checked(1, 1, initial, 1, 4096, 4).expect("policy");
+        let policy = RoutingPolicy::checked(1, 1, grown - 1, 1, 4096, 4).expect("policy");
         let state = RoutingState::try_new(&local_scope, policy).expect("routing state");
         let origin_calls = Arc::new(AtomicUsize::new(0));
         let connected_calls = Arc::new(AtomicUsize::new(0));
@@ -1534,7 +1745,7 @@ mod replay_controls {
             },
             topology.as_ref(),
             MeshContextId::from_bytes([10; 32]),
-            envelope,
+            envelope.clone(),
             &local_key,
         );
         assert!(matches!(refusal, Err(RouteRefusal::EnvelopeTooLarge)));
@@ -1544,6 +1755,42 @@ mod replay_controls {
             state.replay.lock().expect("replay lock").retained_entries,
             0
         );
+
+        // The same signed input succeeds exactly at the complete pre-hop cap
+        // for its destination, and exactly at the post-hop cap for a relay.
+        // Each positive gets the existing exact funded replay-entry fixture.
+        for relay in [false, true] {
+            let (_provider, _scope, mut exact_state, exact_policy) = exact_cap_fixture();
+            exact_state.policy = RoutingPolicy::checked(
+                1,
+                1,
+                if relay { grown } else { initial },
+                1,
+                exact_policy.max_dedup_bytes(),
+                4,
+            )
+            .unwrap();
+            let admission = exact_state
+                .admit_captured_previous_hop(
+                    if relay { &local } else { &destination },
+                    &origin,
+                    || {
+                        assert!(relay, "destination admission must not plan forwarding");
+                        vec![destination.to_string()]
+                    },
+                    |_| true,
+                    topology.as_ref(),
+                    MeshContextId::from_bytes([10; 32]),
+                    envelope.clone(),
+                    if relay { &local_key } else { &destination_key },
+                )
+                .expect("the exact complete-wire cap permits admission");
+            assert!(matches!(
+                (&admission, relay),
+                (RouteAdmission::Relay { .. }, true) | (RouteAdmission::Destination { .. }, false)
+            ));
+            assert_eq!(exact_state.replay.lock().unwrap().retained_entries, 1);
+        }
     }
 
     #[test]
@@ -1565,10 +1812,18 @@ mod replay_controls {
             DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
                 .expect("destination id");
         let context = MeshContextId::from_bytes([25; 32]);
-        let payload = || crate::protocol::ClosedRoutedPayload::ChannelFrame {
-            channel: "leaf-origin".to_owned(),
-            payload: serde_json::json!({"value": "signed"}),
-        };
+        let local_payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &local,
+            &destination,
+            32,
+        );
+        let transit_payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &origin,
+            &destination,
+            32,
+        );
 
         let local_envelope = RoutedApplicationEnvelope::new(
             context,
@@ -1576,7 +1831,7 @@ mod replay_controls {
             destination.clone(),
             [26; 16],
             2,
-            payload(),
+            local_payload,
             &local_key,
         )
         .expect("signed local-origin envelope");
@@ -1600,7 +1855,7 @@ mod replay_controls {
             destination,
             [27; 16],
             3,
-            payload(),
+            transit_payload,
             &origin_key,
         )
         .expect("signed transit envelope");

@@ -21,8 +21,28 @@ use super::*;
 /// without a separate sweep: dropping the flow drops the queue drops the
 /// leases.
 pub(super) struct QueuedUnit<T> {
-    unit: T,
+    pub(super) unit: T,
     _payload: RealtimePayloadLease,
+}
+
+/// The in-flight count has its own allocation because a detached native unit
+/// may outlive the queue/flow that issued it.  The lease travels inside this
+/// shared counter, so the count and its funding remain live through the final
+/// unit drop rather than being backed by the queue's inline root alone.
+pub(super) struct InFlightCounter {
+    value: std::sync::atomic::AtomicUsize,
+    _root: crate::resource::ResourceLease,
+}
+
+impl InFlightCounter {
+    pub(super) fn load(&self) -> usize {
+        self.value.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn finish(&self) {
+        let previous = self.value.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "opaque in-flight count underflow");
+    }
 }
 
 /// A flow's own queue, in its own direction.
@@ -51,12 +71,18 @@ pub(super) struct QueuedUnit<T> {
 pub(super) struct RealtimeFlowQueue<T> {
     units: SyncMutex<crate::resource::LeasedQueue<QueuedUnit<T>>>,
     ready: Arc<LeasedWake>,
+    /// Units detached for a native handoff remain counted until their owned
+    /// entry is dropped after the write reaches a terminal result.
+    in_flight: Arc<InFlightCounter>,
     /// Whether a pump has already been issued for this queue.
     ///
     /// One permit from `Drop` wakes one waiter, so "at most one pump" is not a
     /// convention here — it is the precondition that makes closure reliable,
     /// and it is enforced rather than assumed.
     pump_issued: std::sync::atomic::AtomicBool,
+    /// Sticky native failure. Once a real write fails, later accepted queue
+    /// entries would otherwise accumulate behind a pump that has terminated.
+    pump_failed: std::sync::atomic::AtomicBool,
     /// Never read; it owns the block these fields live in. Last, so everything
     /// it accounts for is destroyed before the funding goes back.
     _root: crate::resource::ResourceLease,
@@ -100,10 +126,18 @@ impl<T> RealtimeFlowQueue<T> {
         let root = registry
             .acquire_flow_root(std::mem::size_of::<Self>())
             .map_err(realtime_drop_refusal)?;
+        let in_flight_root = registry
+            .acquire_flow_root(std::mem::size_of::<InFlightCounter>())
+            .map_err(realtime_drop_refusal)?;
         Ok(Arc::new(Self {
             units: SyncMutex::new(crate::resource::LeasedQueue::new()),
             ready,
+            in_flight: Arc::new(InFlightCounter {
+                value: std::sync::atomic::AtomicUsize::new(0),
+                _root: in_flight_root,
+            }),
             pump_issued: std::sync::atomic::AtomicBool::new(false),
+            pump_failed: std::sync::atomic::AtomicBool::new(false),
             _root: root,
         }))
     }
@@ -115,9 +149,22 @@ impl<T> RealtimeFlowQueue<T> {
     /// the same queue would be the waiter that never wakes, so the invariant
     /// is enforced here rather than left to callers.
     pub(super) fn claim_pump(&self) -> bool {
+        if self.pump_failed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         !self
             .pump_issued
             .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        self.pump_failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn mark_failed(&self) {
+        self.pump_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.ready.notify().notify_waiters();
     }
 
     /// Append one unit. Synchronous and lock-scoped: the guard is dropped
@@ -156,6 +203,32 @@ impl<T> RealtimeFlowQueue<T> {
         self.units.lock().pop_front().map(|queued| queued.unit)
     }
 
+    /// Detach the full funded queue entry for a native handoff. The payload
+    /// lease and queue-node lease remain coupled inside the entry's value and
+    /// guard until the pump's native write completes.
+    pub(super) fn pop_owned(
+        &self,
+    ) -> Option<crate::resource::queue::LeasedQueueEntry<QueuedUnit<T>>> {
+        let mut units = self.units.lock();
+        let entry = units.pop_front_owned()?;
+        self.in_flight
+            .value
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(entry)
+    }
+
+    pub(super) fn in_flight(&self) -> usize {
+        self.in_flight.load()
+    }
+
+    pub(super) fn in_flight_token(&self) -> Arc<InFlightCounter> {
+        Arc::clone(&self.in_flight)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.units.lock().is_empty()
+    }
+
     /// A handle a pump can await on without holding any lock of this flow.
     ///
     /// The clone carries the wake's own funding with it, so a pump that outlives
@@ -183,6 +256,11 @@ impl<T> RealtimeFlowQueue<T> {
 /// through a `Weak` rather than be told about it.
 pub(super) enum FlowQueue {
     Outbound(Arc<RealtimeFlowQueue<RealtimeSendUnit>>),
+    /// An outbound opaque flow uses the same provider-funded queue shape as
+    /// RTP, but its units carry no pacing or codec metadata.  The persistent
+    /// native opaque lane is drained by the worker; opening another logical
+    /// flow never allocates another native channel.
+    OpaqueOutbound(Arc<RealtimeFlowQueue<OpaqueSendUnit>>),
     /// Nothing to hold: units for this flow are funded and retained on the
     /// session's one inbound queue, which is where its only consumer reads.
     Inbound,
@@ -197,9 +275,13 @@ pub(super) enum FlowQueue {
 ///
 /// The pump holds `ready` as a strong `Arc` on purpose — it has to survive the
 /// queue in order to deliver the very wake that announces the queue is gone.
-pub(in crate::transport::webrtc) struct RealtimeOutboundPump {
+pub(crate) struct RealtimeOutboundPump {
     pub(super) queue: std::sync::Weak<RealtimeFlowQueue<RealtimeSendUnit>>,
     pub(super) ready: Arc<LeasedWake>,
+    /// The provider-owned tail witness stays with the actual pump task until
+    /// native retirement is terminal.  Controls construct a pump without a
+    /// native task, hence the option on this provider-internal test shape.
+    pub(super) _tail: Option<super::RealtimeNativeTail>,
 }
 
 impl RealtimeOutboundPump {
@@ -223,10 +305,96 @@ impl RealtimeOutboundPump {
     }
 }
 
+/// The single flow-owned drainer for an opaque logical flow. The queue stores
+/// each unit's exact coordinate/mode snapshot, so this pump does not carry a
+/// second mutable flow record or let a Change rewrite an already-admitted
+/// unit's wire identity.
+pub(crate) struct OpaqueOutboundPump {
+    pub(super) queue: std::sync::Weak<RealtimeFlowQueue<OpaqueSendUnit>>,
+    pub(super) ready: Arc<LeasedWake>,
+    pub(super) _tail: super::RealtimeNativeTail,
+}
+
+impl OpaqueOutboundPump {
+    pub(crate) fn next(&self) -> OpaquePumpStep {
+        let Some(queue) = self.queue.upgrade() else {
+            return OpaquePumpStep::Closed;
+        };
+        match queue.pop_owned() {
+            Some(entry) => {
+                let unit = &entry.value().unit;
+                OpaquePumpStep::Unit(OpaqueOutboundUnit {
+                    data: unit.data.clone(),
+                    mode: unit.mode,
+                    direction: unit.direction,
+                    coordinate: unit.coordinate,
+                    max_unit_bytes: unit.max_unit_bytes,
+                    in_flight: queue.in_flight_token(),
+                    _entry: entry,
+                })
+            }
+            None => OpaquePumpStep::Empty,
+        }
+    }
+
+    pub(crate) async fn ready(&self) {
+        self.ready.notify().notified().await;
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        if let Some(queue) = self.queue.upgrade() {
+            queue.mark_failed();
+        }
+    }
+
+    /// Complete the common native-write terminal boundary.  Production uses
+    /// this immediately after the real data-channel future resolves; the
+    /// boolean keeps the provider's native error type out of the flow queue.
+    /// A failed write permanently closes admission for this logical queue.
+    pub(crate) fn native_write_finished(&self, success: bool) -> bool {
+        if !success {
+            self.mark_failed();
+        }
+        success
+    }
+}
+
+// This enum intentionally carries the funded detached unit inline. Boxing it
+// would add an allocation and move custody outside the existing pump claim.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum OpaquePumpStep {
+    Unit(OpaqueOutboundUnit),
+    Empty,
+    Closed,
+}
+
 /// What one turn of the outbound pump found.
 pub(in crate::transport::webrtc) enum RealtimePumpStep {
     Unit(RealtimeSendUnit),
     Empty,
     /// The flow is gone. Terminal.
     Closed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real flow queue's sticky terminal bit is the refusal boundary after
+    /// a native pump write fails.  Once set, a replacement pump cannot claim a
+    /// queue that may still contain accepted work from the dead pump.
+    #[test]
+    fn v4_opaque_pump_failure_latch_refuses_reclaim() {
+        let (registry, _resources) =
+            RealtimeFlowRegistry::elastic_for_control(super::super::super::elastic_control_grant());
+        let queue = RealtimeFlowQueue::<OpaqueSendUnit>::mint(&registry)
+            .expect("the finite control provider funds one opaque queue");
+        assert!(queue.claim_pump(), "the first native pump owns the queue");
+        queue.mark_failed();
+        assert!(queue.is_failed());
+        assert!(
+            !queue.claim_pump(),
+            "a failed native pump cannot be replaced behind accepted queue work"
+        );
+    }
 }

@@ -52,5 +52,6 @@
   <text class="h" x="1095" y="462" text-anchor="middle">Local client delivery</text>
   <text class="t" x="1095" y="484" text-anchor="middle">myownmesh/src/ipc/bridge.rs</text>
   <path class="edge" d="M835 302H895"/><path class="edge" d="M1095 225V280"/><path class="edge" d="M1095 390V435"/>
-  <text class="s" x="680" y="575" text-anchor="middle">A carrier replacement returns left and repeats endpoint proof; a serialized route or peer ID cannot cross this boundary.</text>
+<text class="s" x="680" y="575" text-anchor="middle">Adopted Hub direction (not qualified by this LAN path): hints may start bounded pre-promotion demand, carry no authority; fallback is endpoint-ciphertext-only or refused.</text>
+  <text class="s" x="680" y="590" text-anchor="middle">A carrier replacement returns left and repeats endpoint proof; a serialized route or peer ID cannot cross this boundary.</text>
 </svg>

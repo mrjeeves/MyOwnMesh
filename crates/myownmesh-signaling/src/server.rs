@@ -621,8 +621,7 @@ fn retain_or_join_fallback(fallback: &Arc<FallbackReaperTasks>, task: JoinHandle
         });
         if let Err(task) = reservation.submit(task) {
             panic!(
-                "signaling fallback custodian rejected a preflighted handle; returned handle must remain owned: {:?}",
-                task
+                "signaling fallback custodian rejected a preflighted handle; returned handle must remain owned: {task:?}"
             );
         }
     } else {
@@ -661,8 +660,7 @@ fn retain_or_overflow(fallback: &Arc<FallbackReaperTasks>, task: JoinHandle<()>,
             });
             if let Err(task) = reservation.submit(task) {
                 panic!(
-                    "signaling terminal custodian rejected a preflighted handle ({context}); returned handle must remain owned: {:?}",
-                    task
+                    "signaling terminal custodian rejected a preflighted handle ({context}); returned handle must remain owned: {task:?}"
                 );
             }
         } else {

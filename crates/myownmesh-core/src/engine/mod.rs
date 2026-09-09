@@ -23,10 +23,12 @@ pub(crate) mod closed_relay;
 pub(crate) mod command;
 pub mod conn_trace;
 pub mod connection;
+pub(crate) mod endpoint_cipher;
 pub mod governance;
 pub mod handshake;
 pub mod heartbeat;
 pub(crate) mod hub;
+pub(crate) mod hub_introduction;
 pub mod ice_watchdog;
 pub mod ladder;
 pub(crate) mod lifecycle;
@@ -98,7 +100,7 @@ use crate::protocol::{
     },
     topology::{ClosedRoutedPayload, ShelveMessage},
     CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
-    RoutedApplicationEnvelope, RoutedApplicationLimits,
+    RoutedApplicationEnvelope,
 };
 use crate::semantic::DeviceId;
 #[cfg(test)]
@@ -191,7 +193,7 @@ pub mod transport_lab {
     /// One-shot fault boundary for a real semantic commit on this exact
     /// durable owner.  This is transport-lab evidence only; it cannot alter
     /// authority, custody, or the ordinary production commit path.
-
+    ///
     /// Explicit low-level constructors for integration harnesses. Production
     /// callers use [`crate::MeshHandle::join`], `create_network`, or
     /// `import_network`; keeping these names below `transport_lab` prevents a
@@ -1184,6 +1186,22 @@ fn connecting_stuck_past_grace(data: &connection::PeerStateData, grace_ms: u64) 
 }
 
 async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: EphemeralIngress) {
+    // An admitted Hub signal may wait in the existing signaling mailbox.
+    // Revalidate its captured carrier and local monotonic ticket before any
+    // native/SDP effect. Never resolve a replacement by the claimed device ID.
+    if !delivered.introduction_carrier_is_current(state) {
+        return;
+    }
+    let introduction_ticket = delivered.introduction_ticket();
+    if introduction_ticket.is_some_and(|ticket| {
+        !state.hub_introductions.as_ref().is_some_and(|controller| {
+            controller
+                .lock()
+                .is_current(ticket, std::time::Instant::now())
+        })
+    }) {
+        return;
+    }
     // Entry trace: signaling handlers run inline on the driver, so in a
     // debug capture the last of these lines names the message being handled
     // when the driver stopped — and also which carrier saw it, on which attach,
@@ -1206,7 +1224,8 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
     // what happens, and `into_inbound` drops the provenance by design.
     let attribution = delivered.attribution();
     let mut dedup = delivered.dedup_token();
-    match delivered.into_inbound() {
+    let (inbound, introduction_witness) = delivered.into_inbound_with_introduction();
+    match inbound {
         SignalingInbound::PeerAnnounced { device_id } => {
             // A stood-down engine (this device is signed-evicted from the
             // network) ignores the mesh entirely: no reflect, no dial —
@@ -1490,6 +1509,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 .owner(&device_id)
                 .is_some_and(|owner| owner.connection().holds_promoted_session())
             {
+                if introduction_ticket.is_some() {
+                    forget_dedup_owned(state, dedup.take());
+                    return;
+                }
                 start_speculative_offer(state, &device_id, &attempt, sdp, dedup).await;
                 return;
             }
@@ -1501,83 +1524,93 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 format!("offer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
-            clear_stale_session_if_zombie(state, &device_id).await;
-            // A *rebuild* offer — one carrying a different DTLS fingerprint
-            // than the remote description we last applied — means the peer tore
-            // its peer connection down and built a fresh one. Renegotiating our
-            // existing PC onto it applies the offer to a corpse: no candidates
-            // ever cross and the link wedges (the "0 remote candidates" stall,
-            // and the answerer half of the post-handoff deadlock). Drop our
-            // side so the fresh answerer PC built below matches theirs. A
-            // *restart* offer (same fingerprint, new ufrag) has a matching
-            // fingerprint and is left to renegotiate in place. Read the
-            // session out of the map first so no DashMap ref is held across the
-            // await.
-            let existing_owner = state.peers.owner(&device_id);
-            let existing_session = existing_owner
-                .as_ref()
-                .and_then(|owner| owner.connection().current_worker());
-            let rebuilt = match existing_session {
-                Some(session) => match session.remote_fingerprint().await {
-                    Some(prev) => crate::transport::webrtc::sdp_fingerprint(&sdp)
-                        .map(|now| now != prev)
-                        .unwrap_or(false),
-                    // No remote applied yet (we offered, they're now offering —
-                    // glare) — nothing to mismatch; fall through.
+            if introduction_ticket.is_none() {
+                clear_stale_session_if_zombie(state, &device_id).await;
+                // A *rebuild* offer — one carrying a different DTLS fingerprint
+                // than the remote description we last applied — means the peer tore
+                // its peer connection down and built a fresh one. Renegotiating our
+                // existing PC onto it applies the offer to a corpse: no candidates
+                // ever cross and the link wedges (the "0 remote candidates" stall,
+                // and the answerer half of the post-handoff deadlock). Drop our
+                // side so the fresh answerer PC built below matches theirs. A
+                // *restart* offer (same fingerprint, new ufrag) has a matching
+                // fingerprint and is left to renegotiate in place. Read the
+                // session out of the map first so no DashMap ref is held across the
+                // await.
+                let existing_owner = state.peers.owner(&device_id);
+                let existing_session = existing_owner
+                    .as_ref()
+                    .and_then(|owner| owner.connection().current_worker());
+                let rebuilt = match existing_session {
+                    Some(session) => match session.remote_fingerprint().await {
+                        Some(prev) => crate::transport::webrtc::sdp_fingerprint(&sdp)
+                            .map(|now| now != prev)
+                            .unwrap_or(false),
+                        // No remote applied yet (we offered, they're now offering —
+                        // glare) — nothing to mismatch; fall through.
+                        None => false,
+                    },
                     None => false,
-                },
-                None => false,
-            };
-            // If our session for this peer has been stuck connecting (data
-            // channel never opened) past the grace, this fresh offer is the
-            // mutual-renegotiation deadlock: re-applying it onto the stuck
-            // PC just re-resets ICE and the channel never opens. Drop the
-            // corpse so the offer below builds a clean fresh PC whose data
-            // channel — created by the offerer in this very offer — can
-            // actually open, aligning our generation to theirs. The grace
-            // (via `connecting_stuck_past_grace`) keeps a burst of
-            // re-offers from churning a still-negotiating attempt.
-            let stuck = existing_owner
-                .as_ref()
-                .map(|owner| {
-                    connecting_stuck_past_grace(
-                        &owner.connection().state.read(),
-                        scheduler_policy(state).restart_traffic_grace_ms,
-                    )
-                })
-                .unwrap_or(false);
-            if rebuilt || stuck {
-                let reason = if rebuilt {
-                    "peer rebuilt (new DTLS fingerprint)"
-                } else {
-                    "stuck connecting"
                 };
-                state.log_diag_with(
-                    crate::events::DiagLevel::Info,
-                    "signaling",
-                    format!(
-                        "fresh offer from {} ({reason}) — rebuilding to answer cleanly",
-                        short_peer(&device_id)
-                    ),
-                    serde_json::json!({
-                        "peer": device_id,
-                        "reason": if rebuilt { "peer_rebuilt" } else { "stuck_connecting" },
-                    }),
-                );
-                if let Some(owner) = existing_owner.as_ref() {
-                    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
-                        forget_dedup_owned(state, dedup.take());
-                        return;
+                // If our session for this peer has been stuck connecting (data
+                // channel never opened) past the grace, this fresh offer is the
+                // mutual-renegotiation deadlock: re-applying it onto the stuck
+                // PC just re-resets ICE and the channel never opens. Drop the
+                // corpse so the offer below builds a clean fresh PC whose data
+                // channel — created by the offerer in this very offer — can
+                // actually open, aligning our generation to theirs. The grace
+                // (via `connecting_stuck_past_grace`) keeps a burst of
+                // re-offers from churning a still-negotiating attempt.
+                let stuck = existing_owner
+                    .as_ref()
+                    .map(|owner| {
+                        connecting_stuck_past_grace(
+                            &owner.connection().state.read(),
+                            scheduler_policy(state).restart_traffic_grace_ms,
+                        )
+                    })
+                    .unwrap_or(false);
+                if rebuilt || stuck {
+                    let reason = if rebuilt {
+                        "peer rebuilt (new DTLS fingerprint)"
+                    } else {
+                        "stuck connecting"
                     };
-                    let Some(removed) = state.peers.remove_if_current_unpromoted(owner) else {
-                        forget_dedup_owned(state, dedup.take());
-                        return;
-                    };
-                    finish_drop_peer(state, &device_id, DropReason::IceFailed, Some(removed)).await;
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Info,
+                        "signaling",
+                        format!(
+                            "fresh offer from {} ({reason}) — rebuilding to answer cleanly",
+                            short_peer(&device_id)
+                        ),
+                        serde_json::json!({
+                            "peer": device_id,
+                            "reason": if rebuilt { "peer_rebuilt" } else { "stuck_connecting" },
+                        }),
+                    );
+                    if let Some(owner) = existing_owner.as_ref() {
+                        let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+                            forget_dedup_owned(state, dedup.take());
+                            return;
+                        };
+                        let Some(removed) = state.peers.remove_if_current_unpromoted(owner) else {
+                            forget_dedup_owned(state, dedup.take());
+                            return;
+                        };
+                        finish_drop_peer(state, &device_id, DropReason::IceFailed, Some(removed))
+                            .await;
+                    }
                 }
+                ensure_peer_session(state, &device_id, role).await;
+            } else {
+                ensure_peer_session_with_introduction(state, &device_id, role, introduction_ticket)
+                    .await;
             }
-            ensure_peer_session(state, &device_id, role).await;
-            let Some(owner) = state.peers.owner(&device_id) else {
+            let selected_owner = match introduction_ticket {
+                Some(ticket) => state.introduction_native_owner(&device_id, ticket),
+                None => state.peers.owner(&device_id),
+            };
+            let Some(owner) = selected_owner else {
                 forget_dedup_owned(state, dedup.take());
                 return;
             };
@@ -1594,7 +1627,15 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 forget_dedup_owned(state, dedup.take());
                 return;
             };
-            if !apply_remote_sdp(state, &owner, RTCSdpType::Offer, sdp).await {
+            if !apply_signaled_sdp(
+                state,
+                &owner,
+                RTCSdpType::Offer,
+                sdp,
+                introduction_witness.as_ref(),
+            )
+            .await
+            {
                 forget_dedup_owned(state, dedup.take());
                 return;
             }
@@ -1615,6 +1656,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             let (session, displaced) = state
                 .peers
                 .with_current(&owner, |peer| {
+                    if introduction_ticket.is_some()
+                        && !owner.worker().is_some_and(|expected| {
+                            peer.current_worker()
+                                .is_some_and(|current| Arc::ptr_eq(expected, &current))
+                        })
+                    {
+                        return (None, None);
+                    }
                     let displaced = peer.adopt_attempt_with_dedup(&attempt, dedup.take());
                     (peer.current_worker(), displaced)
                 })
@@ -1646,7 +1695,33 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             }
             let accepted_attempt = attempt.clone();
             if let Some(session) = session {
-                match session.create_answer().await {
+                let answer = if let Some(witness) = introduction_witness.as_ref() {
+                    let Some(budget) = introduction_phase_budget(
+                        state,
+                        Some(witness.ticket()),
+                        Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
+                    ) else {
+                        return;
+                    };
+                    if !witness.is_current(state) {
+                        return;
+                    }
+                    match tokio::time::timeout(budget, session.create_answer()).await {
+                        Ok(answer) => answer,
+                        Err(_) => Err(Error::Transport(
+                            "introduction answer deadline expired".into(),
+                        )),
+                    }
+                } else {
+                    session.create_answer().await
+                };
+                if introduction_witness
+                    .as_ref()
+                    .is_some_and(|witness| !introduction_witness_is_current(state, witness))
+                {
+                    return;
+                }
+                match answer {
                     Ok(desc) => {
                         let sdp_bytes = desc.sdp.len();
                         let send_result = state
@@ -1726,7 +1801,11 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             attempt,
             sdp,
         } => {
-            let Some(owner) = state.peers.owner(&device_id) else {
+            let selected_owner = match introduction_ticket {
+                Some(ticket) => state.introduction_native_owner(&device_id, ticket),
+                None => state.peers.owner(&device_id),
+            };
+            let Some(owner) = selected_owner else {
                 forget_dedup_owned(state, dedup.take());
                 return;
             };
@@ -1734,6 +1813,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             // promoted worker, even when its carrier-supplied correlation
             // happens to match the primary installation.
             if owner.connection().holds_promoted_session() {
+                if introduction_ticket.is_some() {
+                    forget_dedup_owned(state, dedup.take());
+                    return;
+                }
                 let workers = owner.connection().speculative_workers_for(&attempt);
                 if workers.is_empty() {
                     forget_dedup_owned(state, dedup.take());
@@ -1792,7 +1875,15 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 format!("answer received from {}", short_peer(&device_id)),
                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp.len() }),
             );
-            if apply_remote_sdp(state, &owner, RTCSdpType::Answer, sdp).await {
+            if apply_signaled_sdp(
+                state,
+                &owner,
+                RTCSdpType::Answer,
+                sdp,
+                introduction_witness.as_ref(),
+            )
+            .await
+            {
                 let retained = dedup.as_ref().is_some_and(|token| {
                     state.peers.with_current(&owner, |peer| {
                         if peer.attempt() == attempt {
@@ -1815,7 +1906,11 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             attempt,
             candidate,
         } => {
-            let Some(owner) = state.peers.owner(&device_id) else {
+            let selected_owner = match introduction_ticket {
+                Some(ticket) => state.introduction_native_owner(&device_id, ticket),
+                None => state.peers.owner(&device_id),
+            };
+            let Some(owner) = selected_owner else {
                 forget_dedup_owned(state, dedup.take());
                 return;
             };
@@ -1823,6 +1918,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             // is not authority and must not reach a worker that backs a
             // promoted SessionCapability.
             if owner.connection().holds_promoted_session() {
+                if introduction_ticket.is_some() {
+                    forget_dedup_owned(state, dedup.take());
+                    return;
+                }
                 let workers = owner.connection().speculative_workers_for(&attempt);
                 if workers.is_empty() {
                     forget_dedup_owned(state, dedup.take());
@@ -1884,12 +1983,50 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             };
             // The worker decides whether the remote description is ready and
             // owns either the retained queue value or the live application.
-            let worker = state
-                .peers
-                .get_if_current(&owner)
-                .and_then(|peer| peer.current_worker());
+            let worker = if introduction_ticket.is_some() {
+                state
+                    .peers
+                    .with_current_transport_worker(&owner, Arc::clone)
+            } else {
+                state
+                    .peers
+                    .get_if_current(&owner)
+                    .and_then(|peer| peer.current_worker())
+            };
             if let Some(worker) = worker {
-                let report = match worker.add_remote_candidate_observed(candidate).await {
+                let report = if let Some(witness) = introduction_witness.as_ref() {
+                    let Some(budget) = introduction_phase_budget(
+                        state,
+                        Some(witness.ticket()),
+                        Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
+                    ) else {
+                        return;
+                    };
+                    if !witness.is_current(state) {
+                        return;
+                    }
+                    match tokio::time::timeout(
+                        budget,
+                        worker.add_remote_candidate_observed(candidate),
+                    )
+                    .await
+                    {
+                        Ok(report) => report,
+                        Err(_) => Err(Error::Transport(
+                            "introduction candidate deadline expired".into(),
+                        )),
+                    }
+                } else {
+                    worker.add_remote_candidate_observed(candidate).await
+                };
+                if introduction_witness
+                    .as_ref()
+                    .is_some_and(|witness| !introduction_witness_is_current(state, witness))
+                {
+                    forget_dedup_owned(state, dedup.take());
+                    return;
+                }
+                let report = match report {
                     Ok(report) => report,
                     Err(e) => {
                         state.log_diag_with(
@@ -2888,19 +3025,250 @@ async fn connect_peer(
         // is "the link is ACTIVE", not "a fresh dial happened".
         let already_active = state
             .peers
-            .get(device_id)
-            .map(|p| matches!(p.state.read().status, PeerStatus::Active))
-            .unwrap_or(false);
+            .owner(device_id)
+            .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner));
         if already_active {
-            let _ = reply.reply.send(Ok(()));
-        } else {
-            state.register_connect_waiter(device_id, reply);
+            reply.finish(Ok(()));
+        } else if !state.register_connect_waiter(device_id, reply) {
+            return;
         }
+    }
+    match begin_hub_connection_demand(state, device_id).await {
+        Ok(true) => return,
+        Err(_) => {
+            state.resolve_connect_waiters(device_id, Some("application introduction refused"));
+            return;
+        }
+        Ok(false) => {}
     }
     ensure_peer_session(state, device_id, Role::Offerer).await;
     // Nudge presence so the relays are warm and the remote sees us promptly;
     // globally rate-limited, so this can't add signaling load.
     maybe_reactive_announce(state);
+}
+
+/// Explicit demand only; directory advertisements never call this function.
+/// True means the retained introduction owns this attempt, not link success.
+async fn begin_hub_connection_demand(state: &Arc<NetworkState>, target: &str) -> Result<bool> {
+    let Some(controller) = state.hub_introductions.as_ref() else {
+        return Ok(false);
+    };
+    if !matches!(
+        &state.config.read().topology,
+        crate::config::TopologyMode::Hubs { .. }
+            | crate::config::TopologyMode::HubTree { .. }
+            | crate::config::TopologyMode::Star { .. }
+    ) {
+        return Ok(false);
+    }
+    if state
+        .peers
+        .owner(target)
+        .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner))
+    {
+        return Ok(false);
+    }
+    if state
+        .topology_impl
+        .read()
+        .edge(state.identity.public_id(), target, &[])
+    {
+        // Infrastructure already has its ordinary signaling/authentication
+        // path. Introduction is for demand-created non-edges, not a Hub veto.
+        return Ok(false);
+    }
+    let _work = state.introduction_work()?;
+    let destination = DeviceId::from_canonical_str_uninterned(target)
+        .map_err(|_| Error::Network("introduction destination is not canonical".into()))?;
+    if !state.peers.routed_origin_policy_admits(&destination) {
+        return Err(Error::Network(
+            "introduction endpoint policy refused".into(),
+        ));
+    }
+    let carrier = state
+        .introduction_carrier(target, None)
+        .ok_or_else(|| Error::Network("no current authenticated introduction route".into()))?;
+    let admission = controller
+        .lock()
+        .begin_demand(&destination, &carrier, std::time::Instant::now())
+        .map_err(|_| Error::Network("introduction demand refused".into()))?;
+    state.bind_introduction_waiters(target, admission.ticket)?;
+    if !admission.coalesced {
+        if let Err(error) = state
+            .send_introduction_body(
+                admission.ticket,
+                crate::protocol::HubIntroductionBody::Request,
+                None,
+            )
+            .await
+        {
+            controller.lock().failed(admission.ticket);
+            state.queue_introduction_ticket(target, admission.ticket);
+            return Err(error);
+        }
+    }
+    Ok(true)
+}
+
+/// Inbound introductions may terminate at this node, but must never loop
+/// back from it or name the same endpoint twice. Canonical admission still
+/// checks both participants of every evaluated local/remote pair.
+fn introduction_endpoint_policy_admits(
+    bootstrap: &crate::semantic::VerifiedBootstrap,
+    graph: &crate::semantic::FactGraph,
+    local: &DeviceId,
+    context: crate::semantic::MeshContextId,
+    source: &DeviceId,
+    destination: &DeviceId,
+) -> bool {
+    if context != bootstrap.context_id() || source == destination || source == local {
+        return false;
+    }
+    governance::canonical_policy_admits_devices(bootstrap, graph, local, source)
+        && (destination == local
+            || governance::canonical_policy_admits_devices(bootstrap, graph, local, destination))
+}
+
+/// The caller retains introduction work before this synchronous admission.
+/// Recheck the captured carrier, then hold one canonical graph view through
+/// policy evaluation and controller reduction. No lock survives the return
+/// to the async Accept/forwarding writer.
+fn receive_current_hub_introduction(
+    state: &NetworkState,
+    controller: &parking_lot::Mutex<hub_introduction::HubIntroduction>,
+    carrier: &peer_registry::PeerOwnerToken,
+    frame: &crate::protocol::HubIntroductionEnvelope,
+    next: Option<&peer_registry::PeerOwnerToken>,
+) -> Option<hub_introduction::IntroductionAction> {
+    if !state.peers.has_usable_authenticated_current(carrier) {
+        return None;
+    }
+    // Only the startup-owned local ID is reconstructed. Wire endpoints stay
+    // borrowed, including previously unknown frame-owned identities.
+    let local = DeviceId::from_canonical_str(state.identity.public_id()).ok()?;
+    let graph = state.fact_graph.read();
+    if !introduction_endpoint_policy_admits(
+        state.verified_bootstrap(),
+        &graph,
+        &local,
+        frame.context_id(),
+        frame.source(),
+        frame.destination(),
+    ) {
+        return None;
+    }
+    controller
+        .lock()
+        .receive(carrier, frame, next, std::time::Instant::now())
+        .ok()
+}
+
+async fn on_hub_introduction(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+    mut frame: crate::protocol::HubIntroductionEnvelope,
+) {
+    use hub_introduction::IntroductionAction;
+    let Some(controller) = state.hub_introductions.as_ref() else {
+        return;
+    };
+    let carrier = dispatch.owner();
+    if !state.peers.has_usable_authenticated_current(carrier) {
+        return;
+    }
+    let Ok(_work) = state.introduction_work() else {
+        return;
+    };
+    let destination_id: &str = frame.destination().as_ref();
+    let local_destination = destination_id == state.identity.public_id();
+    if !local_destination
+        && !state
+            .topology_impl
+            .read()
+            .forwards(state.identity.public_id(), &[])
+    {
+        return;
+    }
+    let next = if local_destination {
+        None
+    } else {
+        state.introduction_carrier(frame.destination().as_ref(), Some(carrier))
+    };
+    // A promoted Hub is not endpoint permission. Destination admission checks
+    // the other endpoint; transit retains both canonical membership checks.
+    let Some(action) =
+        receive_current_hub_introduction(state, controller, carrier, &frame, next.as_ref())
+    else {
+        return;
+    };
+    match action {
+        IntroductionAction::Accept(ticket) | IntroductionAction::AcceptReplacing { ticket, .. } => {
+            let _ = state
+                .send_introduction_body(ticket, crate::protocol::HubIntroductionBody::Accept, None)
+                .await;
+        }
+        IntroductionAction::BeginOffer(ticket) => {
+            if state
+                .queue_introduced_peer(frame.source().to_string(), ticket)
+                .is_err()
+            {
+                controller.lock().failed(ticket);
+            }
+        }
+        IntroductionAction::Forward { ticket, reverse } => {
+            let Ok(local) = DeviceId::from_canonical_str(state.identity.public_id()) else {
+                return;
+            };
+            if frame
+                .append_hop(local, state.identity.signing_key())
+                .is_err()
+            {
+                controller.lock().failed(ticket);
+                return;
+            }
+            let next = {
+                let mut intro = controller.lock();
+                if intro
+                    .observe_forward(ticket, &frame, std::time::Instant::now())
+                    .is_err()
+                {
+                    intro.failed(ticket);
+                    return;
+                }
+                intro.route(ticket, reverse)
+            };
+            let (Some(next), Ok(encoded)) = (next, frame.encode_complete()) else {
+                controller.lock().failed(ticket);
+                return;
+            };
+            if send_application_bytes_inner(
+                state,
+                &next,
+                Bytes::from(encoded),
+                traffic::FrameClass::Control,
+            )
+            .await
+            .is_err()
+            {
+                controller.lock().failed(ticket);
+            }
+        }
+        IntroductionAction::Signal(ticket) => {
+            if !state.deliver_introduction_signal(ticket, carrier, &frame) {
+                controller.lock().failed(ticket);
+            }
+        }
+        IntroductionAction::Terminal(ticket) => {
+            let local = state.identity.public_id();
+            let source: &str = frame.source().as_ref();
+            let destination: &str = frame.destination().as_ref();
+            if destination == local {
+                state.queue_introduction_ticket(source, ticket);
+            } else if source == local {
+                state.queue_introduction_ticket(destination, ticket);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3709,6 +4077,130 @@ fn cancel_recovery_for_usable_successor(
 }
 
 async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: Role) {
+    ensure_peer_session_with_introduction(state, device_id, role, None).await;
+}
+
+async fn begin_introduced_peer(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    ticket: hub_introduction::IntroductionTicket,
+) {
+    ensure_peer_session_with_introduction(state, device_id, Role::Offerer, Some(ticket)).await;
+}
+
+/// Reuse the original local deadline and original captured route. This may
+/// shorten an existing native timeout, never renew it or select a successor.
+fn introduction_phase_budget(
+    state: &NetworkState,
+    ticket: Option<hub_introduction::IntroductionTicket>,
+    cap: Duration,
+) -> Option<Duration> {
+    let Some(ticket) = ticket else {
+        return Some(cap);
+    };
+    let controller = state.hub_introductions.as_ref()?;
+    let (remaining, carrier) = {
+        let controller = controller.lock();
+        let remaining = controller.remaining(ticket, std::time::Instant::now())?;
+        let coordinates = controller.coordinates(ticket)?;
+        let reverse =
+            coordinates.destination == state.identity.signing_key().verifying_key().to_bytes();
+        (remaining, controller.route(ticket, reverse)?)
+    };
+    state
+        .peers
+        .has_usable_authenticated_current(&carrier)
+        .then_some(cap.min(remaining))
+}
+
+fn introduction_witness_is_current(
+    state: &NetworkState,
+    witness: &signaling_ingress::HubIngressWitness,
+) -> bool {
+    witness.is_current(state)
+        && state.hub_introductions.as_ref().is_some_and(|controller| {
+            controller
+                .lock()
+                .is_current(witness.ticket(), std::time::Instant::now())
+        })
+}
+
+struct IntroductionConstruction<'a, 'permit> {
+    state: &'a Arc<NetworkState>,
+    permit: &'a state::ShutdownMutationPermit<'permit>,
+    owner: peer_registry::PeerOwnerToken,
+    ticket: hub_introduction::IntroductionTicket,
+    armed: bool,
+}
+
+impl Drop for IntroductionConstruction<'_, '_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let original_introduction = self
+            .state
+            .hub_introductions
+            .as_ref()
+            .and_then(|controller| {
+                let mut controller = controller.lock();
+                let coordinates = controller.coordinates(self.ticket);
+                controller.failed(self.ticket);
+                coordinates.map(|coordinates| coordinates.introduction_id)
+            });
+        if self
+            .state
+            .cancel_bound_introduction_construction(&self.owner, self.ticket)
+        {
+            // The existing record, not a fallible detached shutdown task,
+            // owns this worker and receiver through exact terminal cleanup.
+            return;
+        }
+        let removed = if self.owner.worker().is_some() {
+            self.state
+                .peers
+                .remove_demand_owner_if(&self.owner, |peer| {
+                    peer.introduction_ticket_matches(self.ticket)
+                        && !peer.holds_promoted_session()
+                        && !peer.unpromoted_offer_in_flight()
+                })
+        } else {
+            original_introduction.and_then(|id| {
+                self.state
+                    .peers
+                    .remove_unstarted_introduction_if(&self.owner, |peer| {
+                        peer.introduction_ticket_matches(self.ticket)
+                            && peer.unstarted_introduction_matches(&id)
+                    })
+            })
+        };
+        if let Some(removed) = removed {
+            let peer = removed;
+            peer.retire_connector();
+            self.state.register_shutdown_task(self.permit, || {
+                tokio::spawn(async move {
+                    let _ = peer.retire_and_close().await;
+                })
+            });
+        }
+        if self
+            .owner
+            .connection()
+            .introduction_ticket_matches(self.ticket)
+        {
+            self.state.forget_demand_link(&self.owner);
+        }
+        self.state
+            .resolve_introduction_waiters(self.owner.device_id(), self.ticket, false);
+    }
+}
+
+async fn ensure_peer_session_with_introduction(
+    state: &Arc<NetworkState>,
+    device_id: &str,
+    role: Role,
+    introduction: Option<hub_introduction::IntroductionTicket>,
+) {
     // Return only if we already hold a live *session* for this peer. A
     // session-less discovery placeholder — what a Silent network records for a
     // co-present peer it hasn't dialed (see `note_sighted_without_dialing`) —
@@ -3730,6 +4222,22 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    // Introduction-specific correlation/configuration scratch is funded
+    // before construction. Ordinary discovery retains its existing path.
+    let _introduction_work = if introduction.is_some() {
+        let Ok(work) = state.introduction_work() else {
+            return;
+        };
+        let Ok(target) = DeviceId::from_canonical_str_uninterned(device_id) else {
+            return;
+        };
+        if !state.peers.routed_origin_policy_admits(&target) {
+            return;
+        }
+        Some((work, target))
+    } else {
+        None
+    };
     // Per-peer negotiation stage, same reasoning as the webrtc.rs stage logs:
     // one line per peer per attempt is fine when connects are rare and a flood
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
@@ -3750,8 +4258,84 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
         }
         config.clone()
     };
-    let construction = tokio::time::timeout(
+    let mut demand_slot = None;
+    let mut introduction_owner = None;
+    let mut construction_guard = None;
+    if let Some(ticket) = introduction {
+        let Some(controller) = state.hub_introductions.as_ref() else {
+            return;
+        };
+        if !controller
+            .lock()
+            .is_current(ticket, std::time::Instant::now())
+        {
+            return;
+        }
+        let Ok(slot) = state.reserve_demand_link() else {
+            controller.lock().failed(ticket);
+            return;
+        };
+        let Ok(backing) = state.reserve_introduction_placeholder(device_id) else {
+            controller.lock().failed(ticket);
+            return;
+        };
+        // Discovery-only entries and exactly joined reusable introductions
+        // may adopt a fresh ticket. No occupied live attempt is displaced.
+        let owner = if let Some(owner) = state.peers.owner(device_id) {
+            let adopted = state.peers.with_current(&owner, |peer| {
+                peer.adopt_empty_introduction(ticket, backing)
+            });
+            match adopted {
+                Some(Ok((displaced, previous_backing))) => {
+                    if let Some(displaced) = displaced {
+                        forget_displacement(state, displaced);
+                    }
+                    drop(previous_backing); // replacement funding is already installed
+                    owner
+                }
+                _ => {
+                    controller.lock().failed(ticket);
+                    return;
+                }
+            }
+        } else {
+            let peer = Arc::new(PeerConnection::new_introduction(
+                device_id.to_owned(),
+                ticket.attempt(),
+                backing,
+            ));
+            if !peer.bind_initial_introduction(ticket) {
+                controller.lock().failed(ticket);
+                return;
+            }
+            let Some(owner) = state.peers.install_unpromoted_if_absent(peer) else {
+                controller.lock().failed(ticket);
+                return;
+            };
+            owner
+        };
+        construction_guard = Some(IntroductionConstruction {
+            state,
+            permit: &shutdown_permit,
+            owner: owner.clone(),
+            ticket,
+            armed: true,
+        });
+        if controller.lock().bind_native_owner(ticket, &owner).is_err() {
+            return;
+        }
+        introduction_owner = Some(owner);
+        demand_slot = Some(slot);
+    }
+    let Some(construction_budget) = introduction_phase_budget(
+        state,
+        introduction,
         Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
+    ) else {
+        return;
+    };
+    let construction = tokio::time::timeout(
+        construction_budget,
         state.transport.open_connector_peer(
             role,
             &cfg.stun_servers,
@@ -3790,10 +4374,32 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
         }
     };
     let session = Arc::new(session);
-    let peer = Arc::new(PeerConnection::new(
-        device_id.to_string(),
-        Some(session.clone()),
-    ));
+    let peer = if let Some(owner) = introduction_owner.as_ref() {
+        let Some(ticket) = introduction else {
+            return;
+        };
+        if introduction_phase_budget(state, Some(ticket), construction_budget).is_none()
+            || !_introduction_work
+                .as_ref()
+                .is_some_and(|(_, target)| state.peers.routed_origin_policy_admits(target))
+        {
+            let _ = session.retire_and_close().await;
+            return;
+        }
+        if state.peers.with_current(owner, |peer| {
+            peer.attach_introduction_worker(Arc::clone(&session), introduction)
+        }) != Some(true)
+        {
+            let _ = session.retire_and_close().await;
+            return;
+        }
+        Arc::clone(owner.connection())
+    } else {
+        Arc::new(PeerConnection::new(
+            device_id.to_string(),
+            Some(session.clone()),
+        ))
+    };
     // Start the connect-timeout clock the moment the session exists: if the
     // data channel hasn't opened within DATA_CHANNEL_OPEN_TIMEOUT_MS of
     // now, the attempt is reclaimed and rebuilt (see
@@ -3803,14 +4409,35 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // displaced can never legitimately be heard from again: release its keys.
     // Doing this is what keeps the ring from accumulating a record of every
     // attempt a long-lived reconnecting peer ever made.
-    let replaced = install_peer_for_state_admitted(state, peer.clone(), &shutdown_permit);
+    let replaced = if introduction_owner.is_none() {
+        install_peer_for_state_admitted(state, peer.clone(), &shutdown_permit)
+    } else {
+        None
+    };
     // Capture the installation fence before offer construction can await. A
     // replacement may arrive while that offer is building; resolving by
     // device id after the await would stamp the successor with this worker.
-    let pump_owner = state
-        .peers
-        .owner(device_id)
+    let pump_owner = introduction_owner
+        .clone()
+        .or_else(|| state.peers.owner(device_id))
         .map(|owner| owner.for_worker(Arc::clone(&session)));
+    if let Some(slot) = demand_slot.take() {
+        let Some(owner) = pump_owner.as_ref() else {
+            return;
+        };
+        if let Some(guard) = construction_guard.as_mut() {
+            guard.owner = owner.clone();
+        }
+        let Some(ticket) = introduction else {
+            return;
+        };
+        if slot
+            .bind(owner.clone(), ticket, std::time::Instant::now())
+            .is_err()
+        {
+            return;
+        }
+    }
     let offer_witness = pump_owner
         .as_ref()
         .and_then(|owner| capture_offer_witness_for_owner(state, owner));
@@ -3851,15 +4478,23 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
             .await;
             return;
         };
-        let built = tokio::time::timeout(
+        let Some(offer_budget) = introduction_phase_budget(
+            state,
+            introduction,
             Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
-            witness.worker.create_offer(),
-        )
-        .await;
+        ) else {
+            // Preserve the original receiver's close custody even when
+            // the local ticket expires between constructor and offer.
+            let _ = session.retire_and_close().await;
+            return;
+        };
+        let built = tokio::time::timeout(offer_budget, witness.worker.create_offer()).await;
         match built {
             Ok(Ok(desc)) => {
                 let sdp_bytes = desc.sdp.len();
-                if send_exact_offer(state, device_id, &witness, desc.sdp) {
+                if introduction_phase_budget(state, introduction, offer_budget).is_some()
+                    && send_exact_offer(state, device_id, &witness, desc.sdp)
+                {
                     state.log_diag_with(
                         crate::events::DiagLevel::Debug,
                         "signaling",
@@ -3926,6 +4561,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
         pump_owner,
     )
     .await;
+    if let Some(guard) = construction_guard.as_mut() {
+        guard.armed = false;
+    }
 }
 
 /// Spawn the production per-peer receiver pump with its exact installation
@@ -3936,8 +4574,29 @@ fn spawn_peer_event_pump(
     connector_state: Arc<NetworkState>,
     peer_id: String,
     pump_session: Arc<crate::transport::WebRtcConnectorWorker>,
+    rx: crate::transport::webrtc::WebRtcConnectorEventReceiver,
+    pump_owner: Option<peer_registry::PeerOwnerToken>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_peer_event_pump_with_terminal(
+        connector_state,
+        peer_id,
+        pump_session,
+        rx,
+        pump_owner,
+        std::future::ready(()),
+    )
+}
+
+// The ordinary terminal continuation is allocation-free Ready. A funded
+// co-located control may hold this SAME task after actual native EOF and its
+// exact terminal reducer, discriminating native close from engine task join.
+fn spawn_peer_event_pump_with_terminal(
+    connector_state: Arc<NetworkState>,
+    peer_id: String,
+    pump_session: Arc<crate::transport::WebRtcConnectorWorker>,
     mut rx: crate::transport::webrtc::WebRtcConnectorEventReceiver,
     pump_owner: Option<peer_registry::PeerOwnerToken>,
+    terminal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let task_observation = pump_session.observe_owned_task();
     tokio::spawn(async move {
@@ -3968,6 +4627,7 @@ fn spawn_peer_event_pump(
             )
             .await;
         }
+        terminal.await;
     })
 }
 
@@ -3986,7 +4646,16 @@ async fn spawn_registered_peer_event_pump(
         pump_session.retire();
         return;
     }
+    let captured_owner = pump_owner.clone();
     let pump = spawn_peer_event_pump(connector_state, peer_id, pump_session, rx, pump_owner);
+    let pump = if let Some(owner) = captured_owner.as_ref() {
+        match state.finish_introduced_pump_registration(owner, pump) {
+            Ok(()) => return,
+            Err(pump) => pump,
+        }
+    } else {
+        pump
+    };
     state.finish_peer_event_pump_registration(pump).await;
 }
 
@@ -3996,12 +4665,60 @@ async fn apply_remote_sdp(
     sdp_type: RTCSdpType,
     sdp: String,
 ) -> bool {
+    apply_remote_sdp_inner(state, owner, sdp_type, sdp, true).await
+}
+
+async fn apply_signaled_sdp(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    sdp_type: RTCSdpType,
+    sdp: String,
+    introduction: Option<&signaling_ingress::HubIngressWitness>,
+) -> bool {
+    let Some(witness) = introduction else {
+        return apply_remote_sdp(state, owner, sdp_type, sdp).await;
+    };
+    if !witness.is_current(state) {
+        return false;
+    }
+    let Some(budget) = introduction_phase_budget(
+        state,
+        Some(witness.ticket()),
+        Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
+    ) else {
+        return false;
+    };
+    let applied = tokio::time::timeout(
+        budget,
+        apply_remote_sdp_inner(state, owner, sdp_type, sdp, false),
+    )
+    .await
+    .unwrap_or(false);
+    applied
+        && introduction_witness_is_current(state, witness)
+        && state.peers.get_if_current(owner).is_some()
+}
+
+async fn apply_remote_sdp_inner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    sdp_type: RTCSdpType,
+    sdp: String,
+    allow_reoffer: bool,
+) -> bool {
     let mut applied = false;
     let device_id = owner.device_id();
-    let session = state
-        .peers
-        .get_if_current(owner)
-        .and_then(|peer| peer.current_worker());
+    let session = if allow_reoffer {
+        state
+            .peers
+            .get_if_current(owner)
+            .and_then(|peer| peer.current_worker())
+    } else {
+        // Introduced work carries its already captured worker across awaits.
+        // Do not substitute a successor on the same PeerConnection after a
+        // separately checked installation lookup.
+        state.peers.with_current_transport_worker(owner, Arc::clone)
+    };
     let Some(session) = session else {
         state.log_diag_with(
             crate::events::DiagLevel::Warn,
@@ -4014,7 +4731,7 @@ async fn apply_remote_sdp(
         );
         // A late Answer that lost its session: drive a fresh offer instead
         // of waiting out the next announce-driven re-offer.
-        if sdp_type == RTCSdpType::Answer {
+        if allow_reoffer && sdp_type == RTCSdpType::Answer {
             reoffer_after_failed_answer(state, device_id).await;
         }
         return false;
@@ -4035,7 +4752,9 @@ async fn apply_remote_sdp(
             ),
             serde_json::json!({ "peer": device_id, "reason": "not_awaiting_answer" }),
         );
-        reoffer_after_failed_answer(state, device_id).await;
+        if allow_reoffer {
+            reoffer_after_failed_answer(state, device_id).await;
+        }
         return false;
     }
     if matches!(sdp_type, RTCSdpType::Offer | RTCSdpType::Answer) {
@@ -4061,7 +4780,7 @@ async fn apply_remote_sdp(
                 // transition from stable". A fresh offer re-opens the
                 // negotiation cleanly rather than leaving the link wedged
                 // until the next announce.
-                if sdp_type == RTCSdpType::Answer {
+                if allow_reoffer && sdp_type == RTCSdpType::Answer {
                     reoffer_after_failed_answer(state, device_id).await;
                 }
             }
@@ -4542,6 +5261,18 @@ async fn handle_transport_event_from_worker(
         TransportEvent::RealtimeUnit(delivery) => {
             state.deliver_realtime_unit(&owner, delivery);
         }
+        TransportEvent::ApplicationFlowMessage { mode, bytes } => {
+            let exact_owner = owner.for_worker(Arc::clone(worker));
+            handle_inbound_frame_from_inner(
+                state,
+                &exact_owner,
+                bytes,
+                Some(mode),
+                #[cfg(feature = "route-flow-diagnostics")]
+                None,
+            )
+            .await;
+        }
     }
     // The accepted callback's resource authority belongs to the whole handler,
     // not merely to extraction of its diagnostic receipt.  Keep it named and
@@ -4601,6 +5332,7 @@ async fn handle_exact_promoted_message_with_receipt(
         state,
         &exact_owner,
         bytes,
+        None,
         #[cfg(feature = "route-flow-diagnostics")]
         route_flow_receipt,
     )
@@ -5155,6 +5887,7 @@ fn closed_relay_ingress_marker(bytes: &[u8], stage: &'static str) {
     }
 }
 
+#[cfg(test)]
 async fn handle_inbound_frame_from(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
@@ -5164,6 +5897,7 @@ async fn handle_inbound_frame_from(
         state,
         owner,
         bytes,
+        None,
         #[cfg(feature = "route-flow-diagnostics")]
         None,
     )
@@ -5174,11 +5908,18 @@ async fn handle_inbound_frame_from_inner(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     bytes: Bytes,
+    native_mode: Option<crate::realtime::OpaqueFlowMode>,
     #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
         crate::route_flow::HandlerReceipt,
     >,
 ) {
     let device_id = owner.device_id();
+    // The callback supplies native mode provenance. An opaque lane never
+    // enters the protocol-only JSON branch, even before endpoint promotion.
+    if native_mode.is_some() != crate::protocol::application_flow::is_application_flow_frame(&bytes)
+    {
+        return;
+    }
     #[cfg(feature = "transport-lab")]
     closed_relay_ingress_marker(&bytes, "raw");
     if bytes.len() > crate::protocol::RECEIVE_FRAME_BYTES {
@@ -5524,6 +6265,33 @@ async fn handle_inbound_frame_from_inner(
     // here — it moves with the delivery, under the dispatch's own fence, in
     // `on_channel_seq_admitted`.
     let (msg, application_claim, application_work) = decoded.into_parts();
+    if crate::application_gateway::validate_native_application_lane(&msg, native_mode).is_err() {
+        return;
+    }
+    let msg = match msg {
+        crate::application_gateway::DecodedApplicationMessage::Json(message) => message,
+        crate::application_gateway::DecodedApplicationMessage::OpaqueFlow {
+            coordinate,
+            direction,
+            mode_tag: _,
+            body,
+        } => {
+            // The provider acquires its own queue retention before any body
+            // escapes this exact admitted frame's lease. The full native mode
+            // (including retransmit limit) is compared against its flow record.
+            if let Some(mode) = native_mode {
+                state.deliver_opaque_application_unit(
+                    dispatch.owner(),
+                    coordinate,
+                    direction,
+                    mode,
+                    body,
+                );
+            }
+            drop(application_work);
+            return;
+        }
+    };
     if state
         .peers
         .with_same_session(dispatch.logical_reply_operation(), |operation| {
@@ -5572,6 +6340,10 @@ async fn handle_inbound_frame_from_inner(
     };
     match msg {
         MeshMessage::Ping(p) => heartbeat::on_ping(state, &dispatch, p).await,
+        MeshMessage::HubIntroduction(frame) => on_hub_introduction(state, &dispatch, frame).await,
+        MeshMessage::ApplicationFlowControl(control) => {
+            state.on_opaque_control(&dispatch, control).await
+        }
         MeshMessage::Pong(p) => heartbeat::on_pong(state, &dispatch, p).await,
         MeshMessage::Shelve(s) => on_shelve(state, &dispatch, s).await,
         MeshMessage::Unshelve(_) => on_unshelve(state, &dispatch).await,
@@ -5954,6 +6726,66 @@ async fn retire_admitted_logical_session(
     dispatch: &peer_registry::AdmittedInboundDispatch,
 ) {
     finish_exact_logical_retirement(state, dispatch.logical_reply_operation()).await;
+}
+
+/// This guard covers cancellation after dequeue, including an unpolled native
+/// send. Only the original logical session is retired, and its existing close
+/// owners retain/join the native workers. It never runs under a registry lock.
+struct OpaqueControlWriteGuard<'a> {
+    state: &'a NetworkState,
+    failed: Option<peer_registry::LogicalSessionOperation>,
+}
+
+impl Drop for OpaqueControlWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(operation) = self.failed.take() {
+            self.state.peers.retire_exact_session(operation);
+        }
+    }
+}
+
+/// The command actor awaits this terminal effect before dequeuing another
+/// control. The original bytes' guard survives every native await, failure and
+/// cancellation; cloning Bytes here shares its already-funded backing only.
+async fn write_opaque_control(state: &Arc<NetworkState>, transfer: command::OpaqueControlTransfer) {
+    let mut terminal = OpaqueControlWriteGuard {
+        state,
+        failed: Some(transfer.dispatch.logical_reply_operation()),
+    };
+    let operation = state.peers.admit_exact_channel_application_operation(
+        transfer
+            .dispatch
+            .exact_channel_operation(Arc::clone(&transfer.worker)),
+    );
+    let result = match operation {
+        Some(operation) => {
+            operation
+                .send_frame(
+                    &state.peers,
+                    transfer.wire.bytes().clone(),
+                    Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
+                )
+                .await
+        }
+        None => Err(Error::Network(
+            "opaque control owner is no longer current".into(),
+        )),
+    };
+    match result {
+        Ok(sent) => {
+            state.traffic.record_tx(traffic::FrameClass::Control, sent);
+            terminal.failed = None;
+            transfer.completion.finish(Ok(()));
+        }
+        Err(_) => {
+            if let Some(operation) = terminal.failed.take() {
+                finish_exact_logical_retirement(state, operation).await;
+            }
+            transfer
+                .completion
+                .finish(Err(crate::realtime::RealtimeRefusal::SessionNotCurrent));
+        }
+    }
 }
 
 async fn finish_exact_logical_retirement(
@@ -6652,6 +7484,14 @@ struct AdmittedRpcCall {
     /// can be *awaited on* rather than merely asked. The run selects against it,
     /// so revocation ends the handler instead of being discovered afterwards.
     witness: crate::runtime::session_broker::SessionValidityWitness,
+    lifetime: RpcHandlerLifetime,
+}
+
+/// Keep the activity guard before its funding in one value. Struct field drop
+/// order also applies if the spawned future is cancelled before its first poll;
+/// separate captures would not establish that ordering.
+struct RpcHandlerLifetime {
+    _demand_use: Option<state::OwnedDemandLinkUse>,
     _task_lease: crate::resource::ResourceLease,
 }
 
@@ -6739,7 +7579,15 @@ async fn on_rpc_request(
         &req.request_id,
         &req.method,
         &req.payload,
-    ) {
+    )
+    .and_then(|claim| {
+        let activity = crate::resource::ResourceClaim::try_from_entries([(
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            (std::mem::size_of::<RpcHandlerLifetime>()
+                - std::mem::size_of::<crate::resource::ResourceLease>()) as u64,
+        )])?;
+        claim.checked_add(activity)
+    }) {
         Ok(claim) => claim,
         Err(error) => {
             refuse_rpc_request(
@@ -6773,6 +7621,9 @@ async fn on_rpc_request(
             // speculative copy against the chance of needing one.
             return Err(request_id);
         };
+        let Ok(demand_use) = state.begin_owned_demand_link_use(owner) else {
+            return Err(request_id);
+        };
         // The second buffer, and it is taken only now that the session has
         // agreed to fund two: the call owns one for the duration of the handler
         // run, and the reply path owns the other because the call is moved into
@@ -6791,7 +7642,10 @@ async fn on_rpc_request(
             owner: owner.clone(),
             operation,
             witness: session.validity_witness(),
-            _task_lease: task_lease,
+            lifetime: RpcHandlerLifetime {
+                _demand_use: demand_use,
+                _task_lease: task_lease,
+            },
         })
     });
     let admitted = match admitted {
@@ -6823,7 +7677,7 @@ async fn on_rpc_request(
         owner,
         operation,
         witness,
-        _task_lease,
+        lifetime,
     } = admitted;
     let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
@@ -6848,7 +7702,7 @@ async fn on_rpc_request(
                     let _run_epilogue =
                         crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
                     // Released when this task ends, whichever arm ends it.
-                    let _task_lease = _task_lease;
+                    let _lifetime = lifetime;
                     // **The run's start, and the only thing that decides it.**
                     //
                     // The select below is a race, and a biased race answers
@@ -6954,7 +7808,7 @@ async fn on_rpc_request(
                     #[cfg(test)]
                     let _run_epilogue =
                         crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
-                    let _task_lease = _task_lease;
+                    let _lifetime = lifetime;
                     // The same start point as the unary arm, and for the same
                     // reasons — see there. A stream's closure is entered exactly
                     // once too, and revoking after that cancels the open, the
@@ -7332,7 +8186,7 @@ async fn on_rpc_stream_end(
 async fn on_routed_application(
     state: &Arc<NetworkState>,
     dispatch: &peer_registry::AdmittedInboundDispatch,
-    claim: crate::resource::ResourceClaim,
+    _claim: crate::resource::ResourceClaim,
     retention: crate::resource::ResourceLease,
     envelope: RoutedApplicationEnvelope,
     #[cfg(feature = "route-flow-diagnostics")] route_flow_receipt: Option<
@@ -7345,28 +8199,36 @@ async fn on_routed_application(
     let Ok(previous_hop) = DeviceId::from_canonical_str(dispatch.owner().device_id()) else {
         return;
     };
-    let preferred_parent = state.tree_preferred_parent_for_route();
-    let admission = {
+    // Admission verifies and may append a signed hop. Both operations allocate
+    // canonical scratch; acquire it before either, independently of ingress
+    // retention and the separately funded route candidates/plan.
+    let Ok(work_claim) =
+        crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
+    else {
+        return;
+    };
+    let Ok(_wire_work) = state.acquire_application_work(work_claim) else {
+        return;
+    };
+    let Ok(mut selection) = capture_funded_route_input(state) else {
+        return;
+    };
+    let admission = dispatch.with_captured_logical_state(&state.peers, |_| {
         let topology = state.topology_impl.read();
         state.routing.admit_captured_previous_hop_with_tree_parent(
             &local_id,
             &previous_hop,
-            || {
-                state
-                    .peers
-                    .owners_snapshot(|_| true)
-                    .into_iter()
-                    .filter(|owner| state.peers.has_usable_authenticated_current(owner))
-                    .map(|owner| owner.device_id().to_owned())
-                    .collect()
-            },
+            || selection.connected.take().expect("one funded route input"),
             |candidate| state.peers.routed_origin_policy_admits(candidate.origin()),
             topology.as_ref(),
             state.mesh_context_id(),
             envelope,
             state.identity.signing_key(),
-            preferred_parent.as_deref(),
+            selection.preferred_parent.as_deref(),
         )
+    });
+    let Some(admission) = admission else {
+        return;
     };
     match admission {
         Ok(routing::RouteAdmission::Destination { envelope }) => {
@@ -7377,11 +8239,20 @@ async fn on_routed_application(
                 Some(dispatch.owner().binding_coordinate().binding_epoch),
                 route_flow_receipt,
             );
-            let origin = envelope.origin().to_string();
-            let ClosedRoutedPayload::ChannelFrame { channel, payload } = envelope.into_payload();
-            let disposition =
-                on_channel_frame_from(state, dispatch, claim, retention, &origin, channel, payload)
-                    .await;
+            let origin = envelope.origin().clone();
+            let disposition = match envelope.into_payload() {
+                ClosedRoutedPayload::EndpointControl { control } => {
+                    receive_endpoint_control(state, dispatch, &origin, &control);
+                    None
+                }
+                ClosedRoutedPayload::EndpointCiphertext { packet } => {
+                    receive_endpoint_channel(state, dispatch, &origin, &packet)
+                }
+                // Wire admission also refuses this retired representation.
+                // Never reinterpret it as a direct-channel compatibility path.
+                ClosedRoutedPayload::ChannelFrame { .. } => None,
+            };
+            drop(retention);
             #[cfg(not(feature = "route-flow-diagnostics"))]
             let _ = disposition;
             #[cfg(feature = "route-flow-diagnostics")]
@@ -7406,8 +8277,16 @@ async fn on_routed_application(
             );
             let provider = NetworkRoutingSessionProvider {
                 state: Arc::clone(state),
+                class: if matches!(
+                    envelope.payload(),
+                    ClosedRoutedPayload::EndpointControl { .. }
+                ) {
+                    traffic::FrameClass::Control
+                } else {
+                    traffic::FrameClass::App
+                },
             };
-            let frame = match serde_json::to_vec(&MeshMessage::RoutedApplication(envelope)) {
+            let frame = match envelope.encode_complete() {
                 Ok(frame) => Bytes::from(frame),
                 Err(error) => {
                     trace!(
@@ -8007,7 +8886,24 @@ pub(crate) async fn send_to_peer_owner(
         return Ok(());
     }
     if matches!(message_admission(msg), Admission::Application) {
-        return send_application_bytes(state, owner, Bytes::from(serialized), class).await;
+        let app_use = matches!(
+            msg,
+            MeshMessage::Channel { .. }
+                | MeshMessage::ChannelSeq { .. }
+                | MeshMessage::RpcRequest(_)
+                | MeshMessage::RpcResponse(_)
+                | MeshMessage::RpcStreamChunk(_)
+                | MeshMessage::RpcStreamEnd(_)
+                | MeshMessage::ClosedRelayData(_)
+        );
+        return send_application_bytes_with_use(
+            state,
+            owner,
+            Bytes::from(serialized),
+            class,
+            app_use,
+        )
+        .await;
     }
     // Protocol admission traffic — Hello, AuthResponse, Approve, Deny — is
     // deliberately ungated: it is what establishes the capability the gate above
@@ -8102,8 +8998,29 @@ pub(crate) async fn send_application_bytes(
     frame: Bytes,
     class: traffic::FrameClass,
 ) -> Result<()> {
+    // Direct callers are the reliable application lane and borrowed RPC
+    // stream writer. Control/heartbeat sends use the inner helper above.
+    send_application_bytes_with_use(state, owner, frame, class, true).await
+}
+
+async fn send_application_bytes_inner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    frame: Bytes,
+    class: traffic::FrameClass,
+) -> Result<()> {
+    send_application_bytes_with_use(state, owner, frame, class, false).await
+}
+
+async fn send_application_bytes_with_use(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    frame: Bytes,
+    class: traffic::FrameClass,
+    app_use: bool,
+) -> Result<()> {
     let timeout = Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms);
-    let sent = state
+    let operation = state
         .peers
         .admit_application_operation(
             owner,
@@ -8115,9 +9032,14 @@ pub(crate) async fn send_application_bytes(
                 "peer owner has no live promoted session for application traffic: {}",
                 owner.device_id()
             ))
-        })?
-        .send_frame(&state.peers, frame, timeout)
-        .await?;
+        })?;
+    let captured = operation.captured_owner();
+    let _demand_use = if app_use {
+        state.begin_demand_link_use(&captured)?
+    } else {
+        None
+    };
+    let sent = operation.send_frame(&state.peers, frame, timeout).await?;
     state.traffic.record_tx(class, sent);
     Ok(())
 }
@@ -8150,11 +9072,500 @@ pub(in crate::engine) async fn send_logical_reply(
 
 struct NetworkRoutingSessionProvider {
     state: Arc<NetworkState>,
+    class: traffic::FrameClass,
+}
+
+/// Bounded input and plan work, separate from wire/AEAD work. The caller
+/// captures it before entering graph -> cipher locks, so topology selection
+/// never performs a peer-registry lookup under the canonical graph fence.
+struct FundedRouteInput {
+    connected: Option<Vec<String>>,
+    preferred_parent: Option<String>,
+    #[cfg(feature = "route-flow-diagnostics")]
+    route_flow: Option<crate::route_flow::SelectedRouteFlow>,
+    _work: crate::resource::ResourceLease,
+}
+
+/// Raw claim shared by candidate capture and its finite fixture planner.
+/// No selection, authority, allocation or reservation occurs here.
+fn funded_route_input_work_claim(
+    count: usize,
+    limit: usize,
+    max_parallel_routes: usize,
+) -> Result<crate::resource::ResourceClaim> {
+    use crate::resource::{ResourceClaim, ResourceClass};
+    use std::mem::size_of;
+    let key_bytes = (32usize * 8).div_ceil(5); // canonical base32 public key
+    let overflow = || Error::Network("route preparation claim overflow".into());
+    // Connected spellings, topology return and final plan coexist. Hubs uses
+    // ranked (bool,score,key,spelling); HubTree's smaller ranking is covered by
+    // that same layout. Growing topology Vecs request at most the next doubled
+    // capacity (minimum four), not an allocator/RSS or CPU-cycle guarantee.
+    let grow = limit.checked_mul(2).ok_or_else(overflow)?.max(4);
+    let connected = count
+        .checked_mul(size_of::<String>() + key_bytes)
+        .ok_or_else(overflow)?;
+    let plans = grow
+        .checked_mul(size_of::<String>() + key_bytes)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(overflow)?;
+    let ranking = grow
+        .checked_mul(size_of::<(bool, u64, &str, &str)>())
+        .ok_or_else(overflow)?;
+    let memory = connected
+        .checked_add(plans)
+        .and_then(|n| n.checked_add(ranking))
+        .and_then(|n| {
+            n.checked_add(
+                size_of::<FundedRouteInput>()
+                    + size_of::<routing::RoutePlan>()
+                    + size_of::<String>()
+                    + key_bytes,
+            )
+        })
+        .ok_or_else(overflow)?;
+    // The stored observation is included in FundedRouteInput above. Its one
+    // scalar copy spans the dispatch await while the queued owner remains
+    // borrowed. Also price the builder's earlier local receipt scratch; none
+    // of these values owns an allocation, capability or emission permit.
+    #[cfg(feature = "route-flow-diagnostics")]
+    let memory = memory
+        .checked_add(size_of::<Option<crate::route_flow::SelectedRouteFlow>>())
+        .and_then(|n| n.checked_add(size_of::<Option<crate::route_flow::HandlerReceipt>>()))
+        .ok_or_else(overflow)?;
+    let allocations = count
+        .checked_add(limit.checked_mul(2).ok_or_else(overflow)?)
+        .and_then(|n| n.checked_add(5))
+        .ok_or_else(overflow)?;
+    let claim = ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            u64::try_from(memory).map_err(|_| overflow())?,
+        ),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            u64::try_from(allocations).map_err(|_| overflow())?,
+        ),
+    ])
+    .map_err(|_| overflow())?;
+    let claim = claim
+        .checked_add(routing::dispatch_work_claim(max_parallel_routes).map_err(|_| overflow())?)
+        .map_err(|_| overflow())?;
+    Ok(claim)
+}
+
+fn capture_funded_route_input(state: &NetworkState) -> Result<FundedRouteInput> {
+    // These are the three routed Hub implementations whose scratch shapes
+    // this claim covers. Other topologies do not inherit a guessed allowance.
+    if !matches!(
+        &state.config.read().topology,
+        crate::config::TopologyMode::Star { .. }
+            | crate::config::TopologyMode::Hubs { .. }
+            | crate::config::TopologyMode::HubTree { .. }
+    ) {
+        return Err(Error::Network(
+            "endpoint Hub routing is unavailable for this topology".into(),
+        ));
+    }
+    let count = state.peers.len();
+    let limit = state.routing.policy().max_next_hops();
+    let key_bytes = (32usize * 8).div_ceil(5); // canonical base32 public key
+    let claim =
+        funded_route_input_work_claim(count, limit, state.routing.policy().max_parallel_routes())?;
+    let work = state.acquire_application_work(claim)?;
+    let preferred_parent = state.tree_preferred_parent_for_route();
+    let mut connected = Vec::with_capacity(count);
+    let mut grew = false;
+    state.peers.visit_owners(|owner| {
+        if owner.device_id().len() != key_bytes
+            || !state.peers.has_usable_authenticated_current(&owner)
+        {
+            return;
+        }
+        if connected.len() == count {
+            grew = true;
+            return;
+        }
+        connected.push(owner.device_id().to_owned());
+    });
+    // A concurrent registry growth may refuse this preparation before any
+    // crypto sequence or queued write, but may not grow beyond its real lease.
+    if grew {
+        return Err(Error::Network(
+            "route candidates changed during funded capture".into(),
+        ));
+    }
+    Ok(FundedRouteInput {
+        connected: Some(connected),
+        preferred_parent,
+        #[cfg(feature = "route-flow-diagnostics")]
+        route_flow: None,
+        _work: work,
+    })
+}
+
+struct FundedRoutedFrame {
+    plan: routing::RoutePlan,
+    bytes: Bytes,
+    class: traffic::FrameClass,
+    // Captured/planning scratch remains owned through terminal dispatch.
+    _selection: FundedRouteInput,
+}
+
+struct EndpointRoutedFrames {
+    peer: DeviceId,
+    first: FundedRoutedFrame,
+    second: Option<FundedRoutedFrame>,
+}
+
+/// Only locally originated envelopes choose a hop budget. Received signed
+/// TTLs remain subject to routing's unchanged strict policy/topology checks.
+fn endpoint_origin_hop_budget(policy_max: u8, topology_max: u8) -> Option<u8> {
+    let budget = policy_max.min(topology_max);
+    (budget != 0).then_some(budget)
+}
+
+/// Called only within the canonical endpoint fence and a controller-owned
+/// outer wire reservation. All peer selection happened beforehand; `true`
+/// below is the already-established local endpoint policy, not a hint grant.
+fn prepare_endpoint_routed_frame(
+    state: &NetworkState,
+    peer: &DeviceId,
+    payload: ClosedRoutedPayload,
+    mut selection: FundedRouteInput,
+) -> Result<FundedRoutedFrame> {
+    use rand::RngCore;
+    // Capture only after the caller owns the priced route input, and before
+    // local envelope/signature/route work. Origins have no native receipt.
+    #[cfg(feature = "route-flow-diagnostics")]
+    let route_flow_receipt = crate::route_flow::capture_handler_receipt(None);
+    let class = if matches!(&payload, ClosedRoutedPayload::EndpointControl { .. }) {
+        traffic::FrameClass::Control
+    } else {
+        traffic::FrameClass::App
+    };
+    let origin = DeviceId::from_canonical_str(state.identity.public_id())
+        .map_err(|_| Error::Network("local endpoint identity invalid".into()))?;
+    let policy = state.routing.policy();
+    let limits = policy.protocol_limits();
+    // Use one captured topology for both the signed initial budget and the
+    // synchronous route admission. Reconciliation cannot swap the selector
+    // between those steps. This guard never crosses a native await.
+    let topology = state.topology_impl.read();
+    let initial_hop_budget =
+        endpoint_origin_hop_budget(policy.max_hop_budget(), topology.flood_ttl())
+            .ok_or_else(|| Error::Network("endpoint origin hop budget is zero".into()))?;
+    let mut id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut id);
+    let envelope = RoutedApplicationEnvelope::new_with_limits(
+        state.mesh_context_id(),
+        origin.clone(),
+        peer.clone(),
+        id,
+        initial_hop_budget,
+        payload,
+        state.identity.signing_key(),
+        limits,
+    )
+    .map_err(|_| Error::Network("endpoint envelope refused".into()))?;
+    let admission = state
+        .routing
+        .admit_captured_previous_hop_with_tree_parent(
+            &origin,
+            &origin,
+            || selection.connected.take().expect("one funded route input"),
+            |candidate| candidate.origin() == &origin && candidate.destination() == peer,
+            topology.as_ref(),
+            state.mesh_context_id(),
+            envelope,
+            state.identity.signing_key(),
+            selection.preferred_parent.as_deref(),
+        )
+        .map_err(|_| Error::Network("endpoint route refused".into()))?;
+    drop(topology);
+    let routing::RouteAdmission::Relay { envelope, plan } = admission else {
+        return Err(Error::Network(
+            "endpoint route is not an outbound relay".into(),
+        ));
+    };
+    #[cfg(feature = "route-flow-diagnostics")]
+    {
+        selection.route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
+            &envelope,
+            crate::route_flow::RouteRole::Origin,
+            None,
+            route_flow_receipt,
+        );
+    }
+    let bytes = envelope
+        .encode_complete()
+        .map_err(|_| Error::Network("endpoint route encoding refused".into()))?;
+    Ok(FundedRoutedFrame {
+        plan,
+        bytes: bytes.into(),
+        class,
+        _selection: selection,
+    })
+}
+
+fn endpoint_control_outer_claim() -> Result<crate::resource::ResourceClaim> {
+    crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
+        .map_err(|_| Error::Network("routed work claim refused".into()))?
+        .checked_scale(2)
+        .map_err(|_| Error::Network("routed control work overflow".into()))
+}
+
+/// Prepare or coalesce outside any serial driver wait. Only typed signed
+/// key controls are queued; no caller plaintext is retained in this exchange.
+pub(super) fn begin_endpoint_cipher_wait(
+    state: &NetworkState,
+    peer: &DeviceId,
+) -> Result<endpoint_cipher::ReadinessWaiter> {
+    // Reuse a live exact epoch without preparing an unnecessary resend.
+    if let Some(waiter) = state.with_endpoint_cipher(peer, |root| {
+        root.observe(peer, Instant::now())
+            .map(|observed| root.waiter(&observed.ticket, Instant::now()))
+            .transpose()
+    })? {
+        return Ok(waiter);
+    }
+    let first = capture_funded_route_input(state)?;
+    let mut first = Some(first);
+    let outer = endpoint_control_outer_claim()?;
+    state.with_endpoint_cipher(peer, |root| {
+        let update = root.begin(&state.identity, peer, None, outer, Instant::now())?;
+        if let Some(output) = update.output {
+            let prepared = output.try_map(|frames| {
+                if frames.second.is_some() {
+                    return Err(endpoint_cipher::ControllerError::Invalid);
+                }
+                let first = prepare_endpoint_routed_frame(
+                    state,
+                    peer,
+                    ClosedRoutedPayload::EndpointControl {
+                        control: frames.first.clone(),
+                    },
+                    first
+                        .take()
+                        .ok_or(endpoint_cipher::ControllerError::Invalid)?,
+                )
+                .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
+                Ok(EndpointRoutedFrames {
+                    peer: peer.clone(),
+                    first,
+                    second: None,
+                })
+            });
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    root.retire(&update.ticket);
+                    return Err(error);
+                }
+            };
+            if state.queue_endpoint_controls(prepared).is_err() {
+                root.retire(&update.ticket);
+                return Err(endpoint_cipher::ControllerError::Pressure);
+            }
+        }
+        root.waiter(&update.ticket, Instant::now())
+    })
+}
+
+async fn write_endpoint_controls(
+    state: &Arc<NetworkState>,
+    transfer: command::EndpointControlTransfer,
+) {
+    let result = dispatch_endpoint_output(state, &transfer.output).await;
+    if let Some(reply) = transfer.reply {
+        let _ = reply.send(result);
+    }
+}
+
+/// Reduce signed endpoint controls only under the captured carrier and the
+/// independent canonical endpoint fence. Two funded selections and two outer
+/// wire claims cover the responder's simultaneous answer + confirmation.
+fn receive_endpoint_control(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+    peer: &DeviceId,
+    control: &crate::protocol::EndpointCipherControl,
+) {
+    let Ok(first) = capture_funded_route_input(state) else {
+        return;
+    };
+    let Ok(second) = capture_funded_route_input(state) else {
+        return;
+    };
+    let Ok(outer) = endpoint_control_outer_claim() else {
+        return;
+    };
+    let mut selections = [Some(first), Some(second)];
+    let _ = dispatch.with_captured_logical_state(&state.peers, |_| {
+        state.with_endpoint_cipher(peer, |root| {
+            // The controller verifies a share/confirmation without consuming
+            // its current phase first; hostile mismatches cannot evict it.
+            let update =
+                root.receive_control(&state.identity, peer, control, outer, Instant::now())?;
+            if let Some(output) = update.output {
+                let prepared = output.try_map(|frames| {
+                    let mut prepare =
+                        |index: usize, control: &crate::protocol::EndpointCipherControl| {
+                            prepare_endpoint_routed_frame(
+                                state,
+                                peer,
+                                ClosedRoutedPayload::EndpointControl {
+                                    control: control.clone(),
+                                },
+                                selections[index]
+                                    .take()
+                                    .ok_or(endpoint_cipher::ControllerError::Invalid)?,
+                            )
+                            .map_err(|_| endpoint_cipher::ControllerError::Invalid)
+                        };
+                    let first = prepare(0, &frames.first)?;
+                    let second = frames
+                        .second
+                        .as_ref()
+                        .map(|control| prepare(1, control))
+                        .transpose()?;
+                    Ok(EndpointRoutedFrames {
+                        peer: peer.clone(),
+                        first,
+                        second,
+                    })
+                });
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        root.retire(&update.ticket);
+                        return Err(error);
+                    }
+                };
+                // A waiter observing Ready must re-enter this same root fence;
+                // it cannot publish data ahead of this confirmation admission.
+                if state.queue_endpoint_controls(prepared).is_err() {
+                    root.retire(&update.ticket);
+                    return Err(endpoint_cipher::ControllerError::Pressure);
+                }
+            }
+            Ok(())
+        })
+    });
+}
+
+/// The plaintext guard remains live through bounded decode and synchronous
+/// subscriber admission. Gateway copies acquire their own exact retention
+/// before allocation; no decrypted bytes escape through an unfunded callback.
+fn receive_endpoint_channel(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+    peer: &DeviceId,
+    packet: &crate::protocol::endpoint_cipher::CiphertextPacket,
+) -> Option<ChannelDisposition> {
+    use crate::application_gateway::GatewayRefusal;
+    dispatch
+        .with_captured_logical_state(&state.peers, |operation| {
+            state
+                .with_endpoint_cipher(peer, |root| {
+                    let observed = root
+                        .observe(peer, Instant::now())
+                        .ok_or(endpoint_cipher::ControllerError::Phase)?;
+                    let length = packet
+                        .ciphertext
+                        .len()
+                        .checked_sub(16)
+                        .ok_or(endpoint_cipher::ControllerError::Invalid)?;
+                    let parse_claim = crate::application_gateway::structural_json_claim(length)
+                        .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
+                    // Distinct custody: this lease moves into the gateway along with
+                    // the decoded Value; the cipher's guard owns only plaintext/work.
+                    let parse_retention = state
+                        .acquire_application_work(parse_claim)
+                        .map_err(|_| endpoint_cipher::ControllerError::Pressure)?;
+                    let opened = root.open(
+                        &observed.ticket,
+                        packet,
+                        crate::resource::ResourceClaim::ZERO,
+                        Instant::now(),
+                    )?;
+                    // Decode only the permitted payload family. Deserializing the
+                    // entire MeshMessage enum and rejecting afterward could already
+                    // have constructed semantic/interner-bearing control objects.
+                    let message: EndpointChannelMessage = serde_json::from_slice(opened.bytes())
+                        .map_err(|_| endpoint_cipher::ControllerError::Invalid)?;
+                    let EndpointChannelMessage::Channel { channel, payload } = message;
+                    let result = state.application_gateway.accept_channel(
+                        operation.validity(),
+                        parse_claim,
+                        parse_retention,
+                        &channel,
+                        peer.as_ref(),
+                        payload,
+                    );
+                    Ok(match result {
+                        Ok(_) => ChannelDisposition::Accepted,
+                        Err(GatewayRefusal::Pressure(_)) => ChannelDisposition::Dropped,
+                        Err(_) => ChannelDisposition::Refused,
+                    })
+                })
+                .ok()
+        })
+        .flatten()
+}
+
+/// Funding, not graph/controller locks, spans every native await. The complete
+/// queued owner remains borrowed until all admitted parallel writes settle.
+async fn dispatch_endpoint_output(
+    state: &Arc<NetworkState>,
+    output: &endpoint_cipher::PreparedOutput<EndpointRoutedFrames>,
+) -> Result<()> {
+    let prepared = output.value();
+    for frame in std::iter::once(&prepared.first).chain(prepared.second.iter()) {
+        state.with_endpoint_cipher(&prepared.peer, |root| {
+            if root.current(output.ticket(), Instant::now()) {
+                Ok(())
+            } else {
+                Err(endpoint_cipher::ControllerError::Stale)
+            }
+        })?;
+        let provider = NetworkRoutingSessionProvider {
+            state: Arc::clone(state),
+            class: frame.class,
+        };
+        // One writer visits each prepared frame once. Copy only the nonowning
+        // selected scalars into this terminal dispatch, never the queued work
+        // or cipher ticket. Stale epochs returned above; cancellation drops
+        // the observation without manufacturing a terminal disposition.
+        let report = dispatch_routed_frame_with_route_flow(
+            state,
+            routing::dispatch_borrowed_routed_frame(&frame.plan, frame.bytes.clone(), &provider),
+            #[cfg(feature = "route-flow-diagnostics")]
+            frame._selection.route_flow,
+        )
+        .await;
+        if report.delivered == 0 || report.outcome_unknown != 0 || report.failed != 0 {
+            if let Some(root) = state.endpoint_cipher.as_ref() {
+                root.lock().retire(output.ticket());
+            }
+            return Err(Error::Network(
+                if report.outcome_unknown != 0 || report.failed != 0 {
+                    "endpoint routed write outcome unknown"
+                } else {
+                    "endpoint routed write refused"
+                }
+                .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct NetworkRoutingSession {
     state: Arc<NetworkState>,
     owner: peer_registry::PeerOwnerToken,
+    class: traffic::FrameClass,
+    _work: Option<crate::resource::ResourceLease>,
 }
 
 impl routing::ExactApprovedSessionProvider for NetworkRoutingSessionProvider {
@@ -8167,11 +9578,33 @@ impl routing::ExactApprovedSessionProvider for NetworkRoutingSessionProvider {
             .peers
             .has_usable_authenticated_current(&owner)
             .then(|| {
-                Arc::new(NetworkRoutingSession {
+                let mut session = NetworkRoutingSession {
                     state: Arc::clone(&self.state),
                     owner,
-                }) as Arc<dyn routing::ExactApprovedSession>
+                    class: self.class,
+                    _work: None,
+                };
+                // Constructing an unpolled concrete future allocates nothing.
+                // Price its actual compiler layout before the Box/Arc exist.
+                let future_bytes =
+                    std::mem::size_of_val(&send_network_routed(&session, Bytes::new()));
+                let memory = std::mem::size_of::<NetworkRoutingSession>()
+                    .checked_add(2 * std::mem::size_of::<usize>())?
+                    .checked_add(future_bytes)?;
+                let claim = crate::resource::ResourceClaim::try_from_entries([
+                    (
+                        crate::resource::ResourceClass::AccountedMemoryBytes,
+                        u64::try_from(memory).ok()?,
+                    ),
+                    // Session Arc, erased future Box, and bounded native-send
+                    // dependency bookkeeping; no allocator/crypto-heap claim.
+                    (crate::resource::ResourceClass::OpaqueDependencyResidual, 3),
+                ])
+                .ok()?;
+                session._work = Some(self.state.acquire_application_work(claim).ok()?);
+                Some(Arc::new(session) as Arc<dyn routing::ExactApprovedSession>)
             })
+            .flatten()
     }
 }
 
@@ -8185,30 +9618,50 @@ impl routing::ExactApprovedSession for NetworkRoutingSession {
         frame: Bytes,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<(), routing::RouteSendError>> + Send + 'a>>
     {
-        Box::pin(async move {
-            let timeout = Duration::from_millis(scheduler_policy(&self.state).peer_send_timeout_ms);
-            // Refusal before acquiring an application operation proves that
-            // no write was attempted. Once send_frame starts, an error does
-            // not establish whether the remote endpoint received the frame.
-            let operation = self
-                .state
-                .peers
-                .admit_application_operation(
-                    &self.owner,
-                    self.state.session_broker.as_ref(),
-                    &self.state.mesh_context_id().to_string(),
-                )
-                .ok_or(routing::RouteSendError::Refused)?;
-            #[cfg(all(test, feature = "route-flow-diagnostics"))]
-            hold_route_flow_dispatch_for_test().await;
-            let sent = operation
-                .send_frame(&self.state.peers, frame, timeout)
-                .await
-                .map_err(|_| routing::RouteSendError::OutcomeUnknown)?;
-            self.state.traffic.record_tx(traffic::FrameClass::App, sent);
-            Ok(())
-        })
+        Box::pin(send_network_routed(self, frame))
     }
+}
+
+async fn send_network_routed(
+    session: &NetworkRoutingSession,
+    frame: Bytes,
+) -> std::result::Result<(), routing::RouteSendError> {
+    let timeout = Duration::from_millis(scheduler_policy(&session.state).peer_send_timeout_ms);
+    let mut encoded_context = [0u8; 52];
+    data_encoding::BASE32_NOPAD.encode_mut(
+        session.state.mesh_context_id().as_bytes(),
+        &mut encoded_context,
+    );
+    encoded_context.make_ascii_lowercase();
+    let context =
+        std::str::from_utf8(&encoded_context).map_err(|_| routing::RouteSendError::Refused)?;
+    // Refusal before acquiring an application operation proves that
+    // no write was attempted. Once send_frame starts, an error does
+    // not establish whether the remote endpoint received the frame.
+    let operation = session
+        .state
+        .peers
+        .admit_application_operation(
+            &session.owner,
+            session.state.session_broker.as_ref(),
+            context,
+        )
+        .ok_or(routing::RouteSendError::Refused)?;
+    // The selector above may have been unstamped. Activity belongs to
+    // the admitted channel W0, never whichever W1 is selected later.
+    let captured = operation.captured_owner();
+    let _demand_use = session
+        .state
+        .begin_demand_link_use(&captured)
+        .map_err(|_| routing::RouteSendError::Refused)?;
+    #[cfg(all(test, feature = "route-flow-diagnostics"))]
+    hold_route_flow_dispatch_for_test().await;
+    let sent = operation
+        .send_frame(&session.state.peers, frame, timeout)
+        .await
+        .map_err(|_| routing::RouteSendError::OutcomeUnknown)?;
+    session.state.traffic.record_tx(session.class, sent);
+    Ok(())
 }
 
 #[cfg(all(test, feature = "route-flow-diagnostics"))]
@@ -8327,121 +9780,110 @@ where
     report
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BorrowedChannelMessage<'a> {
+    Channel {
+        channel: &'a str,
+        payload: &'a serde_json::Value,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum EndpointChannelMessage {
+    Channel {
+        channel: String,
+        payload: serde_json::Value,
+    },
+}
+
+fn queue_routed_channel_frame(
+    state: &Arc<NetworkState>,
+    peer: &str,
+    channel: &str,
+    payload: serde_json::Value,
+    reply: &mut Option<tokio::sync::oneshot::Sender<Result<()>>>,
+) -> Result<()> {
+    use crate::protocol::endpoint_cipher::CipherError;
+    use crate::resource::{ResourceClaim, ResourceClass};
+    let (destination, _identity_work) = state.funded_endpoint_id(peer)?;
+    let mut selection = Some(capture_funded_route_input(state)?);
+    let outer = crate::protocol::topology::routed_work_claim(crate::protocol::RECEIVE_FRAME_BYTES)
+        .map_err(|_| Error::Network("routed work claim refused".into()))?;
+    state.with_endpoint_cipher(&destination, |root| {
+        let observed = root
+            .observe(&destination, Instant::now())
+            .ok_or(endpoint_cipher::ControllerError::Phase)?;
+        let maximum = observed
+            .max_plaintext_bytes
+            .ok_or(endpoint_cipher::ControllerError::Phase)?;
+        let input = BorrowedChannelMessage::Channel {
+            channel,
+            payload: &payload,
+        };
+        let (_, encoded, _) =
+            crate::resource::mailbox_measure_serialized(&input).map_err(|_| CipherError::Limit)?;
+        // Count the WHOLE channel message before allocation or crypto sequence
+        // mutation. A negotiated one-byte limit is valid but cannot fit it.
+        if encoded > maximum {
+            return Err(CipherError::Limit.into());
+        }
+        let raw = ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, encoded as u64),
+            (ResourceClass::ParsingOrCpuWork, encoded as u64),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .map_err(|_| CipherError::Limit)?;
+        let _input_work = state
+            .acquire_application_work(raw)
+            .map_err(|_| endpoint_cipher::ControllerError::Pressure)?;
+        let mut plaintext = zeroize::Zeroizing::new(Vec::with_capacity(encoded));
+        serde_json::to_writer(&mut *plaintext, &input).map_err(|_| CipherError::Limit)?;
+        if plaintext.len() != encoded {
+            return Err(CipherError::Limit.into());
+        }
+        let sealed = root.seal(&observed.ticket, &plaintext, outer, Instant::now())?;
+        let prepared = sealed.try_map(|packet| {
+            // The outer reservation covers this one retained DTO copy and
+            // complete canonical/envelope encoding. No clone escapes on Err.
+            let first = prepare_endpoint_routed_frame(
+                state,
+                &destination,
+                ClosedRoutedPayload::EndpointCiphertext {
+                    packet: packet.clone(),
+                },
+                selection.take().ok_or(CipherError::OperationOwner)?,
+            )
+            .map_err(|_| CipherError::Limit)?;
+            Ok(EndpointRoutedFrames {
+                peer: destination.clone(),
+                first,
+                second: None,
+            })
+        })?;
+        // Publish the owned ciphertext while the canonical graph and exact
+        // epoch are still fenced. The serial driver does not await this next
+        // command: it transfers the original caller reply to the terminal
+        // writer, then continues. There is no nested-supervisor wait.
+        state
+            .queue_endpoint_payload(prepared, reply.take().ok_or(CipherError::OperationOwner)?)
+            .map_err(|_| endpoint_cipher::ControllerError::Pressure)
+    })
+}
+
+#[cfg(all(test, feature = "route-flow-diagnostics"))]
 async fn send_routed_channel_frame(
     state: &Arc<NetworkState>,
     peer: &str,
     channel: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    use rand::RngCore;
-
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_flow_receipt = crate::route_flow::capture_handler_receipt(None);
-
-    let destination = DeviceId::from_canonical_str(peer)
-        .map_err(|_| Error::Network("routed destination is not canonical".into()))?;
-    let origin = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|_| Error::Network("local device id is not canonical".into()))?;
-    let policy = state.routing.policy();
-    let limits = RoutedApplicationLimits::checked(
-        usize::try_from(policy.max_envelope_bytes())
-            .map_err(|_| Error::Network("routing envelope limit overflows usize".into()))?,
-        policy.max_hop_budget(),
-    )
-    .map_err(|error| Error::Network(format!("routing protocol limit rejected: {error}")))?;
-    let mut message_id = [0u8; 16];
-    let mut rng = rand::rngs::OsRng;
-    rng.fill_bytes(&mut message_id);
-    let envelope = RoutedApplicationEnvelope::new_with_limits(
-        state.mesh_context_id(),
-        origin.clone(),
-        destination,
-        message_id,
-        policy.max_hop_budget(),
-        ClosedRoutedPayload::ChannelFrame {
-            channel: channel.to_owned(),
-            payload,
-        },
-        state.identity.signing_key(),
-        limits,
-    )
-    .map_err(|error| Error::Network(format!("routed envelope refused: {error}")))?;
-    let preferred_parent = state.tree_preferred_parent_for_route();
-    let admission = {
-        let topology = state.topology_impl.read();
-        state.routing.admit_captured_previous_hop_with_tree_parent(
-            &origin,
-            &origin,
-            || {
-                state
-                    .peers
-                    .owners_snapshot(|_| true)
-                    .into_iter()
-                    .filter(|owner| state.peers.has_usable_authenticated_current(owner))
-                    .map(|owner| owner.device_id().to_owned())
-                    .collect()
-            },
-            |candidate| {
-                candidate.origin() == &origin
-                    || state.peers.routed_origin_policy_admits(candidate.origin())
-            },
-            topology.as_ref(),
-            state.mesh_context_id(),
-            envelope,
-            state.identity.signing_key(),
-            preferred_parent.as_deref(),
-        )
-    };
-    let (envelope, plan) = match admission {
-        Ok(routing::RouteAdmission::Relay { envelope, plan }) => (envelope, plan),
-        Ok(routing::RouteAdmission::Destination { .. }) => {
-            return Err(Error::Network("routed destination resolved locally".into()))
-        }
-        Ok(routing::RouteAdmission::Duplicate) => {
-            return Err(Error::Network(
-                "routed message id was already admitted".into(),
-            ))
-        }
-        Err(error) => return Err(Error::Network(format!("routed frame refused: {error}"))),
-    };
-    #[cfg(feature = "route-flow-diagnostics")]
-    let route_flow = crate::route_flow::SelectedRouteFlow::after_admission(
-        &envelope,
-        crate::route_flow::RouteRole::Origin,
-        None,
-        route_flow_receipt,
-    );
-    let provider = NetworkRoutingSessionProvider {
-        state: Arc::clone(state),
-    };
-    let frame = match serde_json::to_vec(&MeshMessage::RoutedApplication(envelope)) {
-        Ok(frame) => Bytes::from(frame),
-        Err(error) => {
-            #[cfg(feature = "route-flow-diagnostics")]
-            if let Some(route_flow) = route_flow {
-                route_flow.emit(state, None, crate::route_flow::RouteOutcome::Refused);
-            }
-            return Err(Error::Serde(error));
-        }
-    };
-    let report = dispatch_routed_frame_with_route_flow(
-        state,
-        routing::dispatch_routed_frame(plan, frame, &provider),
-        #[cfg(feature = "route-flow-diagnostics")]
-        route_flow,
-    )
-    .await;
-    if report.delivered == 0 {
-        if report.outcome_unknown > 0 || report.failed > 0 {
-            return Err(Error::Network(
-                "routed channel frame delivery outcome is unknown".into(),
-            ));
-        }
-        return Err(Error::Network(
-            "no approved route delivered channel frame".into(),
-        ));
-    }
-    Ok(())
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    queue_routed_channel_frame(state, peer, channel, payload, &mut Some(reply))?;
+    receive
+        .await
+        .map_err(|_| Error::Network("endpoint writer ended".into()))?
 }
 
 async fn send_channel_frame(
@@ -8468,7 +9910,9 @@ async fn send_channel_frame(
         )
         .await;
     }
-    send_routed_channel_frame(state, peer, channel, payload).await
+    Err(Error::Network(
+        "direct channel became unavailable before send".into(),
+    ))
 }
 
 async fn broadcast_channel_frame(
@@ -9200,6 +10644,9 @@ async fn drop_peer_if_current_with_correlation(
     let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    if state.request_failed_introduction(owner, explicit_correlation, &reason) {
+        return;
+    }
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     if let Some(worker) = owner.worker().cloned() {
         if let Some(correlation) = explicit_correlation.filter(|correlation| {
@@ -9670,19 +11117,6 @@ fn install_peer(
     Some(attempt)
 }
 
-/// Production replacement boundary with access to the network's exact
-/// delivery settlement coordinator. The registry atomically returns the
-/// displaced owner token; state then settles only that captured owner before
-/// any asynchronous close, so a replacement cannot be retired by device or
-/// attempt correlation.
-fn install_peer_for_state(
-    state: &Arc<NetworkState>,
-    peer: Arc<PeerConnection>,
-) -> Option<connection::AttemptDisplacement> {
-    let shutdown_permit = state.try_admit_shutdown_mutation()?;
-    install_peer_for_state_admitted(state, peer, &shutdown_permit)
-}
-
 /// Install a peer while the caller retains the lifecycle admission witness.
 ///
 /// `None` is the normal result for a fresh installation with no displaced
@@ -9810,18 +11244,21 @@ fn build_test_state_parts_with(
 }
 
 #[cfg(test)]
-fn build_test_state_parts_metered(
-    network_id_suffix: &str,
-    profile_override: Option<crate::WebRtcConnectorProfile>,
-    connector_slots: usize,
-    retained: Option<crate::resource::ResourceClaim>,
-) -> (
+type MeteredTestStateParts = (
     Arc<NetworkState>,
     crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
     crate::resource::ResourceMailboxReceiver<NetworkCmd>,
     crate::resource::FiniteResourceProvider,
     crate::resource::ResourceClaim,
-) {
+);
+
+#[cfg(test)]
+fn build_test_state_parts_metered(
+    network_id_suffix: &str,
+    profile_override: Option<crate::WebRtcConnectorProfile>,
+    connector_slots: usize,
+    retained: Option<crate::resource::ResourceClaim>,
+) -> MeteredTestStateParts {
     build_test_state_parts_metered_with_creation(
         network_id_suffix,
         profile_override,
@@ -9838,13 +11275,53 @@ fn build_test_state_parts_metered_with_creation(
     connector_slots: usize,
     retained: Option<crate::resource::ResourceClaim>,
     closed_creation_id: Option<[u8; 32]>,
-) -> (
-    Arc<NetworkState>,
-    crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
-    crate::resource::ResourceMailboxReceiver<NetworkCmd>,
-    crate::resource::FiniteResourceProvider,
-    crate::resource::ResourceClaim,
-) {
+) -> MeteredTestStateParts {
+    build_test_state_parts_metered_with_application(
+        network_id_suffix,
+        profile_override,
+        connector_slots,
+        retained,
+        closed_creation_id,
+        None,
+    )
+}
+
+/// The original fixture delegates with None. Settlement controls opt in to
+/// the real production roots, with their disjoint concrete claims supplied
+/// through the existing retained planning argument.
+#[cfg(test)]
+fn build_test_state_parts_metered_with_application(
+    network_id_suffix: &str,
+    profile_override: Option<crate::WebRtcConnectorProfile>,
+    connector_slots: usize,
+    retained: Option<crate::resource::ResourceClaim>,
+    closed_creation_id: Option<[u8; 32]>,
+    application_transport: Option<crate::config::ApplicationTransportPolicyConfig>,
+) -> MeteredTestStateParts {
+    try_build_test_state_parts_metered_with_application_in_instance_root(
+        network_id_suffix,
+        profile_override,
+        connector_slots,
+        retained,
+        closed_creation_id,
+        application_transport,
+        None,
+    )
+    .expect("network state")
+}
+
+/// Same finite fixture construction, with an explicit per-node storage root
+/// and a fallible state-publication boundary for multi-node setup cleanup.
+#[cfg(test)]
+fn try_build_test_state_parts_metered_with_application_in_instance_root(
+    network_id_suffix: &str,
+    profile_override: Option<crate::WebRtcConnectorProfile>,
+    connector_slots: usize,
+    retained: Option<crate::resource::ResourceClaim>,
+    closed_creation_id: Option<[u8; 32]>,
+    application_transport: Option<crate::config::ApplicationTransportPolicyConfig>,
+    instance_root: Option<std::path::PathBuf>,
+) -> Result<MeteredTestStateParts> {
     use std::sync::OnceLock;
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     let _ = HOME.get_or_init(|| {
@@ -9866,13 +11343,14 @@ fn build_test_state_parts_metered_with_creation(
         } else {
             Default::default()
         },
-        semantic_policy: semantic_policy.clone(),
+        semantic_policy,
         scheduler: crate::config::SchedulerPolicyConfig::default(),
         topology: crate::config::TopologyMode::FullMesh,
         routing_policy: crate::config::RoutingPolicyConfig::default(),
         hub: None,
         tree: None,
         local_observations: None,
+        application_transport,
         signaling: crate::config::SignalingConfig::default(),
         closed_relay: crate::config::ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
@@ -10214,16 +11692,16 @@ fn build_test_state_parts_metered_with_creation(
         None => VerifiedBootstrap::open(config.network_id.clone())
             .expect("engine fixture creates founderless semantic bootstrap"),
     };
-    let (state, signaling_in_rx, cmd_rx) = NetworkState::new_in_mesh_scope(
+    let (state, signaling_in_rx, cmd_rx) = NetworkState::new_in_mesh_scope_with_instance_root(
         config,
         identity,
         transport,
         bootstrap,
         &mesh_scope,
         &local_resources,
-    )
-    .expect("network state");
-    (state, signaling_in_rx, cmd_rx, metered, grant)
+        instance_root,
+    )?;
+    Ok((state, signaling_in_rx, cmd_rx, metered, grant))
 }
 
 /// A cancelled governance planner or commit leaves its planning owner on the
@@ -10872,9 +12350,28 @@ pub(crate) async fn install_promoted_session_over_real_link(
     near_state: &Arc<NetworkState>,
     far_state: &Arc<NetworkState>,
 ) -> LinkedPromotedSession {
+    let (linked, (), ()) =
+        install_linked_session_with_capture(near_state, far_state, |_, _, _, _| ()).await;
+    linked
+}
+
+// The legacy path captures unit, so it retains no additional validity owner.
+// The opt-in path captures at installation, before either fixture is returned.
+#[cfg(feature = "transport-lab")]
+async fn install_linked_session_with_capture<R>(
+    near_state: &Arc<NetworkState>,
+    far_state: &Arc<NetworkState>,
+    capture: impl Fn(
+        &Arc<NetworkState>,
+        &peer_registry::PeerOwnerToken,
+        &Arc<crate::transport::WebRtcConnectorWorker>,
+        &str,
+    ) -> R,
+) -> (LinkedPromotedSession, R, R) {
     let far_device_id = far_state.identity.public_id().to_string();
     let near_device_id = near_state.identity.public_id().to_string();
-    let mut near = insert_promoted_peer_over_real_link(near_state, far_state, &far_device_id).await;
+    let (mut near, near_capture) =
+        insert_linked_peer_with_capture(near_state, far_state, &far_device_id, &capture).await;
 
     let handoff = near.receive_ready.take_right_handoff();
     let far_peer = Arc::new(PeerConnection::new(
@@ -10914,6 +12411,13 @@ pub(crate) async fn install_promoted_session_over_real_link(
             .is_some(),
         "the far-side exact owner is live before the real-link fixture returns"
     );
+    assert!(Arc::ptr_eq(far_owner.connection(), &far_peer));
+    let far_capture = capture(
+        far_state,
+        &far_owner,
+        &near.receive_ready.link.right,
+        &far_mesh_context,
+    );
 
     let near_pumping = Arc::clone(near_state);
     let near_device = far_device_id.clone();
@@ -10937,12 +12441,16 @@ pub(crate) async fn install_promoted_session_over_real_link(
         }
     });
 
-    LinkedPromotedSession {
-        near,
-        _far_peer: far_peer,
-        near_pump,
-        far_pump,
-    }
+    (
+        LinkedPromotedSession {
+            near,
+            _far_peer: far_peer,
+            near_pump,
+            far_pump,
+        },
+        near_capture,
+        far_capture,
+    )
 }
 
 #[cfg(feature = "transport-lab")]
@@ -10980,6 +12488,234 @@ impl LinkedPromotedSession {
     }
 }
 
+/// Opt-in fixture ownership for explicit retirement of the two original
+/// channels. Unlike the legacy fixture, this retains each original logical
+/// witness; none of these additional owners is retained by the legacy path.
+#[cfg(feature = "transport-lab")]
+pub(crate) struct LinkedRetirableSession {
+    linked: LinkedPromotedSession,
+    near_state: Arc<NetworkState>,
+    far_state: Arc<NetworkState>,
+    near_channel: peer_registry::ExactChannelOperation,
+    far_channel: peer_registry::ExactChannelOperation,
+}
+
+#[cfg(feature = "transport-lab")]
+fn capture_lab_channel(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    mesh_context: &str,
+) -> peer_registry::ExactChannelOperation {
+    let stamped = owner.for_worker(Arc::clone(worker));
+    state
+        .peers
+        .with_admitted_current_or_refused(
+            &stamped,
+            state.session_broker.as_ref(),
+            mesh_context,
+            |admitted| {
+                Some(
+                    admitted
+                        .capture_inbound_dispatch()
+                        .exact_channel_operation(Arc::clone(worker)),
+                )
+            },
+            |_| None,
+        )
+        .flatten()
+        .expect("the original installed lab channel is admitted before publication")
+}
+
+#[cfg(feature = "transport-lab")]
+pub(crate) async fn install_retirable_session_over_real_link(
+    near_state: &Arc<NetworkState>,
+    far_state: &Arc<NetworkState>,
+) -> LinkedRetirableSession {
+    let (linked, near_channel, far_channel) =
+        install_linked_session_with_capture(near_state, far_state, capture_lab_channel).await;
+    LinkedRetirableSession {
+        linked,
+        near_state: Arc::clone(near_state),
+        far_state: Arc::clone(far_state),
+        near_channel,
+        far_channel,
+    }
+}
+
+// Called only AFTER both original native closes and event-pump joins. Until
+// then, the intact terminal owns its dedup tokens and additional leased nodes.
+// A missing closing entry may release custody here, including under pressure:
+// the awaited terminal boundary has already passed. W1 remains untouched.
+#[cfg(feature = "transport-lab")]
+fn start_lab_channel_terminal(
+    owner: &peer_registry::PeerOwnerToken,
+    terminal: peer_registry::ChannelTerminal,
+) -> Option<Arc<PeerConnection>> {
+    let (peer, channel) = match terminal {
+        peer_registry::ChannelTerminal::Stale => return None,
+        peer_registry::ChannelTerminal::Channel { channel } => {
+            (Arc::clone(owner.connection()), channel)
+        }
+        peer_registry::ChannelTerminal::Peer { peer, channel } => (peer, channel),
+    };
+    let _started = peer.start_exact_retired_worker(
+        &channel.worker,
+        channel.dedup,
+        channel.additional_dedup.drain_tokens(),
+    );
+    // The pressure fallback and the ordinary close owner have both already
+    // been awaited; false must never cause a pre-terminal custody release.
+    Some(peer)
+}
+
+// Shared by the opt-in adapter and the exact post-removal pressure control.
+// Callers retain shutdown permits and captured installation owners throughout.
+#[cfg(feature = "transport-lab")]
+async fn finish_lab_channel_terminals(
+    linked: LinkedPromotedSession,
+    near_owner: &peer_registry::PeerOwnerToken,
+    near_terminal: peer_registry::ChannelTerminal,
+    far_owner: &peer_registry::PeerOwnerToken,
+    far_terminal: peer_registry::ChannelTerminal,
+) -> Vec<crate::Result<()>> {
+    let LinkedPromotedSession {
+        near,
+        _far_peer,
+        near_pump,
+        far_pump,
+    } = linked;
+    let LinkedPromotedPeer {
+        peer: near_peer,
+        receive_ready,
+    } = near;
+    // Both intact removed channels retain token/node funding even when the
+    // original close-entry acquisition refused or native close reports Err.
+    let mut outcomes = receive_ready.close_outcomes().await;
+    outcomes.reserve_exact(4);
+    for pump in [near_pump, far_pump] {
+        outcomes.push(
+            pump.await.map_err(|error| {
+                Error::Network(format!("lab original event pump failed: {error}"))
+            }),
+        );
+    }
+    let near_retired = start_lab_channel_terminal(near_owner, near_terminal);
+    let far_retired = start_lab_channel_terminal(far_owner, far_terminal);
+    for peer in [near_retired, far_retired].into_iter().flatten() {
+        outcomes.push(peer.await_retired_workers().await);
+    }
+    // Never retire the peer again after await: a successor may now own it.
+    drop((near_peer, _far_peer));
+    outcomes
+}
+
+#[cfg(feature = "transport-lab")]
+impl LinkedRetirableSession {
+    pub(crate) fn peer_device_id(&self) -> &str {
+        self.linked.peer_device_id()
+    }
+
+    pub(crate) async fn retire_sessions(self) -> Vec<crate::Result<()>> {
+        let Self {
+            linked,
+            near_state,
+            far_state,
+            near_channel,
+            far_channel,
+        } = self;
+        let near_owner = near_channel.owner().clone();
+        let far_owner = far_channel.owner().clone();
+        let near_permit = near_state.try_admit_shutdown_mutation();
+        let far_permit = far_state.try_admit_shutdown_mutation();
+        // BOTH synchronous terminals precede the first native await. No
+        // selected-worker lookup, fresh witness, or label-based retirement.
+        let near_terminal = if near_permit.is_some() {
+            near_state
+                .peers
+                .remove_current_channel_for_terminal(near_channel)
+        } else {
+            peer_registry::ChannelTerminal::Stale
+        };
+        let far_terminal = if far_permit.is_some() {
+            far_state
+                .peers
+                .remove_current_channel_for_terminal(far_channel)
+        } else {
+            peer_registry::ChannelTerminal::Stale
+        };
+        let mut outcomes = finish_lab_channel_terminals(
+            linked,
+            &near_owner,
+            near_terminal,
+            &far_owner,
+            far_terminal,
+        )
+        .await;
+        if near_permit.is_none() || far_permit.is_none() {
+            outcomes.push(Err(Error::Network(
+                "lab session retirement overlapped network shutdown".into(),
+            )));
+        }
+        // Do not call retire_connector/retire_and_close on these peer Arcs:
+        // they might have been reinstalled while native cleanup was awaited.
+        drop((near_owner, far_owner));
+        drop((near_permit, far_permit));
+        outcomes
+    }
+}
+
+/// One immediate, scalar-only read of the existing introduction controller.
+#[cfg(feature = "transport-lab")]
+pub(crate) fn introduction_snapshot_for_lab(
+    state: &NetworkState,
+    source: [u8; 32],
+    destination: [u8; 32],
+) -> Option<crate::handle::TransportLabIntroductionSnapshot> {
+    let now = std::time::Instant::now();
+    let snapshot =
+        state
+            .hub_introductions
+            .as_ref()?
+            .lock()
+            .snapshot_for_lab(source, destination, now);
+    Some(public_introduction_snapshot(snapshot))
+}
+
+#[cfg(feature = "transport-lab")]
+fn public_introduction_snapshot(
+    snapshot: hub_introduction::IntroductionSnapshotForLab,
+) -> crate::handle::TransportLabIntroductionSnapshot {
+    use crate::handle::{
+        TransportLabIntroductionPhase as PublicPhase, TransportLabIntroductionRecord,
+        TransportLabIntroductionSnapshot,
+    };
+    use hub_introduction::IntroductionPhaseForLab as Phase;
+    TransportLabIntroductionSnapshot {
+        records: snapshot.records.map(|record| {
+            record.map(|record| TransportLabIntroductionRecord {
+                introduction_id: record.introduction_id,
+                phase: match record.phase {
+                    Phase::Requested => PublicPhase::Requested,
+                    Phase::Accepted => PublicPhase::Accepted,
+                    Phase::Offered => PublicPhase::Offered,
+                    Phase::Answered => PublicPhase::Answered,
+                    Phase::Terminal => PublicPhase::Terminal,
+                },
+                sequences: record.sequences,
+                request_sent: record.request_sent,
+                challenge_present: record.challenge_present,
+                signal_pending: record.signal_pending,
+                forward_pending: record.forward_pending,
+                native_upgraded: record.native_upgraded,
+                native_worker_present: record.native_worker_present,
+                expired: record.expired,
+            })
+        }),
+        truncated: snapshot.truncated,
+    }
+}
+
 /// Install `device_id` as a promoted peer over a live link to `peer_state`.
 ///
 /// The left connector's own native open callback is consumed here, exactly as
@@ -10987,12 +12723,29 @@ impl LinkedPromotedSession {
 /// generic handoff, then commit — and that exact worker and handoff become the
 /// peer's authenticated channel. So the installed peer is the same shape
 /// `insert_promoted_peer` produces, differing only in having a far side.
-#[cfg(feature = "transport-lab")]
+#[cfg(all(test, feature = "transport-lab"))]
 pub(crate) async fn insert_promoted_peer_over_real_link(
     state: &Arc<NetworkState>,
     peer_state: &Arc<NetworkState>,
     device_id: &str,
 ) -> LinkedPromotedPeer {
+    let (linked, ()) =
+        insert_linked_peer_with_capture(state, peer_state, device_id, |_, _, _, _| ()).await;
+    linked
+}
+
+#[cfg(feature = "transport-lab")]
+async fn insert_linked_peer_with_capture<R>(
+    state: &Arc<NetworkState>,
+    peer_state: &Arc<NetworkState>,
+    device_id: &str,
+    capture: impl FnOnce(
+        &Arc<NetworkState>,
+        &peer_registry::PeerOwnerToken,
+        &Arc<crate::transport::WebRtcConnectorWorker>,
+        &str,
+    ) -> R,
+) -> (LinkedPromotedPeer, R) {
     let mut receive_ready =
         crate::endpoint_auth::native_link::connect_before_engine_open_receive_ready(
             state, peer_state,
@@ -11048,10 +12801,15 @@ pub(crate) async fn insert_promoted_peer_over_real_link(
             .is_some(),
         "the exact real-link owner is live before the fixture returns"
     );
-    LinkedPromotedPeer {
-        peer,
-        receive_ready,
-    }
+    assert!(Arc::ptr_eq(owner.connection(), &peer));
+    let captured = capture(state, &owner, &receive_ready.link.left, &mesh_context);
+    (
+        LinkedPromotedPeer {
+            peer,
+            receive_ready,
+        },
+        captured,
+    )
 }
 
 /// Wait until the far connector receives exactly `expected`, or panic.
@@ -11161,6 +12919,719 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn routed_channel_borrowed_count_includes_name_and_complete_message() {
+        for channel in ["x", "quoted\"channel", "\u{1f642}"] {
+            let payload = serde_json::json!({"nested": [null, true, "private"]});
+            let borrowed = BorrowedChannelMessage::Channel {
+                channel,
+                payload: &payload,
+            };
+            let wire = serde_json::to_vec(&MeshMessage::Channel {
+                channel: channel.into(),
+                payload: payload.clone(),
+            })
+            .unwrap();
+            let (_, counted, _) = crate::resource::mailbox_measure_serialized(&borrowed).unwrap();
+            assert_eq!(counted, wire.len());
+            assert_eq!(serde_json::to_vec(&borrowed).unwrap(), wire);
+            assert!(counted > serde_json::to_vec(&payload).unwrap().len());
+            assert!(
+                counted > 1,
+                "a signed one-byte agreement cannot fit a channel message"
+            );
+        }
+    }
+
+    #[test]
+    fn decrypted_endpoint_decoder_refuses_other_families_before_typed_construction() {
+        for kind in [
+            "hub_introduction",
+            "routed_application",
+            "application_flow_control",
+            "rpc_request",
+            "hello",
+        ] {
+            let wire =
+                format!("{{\"kind\":\"{kind}\",\"source\":\"never construct a semantic key\"}}");
+            assert!(serde_json::from_slice::<EndpointChannelMessage>(wire.as_bytes()).is_err());
+        }
+        let wire = br#"{"kind":"channel","channel":"private","payload":{"kind":"hello"}}"#;
+        let EndpointChannelMessage::Channel { channel, payload } =
+            serde_json::from_slice(wire).unwrap();
+        assert_eq!(channel, "private");
+        assert_eq!(
+            payload["kind"], "hello",
+            "application payload stays opaque JSON"
+        );
+        assert!(serde_json::from_slice::<EndpointChannelMessage>(
+            br#"{"kind":"channel","channel":"x","payload":null,"extra":1}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn introduction_endpoint_policy_accepts_local_destination_without_self_connect() {
+        let bootstrap = VerifiedBootstrap::open("intro-endpoint-policy-open").unwrap();
+        let graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        let ids: [DeviceId; 3] = std::array::from_fn(|index| {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[0xc1 + index as u8; 32]);
+            DeviceId::from_public_key_bytes(key.verifying_key().to_bytes()).unwrap()
+        });
+        let admits = |local, source, destination| {
+            introduction_endpoint_policy_admits(
+                &bootstrap,
+                &graph,
+                local,
+                bootstrap.context_id(),
+                source,
+                destination,
+            )
+        };
+        assert!(admits(&ids[1], &ids[0], &ids[1]));
+        assert!(
+            admits(&ids[0], &ids[1], &ids[0]),
+            "reverse messages also terminate locally"
+        );
+        assert!(
+            admits(&ids[2], &ids[0], &ids[1]),
+            "transit evaluates both endpoints"
+        );
+        assert!(
+            !governance::canonical_policy_admits_devices(&bootstrap, &graph, &ids[1], &ids[1],),
+            "the original second self gate refuses; global self-connect stays forbidden"
+        );
+        assert!(!admits(&ids[1], &ids[1], &ids[1]));
+        assert!(!admits(&ids[2], &ids[0], &ids[0]));
+        assert!(
+            !admits(&ids[0], &ids[0], &ids[1]),
+            "inbound source-local loop refuses"
+        );
+        let foreign = VerifiedBootstrap::open("intro-endpoint-policy-foreign").unwrap();
+        assert!(!introduction_endpoint_policy_admits(
+            &bootstrap,
+            &graph,
+            &ids[1],
+            foreign.context_id(),
+            &ids[0],
+            &ids[1],
+        ));
+        let foreign_graph = crate::semantic::FactGraph::from_bootstrap(&foreign);
+        assert!(!introduction_endpoint_policy_admits(
+            &bootstrap,
+            &foreign_graph,
+            &ids[1],
+            bootstrap.context_id(),
+            &ids[0],
+            &ids[1],
+        ));
+    }
+
+    fn admit_introduction_policy_fact(
+        graph: &mut crate::semantic::FactGraph,
+        key: &ed25519_dalek::SigningKey,
+        body: crate::semantic::FactBody,
+    ) -> crate::semantic::FactId {
+        let author = DeviceId::from_public_key_bytes(key.verifying_key().to_bytes()).unwrap();
+        let witness = graph.authoring_witness(&body, &author);
+        let content = crate::semantic::FactContent::from_authoring_witness(
+            graph,
+            body,
+            &witness,
+            std::iter::empty(),
+        );
+        let fact = crate::semantic::SignedFact::sign(content, key).unwrap();
+        let id = fact.id;
+        assert_eq!(graph.admit(fact), Ok(crate::semantic::Admission::Inserted));
+        id
+    }
+
+    #[test]
+    fn introduction_endpoint_policy_preserves_closed_membership_and_stand_down() {
+        use crate::semantic::{AttestationDecision, FactBody};
+        let keys: [ed25519_dalek::SigningKey; 4] = std::array::from_fn(|index| {
+            ed25519_dalek::SigningKey::from_bytes(&[0xd1 + index as u8; 32])
+        });
+        let ids = keys
+            .each_ref()
+            .map(|key| DeviceId::from_public_key_bytes(key.verifying_key().to_bytes()).unwrap());
+        let bootstrap = VerifiedBootstrap::create_closed(
+            "intro-endpoint-policy-closed",
+            vec![keys[0].clone()],
+            [0xd8; 32],
+        )
+        .unwrap();
+        let mut graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        let admits = |graph: &crate::semantic::FactGraph, local, source, destination| {
+            introduction_endpoint_policy_admits(
+                &bootstrap,
+                graph,
+                local,
+                bootstrap.context_id(),
+                source,
+                destination,
+            )
+        };
+        assert!(
+            !admits(&graph, &ids[0], &ids[1], &ids[0]),
+            "remote not admitted"
+        );
+        assert!(
+            !admits(&graph, &ids[1], &ids[0], &ids[1]),
+            "local not admitted"
+        );
+        for target in [&ids[1], &ids[2]] {
+            admit_introduction_policy_fact(
+                &mut graph,
+                &keys[0],
+                FactBody::RoleGrant {
+                    target: target.clone(),
+                    role: crate::semantic::Role::Member,
+                },
+            );
+        }
+        assert!(admits(&graph, &ids[1], &ids[2], &ids[1]));
+        assert!(admits(&graph, &ids[0], &ids[1], &ids[2]));
+        assert!(
+            !admits(&graph, &ids[0], &ids[3], &ids[2]),
+            "transit source membership required"
+        );
+        assert!(
+            !admits(&graph, &ids[0], &ids[1], &ids[3]),
+            "transit destination membership required"
+        );
+        assert!(
+            !admits(&graph, &ids[3], &ids[1], &ids[2]),
+            "transit local membership required"
+        );
+        assert!(
+            !admits(&graph, &ids[3], &ids[1], &ids[3]),
+            "local destination is not a membership bypass"
+        );
+        let proposal = admit_introduction_policy_fact(
+            &mut graph,
+            &keys[0],
+            FactBody::Evict {
+                target: ids[1].clone(),
+            },
+        );
+        let attestation = admit_introduction_policy_fact(
+            &mut graph,
+            &keys[2],
+            FactBody::Attestation {
+                target: ids[1].clone(),
+                proposal,
+                decision: AttestationDecision::Evict,
+                signer: ids[2].clone(),
+                contributions: Vec::new(),
+            },
+        );
+        admit_introduction_policy_fact(
+            &mut graph,
+            &keys[0],
+            FactBody::EvictionProof {
+                target: ids[1].clone(),
+                evidence: vec![attestation],
+            },
+        );
+        assert!(
+            graph.evaluator().is_stood_down(&ids[1]),
+            "real admitted proof supplies stand-down"
+        );
+        assert!(
+            !admits(&graph, &ids[1], &ids[2], &ids[1]),
+            "stood-down local destination refuses"
+        );
+        assert!(
+            !admits(&graph, &ids[2], &ids[1], &ids[2]),
+            "stood-down remote source refuses"
+        );
+        assert!(!admits(&graph, &ids[0], &ids[1], &ids[2]));
+        assert!(!admits(&graph, &ids[0], &ids[2], &ids[1]));
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated native harness"]
+    async fn introduction_local_destination_request_reaches_challenge_after_exact_carrier_gate() {
+        use crate::protocol::{HubIntroductionBody, HubIntroductionEnvelope};
+        use crate::resource::FiniteResourceProvider;
+        use hub_introduction::{HubIntroduction, IntroductionAction};
+        let bound = crate::protocol::hub_introduction::HUB_INTRODUCTION_MAX_WIRE_BYTES;
+        // A single controller root/record in one explicit test child scope,
+        // plus one caller construction/verification lease and the controller's
+        // independently acquired transient verification lease. Frames are
+        // constructed/dropped sequentially; there is no native send or queue.
+        let retained = [
+            HubIntroduction::root_claim().unwrap(),
+            HubIntroduction::entry_claim().unwrap(),
+            crate::protocol::hub_introduction::introduction_work_claim(bound).unwrap(),
+            HubIntroduction::frame_work_claim(bound).unwrap(),
+        ]
+        .into_iter()
+        .try_fold(
+            FiniteResourceProvider::scope_planning_charge(),
+            |sum, raw| {
+                sum.checked_add(FiniteResourceProvider::reservation_planning_charge(raw).unwrap())
+            },
+        )
+        .unwrap();
+        let (state, _signaling, commands, provider, _grant) =
+            build_test_state_parts_metered("intro-endpoint-challenge", None, 2, Some(retained));
+        state.park_command_receiver_for_test(commands);
+        let remote = crate::identity::Identity::ephemeral();
+        let local = DeviceId::from_canonical_str(state.identity.public_id()).unwrap();
+        let scope = state.local_application_resource_scope().unwrap();
+        let controller = parking_lot::Mutex::new(
+            HubIntroduction::new(
+                crate::config::HubIntroductionPolicyConfig {
+                    max_records: 1,
+                    max_waiters_per_target: 1,
+                    max_signaling_bytes: 16_384,
+                    max_candidates_per_attempt: 1,
+                    attempt_timeout_ms: 10_000,
+                    terminal_retention_ms: 1_000,
+                    max_transient_links: 1,
+                    idle_timeout_ms: 1_000,
+                    max_maintenance_per_tick: 1,
+                },
+                scope,
+                state.mesh_context_id(),
+                &local,
+            )
+            .unwrap(),
+        );
+        // The existing fixture installs authenticated native channel state;
+        // it is not a real remote handshake/delivery fixture. Replace one
+        // retired connector so stale and current carriers share the same key.
+        let old_fixture = insert_admitted_peer(&state, remote.public_id()).await;
+        let old_worker = old_fixture.peer.current_worker().unwrap();
+        let old_owner = state
+            .peers
+            .owner(remote.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&old_worker));
+        old_worker.retire();
+        let fixture = insert_admitted_peer(&state, remote.public_id()).await;
+        let worker = fixture.peer.current_worker().unwrap();
+        let unstamped = state.peers.owner(remote.public_id()).unwrap();
+        let carrier = unstamped.for_worker(Arc::clone(&worker));
+        let result = (|| -> Result<()> {
+            let work = state.introduction_work()?;
+            let source = DeviceId::from_canonical_str_uninterned(remote.public_id())
+                .map_err(|_| Error::Network("fixture source invalid".into()))?;
+            // The original second local-to-local gate necessarily refused.
+            if state.peers.routed_origin_policy_admits(&local)
+                || !state.peers.routed_origin_policy_admits(&source)
+                || !state.peers.has_usable_authenticated_current(&carrier)
+            {
+                return Err(Error::Network(
+                    "fixture policy/carrier non-vacuity failed".into(),
+                ));
+            }
+            let baseline = provider.in_use();
+            let foreign = VerifiedBootstrap::open("intro-challenge-foreign").unwrap();
+            for (context, key) in [
+                (foreign.context_id(), remote.signing_key()),
+                (state.mesh_context_id(), state.identity.signing_key()),
+            ] {
+                let sender = DeviceId::from_public_key_bytes(key.verifying_key().to_bytes())
+                    .map_err(|_| Error::Network("fixture sender invalid".into()))?;
+                // The second case is a valid signed inbound source-local loop
+                // to the remote endpoint, not an unsigned malformed frame.
+                let destination = if sender == local {
+                    source.clone()
+                } else {
+                    local.clone()
+                };
+                let frame = HubIntroductionEnvelope::new(
+                    context,
+                    sender,
+                    destination,
+                    [0x71; 16],
+                    0,
+                    None,
+                    4,
+                    HubIntroductionBody::Request,
+                    key,
+                )
+                .map_err(|error| Error::Network(format!("fixture request: {error:?}")))?;
+                if receive_current_hub_introduction(&state, &controller, &carrier, &frame, None)
+                    .is_some()
+                    || provider.in_use() != baseline
+                {
+                    return Err(Error::Network(
+                        "invalid context/loop retained introduction".into(),
+                    ));
+                }
+            }
+            let request = HubIntroductionEnvelope::new(
+                state.mesh_context_id(),
+                source.clone(),
+                local.clone(),
+                [0x72; 16],
+                0,
+                None,
+                4,
+                HubIntroductionBody::Request,
+                remote.signing_key(),
+            )
+            .map_err(|error| Error::Network(format!("fixture request: {error:?}")))?;
+            for refused in [&unstamped, &old_owner] {
+                if receive_current_hub_introduction(&state, &controller, refused, &request, None)
+                    .is_some()
+                    || provider.in_use() != baseline
+                {
+                    return Err(Error::Network(
+                        "invalid/retired carrier retained introduction".into(),
+                    ));
+                }
+            }
+            let Some(IntroductionAction::Accept(ticket)) =
+                receive_current_hub_introduction(&state, &controller, &carrier, &request, None)
+            else {
+                return Err(Error::Network(
+                    "valid destination Request did not reach Accept".into(),
+                ));
+            };
+            let digest = request
+                .request_digest()
+                .map_err(|error| Error::Network(format!("fixture digest: {error:?}")))?;
+            drop(request);
+            let coords = controller
+                .lock()
+                .coordinates(ticket)
+                .ok_or_else(|| Error::Network("accepted introduction missing".into()))?;
+            let challenge = coords
+                .challenge
+                .ok_or_else(|| Error::Network("accepted introduction lacks challenge".into()))?;
+            if challenge.request_hash != digest || challenge.responder_challenge == [0; 32] {
+                return Err(Error::Network(
+                    "accepted challenge not bound to Request".into(),
+                ));
+            }
+            let accept = HubIntroductionEnvelope::new(
+                state.mesh_context_id(),
+                local.clone(),
+                source,
+                coords.introduction_id,
+                0,
+                Some(challenge),
+                4,
+                HubIntroductionBody::Accept,
+                state.identity.signing_key(),
+            )
+            .map_err(|error| Error::Network(format!("fixture Accept: {error:?}")))?;
+            controller
+                .lock()
+                .observe_outbound(ticket, None, &accept, std::time::Instant::now())
+                .map_err(|error| Error::Network(format!("fixture observed Accept: {error:?}")))?;
+            accept
+                .verify_for_previous_hop(&local, state.mesh_context_id())
+                .map_err(|error| {
+                    Error::Network(format!("fixture Accept verification: {error:?}"))
+                })?;
+            drop(accept);
+            drop(work);
+            Ok(())
+        })();
+        drop(controller);
+        state.shutdown().await;
+        let old_closed = old_worker.retire_and_close().await;
+        let closed = worker.retire_and_close().await;
+        drop(old_fixture);
+        drop(fixture);
+        old_closed.expect("original retired fixture reaches native terminal");
+        closed.expect("current fixture reaches native terminal");
+        result.expect("actual policy/controller admission yields a bound responder challenge");
+    }
+
+    #[tokio::test]
+    async fn routed_channel_without_enabled_ready_epoch_never_queues_plaintext() {
+        let (state, mut commands) = build_test_state_parts("cipher-disabled-no-plaintext");
+        while commands.try_recv().is_some() {}
+        let destination = crate::identity::Identity::ephemeral();
+        let (reply, _receive) = tokio::sync::oneshot::channel();
+        let mut reply = Some(reply);
+        let result = queue_routed_channel_frame(
+            &state,
+            destination.public_id(),
+            "private",
+            serde_json::json!({"body": "must not route in plaintext"}),
+            &mut reply,
+        );
+        assert!(result.is_err());
+        assert!(reply.is_some(), "no terminal writer was admitted");
+        assert!(
+            commands.try_recv().is_none(),
+            "refusal queues neither legacy plaintext nor a keyless ciphertext"
+        );
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated native harness"]
+    async fn endpoint_routed_builder_default_policy_accepts_control_and_ciphertext_shapes() {
+        use crate::resource::{FiniteResourceProvider, ResourceClass};
+
+        // Exercise the actual builder and funded candidate capture with the
+        // existing locally promoted connector fixture. These are wire-shape
+        // controls, not proof of key confirmation or native delivery; the
+        // public encrypted-channel fixture remains the acceptance gate.
+        let config = crate::config::RoutingPolicyConfig::default()
+            .checked()
+            .expect("default routing fixture policy is valid");
+        let candidate_count = 1;
+        let next_hops = usize::try_from(config.max_next_hops).unwrap();
+        let parallel_routes = usize::try_from(config.max_parallel_routes).unwrap();
+        let wire_bound = crate::protocol::RECEIVE_FRAME_BYTES;
+        let wire_claim = crate::protocol::topology::routed_work_claim(wire_bound).unwrap();
+        let selection_claim =
+            funded_route_input_work_claim(candidate_count, next_hops, parallel_routes).unwrap();
+        let decode_claim =
+            crate::application_gateway::AdmittedApplicationFrame::claim(wire_bound).unwrap();
+        // One lease of each kind, all three live at the decode/verify peak:
+        // W owns the routed wire work, S moves into the resulting frame, and
+        // D owns the second decoded representation until its envelope drops.
+        // Each actual reservation gets its own provider bookkeeping charge.
+        let wire_charge = FiniteResourceProvider::reservation_planning_charge(wire_claim).unwrap();
+        let selection_charge =
+            FiniteResourceProvider::reservation_planning_charge(selection_claim).unwrap();
+        let decode_charge =
+            FiniteResourceProvider::reservation_planning_charge(decode_claim).unwrap();
+        // Only replay records persist between the two successive outputs.
+        // E already charges both map-node reservations, so do not charge it
+        // again. This is two route IDs, not two simultaneous W/S/D lifetimes.
+        let replay_charge = routing::replay_entry_reservation_charge_for_test()
+            .checked_scale(2)
+            .unwrap();
+        let retained = wire_charge
+            .checked_add(selection_charge)
+            .and_then(|claim| claim.checked_add(decode_charge))
+            .and_then(|claim| claim.checked_add(replay_charge))
+            .unwrap();
+        let (state, _signaling, commands, _provider, grant) = build_test_state_parts_metered(
+            "endpoint-builder-default-policy",
+            None,
+            2,
+            Some(retained),
+        );
+        // The fixture adds this exact planning term. Preserve the original
+        // refused-base discriminator without constructing a second connector
+        // or deriving a grant from the observed numerical deficit.
+        let baseline_grant = grant.checked_sub(retained).unwrap();
+        assert!(
+            wire_charge.amount(ResourceClass::ParsingOrCpuWork)
+                > baseline_grant.amount(ResourceClass::ParsingOrCpuWork),
+            "the unchanged ordinary-frame fixture alone cannot fund routed work"
+        );
+        state.park_command_receiver_for_test(commands);
+        let remote = crate::identity::Identity::ephemeral();
+        let peer = DeviceId::from_canonical_str(remote.public_id()).unwrap();
+        let local = DeviceId::from_canonical_str(state.identity.public_id()).unwrap();
+        // Configure the fixture's paired sparse selector before installing
+        // its peer. Keep its default routing cap and fixture base unchanged;
+        // only the named simultaneous workload above supplies extra capacity.
+        let topology = crate::config::TopologyMode::Star {
+            hub: remote.public_id().to_owned(),
+        };
+        *state.topology_impl.write() = crate::topology::from_mode(&topology);
+        state.config.write().topology = topology;
+        assert_eq!(state.routing.policy().max_envelope_bytes(), 65_535);
+        assert_eq!(state.routing.policy().max_hop_budget(), 4);
+        assert_eq!(state.topology_impl.read().flood_ttl(), 3);
+        assert_eq!(
+            state.routing.policy().max_envelope_bytes(),
+            config.max_envelope_bytes
+        );
+        assert_eq!(state.routing.policy().max_next_hops(), next_hops);
+        assert_eq!(
+            state.routing.policy().max_parallel_routes(),
+            parallel_routes
+        );
+        assert_eq!(
+            u64::from(state.routing.policy().max_hop_budget()),
+            config.max_hop_budget
+        );
+        assert_eq!(
+            state.routing.policy().protocol_limits().max_payload_bytes,
+            40_000
+        );
+        let fixture = insert_admitted_peer(&state, remote.public_id()).await;
+        let worker = fixture.peer.current_worker().unwrap();
+
+        // Return fallible preparation/verification before asserting so the
+        // original cap-conflation failure still closes the native fixture.
+        let result = (|| -> Result<()> {
+            for is_control in [true, false] {
+                if state.peers.len() != candidate_count {
+                    return Err(Error::Network("fixture candidate count changed".into()));
+                }
+                let work = state.acquire_application_work(wire_claim)?;
+                let mut payload = crate::protocol::topology::ciphertext_payload_for_test(
+                    state.mesh_context_id(),
+                    &local,
+                    &peer,
+                    32,
+                );
+                if let (true, ClosedRoutedPayload::EndpointCiphertext { packet }) =
+                    (is_control, &payload)
+                {
+                    payload = ClosedRoutedPayload::EndpointControl {
+                        control: crate::protocol::topology::EndpointCipherControl::Confirmation(
+                            crate::protocol::endpoint_cipher::KeyConfirmation {
+                                binding: packet.binding.clone(),
+                                sender: packet.sender,
+                                transcript_hash: [0x39; 32],
+                                tag: [0x47; 16],
+                            },
+                        ),
+                    };
+                }
+                let selection = capture_funded_route_input(&state)?;
+                if selection.connected.as_ref().map(Vec::len) != Some(candidate_count)
+                    || selection._work.claim() != selection_claim
+                {
+                    return Err(Error::Network("fixture route-input claim mismatch".into()));
+                }
+                let frame = {
+                    let graph = state.fact_graph.read();
+                    if !governance::canonical_policy_admits_devices(
+                        state.verified_bootstrap(),
+                        &graph,
+                        &local,
+                        &peer,
+                    ) {
+                        return Err(Error::Network("fixture endpoint policy refused".into()));
+                    }
+                    prepare_endpoint_routed_frame(&state, &peer, payload, selection)?
+                };
+                if frame.bytes.len() > wire_bound {
+                    return Err(Error::Network(
+                        "builder exceeded planned decode bound".into(),
+                    ));
+                }
+                let decoded_work = state.acquire_application_work(
+                    crate::application_gateway::AdmittedApplicationFrame::claim(frame.bytes.len())
+                        .map_err(|error| {
+                            Error::Network(format!("builder decode claim: {error:?}"))
+                        })?,
+                )?;
+                let MeshMessage::RoutedApplication(envelope) =
+                    serde_json::from_slice::<MeshMessage>(&frame.bytes)
+                        .map_err(|error| Error::Network(format!("builder decode: {error}")))?
+                else {
+                    return Err(Error::Network("builder emitted a non-routed frame".into()));
+                };
+                envelope
+                    .verify_for_previous_hop_with_limits(
+                        &local,
+                        state.mesh_context_id(),
+                        state.routing.policy().protocol_limits(),
+                    )
+                    .map_err(|error| Error::Network(format!("builder verify: {error:?}")))?;
+                let expected_class = if is_control {
+                    traffic::FrameClass::Control
+                } else {
+                    traffic::FrameClass::App
+                };
+                if frame.class != expected_class
+                    || frame.plan.next_hops().len() != 1
+                    || frame.plan.next_hops()[0].as_str() != remote.public_id()
+                    || frame.plan.outgoing_ttl() != 2
+                    || envelope.initial_hop_budget() != 3
+                    || envelope.remaining_ttl() != 2
+                    || envelope.hops().len() != 1
+                    || envelope.hops()[0].previous_remaining_ttl != 3
+                    || envelope.hops()[0].remaining_ttl != 2
+                    || envelope.destination() != &peer
+                    || envelope.complete_encoded_len() != Some(frame.bytes.len())
+                    || frame.bytes.len() > 65_535
+                    || matches!(
+                        envelope.payload(),
+                        ClosedRoutedPayload::EndpointControl { .. }
+                    ) != is_control
+                {
+                    return Err(Error::Network("builder output contract mismatch".into()));
+                }
+                drop(envelope);
+                drop(decoded_work);
+                drop(frame);
+                drop(work);
+            }
+            Ok(())
+        })();
+        state.shutdown().await;
+        let closed = worker.retire_and_close().await;
+        drop(fixture);
+        closed.expect("the builder fixture's original worker reaches native terminal");
+        result.expect("default complete-wire policy admits both actual routed builder branches");
+    }
+
+    #[test]
+    fn endpoint_origin_hop_budget_uses_both_ceilings_and_refuses_zero() {
+        assert_eq!(endpoint_origin_hop_budget(4, 3), Some(3));
+        assert_eq!(endpoint_origin_hop_budget(2, 3), Some(2));
+        assert_eq!(endpoint_origin_hop_budget(4, 4), Some(4));
+        assert_eq!(endpoint_origin_hop_budget(1, 3), Some(1));
+        assert_eq!(endpoint_origin_hop_budget(4, 0), None);
+        assert_eq!(endpoint_origin_hop_budget(0, 3), None);
+    }
+
+    #[test]
+    fn endpoint_star_received_ttl_is_refused_not_clamped_even_for_direct_destination() {
+        let config = crate::config::RoutingPolicyConfig::default()
+            .checked()
+            .unwrap();
+        let policy = routing::RoutingPolicy::checked(
+            usize::try_from(config.max_next_hops).unwrap(),
+            usize::try_from(config.max_parallel_routes).unwrap(),
+            config.max_envelope_bytes,
+            usize::try_from(config.max_dedup_entries).unwrap(),
+            config.max_dedup_bytes,
+            u8::try_from(config.max_hop_budget).unwrap(),
+        )
+        .unwrap();
+        let topology =
+            crate::topology::from_mode(&crate::config::TopologyMode::Star { hub: "hub".into() });
+        assert_eq!(policy.max_hop_budget(), 4);
+        assert_eq!(topology.flood_ttl(), 3);
+        // This is the existing received-frame planner, not the local-origin
+        // helper. Both direct and transit cases must reject the incoming TTL
+        // before choosing a next hop; string labels convey no session authority.
+        let connected = vec!["spoke-a".to_owned(), "spoke-b".to_owned()];
+        for destination in ["spoke-b", "unconnected"] {
+            assert!(matches!(
+                routing::plan_next_hops(
+                    topology.as_ref(),
+                    "hub",
+                    destination,
+                    &connected,
+                    4,
+                    policy,
+                ),
+                Err(routing::RouteRefusal::TtlExceedsPolicy)
+            ));
+            assert!(matches!(
+                routing::plan_next_hops(
+                    topology.as_ref(),
+                    "hub",
+                    destination,
+                    &connected,
+                    0,
+                    policy,
+                ),
+                Err(routing::RouteRefusal::Envelope(
+                    crate::protocol::topology::RoutedApplicationError::HopBudgetExhausted
+                ))
+            ));
+        }
+        let at_limit =
+            routing::plan_next_hops(topology.as_ref(), "hub", "spoke-b", &connected, 3, policy)
+                .expect("unchanged received TTL at the topology ceiling is valid");
+        assert_eq!(at_limit.outgoing_ttl(), 2);
+        assert_eq!(at_limit.next_hops(), &["spoke-b"]);
+    }
+
+    #[test]
     fn routed_channel_is_application_admission() {
         let origin_key = ed25519_dalek::SigningKey::from_bytes(&[0x31; 32]);
         let destination_key = ed25519_dalek::SigningKey::from_bytes(&[0x32; 32]);
@@ -11169,16 +13640,22 @@ mod tests {
         let destination =
             DeviceId::from_public_key_bytes(*destination_key.verifying_key().as_bytes())
                 .expect("destination key produces a canonical device id");
+        let context = crate::semantic::MeshContextId::from_bytes([0x42; 32]);
+        // This classification control proves signed ciphertext wire admission,
+        // not encryption or endpoint key confirmation.
+        let payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &origin,
+            &destination,
+            32,
+        );
         let envelope = RoutedApplicationEnvelope::new(
-            crate::semantic::MeshContextId::from_bytes([0x42; 32]),
+            context,
             origin,
             destination,
             [0x43; 16],
             2,
-            ClosedRoutedPayload::ChannelFrame {
-                channel: "control".to_owned(),
-                payload: serde_json::json!({"value": "opaque"}),
-            },
+            payload,
             &origin_key,
         )
         .expect("the signed routed channel envelope is valid");
@@ -16111,6 +18588,1087 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated native harness"]
+    async fn introduction_vacant_install_preserves_a_real_promoted_owner() {
+        let state = build_test_state("introduction-vacant-promoted");
+        let fixture = insert_admitted_peer(&state, "peer").await;
+        let owner = state.peers.owner("peer").expect("fixture installation");
+        let promoted_before = fixture.peer.holds_promoted_session();
+        let current_refused = state
+            .peers
+            .install_unpromoted_if_absent(Arc::clone(&fixture.peer))
+            .is_none();
+        let new_refused = state
+            .peers
+            .install_unpromoted_if_absent(Arc::new(PeerConnection::new("peer".into(), None)))
+            .is_none();
+        // Also refuse a worker/promoted candidate in a vacant registry. The
+        // candidate retains its real fixture owner; this never promotes it.
+        let vacant = peer_registry::PeerRegistry::new("other".into());
+        let vacant_refused = vacant
+            .install_unpromoted_if_absent(Arc::clone(&fixture.peer))
+            .is_none();
+        let owner_unchanged = state
+            .peers
+            .owner("peer")
+            .is_some_and(|after| after.same_exact_owner(&owner));
+        let still_promoted = fixture.peer.holds_promoted_session();
+        state.shutdown().await;
+        drop(fixture);
+        assert!(
+            promoted_before,
+            "the negative starts with a promoted session"
+        );
+        assert!(current_refused && new_refused && vacant_refused);
+        assert!(
+            owner_unchanged && still_promoted,
+            "refusal does not displace or revoke the admitted owner"
+        );
+        assert!(!vacant.contains_key("peer"));
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated native harness"]
+    async fn demand_removal_requires_exact_stamped_worker_and_eligibility() {
+        let state = build_test_state("demand-exact-retirement");
+        let fixture = insert_admitted_peer(&state, "peer").await;
+        let installation = state.peers.owner("peer").expect("original installation");
+        let original_worker = fixture.peer.current_worker().expect("fixture worker");
+        let original = installation.for_worker(Arc::clone(&original_worker));
+        let called = std::cell::Cell::new(false);
+        let unstamped_refused = state
+            .peers
+            .remove_demand_owner_if(&installation, |_| {
+                called.set(true);
+                true
+            })
+            .is_none()
+            && !called.get();
+        let ineligible_refused = state
+            .peers
+            .remove_demand_owner_if(&original, |_| false)
+            .is_none();
+        let still_original = state.peers.get_if_current(&original).is_some();
+
+        let (replacement, replacement_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("existing fixture grant admits the replacement worker");
+        let replacement = Arc::new(replacement);
+        fixture.peer.revoke_promoted_session();
+        fixture
+            .peer
+            .replace_connector_for_session_control(Arc::clone(&replacement));
+        let successor = installation.for_worker(Arc::clone(&replacement));
+        called.set(false);
+        let old_worker_refused = state
+            .peers
+            .remove_demand_owner_if(&original, |_| {
+                called.set(true);
+                true
+            })
+            .is_none()
+            && !called.get();
+        let replacement_preserved = state.peers.get_if_current(&successor).is_some();
+        let removed = state.peers.remove_demand_owner_if(&successor, |_| true);
+        let removed_exact = removed
+            .as_ref()
+            .is_some_and(|peer| Arc::ptr_eq(peer, &fixture.peer));
+        // The primitive returns close custody, never awaits under the registry
+        // lock. This is a removal-fence control, not an idle-policy assertion.
+        if let Some(peer) = removed {
+            peer.retire_and_close().await.expect("removed owner closes");
+        }
+        original_worker
+            .retire_and_close()
+            .await
+            .expect("original worker closes");
+        replacement
+            .retire_and_close()
+            .await
+            .expect("replacement worker closes");
+        drop(replacement_events);
+        state.shutdown().await;
+        drop(fixture);
+        assert!(unstamped_refused && ineligible_refused && still_original);
+        assert!(old_worker_refused && replacement_preserved && removed_exact);
+        assert!(state.peers.owner("peer").is_none());
+    }
+
+    #[tokio::test]
+    async fn unstarted_introduction_cancel_releases_exact_placeholder_funding() {
+        let (state, signaling, commands, provider, _grant) = build_test_state_parts_metered(
+            "intro-cancel-funding",
+            None,
+            FIXTURE_CONNECTOR_SLOTS,
+            None,
+        );
+        state.park_command_receiver_for_test(commands);
+        let baseline = provider.in_use();
+        let (weak, charged, detached_exact) = {
+            let backing = state
+                .reserve_introduction_placeholder("pending")
+                .expect("existing grant funds placeholder");
+            let peer = Arc::new(PeerConnection::new_introduction(
+                "pending".into(),
+                hex::encode([17u8; 16]),
+                backing,
+            ));
+            let weak = Arc::downgrade(&peer);
+            let owner = state
+                .peers
+                .install_unpromoted_if_absent(Arc::clone(&peer))
+                .unwrap();
+            let charged = provider.in_use() != baseline;
+            let removed = state
+                .peers
+                .remove_unstarted_introduction_if(&owner, |peer| {
+                    peer.unstarted_introduction_matches(&[17; 16])
+                });
+            let exact = removed
+                .as_ref()
+                .is_some_and(|removed| Arc::ptr_eq(removed, &peer));
+            if let Some(removed) = removed {
+                removed
+                    .retire_and_close()
+                    .await
+                    .expect("vacant original closes");
+            }
+            (weak, charged, exact)
+        };
+        let released = weak.upgrade().is_none() && provider.in_use() == baseline;
+        let absent = !state.peers.contains_key("pending");
+        state.shutdown().await;
+        drop(signaling);
+        assert!(charged && detached_exact && absent);
+        assert!(
+            released,
+            "no placeholder or backing remains after its last exact owner drops"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated native harness"]
+    async fn unstarted_cleanup_preserves_intervening_worker_and_real_promotion() {
+        let state = build_test_state("intro-unstarted-worker-fence");
+        let backing = state.reserve_introduction_placeholder("pending").unwrap();
+        let pending = Arc::new(PeerConnection::new_introduction(
+            "pending".into(),
+            hex::encode([18u8; 16]),
+            backing,
+        ));
+        let owner = state
+            .peers
+            .install_unpromoted_if_absent(Arc::clone(&pending))
+            .unwrap();
+        let (worker, events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("existing fixture grant funds attached worker");
+        let worker = Arc::new(worker);
+        let attached = state.peers.with_current(&owner, |peer| {
+            peer.attach_introduction_worker(Arc::clone(&worker), None)
+        }) == Some(true);
+        let called = std::cell::Cell::new(false);
+        let refused = state
+            .peers
+            .remove_unstarted_introduction_if(&owner, |_| {
+                called.set(true);
+                true
+            })
+            .is_none()
+            && !called.get();
+        let original_preserved = state.peers.get_if_current(&owner).is_some()
+            && pending
+                .current_worker()
+                .is_some_and(|current| Arc::ptr_eq(&current, &worker));
+        let negotiation = state.peers.begin_unpromoted_negotiation(&owner);
+        let negotiating_refused = negotiation.is_some()
+            && state
+                .peers
+                .remove_unstarted_introduction_if(&owner, |_| true)
+                .is_none();
+        drop(negotiation);
+        let promoted = insert_admitted_peer(&state, "promoted").await;
+        let promoted_owner = state.peers.owner("promoted").unwrap();
+        let was_promoted = promoted.peer.holds_promoted_session();
+        let promoted_refused = state
+            .peers
+            .remove_unstarted_introduction_if(&promoted_owner, |_| true)
+            .is_none();
+        let remains_promoted = promoted.peer.holds_promoted_session();
+        state.shutdown().await;
+        worker
+            .retire_and_close()
+            .await
+            .expect("captured worker closes");
+        drop(events);
+        drop(promoted);
+        assert!(attached && refused && original_preserved && negotiating_refused);
+        assert!(was_promoted && promoted_refused && remains_promoted);
+    }
+
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated native harness"]
+    async fn opaque_control_exact_channel_admission_rejects_foreign_and_retired_workers() {
+        // Existing authenticated-channel fixture, explicitly promoted by
+        // insert_admitted_peer. This tests admission, not a native handshake
+        // or a claim that an unlinked data channel can deliver bytes.
+        let (state, _signaling, command_rx, provider, _grant) =
+            build_test_state_parts_metered("opaque-exact-channel", None, 2, None);
+        state.park_command_receiver_for_test(command_rx);
+        let first = insert_admitted_peer(&state, "first").await;
+        let other = insert_admitted_peer(&state, "other").await;
+        let owner = state.peers.owner("first").unwrap();
+        let original = first.peer.current_worker().unwrap();
+        let foreign = other.peer.current_worker().unwrap();
+        let admitted = admit_inbound_for_test(&state, &owner, shelve_frame()).unwrap();
+        let (_, _, work, dispatch) = admitted.into_dispatch();
+        let baseline = provider.in_use();
+        let original_accepted = state
+            .peers
+            .admit_exact_channel_application_operation(
+                dispatch.exact_channel_operation(Arc::clone(&original)),
+            )
+            .is_some();
+        let foreign_refused = state
+            .peers
+            .admit_exact_channel_application_operation(
+                dispatch.exact_channel_operation(Arc::clone(&foreign)),
+            )
+            .is_none();
+        let admission_did_not_allocate = provider.in_use() == baseline;
+        let retired = state
+            .peers
+            .retire_exact_session(dispatch.logical_reply_operation());
+        let retired_refused = state
+            .peers
+            .admit_exact_channel_application_operation(
+                dispatch.exact_channel_operation(Arc::clone(&original)),
+            )
+            .is_none();
+        let other_preserved = other.peer.holds_promoted_session();
+        drop(work);
+        drop(dispatch);
+        state.shutdown().await;
+        drop(first);
+        drop(other);
+        assert!(original_accepted && foreign_refused && admission_did_not_allocate);
+        assert!(retired && retired_refused && other_preserved);
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    async fn introduction_public_snapshot_preserves_fixed_scalar_mapping() {
+        use crate::TransportLabIntroductionPhase as Public;
+        use hub_introduction::{
+            IntroductionPhaseForLab as Phase, IntroductionRecordForLab, IntroductionSnapshotForLab,
+        };
+        let mut raw = IntroductionSnapshotForLab {
+            records: [None; 16],
+            truncated: true,
+        };
+        for (index, phase) in [
+            Phase::Requested,
+            Phase::Accepted,
+            Phase::Offered,
+            Phase::Answered,
+            Phase::Terminal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            raw.records[index] = Some(IntroductionRecordForLab {
+                introduction_id: [index as u8; 16],
+                phase,
+                sequences: [None, Some(u64::MAX - index as u64)],
+                request_sent: index % 2 == 0,
+                challenge_present: index != 0,
+                signal_pending: [true, false],
+                forward_pending: [false, true],
+                native_upgraded: index == 3,
+                native_worker_present: index == 3,
+                expired: index == 4,
+            });
+        }
+        let public = public_introduction_snapshot(raw);
+        assert!(public.truncated);
+        for (index, phase) in [
+            Public::Requested,
+            Public::Accepted,
+            Public::Offered,
+            Public::Answered,
+            Public::Terminal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = public.records[index].unwrap();
+            let original = raw.records[index].unwrap();
+            assert_eq!(record.phase, phase);
+            assert_eq!(record.introduction_id, original.introduction_id);
+            assert_eq!(record.sequences, original.sequences);
+            assert_eq!(record.request_sent, original.request_sent);
+            assert_eq!(record.challenge_present, original.challenge_present);
+            assert_eq!(record.signal_pending, original.signal_pending);
+            assert_eq!(record.forward_pending, original.forward_pending);
+            assert_eq!(record.native_upgraded, original.native_upgraded);
+            assert_eq!(record.native_worker_present, original.native_worker_present);
+            assert_eq!(record.expired, original.expired);
+        }
+        assert!(public.records[5..].iter().all(Option::is_none));
+        let empty = public_introduction_snapshot(IntroductionSnapshotForLab {
+            records: [None; 16],
+            truncated: false,
+        });
+        assert_eq!(empty.records, [None; 16]);
+        assert!(!empty.truncated);
+        let state = build_test_state("intro-public-snapshot-disabled");
+        assert!(introduction_snapshot_for_lab(&state, [1; 32], [2; 32]).is_none());
+        state.shutdown().await;
+    }
+
+    // Teardown-only setup: directly commits one provider flow record, not an
+    // Open/Accept or remote-delivery oracle. Its actual owned idle pump is the
+    // native-close dependency this control must discriminate.
+    #[cfg(feature = "transport-lab")]
+    fn install_lab_idle_opaque_pump(
+        state: &Arc<NetworkState>,
+        channel: &peer_registry::ExactChannelOperation,
+        label: u8,
+    ) -> crate::realtime::RealtimeFlowHandle {
+        let owner = channel.owner().for_worker(Arc::clone(channel.worker()));
+        let (handle, pump, completion) = state
+            .peers
+            .with_live_session_flow(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+                |session, flows, live| {
+                    let name = flows
+                        .open_opaque(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::OpaqueFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                opener_direction: crate::realtime::RealtimeFlowDirection::Outbound,
+                                mode: crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                                max_unit_bytes: 8,
+                                name: realtime_test_name(label),
+                            },
+                        )
+                        .expect("existing realtime fixture funds one opaque flow");
+                    let identity = flows.flow_identity(&name).unwrap();
+                    let (pump, completion) = flows
+                        .attach_opaque_pump(session, Some(live), &name)
+                        .expect("existing provider tail funds the actual idle pump");
+                    let handle = crate::realtime::RealtimeFlowHandle::new(
+                        owner.clone(),
+                        flows.identity(),
+                        identity,
+                        name,
+                        Arc::downgrade(state),
+                    );
+                    (handle, pump, completion)
+                },
+            )
+            .expect("the captured exact channel owns its flow set");
+        channel
+            .worker()
+            .spawn_opaque_outbound_pump(pump, completion);
+        handle
+    }
+
+    // BEGIN retirable missing-close-entry controls
+    // This is the exact removed-channel/shared-finish boundary, not a claim
+    // that the control intercepts the whole registry's removal operation.
+    #[cfg(feature = "transport-lab")]
+    async fn retirable_lab_withdrawn_scope_control(native_failure: bool) {
+        let (near, mut signals, mut commands, provider, _) = build_test_state_parts_metered(
+            "retirable-withdrawn-scope-near",
+            Some(realtime_test_profile()),
+            FIXTURE_CONNECTOR_SLOTS,
+            None,
+        );
+        // Keep the real receiver undriven through native and event cleanup.
+        // Shutdown closes admission, but does not discard accepted commands.
+        let far = build_test_state_with_realtime_flows("retirable-withdrawn-scope-far");
+        let runtime = signaling_ingress::SignalingRuntime::new(
+            near.signaling_inbound_tx.clone(),
+            near.local_application_resource_scope()
+                .expect("existing fixture scope"),
+        );
+        near.publish_signaling_runtime(&runtime);
+        let carrier =
+            signaling_ingress::SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        let link = install_retirable_session_over_real_link(&near, &far).await;
+        let near_owner = link.near_channel.owner().clone();
+        let far_owner = link.far_channel.owner().clone();
+        let worker = Arc::clone(link.near_channel.worker());
+        let far_worker = Arc::clone(link.far_channel.worker());
+        let attempt = near_owner.connection().attempt();
+        let mut weak_tokens = [None, None];
+        for (index, weak) in weak_tokens.iter_mut().enumerate() {
+            let candidate = myownmesh_signaling::SignalingMessage::Candidate {
+                peer_id: near_owner.device_id().to_string(),
+                offer_id: attempt.clone(),
+                candidate: format!(
+                    "candidate:withdrawn{index} 1 udp 2113937151 192.0.2.1 5000 typ host"
+                ),
+                sdp_mid: Some("0".to_string()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            };
+            assert!(
+                carrier.deliver(carrier.directed(near_owner.device_id().to_string(), candidate))
+            );
+            let delivery = signals
+                .recv()
+                .await
+                .expect("real carrier ingress is admitted");
+            let token = delivery
+                .value()
+                .dedup_token()
+                .expect("Candidate owns a real ingress token");
+            *weak = Some(token.weak());
+            assert!(near
+                .peers
+                .retain_dedup_for_worker(&near_owner, &attempt, &worker, token));
+            // This control tests custody transfer, not native Candidate parsing.
+            // Drop the delivery's copy; only the actual channel retains tokens.
+            drop(delivery);
+        }
+        assert!(runtime.remembers_attempt_for_test(&attempt));
+        let old_flow = near
+            .peers
+            .with_live_session_flow(
+                &near_owner,
+                near.session_broker.as_ref(),
+                &near.mesh_context_id().to_string(),
+                |session, flows, live| {
+                    let name = flows
+                        .open_opaque(
+                            session,
+                            Some(live),
+                            crate::transport::webrtc::OpaqueFlowSpec {
+                                direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                                opener_direction: crate::realtime::RealtimeFlowDirection::Outbound,
+                                mode: crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                                max_unit_bytes: 8,
+                                name: realtime_test_name(93),
+                            },
+                        )
+                        .expect("existing fixture funds one dormant flow");
+                    crate::realtime::RealtimeFlowHandle::new(
+                        near_owner.clone(),
+                        flows.identity(),
+                        flows.flow_identity(&name).unwrap(),
+                        name,
+                        Arc::downgrade(&near),
+                    )
+                },
+            )
+            .expect("original channel is current");
+        // The dormant flow contributes a stale-handle oracle. Removing its
+        // real session drops the handoff and withdraws work scope before the
+        // close-entry acquisition; this is NOT a finite-memory-pressure test.
+        let near_permit = near
+            .try_admit_shutdown_mutation()
+            .expect("near mutation permit");
+        let far_permit = far
+            .try_admit_shutdown_mutation()
+            .expect("far mutation permit");
+        let gate = worker.install_native_close_gate_for_test();
+        if native_failure {
+            gate.inject_close_failure();
+        }
+        let removed = near_owner
+            .connection()
+            .retire_authenticated_worker(&worker)
+            .expect("remove the original live channel through the shared production body");
+        let scope_probe = near_owner
+            .connection()
+            .reserve_closing_entry_for_test(&worker);
+        let closing_entry_count = near_owner.connection().retired_worker_count_for_test();
+        let LinkedRetirableSession {
+            linked,
+            near_channel,
+            far_channel,
+            near_state: linked_near_state,
+            far_state: linked_far_state,
+        } = link;
+        let far_terminal = far.peers.remove_current_channel_for_terminal(far_channel);
+        let stale_repeat = matches!(
+            near.peers.remove_current_channel_for_terminal(near_channel),
+            peer_registry::ChannelTerminal::Stale,
+        );
+        let (outcomes, reached, gated_custody, old_stale, was_pending) = {
+            let finish = finish_lab_channel_terminals(
+                linked,
+                &near_owner,
+                peer_registry::ChannelTerminal::Channel { channel: removed },
+                &far_owner,
+                far_terminal,
+            );
+            tokio::pin!(finish);
+            // Poll the SAME adapter finish before observing the gate. Moving its
+            // custody transfer back before await would release the tokens here.
+            let early = match futures::poll!(&mut finish) {
+                std::task::Poll::Ready(outcomes) => Some(outcomes),
+                std::task::Poll::Pending => None,
+            };
+            let reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+                .await
+                .is_ok();
+            let gated_custody = weak_tokens
+                .iter()
+                .all(|weak| weak.as_ref().unwrap().strong_count() == 1)
+                && runtime.remembers_attempt_for_test(&attempt);
+            let old_stale = near.send_opaque(&old_flow, Bytes::from_static(b"late"))
+                == Err(crate::realtime::RealtimeRefusal::SessionNotCurrent);
+            let was_pending = early.is_none();
+            gate.open();
+            let outcomes = match early {
+                Some(outcomes) => outcomes,
+                None => finish.as_mut().await,
+            };
+            (outcomes, reached, gated_custody, old_stale, was_pending)
+        };
+        let released = weak_tokens
+            .iter()
+            .all(|weak| weak.as_ref().unwrap().strong_count() == 0)
+            && !runtime.remembers_attempt_for_test(&attempt);
+        let native_once = gate.entries() == 1;
+        // Even assertion failures below cannot leave a gate or original task
+        // unjoined. No re-admission, retry-as-new, or successor lookup occurs.
+        drop((near_permit, far_permit));
+        let scope_refusal = scope_probe.err();
+        let original_close = worker.retire_and_close().await;
+        let far_close = far_worker.retire_and_close().await;
+        drop((
+            old_flow,
+            far_owner,
+            worker,
+            far_worker,
+            gate,
+            weak_tokens,
+            carrier,
+            runtime,
+        ));
+        near.shutdown().await;
+        far.shutdown().await;
+        // Promotion queued one real ReplayCapabilities owner, backed by the
+        // mailbox's separate retained-value and queue-node reservations. Read
+        // that exact owner only after all original work has terminated.
+        let queued_use = provider.in_use();
+        let queued_reservations = provider.active_reservations();
+        let replay = commands.try_recv();
+        let replay_charge = replay.as_ref().map(|delivery| {
+            crate::resource::ResourceMailboxSender::<NetworkCmd>::accepted_item_charge_for_test(
+                delivery.value(),
+            )
+        });
+        let exact_replay = replay.as_ref().is_some_and(|delivery| {
+            matches!(delivery.value(), NetworkCmd::ReplayCapabilities { owner }
+                if owner.same_exact_owner(&near_owner)
+                    && Arc::ptr_eq(owner.connection(), near_owner.connection()))
+        });
+        drop(replay);
+        let replay_released_claim = queued_use.checked_sub(provider.in_use());
+        let replay_released_reservations =
+            queued_reservations.checked_sub(provider.active_reservations());
+        let unexpected_command = commands.try_recv();
+        let only_replay = unexpected_command.is_none();
+        drop((unexpected_command, commands, near_owner, signals));
+        // End every fixture root as well as the semantic storage owner joined
+        // by shutdown. No pre-shutdown baseline survives as a resource oracle.
+        drop((linked_near_state, linked_far_state, near, far));
+        assert!(
+            matches!(
+                scope_refusal,
+                Some(crate::resource::ResourceUnavailable::ProviderInvariant {
+                    dimension: crate::resource::ResourceClass::WorkerOrTask,
+                })
+            ) && closing_entry_count == 0,
+            "handoff Drop must withdraw work scope, not report arbitrary pressure: \
+             refusal={scope_refusal:?}, closing_entry_count={closing_entry_count}"
+        );
+        assert!(
+            reached && was_pending && gated_custody,
+            "token/node custody survives gated original close"
+        );
+        assert!(
+            old_stale && stale_repeat && released && native_once,
+            "exact stale/release/idempotence boundaries"
+        );
+        assert_eq!(
+            outcomes.len(),
+            6,
+            "both native, event, and retired-owner joins report"
+        );
+        assert_eq!(outcomes[0].is_err(), native_failure);
+        assert!(outcomes[1..].iter().all(Result::is_ok));
+        assert_eq!(original_close.is_err(), native_failure);
+        assert!(far_close.is_ok());
+        assert!(
+            exact_replay && only_replay,
+            "one queued replay owns the original installation"
+        );
+        assert_eq!(
+            replay_released_claim.expect("replay release subtracts from actual queued usage"),
+            replay_charge.expect("the queued replay has an exact mailbox charge"),
+        );
+        assert_eq!(
+            replay_released_reservations,
+            Some(2),
+            "dequeue and delivery Drop release the actual mailbox node and value reservations"
+        );
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        let failed = provider.retained_after_failed_cleanup();
+        assert_eq!(provider.in_use(), failed);
+        if native_failure {
+            assert_ne!(
+                failed,
+                crate::resource::ResourceClaim::ZERO,
+                "injected post-native error retains the actual failed claims"
+            );
+        } else {
+            assert_eq!(failed, crate::resource::ResourceClaim::ZERO);
+        }
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_removed_channel_withdrawn_scope_holds_real_tokens_to_terminal() {
+        retirable_lab_withdrawn_scope_control(false).await;
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_removed_channel_withdrawn_scope_holds_tokens_through_reported_native_error(
+    ) {
+        // Existing gate runs the genuine native close and only then reports
+        // failure; this is not a physical native-failure injection claim.
+        retirable_lab_withdrawn_scope_control(true).await;
+    }
+    // This separate companion retains the real authenticated handoff in an
+    // unpromoted fixture. Unlike channel removal, it has not dropped that
+    // handoff or withdrawn the worker's work scope when pressure is applied.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens one local WebRTC object; run explicitly in the isolated native harness"]
+    async fn retirable_lab_owned_handoff_close_entry_refuses_exact_finite_pressure() {
+        let (state, signals, mut commands, provider, _) = build_test_state_parts_metered(
+            "retirable-owned-handoff-pressure",
+            None,
+            FIXTURE_CONNECTOR_SLOTS,
+            None,
+        );
+        // The unpromoted fixture must not produce a promotion command. Keep
+        // its actual receiver local and undriven until all cleanup is joined.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0xa8; 32]);
+        let remote =
+            crate::semantic::DeviceId::from_public_key_bytes(key.verifying_key().to_bytes())
+                .expect("fixed public key is canonical");
+        let remote_id: &str = remote.as_ref();
+        assert_ne!(remote_id, state.identity.public_id());
+        let fixture = insert_promoted_peer(&state, remote_id).await;
+        let worker = fixture
+            .peer
+            .current_worker()
+            .expect("fixture retains its original worker");
+        let unpromoted = !fixture.peer.holds_promoted_session();
+        let gate = worker.install_native_close_gate_for_test();
+        let pressure = fixture
+            .peer
+            .retain_closing_worker_under_pressure_for_test(&worker);
+        let closing_entry_count = fixture.peer.retired_worker_count_for_test();
+        let (close_result, reached, was_pending) = {
+            let close = worker.retire_and_close();
+            tokio::pin!(close);
+            let early = match futures::poll!(&mut close) {
+                std::task::Poll::Ready(result) => Some(result),
+                std::task::Poll::Pending => None,
+            };
+            let reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_for_entry())
+                .await
+                .is_ok();
+            let was_pending = early.is_none();
+            gate.open();
+            let result = match early {
+                Some(result) => result,
+                None => close.as_mut().await,
+            };
+            (result, reached, was_pending)
+        };
+        let native_once = gate.entries() == 1;
+        let pressure_result = pressure
+            .as_ref()
+            .map(|(_, report)| *report)
+            .map_err(|error| *error);
+        drop(pressure);
+        // Only now drop the held handoff through normal state retirement.
+        // No capability is restored and no new close owner is manufactured.
+        state.shutdown().await;
+        let repeated_close = worker.retire_and_close().await;
+        let drained = fixture.peer.await_retired_workers().await;
+        drop((fixture, worker, gate));
+        let unexpected_command = commands.try_recv();
+        let no_command = unexpected_command.is_none();
+        drop((unexpected_command, commands, signals, state));
+        assert!(
+            unpromoted,
+            "the companion must hold a real handoff before promotion/removal"
+        );
+        assert!(
+            pressure_result.as_ref().is_ok_and(|report| {
+                report.dimension == crate::resource::ResourceClass::AccountedMemoryBytes
+                    && report.capacity.checked_sub(report.in_use)
+                        .and_then(|free| free.checked_add(1)) == Some(report.requested)
+            }) && closing_entry_count == 0,
+            "true finite close-entry refusal: result={pressure_result:?}, closing_entry_count={closing_entry_count}",
+        );
+        assert!(
+            reached && was_pending && native_once,
+            "original native close is gated and idempotent"
+        );
+        assert!(
+            close_result.is_ok() && repeated_close.is_ok() && drained.is_ok(),
+            "all original cleanup outcomes: {close_result:?}, {repeated_close:?}, {drained:?}"
+        );
+        assert!(no_command, "the unpromoted fixture queues no replay");
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(
+            provider.retained_after_failed_cleanup(),
+            crate::resource::ResourceClaim::ZERO
+        );
+        assert_eq!(provider.in_use(), provider.retained_after_failed_cleanup());
+    }
+    // END retirable missing-close-entry controls
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_link_ends_live_opaque_pumps_and_stales_both_handles() {
+        let near = build_test_state_with_realtime_flows("retirable-opaque-near");
+        let far = build_test_state_with_realtime_flows("retirable-opaque-far");
+        let link = install_retirable_session_over_real_link(&near, &far).await;
+        let near_flow = install_lab_idle_opaque_pump(&near, &link.near_channel, 91);
+        let far_flow = install_lab_idle_opaque_pump(&far, &link.far_channel, 92);
+        let near_peer = Arc::clone(link.near_channel.owner().connection());
+        let far_peer = Arc::clone(link.far_channel.owner().connection());
+        assert!(near_peer.holds_promoted_session() && far_peer.holds_promoted_session());
+        let results = tokio::time::timeout(Duration::from_secs(10), link.retire_sessions()).await;
+        let near_stale = near.send_opaque(&near_flow, Bytes::from_static(b"late"));
+        let far_stale = far.send_opaque(&far_flow, Bytes::from_static(b"late"));
+        let emptied = !near_peer.holds_promoted_session() && !far_peer.holds_promoted_session();
+        drop((near_flow, far_flow));
+        near.shutdown().await;
+        far.shutdown().await;
+        assert!(results
+            .expect("explicit retirement terminates both actual idle pumps")
+            .into_iter()
+            .all(|result| result.is_ok()));
+        assert!(emptied);
+        assert_eq!(
+            near_stale,
+            Err(crate::realtime::RealtimeRefusal::SessionNotCurrent)
+        );
+        assert_eq!(
+            far_stale,
+            Err(crate::realtime::RealtimeRefusal::SessionNotCurrent)
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_link_preserves_selected_w1_and_repeated_terminal_is_stale() {
+        let near = build_test_state("retirable-w1-near");
+        let far = build_test_state("retirable-w1-far");
+        let link = install_retirable_session_over_real_link(&near, &far).await;
+        let owner = link.near_channel.owner().clone();
+        let old_worker = Arc::clone(link.near_channel.worker());
+        let repeat = capture_lab_channel(
+            &near,
+            &owner,
+            &old_worker,
+            &near.mesh_context_id().to_string(),
+        );
+        let mut standby =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&near, &far).await;
+        let open = standby.take_open_event();
+        let (open, work) = standby.left.accept_event(open).unwrap().into_parts();
+        assert!(matches!(open, TransportEvent::DataChannelOpen));
+        standby.left_events_mut().commit_data_channel_open();
+        drop(work);
+        let worker = Arc::clone(&standby.left);
+        let correlation = "retirable-selected-w1";
+        let task = prepare_b2_provider_speculative_channel(
+            &near,
+            owner.connection(),
+            &worker,
+            correlation,
+            far.identity.public_id(),
+            far.identity.signing_key(),
+        )
+        .await;
+        assert!(near
+            .peers
+            .promote_speculative_command(
+                &owner,
+                &worker,
+                correlation,
+                near.session_broker.as_ref().unwrap(),
+                &near.mesh_context_id().to_string(),
+            )
+            .is_some());
+        assert!(owner.connection().select_promoted_channel(&worker));
+        assert_eq!(owner.connection().promoted_channel_count(), 2);
+        let results = link.retire_sessions().await;
+        let survivor = near
+            .peers
+            .get_if_current(&owner.for_worker(Arc::clone(&worker)))
+            .is_some()
+            && owner.connection().owns_authenticated_worker(&worker)
+            && owner
+                .connection()
+                .current_worker()
+                .is_some_and(|selected| Arc::ptr_eq(&selected, &worker))
+            && owner.connection().promoted_channel_count() == 1;
+        let repeated = matches!(
+            near.peers.remove_current_channel_for_terminal(repeat),
+            peer_registry::ChannelTerminal::Stale
+        );
+        assert!(survivor && repeated);
+        assert!(!owner.connection().owns_authenticated_worker(&old_worker));
+        near.shutdown().await;
+        far.shutdown().await;
+        let standby_results = standby.close_outcomes().await;
+        drop(task);
+        assert!(results
+            .into_iter()
+            .chain(standby_results)
+            .all(|result| result.is_ok()));
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_link_does_not_retire_replacement_l1() {
+        let near = build_test_state("retirable-l1-near");
+        let far = build_test_state("retirable-l1-far");
+        let old = install_retirable_session_over_real_link(&near, &far).await;
+        let old_owner = old.near_channel.owner().clone();
+        let replacement = install_retirable_session_over_real_link(&near, &far).await;
+        let replacement_owner = replacement.near_channel.owner().clone();
+        assert!(!old_owner.same_exact_owner(&replacement_owner));
+        let old_results = old.retire_sessions().await;
+        let preserved = near.peers.get_if_current(&replacement_owner).is_some()
+            && replacement_owner.connection().holds_promoted_session()
+            && far
+                .peers
+                .get_if_current(replacement.far_channel.owner())
+                .is_some();
+        let results = replacement.retire_sessions().await;
+        near.shutdown().await;
+        far.shutdown().await;
+        assert!(preserved, "old captured cleanup cannot resolve into L1");
+        assert!(old_results
+            .into_iter()
+            .chain(results)
+            .all(|result| result.is_ok()));
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens real linked WebRTC sessions; run explicitly in the isolated native harness"]
+    async fn retirable_lab_link_reports_failed_pump_and_still_joins_both_sides() {
+        let near = build_test_state("retirable-pump-failure-near");
+        let far = build_test_state("retirable-pump-failure-far");
+        let link = install_retirable_session_over_real_link(&near, &far).await;
+        // Fault only the already-owned fixture event task, not the provider
+        // pump or production close ordering. Await confirms the actual error.
+        link.linked.near_pump.abort();
+        let outcomes = link.retire_sessions().await;
+        near.shutdown().await;
+        far.shutdown().await;
+        assert!(outcomes.len() >= 4);
+        assert!(
+            outcomes[2].is_err(),
+            "the original near event task error is reported"
+        );
+        assert!(
+            outcomes[3].is_ok(),
+            "the far event task was joined despite the near error"
+        );
+        assert!(
+            outcomes[0].is_ok() && outcomes[1].is_ok(),
+            "both original native closes settled"
+        );
+        assert!(
+            outcomes[4..].iter().all(Result::is_ok),
+            "retired custody is also joined"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens one local WebRTC object; run explicitly in the isolated native harness"]
+    async fn retirable_lab_channel_refuses_same_arc_different_installation() {
+        // Two existing state registries give the SAME Arc a different exact
+        // installation, without fabricating a token or resetting a retired
+        // worker. This isolates the Arc-only alias counterexample; it is not
+        // a claim that ordinary same-registry install replaces an identical Arc.
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[0xa7; 32]);
+        let remote =
+            crate::semantic::DeviceId::from_public_key_bytes(remote_key.verifying_key().to_bytes())
+                .expect("the fixed signing key has a canonical public identity");
+        let remote_id: &str = remote.as_ref();
+        let first_state = build_test_state("retirable-same-arc-first");
+        let second_state = build_test_state("retirable-same-arc-second");
+        let fixture = insert_promoted_peer(&first_state, remote_id).await;
+        let worker = fixture.peer.current_worker();
+        // Save every fallible admission/oracle result before assertions so the
+        // original connector and its event receiver remain owned during cleanup.
+        let body_result = (|| -> std::result::Result<(), &'static str> {
+            if crate::semantic::DeviceId::from_canonical_str(remote_id).as_ref() != Ok(&remote)
+                || remote_id == first_state.identity.public_id()
+                || remote_id == second_state.identity.public_id()
+            {
+                return Err("the canonical remote must parse and differ from both locals");
+            }
+            if !fence_admits(&first_state, remote_id) {
+                return Err("non-vacuity: the fixture peer really is admitted by the fence");
+            }
+            let original = first_state
+                .peers
+                .owner(remote_id)
+                .ok_or("original owner missing")?;
+            let worker = worker.as_ref().ok_or("original worker missing")?;
+            let stamped = original.for_worker(Arc::clone(worker));
+            let operation = first_state
+                .peers
+                .with_admitted_current_or_refused(
+                    &stamped,
+                    first_state.session_broker.as_ref(),
+                    &first_state.mesh_context_id().to_string(),
+                    |admitted| {
+                        Some(
+                            admitted
+                                .capture_inbound_dispatch()
+                                .exact_channel_operation(Arc::clone(worker)),
+                        )
+                    },
+                    |_| None,
+                )
+                .flatten()
+                .ok_or("the original exact channel must be admitted before replacement")?;
+            install_peer(&second_state.peers, Arc::clone(&fixture.peer));
+            let other = second_state
+                .peers
+                .owner(remote_id)
+                .ok_or("second installation missing")?
+                .for_worker(Arc::clone(worker));
+            if !Arc::ptr_eq(original.connection(), other.connection())
+                || stamped.same_exact_owner(&other)
+            {
+                return Err("the same peer and worker must have distinct installations");
+            }
+            let result = second_state
+                .peers
+                .remove_current_channel_for_terminal(operation);
+            if !matches!(result, peer_registry::ChannelTerminal::Stale)
+                || second_state.peers.get_if_current(&other).is_none()
+                || !fixture.peer.holds_promoted_session()
+            {
+                return Err("identical peer and worker Arcs cannot substitute an installation");
+            }
+            Ok(())
+        })();
+        first_state.shutdown().await;
+        second_state.shutdown().await;
+        let close_result = match worker.as_ref() {
+            Some(worker) => worker.retire_and_close().await,
+            None => Err(crate::Error::Network(
+                "original worker missing at cleanup".into(),
+            )),
+        };
+        drop(fixture);
+        assert!(
+            body_result.is_ok() && close_result.is_ok(),
+            "same-Arc oracle: {body_result:?}; original worker close: {close_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated native harness"]
+    async fn captured_application_owner_preserves_stamp_across_same_arc_reinstallation() {
+        // This is an installation/accessor control using the existing local
+        // promoted fixture, not a claim that its unlinked channel sends data.
+        let state = build_test_state("captured-owner-reinstallation");
+        let fixture = insert_admitted_peer(&state, "original").await;
+        let owner = state.peers.owner("original").unwrap();
+        let worker = fixture.peer.current_worker().unwrap();
+        let admitted = admit_inbound_for_test(&state, &owner, shelve_frame()).unwrap();
+        let (_, _, work, dispatch) = admitted.into_dispatch();
+        let operation = state
+            .peers
+            .admit_exact_channel_application_operation(
+                dispatch.exact_channel_operation(Arc::clone(&worker)),
+            )
+            .expect("the original exact channel is admitted");
+        let captured = operation.captured_owner();
+        assert!(captured.same_exact_owner(&owner.for_worker(Arc::clone(&worker))));
+
+        install_peer(&state.peers, Arc::clone(&fixture.peer));
+        let successor = state
+            .peers
+            .owner("original")
+            .unwrap()
+            .for_worker(Arc::clone(&worker));
+        assert!(Arc::ptr_eq(captured.connection(), successor.connection()));
+        assert!(
+            !captured.same_exact_owner(&successor),
+            "same Arc and worker do not erase installation identity"
+        );
+        assert!(operation.captured_owner().same_exact_owner(&captured));
+        assert!(state
+            .peers
+            .admit_exact_channel_application_operation(
+                dispatch.exact_channel_operation(Arc::clone(&worker)),
+            )
+            .is_none());
+        assert!(
+            operation
+                .send_frame(&state.peers, Bytes::new(), Duration::from_secs(1))
+                .await
+                .is_err(),
+            "stale admission cannot construct a successor send"
+        );
+        drop(dispatch);
+        drop(work);
+        state.shutdown().await;
+        drop(fixture);
+    }
+
+    #[tokio::test]
     #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
     async fn v4_arc04e1_admitted_inbound_effect_lands_on_the_captured_installation() {
         // Positive baseline for the control below: with no replacement, the
@@ -16126,7 +19684,9 @@ mod tests {
         let operation = admit_inbound_for_test(&state, &owner, shelve_frame())
             .expect("an admitted owner mints an inbound authority");
         let (msg, _claim, _work, dispatch) = operation.into_dispatch();
-        let MeshMessage::Shelve(s) = msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::Shelve(s)) =
+            msg
+        else {
             panic!("the authority carries the frame it admitted");
         };
         on_shelve(&state, &dispatch, s).await;
@@ -16185,7 +19745,9 @@ mod tests {
 
         // RESUME — dispatch the authority minted for A.
         let (msg, _claim, _work, dispatch) = operation.into_dispatch();
-        let MeshMessage::Shelve(s) = msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::Shelve(s)) =
+            msg
+        else {
             panic!("the authority carries the frame it admitted");
         };
         on_shelve(&state, &dispatch, s).await;
@@ -16296,7 +19858,11 @@ mod tests {
             admit_inbound_for_test(&state, &captured_owner, channel_frame())
                 .expect("A is admitted")
                 .into_dispatch();
-        let MeshMessage::Channel { channel, payload } = msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::Channel {
+            channel,
+            payload,
+        }) = msg
+        else {
             panic!("the authority carries the frame it admitted");
         };
         on_channel_frame(&state, &dispatch, claim, work, channel, payload).await;
@@ -16314,7 +19880,11 @@ mod tests {
             .expect("A is still admitted at mint time");
         let replacement_fixture = insert_admitted_peer(&state, "peer").await;
         let (msg, claim, work, dispatch) = operation.into_dispatch();
-        let MeshMessage::Channel { channel, payload } = msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::Channel {
+            channel,
+            payload,
+        }) = msg
+        else {
             panic!("the authority carries the frame it admitted");
         };
         on_channel_frame(&state, &dispatch, claim, work, channel, payload).await;
@@ -18230,6 +21800,20 @@ mod tests {
             )
             .is_some());
         let w0 = peer.current_worker().expect("the promoted W0 is live");
+        let captured_w0 = state
+            .peers
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .expect("W0 is captured before another worker is selected");
+        let exact_w0 = captured_w0.captured_owner();
+        assert!(exact_w0.same_exact_owner(&owner.for_worker(Arc::clone(&w0))));
+        assert!(
+            !exact_w0.same_exact_owner(&owner),
+            "an unstamped owner is not the captured channel"
+        );
 
         let remote_w1 = build_test_state("renegotiation-logical-handoff-w1");
         let mut link_w1 =
@@ -18267,6 +21851,25 @@ mod tests {
             assert!(peer.mark_media_renegotiation(worker));
             peer.state.write().media_reneg_pending = true;
         };
+
+        // Selection may move while an already-admitted exact channel remains
+        // owned. The accessor cites W0, never whichever worker is now selected.
+        assert!(peer.select_promoted_channel(&w1));
+        assert!(captured_w0.captured_owner().same_exact_owner(&exact_w0));
+        assert!(!captured_w0
+            .captured_owner()
+            .same_exact_owner(&owner.for_worker(Arc::clone(&w1))));
+        let exact_dispatch = admit_logical_terminal_dispatch(&state, &exact_w0)
+            .expect("the still-owned nonselected W0 retains its logical witness");
+        let nonselected = state
+            .peers
+            .admit_exact_channel_application_operation(
+                exact_dispatch.exact_channel_operation(Arc::clone(&w0)),
+            )
+            .expect("selection of W1 does not retire the authenticated W0 channel");
+        assert!(nonselected.captured_owner().same_exact_owner(&exact_w0));
+        drop(nonselected);
+        assert!(peer.select_promoted_channel(&w0));
         let claim = || {
             state.peers.claim_renegotiation(
                 &owner,
@@ -18310,6 +21913,26 @@ mod tests {
                 .connection()
                 .owns_authenticated_worker(&removed_w0_worker),
             "the production terminal fence retires the exact W0 worker"
+        );
+        assert!(
+            captured_w0.captured_owner().same_exact_owner(&exact_w0),
+            "retirement does not rewrite captured identity to a successor"
+        );
+        assert!(
+            state
+                .peers
+                .admit_exact_channel_application_operation(
+                    exact_dispatch.exact_channel_operation(Arc::clone(&w0)),
+                )
+                .is_none(),
+            "retired W0 is refused without selecting W1"
+        );
+        assert!(
+            captured_w0
+                .send_frame(&state.peers, Bytes::new(), Duration::from_secs(1))
+                .await
+                .is_err(),
+            "begin refuses the retired channel before native send"
         );
         if close_owner_started {
             owner
@@ -18986,6 +22609,9 @@ mod tests {
         let (message, _claim, work, dispatch) = admit_inbound_for_test(state, &owner, msg)
             .expect("an admitted peer mints an inbound authority")
             .into_dispatch();
+        let crate::application_gateway::DecodedApplicationMessage::Json(message) = message else {
+            panic!("the RPC fixture admitted its JSON application frame");
+        };
         (message, work, dispatch)
     }
 
@@ -20575,9 +24201,12 @@ mod tests {
             .peers
             .owner(device_id)
             .expect("the peer is installed for this control");
-        let outer = crate::application_gateway::structural_json_claim(encoded_len)
+        let outer = crate::application_gateway::AdmittedApplicationFrame::claim(encoded_len)
             .expect("the frame under test has a representable admission claim")
             .amount(ResourceClass::AccountedMemoryBytes);
+        // Use the complete admission claim, including its fixed cold-identity
+        // surcharge, so OneAdmission reaches the inner retention refusal and
+        // JustUnderOneAdmission still refuses before deserialization.
         state
             .peers
             .with_live_session_state(
@@ -25648,7 +29277,10 @@ mod tests {
             admit_inbound_for_test(&state_b, &w0_owner_b, handoff_frame)
                 .expect("the exact selected W0 admits the inbound RPC")
                 .into_dispatch();
-        let MeshMessage::RpcRequest(handoff_req) = handoff_msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::RpcRequest(
+            handoff_req,
+        )) = handoff_msg
+        else {
             panic!("the admitted handoff authority carries the RPC request");
         };
         on_rpc_request(&state_b, &handoff_dispatch, handoff_req).await;
@@ -25795,6 +29427,11 @@ mod tests {
             .expect("the saved logical acknowledgement decodes after W0 removal");
         let (saved_terminal_message, _saved_terminal_claim, saved_terminal_work) =
             saved_terminal_decoded.into_parts();
+        let crate::application_gateway::DecodedApplicationMessage::Json(saved_terminal_message) =
+            saved_terminal_message
+        else {
+            panic!("the saved terminal acknowledgement remains a JSON control");
+        };
         let saved_logical_commit = state_b.peers.with_same_session(
             saved_terminal_dispatch.logical_reply_operation(),
             |operation| {
@@ -25905,7 +29542,10 @@ mod tests {
             admit_inbound_for_test(&state_b, &standby_owner_b, stale_rpc_frame)
                 .expect("W1 admits the response operation that names logical L0")
                 .into_dispatch();
-        let MeshMessage::RpcResponse(_stale_rpc_response) = stale_rpc_msg else {
+        let crate::application_gateway::DecodedApplicationMessage::Json(MeshMessage::RpcResponse(
+            _stale_rpc_response,
+        )) = stale_rpc_msg
+        else {
             panic!("the saved stale authority carries an RPC response");
         };
         assert!(
@@ -26185,7 +29825,6 @@ mod tests {
     /// — which is asserted rather than assumed, because "the proof did not go
     /// out" is precisely the arm where the old shape's timer was load-bearing.
     /// acknowledgement for it, or retries it.
-
     /*
             "non-vacuity: this is the failed-send arm — the proof never reached \
              the wire"
@@ -28098,7 +31737,7 @@ mod tests {
         let origin = DeviceId::from_public_key_bytes(*origin_key.verifying_key().as_bytes())
             .expect("the route-flow origin key has a canonical id");
         let policy = state.routing.policy();
-        let limits = RoutedApplicationLimits::checked(
+        let limits = crate::protocol::RoutedApplicationLimits::checked(
             usize::try_from(policy.max_envelope_bytes())
                 .expect("the fixture routing envelope limit fits usize"),
             policy.max_hop_budget(),
@@ -28176,6 +31815,564 @@ mod tests {
             try_route_flow_detail_for_test(events).is_none(),
             "an unselected or unadmitted frame emitted route-flow evidence"
         );
+    }
+
+    // These controls create genuinely confirmed endpoint epochs through the
+    // controller's signed share/confirmation exchange. The exchange is local
+    // fixture setup, not remote-handshake qualification. Ciphertext then uses
+    // the actual builder, funded command, writer and two live native links.
+    #[cfg(all(feature = "transport-lab", feature = "route-flow-diagnostics"))]
+    mod ciphertext_origin_controls {
+        use super::*;
+        use crate::resource::{FiniteResourceProvider, ResourceClaim, ResourceClass};
+
+        const RUN: &str = "cipher-origin-629";
+        const CHANNEL: &str = "cipher-origin";
+        const PLAIN: usize = 1024;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Case {
+            Delivered,
+            Cancelled,
+            Stale,
+            Unavailable,
+            Disabled,
+        }
+
+        fn policy() -> crate::config::EndpointCipherPolicyConfig {
+            crate::config::EndpointCipherPolicyConfig {
+                max_sessions: 1,
+                max_plaintext_bytes: PLAIN as u64,
+                replay_window: 8,
+                max_age_ms: 10_000,
+            }
+        }
+
+        fn plan(endpoint: bool, peers: usize) -> ResourceClaim {
+            use endpoint_cipher::EndpointCipherController as Controller;
+            let charge = |raw| FiniteResourceProvider::reservation_planning_charge(raw).unwrap();
+            let routing = crate::config::RoutingPolicyConfig::default()
+                .checked()
+                .unwrap();
+            let wire = crate::protocol::RECEIVE_FRAME_BYTES;
+            let outer = crate::protocol::topology::routed_work_claim(wire).unwrap();
+            let mut claims = vec![
+                // One received frame, its independent route signing/verification,
+                // and the captured candidates/plan/terminal observation coexist.
+                charge(crate::application_gateway::AdmittedApplicationFrame::claim(wire).unwrap()),
+                charge(outer),
+                charge(
+                    funded_route_input_work_claim(
+                        peers,
+                        usize::try_from(routing.max_next_hops).unwrap(),
+                        usize::try_from(routing.max_parallel_routes).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                // At origin the test control plus one ciphertext retain two IDs;
+                // downstream only the ciphertext is admitted. No repeated sends.
+                routing::replay_entry_reservation_charge_for_test()
+                    .checked_scale(if endpoint { 2 } else { 1 })
+                    .unwrap(),
+            ];
+            if endpoint {
+                claims.extend([
+                    Controller::planned_retention_claim(policy()).unwrap(),
+                    FiniteResourceProvider::scope_planning_charge(),
+                    // Offer and confirmation may both be held while a third
+                    // receive-control operation is in progress; no wire clones.
+                    charge(Controller::control_work_claim(ResourceClaim::ZERO).unwrap())
+                        .checked_scale(3)
+                        .unwrap(),
+                    charge(Controller::data_work_claim(PLAIN, outer).unwrap()),
+                    charge(crate::application_gateway::structural_json_claim(PLAIN).unwrap()),
+                    charge(
+                        ResourceClaim::try_from_entries([
+                            (
+                                ResourceClass::AccountedMemoryBytes,
+                                DeviceId::uninterned_backing_bytes() as u64,
+                            ),
+                            (ResourceClass::ParsingOrCpuWork, 52),
+                            (ResourceClass::OpaqueDependencyResidual, 2),
+                        ])
+                        .unwrap(),
+                    ),
+                    charge(
+                        ResourceClaim::try_from_entries([
+                            (ResourceClass::AccountedMemoryBytes, PLAIN as u64),
+                            (ResourceClass::ParsingOrCpuWork, PLAIN as u64),
+                            (ResourceClass::OpaqueDependencyResidual, 1),
+                        ])
+                        .unwrap(),
+                    ),
+                ]);
+            }
+            claims
+                .into_iter()
+                .try_fold(ResourceClaim::ZERO, |sum, next| sum.checked_add(next))
+                .unwrap()
+        }
+
+        fn confirmed(
+            source: &Arc<NetworkState>,
+            destination: &Arc<NetworkState>,
+        ) -> std::result::Result<bool, String> {
+            let source_id = DeviceId::from_canonical_str(source.identity.public_id())
+                .map_err(|e| format!("{e:?}"))?;
+            let destination_id = DeviceId::from_canonical_str(destination.identity.public_id())
+                .map_err(|e| format!("{e:?}"))?;
+            let selection = capture_funded_route_input(source).map_err(|e| format!("{e:?}"))?;
+            let work = source
+                .acquire_application_work(
+                    crate::protocol::topology::routed_work_claim(
+                        crate::protocol::RECEIVE_FRAME_BYTES,
+                    )
+                    .map_err(|e| format!("{e:?}"))?,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+            let source_graph = source.fact_graph.read();
+            let destination_graph = destination.fact_graph.read();
+            if !governance::canonical_policy_admits_devices(
+                source.verified_bootstrap(),
+                &source_graph,
+                &source_id,
+                &destination_id,
+            ) || !governance::canonical_policy_admits_devices(
+                destination.verified_bootstrap(),
+                &destination_graph,
+                &destination_id,
+                &source_id,
+            ) {
+                return Err("fixture canonical endpoint policy refused".to_owned());
+            }
+            let at = Instant::now();
+            let mut a = source
+                .endpoint_cipher
+                .as_ref()
+                .ok_or("source cipher missing")?
+                .lock();
+            let mut b = destination
+                .endpoint_cipher
+                .as_ref()
+                .ok_or("destination cipher missing")?
+                .lock();
+            let offer = a
+                .begin(
+                    &source.identity,
+                    &destination_id,
+                    None,
+                    ResourceClaim::ZERO,
+                    at,
+                )
+                .map_err(|e| format!("offer {e:?}"))?;
+            let frames = offer.output.as_ref().ok_or("offer absent")?.frames();
+            // A real control also traverses the funded outer builder, but must
+            // not acquire an Origin observation or emit ciphertext metadata.
+            let control = prepare_endpoint_routed_frame(
+                source,
+                &destination_id,
+                ClosedRoutedPayload::EndpointControl {
+                    control: frames.first.clone(),
+                },
+                selection,
+            )
+            .map_err(|e| format!("control builder {e:?}"))?;
+            let control_unselected = control._selection.route_flow.is_none();
+            drop((control, work));
+            let answer = b
+                .receive_control(
+                    &destination.identity,
+                    &source_id,
+                    &frames.first,
+                    ResourceClaim::ZERO,
+                    at,
+                )
+                .map_err(|e| format!("answer {e:?}"))?;
+            let answer_frames = answer.output.as_ref().ok_or("answer absent")?.frames();
+            let confirmation = a
+                .receive_control(
+                    &source.identity,
+                    &destination_id,
+                    &answer_frames.first,
+                    ResourceClaim::ZERO,
+                    at,
+                )
+                .map_err(|e| format!("confirm {e:?}"))?;
+            b.receive_control(
+                &destination.identity,
+                &source_id,
+                &confirmation
+                    .output
+                    .as_ref()
+                    .ok_or("confirmation absent")?
+                    .frames()
+                    .first,
+                ResourceClaim::ZERO,
+                at,
+            )
+            .map_err(|e| format!("peer confirm {e:?}"))?;
+            a.receive_control(
+                &source.identity,
+                &destination_id,
+                answer_frames
+                    .second
+                    .as_ref()
+                    .ok_or("peer confirmation absent")?,
+                ResourceClaim::ZERO,
+                at,
+            )
+            .map_err(|e| format!("local confirm {e:?}"))?;
+            Ok(control_unselected
+                && offer.ticket.phase(at) == endpoint_cipher::CipherPhase::Ready
+                && answer.ticket.phase(at) == endpoint_cipher::CipherPhase::Ready)
+        }
+
+        async fn run(case: Case) {
+            let enabled = case != Case::Disabled;
+            assert_eq!(
+                crate::route_flow::active_run_id_for_test(),
+                enabled.then_some(RUN),
+                "run this isolated selector with the exact opt-in, or unset it for Disabled"
+            );
+            // Local storage locators are distinct; network/context and node
+            // identities are still constructed by the unchanged fixture body.
+            // Keep this root alive beyond every state/store owner, including
+            // the successfully constructed prefix of a failed setup.
+            let fixture_root = tempfile::tempdir().expect("Origin fixture storage root");
+            let mut built = [None, None, None];
+            let mut build_error = None;
+            for (index, (name, endpoint, peers)) in [
+                ("source", true, 1),
+                ("hub", false, 2),
+                ("destination", true, 1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                match try_build_test_state_parts_metered_with_application_in_instance_root(
+                    "cipher-origin",
+                    None,
+                    peers,
+                    Some(plan(endpoint, peers)),
+                    None,
+                    None,
+                    Some(fixture_root.path().join(name)),
+                ) {
+                    Ok(node) => built[index] = Some(node),
+                    Err(error) => {
+                        build_error = Some((name, error));
+                        break;
+                    }
+                }
+            }
+            if let Some((name, error)) = build_error {
+                let mut prefix_clean = true;
+                for slot in &mut built {
+                    if let Some((node, signals, commands, provider, _)) = slot.take() {
+                        node.shutdown().await;
+                        drop((commands, signals, node));
+                        prefix_clean &= provider.active_reservations() == 0
+                            && provider.active_scopes() == 0
+                            && provider.in_use() == ResourceClaim::ZERO
+                            && provider.retained_after_failed_cleanup() == ResourceClaim::ZERO;
+                        drop(provider);
+                    }
+                }
+                drop(fixture_root);
+                panic!("Origin {name} construction failed after owned-prefix cleanup (clean={prefix_clean}): {error}");
+            }
+            let (mut source, source_signals, mut source_commands, source_provider, _) =
+                built[0].take().expect("source constructed");
+            let (hub, hub_signals, mut hub_commands, hub_provider, _) =
+                built[1].take().expect("hub constructed");
+            let (
+                mut destination,
+                destination_signals,
+                mut destination_commands,
+                destination_provider,
+                _,
+            ) = built[2].take().expect("destination constructed");
+            let mut source_events = source.events_tx.subscribe();
+            let mut hub_events = hub.events_tx.subscribe();
+            let mut destination_events = destination.events_tx.subscribe();
+            // Install only real cipher roots with their own issued child scope.
+            // No introduced-link record, Ready bit, epoch or capability is forged.
+            let setup = (|| -> std::result::Result<(), String> {
+                if source.mesh_context_id() != hub.mesh_context_id()
+                    || source.mesh_context_id() != destination.mesh_context_id()
+                    || source.identity.public_id() == hub.identity.public_id()
+                    || source.identity.public_id() == destination.identity.public_id()
+                    || hub.identity.public_id() == destination.identity.public_id()
+                {
+                    return Err(
+                        "fixture requires three distinct nodes in one actual context".to_owned(),
+                    );
+                }
+                for node in [&mut source, &mut destination] {
+                    let id = DeviceId::from_canonical_str(node.identity.public_id())
+                        .map_err(|e| format!("{e:?}"))?;
+                    let root = endpoint_cipher::EndpointCipherController::new(
+                        policy(),
+                        node.local_application_resource_scope()
+                            .map_err(|e| format!("{e:?}"))?,
+                        node.mesh_context_id(),
+                        &id,
+                    )
+                    .map_err(|e| format!("cipher root {e:?}"))?;
+                    Arc::get_mut(node)
+                        .ok_or("fixture state already shared")?
+                        .endpoint_cipher = Some(parking_lot::Mutex::new(root));
+                }
+                for node in [&source, &hub, &destination] {
+                    if node.routing.policy().max_envelope_bytes() != 65_535
+                        || node.routing.policy().max_hop_budget() != 4
+                    {
+                        return Err("original default routing limits changed".to_owned());
+                    }
+                    let topology = crate::config::TopologyMode::Star {
+                        hub: hub.identity.public_id().to_owned(),
+                    };
+                    *node.topology_impl.write() = crate::topology::from_mode(&topology);
+                    node.config.write().topology = topology;
+                }
+                Ok(())
+            })();
+            let first = if setup.is_ok() {
+                Some(install_retirable_session_over_real_link(&source, &hub).await)
+            } else {
+                None
+            };
+            let second = if setup.is_ok() {
+                Some(install_retirable_session_over_real_link(&hub, &destination).await)
+            } else {
+                None
+            };
+            let mut subscriber = crate::channels::Channel::<serde_json::Value>::new(
+                CHANNEL.to_owned(),
+                Arc::clone(&destination),
+            )
+            .subscribe();
+            let observations = async {
+                setup?;
+                if !confirmed(&source, &destination)? { return Err("control selection or genuine confirmation failed".to_owned()); }
+                // Installation announces capabilities on the undriven command
+                // queues. Retain no unexpected work and never reinterpret it.
+                for commands in [&mut source_commands, &mut hub_commands, &mut destination_commands] {
+                    while let Some(delivery) = commands.try_recv() {
+                        if !matches!(delivery.value(), NetworkCmd::ReplayCapabilities { .. }) {
+                            return Err("unexpected fixture command before payload".to_owned());
+                        }
+                        drop(delivery);
+                    }
+                }
+                if try_route_flow_detail_for_test(&mut source_events).is_some()
+                    || try_route_flow_detail_for_test(&mut hub_events).is_some()
+                    || try_route_flow_detail_for_test(&mut destination_events).is_some() {
+                    return Err("key controls emitted route-flow rows".to_owned());
+                }
+                let body = serde_json::json!({"opaque_application_value": 629});
+                let (reply, mut completion) = tokio::sync::oneshot::channel();
+                queue_routed_channel_frame(&source, destination.identity.public_id(), CHANNEL, body.clone(), &mut Some(reply))
+                    .map_err(|e| format!("actual ciphertext queue {e:?}"))?;
+                let delivery = source_commands.try_recv().ok_or("cipher command absent")?;
+                let NetworkCmd::EndpointControls(transfer) = delivery.value() else { return Err("not a cipher command".to_owned()); };
+                let frame = &transfer.output.value().first;
+                let selection_funded = frame._selection._work.claim() == funded_route_input_work_claim(1, source.routing.policy().max_next_hops(), source.routing.policy().max_parallel_routes()).map_err(|e| format!("{e:?}"))?;
+                let decode = source.acquire_application_work(crate::application_gateway::AdmittedApplicationFrame::claim(frame.bytes.len()).map_err(|e| format!("{e:?}"))?).map_err(|e| format!("{e:?}"))?;
+                let MeshMessage::RoutedApplication(envelope) = serde_json::from_slice::<MeshMessage>(&frame.bytes).map_err(|e| format!("{e:?}"))? else { return Err("not routed ciphertext".to_owned()); };
+                let route_id = hex::encode(envelope.message_id());
+                let selected = frame._selection.route_flow.is_some();
+                let ciphertext = matches!(envelope.payload(), ClosedRoutedPayload::EndpointCiphertext { .. });
+                if case == Case::Stale {
+                    source.endpoint_cipher.as_ref().ok_or("cipher absent")?.lock().retire(transfer.output.ticket());
+                }
+                if case == Case::Unavailable {
+                    // Retire only the adapter's originally captured carrier;
+                    // the queued ciphertext epoch is deliberately still live.
+                    let original_channel = &first.as_ref().ok_or("original link absent")?.near_channel;
+                    if frame.plan.next_hops().len() != 1
+                        || frame.plan.next_hops()[0] != original_channel.owner().device_id() {
+                        return Err("ciphertext does not select original carrier".to_owned());
+                    }
+                    original_channel.worker().retire();
+                }
+                drop((envelope, decode));
+                let mut early = false;
+                let gated = !matches!(case, Case::Stale | Case::Unavailable);
+                let mut entered = !gated;
+                let mut interval = !gated;
+                {
+                    let gate = gated.then(install_route_flow_dispatch_gate_for_test);
+                    let writer = delivery.run_terminal_effect(|command| handle_command(&source, command));
+                    tokio::pin!(writer);
+                    let first_poll = futures::poll!(&mut writer);
+                    if let Some(gate) = gate {
+                        let entered_notification = gate.entered.notified();
+                        tokio::pin!(entered_notification);
+                        entered = first_poll.is_pending()
+                            && futures::poll!(&mut entered_notification).is_ready();
+                        interval = gate.interval_open.load(std::sync::atomic::Ordering::SeqCst) == enabled;
+                        early = try_route_flow_detail_for_test(&mut source_events).is_some();
+                        // Clear the global gate before allowing the Hub's next
+                        // actual write; the captured origin waiter still owns it.
+                        clear_route_flow_dispatch_gate_for_test(&gate);
+                        gate.release.notify_one();
+                        if case != Case::Cancelled && first_poll.is_pending() { writer.await; }
+                    } else if first_poll.is_pending() {
+                        writer.await;
+                    }
+                    // Cancelled drops this exact pinned terminal effect here.
+                }
+                let outcome = completion.try_recv();
+                if !selection_funded || selected != enabled || !ciphertext || !entered || !interval || early {
+                    return Err(format!("builder/held-writer: funded={selection_funded} selected={selected} ciphertext={ciphertext} entered={entered} interval={interval} early={early}"));
+                }
+                if matches!(case, Case::Cancelled | Case::Stale) {
+                    let expected = if case == Case::Cancelled {
+                        matches!(outcome, Err(tokio::sync::oneshot::error::TryRecvError::Closed))
+                    } else { matches!(outcome, Ok(Err(_))) };
+                    if !expected { return Err(format!("cancel/stale terminal result {outcome:?}")); }
+                    for _ in 0..32 { tokio::task::yield_now().await; }
+                    if try_route_flow_detail_for_test(&mut source_events).is_some()
+                        || try_route_flow_detail_for_test(&mut hub_events).is_some()
+                        || try_route_flow_detail_for_test(&mut destination_events).is_some() {
+                        return Err("cancel/stale emitted a terminal row".to_owned());
+                    }
+                    return Ok(());
+                }
+                if case == Case::Unavailable {
+                    let row = try_route_flow_detail_for_test(&mut source_events).ok_or("missing unavailable Origin row")?;
+                    if !matches!(outcome, Ok(Err(_))) || row["outcome"] != "unavailable"
+                        || row["route_id"] != route_id || row["role"] != "origin"
+                        || row["schema"] != "myownmesh.route-flow-ciphertext/v1"
+                        || !row["route_dispatch_us"].is_u64()
+                        || try_route_flow_detail_for_test(&mut source_events).is_some()
+                        || try_route_flow_detail_for_test(&mut hub_events).is_some()
+                        || try_route_flow_detail_for_test(&mut destination_events).is_some() {
+                        return Err("retired original carrier lost actual unavailable outcome".to_owned());
+                    }
+                    return Ok(());
+                }
+                if !matches!(outcome, Ok(Ok(()))) { return Err(format!("actual writer result {outcome:?}")); }
+                let received = tokio::time::timeout(Duration::from_secs(10), subscriber.as_mut().map_err(|e| format!("subscribe {e:?}"))?.recv())
+                    .await.map_err(|_| "ciphertext delivery observation elapsed")?
+                    .ok_or("subscriber ended")?.map_err(|e| format!("delivery {e:?}"))?;
+                if received.body() != &body || received.from() != source.identity.public_id() {
+                    return Err("exact decrypted body/sender mismatch".to_owned());
+                }
+                let mut rows = [None, None, None];
+                for _ in 0..10_000 {
+                    for (slot, events) in rows.iter_mut().zip([&mut source_events, &mut hub_events, &mut destination_events]) {
+                        if slot.is_none() { *slot = try_route_flow_detail_for_test(events); }
+                    }
+                    if !enabled || rows.iter().all(Option::is_some) { break; }
+                    tokio::task::yield_now().await;
+                }
+                if !enabled {
+                    if rows.iter().any(Option::is_some) { return Err("disabled path emitted".to_owned()); }
+                    return Ok(());
+                }
+                for (row, role) in rows.into_iter().zip(["origin", "relay", "destination"]) {
+                    let row = row.ok_or_else(|| format!("missing {role} row"))?;
+                    if row["schema"] != "myownmesh.route-flow-ciphertext/v1"
+                        || row["local_run_label"] != RUN || row["label_attribution"] != "local_opt_in_only"
+                        || row["route_id"] != route_id || row["role"] != role
+                        || row["outcome"] != "delivered"
+                        || ["run_id", "seq", "direction", "payload", "channel"].iter().any(|key| row.get(*key).is_some()) {
+                        return Err(format!("metadata schema/route/outcome mismatch at {role}"));
+                    }
+                    if role == "origin" && (!row["owner_epoch"].is_null()
+                        || !row["callback_to_insert_us"].is_null()
+                        || !row["insert_to_dequeue_us"].is_null()
+                        || !row["dequeue_to_handler_us"].is_null()
+                        || !row["route_dispatch_us"].is_u64()
+                        || row["hop_index"] != 0 || row["remaining_ttl"] != 2) {
+                        return Err("origin fabricated native/owner or lost interval".to_owned());
+                    }
+                }
+                if try_route_flow_detail_for_test(&mut source_events).is_some()
+                    || try_route_flow_detail_for_test(&mut hub_events).is_some()
+                    || try_route_flow_detail_for_test(&mut destination_events).is_some() {
+                    return Err("duplicate row for a single actual writer".to_owned());
+                }
+                Ok::<(), String>(())
+            }.await;
+            // No assertion leaves real links/pumps, command deliveries, roots
+            // or subscriptions behind, including setup and saved-body failures.
+            drop(subscriber);
+            let first_closed = if let Some(link) = first {
+                link.retire_sessions().await
+            } else {
+                Vec::new()
+            };
+            let second_closed = if let Some(link) = second {
+                link.retire_sessions().await
+            } else {
+                Vec::new()
+            };
+            source.shutdown().await;
+            hub.shutdown().await;
+            destination.shutdown().await;
+            drop((
+                source_commands,
+                hub_commands,
+                destination_commands,
+                source_signals,
+                hub_signals,
+                destination_signals,
+                source_events,
+                hub_events,
+                destination_events,
+                source,
+                hub,
+                destination,
+            ));
+            drop(fixture_root);
+            assert!(
+                first_closed.iter().chain(&second_closed).all(Result::is_ok),
+                "both exact links and pumps must close"
+            );
+            for provider in [source_provider, hub_provider, destination_provider] {
+                assert_eq!(provider.active_reservations(), 0);
+                assert_eq!(provider.active_scopes(), 0);
+                assert_eq!(
+                    provider.retained_after_failed_cleanup(),
+                    ResourceClaim::ZERO
+                );
+                assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+            }
+            observations.expect("current ciphertext Origin production-path control");
+        }
+
+        #[tokio::test]
+        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
+        async fn ready_ciphertext_command_writer_emits_correlated_origin() {
+            run(Case::Delivered).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
+        async fn cancelled_ciphertext_writer_emits_no_terminal_origin() {
+            run(Case::Cancelled).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
+        async fn stale_ciphertext_epoch_emits_no_origin() {
+            run(Case::Stale).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "three native nodes; isolated process with MYOWNMESH_ROUTE_FLOW_RUN_ID=cipher-origin-629"]
+        async fn retired_original_carrier_emits_unavailable_origin() {
+            run(Case::Unavailable).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "three native nodes; isolated process WITHOUT MYOWNMESH_ROUTE_FLOW_RUN_ID"]
+        async fn disabled_ciphertext_origin_keeps_actual_delivery() {
+            run(Case::Disabled).await;
+        }
     }
 
     /// Exact environment-backed qualification for the diagnostic-only engine

@@ -14,7 +14,7 @@ SPEC.loader.exec_module(checker)
 CURRENT_SOURCE = """
 pub const PROTOCOL_VERSION: u32 = 2;
 enum MeshMessage { ClosedRelayControl, ClosedRelayData }
-struct FactInventory; struct FactRequest; struct FactBundle;
+struct FactInventory; struct FactRequest; struct FactPageMessage;
 enum FactBody { AuthorityLineageResolution }
 const FEATURE: &str = "endpoint_auth_v1";
 """
@@ -23,6 +23,41 @@ const FEATURE: &str = "endpoint_auth_v1";
 class SourceControls(unittest.TestCase):
     def test_current_source_passes(self) -> None:
         checker.scan_source_text("current", CURRENT_SOURCE)
+
+    def test_current_noncanonical_device_error_is_allowed(self) -> None:
+        checker.scan_source_text(
+            "current routed error",
+            "enum RoutedApplicationError { NonCanonicalDeviceId }\n"
+            "let error = RoutedApplicationError::NonCanonicalDeviceId;",
+        )
+
+    def test_exact_removed_identifier_markers_are_rejected(self) -> None:
+        for marker in checker.LEGACY_MARKERS:
+            if not marker.isidentifier():
+                continue
+            for source in (
+                marker,
+                f"struct {marker};",
+                f"type Removed = old::{marker};",
+                f'const KIND: &str = "{marker}";',
+            ):
+                with self.subTest(marker=marker, source=source):
+                    with self.assertRaises(SystemExit) as error:
+                        checker.scan_source_text("removed", source)
+                    self.assertIn(marker, str(error.exception))
+
+    def test_longer_identifiers_are_not_removed_identifier_tokens(self) -> None:
+        for marker in checker.LEGACY_MARKERS:
+            if not marker.isidentifier():
+                continue
+            for current in (f"Current{marker}", f"{marker}_detail", f"{marker}\u00e9"):
+                with self.subTest(marker=marker, current=current):
+                    checker.scan_source_text("distinct current identifier", f"struct {current};")
+
+    def test_removed_namespace_is_still_rejected(self) -> None:
+        with self.assertRaises(SystemExit) as error:
+            checker.scan_source_text("namespace", "use network_state::Current;")
+        self.assertIn("network_state::", str(error.exception))
 
     def test_removed_wire_is_rejected(self) -> None:
         with self.assertRaises(SystemExit) as error:
@@ -65,6 +100,28 @@ class GraphControls(unittest.TestCase):
             "fn main() {}", encoding="utf-8"
         )
         return root
+
+    def test_current_routed_error_and_fact_page_graph_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._write_current_graph(directory)
+            (root / "crates" / "demo" / "src" / "routing.rs").write_text(
+                "enum RoutedApplicationError { NonCanonicalDeviceId }\n"
+                "let error = RoutedApplicationError::NonCanonicalDeviceId;",
+                encoding="utf-8",
+            )
+            checker.scan_source_tree(root)
+
+    def test_missing_current_fact_page_message_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._write_current_graph(directory)
+            source = root / "crates" / "demo" / "src" / "lib.rs"
+            source.write_text(
+                CURRENT_SOURCE.replace("struct FactPageMessage;", "struct FactBundle;"),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as error:
+                checker.scan_source_tree(root)
+            self.assertIn("lacks current form(s): FactPageMessage", str(error.exception))
 
     def test_gui_and_tauri_legacy_wires_are_rejected(self) -> None:
         for relative in (

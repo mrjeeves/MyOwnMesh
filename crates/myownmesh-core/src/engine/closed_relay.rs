@@ -97,7 +97,7 @@ static RELAY_PIPELINE_WITNESS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 fn record_relay_pipeline_stage(stage: RelayPipelineStage) {
     let _ = RELAY_PIPELINE_WITNESS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        (value <= 0x0fff_ffff_ffff_fff).then_some((value << 4) | stage as u64)
+        (value <= 0x00ff_ffff_ffff_ffff).then_some((value << 4) | stage as u64)
     });
 }
 
@@ -1555,7 +1555,7 @@ pub(crate) struct ClosedRelayEngineRoot {
 
 pub(crate) struct ClosedRelayPendingExpiryTask {
     pub(crate) handle: JoinHandle<()>,
-    pub(crate) funding: FundedArc<ClosedRelayPendingExpiryControl>,
+    pub(crate) _funding: FundedArc<ClosedRelayPendingExpiryControl>,
 }
 
 /// A root-pinned shutdown observation.  Awaiting through this guard keeps the
@@ -2470,8 +2470,9 @@ fn checked_claim_bytes(value: usize) -> Result<u64, ClosedRelayRefusal> {
     u64::try_from(value).map_err(|_| ClosedRelayRefusal::InvalidProfile)
 }
 
-const CANONICAL_BASE32_BYTES: usize = (32 * 8 + 4) / 5;
-const CANONICAL_SIGNATURE_BYTES: usize = (ed25519_dalek::SIGNATURE_LENGTH * 8 + 4) / 5;
+const CANONICAL_BASE32_BYTES: usize = (32_usize * 8).div_ceil(5);
+#[cfg(all(test, feature = "transport-lab"))]
+const CANONICAL_SIGNATURE_BYTES: usize = (ed25519_dalek::SIGNATURE_LENGTH * 8).div_ceil(5);
 
 /// Retained capacities of the four variable strings in one generated
 /// [`RelayKeyShare`]. The fixture planner receives this typed shape from the
@@ -3624,6 +3625,8 @@ pub(crate) fn on_data(
     };
     #[cfg(feature = "transport-lab")]
     relay_transport_lab_marker("on-data-packet-check");
+    // Preserve the lab refusal marker before returning the original error.
+    #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
     if let Err(error) = validate_data_for_direction(&data, max, direction) {
         #[cfg(feature = "transport-lab")]
         relay_transport_lab_marker("on-data-packet-refused");
@@ -3633,6 +3636,8 @@ pub(crate) fn on_data(
     relay_transport_lab_marker("on-data-packet-ok");
     #[cfg(feature = "transport-lab")]
     relay_transport_lab_marker("on-data-owner-witness-check");
+    // Preserve the lab refusal marker before returning the original error.
+    #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
     if let Err(error) = current_owner_witness(
         state,
         owner,
@@ -3726,6 +3731,8 @@ pub(crate) async fn handle_data(
             return Err(error);
         }
     };
+    // Preserve the lab refusal marker before returning the original error.
+    #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
     if let Err(error) = validate_data_for_direction(&data, max, direction) {
         #[cfg(feature = "transport-lab")]
         relay_transport_lab_marker("handle-data-packet-refused");
@@ -3735,6 +3742,8 @@ pub(crate) async fn handle_data(
     relay_transport_lab_marker("handle-data-packet-ok");
     #[cfg(feature = "transport-lab")]
     relay_transport_lab_marker("handle-data-route-check");
+    // Preserve the lab refusal marker before returning the original error.
+    #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
     if let Err(error) = canonical_route_admitted(state, &data.requester, &data.relay, &data.target)
     {
         #[cfg(feature = "transport-lab")]
@@ -3745,6 +3754,8 @@ pub(crate) async fn handle_data(
     relay_transport_lab_marker("handle-data-route-ok");
     #[cfg(feature = "transport-lab")]
     relay_transport_lab_marker("handle-data-owner-witness-check");
+    // Preserve the lab refusal marker before returning the original error.
+    #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
     if let Err(error) = current_owner_witness(state, owner, &data.relay) {
         #[cfg(feature = "transport-lab")]
         relay_transport_lab_marker("handle-data-owner-witness-refused");

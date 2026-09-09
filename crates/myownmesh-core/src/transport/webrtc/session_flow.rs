@@ -100,6 +100,37 @@ pub(crate) struct RealtimeSendUnit {
     pub(crate) data: Bytes,
 }
 
+/// One application-owned opaque unit waiting for a persistent native lane.
+/// The payload remains provider-neutral and its existing lease stays attached
+/// until the worker has completed the native send.
+#[derive(Clone, Debug)]
+pub(crate) struct OpaqueSendUnit {
+    pub(crate) data: Bytes,
+    pub(crate) mode: crate::realtime::OpaqueFlowMode,
+    pub(crate) direction: crate::realtime::RealtimeFlowDirection,
+    pub(crate) coordinate: crate::protocol::ApplicationFlowCoordinate,
+    pub(crate) max_unit_bytes: usize,
+}
+
+/// A dequeued opaque unit whose payload accounting remains live through the
+/// native write. It cannot be forged by the engine because the payload lease
+/// is minted only by the flow's queue.
+pub(crate) struct OpaqueOutboundUnit {
+    pub(crate) data: Bytes,
+    pub(crate) mode: crate::realtime::OpaqueFlowMode,
+    pub(crate) direction: crate::realtime::RealtimeFlowDirection,
+    pub(crate) coordinate: crate::protocol::ApplicationFlowCoordinate,
+    pub(crate) max_unit_bytes: usize,
+    in_flight: Arc<queue::InFlightCounter>,
+    _entry: crate::resource::queue::LeasedQueueEntry<queue::QueuedUnit<OpaqueSendUnit>>,
+}
+
+impl Drop for OpaqueOutboundUnit {
+    fn drop(&mut self) {
+        self.in_flight.finish();
+    }
+}
+
 /// One unit received on a flow.
 ///
 /// Deliberately *not* the same type as [`RealtimeSendUnit`]. Inbound really
@@ -182,8 +213,21 @@ pub(super) use wake::LeasedWake;
 /// them.
 mod queue;
 
+pub(super) use queue::RealtimePumpStep;
 use queue::{FlowQueue, QueuedUnit, RealtimeFlowQueue};
-pub(super) use queue::{RealtimeOutboundPump, RealtimePumpStep};
+pub(crate) use queue::{OpaqueOutboundPump, OpaquePumpStep, RealtimeOutboundPump};
+
+/// A crate-visible waiter backed by the pending flow record's funded wake.
+/// The wake's implementation and lease remain provider-private; callers can
+/// only await the one readiness transition.
+pub(crate) struct OpaquePendingWait(Arc<LeasedWake>);
+
+impl OpaquePendingWait {
+    pub(crate) async fn wait(self) {
+        let wake = self.0;
+        wake.notify().notified().await;
+    }
+}
 
 /// One open flow: what it binds, what may still reach it, and what its close
 /// leaves behind.
@@ -195,8 +239,10 @@ pub(super) use queue::{RealtimeOutboundPump, RealtimePumpStep};
 /// belongs to this module alone.
 mod flow;
 
-use flow::open_session_flow;
-pub(crate) use flow::{RealtimeFlow, RealtimeFlowRemains, RealtimeFlowSpec};
+use flow::{open_opaque_flow, open_session_flow, OpaqueFlowPendingChange, RealtimeFlowKind};
+pub(crate) use flow::{
+    OpaqueFlowChange, OpaqueFlowSpec, RealtimeFlow, RealtimeFlowRemains, RealtimeFlowSpec,
+};
 pub(super) use flow::{RealtimeFlowPortHandle, RealtimeInboundAttachment};
 
 /// One session-scoped signal, and the single consumer that holds it.
@@ -295,11 +341,32 @@ pub(crate) use inbound_binding::{
 /// what a queued arrival means after its flow closes: the name stays paid for
 /// and stays spelled by this entry until the entry is taken, so the unit that
 /// comes out names the flow it actually arrived on.
-struct QueuedInboundUnit {
+pub(super) struct QueuedInboundUnit {
     label: RealtimeFlowLabel,
     unit: RealtimeRecvUnit,
+    opaque: Option<(
+        crate::realtime::OpaqueFlowMode,
+        crate::protocol::ApplicationFlowCoordinate,
+    )>,
     _payload: RealtimePayloadLease,
+    /// Reserved before the public label copy is allocated. The queue entry
+    /// keeps this lease attached through dequeue and arrival consumption.
+    _label_copy: RealtimePayloadLease,
+    /// Prices the provider-owned custody wrapper before it is boxed after
+    /// dequeue.  The lease travels inside the same queued entry, so legacy
+    /// consumers release it on pop and guarded consumers retain it through
+    /// arrival consumption.
+    _custody: crate::resource::ResourceLease,
 }
+
+/// Provider custody moved with an opaque arrival. The marker keeps the
+/// provider-specific lease private while making the public arrival move-only
+/// and lifetime-coupled to its accounting.
+struct WebRtcInboundCustody {
+    _entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+}
+
+impl crate::realtime::OpaqueInboundCustody for WebRtcInboundCustody {}
 
 impl QueuedInboundUnit {
     /// Turn one whole delivery into one whole queue entry.
@@ -320,29 +387,179 @@ impl QueuedInboundUnit {
     ///
     /// Every check a caller wants to make *before* this is a question about the
     /// label, which it can borrow while the delivery is still whole.
-    fn from_delivery(delivery: RealtimeInboundDelivery) -> Option<Self> {
+    fn from_delivery(
+        delivery: RealtimeInboundDelivery,
+        custody: crate::resource::ResourceLease,
+    ) -> Option<Self> {
         let RealtimeInboundDelivery {
             label,
             unit,
             payload,
         } = delivery;
+        let payload = payload?;
+        let label_copy = payload.reserve_supplemental_output(label.name().as_bytes().len())?;
         Some(Self {
             label,
             unit,
-            _payload: payload?,
+            opaque: None,
+            _payload: payload,
+            _label_copy: label_copy,
+            _custody: custody,
+        })
+    }
+
+    fn from_opaque(
+        label: RealtimeFlowLabel,
+        mode: crate::realtime::OpaqueFlowMode,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        bytes: Bytes,
+        payload: RealtimePayloadLease,
+        custody: crate::resource::ResourceLease,
+    ) -> Option<Self> {
+        let label_copy = payload.reserve_supplemental_output(label.name().as_bytes().len())?;
+        Some(Self {
+            label,
+            // The opaque reader consumes `bytes` directly and never exposes
+            // RTP timestamp/marker fields. These inert values retain the one
+            // existing inbound queue type without fabricating media meaning.
+            unit: RealtimeRecvUnit {
+                timestamp: 0,
+                marker: false,
+                data: bytes,
+            },
+            opaque: Some((mode, coordinate)),
+            _payload: payload,
+            _label_copy: label_copy,
+            _custody: custody,
         })
     }
 }
 
 /// The reader an inbound consumer awaits: one whole unit per arrival.
 ///
-/// A wrapper rather than the raw stream reader, so the payload lease inside a
-/// queued arrival never reaches a caller. Taking an arrival hands out the label
-/// and the unit and releases the lease here, which is where the bytes stop
-/// being this session's to account for.
+/// A wrapper rather than the raw stream reader, so the payload and label-copy
+/// leases inside a queued arrival remain attached to the move-only provider
+/// arrival until that arrival is dropped.
+/// One item from the session's single inbound consumer.
+///
+/// The queue entry stays attached to the opaque variant until the application
+/// drops its arrival. RTP keeps the historical provider handoff (the unit is
+/// copied into the provider DTO), while the opaque path must retain its queue
+/// node because its public arrival is move-only and can outlive dequeue.
+pub(super) enum SessionInboundArrival {
+    Rtp {
+        entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    },
+    Opaque {
+        entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    },
+}
+
+impl SessionInboundArrival {
+    pub(super) fn into_provider_event(self) -> crate::transport::webrtc::RealtimeInboundArrival {
+        match self {
+            Self::Rtp { entry } => crate::transport::webrtc::RealtimeInboundArrival::Rtp(
+                RealtimeInboundArrivals::into_rtp_arrival(entry)
+                    .expect("tagged RTP entry carries RTP metadata"),
+            ),
+            Self::Opaque { entry } => {
+                // The entry becomes the opaque arrival's private custody. It
+                // is not dropped at this handoff, so queue-node and payload
+                // leases cover the public Bytes/label copies until consume.
+                crate::transport::webrtc::RealtimeInboundArrival::Opaque(
+                    RealtimeInboundArrivals::into_opaque(entry)
+                        .expect("tagged opaque entry carries opaque metadata"),
+                )
+            }
+        }
+    }
+}
+
 pub(crate) struct RealtimeInboundArrivals(SessionStreamReader<QueuedInboundUnit>);
 
 impl RealtimeInboundArrivals {
+    fn entry_is_opaque(
+        entry: &crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    ) -> bool {
+        entry.value().opaque.is_some()
+    }
+
+    #[cfg(test)]
+    fn into_rtp(
+        entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    ) -> Option<(RealtimeFlowLabel, RealtimeRecvUnit)> {
+        if Self::entry_is_opaque(&entry) {
+            return None;
+        }
+        let value = entry.value();
+        Some((
+            value.label.clone(),
+            RealtimeRecvUnit {
+                timestamp: value.unit.timestamp,
+                marker: value.unit.marker,
+                data: value.unit.data.clone(),
+            },
+        ))
+    }
+
+    fn into_rtp_arrival(
+        entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    ) -> Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival> {
+        if Self::entry_is_opaque(&entry) {
+            return None;
+        }
+        let value = entry.value();
+        Some(
+            crate::transport::webrtc::WebRtcRealtimeInboundArrival::with_custody(
+                value.label.name().as_bytes().to_vec(),
+                crate::transport::webrtc::WebRtcRealtimeInboundUnit {
+                    rtp_timestamp: value.unit.timestamp,
+                    marker: value.unit.marker,
+                    data: value.unit.data.clone(),
+                },
+                Box::new(WebRtcInboundCustody { _entry: entry }),
+            ),
+        )
+    }
+
+    fn into_opaque(
+        entry: crate::resource::queue::LeasedQueueEntry<QueuedInboundUnit>,
+    ) -> Option<crate::realtime::OpaqueInboundArrival> {
+        let value = entry.value();
+        value.opaque.as_ref()?;
+        // The queue entry is deliberately moved into custody before the
+        // provider-facing Bytes copy escapes. Its payload and node leases
+        // therefore remain live for the complete arrival lifetime.
+        let label = value.label.name().as_bytes().to_vec();
+        let bytes = value.unit.data.clone();
+        Some(crate::realtime::OpaqueInboundArrival {
+            label,
+            bytes,
+            _custody: Some(Box::new(WebRtcInboundCustody { _entry: entry })),
+        })
+    }
+
+    /// Consume the next item without filtering either kind. This is the
+    /// lossless seam for mixed RTP/opaque sessions.
+    pub(super) async fn next_arrival(&self) -> Option<SessionInboundArrival> {
+        let entry = self.0.next_owned().await?;
+        if Self::entry_is_opaque(&entry) {
+            Some(SessionInboundArrival::Opaque { entry })
+        } else {
+            Some(SessionInboundArrival::Rtp { entry })
+        }
+    }
+
+    /// Cross the provider boundary only after converting the private tagged
+    /// queue entry into the public, custody-carrying arrival type.
+    pub(crate) async fn next_provider_arrival(
+        &self,
+    ) -> Option<crate::transport::webrtc::RealtimeInboundArrival> {
+        self.next_arrival()
+            .await
+            .map(SessionInboundArrival::into_provider_event)
+    }
+
     /// The next unit to arrive on any inbound flow of this session.
     ///
     /// `None` is terminal and means the flow set is gone. Nothing else can
@@ -350,9 +567,48 @@ impl RealtimeInboundArrivals {
     /// past a replacement observes that end rather than the replacement's
     /// units. There is no name to re-resolve and therefore no window in which a
     /// name could resolve to something else.
+    #[cfg(test)]
     pub(crate) async fn next(&self) -> Option<(RealtimeFlowLabel, RealtimeRecvUnit)> {
-        let arrival = self.0.next().await?;
-        Some((arrival.label, arrival.unit))
+        let entry = self
+            .0
+            .next_owned_if(|item| item.opaque.is_none())
+            .await
+            .ok()
+            .flatten()?;
+        Self::into_rtp(entry)
+    }
+
+    /// The next RTP item, refusing without dequeue when an opaque item is at
+    /// the head. The queue's predicate and pop run under one lock.
+    pub(crate) async fn next_rtp(
+        &self,
+    ) -> std::result::Result<
+        Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        let entry = self
+            .0
+            .next_owned_if(|item| item.opaque.is_none())
+            .await
+            .map_err(|_| crate::realtime::RealtimeRefusal::FlowRefused)?;
+        Ok(entry.and_then(Self::into_rtp_arrival))
+    }
+
+    /// The next opaque body from this same session-owned stream. An RTP head is
+    /// a typed mismatch and remains queued for the tagged reader; it is never
+    /// skipped or discarded.
+    pub(crate) async fn next_opaque(
+        &self,
+    ) -> std::result::Result<
+        Option<crate::realtime::OpaqueInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        let entry = self
+            .0
+            .next_owned_if(|item| item.opaque.is_some())
+            .await
+            .map_err(|_| crate::realtime::RealtimeRefusal::FlowRefused)?;
+        Ok(entry.and_then(Self::into_opaque))
     }
 
     /// Take whatever is queued right now, without waiting.
@@ -381,8 +637,38 @@ impl RealtimeInboundArrivals {
     /// none either.
     #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) fn try_next(&self) -> Option<(RealtimeFlowLabel, RealtimeRecvUnit)> {
-        let arrival = self.0.try_next()?;
-        Some((arrival.label, arrival.unit))
+        let entry = self
+            .0
+            .try_next_owned_if(|item| item.opaque.is_none())
+            .ok()
+            .flatten()?;
+        Self::into_rtp(entry)
+    }
+}
+
+/// Shared, funded witness for native work that outlives a logical flow record.
+/// The state is rooted in the existing flow-set lifetime; each actual pump or
+/// retirement carries one task lease and drops it only after native work ends.
+pub(crate) struct RealtimeNativeTailState {
+    outstanding: std::sync::atomic::AtomicUsize,
+    _root: crate::resource::ResourceLease,
+}
+
+/// One native tail's owned scheduling claim.  It is deliberately move-only:
+/// dropping a caller's close receipt must not make an in-flight native task
+/// disappear from the flow-set quiescence proof.
+pub(super) struct RealtimeNativeTail {
+    state: Arc<RealtimeNativeTailState>,
+    _task: crate::resource::ResourceLease,
+}
+
+impl Drop for RealtimeNativeTail {
+    fn drop(&mut self) {
+        let previous = self
+            .state
+            .outstanding
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "native tail witness count underflow");
     }
 }
 
@@ -501,6 +787,13 @@ pub(crate) struct SessionRealtimeFlows {
     /// connector that registered them and released by whichever holder drops
     /// last.
     profile: Option<LeasedRealtimeProfile>,
+    /// Lazily allocated only when a native tail exists. The state allocation
+    /// owns its lease, and each tail owns a separate worker/task lease.
+    native_tail_state: Option<Arc<RealtimeNativeTailState>>,
+    /// Monotonic wire-coordinate source for logical opaque flows. It is a
+    /// scalar on the existing flow set, not an index or authority table;
+    /// closed records cannot be rebound by a stale coordinate.
+    next_opaque_flow_id: u64,
 }
 
 impl SessionRealtimeFlows {
@@ -524,7 +817,37 @@ impl SessionRealtimeFlows {
             profile,
             arrivals: Arc::new(SessionStream::new()),
             bindings: Arc::new(RealtimeInboundBindings::default()),
+            next_opaque_flow_id: 1,
+            native_tail_state: None,
         }
+    }
+
+    /// Acquire the exact native tail witness before publishing a pump or
+    /// retirement. The state allocation is shared by this flow set and any
+    /// delayed native owner; the task lease remains with the actual owner.
+    fn acquire_native_tail(&mut self) -> FlowResult<RealtimeNativeTail> {
+        let state = if let Some(state) = self.native_tail_state.as_ref() {
+            Arc::clone(state)
+        } else {
+            let root = self
+                .registry
+                .acquire_native_tail_state()
+                .map_err(realtime_drop_refusal)?;
+            let state = Arc::new(RealtimeNativeTailState {
+                outstanding: std::sync::atomic::AtomicUsize::new(0),
+                _root: root,
+            });
+            self.native_tail_state = Some(Arc::clone(&state));
+            state
+        };
+        let task = self
+            .registry
+            .acquire_native_tail()
+            .map_err(realtime_drop_refusal)?;
+        state
+            .outstanding
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(RealtimeNativeTail { state, _task: task })
     }
 
     /// The heap roots one promotion allocates for a session's flow set.
@@ -759,6 +1082,860 @@ impl SessionRealtimeFlows {
         Ok(name)
     }
 
+    /// Open one logical opaque flow against the same leased flow map used by
+    /// RTP. The native reliable/partial lane is selected by the worker; this
+    /// operation allocates only the logical flow record and its existing flow
+    /// leases.
+    pub(crate) fn prepare_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        spec: OpaqueFlowSpec,
+    ) -> FlowResult<RealtimeFlowName> {
+        if self.flows.contains_key(spec.name.as_bytes()) {
+            return Err(RealtimeFlowError::LabelInUse);
+        }
+        let coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: self.next_opaque_flow_id,
+            generation: 1,
+        };
+        coordinate
+            .validate()
+            .map_err(|_| RealtimeFlowError::FlowRefused)?;
+        let registry = Arc::clone(&self.registry);
+        let application_claim = registry
+            .acquire_opaque_application_claim()
+            .map_err(realtime_drop_refusal)?;
+        self.open_opaque_with_coordinate(session, live, spec, coordinate, Some(application_claim))
+    }
+
+    /// Prepare a local opaque flow, or claim a matching transport-only record
+    /// created by the peer, using the one authoritative flow map. A remote
+    /// Open is not application authority: its record has no application claim
+    /// until this exact current-session operation supplies one.
+    ///
+    /// `true` means an existing record was claimed; `false` means a new local
+    /// pending record was created with its claim already attached. Matching is
+    /// against the existing record's raw label, local direction, mode and
+    /// ceiling. The retained opener-relative direction is deliberately not
+    /// compared with the local request.
+    pub(crate) fn prepare_or_claim_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        spec: OpaqueFlowSpec,
+    ) -> FlowResult<(RealtimeFlowName, bool)> {
+        if let Some(flow) = self.flows.get(spec.name.as_bytes()) {
+            flow.port_if_current(session, live)?;
+            if flow.opaque_mode() != Some(spec.mode)
+                || flow.opaque_max_unit_bytes() != Some(spec.max_unit_bytes)
+                || flow.direction() != spec.direction
+                || flow.opaque_application_claim.is_some()
+            {
+                return Err(RealtimeFlowError::FlowRefused);
+            }
+            let name = flow.label().name().clone();
+            let claim = self
+                .registry
+                .acquire_opaque_application_claim()
+                .map_err(realtime_drop_refusal)?;
+            let flow = self
+                .flows
+                .get_mut(name.as_bytes())
+                .ok_or(RealtimeFlowError::FlowRefused)?;
+            if flow.opaque_application_claim.is_some()
+                || flow.port_if_current(session, live).is_err()
+            {
+                return Err(RealtimeFlowError::FlowRefused);
+            }
+            flow.opaque_application_claim = Some(claim);
+            return Ok((name, true));
+        }
+
+        let name = self.prepare_opaque(session, live, spec)?;
+        // A newly prepared local record has already reserved its application
+        // claim in `prepare_opaque`; the bool distinguishes it from the
+        // existing-record branch without exposing another identity table.
+        Ok((name, false))
+    }
+
+    /// Convenience for a locally committed flow where the surrounding engine
+    /// has already completed its control transaction. The explicit prepare /
+    /// accept methods are used when Open/Accept crosses the wire.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn open_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        spec: OpaqueFlowSpec,
+    ) -> FlowResult<RealtimeFlowName> {
+        let mode = spec.mode;
+        let max_unit_bytes = spec.max_unit_bytes;
+        let name = self.prepare_opaque(session, live, spec)?;
+        let coordinate = self
+            .opaque_coordinate(&name)
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        self.accept_opaque(session, live, &name, coordinate, mode, max_unit_bytes)?;
+        Ok(name)
+    }
+
+    /// Open a logical opaque record with a control-plane coordinate already
+    /// selected by the authenticated session's Open/Change transaction.
+    /// Coordinate lookup remains on the existing flow records; this method
+    /// does not create a second map.
+    pub(crate) fn open_opaque_with_coordinate(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        spec: OpaqueFlowSpec,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        application_claim: Option<crate::resource::ResourceLease>,
+    ) -> FlowResult<RealtimeFlowName> {
+        coordinate
+            .validate()
+            .map_err(|_| RealtimeFlowError::FlowRefused)?;
+        if self.flows.contains_key(spec.name.as_bytes()) {
+            return Err(RealtimeFlowError::LabelInUse);
+        }
+        let mut coordinate_in_use = false;
+        self.flows.for_each(|_, flow| {
+            if flow.opaque_coordinate() == Some(coordinate)
+                && flow.opaque_opener_direction() == Some(spec.opener_direction)
+            {
+                coordinate_in_use = true;
+            }
+        });
+        if coordinate_in_use {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let next_opaque_flow_id = if coordinate.flow_id >= self.next_opaque_flow_id {
+            Some(
+                coordinate
+                    .flow_id
+                    .checked_add(1)
+                    .ok_or(RealtimeFlowError::FlowRefused)?,
+            )
+        } else {
+            None
+        };
+        let registry = Arc::clone(&self.registry);
+        let (flow, map_entry) = open_opaque_flow(
+            session,
+            live,
+            &registry,
+            spec,
+            coordinate,
+            application_claim,
+        )?;
+        let label = flow.label().clone();
+        let name = label.name().clone();
+        // The coordinate is part of the flow record's kind. The constructor
+        // receives it through the provider helper, so this check prevents a
+        // future caller from accidentally inserting a differently-coordinate
+        // record under the accepted label.
+        if flow.opaque_coordinate() != Some(coordinate) {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        if self.flows.insert(label, flow, map_entry).is_err() {
+            return Err(RealtimeFlowError::LabelInUse);
+        }
+        if let Some(next_opaque_flow_id) = next_opaque_flow_id {
+            self.next_opaque_flow_id = next_opaque_flow_id;
+        }
+        Ok(name)
+    }
+
+    /// Return the exact wire coordinate stored on this flow record.
+    pub(crate) fn opaque_coordinate(
+        &self,
+        name: &RealtimeFlowName,
+    ) -> Option<crate::protocol::ApplicationFlowCoordinate> {
+        self.flows
+            .get(name.as_bytes())
+            .and_then(RealtimeFlow::opaque_coordinate)
+    }
+
+    /// Return the opener-relative direction from the exact existing record.
+    /// This is a copied scalar read and does not reverse-index by allocating a
+    /// temporary label, so close/control paths cannot mistake a successor for
+    /// the captured flow.
+    pub(crate) fn opaque_opener_direction(
+        &self,
+        name: &RealtimeFlowName,
+    ) -> Option<crate::realtime::RealtimeFlowDirection> {
+        self.flows
+            .get(name.as_bytes())
+            .and_then(RealtimeFlow::opaque_opener_direction)
+    }
+
+    /// The exact readiness wake owned by one pending flow record.
+    /// Return a safe awaitable for the exact pending record without exposing
+    /// the provider's raw funded wake or its Notify operation.
+    pub(crate) fn opaque_pending_wait(
+        &self,
+        name: &RealtimeFlowName,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+    ) -> Option<OpaquePendingWait> {
+        let flow = self.flows.get(name.as_bytes())?;
+        if flow.opaque_coordinate()? != coordinate || flow.opaque_is_ready()? {
+            return None;
+        }
+        Some(OpaquePendingWait(flow.end.watch()))
+    }
+
+    /// Return the existing flow-end wake for one exact staged Change.  A
+    /// Change keeps its predecessor logically ready, so the ordinary Open
+    /// pending wait cannot represent this state.  The token identity and all
+    /// staged fields are checked before borrowing the wake; a confirmed or
+    /// canceled token returns `None` so callers commit/reconcile immediately
+    /// rather than registering a waiter that can never be notified.
+    pub(crate) fn opaque_change_wait(
+        &self,
+        name: &RealtimeFlowName,
+        change: &OpaqueFlowChange,
+    ) -> Option<OpaquePendingWait> {
+        if change.finished {
+            return None;
+        }
+        let flow = self.flows.get(name.as_bytes())?;
+        if !flow.label().is_identity(&change.identity)
+            || flow.opaque_coordinate() != Some(change.previous)
+            || flow.opaque_mode() != Some(change.mode)
+            || flow.opaque_opener_direction() != Some(change.opener_direction)
+            || flow.opaque_is_ready() != Some(true)
+        {
+            return None;
+        }
+        let pending = flow.opaque_pending_change.as_ref()?;
+        if !pending.active.is_active()
+            || pending.confirmed
+            || pending.previous != change.previous
+            || pending.coordinate != change.coordinate
+            || pending.opener_direction != change.opener_direction
+            || pending.mode != change.mode
+            || pending.max_unit_bytes != change.max_unit_bytes
+        {
+            return None;
+        }
+        Some(OpaquePendingWait(flow.end.watch()))
+    }
+
+    /// Read exact readiness without conflating a missing record with a
+    /// pending one. The coordinate is checked against the existing flow record
+    /// before the state is returned.
+    pub(crate) fn opaque_ready(
+        &self,
+        name: &RealtimeFlowName,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+    ) -> Option<bool> {
+        let flow = self.flows.get(name.as_bytes())?;
+        if flow.opaque_coordinate() == Some(coordinate) {
+            flow.opaque_is_ready()
+        } else {
+            None
+        }
+    }
+
+    /// Read the one application-claim bit on the existing flow record.
+    /// Remote transport admission leaves this false; only the exact local
+    /// claim operation may turn it on.
+    pub(crate) fn opaque_is_claimed(&self, name: &RealtimeFlowName) -> Option<bool> {
+        self.flows
+            .get(name.as_bytes())
+            .map(|flow| flow.opaque_application_claim.is_some())
+    }
+
+    /// Locate an exact control record, including a still-pending Open. This is
+    /// intentionally separate from frame lookup, which admits only ready
+    /// records and also checks mode/body bounds.
+    pub(crate) fn opaque_name_for_control(
+        &self,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+    ) -> Option<RealtimeFlowName> {
+        let mut found = None;
+        self.flows.for_each(|label, flow| {
+            if found.is_none()
+                && flow.opaque_coordinate() == Some(coordinate)
+                && flow.opaque_opener_direction() == Some(opener_direction)
+            {
+                found = Some(label.name().clone());
+            }
+        });
+        found
+    }
+
+    /// Commit an echoed Accept to the exact pending record. The mode and body
+    /// ceiling must match the prepared record; no new lease or flow is created.
+    pub(crate) fn accept_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        mode: crate::realtime::OpaqueFlowMode,
+        max_unit_bytes: usize,
+    ) -> FlowResult<()> {
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        let Some(pending) = flow.opaque_pending.as_ref() else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        if pending.coordinate != coordinate
+            || pending.mode != mode
+            || pending.max_unit_bytes != max_unit_bytes
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        if let Some(pending) = flow.opaque_pending.as_mut() {
+            pending.ready = true;
+            flow.end.notify().notify().notify_waiters();
+            Ok(())
+        } else {
+            Err(RealtimeFlowError::FlowRefused)
+        }
+    }
+
+    /// Claim the one persistent outbound pump for a ready opaque record. The
+    /// caller receives the pump and its completion sender, while the flow
+    /// retains the matching receiver as its ordinary native remainder.
+    pub(crate) fn attach_opaque_pump(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+    ) -> FlowResult<(OpaqueOutboundPump, tokio::sync::oneshot::Sender<()>)> {
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if flow.opaque_is_ready() != Some(true)
+            || flow.opaque_application_claim.is_none()
+            || flow
+                .opaque_pending_change
+                .as_ref()
+                .is_some_and(|pending| pending.active.is_active())
+            || flow.direction() != RealtimeDirection::Outbound
+            || !matches!(flow.native, RealtimeFlowRemains::None)
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let FlowQueue::OpaqueOutbound(queue) = &flow.queue else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        let queue = Arc::clone(queue);
+        let tail = self.acquire_native_tail()?;
+        if !queue.claim_pump() {
+            drop(tail);
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let pump = OpaqueOutboundPump {
+            queue: Arc::downgrade(&queue),
+            ready: queue.ready(),
+            _tail: tail,
+        };
+        let (retired, remains) = tokio::sync::oneshot::channel();
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.native = RealtimeFlowRemains::Outbound(remains);
+        Ok((pump, retired))
+    }
+
+    /// Cancel only the exact still-pending record. A ready flow must use the
+    /// normal handle close path so its ownership and native remainder follow
+    /// the same fence as every other flow.
+    pub(crate) fn cancel_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+    ) -> FlowResult<RealtimeFlowRemains> {
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if flow.opaque_coordinate() != Some(coordinate) || flow.opaque_is_ready() != Some(false) {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        self.close(session, live, name)
+    }
+
+    /// Stage a provider-side Change on the exact predecessor record.
+    ///
+    /// The pending scalar lives on the flow itself, while the returned token
+    /// carries the record identity across the asynchronous control exchange.
+    /// A label reuse therefore cannot make a delayed Accept operate on a
+    /// successor.  A claimed outbound pump may remain attached, but the
+    /// queue and its actual in-flight counter must be quiescent; changing a
+    /// record never discards accepted work.
+    // Keep session, incarnation, predecessor, staged coordinate, direction,
+    // mode, and ceiling explicit at this authority boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_opaque_change(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        previous: crate::protocol::ApplicationFlowCoordinate,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        max_unit_bytes: usize,
+    ) -> FlowResult<OpaqueFlowChange> {
+        // A dropped caller token marks its record state canceled. Reap that
+        // inert state lazily under this same map fence before preparing a new
+        // transaction; an abandoned token therefore cannot block the label
+        // forever or be mistaken for a live Change.
+        let canceled = self
+            .flows
+            .get(name.as_bytes())
+            .and_then(|flow| flow.opaque_pending_change.as_ref())
+            .is_some_and(|pending| !pending.active.is_active());
+        if canceled {
+            if let Some(flow) = self.flows.get_mut(name.as_bytes()) {
+                flow.opaque_pending_change = None;
+            }
+        }
+        coordinate
+            .validate()
+            .map_err(|_| RealtimeFlowError::FlowRefused)?;
+        if coordinate.flow_id != previous.flow_id
+            || previous.generation.checked_add(1) != Some(coordinate.generation)
+            || max_unit_bytes == 0
+            || max_unit_bytes > crate::realtime::MAX_OPAQUE_FLOW_UNIT_BYTES
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if !matches!(
+            &flow.kind,
+            RealtimeFlowKind::Opaque {
+                coordinate: current,
+                mode: current_mode,
+                opener_direction: current_opener,
+                ..
+            } if *current == previous && *current_mode == mode && *current_opener == opener_direction
+        ) || flow.opaque_is_ready() != Some(true)
+            || flow
+                .opaque_pending_change
+                .as_ref()
+                .is_some_and(|pending| pending.active.is_active())
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let queue = match &flow.queue {
+            FlowQueue::OpaqueOutbound(queue) => queue,
+            FlowQueue::Inbound => {
+                let identity = flow.label().identity();
+                if self
+                    .arrivals
+                    .contains(|item| item.opaque.is_some() && item.label.is_identity(&identity))
+                {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+                let active = flow
+                    .opaque_pending_change
+                    .as_ref()
+                    .is_some_and(|pending| pending.active.is_active());
+                if active {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+                let identity = flow.label().identity();
+                let claim = self
+                    .registry
+                    .acquire_opaque_change()
+                    .map_err(realtime_drop_refusal)?;
+                // The marker's allocation is part of the change claim.  Take
+                // that claim before constructing the Arc so a refusal cannot
+                // leave an unfunded cancellation state behind.
+                let active = Arc::new(OpaqueChangeMarker {
+                    active: std::sync::atomic::AtomicBool::new(true),
+                    _root: claim,
+                });
+                let flow = self
+                    .flows
+                    .get_mut(name.as_bytes())
+                    .ok_or(RealtimeFlowError::FlowRefused)?;
+                if flow.opaque_pending_change.is_some() {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+                flow.opaque_pending_change = Some(OpaqueFlowPendingChange {
+                    previous,
+                    coordinate,
+                    opener_direction,
+                    mode,
+                    max_unit_bytes,
+                    active: Arc::clone(&active),
+                    confirmed: false,
+                });
+                return Ok(OpaqueFlowChange {
+                    identity,
+                    previous,
+                    coordinate,
+                    opener_direction,
+                    mode,
+                    max_unit_bytes,
+                    active,
+                    finished: false,
+                });
+            }
+            FlowQueue::Outbound(_) => return Err(RealtimeFlowError::FlowRefused),
+        };
+        if !queue.is_empty() || queue.in_flight() != 0 || queue.is_failed() {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let identity = flow.label().identity();
+        let claim = self
+            .registry
+            .acquire_opaque_change()
+            .map_err(realtime_drop_refusal)?;
+        // The marker's allocation is part of the change claim.  Take that
+        // claim before constructing the Arc so a refusal cannot leave an
+        // unfunded cancellation state behind.
+        let active = Arc::new(OpaqueChangeMarker {
+            active: std::sync::atomic::AtomicBool::new(true),
+            _root: claim,
+        });
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        if flow
+            .opaque_pending_change
+            .as_ref()
+            .is_some_and(|pending| pending.active.is_active())
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        flow.opaque_pending_change = Some(OpaqueFlowPendingChange {
+            previous,
+            coordinate,
+            opener_direction,
+            mode,
+            max_unit_bytes,
+            active: Arc::clone(&active),
+            confirmed: false,
+        });
+        Ok(OpaqueFlowChange {
+            identity,
+            previous,
+            coordinate,
+            opener_direction,
+            mode,
+            max_unit_bytes,
+            active,
+            finished: false,
+        })
+    }
+
+    /// Commit a previously staged Change after the peer's exact Accept.
+    /// Revalidates session, record identity, mode, queue and in-flight state
+    /// before changing the existing record's coordinate and ceiling.
+    pub(crate) fn commit_opaque_change(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        change: &mut OpaqueFlowChange,
+    ) -> FlowResult<()> {
+        if change.finished {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if !flow.label().is_identity(&change.identity)
+            || !matches!(
+                &flow.kind,
+                RealtimeFlowKind::Opaque {
+                    coordinate: current,
+                    mode,
+                    opener_direction,
+                    ..
+                } if *current == change.previous
+                    && *mode == change.mode
+                    && *opener_direction == change.opener_direction
+            )
+            || flow.opaque_is_ready() != Some(true)
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        match &flow.queue {
+            FlowQueue::OpaqueOutbound(queue)
+                if !queue.is_empty() || queue.in_flight() != 0 || queue.is_failed() =>
+            {
+                return Err(RealtimeFlowError::FlowRefused);
+            }
+            // An inbound record has no per-flow outbound queue. Recheck its
+            // shared arrival queue at the terminal commit as well as during
+            // prepare: a predecessor can arrive in the interleaving window,
+            // and changing the coordinate must never silently discard it.
+            FlowQueue::Inbound => {
+                let identity = flow.label().identity();
+                if self
+                    .arrivals
+                    .contains(|item| item.opaque.is_some() && item.label.is_identity(&identity))
+                {
+                    return Err(RealtimeFlowError::FlowRefused);
+                }
+            }
+            FlowQueue::OpaqueOutbound(_) => {}
+            FlowQueue::Outbound(_) => return Err(RealtimeFlowError::FlowRefused),
+        }
+        if !matches!(
+            flow.opaque_pending_change.as_ref(),
+            Some(pending)
+                if pending.previous == change.previous
+                    && pending.coordinate == change.coordinate
+                    && pending.mode == change.mode
+                    && pending.max_unit_bytes == change.max_unit_bytes
+                    && pending.opener_direction == change.opener_direction
+                    && pending.confirmed
+        ) {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        if let RealtimeFlowKind::Opaque {
+            coordinate: current,
+            max_unit_bytes: ceiling,
+            ..
+        } = &mut flow.kind
+        {
+            *current = change.coordinate;
+            *ceiling = change.max_unit_bytes;
+        } else {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        if let Some(pending) = flow.opaque_pending_change.as_mut() {
+            pending.active.cancel();
+        }
+        flow.opaque_pending_change = None;
+        change.finished = true;
+        Ok(())
+    }
+
+    /// Confirm the exact staged Change from the authenticated peer control
+    /// path.  The reducer does not receive the caller's move-only token, so
+    /// confirmation is recorded on the same flow record; the token's commit
+    /// must still revalidate that tuple and identity before mutation.
+    // Keep the authenticated tuple explicit at this reducer boundary; these
+    // are the fields that must be compared before confirmation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn confirm_opaque_change(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        previous: crate::protocol::ApplicationFlowCoordinate,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        max_unit_bytes: usize,
+    ) -> FlowResult<()> {
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if !matches!(
+            &flow.kind,
+            RealtimeFlowKind::Opaque {
+                coordinate: current,
+                mode: current_mode,
+                opener_direction: current_opener,
+                ..
+            } if *current == previous
+                && *current_mode == mode
+                && *current_opener == opener_direction
+        ) || flow.opaque_is_ready() != Some(true)
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        match &flow.queue {
+            FlowQueue::OpaqueOutbound(queue)
+                if !queue.is_empty() || queue.in_flight() != 0 || queue.is_failed() =>
+            {
+                return Err(RealtimeFlowError::FlowRefused);
+            }
+            FlowQueue::Inbound => {}
+            FlowQueue::OpaqueOutbound(_) => {}
+            FlowQueue::Outbound(_) => return Err(RealtimeFlowError::FlowRefused),
+        }
+        let Some(pending) = flow.opaque_pending_change.as_ref() else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        if !pending.active.is_active()
+            || pending.confirmed
+            || pending.previous != previous
+            || pending.coordinate != coordinate
+            || pending.opener_direction != opener_direction
+            || pending.mode != mode
+            || pending.max_unit_bytes != max_unit_bytes
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        let Some(pending) = flow.opaque_pending_change.as_mut() else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        pending.confirmed = true;
+        flow.end.notify().notify().notify_waiters();
+        Ok(())
+    }
+
+    /// Cancel a staged Change without mutating the predecessor. Exact flow
+    /// identity and pending values are checked before the record is cleared.
+    pub(crate) fn rollback_opaque_change(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        change: &mut OpaqueFlowChange,
+    ) -> FlowResult<()> {
+        if change.finished {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        flow.port_if_current(session, live)?;
+        if !flow.label().is_identity(&change.identity)
+            || !matches!(
+                &flow.kind,
+                RealtimeFlowKind::Opaque {
+                    coordinate: current,
+                    mode,
+                    opener_direction,
+                    ..
+                } if *current == change.previous
+                    && *mode == change.mode
+                    && *opener_direction == change.opener_direction
+            )
+            || !matches!(
+                flow.opaque_pending_change.as_ref(),
+                Some(pending)
+                    if pending.previous == change.previous
+                        && pending.coordinate == change.coordinate
+                        && pending.mode == change.mode
+                    && pending.max_unit_bytes == change.max_unit_bytes
+                    && pending.opener_direction == change.opener_direction
+            )
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let flow = self
+            .flows
+            .get_mut(name.as_bytes())
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        if let Some(pending) = flow.opaque_pending_change.as_ref() {
+            pending.active.cancel();
+        }
+        flow.opaque_pending_change = None;
+        change.finished = true;
+        Ok(())
+    }
+
+    /// Compatibility wrapper for callers that already hold the fence for the
+    /// entire operation. New wire controls should use explicit prepare,
+    /// commit and rollback so a peer refusal cannot leave a staged record.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn change_opaque(
+        &mut self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        previous: crate::protocol::ApplicationFlowCoordinate,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        max_unit_bytes: usize,
+    ) -> FlowResult<()> {
+        let mode = self
+            .flows
+            .get(name.as_bytes())
+            .and_then(RealtimeFlow::opaque_mode)
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        let opener_direction = self
+            .flows
+            .get(name.as_bytes())
+            .and_then(RealtimeFlow::opaque_opener_direction)
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        let mut change = self.prepare_opaque_change(
+            session,
+            live,
+            name,
+            previous,
+            coordinate,
+            opener_direction,
+            mode,
+            max_unit_bytes,
+        )?;
+        self.confirm_opaque_change(
+            session,
+            live,
+            name,
+            previous,
+            coordinate,
+            opener_direction,
+            mode,
+            max_unit_bytes,
+        )?;
+        self.commit_opaque_change(session, live, name, &mut change)
+    }
+
+    /// Resolve an incoming coordinate by scanning the one authoritative flow
+    /// map and validate its negotiated mode/body/direction before admission.
+    /// A stale coordinate cannot reach a successor that reused the label.
+    pub(crate) fn opaque_name_for_coordinate(
+        &self,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        body_len: usize,
+    ) -> Option<RealtimeFlowName> {
+        let mut found = None;
+        self.flows.for_each(|label, flow| {
+            if found.is_some()
+                || flow.opaque_coordinate() != Some(coordinate)
+                || flow.opaque_is_ready() != Some(true)
+                || flow.opaque_mode() != Some(mode)
+                || flow
+                    .opaque_max_unit_bytes()
+                    .is_none_or(|max| max < body_len)
+                || flow.direction() != RealtimeDirection::Inbound
+            {
+                return;
+            }
+            if flow.opaque_opener_direction() == Some(opener_direction) {
+                found = Some(label.name().clone());
+            }
+        });
+        found
+    }
+
     /// Record what the connector is about to negotiate for an already-open
     /// inbound flow.
     ///
@@ -787,7 +1964,7 @@ impl SessionRealtimeFlows {
         live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
         name: &RealtimeFlowName,
         identity: Arc<RealtimeTrackIdentity>,
-        retirement: RealtimeInboundRetirement,
+        mut retirement: RealtimeInboundRetirement,
     ) -> FlowResult<()> {
         let Some(flow) = self.flows.get(name.as_bytes()) else {
             return Err(RealtimeFlowError::FlowRefused);
@@ -803,17 +1980,19 @@ impl SessionRealtimeFlows {
         // a default. This is the same question `admits_encoding` answers for
         // an arriving track, asked once at bind time so both ends of the
         // decision come from one place.
+        let Some(encoding) = flow.encoding() else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
         let Some(framing) = self
             .profile
             .as_ref()
-            .and_then(|profile| profile.profile().admits_encoding(flow.encoding()))
+            .and_then(|profile| profile.profile().admits_encoding(encoding))
         else {
             return Err(RealtimeFlowError::EncodingInvalid);
         };
         // Cloned from the map's own key, so the binding shares the label's one
         // allocation and its one lease rather than minting a second.
-        let binding =
-            RealtimeInboundBinding::new(flow.label().clone(), flow.encoding().clone(), framing);
+        let binding = RealtimeInboundBinding::new(flow.label().clone(), encoding.clone(), framing);
         // The pump's two handles on this flow, taken here because this is the
         // last point at which the flow and the table are both in hand. Both are
         // non-owning in the sense that matters: the port claim cannot keep the
@@ -828,6 +2007,12 @@ impl SessionRealtimeFlows {
             .port
             .reserve_queue_record_checked::<RealtimeInboundEntry>()
             .map_err(realtime_drop_refusal)?;
+        // The retirement may outlive this flow record and even a cancelled
+        // close waiter.  Acquire its provider-owned tail before publication,
+        // then keep it inside the retirement token that owns the native stop.
+        // Explicit and implicit teardown therefore share one quiescence fact.
+        let native_tail = self.acquire_native_tail()?;
+        retirement.attach_native_tail(native_tail);
         if !self.bindings.bind(
             Arc::clone(&identity),
             RealtimeDirection::Inbound,
@@ -890,14 +2075,24 @@ impl SessionRealtimeFlows {
         let FlowQueue::Outbound(queue) = &flow.queue else {
             return Err((RealtimeFlowError::FlowRefused, track));
         };
+        let queue = Arc::clone(queue);
+        // Acquire the tail before consuming the queue's one pump claim.  A
+        // refusal must return the native track with both provider and pump
+        // ownership untouched.
+        let tail = match self.acquire_native_tail() {
+            Ok(tail) => tail,
+            Err(_) => return Err((RealtimeFlowError::FlowRefused, track)),
+        };
         // Last, and only once nothing else can refuse: a queue issues exactly
         // one pump, and a consumed claim cannot be handed back with the track.
         if !queue.claim_pump() {
+            drop(tail);
             return Err((RealtimeFlowError::FlowRefused, track));
         }
         let pump = RealtimeOutboundPump {
-            queue: Arc::downgrade(queue),
+            queue: Arc::downgrade(&queue),
             ready: queue.ready(),
+            _tail: Some(tail),
         };
         // The pump task owns the track from here, and is the only thing that
         // may retire it. That is what makes teardown mechanical: the flow drops,
@@ -942,6 +2137,16 @@ impl SessionRealtimeFlows {
             return Err(RealtimeFlowError::FlowRefused);
         };
         flow.port_if_current(session, live)?;
+        if flow
+            .opaque_pending_change
+            .as_ref()
+            .is_some_and(|pending| pending.active.is_active())
+        {
+            // A live Change token owns the only safe terminal decision.  Do
+            // not drop its record and release its marker funding underneath
+            // the pending control exchange.
+            return Err(RealtimeFlowError::FlowRefused);
+        }
         // Order matters: take the flow out first, then release the label. The
         // label is only free once nothing holds the flow it named. The gate
         // above has already passed, so this removal cannot be the mutation of a
@@ -1031,6 +2236,113 @@ impl SessionRealtimeFlows {
             .map_err(realtime_drop_refusal)?;
         queue.push(unit, output.into_payload_lease(), record);
         Ok(())
+    }
+
+    /// Queue one application-owned opaque body on an exact current flow.
+    /// Admission is synchronous under the flow-set fence: the body and queue
+    /// record are funded before the unit is retained, and a stale handle or a
+    /// body above the negotiated ceiling is refused without mutation.
+    pub(crate) fn send_opaque(
+        &self,
+        session: &impl RealtimeSessionBinding,
+        live: Option<&Arc<crate::connector::ConnectorIncarnation>>,
+        name: &RealtimeFlowName,
+        bytes: Bytes,
+    ) -> FlowResult<()> {
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        let port = flow.port_if_current(session, live)?;
+        let Some(max_unit_bytes) = flow.opaque_max_unit_bytes() else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        if flow.opaque_is_ready() != Some(true)
+            || flow.opaque_application_claim.is_none()
+            || flow.direction() != RealtimeDirection::Outbound
+            || bytes.len() > max_unit_bytes
+            || flow
+                .opaque_pending_change
+                .as_ref()
+                .is_some_and(|pending| pending.active.is_active())
+        {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let FlowQueue::OpaqueOutbound(queue) = &flow.queue else {
+            return Err(RealtimeFlowError::FlowRefused);
+        };
+        if queue.is_failed() {
+            return Err(RealtimeFlowError::FlowRefused);
+        }
+        let output = port
+            .reserve_output_checked(bytes.len())
+            .map_err(realtime_drop_refusal)?;
+        let record = port
+            .reserve_queue_record_checked::<QueuedUnit<OpaqueSendUnit>>()
+            .map_err(realtime_drop_refusal)?;
+        let mode = flow.opaque_mode().ok_or(RealtimeFlowError::FlowRefused)?;
+        let coordinate = flow
+            .opaque_coordinate()
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        let opener_direction = flow
+            .opaque_opener_direction()
+            .ok_or(RealtimeFlowError::FlowRefused)?;
+        queue.push(
+            OpaqueSendUnit {
+                data: bytes,
+                mode,
+                direction: opener_direction,
+                coordinate,
+                max_unit_bytes,
+            },
+            output.into_payload_lease(),
+            record,
+        );
+        Ok(())
+    }
+
+    /// Admit a body received from a trusted native opaque lane. The coordinate
+    /// is matched against the current flow record, not its reusable label, so a
+    /// frame from a closed predecessor cannot reach a successor.
+    pub(crate) fn deliver_opaque(
+        &self,
+        coordinate: crate::protocol::ApplicationFlowCoordinate,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        bytes: Bytes,
+    ) -> bool {
+        let Some(name) =
+            self.opaque_name_for_coordinate(coordinate, opener_direction, mode, bytes.len())
+        else {
+            return false;
+        };
+        let Some(flow) = self.flows.get(name.as_bytes()) else {
+            return false;
+        };
+        let Ok(custody) = flow.port.reserve_boxed_checked::<WebRtcInboundCustody>() else {
+            return false;
+        };
+        let label = flow.label().clone();
+        let Some(payload) = flow.port.reserve_output(bytes.len()) else {
+            return false;
+        };
+        let Ok(record) = flow
+            .port
+            .reserve_queue_record_checked::<QueuedInboundUnit>()
+        else {
+            return false;
+        };
+        let Some(queued) = QueuedInboundUnit::from_opaque(
+            label.clone(),
+            mode,
+            coordinate,
+            bytes,
+            payload.into_payload_lease(),
+            custody,
+        ) else {
+            return false;
+        };
+        self.arrivals.push(queued, record);
+        true
     }
 
     /// **Controls only.** One delivery accounted against `label`'s flow,
@@ -1168,6 +2480,9 @@ impl SessionRealtimeFlows {
         if !matches!(flow.queue, FlowQueue::Inbound) {
             return false;
         }
+        let Ok(custody) = flow.port.reserve_boxed_checked::<WebRtcInboundCustody>() else {
+            return false;
+        };
         // The node this arrival will wait in, funded against the flow that
         // received it. An owner with nothing left to give refuses here, and the
         // whole delivery is dropped — which releases the bytes with the unit
@@ -1178,7 +2493,7 @@ impl SessionRealtimeFlows {
         else {
             return false;
         };
-        let Some(queued) = QueuedInboundUnit::from_delivery(delivery) else {
+        let Some(queued) = QueuedInboundUnit::from_delivery(delivery, custody) else {
             return false;
         };
         self.arrivals.push(queued, record);
@@ -1196,6 +2511,20 @@ impl SessionRealtimeFlows {
         self.flows
             .get(name.as_bytes())
             .is_some_and(|flow| flow.port_if_current(session, live).is_ok())
+    }
+
+    /// Whether this exact flow set has no logical records, queued inbound
+    /// arrivals, or provider-owned native tails. A close receipt may be
+    /// dropped while its pump/retirement is still running, so map and queue
+    /// emptiness alone is not a proof that demand-link retirement is safe.
+    pub(crate) fn is_quiescent(&self) -> bool {
+        let mut has_flow = false;
+        self.flows.for_each(|_, _| has_flow = true);
+        let native_tails_done = self
+            .native_tail_state
+            .as_ref()
+            .is_none_or(|state| state.outstanding.load(std::sync::atomic::Ordering::Acquire) == 0);
+        !has_flow && self.arrivals.is_empty() && native_tails_done
     }
 
     /// Whether `bindings` is *this* flow set's negotiated-track table.
@@ -1342,6 +2671,23 @@ mod tests {
     fn control_encoding() -> RealtimeEncoding {
         RealtimeEncoding::new(WebRtcRtpKind::Video, "video/H264", 90_000, 0)
             .expect("the control encoding names a family the control profile registers")
+    }
+
+    #[cfg(feature = "transport-lab")]
+    fn control_opaque_spec(
+        label: &[u8],
+        direction: RealtimeDirection,
+        opener_direction: crate::realtime::RealtimeFlowDirection,
+        mode: crate::realtime::OpaqueFlowMode,
+        max_unit_bytes: usize,
+    ) -> OpaqueFlowSpec {
+        OpaqueFlowSpec {
+            direction,
+            opener_direction,
+            mode,
+            max_unit_bytes,
+            name: control_name(label),
+        }
     }
 
     /// An elastic session — `Enabled(None)`, no owner ceilings anywhere — opens
@@ -1720,6 +3066,7 @@ mod tests {
             .then(|| RealtimeOutboundPump {
                 queue: Arc::downgrade(&queue),
                 ready: queue.ready(),
+                _tail: None,
             })
             .expect("the first pump claims the queue");
 
@@ -2499,5 +3846,970 @@ mod tests {
             "but two variants of one family are exactly the deployed shape and \
              must not be refused"
         );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    async fn v4_opaque_local_outbound_delivery_refused_matching_inbound_accepted() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+
+        let outbound = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"opaque-outbound",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    64,
+                ),
+            )
+            .expect("the local outbound record is admitted by the real provider");
+        let outbound_coordinate = flows
+            .opaque_coordinate(&outbound)
+            .expect("the outbound record retains its wire coordinate");
+        assert!(
+            !flows.deliver_opaque(
+                outbound_coordinate,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                Bytes::from_static(b"must-not-arrive"),
+            ),
+            "a local outbound record cannot be used as an inbound arrival target"
+        );
+
+        let inbound_coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: outbound_coordinate.flow_id + 1,
+            generation: 1,
+        };
+        let inbound = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"opaque-inbound",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    64,
+                ),
+                inbound_coordinate,
+                None,
+            )
+            .expect("the matching remote-owned inbound record is admitted");
+        flows
+            .accept_opaque(
+                &session,
+                Some(&incarnation),
+                &inbound,
+                inbound_coordinate,
+                mode,
+                64,
+            )
+            .expect("the exact inbound record becomes ready");
+        let reader = flows
+            .inbound_arrivals()
+            .expect("the session has one funded inbound reader");
+        assert!(flows.deliver_opaque(
+            inbound_coordinate,
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            mode,
+            Bytes::from_static(b"accepted"),
+        ));
+        let arrival = reader
+            .next_opaque()
+            .await
+            .expect("the provider returns the funded opaque arrival")
+            .expect("the inbound stream is still live");
+        assert_eq!(arrival.bytes, Bytes::from_static(b"accepted"));
+        assert!(arrival.has_custody(), "dequeue retained provider custody");
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_reciprocal_claim_is_single_exact_record_operation() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: 41,
+            generation: 1,
+        };
+        let spec = control_opaque_spec(
+            b"reciprocal",
+            RealtimeDirection::Inbound,
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            mode,
+            32,
+        );
+        let name = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                spec.clone(),
+                coordinate,
+                None,
+            )
+            .expect("the peer Open creates one transport-only record");
+        assert_eq!(flows.opaque_is_claimed(&name), Some(false));
+
+        let (claimed_name, claimed_existing) = flows
+            .prepare_or_claim_opaque(&session, Some(&incarnation), spec.clone())
+            .expect("the exact local request claims the existing record");
+        assert!(claimed_existing);
+        assert_eq!(claimed_name, name);
+        assert_eq!(flows.opaque_is_claimed(&name), Some(true));
+        assert_eq!(flows.opaque_coordinate(&name), Some(coordinate));
+        assert_eq!(
+            flows.opaque_opener_direction(&name),
+            Some(crate::realtime::RealtimeFlowDirection::Outbound)
+        );
+        assert_eq!(
+            flows.prepare_or_claim_opaque(&session, Some(&incarnation), spec),
+            Err(RealtimeFlowError::FlowRefused),
+            "a second local claimant cannot mint another handle"
+        );
+
+        let mismatched = control_opaque_spec(
+            b"reciprocal",
+            RealtimeDirection::Inbound,
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits: 0 },
+            32,
+        );
+        assert_eq!(
+            flows.prepare_or_claim_opaque(&session, Some(&incarnation), mismatched),
+            Err(RealtimeFlowError::FlowRefused),
+            "a mode mismatch cannot inherit the predecessor claim"
+        );
+        assert_eq!(flows.opaque_coordinate(&name), Some(coordinate));
+        assert_eq!(flows.opaque_is_claimed(&name), Some(true));
+
+        assert_eq!(
+            flows.open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"other-label",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    32,
+                ),
+                coordinate,
+                None,
+            ),
+            Err(RealtimeFlowError::FlowRefused),
+            "the same coordinate and opener direction cannot alias another label"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_change_refuses_queued_predecessor_without_discarding_it() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"change-queue",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                    32,
+                ),
+            )
+            .expect("the outbound opaque flow is ready");
+        let predecessor = flows.opaque_coordinate(&name).expect("coordinate exists");
+        flows
+            .send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(b"accepted-before-change"),
+            )
+            .expect("the real flow queue admits the predecessor unit");
+        assert_eq!(
+            flows.change_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                predecessor,
+                crate::protocol::ApplicationFlowCoordinate {
+                    flow_id: predecessor.flow_id,
+                    generation: predecessor.generation + 1,
+                },
+                32,
+            ),
+            Err(RealtimeFlowError::FlowRefused),
+            "Change cannot silently invalidate accepted reliable queue work"
+        );
+        assert_eq!(flows.opaque_coordinate(&name), Some(predecessor));
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_change_prepare_commit_rollback_is_exact_and_blocks_send() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"change-transaction",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    32,
+                ),
+            )
+            .expect("the exact outbound record is ready");
+        let previous = flows.opaque_coordinate(&name).expect("coordinate exists");
+        let next = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: previous.flow_id,
+            generation: previous.generation + 1,
+        };
+        let mut staged = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                16,
+            )
+            .expect("a quiescent exact record can stage Change");
+        assert_eq!(flows.opaque_coordinate(&name), Some(previous));
+        assert_eq!(
+            flows.send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(b"blocked-while-staged"),
+            ),
+            Err(RealtimeFlowError::FlowRefused),
+            "a staged Change cannot admit predecessor-generation sends"
+        );
+        flows
+            .rollback_opaque_change(&session, Some(&incarnation), &name, &mut staged)
+            .expect("exact refusal/cancel restores the predecessor");
+        assert_eq!(flows.opaque_coordinate(&name), Some(previous));
+        // Completion transfers the marker funding into the terminal token;
+        // release that caller-owned token before staging the next operation.
+        drop(staged);
+
+        let mut committed = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                16,
+            )
+            .expect("the restored exact record can be prepared again");
+        assert_eq!(
+            flows.commit_opaque_change(&session, Some(&incarnation), &name, &mut committed),
+            Err(RealtimeFlowError::FlowRefused),
+            "a staged Change cannot commit before the authenticated Accept"
+        );
+        flows
+            .confirm_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                16,
+            )
+            .expect("the exact echoed Accept confirms the staged Change");
+        flows
+            .commit_opaque_change(&session, Some(&incarnation), &name, &mut committed)
+            .expect("the exact echoed Accept commits the staged Change");
+        assert_eq!(flows.opaque_coordinate(&name), Some(next));
+        assert_eq!(
+            flows.rollback_opaque_change(&session, Some(&incarnation), &name, &mut committed),
+            Err(RealtimeFlowError::FlowRefused),
+            "a completed token cannot roll back a newer record state"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_change_marker_funding_survives_flow_set_and_token_drop_orders() {
+        let marker_claim = crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+            RealtimeFlowRegistry::opaque_change_claim().expect("the marker claim is representable"),
+        )
+        .expect("the marker reservation is representable");
+
+        // First ordering: the promoted flow set is retired while the caller's
+        // Change token is still alive.  The token must retain the marker's
+        // exact provider claim after the record and set have gone away.
+        let (registry, resources) = control_label_registry();
+        let empty = resources.in_use();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"change-set-first",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                    32,
+                ),
+            )
+            .expect("the exact opaque record is ready");
+        let previous = flows.opaque_coordinate(&name).expect("coordinate exists");
+        let next = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: previous.flow_id,
+            generation: previous.generation + 1,
+        };
+        let change = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                16,
+            )
+            .expect("the provider stages one funded Change");
+        drop(flows);
+        assert_eq!(
+            resources.in_use(),
+            empty
+                .checked_add(marker_claim)
+                .expect("the marker and control baseline compose"),
+            "retiring the whole flow set leaves exactly the token-owned marker claim"
+        );
+        drop(change);
+        assert_eq!(
+            resources.in_use(),
+            empty,
+            "the final Change-token drop releases the marker and nothing else"
+        );
+
+        // Second ordering: dropping the token first cancels the record-owned
+        // marker but must not release it while the flow record still retains
+        // the shared Arc.  Closing that exact record then returns the set to
+        // its pre-open baseline.
+        let (registry, resources) = control_label_registry();
+        let empty = resources.in_use();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"change-token-first",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                    32,
+                ),
+            )
+            .expect("the exact opaque record is ready");
+        let previous = flows.opaque_coordinate(&name).expect("coordinate exists");
+        let next = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: previous.flow_id,
+            generation: previous.generation + 1,
+        };
+        let before_change = resources.in_use();
+        let change = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                16,
+            )
+            .expect("the provider stages one funded Change");
+        assert_eq!(
+            resources.in_use(),
+            before_change
+                .checked_add(marker_claim)
+                .expect("the Change marker composes with the live flow"),
+            "staging charges the marker before its shared Arc is published"
+        );
+        drop(change);
+        assert_eq!(
+            resources.in_use(),
+            before_change
+                .checked_add(marker_claim)
+                .expect("the record still owns the marker claim"),
+            "canceling the token leaves the canceled marker funded by the record"
+        );
+        let _remains = flows
+            .close(&session, Some(&incarnation), &name)
+            .expect("the canceled exact record can close");
+        assert_eq!(
+            resources.in_use(),
+            empty,
+            "closing the canceled record releases the marker and flow claims"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_inbound_change_confirms_and_commits_same_record() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: 9,
+            generation: 1,
+        };
+        let name = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"inbound-change",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    32,
+                ),
+                coordinate,
+                None,
+            )
+            .expect("the exact inbound transport record is created");
+        flows
+            .accept_opaque(&session, Some(&incarnation), &name, coordinate, mode, 32)
+            .expect("the inbound record becomes ready after its Open");
+        let next = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: coordinate.flow_id,
+            generation: 2,
+        };
+        let mut change = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                coordinate,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                16,
+            )
+            .expect("an inbound record can stage a quiescent Change");
+        flows
+            .confirm_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                coordinate,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                16,
+            )
+            .expect("the inbound Accept confirms the exact staged record");
+        flows
+            .commit_opaque_change(&session, Some(&incarnation), &name, &mut change)
+            .expect("the inbound Change commits without an outbound queue");
+        assert_eq!(flows.opaque_coordinate(&name), Some(next));
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    async fn v4_opaque_inbound_change_commit_rechecks_arrival_interleaving() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let previous = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: 17,
+            generation: 1,
+        };
+        let name = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"inbound-change-arrival",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    64,
+                ),
+                previous,
+                None,
+            )
+            .expect("the exact inbound transport record is admitted");
+        flows
+            .accept_opaque(&session, Some(&incarnation), &name, previous, mode, 64)
+            .expect("the inbound record is ready before Change staging");
+        let next = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: previous.flow_id,
+            generation: previous.generation + 1,
+        };
+        let mut change = flows
+            .prepare_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                32,
+            )
+            .expect("the inbound record stages while its arrival queue is empty");
+        flows
+            .confirm_opaque_change(
+                &session,
+                Some(&incarnation),
+                &name,
+                previous,
+                next,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                mode,
+                32,
+            )
+            .expect("the exact staged Change is confirmed before the interleaving");
+        let reader = flows
+            .inbound_arrivals()
+            .expect("the session has one tagged inbound reader");
+        assert!(flows.deliver_opaque(
+            previous,
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            mode,
+            Bytes::from_static(b"arrived-after-prepare"),
+        ));
+        assert_eq!(
+            flows.commit_opaque_change(&session, Some(&incarnation), &name, &mut change),
+            Err(RealtimeFlowError::FlowRefused),
+            "a predecessor arrival in the prepare-to-commit window blocks mutation"
+        );
+        assert_eq!(
+            flows.opaque_coordinate(&name),
+            Some(previous),
+            "the refused terminal commit preserves the predecessor coordinate"
+        );
+        match reader
+            .next_arrival()
+            .await
+            .expect("the refused Change did not discard the predecessor arrival")
+            .into_provider_event()
+        {
+            crate::transport::webrtc::RealtimeInboundArrival::Opaque(arrival) => {
+                assert_eq!(arrival.bytes, Bytes::from_static(b"arrived-after-prepare"));
+                assert_eq!(arrival.label, b"inbound-change-arrival".to_vec());
+            }
+            crate::transport::webrtc::RealtimeInboundArrival::Rtp(_) => {
+                panic!("an opaque predecessor arrival changed kind")
+            }
+        }
+        flows
+            .commit_opaque_change(&session, Some(&incarnation), &name, &mut change)
+            .expect("draining the predecessor arrival leaves the exact Change quiescent");
+        assert_eq!(
+            flows.opaque_coordinate(&name),
+            Some(next),
+            "the same confirmed Change commits after its predecessor is drained"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_actual_pump_terminal_failure_refuses_next_send() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"pump-terminal",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    64,
+                ),
+            )
+            .expect("the exact outbound record is ready");
+        flows
+            .send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(b"held-until-native-terminal"),
+            )
+            .expect("the real flow queue admits the first unit");
+        let (pump, _retired) = flows
+            .attach_opaque_pump(&session, Some(&incarnation), &name)
+            .expect("the flow owns one funded production pump");
+        let unit = match pump.next() {
+            OpaquePumpStep::Unit(unit) => unit,
+            _ => panic!("the production pump dequeues the admitted unit"),
+        };
+        assert!(!pump.native_write_finished(false));
+        drop(unit);
+        assert_eq!(
+            flows.send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(b"must-refuse-after-failed-pump"),
+            ),
+            Err(RealtimeFlowError::FlowRefused),
+            "a failed production pump cannot accept work behind its terminal error"
+        );
+        assert_eq!(flows.opaque_coordinate(&name).unwrap().generation, 1);
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_failed_pump_keeps_detached_unit_funded_through_set_drop() {
+        let (registry, resources) = control_label_registry();
+        let empty = resources.in_use();
+        let held_body = b"held-through-set-retirement";
+        let retained_claim = [
+            RealtimeFlowRegistry::output_claim(held_body.len())
+                .expect("the detached payload claim is representable"),
+            RealtimeFlowRegistry::queue_node_claim::<QueuedUnit<OpaqueSendUnit>>()
+                .expect("the detached queue-node claim is representable"),
+            RealtimeFlowRegistry::flow_root_claim(std::mem::size_of::<queue::InFlightCounter>())
+                .expect("the detached in-flight counter claim is representable"),
+        ]
+        .into_iter()
+        .map(|claim| {
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(claim)
+                .expect("the detached claim is reservable")
+        })
+        .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+            total.checked_add(claim)
+        })
+        .expect("the detached claims compose without arithmetic overflow");
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let name = flows
+            .open_opaque(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"pump-held-set-drop",
+                    RealtimeDirection::Outbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                    64,
+                ),
+            )
+            .expect("the exact outbound opaque flow is ready");
+        flows
+            .send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(held_body),
+            )
+            .expect("the provider admits the first unit");
+        let (pump, retired) = flows
+            .attach_opaque_pump(&session, Some(&incarnation), &name)
+            .expect("the flow owns one production opaque pump");
+        let unit = match pump.next() {
+            OpaquePumpStep::Unit(unit) => unit,
+            _ => panic!("the production pump detaches the admitted unit"),
+        };
+        let with_unit = resources.in_use();
+        assert!(
+            with_unit != empty,
+            "a detached unit keeps its queue-node, payload, and in-flight claims"
+        );
+        assert!(!pump.native_write_finished(false));
+        assert_eq!(
+            flows.send_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                Bytes::from_static(b"must-not-follow-terminal-failure"),
+            ),
+            Err(RealtimeFlowError::FlowRefused),
+            "a terminal pump failure remains a sticky admission refusal"
+        );
+
+        // The actual flow set and pump are gone before the detached unit.  Its
+        // queue entry and shared in-flight counter must still pay for the
+        // outstanding native handoff until the unit reaches its terminal drop.
+        drop(pump);
+        drop(flows);
+        assert_eq!(
+            resources.in_use(),
+            empty
+                .checked_add(retained_claim)
+                .expect("the empty baseline and detached claims compose"),
+            "set retirement leaves exactly the detached payload, node, and in-flight claims"
+        );
+        drop(unit);
+        drop(retired);
+        assert_eq!(
+            resources.in_use(),
+            empty,
+            "the final detached-unit drop releases every provider claim"
+        );
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    async fn v4_opaque_mixed_head_refusal_then_tagged_drain_preserves_order_and_custody() {
+        let (registry, _resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(
+            Arc::clone(&registry),
+            Some(leased_control_profile(&registry)),
+        );
+        let mode = crate::realtime::OpaqueFlowMode::ReliableOrdered;
+        let opaque_coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: 51,
+            generation: 1,
+        };
+        let opaque = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"mixed-opaque",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    mode,
+                    64,
+                ),
+                opaque_coordinate,
+                None,
+            )
+            .expect("the opaque inbound record is admitted");
+        flows
+            .accept_opaque(
+                &session,
+                Some(&incarnation),
+                &opaque,
+                opaque_coordinate,
+                mode,
+                64,
+            )
+            .expect("the opaque record is ready");
+        let rtp = flows
+            .open(
+                &session,
+                Some(&incarnation),
+                RealtimeFlowSpec {
+                    direction: RealtimeDirection::Inbound,
+                    encoding: control_encoding(),
+                    name: control_name(b"mixed-rtp"),
+                },
+            )
+            .expect("the RTP inbound record is admitted");
+        let reader = flows
+            .inbound_arrivals()
+            .expect("the mixed session has one tagged reader");
+        assert!(flows.deliver_opaque(
+            opaque_coordinate,
+            crate::realtime::RealtimeFlowDirection::Outbound,
+            mode,
+            Bytes::from_static(b"opaque-first"),
+        ));
+        let delivery = flows
+            .accounted_delivery_for_test(
+                &rtp,
+                RealtimeRecvUnit {
+                    timestamp: 7,
+                    marker: true,
+                    data: Bytes::from_static(b"rtp-second"),
+                },
+            )
+            .expect("the RTP payload is reserved through the real flow port");
+        assert!(flows.deliver_inbound(delivery));
+
+        assert!(
+            matches!(
+                reader.next_rtp().await,
+                Err(crate::realtime::RealtimeRefusal::FlowRefused)
+            ),
+            "typed mismatch refuses without consuming the opaque head"
+        );
+        match reader
+            .next_arrival()
+            .await
+            .expect("the opaque head remains available")
+            .into_provider_event()
+        {
+            crate::transport::webrtc::RealtimeInboundArrival::Opaque(arrival) => {
+                assert_eq!(arrival.bytes, Bytes::from_static(b"opaque-first"));
+                assert!(arrival.has_custody());
+            }
+            crate::transport::webrtc::RealtimeInboundArrival::Rtp(_) => {
+                panic!("the tagged reader reordered the mixed queue")
+            }
+        }
+        match reader
+            .next_arrival()
+            .await
+            .expect("the RTP item follows the opaque item")
+            .into_provider_event()
+        {
+            crate::transport::webrtc::RealtimeInboundArrival::Rtp(arrival) => {
+                assert_eq!(arrival.unit.data, Bytes::from_static(b"rtp-second"));
+            }
+            crate::transport::webrtc::RealtimeInboundArrival::Opaque(_) => {
+                panic!("the tagged reader duplicated or reordered the RTP item")
+            }
+        }
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_native_tail_witness_keeps_quiescence_false_until_terminal_drop() {
+        let (registry, _resources) = control_label_registry();
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        assert!(flows.is_quiescent());
+        let tail = flows
+            .acquire_native_tail()
+            .expect("the finite provider funds one native retirement tail");
+        assert!(
+            !flows.is_quiescent(),
+            "map and arrival emptiness cannot hide an outstanding native task"
+        );
+        drop(tail);
+        assert!(flows.is_quiescent());
+    }
+
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn v4_opaque_wrapper_pressure_refuses_before_queueing_or_dequeue() {
+        let (registry, resources) = control_label_registry();
+        let incarnation = crate::connector::ConnectorIncarnation::new();
+        let session = ControlSession {
+            incarnation: Arc::clone(&incarnation),
+        };
+        let mut flows = SessionRealtimeFlows::new(Arc::clone(&registry), None);
+        let coordinate = crate::protocol::ApplicationFlowCoordinate {
+            flow_id: 61,
+            generation: 1,
+        };
+        let name = flows
+            .open_opaque_with_coordinate(
+                &session,
+                Some(&incarnation),
+                control_opaque_spec(
+                    b"wrapper-pressure",
+                    RealtimeDirection::Inbound,
+                    crate::realtime::RealtimeFlowDirection::Outbound,
+                    crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                    64,
+                ),
+                coordinate,
+                None,
+            )
+            .expect("the exact inbound record is admitted before pressure is applied");
+        flows
+            .accept_opaque(
+                &session,
+                Some(&incarnation),
+                &name,
+                coordinate,
+                crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                64,
+            )
+            .expect("the exact inbound record is ready");
+
+        let wrapper = RealtimeFlowRegistry::boxed_claim::<WebRtcInboundCustody>()
+            .expect("the custody wrapper claim is representable");
+        let remaining = control_label_grant()
+            .checked_sub(resources.in_use())
+            .expect("the open remains within the finite control grant");
+        let counters = u64::try_from(2 * std::mem::size_of::<usize>())
+            .expect("the Arc counter pair is representable");
+        let filler_bytes = remaining
+            .amount(crate::resource::ResourceClass::AccountedMemoryBytes)
+            .checked_sub(wrapper.amount(crate::resource::ResourceClass::AccountedMemoryBytes))
+            .and_then(|bytes| bytes.checked_sub(counters))
+            .and_then(|bytes| bytes.checked_add(1))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .expect("the grant leaves enough exact headroom to make the wrapper refuse");
+        let filler = registry
+            .acquire_flow_root(filler_bytes)
+            .expect("the filler consumes the exact pre-wrapper byte headroom");
+        let at_pressure = resources.in_use();
+        assert!(
+            !flows.deliver_opaque(
+                coordinate,
+                crate::realtime::RealtimeFlowDirection::Outbound,
+                crate::realtime::OpaqueFlowMode::ReliableOrdered,
+                Bytes::from_static(b"wrapper-must-refuse"),
+            ),
+            "custody wrapper pressure refuses before payload or queue admission"
+        );
+        assert_eq!(
+            resources.in_use(),
+            at_pressure,
+            "the refused wrapper does not dequeue, retain bytes, or alter the queue"
+        );
+        drop(filler);
     }
 }

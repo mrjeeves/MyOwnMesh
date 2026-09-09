@@ -467,7 +467,7 @@ mod tests {
                 .expect("longest typed refusal serializes");
         assert_eq!(worst_rejected_wire.len(), 476);
         assert!(worst_rejected_wire.len() <= HUB_TREE_ATTACH_MAX_WIRE_BYTES);
-        assert!(HUB_TREE_ATTACH_MAX_WIRE_BYTES < crate::protocol::RECEIVE_FRAME_BYTES);
+        const { assert!(HUB_TREE_ATTACH_MAX_WIRE_BYTES < crate::protocol::RECEIVE_FRAME_BYTES) };
     }
 
     #[test]

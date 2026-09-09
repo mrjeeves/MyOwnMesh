@@ -827,7 +827,7 @@ mod tests {
         let reservations_after_take = provider.active_reservations();
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                candidate.take_late_transport_lease();
+                let _ = candidate.take_late_transport_lease();
             }))
             .is_err(),
             "taking the transferred lease twice is forbidden"

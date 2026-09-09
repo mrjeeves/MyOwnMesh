@@ -91,7 +91,7 @@ async fn hold_connection_command_gate() {
     }
 }
 
-async fn run_connection_commands(
+pub(super) async fn run_connection_commands(
     state: Arc<NetworkState>,
     mut receiver: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
 ) {
@@ -109,11 +109,32 @@ async fn run_connection_commands(
                         hold_connection_command_gate().await;
                         connect_peer(&command_state, &device_id, sticky, reply).await;
                     }
+                    NetworkCmd::BeginIntroducedPeer { device_id, ticket } => {
+                        super::begin_introduced_peer(&command_state, &device_id, ticket).await;
+                    }
+                    NetworkCmd::SettleIntroduction {
+                        key,
+                        ticket,
+                        generation,
+                    } => {
+                        command_state
+                            .settle_failed_introduction(key, ticket, generation)
+                            .await;
+                    }
+                    NetworkCmd::SettleIntroductionWait(wait) => {
+                        command_state.settle_introduction_wait(wait).await;
+                    }
+                    NetworkCmd::IntroducedSignaling(signal) => {
+                        super::handle_signaling_inbound(&command_state, signal.0).await;
+                    }
+                    NetworkCmd::OpaqueChange(change) => {
+                        command_state.run_opaque_change(change).await;
+                    }
                     _ => {
                         // The sender is private to NetworkState; this is a
                         // defensive terminal path that still settles a
                         // delivery if an internal caller violates that seam.
-                        warn!("non-ConnectPeer command reached connection lane");
+                        warn!("non-connection command reached connection lane");
                     }
                 }
             })
@@ -285,8 +306,16 @@ pub(crate) async fn run_driver(
                     // outside the claim that funded them, so the whole delivery
                     // rides into the handler and its funding is released only after
                     // the handler has finished.
-                    sig.run_terminal_effect(|sig| super::handle_signaling_inbound(&state, sig))
-                        .await;
+                    sig.run_terminal_effect(|sig| async {
+                        if sig.introduction_ticket().is_some() {
+                            // Re-admit retained ownership before releasing this
+                            // mailbox delivery. Native Offer/Answer work then
+                            // runs on the existing separately joined lane.
+                            let _ = state.queue_introduction_signal(sig);
+                        } else {
+                            super::handle_signaling_inbound(&state, sig).await;
+                        }
+                    }).await;
                 }
 
                 _ = heartbeat.tick() => {
@@ -346,6 +375,15 @@ use super::{
 
 pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
     match cmd {
+        NetworkCmd::OpaqueControl(transfer) => super::write_opaque_control(state, transfer).await,
+        NetworkCmd::EndpointControls(transfer) => {
+            super::write_endpoint_controls(state, transfer).await
+        }
+        NetworkCmd::OpaqueChange(change) => {
+            // This variant is admitted only to the separately owned connection
+            // lane. A misplaced command fails closed without publishing it.
+            drop(change);
+        }
         NetworkCmd::SetTopology(mode) => {
             // A funded Hub controller retains configuration-bound replay and
             // discovery state. The public API checks this too, but commands
@@ -362,8 +400,16 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             // governance authority-bearing fact.  Apply the local command
             // directly; canonical governance projection never derives a
             // topology selector from the compatibility DTO.
-            *state.topology.write() = mode.clone();
+            let changed = {
+                let mut current = state.topology.write();
+                let changed = *current != mode;
+                *current = mode.clone();
+                changed
+            };
             *state.topology_impl.write() = crate::topology::from_mode(&mode);
+            if changed {
+                state.note_hub_local_topology_change();
+            }
             ladder::reevaluate_topology(state).await;
         }
         // A successful approval changed our roster — advertise the new
@@ -465,6 +511,25 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             sticky,
             reply,
         } => connect_peer(state, &device_id, sticky, reply).await,
+        NetworkCmd::BeginIntroducedPeer { device_id, ticket } => {
+            // Establishment belongs to the separately joined connection lane.
+            let _ = state.queue_introduced_peer(device_id, ticket);
+        }
+        NetworkCmd::IntroducedSignaling(signal) => {
+            let _ = state.queue_introduction_signal(signal.0);
+        }
+        NetworkCmd::SettleIntroduction {
+            key,
+            ticket,
+            generation,
+        } => {
+            state.queue_failed_introduction(key, ticket, generation);
+        }
+        NetworkCmd::SettleIntroductionWait(_) => {
+            // Only the private connection sender admits this transfer. A
+            // misrouted transfer is not authority to drive cleanup here.
+            warn!("introduction settlement waiter reached wrong command lane");
+        }
         NetworkCmd::SendChannelReliable {
             peer,
             channel,
@@ -479,8 +544,21 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             payload,
             reply,
         } => {
-            let result = send_channel_frame(state, &peer, &channel, payload).await;
-            let _ = reply.send(result);
+            if state
+                .peers
+                .owner(&peer)
+                .is_some_and(|owner| state.peers.has_usable_authenticated_current(&owner))
+            {
+                let result = send_channel_frame(state, &peer, &channel, payload).await;
+                let _ = reply.send(result);
+            } else {
+                let mut reply = Some(reply);
+                let result =
+                    super::queue_routed_channel_frame(state, &peer, &channel, payload, &mut reply);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
         }
         NetworkCmd::BroadcastChannelFrame {
             channel,

@@ -257,20 +257,6 @@ impl<T> FixedFifo<T> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         (0..self.len).filter_map(|index| self.get(index))
     }
-
-    pub(crate) fn take_one_matching(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
-        let mut index = None;
-        for candidate in 0..self.len {
-            if let Some(value) = self.get(candidate) {
-                if predicate(value) {
-                    index = Some(candidate);
-                    break;
-                }
-            }
-        }
-        let index = index?;
-        self.remove(index)
-    }
 }
 
 impl<T> Default for FixedFifo<T> {
@@ -306,12 +292,11 @@ mod tests {
         table.restore_exact(slot, old);
         assert!(!table.release_reserved(slot));
 
-        let old = table.remove(slot).expect("old value");
+        let _ = table.remove(slot).expect("old value");
         assert_eq!(table.insert("successor"), Ok(slot));
         let successor = table.reserve(slot).expect("successor reservation");
         table.restore_exact(slot, successor);
         assert!(!table.release_reserved(slot));
-        drop(old);
     }
 
     #[test]

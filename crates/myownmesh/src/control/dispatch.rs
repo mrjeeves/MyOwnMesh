@@ -18,6 +18,7 @@ pub(super) mod channel;
 pub(super) mod governance;
 pub(super) mod identity;
 pub(super) mod network;
+pub(super) mod opaque;
 pub(super) mod realtime;
 pub(super) mod rpc;
 pub(super) mod services;

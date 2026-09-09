@@ -26,7 +26,8 @@ MyOwnMesh supplies:
 - typed signaling for durable facts and ephemeral transport control;
 - candidate discovery, bounded remote ICE-candidate application, connectivity
   checks, and transport recovery;
-- direct, TURN, generic opaque relay, and eligible Closed member-relay connectors;
+- direct, distinct TURN, bounded encrypted Hub fallback, and eligible Closed
+  member-relay connectors;
 - bounded speculative pre-authentication work;
 - fresh channel-bound endpoint authentication;
 - exact session promotion and principal-bound live handles;
@@ -343,9 +344,21 @@ Direct and TURN-carried sessions expose the same remote Device ID and applicatio
 
 TURN is a packet carrier. It may observe addresses, packet sizes, timing, and the metadata required by its function. It cannot become the endpoint or application authority under the endpoint cryptographic premises.
 
-### 7.2 Generic opaque relay (removed)
+### 7.2 Hub introduction and encrypted transit fallback
 
-The unowned generic opaque relay is not a supported V4 carrier. Opaque fallback is provided only by the bounded, visibly identified Closed member-relay path below.
+The configured Hub set may introduce bounded direct endpoint demand, but it does
+not grant membership, authority, a permanent peer, or a veto over a viable
+direct or alternate route. A directly usable endpoint connection is preferred
+and TURN is a distinct ICE service. Hub introduction negotiates endpoint
+connectivity; it does not make the Hub a payload owner.
+
+If residual Hub transit is selected, endpoints derive a fresh endpoint-to-
+endpoint E2E epoch bound to the exact mesh context and full endpoint keys
+before payload is usable. The Hub may copy/forward endpoint ciphertext and
+observe carrier metadata, but cannot decrypt or read application plaintext.
+Failure to establish the endpoint epoch refuses the operation; there is no
+plaintext compatibility fallback. This is an adopted integration direction,
+not a claim that the current source has passed qualification.
 
 ### 7.3 Closed member relay
 
@@ -590,7 +603,8 @@ final compliance PASS. The application integration requires:
 - no application payload is sent or delivered before channel promotion;
 - a working socket alone never becomes a peer session;
 - every session proves the exact remote Device on the exact channel;
-- direct, TURN, and Closed member relay preserve the same endpoint identity;
+- direct, TURN, bounded encrypted Hub fallback, and Closed member relay preserve
+  the same endpoint identity;
 - carrier diagnostics are separate from peer identity and application authorization;
 - recovery does not require a persistent transport-path ledger or monotonic transport session generation;
 - stale or foreign-principal handles fail before payload use;
@@ -625,7 +639,7 @@ The owner must select:
 3. whether applications share peer sessions;
 4. key custody for in-process and shared-process deployments;
 5. connector and carrier profiles;
-6. Closed member-relay policy;
+6. bounded encrypted Hub fallback and Closed member-relay policy;
 7. session recovery and multi-channel behavior;
 8. diagnostic detail;
 9. headless consumer connector types;

@@ -38,6 +38,7 @@ fn cfg(label: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,

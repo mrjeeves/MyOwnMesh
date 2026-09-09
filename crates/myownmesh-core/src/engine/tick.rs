@@ -53,18 +53,6 @@ pub(crate) trait Ticker: Send {
 /// observed by the next in the same pass when that matters.
 pub(crate) struct TickRegistry {
     tickers: Vec<Box<dyn Ticker>>,
-    #[cfg(feature = "transport-lab")]
-    passes: u64,
-}
-
-/// Fixed-size transport-lab correlation metadata for state-watch execution.
-/// It contains no peer, payload, or operation history; HubController exposes
-/// its own bounded discovery counters alongside this pass count.
-#[cfg(feature = "transport-lab")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TickDiagnostics {
-    pub(crate) passes: u64,
-    pub(crate) registered_tickers: u64,
 }
 
 impl TickRegistry {
@@ -72,11 +60,10 @@ impl TickRegistry {
         Self {
             tickers: vec![
                 Box::new(HubTicker),
+                Box::new(HubIntroductionTicker),
                 Box::new(ParentingTicker),
                 Box::new(LocalObservationTicker),
             ],
-            #[cfg(feature = "transport-lab")]
-            passes: 0,
         }
     }
 
@@ -89,22 +76,8 @@ impl TickRegistry {
 
     /// Run every registered ticker once, in registration order.
     pub(crate) async fn run(&mut self, state: &Arc<NetworkState>) {
-        #[cfg(feature = "transport-lab")]
-        {
-            self.passes = self.passes.saturating_add(1);
-        }
         for ticker in self.tickers.iter_mut() {
             ticker.tick(state).await;
-        }
-    }
-
-    /// Snapshot bounded tick cadence for transport-lab correlation.  This is
-    /// intentionally read-only and does not alter ticker scheduling.
-    #[cfg(feature = "transport-lab")]
-    pub(crate) fn diagnostics(&self) -> TickDiagnostics {
-        TickDiagnostics {
-            passes: self.passes,
-            registered_tickers: u64::try_from(self.tickers.len()).unwrap_or(u64::MAX),
         }
     }
 
@@ -131,6 +104,21 @@ impl Ticker for HubTicker {
 /// Bounded HubTree parent registration and expiry maintenance.  This shares
 /// the existing state-watch cadence and never creates a detached task.
 pub(crate) struct ParentingTicker;
+
+/// Local monotonic introduction deadlines and replay-record retention share
+/// the existing watch cadence. One pass is capped by the explicit policy.
+pub(crate) struct HubIntroductionTicker;
+
+#[async_trait]
+impl Ticker for HubIntroductionTicker {
+    fn name(&self) -> &'static str {
+        "hub-introduction"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        state.maintain_hub_introductions().await;
+    }
+}
 
 #[async_trait]
 impl Ticker for ParentingTicker {

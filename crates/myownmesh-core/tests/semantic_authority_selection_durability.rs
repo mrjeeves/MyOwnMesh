@@ -110,8 +110,10 @@ fn connector_policy(
 }
 
 fn config(name: &str) -> NetworkConfig {
-    let mut semantic_policy = SemanticPolicyConfig::default();
-    semantic_policy.max_hot_history_facts = 1;
+    let semantic_policy = SemanticPolicyConfig {
+        max_hot_history_facts: 1,
+        ..SemanticPolicyConfig::default()
+    };
     assert!(semantic_policy.validate());
     NetworkConfig {
         id: name.to_string(),
@@ -126,6 +128,7 @@ fn config(name: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),

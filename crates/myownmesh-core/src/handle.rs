@@ -411,6 +411,66 @@ impl TransportLabPromotedPeer {
     }
 }
 
+/// Opt-in real-link owner that explicitly retires its original two channels.
+/// This is a lab cleanup/control operation, not an engine withdrawal event
+/// oracle. Other channels and replacement installations are not selected.
+#[cfg(feature = "transport-lab")]
+pub struct TransportLabRetirableSession {
+    linked: crate::engine::LinkedRetirableSession,
+}
+
+#[cfg(feature = "transport-lab")]
+impl TransportLabRetirableSession {
+    pub fn peer_device_id(&self) -> &str {
+        self.linked.peer_device_id()
+    }
+
+    /// Retire both captured channels before awaiting native close, then join
+    /// both event pumps and already-retired close owners. Every returned result
+    /// must be inspected. Await to completion; dropping this future is not a
+    /// successful cleanup. This does not change `TransportLabPromotedPeer::retire`.
+    pub async fn retire_sessions(self) -> Vec<Result<()>> {
+        self.linked.retire_sessions().await
+    }
+}
+
+/// Current retained introduction phase; Terminal is not last-success evidence.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportLabIntroductionPhase {
+    Requested,
+    Accepted,
+    Offered,
+    Answered,
+    Terminal,
+}
+
+/// Scalar observation, with no ticket, ownership, signature or challenge bytes.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportLabIntroductionRecord {
+    pub introduction_id: [u8; 16],
+    pub phase: TransportLabIntroductionPhase,
+    pub sequences: [Option<u64>; 2],
+    pub request_sent: bool,
+    pub challenge_present: bool,
+    pub signal_pending: [bool; 2],
+    pub forward_pending: [bool; 2],
+    /// A weak upgrade succeeded, NOT current registry or authentication proof.
+    pub native_upgraded: bool,
+    pub native_worker_present: bool,
+    pub expired: bool,
+}
+
+/// Dense introduction-ID-ordered prefix for one ordered source/destination pair.
+/// Missing rows are absence, not success; truncation means a seventeenth match.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportLabIntroductionSnapshot {
+    pub records: [Option<TransportLabIntroductionRecord>; 16],
+    pub truncated: bool,
+}
+
 /// One joined network's user-facing handle.
 pub struct JoinedNetwork {
     state: Arc<NetworkState>,
@@ -1148,6 +1208,36 @@ impl JoinedNetwork {
         }
     }
 
+    /// The explicit-retirement alternative to the historical real-link fixture.
+    /// Captures original installation/session/channel witnesses at construction;
+    /// retiring it never resolves a peer label into a replacement. Use this for
+    /// controls that intentionally invalidate live flows, not event withdrawal.
+    #[cfg(feature = "transport-lab")]
+    pub async fn install_retirable_session_over_real_link(
+        &self,
+        far: &JoinedNetwork,
+    ) -> TransportLabRetirableSession {
+        TransportLabRetirableSession {
+            linked: crate::engine::install_retirable_session_over_real_link(
+                &self.state,
+                &far.state,
+            )
+            .await,
+        }
+    }
+
+    /// One immediate post-demand observation of existing records, without
+    /// mutation, polling, ID reconstruction or ownership escape. `None` means
+    /// introduction is disabled; an empty `Some` has no matching retained row.
+    #[cfg(feature = "transport-lab")]
+    pub fn introduction_snapshot_for_lab(
+        &self,
+        source: [u8; 32],
+        destination: [u8; 32],
+    ) -> Option<TransportLabIntroductionSnapshot> {
+        crate::engine::introduction_snapshot_for_lab(&self.state, source, destination)
+    }
+
     /// List approved peers from the on-disk roster.
     pub async fn roster_list(&self) -> Result<Vec<AuthorizedPeer>> {
         Ok(self.state.canonical_roster_view())
@@ -1439,6 +1529,53 @@ impl JoinedNetwork {
         self.state.open_realtime_negotiated(peer, spec).await
     }
 
+    /// Open one provider-backed application flow carrying opaque bytes.
+    ///
+    /// The label, reliability mode and unit ceiling are application-owned
+    /// coordinates.  The returned move-only handle is the only authority for
+    /// later operations; `peer` is resolved once here and never re-resolved by
+    /// a send or pipe after the session changes.
+    pub async fn open_opaque_flow(
+        &self,
+        peer: &str,
+        open: &crate::realtime::OpaqueFlowOpen,
+    ) -> std::result::Result<crate::realtime::RealtimeFlowHandle, crate::realtime::RealtimeRefusal>
+    {
+        self.state.open_opaque_flow(peer, open).await
+    }
+
+    /// Send one opaque application body through the exact flow handle.
+    ///
+    /// Core does not inspect, decode or reinterpret the bytes.  The provider
+    /// enforces the negotiated finite unit ceiling and exact session
+    /// incarnation before queueing them.
+    pub fn send_opaque_flow(
+        &self,
+        flow: &crate::realtime::RealtimeFlowHandle,
+        bytes: bytes::Bytes,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        self.state.send_opaque(flow, bytes)
+    }
+
+    /// Change the negotiated ceiling of one exact outbound opaque flow.
+    ///
+    /// The handle is borrowed, never taken, cloned, or reinstalled.  Its
+    /// session and flow identities remain the authority while the existing
+    /// connection-command actor performs the funded change transaction.  The
+    /// label, direction, and mode in `open` must describe that same flow; only
+    /// its unit ceiling may change.  A refusal before control publication
+    /// rolls the prepared record back.  After publication, the actor either
+    /// commits the change or performs the exact-session retirement required by
+    /// the existing ambiguity fence; callers must not retry an ambiguous
+    /// result.
+    pub async fn change_opaque_flow(
+        &self,
+        flow: &crate::realtime::RealtimeFlowHandle,
+        open: &crate::realtime::OpaqueFlowOpen,
+    ) -> std::result::Result<(), crate::realtime::RealtimeRefusal> {
+        self.state.change_opaque_flow(flow, open).await
+    }
+
     /// Hand one unit to an outbound WebRTC flow. Synchronous: it queues and
     /// returns, and the connector drains to the native track on its own task.
     ///
@@ -1526,20 +1663,34 @@ impl JoinedNetwork {
     pub async fn recv_webrtc_realtime_any(
         &self,
         inbound: &crate::realtime::RealtimeInboundStream,
-    ) -> Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival> {
-        self.state
-            .next_realtime_arrival(inbound)
-            .await
-            .map(
-                |(label, unit)| crate::transport::webrtc::WebRtcRealtimeInboundArrival {
-                    // A copy of the bytes, made once on the way out. The
-                    // session's leased label never leaves the connector, so a
-                    // consumer cannot become an untracked holder of the lease
-                    // that owns them.
-                    label,
-                    unit: unit.into(),
-                },
-            )
+    ) -> std::result::Result<
+        Option<crate::transport::webrtc::WebRtcRealtimeInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        self.state.next_realtime_arrival(inbound).await
+    }
+
+    /// Receive the next opaque body from one exact inbound session stream.
+    /// `None` means that session's stream ended; no peer selector is resolved
+    /// after the stream is claimed.
+    pub async fn recv_opaque_flow(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> std::result::Result<
+        Option<crate::realtime::OpaqueInboundArrival>,
+        crate::realtime::RealtimeRefusal,
+    > {
+        self.state.recv_opaque(inbound).await
+    }
+
+    /// Receive the next item from one exact session stream without filtering
+    /// its RTP and opaque kinds. The tagged API is the only mixed-kind reader;
+    /// typed readers refuse an opposite-kind head without consuming it.
+    pub async fn recv_realtime_arrival(
+        &self,
+        inbound: &crate::realtime::RealtimeInboundStream,
+    ) -> Option<crate::transport::webrtc::RealtimeInboundArrival> {
+        self.state.recv_realtime_arrival(inbound).await
     }
 }
 

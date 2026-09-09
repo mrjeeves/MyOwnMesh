@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 thread_local! {
-    static RESIDENCY_SCAN_COUNT: Cell<usize> = Cell::new(0);
-    static INDEX_REBUILD_COUNT: Cell<usize> = Cell::new(0);
+    static RESIDENCY_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+    static INDEX_REBUILD_COUNT: Cell<usize> = const { Cell::new(0) };
     // Diagnostic-only counters for graph-work scaling probes.  These are
     // deliberately not performance gates: they expose the work performed by
     // the current implementation so a later optimization can be measured
@@ -118,6 +118,9 @@ impl Default for SemanticAdmissionPolicy {
 }
 
 impl SemanticAdmissionPolicy {
+    // Keep the existing scalar configuration boundary explicit and one-to-one;
+    // regrouping these limits would change the public constructor contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_config_values(
         max_fact_encoded_bytes: u64,
         max_dependencies_per_fact: u64,
@@ -441,7 +444,7 @@ impl Clone for FactGraph {
 struct FactCost {
     encoded_bytes: u64,
     derived_index_bytes: u64,
-    authority_dependents_index_bytes: u64,
+    _authority_dependents_index_bytes: u64,
     dependency_edges: u64,
     missing: Vec<FactId>,
 }
@@ -674,6 +677,7 @@ impl AdmissionPreflight {
         &self.admission
     }
 
+    #[cfg(test)]
     pub(crate) fn encoded_bytes(&self) -> Option<u64> {
         self.cost.as_ref().map(|cost| cost.encoded_bytes)
     }
@@ -1128,6 +1132,7 @@ impl<'graph> AdmissionJournal<'graph> {
         &self.delta
     }
 
+    #[cfg(test)]
     pub(crate) fn rollback(mut self) {
         self.graph.remove_staged_cold(&self.staged_cold);
         if let Some(rollback) = self.rollback.take() {
@@ -1198,7 +1203,7 @@ pub(crate) struct AggregateAdmissionJournal<'graph> {
 #[derive(Debug)]
 pub(crate) struct AggregateAdmissionResult {
     outcome: AggregateAdmissionOutcome,
-    delta: SemanticDelta,
+    _delta: SemanticDelta,
 }
 
 impl AggregateAdmissionResult {
@@ -1206,12 +1211,14 @@ impl AggregateAdmissionResult {
         &self.outcome
     }
 
+    #[cfg(test)]
     pub(crate) fn delta(&self) -> &SemanticDelta {
-        &self.delta
+        &self._delta
     }
 }
 
 impl<'graph> AggregateAdmissionJournal<'graph> {
+    #[cfg(test)]
     pub(crate) fn graph(&self) -> &FactGraph {
         self.graph
     }
@@ -1257,6 +1264,9 @@ impl Drop for AggregateAdmissionJournal<'_> {
 /// directly; unrelated candidates retain an owned, exact closure.  This keeps
 /// the authority boundary unchanged while avoiding a full graph clone on the
 /// normal current-head path.
+// Preserve the inline owned closure and borrowed fast path. Boxing Scoped would
+// add an allocation and change admission custody/layout merely to shrink a tag.
+#[allow(clippy::large_enum_variant)]
 enum CausalAdmissionGraph<'a> {
     Full(&'a FactGraph),
     Scoped(FactGraph),
@@ -1520,6 +1530,7 @@ impl FactGraph {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_live_checkpoint(
         bootstrap: &VerifiedBootstrap,
         policy: crate::config::SemanticPolicyConfig,
@@ -2343,6 +2354,7 @@ impl FactGraph {
     /// ordered, and then admitted through the normal checked path. The ready
     /// batch remains bounded by the same policy as ordinary ingress; unresolved
     /// rows are admitted afterward and are never silently promoted here.
+    #[cfg(test)]
     pub(crate) fn bulk_restore_admitted(
         &mut self,
         admitted: Vec<SignedFact>,
@@ -2360,64 +2372,7 @@ impl FactGraph {
         result
     }
 
-    /// Restore rows already ordered by their durable admission sequence.
-    /// This is only for a newly constructed graph: an error discards that
-    /// graph, so retaining a graph-sized rollback journal would waste memory.
-    pub(crate) fn restore_admitted_in_order(
-        &mut self,
-        admitted: Vec<SignedFact>,
-        quarantined: Vec<SignedFact>,
-    ) -> Result<(), SemanticError> {
-        if !self.facts.is_empty() || !self.quarantined.is_empty() {
-            return Err(SemanticError::DuplicateFact(
-                self.facts
-                    .keys()
-                    .next()
-                    .copied()
-                    .or_else(|| self.quarantined.keys().next().copied())
-                    .expect("nonempty restore graph has a fact"),
-            ));
-        }
-        self.defer_projection_commitment = true;
-        for fact in admitted {
-            match self.admit_inner(fact, false)? {
-                Admission::Inserted => {}
-                Admission::AlreadyPresent | Admission::Quarantined { .. } => {
-                    return Err(SemanticError::DomainMismatch)
-                }
-            }
-        }
-        for fact in quarantined {
-            match self.admit_inner(fact, false)? {
-                Admission::Quarantined { .. } => {}
-                Admission::AlreadyPresent | Admission::Inserted => {
-                    return Err(SemanticError::DomainMismatch)
-                }
-            }
-        }
-        self.defer_projection_commitment = false;
-        let mut projection_cache = self.projection_cache.lock();
-        if let Some((generation, projection)) = projection_cache.take() {
-            let projection = projection.rebuild_commitment();
-            let resident = self
-                .admitted_bytes
-                .checked_add(self.derived_index_bytes)
-                .and_then(|bytes| bytes.checked_add(projection.commitment_bytes()))
-                .ok_or(SemanticError::CapacityExceeded {
-                    dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                    limit: self.policy_limits.max_database_bytes,
-                    observed: u64::MAX,
-                })?;
-            self.check_capacity(
-                super::SemanticCapacityDimension::AdmittedBytes,
-                resident,
-                self.policy_limits.max_database_bytes,
-            )?;
-            *projection_cache = Some((generation, projection));
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     fn bulk_restore_admitted_inner(
         &mut self,
         admitted: Vec<SignedFact>,
@@ -2716,13 +2671,6 @@ impl FactGraph {
     /// journal delta.  The lookup starts from changed facts and the maintained
     /// subject-scoped reverse witness index; it never enumerates the whole
     /// ledger.
-    pub(crate) fn projection_impact_for_facts(
-        &self,
-        fact_ids: impl IntoIterator<Item = FactId>,
-    ) -> (BTreeSet<ExclusiveCell>, BTreeSet<DeviceId>) {
-        self.projection_impact_for_facts_with_staged(fact_ids, &[])
-    }
-
     fn projection_impact_for_facts_with_staged(
         &self,
         fact_ids: impl IntoIterator<Item = FactId>,
@@ -2955,6 +2903,7 @@ impl FactGraph {
         self.authority_branch_impact_with_staged(subject, participating, staged_cold)
     }
 
+    #[cfg(test)]
     fn projection_impact_for_fact(
         &self,
         fact: &SignedFact,
@@ -3729,13 +3678,8 @@ impl FactGraph {
         // Conservative reservation includes the complete positive replacement
         // delta; exact commit accounting releases the superseded sparse rows.
         let provenance = self.provenance_residency_delta(fact)?;
-        total = self.checked_add_bytes(
-            total,
-            provenance
-                .added
-                .checked_sub(provenance.removed)
-                .unwrap_or(0),
-        )?;
+        total =
+            self.checked_add_bytes(total, provenance.added.saturating_sub(provenance.removed))?;
         // Canonical body bytes are already admitted-owned; reserve the exact
         // additional subject-index entries for cold witnesses before commit
         // can retain them. Retirement may release more, never charge more.
@@ -3807,6 +3751,7 @@ impl FactGraph {
         ))
     }
 
+    #[cfg(test)]
     fn authority_dependents_residency_bytes(&self) -> Result<u64, SemanticError> {
         Ok(0)
     }
@@ -3879,7 +3824,7 @@ impl FactGraph {
         Ok(FactCost {
             encoded_bytes,
             derived_index_bytes,
-            authority_dependents_index_bytes: authority_reverse_index_bytes,
+            _authority_dependents_index_bytes: authority_reverse_index_bytes,
             dependency_edges,
             missing,
         })
@@ -4233,6 +4178,7 @@ impl FactGraph {
     /// inputs. An input-local refusal is recorded and does not undo earlier
     /// valid mutations; only the returned aggregate journal owns rollback of
     /// the whole group.
+    #[cfg(test)]
     pub(crate) fn admit_journaled_batch(
         &mut self,
         facts: Vec<SignedFact>,
@@ -4367,7 +4313,7 @@ impl FactGraph {
                     }
                     results.push(AggregateAdmissionResult {
                         outcome: AggregateAdmissionOutcome::Refused { fact_id, error },
-                        delta: SemanticDelta::default(),
+                        _delta: SemanticDelta::default(),
                     });
                     continue;
                 }
@@ -4375,7 +4321,7 @@ impl FactGraph {
             if matches!(preflight.admission(), Admission::AlreadyPresent) {
                 results.push(AggregateAdmissionResult {
                     outcome: AggregateAdmissionOutcome::AlreadyPresent { fact_id },
-                    delta: SemanticDelta::default(),
+                    _delta: SemanticDelta::default(),
                 });
                 continue;
             }
@@ -4398,7 +4344,7 @@ impl FactGraph {
                     }
                     results.push(AggregateAdmissionResult {
                         outcome: AggregateAdmissionOutcome::Refused { fact_id, error },
-                        delta: SemanticDelta::default(),
+                        _delta: SemanticDelta::default(),
                     });
                     continue;
                 }
@@ -4419,7 +4365,7 @@ impl FactGraph {
             };
             results.push(AggregateAdmissionResult {
                 outcome,
-                delta: item_delta,
+                _delta: item_delta,
             });
         }
 
@@ -4431,9 +4377,11 @@ impl FactGraph {
         // Normalize repeated/touched rows to their final resident state. The
         // per-input records above retain attribution for replies, while this
         // single delta is the only payload handed to the durable store.
-        let mut delta = SemanticDelta::default();
-        delta.affected_cells = affected_cells;
-        delta.affected_subjects = affected_subjects;
+        let mut delta = SemanticDelta {
+            affected_cells,
+            affected_subjects,
+            ..SemanticDelta::default()
+        };
         for id in touched_ids {
             let base_admitted = rollback.facts.get(&id).and_then(Option::as_ref).is_some();
             let base_quarantined = rollback
@@ -4553,6 +4501,7 @@ impl FactGraph {
     /// Apply a preflight result while retaining the same journal guarantees.
     /// The caller must hold the graph's publication fence between the
     /// read-only preflight and this method so the checked graph cannot change.
+    #[cfg(test)]
     pub(crate) fn apply_preflight_journaled(
         &mut self,
         fact: SignedFact,
@@ -4581,6 +4530,9 @@ impl FactGraph {
         )
     }
 
+    // Owned staged rows/rollback and borrowed history/impact have distinct
+    // journal lifetimes; keep those existing admission inputs explicit.
+    #[allow(clippy::too_many_arguments)]
     fn apply_preflight_journaled_with_history_and_impact(
         &mut self,
         fact: SignedFact,
@@ -4789,6 +4741,7 @@ impl FactGraph {
         })
     }
 
+    #[cfg(test)]
     fn retry_quarantined_batch(
         &mut self,
         batch_limit: usize,
@@ -7734,14 +7687,14 @@ mod tests {
                     .fact_cost(&grant_other)
                     .expect("branch residency cost computes");
                 assert_eq!(
-                    branch_cost.authority_dependents_index_bytes,
+                    branch_cost._authority_dependents_index_bytes,
                     graph
                         .authority_dependents_residency_delta(&grant_other)
                         .expect("branch reverse-index delta computes"),
                     "cost and retained residency agree"
                 );
                 assert_eq!(
-                    branch_cost.authority_dependents_index_bytes, 0,
+                    branch_cost._authority_dependents_index_bytes, 0,
                     "the production graph derives rare subject-local reverse edges on demand"
                 );
                 let order = if reverse {
@@ -9381,8 +9334,10 @@ mod tests {
     #[test]
     fn admission_budget_refuses_n_plus_one_but_replays_duplicates() {
         let (bootstrap, root_key) = closed(62);
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_admitted_facts = 1;
+        let policy = SemanticAdmissionPolicy {
+            max_admitted_facts: 1,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         let first = fact(
             &bootstrap,
@@ -9417,8 +9372,10 @@ mod tests {
     #[test]
     fn dependency_waiters_wake_only_after_their_parent_arrives() {
         let (bootstrap, root_key) = closed(65);
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_ready_batch = 1;
+        let policy = SemanticAdmissionPolicy {
+            max_ready_batch: 1,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         let parent = fact(
             &bootstrap,
@@ -9548,8 +9505,10 @@ mod tests {
             },
             vec![parent.id],
         );
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_retained_facts_per_author = 2;
+        let policy = SemanticAdmissionPolicy {
+            max_retained_facts_per_author: 2,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         assert!(matches!(
             graph.admit(child.clone()),
@@ -9722,8 +9681,10 @@ mod tests {
         let controller_key = key(185);
         let other_owner_key = key(186);
         let controller = device(&controller_key);
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_hot_history_facts = 4;
+        let policy = SemanticAdmissionPolicy {
+            max_hot_history_facts: 4,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut seed = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         for ordinal in 0..8 {
             let precursor = witnessed_fact(
@@ -10505,8 +10466,10 @@ mod tests {
         let left_key = key(202);
         let right_key = key(203);
         let target = device(&key(204));
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_hot_history_facts = 4;
+        let policy = SemanticAdmissionPolicy {
+            max_hot_history_facts: 4,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut eligible = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         for ordinal in 0..8 {
             let support = witnessed_fact(
@@ -10909,8 +10872,10 @@ mod tests {
             FactBody::RoleRevoke { target },
             vec![parent.id],
         );
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_ready_batch = 2;
+        let policy = SemanticAdmissionPolicy {
+            max_ready_batch: 2,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         assert!(matches!(
             graph.admit(first_child),
@@ -11050,8 +11015,10 @@ mod tests {
             },
             vec![child.id],
         );
-        let mut policy = SemanticAdmissionPolicy::default();
-        policy.max_ready_batch = 2;
+        let policy = SemanticAdmissionPolicy {
+            max_ready_batch: 2,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
         assert!(matches!(
             graph.admit(grandchild.clone()),
@@ -11708,8 +11675,10 @@ mod tests {
             CausalAdmissionGraph::Full(_)
         ));
 
-        let mut refusal_policy = SemanticAdmissionPolicy::default();
-        refusal_policy.max_database_bytes = 1;
+        let refusal_policy = SemanticAdmissionPolicy {
+            max_database_bytes: 1,
+            ..SemanticAdmissionPolicy::default()
+        };
         let mut refused = FactGraph::from_bootstrap_with_policy(&bootstrap, refusal_policy);
         assert!(matches!(
             refused.admit(first),
@@ -12646,8 +12615,10 @@ mod tests {
         ) -> (FactGraph, SignedFact, FactGraph, Vec<FactId>, Vec<FactId>) {
             let (bootstrap, root_key) = closed(bootstrap_seed);
             let root = device(&root_key);
-            let mut policy = SemanticAdmissionPolicy::default();
-            policy.max_ready_batch = 1;
+            let policy = SemanticAdmissionPolicy {
+                max_ready_batch: 1,
+                ..SemanticAdmissionPolicy::default()
+            };
             let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
             let mut root_head = None;
             let mut supports = Vec::new();
@@ -12726,7 +12697,7 @@ mod tests {
             }
             let mut grandchildren = Vec::new();
             for (offset, child) in children.iter().enumerate() {
-                let (author_key, author_support, target_support) = &supports[offset];
+                let (author_key, _, target_support) = &supports[offset];
                 let target = match &target_support.content.body {
                     FactBody::RoleGrant { target, .. } => target.clone(),
                     _ => unreachable!("target support is a role grant"),

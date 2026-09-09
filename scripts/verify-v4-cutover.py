@@ -78,7 +78,7 @@ CURRENT_MARKERS = (
     "ClosedRelayData",
     "FactInventory",
     "FactRequest",
-    "FactBundle",
+    "FactPageMessage",
     "AuthorityLineageResolution",
     "endpoint_auth_v1",
 )
@@ -96,7 +96,20 @@ def fail(message: str) -> None:
 
 
 def find_markers(label: str, text: str, markers: tuple[str, ...]) -> list[str]:
-    return [marker for marker in markers if marker in text]
+    found = []
+    for marker in markers:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", marker):
+            # A removed identifier or serialized key must be a complete token.
+            # NonCanonicalDeviceId is a current error, not CanonicalDeviceId.
+            # Unicode-aware boundaries also avoid splitting longer identifiers.
+            present = re.search(rf"(?<!\w){re.escape(marker)}(?!\w)", text) is not None
+        else:
+            # Preserve explicit namespace and banned-expression matching,
+            # including network_state::Type and pub use semantic::{ ... }.
+            present = marker in text
+        if present:
+            found.append(marker)
+    return found
 
 
 def scan_source_text(label: str, text: str) -> None:

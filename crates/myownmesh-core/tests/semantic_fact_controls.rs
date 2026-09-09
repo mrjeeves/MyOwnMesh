@@ -376,8 +376,10 @@ fn closed_repeats_are_idempotent_and_author_lifetime_cap_is_exact() {
     let target_a = author(&key(201));
     let target_b = author(&key(202));
     let target_c = author(&key(203));
-    let mut policy = SemanticAdmissionPolicy::default();
-    policy.max_retained_facts_per_author = 4;
+    let policy = SemanticAdmissionPolicy {
+        max_retained_facts_per_author: 4,
+        ..SemanticAdmissionPolicy::default()
+    };
     let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
 
     let meaningful = [

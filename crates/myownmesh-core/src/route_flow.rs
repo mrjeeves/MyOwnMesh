@@ -1,4 +1,5 @@
-//! Bounded field evidence for one opted-in routed echo workload.
+//! Bounded, opted-in routed disposition evidence. Historical echo-selected
+//! v2 rows and ciphertext-metadata v1 rows are explicitly different schemas.
 //!
 //! The whole module is feature-gated at the crate root. A diagnostic build is
 //! still inert unless `MYOWNMESH_ROUTE_FLOW_RUN_ID` contains one bounded ASCII
@@ -19,15 +20,18 @@ const RUN_ID_ENV: &str = "MYOWNMESH_ROUTE_FLOW_RUN_ID";
 const MAX_RUN_ID_BYTES: usize = 80;
 const MAX_SELECTED_SEQUENCE_EXCLUSIVE: u64 = 10_000;
 const MAX_DATA_ROWS: u8 = 64;
+const CIPHERTEXT_SCHEMA: &str = "myownmesh.route-flow-ciphertext/v1";
 const MAX_MEASURED_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Exact compact-JSON ceiling for either serialized event shape below.
+/// Exact compact-JSON ceiling for historical and ciphertext data/overflow
+/// event shapes below.
 ///
 /// The longest data row uses an 80-byte run id, a 32-byte route id, a
 /// 20-digit owner epoch, seven 11-digit (24-hour microsecond) timestamps or
 /// durations and the fixed outer `MeshEvent::Diag` fields. The unit control serializes that
 /// maximal shape and pins this ceiling. The event hub's framing is priced by
 /// its existing envelope limit rather than by this source-local ceiling.
+#[cfg(test)]
 pub(crate) const MAX_SERIALIZED_EVENT_BYTES: usize = 1_536;
 
 static ACTIVE_RUN: RuntimeGate = RuntimeGate::new();
@@ -316,6 +320,12 @@ struct SelectedPayload {
     seq: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SelectedEvidence {
+    HistoricalEcho(SelectedPayload),
+    CiphertextMetadata,
+}
+
 fn select_payload(payload: &serde_json::Value, expected_run_id: &str) -> Option<SelectedPayload> {
     let object = payload.as_object()?;
     if object.get("run_id")?.as_str()? != expected_run_id {
@@ -335,11 +345,14 @@ fn select_payload(payload: &serde_json::Value, expected_run_id: &str) -> Option<
 
 /// An admitted, selected routed disposition. All identity-bearing envelope
 /// fields have been reduced to the opaque route id and bounded numeric shape.
+/// Copying transfers only scalar observation data: no payload, capability,
+/// resource lease or emission reservation is held here. The emission limiter
+/// is consulted only after the actual terminal dispatch, never at selection.
+#[derive(Clone, Copy)]
 pub(crate) struct SelectedRouteFlow {
     run_id: &'static str,
     route_id: [u8; 16],
-    direction: Direction,
-    seq: u64,
+    evidence: SelectedEvidence,
     role: RouteRole,
     hop_index: u8,
     remaining_ttl: u8,
@@ -351,17 +364,44 @@ pub(crate) struct SelectedRouteFlow {
 impl SelectedRouteFlow {
     /// Select only after the caller has obtained an ordinary successful
     /// `RouteAdmission`. The payload remains borrowed and is never copied into
-    /// diagnostic custody.
+    /// diagnostic custody. Ciphertext selection means only that this process
+    /// opted into metadata observation, not that any application run/sequence
+    /// was recognized. The caller must not use this as an admission check.
     pub(crate) fn after_admission(
         envelope: &RoutedApplicationEnvelope,
         role: RouteRole,
         owner_epoch: Option<u64>,
         receipt: Option<HandlerReceipt>,
     ) -> Option<Self> {
-        let run_id = active_run_id()?;
+        Self::after_admission_with(
+            envelope,
+            role,
+            owner_epoch,
+            receipt,
+            active_run_id(),
+            route_flow_now,
+        )
+    }
+
+    fn after_admission_with(
+        envelope: &RoutedApplicationEnvelope,
+        role: RouteRole,
+        owner_epoch: Option<u64>,
+        receipt: Option<HandlerReceipt>,
+        local_run_label: Option<&'static str>,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<Self> {
+        let run_id = local_run_label.filter(|value| valid_run_id(value))?;
         let receipt = receipt?;
-        let ClosedRoutedPayload::ChannelFrame { payload, .. } = envelope.payload();
-        let selected = select_payload(payload, run_id)?;
+        let evidence = match envelope.payload() {
+            ClosedRoutedPayload::ChannelFrame { payload, .. } => {
+                SelectedEvidence::HistoricalEcho(select_payload(payload, run_id)?)
+            }
+            // Only outer routing metadata is observed. The process-local
+            // opt-in does not identify an authenticated application workload.
+            ClosedRoutedPayload::EndpointCiphertext { .. } => SelectedEvidence::CiphertextMetadata,
+            ClosedRoutedPayload::EndpointControl { .. } => return None,
+        };
         let hops = u8::try_from(envelope.hops().len()).ok()?;
         let hop_index = match role {
             RouteRole::Destination => hops,
@@ -370,14 +410,13 @@ impl SelectedRouteFlow {
         Some(Self {
             run_id,
             route_id: envelope.message_id(),
-            direction: selected.direction,
-            seq: selected.seq,
+            evidence,
             role,
             hop_index,
             remaining_ttl: envelope.remaining_ttl(),
             owner_epoch,
             receipt,
-            route_decision: route_flow_now(),
+            route_decision: now(),
         })
     }
 
@@ -392,10 +431,25 @@ impl SelectedRouteFlow {
         outcome: RouteOutcome,
     ) {
         let finished = route_flow_now();
-        match EMISSIONS.reserve() {
-            EmissionPermit::Data => state.emit(self.event(dispatch_started, finished, outcome)),
-            EmissionPermit::Overflow => state.emit(overflow_event()),
-            EmissionPermit::Suppress => {}
+        if let Some(event) = self.limited_event(&EMISSIONS, dispatch_started, finished, outcome) {
+            state.emit(event);
+        }
+    }
+
+    fn limited_event(
+        self,
+        limiter: &EmissionLimiter,
+        dispatch_started: Option<Instant>,
+        finished: Instant,
+        outcome: RouteOutcome,
+    ) -> Option<MeshEvent> {
+        match limiter.reserve() {
+            EmissionPermit::Data => Some(self.event(dispatch_started, finished, outcome)),
+            EmissionPermit::Overflow => Some(match self.evidence {
+                SelectedEvidence::HistoricalEcho(_) => overflow_event(),
+                SelectedEvidence::CiphertextMetadata => ciphertext_overflow_event(),
+            }),
+            EmissionPermit::Suppress => None,
         }
     }
 
@@ -426,11 +480,26 @@ impl SelectedRouteFlow {
         let route_dispatch_us = dispatch_started.and_then(|start| checked_us(start, finished));
         let handler_total_us = checked_us(self.receipt.handler_enter, finished);
         let disposition_finished_mono_us = monotonic_offset_us(&MONOTONIC_ANCHOR, finished);
+        let SelectedEvidence::HistoricalEcho(selected) = self.evidence else {
+            return ciphertext_disposition_event(
+                &self,
+                [
+                    callback_to_insert_us,
+                    insert_to_dequeue_us,
+                    dequeue_to_handler_us,
+                    handler_to_route_decision_us,
+                    route_dispatch_us,
+                    handler_total_us,
+                    disposition_finished_mono_us,
+                ],
+                outcome,
+            );
+        };
         disposition_event(
             self.run_id,
             self.route_id,
-            self.direction,
-            self.seq,
+            selected.direction,
+            selected.seq,
             self.role,
             self.hop_index,
             self.remaining_ttl,
@@ -445,6 +514,55 @@ impl SelectedRouteFlow {
             outcome,
         )
     }
+}
+
+fn ciphertext_disposition_event(
+    flow: &SelectedRouteFlow,
+    times: [Option<u64>; 7],
+    outcome: RouteOutcome,
+) -> MeshEvent {
+    MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
+        network_id: "route_flow_diagnostic".to_string(),
+        level: DiagLevel::Debug,
+        category: "route_flow".to_string(),
+        message: "routed ciphertext disposition".to_string(),
+        detail: serde_json::json!({
+            "schema": CIPHERTEXT_SCHEMA,
+            "kind": "disposition",
+            "local_run_label": flow.run_id,
+            "label_attribution": "local_opt_in_only",
+            "route_id": hex::encode(flow.route_id),
+            "role": flow.role.as_str(),
+            "hop_index": flow.hop_index,
+            "remaining_ttl": flow.remaining_ttl,
+            "owner_epoch": flow.owner_epoch.map(|value| value.to_string()),
+            "callback_to_insert_us": times[0],
+            "insert_to_dequeue_us": times[1],
+            "dequeue_to_handler_us": times[2],
+            "handler_to_route_decision_us": times[3],
+            "route_dispatch_us": times[4],
+            "handler_total_us": times[5],
+            "disposition_finished_mono_us": times[6],
+            "outcome": outcome.as_str(),
+        }),
+    })
+}
+
+fn ciphertext_overflow_event() -> MeshEvent {
+    MeshEvent::Diag(DiagEntry {
+        ts: crate::engine::state::now_unix_ms(),
+        network_id: "route_flow_diagnostic".to_string(),
+        level: DiagLevel::Debug,
+        category: "route_flow".to_string(),
+        message: "route ciphertext flow overflow".to_string(),
+        detail: serde_json::json!({
+            "schema": CIPHERTEXT_SCHEMA,
+            "kind": "overflow",
+            "capacity": MAX_DATA_ROWS,
+            "outcome": "outcome_unknown",
+        }),
+    })
 }
 
 fn monotonic_offset_us(anchor: &OnceLock<Instant>, at: Instant) -> Option<u64> {
@@ -574,6 +692,325 @@ enum EmissionPermit {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    // Signed outer envelope, ciphertext-shaped body ONLY. These schema tests
+    // do not establish endpoint AEAD confirmation or native gateway delivery.
+    fn ciphertext_envelope() -> (RoutedApplicationEnvelope, ed25519_dalek::SigningKey) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
+        let peer = ed25519_dalek::SigningKey::from_bytes(&[92; 32]);
+        let source =
+            crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+                .unwrap();
+        let destination =
+            crate::semantic::DeviceId::from_public_key_bytes(*peer.verifying_key().as_bytes())
+                .unwrap();
+        let context = crate::semantic::MeshContextId::from_bytes([91; 32]);
+        let payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &source,
+            &destination,
+            32,
+        );
+        let mut envelope = RoutedApplicationEnvelope::new(
+            context,
+            source.clone(),
+            destination,
+            [93; 16],
+            4,
+            payload,
+            &key,
+        )
+        .unwrap();
+        envelope.append_hop(source, &key).unwrap();
+        envelope.verify().unwrap();
+        (envelope, key)
+    }
+
+    fn ciphertext_selection(
+        envelope: &RoutedApplicationEnvelope,
+        role: RouteRole,
+        at: Instant,
+    ) -> SelectedRouteFlow {
+        SelectedRouteFlow::after_admission_with(
+            envelope,
+            role,
+            Some(9),
+            Some(HandlerReceipt {
+                native: Some(NativeReceipt {
+                    callback_enter: at,
+                    mailbox_attempt: Some(at + Duration::from_micros(5)),
+                    dequeued: Some(at + Duration::from_micros(15)),
+                }),
+                handler_enter: at + Duration::from_micros(20),
+            }),
+            Some("local-ciphertext-test"),
+            || at + Duration::from_micros(30),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ciphertext_metadata_schema_preserves_outer_coordinates_and_receipt_intervals() {
+        let (envelope, _) = ciphertext_envelope();
+        let at = Instant::now();
+        for (role, hop_index) in [
+            (RouteRole::Origin, 0),
+            (RouteRole::Relay, 0),
+            (RouteRole::Destination, 1),
+        ] {
+            let flow = ciphertext_selection(&envelope, role, at);
+            let value = serde_json::to_value(flow.event(
+                Some(at + Duration::from_micros(40)),
+                at + Duration::from_micros(90),
+                RouteOutcome::Delivered,
+            ))
+            .unwrap();
+            let detail = value["detail"].as_object().unwrap();
+            assert_eq!(detail["schema"], CIPHERTEXT_SCHEMA);
+            assert_eq!(detail["local_run_label"], "local-ciphertext-test");
+            assert_eq!(detail["label_attribution"], "local_opt_in_only");
+            assert_eq!(detail["route_id"], hex::encode(envelope.message_id()));
+            assert_eq!(detail["role"], role.as_str());
+            assert_eq!(detail["hop_index"], hop_index);
+            assert_eq!(detail["remaining_ttl"], envelope.remaining_ttl());
+            assert_eq!(detail["owner_epoch"], "9");
+            assert_eq!(detail["outcome"], "delivered");
+            for (name, expected) in [
+                ("callback_to_insert_us", 5),
+                ("insert_to_dequeue_us", 10),
+                ("dequeue_to_handler_us", 5),
+                ("handler_to_route_decision_us", 10),
+                ("route_dispatch_us", 50),
+                ("handler_total_us", 70),
+            ] {
+                assert_eq!(detail[name].as_u64(), Some(expected));
+            }
+            let mut names: Vec<_> = detail.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "callback_to_insert_us",
+                    "dequeue_to_handler_us",
+                    "disposition_finished_mono_us",
+                    "handler_to_route_decision_us",
+                    "handler_total_us",
+                    "hop_index",
+                    "insert_to_dequeue_us",
+                    "kind",
+                    "label_attribution",
+                    "local_run_label",
+                    "outcome",
+                    "owner_epoch",
+                    "remaining_ttl",
+                    "role",
+                    "route_dispatch_us",
+                    "route_id",
+                    "schema"
+                ]
+            );
+            assert_eq!(value["network_id"], "route_flow_diagnostic");
+            let text = serde_json::to_string(&value).unwrap();
+            assert!(!text.contains(&envelope.origin().to_string()));
+            assert!(!text.contains(&envelope.destination().to_string()));
+            for excluded in [
+                "channel",
+                "payload",
+                "sender",
+                "ephemeral",
+                "transcript",
+                "sequence",
+                "direction",
+                "run_id",
+            ] {
+                assert!(!detail.contains_key(excluded));
+            }
+        }
+    }
+
+    #[test]
+    fn ciphertext_selection_requires_opt_in_receipt_and_excludes_endpoint_control() {
+        let (envelope, key) = ciphertext_envelope();
+        let at = Instant::now();
+        let receipt = Some(HandlerReceipt {
+            native: None,
+            handler_enter: at,
+        });
+        for label in [None, Some(""), Some("invalid.label")] {
+            assert!(SelectedRouteFlow::after_admission_with(
+                &envelope,
+                RouteRole::Destination,
+                None,
+                receipt,
+                label,
+                || panic!("disabled selection must not sample clock")
+            )
+            .is_none());
+        }
+        assert!(SelectedRouteFlow::after_admission_with(
+            &envelope,
+            RouteRole::Destination,
+            None,
+            None,
+            Some("local-only"),
+            || panic!("missing receipt")
+        )
+        .is_none());
+        let ClosedRoutedPayload::EndpointCiphertext { packet } = envelope.payload() else {
+            unreachable!()
+        };
+        let control = crate::protocol::topology::EndpointCipherControl::Confirmation(
+            crate::protocol::endpoint_cipher::KeyConfirmation {
+                binding: packet.binding.clone(),
+                sender: packet.sender,
+                transcript_hash: [1; 32],
+                tag: [2; 16],
+            },
+        );
+        let control = RoutedApplicationEnvelope::new(
+            envelope.context_id(),
+            envelope.origin().clone(),
+            envelope.destination().clone(),
+            [94; 16],
+            4,
+            ClosedRoutedPayload::EndpointControl { control },
+            &key,
+        )
+        .unwrap();
+        assert!(SelectedRouteFlow::after_admission_with(
+            &control,
+            RouteRole::Destination,
+            None,
+            receipt,
+            Some("local-only"),
+            || panic!("control is not application delivery")
+        )
+        .is_none());
+        let flow = SelectedRouteFlow::after_admission_with(
+            &envelope,
+            RouteRole::Destination,
+            None,
+            receipt,
+            Some("local-only"),
+            || at,
+        )
+        .unwrap();
+        let value = serde_json::to_value(flow.event(None, at, RouteOutcome::Refused)).unwrap();
+        assert!(value["detail"]["callback_to_insert_us"].is_null());
+        assert!(value["detail"]["route_dispatch_us"].is_null());
+        assert!(value["detail"]["owner_epoch"].is_null());
+        assert_eq!(value["detail"]["outcome"], "refused");
+    }
+
+    #[test]
+    fn ciphertext_maximal_event_and_shared_limiter_remain_bounded() {
+        let (envelope, _) = ciphertext_envelope();
+        let at = Instant::now();
+        let mut flow = ciphertext_selection(&envelope, RouteRole::Relay, at);
+        flow.run_id = concat!(
+            "rrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrr"
+        );
+        flow.route_id = [255; 16];
+        flow.hop_index = u8::MAX;
+        flow.remaining_ttl = u8::MAX;
+        flow.owner_epoch = Some(u64::MAX);
+        let mut event = ciphertext_disposition_event(
+            &flow,
+            [Some(MAX_MEASURED_DURATION.as_micros() as u64); 7],
+            RouteOutcome::OutcomeUnknown,
+        );
+        let MeshEvent::Diag(entry) = &mut event else {
+            unreachable!()
+        };
+        entry.ts = u64::MAX;
+        let bytes = serde_json::to_vec(&event).unwrap();
+        assert!(bytes.len() <= MAX_SERIALIZED_EVENT_BYTES, "{}", bytes.len());
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            value["detail"]["disposition_finished_mono_us"],
+            86_400_000_000u64
+        );
+
+        let limiter = EmissionLimiter::new();
+        for index in 0..MAX_DATA_ROWS {
+            let mut flow = ciphertext_selection(&envelope, RouteRole::Relay, at);
+            if index % 2 == 0 {
+                flow.evidence = SelectedEvidence::HistoricalEcho(SelectedPayload {
+                    direction: Direction::Request,
+                    seq: 0,
+                });
+            }
+            let value = serde_json::to_value(
+                flow.limited_event(
+                    &limiter,
+                    None,
+                    at + Duration::from_micros(90),
+                    RouteOutcome::OutcomeUnknown,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["detail"]["kind"], "disposition");
+            assert_eq!(value["detail"]["outcome"], "outcome_unknown");
+        }
+        let overflow = ciphertext_selection(&envelope, RouteRole::Relay, at)
+            .limited_event(&limiter, None, at, RouteOutcome::Delivered)
+            .unwrap();
+        assert!(serde_json::to_vec(&overflow).unwrap().len() <= MAX_SERIALIZED_EVENT_BYTES);
+        let value = serde_json::to_value(overflow).unwrap();
+        assert_eq!(
+            value["detail"],
+            serde_json::json!({"schema": CIPHERTEXT_SCHEMA,
+            "kind": "overflow", "capacity": 64, "outcome": "outcome_unknown"})
+        );
+        assert!(ciphertext_selection(&envelope, RouteRole::Relay, at)
+            .limited_event(&limiter, None, at, RouteOutcome::Delivered)
+            .is_none());
+    }
+
+    #[test]
+    fn copied_origin_metadata_has_no_emission_permit_and_obeys_terminal_limiter() {
+        fn requires_copy<T: Copy>() {}
+        requires_copy::<SelectedRouteFlow>();
+        let (envelope, _) = ciphertext_envelope();
+        let at = Instant::now();
+        let selected = ciphertext_selection(&envelope, RouteRole::Origin, at);
+        let limiter = EmissionLimiter::new();
+        let queued = Some(selected);
+        let dispatch = queued;
+        assert_eq!(
+            limiter.count.load(Ordering::Relaxed),
+            0,
+            "selection and scalar handoff reserve no terminal emission"
+        );
+        // Pure observation/limiter boundary, not repeated production writes
+        // or native outcome qualification. Each terminal emission shares the
+        // same limiter; copying never duplicates a pre-reserved permit.
+        for _ in 0..MAX_DATA_ROWS {
+            let event = dispatch
+                .unwrap()
+                .limited_event(&limiter, Some(at), at, RouteOutcome::Delivered)
+                .unwrap();
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(value["detail"]["role"], "origin");
+            assert_eq!(value["detail"]["schema"], CIPHERTEXT_SCHEMA);
+        }
+        let event = dispatch
+            .unwrap()
+            .limited_event(&limiter, Some(at), at, RouteOutcome::Delivered)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["detail"]["kind"],
+            "overflow"
+        );
+        assert!(dispatch
+            .unwrap()
+            .limited_event(&limiter, Some(at), at, RouteOutcome::Delivered)
+            .is_none());
+    }
 
     #[test]
     fn disabled_gate_does_not_call_clock() {
@@ -780,8 +1217,10 @@ mod tests {
         let flow = SelectedRouteFlow {
             run_id: "first-echo-route-cc6-c1",
             route_id: [7; 16],
-            direction: Direction::Request,
-            seq: 3,
+            evidence: SelectedEvidence::HistoricalEcho(SelectedPayload {
+                direction: Direction::Request,
+                seq: 3,
+            }),
             role: RouteRole::Relay,
             hop_index: 2,
             remaining_ttl: 5,

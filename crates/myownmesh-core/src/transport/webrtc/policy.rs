@@ -17,8 +17,6 @@ pub enum WebRtcCandidatePathPolicyError {
     AdmissionCapacityExceeded,
     #[error("candidate path IDs must be unique")]
     DuplicatePathId,
-    #[error("candidate path parallelism must be non-zero")]
-    ZeroParallelism,
     #[error("candidate path is not currently in flight")]
     PathNotInFlight,
     #[error("candidate path planner is already terminal")]
@@ -133,14 +131,17 @@ impl WebRtcCandidatePathPlanner {
         }
     }
 
+    #[cfg(test)]
     pub fn active_path_ids(&self) -> &[u64] {
         &self.active
     }
 
+    #[cfg(test)]
     pub fn failed_path_ids(&self) -> &[u64] {
         &self.failed
     }
 
+    #[cfg(test)]
     pub const fn selected_path_id(&self) -> Option<u64> {
         self.winner
     }

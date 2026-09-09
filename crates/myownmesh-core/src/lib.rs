@@ -33,6 +33,7 @@
 //!     // Resource retention is an owner decision; the library supplies no
 //!     // hidden production ceiling.
 //!     semantic_policy,
+//!     application_transport: None,
 //!     routing_policy: RoutingPolicyConfig::default(),
 //!     tree: None,
 //!     hub: None,
@@ -177,11 +178,14 @@ pub use engine::signaling_bridge::{
 /// is built, and refusable at four separate points.
 pub use error::{ClosedRelayError, Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
+pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 /// The real-link fixture owner, exported at the root for the same reason the
 /// fixture exists: the controls that need it live in another crate.
 #[cfg(feature = "transport-lab")]
-pub use handle::TransportLabPromotedPeer;
-pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};
+pub use handle::{
+    TransportLabIntroductionPhase, TransportLabIntroductionRecord,
+    TransportLabIntroductionSnapshot, TransportLabPromotedPeer, TransportLabRetirableSession,
+};
 pub use identity::{generate_network_id, normalize_network_id, Identity};
 pub use myownmesh_signaling::local::LocalBroker;
 pub use protocol::CapabilityAdvert;
@@ -218,17 +222,19 @@ pub use transport::{
     transport_lab_remote_description_fixture_grant, TransportLabCallbackGrant,
     TransportLabCallbackWorkload, TransportLabRealtimeWorkload,
 };
-/// Every realtime name at the crate root is `WebRtc`-qualified.
+/// Provider-specific realtime names at the crate root are `WebRtc`-qualified;
+/// the one unqualified `RealtimeInboundArrival` is the provider-neutral tagged
+/// mixed-stream boundary and carries either a WebRTC RTP or opaque arrival.
 ///
 /// The generic realtime vocabulary lives in [`realtime`] and names no codec, no
 /// media kind and no RTP fact; everything that does is a property of the WebRTC
 /// provider and says so in its own name. There is no unqualified spelling and no
 /// compatibility alias — a caller names the qualified type or does not compile.
 pub use transport::{
-    WebRtcConnectorProfile, WebRtcConnectorProfileError, WebRtcRealtimeCodec,
-    WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival,
-    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile,
-    WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
+    RealtimeInboundArrival, WebRtcConnectorProfile, WebRtcConnectorProfileError,
+    WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming,
+    WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit,
+    WebRtcRealtimeProfile, WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
 
 /// App-id used to derive the Trystero room handle. Two MyOwnMesh peers

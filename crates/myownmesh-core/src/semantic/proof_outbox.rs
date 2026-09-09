@@ -205,6 +205,9 @@ pub struct DurableProofOutbox {
 }
 
 #[derive(Debug, Clone)]
+// Only tests carry a direct store inline. Preserve that fixture ownership and
+// the production shared-owner representation without introducing a new Box.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
 enum ProofOutboxBackend {
     #[cfg(test)]
     Store(DurableSemanticStore),
@@ -459,6 +462,7 @@ impl DurableProofOutbox {
         }
     }
 
+    #[cfg(test)]
     fn proof_records(
         &self,
         context_id: MeshContextId,

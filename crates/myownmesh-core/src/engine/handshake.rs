@@ -36,9 +36,9 @@
 //!     proof is not accepted as mutual.
 //!   - On success: install the `AuthenticatedChannelCapability` on the
 //!     peer before any diagnostic admission state, emit `PeerAuthenticated`,
-//!     decide approval from canonical policy plus explicit `auto_approve`
-//!     configuration (the roster is diagnostic/UI metadata), send
-//!     `approve` when cleared.
+//!     activate canonical Open participation without pair approval. Closed
+//!     retains its canonical policy and bilateral approval/configuration gate
+//!     (the roster is diagnostic/UI metadata).
 //!   - Duplicates are idempotent for a channel this exact current task
 //!     already promoted; anything else fails closed.
 //!
@@ -47,8 +47,8 @@
 //! `endpoint_auth/BOUNDARY.md`.
 //!
 //! On inbound approve:
-//!   - If we've also sent ours, transition to `Active` and emit
-//!     `PeerApproved`.
+//!   - Record the actual observation and recheck activation. Closed also
+//!     requires our approval send; Open does not require either observation.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -793,7 +793,8 @@ pub async fn on_auth_response(
     // this peer's state.
     let rostered = state.is_rostered(device_id);
     let policy_admits = canonical_policy_admits_both(state, device_id);
-    let auto_approve = policy_admits && state.config.read().auto_approve;
+    let open_participation = is_open_participation(state);
+    let auto_approve = !open_participation && policy_admits && state.config.read().auto_approve;
     // Presence is ephemeral; the Open policy gate is evaluated against this
     // authenticated owner directly and never authors or forwards a durable
     // participation fact. Re-run the canonical gate now that the owner is
@@ -806,7 +807,9 @@ pub async fn on_auth_response(
         format!(
             "auth ok with {} ({})",
             super::short_peer(device_id),
-            if auto_approve {
+            if open_participation && policy_admits {
+                "canonical Open participation"
+            } else if auto_approve {
                 "canonical policy + auto-approve"
             } else {
                 "awaiting user approval"
@@ -816,6 +819,7 @@ pub async fn on_auth_response(
             "peer": device_id,
             "rostered": rostered,
             "auto_approve": auto_approve,
+            "open_participation": open_participation,
         }),
     );
 
@@ -842,9 +846,9 @@ pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
 /// become visible. The caller supplies the owner it already holds; this hook
 /// never resolves a peer by Device ID or manufactures approval observations.
 ///
-/// A newly admitted peer may auto-approve only under the same ordinary
-/// roster/configuration rule used at authentication. Activation itself still
-/// requires both approval observations and the canonical projection below.
+/// Open (including Silent) participation requires no pair permission. Closed
+/// retains its configuration and bilateral observations, in addition to the
+/// canonical projection. Neither path invents a remote Approve observation.
 pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
     let Some(should_reevaluate) = state.peers.with_current(owner, |peer| {
         let data = peer.state.read();
@@ -856,11 +860,22 @@ pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner
         return;
     }
     let auto_approve = state.config.read().auto_approve;
-    if auto_approve {
+    if is_open_participation(state) {
+        maybe_activate(state, owner).await;
+    } else if auto_approve {
         send_local_approve_owner(state, owner).await;
     } else {
         maybe_activate(state, owner).await;
     }
+}
+
+/// Membership mode comes from the verified, immutable bootstrap, never a UI
+/// visibility/dialing preference or a mutable configuration label.
+fn is_open_participation(state: &Arc<NetworkState>) -> bool {
+    matches!(
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
+    )
 }
 
 /// Whether the exact local/remote pair is admitted by the canonical policy.
@@ -883,7 +898,8 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
 
 /// Complete the Active edge from facts already established on the exact peer.
 /// Only [`on_approve`] may latch remote approval. Re-evaluating after a local
-/// send must never manufacture peer consent.
+/// send must never manufacture peer consent. Open bypasses the pair gate, not
+/// authentication, canonical admission, or subsequent resource-funded lending.
 async fn maybe_activate(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
     maybe_activate_after_check(state, owner, || {}).await;
 }
@@ -917,12 +933,15 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
     P: FnOnce(&Arc<NetworkState>, &str, &str) -> crate::Result<()>,
 {
     let device_id = owner.device_id();
+    let open_participation = is_open_participation(state);
     let eligible = state.peers.get_if_current(owner).is_some_and(|peer| {
+        // Read the channel slot separately from peer state (no nested locks).
+        let channel_ready = !open_participation || peer.has_authenticated_channel();
         let data = peer.state.read();
         !matches!(data.status, PeerStatus::Active)
             && data.authenticated
-            && data.local_approve_sent
-            && data.remote_approve_seen
+            && channel_ready
+            && (open_participation || (data.local_approve_sent && data.remote_approve_seen))
     });
     if !eligible {
         return;
@@ -935,6 +954,7 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
     }
 
     let Some(result) = state.peers.with_current(owner, |peer| {
+        let channel_ready = !open_participation || peer.has_authenticated_channel();
         let data = peer.state.write();
         // Guard the transition edge: a peer that re-sends Approve after
         // we're already ACTIVE shouldn't re-fire the on-active side
@@ -949,8 +969,8 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
         // every application and control plane. The early latch is harmless: the
         // transition simply completes the moment authentication lands.
         let active = data.authenticated
-            && data.local_approve_sent
-            && data.remote_approve_seen
+            && channel_ready
+            && (open_participation || (data.local_approve_sent && data.remote_approve_seen))
             && policy_admits;
         if !active || was_active {
             return None;
@@ -958,10 +978,11 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
         let label = data.label.clone();
         drop(data);
 
+        let channel_ready = !open_participation || peer.has_authenticated_channel();
         let mut data = peer.state.write();
         if !data.authenticated
-            || !data.local_approve_sent
-            || !data.remote_approve_seen
+            || !channel_ready
+            || (!open_participation && (!data.local_approve_sent || !data.remote_approve_seen))
             || matches!(data.status, PeerStatus::Active)
         {
             return None;
@@ -971,6 +992,10 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
         data.ice_failed_count = 0;
         data.no_turn_diag_emitted = false;
         drop(data);
+
+        // The exact-owner mutation fence is still held; the advisory Hub
+        // hook neither re-enters that fence nor decides activation.
+        state.note_hub_authenticated_owner_change(owner);
 
         state.log_diag_with(
             crate::events::DiagLevel::Info,
@@ -983,7 +1008,7 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
             device_id: device_id.to_string(),
             label: label.clone(),
         }));
-        state.resolve_connect_waiters(device_id, None);
+        state.resolve_authenticated_connect_waiters(owner);
         state.clear_reconnect_intent(device_id);
         Some(label)
     }) else {
@@ -1001,7 +1026,7 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
             crate::events::DiagLevel::Warn,
             "roster",
             format!(
-                "refresh compatibility projection for {} after mutual approve failed: {error}",
+                "refresh compatibility projection for {} after canonical activation failed: {error}",
                 super::short_peer(device_id)
             ),
         );
@@ -1187,6 +1212,262 @@ mod tests {
         AuthResponseMessage {
             signature: signature.to_string(),
         }
+    }
+
+    /// Genuine Device proof and capability installation through the handler;
+    /// only the connector handoff is a local fixture (no native transport).
+    fn signed_pending_auth(state: &Arc<NetworkState>, context: &str) -> (PeerOwnerToken, String) {
+        signed_pending_auth_with_signer(
+            state,
+            context,
+            &ed25519_dalek::SigningKey::from_bytes(&[73; 32]),
+        )
+    }
+
+    fn signed_pending_auth_with_signer(
+        state: &Arc<NetworkState>,
+        context: &str,
+        proof_signer: &ed25519_dalek::SigningKey,
+    ) -> (PeerOwnerToken, String) {
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[73; 32]);
+        let remote = data_encoding::BASE32_NOPAD
+            .encode(remote_key.verifying_key().as_bytes())
+            .to_lowercase();
+        let context = crate::endpoint_auth::EndpointAuthContext::new(
+            context,
+            state.identity.public_id(),
+            &remote,
+            crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
+                "open-admission-local",
+                "open-admission-remote",
+            )
+            .expect("fixture binding"),
+        )
+        .expect("canonical fixture identities and context");
+        let task = Arc::new(crate::endpoint_auth::EndpointAuthTask::begin(
+            context,
+            crate::connector::handoff_for_test(crate::runtime::runtime_for_test()),
+            crate::endpoint_auth::LocalIdentitySigner::for_identity(Arc::clone(&state.identity)),
+        ));
+        let contribution = crate::endpoint_auth::PeerContribution::from_wire(
+            crate::endpoint_auth::LocalContribution::generate().as_str(),
+        )
+        .expect("canonical peer contribution");
+        task.accept_peer_hello(contribution.clone())
+            .expect("bind signed transcript");
+        let proof = crate::endpoint_auth::peer_proof_for_test(&task, &contribution, proof_signer);
+        crate::engine::install_peer(
+            &state.peers,
+            Arc::new(crate::engine::PeerConnection::with_endpoint_auth_for_test(
+                remote.clone(),
+                task,
+            )),
+        );
+        (state.peers.owner(&remote).expect("exact auth owner"), proof)
+    }
+
+    /// Pre-fix discriminator: the identical signed proof would leave PendingApproval
+    /// when auto_approve=false, despite canonical Open admission being true.
+    #[tokio::test]
+    async fn v4_open_and_silent_authenticate_without_pair_approval() {
+        for kind in [
+            crate::config::NetworkKind::Open,
+            crate::config::NetworkKind::Silent,
+        ] {
+            let state = crate::engine::build_test_state(&format!("permissionless-{kind:?}"));
+            {
+                let mut config = state.config.write();
+                config.kind = kind;
+                config.auto_approve = false;
+            }
+            assert!(matches!(
+                state.verified_bootstrap().policy(),
+                crate::semantic::VerifiedProjectPolicy::Open
+            ));
+            let (owner, proof) = signed_pending_auth(&state, &state.mesh_context_id().to_string());
+            assert!(canonical_policy_admits_both(&state, owner.device_id()));
+            let before = state
+                .authoritative_fact_graph()
+                .read()
+                .projection_commitment_root();
+            let mut events = state.events_tx.subscribe();
+            on_auth_response(&state, &owner, auth_response(&proof)).await;
+            {
+                let peer = state
+                    .peers
+                    .get_if_current(&owner)
+                    .expect("authenticated owner retained");
+                assert!(peer.has_authenticated_channel());
+                let data = peer.state.read();
+                assert!(data.authenticated);
+                assert_eq!(data.status, PeerStatus::Active);
+                assert!(!data.local_approve_sent);
+                assert!(!data.remote_approve_seen, "no fabricated remote consent");
+            }
+            // Re-evaluation and duplicate proof cannot publish Active twice.
+            reevaluate_after_role_grant(&state, &owner).await;
+            on_auth_response(&state, &owner, auth_response(&proof)).await;
+            let mut activations = 0;
+            while let Ok(event) = events.try_recv() {
+                if matches!(event, MeshEvent::Peer(PeerEvent::Approved { device_id, .. })
+                    if device_id == owner.device_id())
+                {
+                    activations += 1;
+                }
+            }
+            assert_eq!(activations, 1);
+            assert_eq!(
+                state
+                    .authoritative_fact_graph()
+                    .read()
+                    .projection_commitment_root(),
+                before
+            );
+            assert_eq!(
+                state
+                    .authoritative_fact_graph()
+                    .read()
+                    .admitted_fact_count(),
+                0
+            );
+            state.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_open_pair_bypass_refuses_unverified_and_stale_owners() {
+        for case in [
+            "forged",
+            "foreign",
+            "unauthenticated",
+            "missing-capability",
+            "stale",
+        ] {
+            let state = crate::engine::build_test_state(&format!("permissionless-refuse-{case}"));
+            state.config.write().auto_approve = false;
+            let context = if case == "foreign" {
+                crate::semantic::VerifiedBootstrap::open("foreign-permissionless")
+                    .expect("foreign bootstrap")
+                    .context_id()
+                    .to_string()
+            } else {
+                state.mesh_context_id().to_string()
+            };
+            let (owner, proof) = if case == "forged" {
+                signed_pending_auth_with_signer(
+                    &state,
+                    &context,
+                    &ed25519_dalek::SigningKey::from_bytes(&[74; 32]),
+                )
+            } else {
+                signed_pending_auth(&state, &context)
+            };
+            let before = state
+                .authoritative_fact_graph()
+                .read()
+                .projection_commitment_root();
+            let mut events = state.events_tx.subscribe();
+            match case {
+                "forged" => on_auth_response(&state, &owner, auth_response(&proof)).await,
+                "foreign" => on_auth_response(&state, &owner, auth_response(&proof)).await,
+                "stale" => {
+                    crate::engine::insert_session_less_peer(&state, owner.device_id(), None);
+                    on_auth_response(&state, &owner, auth_response(&proof)).await;
+                    reevaluate_after_role_grant(&state, &owner).await;
+                }
+                _ => {
+                    state.peers.with_current(&owner, |peer| {
+                        if case == "unauthenticated" {
+                            // Isolate the authenticated-marker fence: a real
+                            // capability alone must not complete activation.
+                            let task = peer.endpoint_auth_task_for(owner.worker()).expect("fixture task");
+                            let crate::endpoint_auth::PeerProofAcceptance::Promoted(capability) =
+                                task.accept_peer_proof(&proof).expect("valid fixture proof")
+                            else { panic!("first proof must promote"); };
+                            assert!(peer.install_authenticated_channel(&task, *capability));
+                        }
+                        let mut data = peer.state.write();
+                        data.status = PeerStatus::PendingApproval;
+                        data.authenticated = case == "missing-capability";
+                        data.local_approve_sent = true;
+                    }).expect("owner current before refused activation");
+                    on_approve(&state, &owner).await;
+                    reevaluate_after_role_grant(&state, &owner).await;
+                }
+            }
+            assert!(state.peers.get(owner.device_id()).is_none_or(|peer| {
+                (case == "unauthenticated" || !peer.has_authenticated_channel())
+                    && peer.state.read().status != PeerStatus::Active
+            }));
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(
+                    event,
+                    MeshEvent::Peer(PeerEvent::Approved { .. })
+                ));
+            }
+            assert_eq!(
+                state
+                    .authoritative_fact_graph()
+                    .read()
+                    .projection_commitment_root(),
+                before
+            );
+            assert_eq!(
+                state
+                    .authoritative_fact_graph()
+                    .read()
+                    .admitted_fact_count(),
+                0
+            );
+            state.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_closed_authentication_retains_governance_and_pair_gates() {
+        let state = crate::engine::build_test_closed_state("closed-no-open-bypass", [0x73; 32]);
+        state.config.write().auto_approve = false;
+        let (owner, proof) = signed_pending_auth(&state, &state.mesh_context_id().to_string());
+        assert!(!is_open_participation(&state));
+        on_auth_response(&state, &owner, auth_response(&proof)).await;
+        assert!(state
+            .peers
+            .get_if_current(&owner)
+            .expect("pending authenticated peer")
+            .has_authenticated_channel());
+        assert!(!canonical_policy_admits_both(&state, owner.device_id()));
+        // Model an accepted local send; even both approval flags cannot supply
+        // a role. Only on_approve records the remote observation.
+        state
+            .peers
+            .with_current(&owner, |peer| peer.state.write().local_approve_sent = true)
+            .expect("authenticated Closed owner remains current");
+        on_approve(&state, &owner).await;
+        assert_eq!(
+            state
+                .peers
+                .get_if_current(&owner)
+                .unwrap()
+                .state
+                .read()
+                .status,
+            PeerStatus::PendingApproval
+        );
+        // A configuration label is not a replacement for the Closed bootstrap.
+        state.config.write().kind = crate::config::NetworkKind::Open;
+        assert!(!is_open_participation(&state));
+        maybe_activate(&state, &owner).await;
+        assert_eq!(
+            state
+                .peers
+                .get_if_current(&owner)
+                .unwrap()
+                .state
+                .read()
+                .status,
+            PeerStatus::PendingApproval
+        );
+        state.shutdown().await;
     }
 
     /// A registry peer whose endpoint-auth task has promoted and whose
@@ -1789,26 +2070,33 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_remote_approve_before_local_send_acceptance_converges() {
-        let state = crate::engine::build_test_state("arc03-approve-remote-first");
-        let remote_identity = crate::identity::Identity::ephemeral();
-        let remote_device = remote_identity.public_id().to_string();
+        let state =
+            crate::engine::build_test_closed_state("arc03-approve-remote-first", [0x74; 32]);
+        state.config.write().auto_approve = false;
+        let (owner, proof) = signed_pending_auth(&state, &state.mesh_context_id().to_string());
+        let remote_device = owner.device_id().to_string();
+        super::super::governance::propose_role_grant(
+            &state,
+            &remote_device,
+            crate::semantic::Role::Member,
+            None,
+        )
+        .await
+        .expect("Closed peer has canonical authority before pair gating");
         assert!(
             canonical_policy_admits_both(&state, &remote_device),
-            "authenticated Open presence uses the exact Open policy gate"
+            "this control exercises the preserved Closed bilateral gate"
         );
-        crate::engine::insert_session_less_peer(&state, &remote_device, None);
-        let owner = state
-            .peers
-            .owner(&remote_device)
-            .expect("installed peer owner");
+        on_auth_response(&state, &owner, auth_response(&proof)).await;
         {
             let peer = state
                 .peers
                 .get_if_current(&owner)
                 .expect("exact peer remains installed");
-            let mut data = peer.state.write();
-            data.authenticated = true;
-            data.status = PeerStatus::PendingApproval;
+            assert!(peer.has_authenticated_channel());
+            let data = peer.state.read();
+            assert!(data.authenticated);
+            assert_eq!(data.status, PeerStatus::PendingApproval);
         }
 
         on_approve(&state, &owner).await;
@@ -1935,18 +2223,29 @@ mod tests {
 
     #[tokio::test]
     async fn v4_arc03_local_approve_without_remote_consent_stays_pending() {
-        let state = crate::engine::build_test_state("arc03-approve-local-only");
-        crate::engine::insert_session_less_peer(&state, "peer", None);
-        let owner = state.peers.owner("peer").expect("installed peer owner");
+        let state = crate::engine::build_test_closed_state("arc03-approve-local-only", [0x75; 32]);
+        state.config.write().auto_approve = false;
+        let (owner, proof) = signed_pending_auth(&state, &state.mesh_context_id().to_string());
+        let remote_device = owner.device_id().to_string();
+        super::super::governance::propose_role_grant(
+            &state,
+            &remote_device,
+            crate::semantic::Role::Member,
+            None,
+        )
+        .await
+        .expect("Closed peer is canonically admitted");
+        assert!(canonical_policy_admits_both(&state, &remote_device));
+        on_auth_response(&state, &owner, auth_response(&proof)).await;
         {
             let peer = state
                 .peers
                 .get_if_current(&owner)
                 .expect("exact peer remains installed");
             let mut data = peer.state.write();
-            data.authenticated = true;
+            assert!(data.authenticated);
             data.local_approve_sent = true;
-            data.status = PeerStatus::PendingApproval;
+            assert_eq!(data.status, PeerStatus::PendingApproval);
         }
 
         send_local_approve_owner(&state, &owner).await;
@@ -1979,6 +2278,7 @@ mod tests {
         state
             .peers
             .with_current(&owner, |peer| {
+                peer.install_authenticated_channel_for_test();
                 let mut data = peer.state.write();
                 data.authenticated = true;
                 data.local_approve_sent = true;
@@ -2027,34 +2327,74 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_replacement_before_roster_persistence_cancels_activation_commit() {
         let state = crate::engine::build_test_state("arc03-approve-stale-owner");
-        crate::engine::insert_session_less_peer(&state, "peer", None);
-        let stale_owner = state.peers.owner("peer").expect("first peer owner");
+        state.config.write().auto_approve = false;
+        let (stale_owner, proof) =
+            signed_pending_auth(&state, &state.mesh_context_id().to_string());
+        let remote_device = stale_owner.device_id().to_string();
+        assert!(canonical_policy_admits_both(&state, &remote_device));
+        // This compatibility query is canonical Open admission, not presence
+        // in the persisted UI roster. It is already true before activation.
+        assert!(state.is_rostered(&remote_device));
+        let roster_before = {
+            let roster = state.roster.read();
+            assert!(!roster
+                .authorized_devices
+                .iter()
+                .any(|peer| peer.device_id == remote_device));
+            (
+                roster.version,
+                roster.network_id.clone(),
+                roster.authorized_devices.clone(),
+            )
+        };
         let mut events = state.events_tx.subscribe();
         let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
         let (registration, cancellation) =
-            state.connect_waiter_registration_for_test("peer", 1, waiter_tx);
-        state.register_connect_waiter("peer", registration);
-        state.record_reconnect_intent("peer", false);
+            state.connect_waiter_registration_for_test(&remote_device, 1, waiter_tx);
+        state.register_connect_waiter(&remote_device, registration);
+        state.record_reconnect_intent(&remote_device, false);
         {
             let peer = state
                 .peers
                 .get_if_current(&stale_owner)
                 .expect("first peer remains installed");
+            let task = peer
+                .endpoint_auth_task_for(stale_owner.worker())
+                .expect("current task");
+            let crate::endpoint_auth::PeerProofAcceptance::Promoted(capability) =
+                task.accept_peer_proof(&proof).expect("valid proof")
+            else {
+                panic!("first proof must promote");
+            };
+            assert!(peer.install_authenticated_channel(&task, *capability));
             let mut data = peer.state.write();
             data.authenticated = true;
-            data.local_approve_sent = true;
-            data.remote_approve_seen = true;
             data.status = PeerStatus::PendingApproval;
         }
 
         let replacement_state = Arc::clone(&state);
-        maybe_activate_after_check(&state, &stale_owner, move || {
-            crate::engine::insert_session_less_peer(&replacement_state, "peer", None);
-        })
+        let replacement_device = remote_device.clone();
+        let persistence_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted_by_persist = Arc::clone(&persistence_attempted);
+        maybe_activate_after_check_with_persistence(
+            &state,
+            &stale_owner,
+            move || {
+                crate::engine::insert_session_less_peer(
+                    &replacement_state,
+                    &replacement_device,
+                    None,
+                );
+            },
+            move |state, device_id, label| {
+                attempted_by_persist.store(true, std::sync::atomic::Ordering::SeqCst);
+                state.refresh_roster_projection(device_id, label)
+            },
+        )
         .await;
 
         {
-            let replacement = state.peers.get("peer").expect("replacement peer");
+            let replacement = state.peers.get(&remote_device).expect("replacement peer");
             let data = replacement.state.read();
             assert!(!data.authenticated);
             assert!(!data.local_approve_sent);
@@ -2069,11 +2409,24 @@ mod tests {
             waiter_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        assert!(state.has_reconnect_intent("peer"));
+        assert!(state.has_reconnect_intent(&remote_device));
         assert!(
-            !state.is_rostered("peer"),
-            "a peer replaced before the persistence fence must not enter the roster"
+            !persistence_attempted.load(std::sync::atomic::Ordering::SeqCst),
+            "a replaced owner must never reach roster persistence"
         );
+        {
+            let roster = state.roster.read();
+            assert_eq!(roster.version, roster_before.0);
+            assert_eq!(roster.network_id, roster_before.1);
+            assert_eq!(roster.authorized_devices, roster_before.2);
+            assert!(
+                !roster
+                    .authorized_devices
+                    .iter()
+                    .any(|peer| peer.device_id == remote_device),
+                "a peer replaced before the persistence fence must not enter the UI roster"
+            );
+        }
         state.shutdown().await;
         drop(waiter_rx);
         drop(cancellation);

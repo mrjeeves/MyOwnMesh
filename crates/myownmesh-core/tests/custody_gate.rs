@@ -33,6 +33,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),

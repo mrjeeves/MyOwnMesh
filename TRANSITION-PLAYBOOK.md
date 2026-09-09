@@ -51,7 +51,7 @@ Everything else builds outward from that vertical slice.
 5. **One state class, one owner.** No `Arc<Mutex<GlobalState>>`, replacement engine grab bag, or global command/event enum.
 6. **Open remains open.** Resource control cannot become disguised admission.
 7. **Closed alone adds governance authorization.** Existing `auto_approve`, local roster mutation, or transport state cannot satisfy it.
-8. **No ordinary mesh forwarding.** A relay is an explicit exact allocation carrying opaque endpoint packets.
+8. **No unbounded or plaintext ordinary mesh forwarding.** Any Hub fallback is an explicit bounded path carrying endpoint ciphertext or refusing; a Closed relay remains an exact allocation carrying opaque endpoint packets.
 9. **No translation layer owns product behavior.** Typed boundaries keep one state owner and expose only the capabilities required by their caller.
 10. **Do not invent numeric budgets.** Instrument the complete path, measure supported targets, and surface values for owner review.
 11. **Own properties, not magnitudes.** This package fixes the *properties* of resource ownership. Capacity magnitudes come from a named provider supplied by the deployment or embedder, never from a document, default, or library constant. A concrete provider's arbitration algorithm is that provider's policy, not a basal architectural requirement.
@@ -220,7 +220,7 @@ authority path is retained for a caller that lacks a live session capability.
 Exit condition:
 
 ```text
-working direct and TURN connectors preserve the same remote Device identity
+working direct, TURN, and any bounded encrypted Hub-fallback connectors preserve the same remote Device identity
 exact endpoint authentication plus current policy and a local principal mint a live SessionCapability
 a generic MyOwnMesh application operation succeeds only through that session
 connected but unauthenticated channels deliver nothing
@@ -235,10 +235,11 @@ no operation has an authority bypass
 ### 7.2. Authority, durability, relay, and closure
 
 This gate covers typed durable-semantic and ephemeral-transport lanes, Open and
-Closed semantics with their governance rules, opaque infrastructure and
-Closed-member relay profiles, durable store reopening/compaction, provider
-resource closure, and the release owner graph. Ordinary forwarding,
-obsolete governance, dead APIs, and parallel authority paths are absent. The
+Closed semantics with their governance rules, opaque infrastructure,
+bounded encrypted Hub-fallback and Closed-member relay profiles, durable store
+reopening/compaction, provider resource closure, and the release owner graph.
+Unbounded or plaintext ordinary forwarding, obsolete governance, dead APIs,
+and parallel authority paths are absent. The
 closure gate in 7.3 makes these final-state requirements verifiable rather than
 asserted.
 
@@ -401,7 +402,7 @@ The architecture is complete when all of the following are true:
 7. durable semantics are transport-independent, while transport remains first-class;
 8. Open has no hidden sponsor or pair-permission gate;
 9. Closed alone carries governance authorization;
-10. ordinary mesh-member payload forwarding is absent;
+10. unbounded or plaintext ordinary mesh-member payload forwarding is absent; only explicitly owned bounded encrypted Hub fallback and Closed-member relay profiles may forward endpoint ciphertext;
 11. relays use exact bounded opaque allocations;
 12. handoff is endpoint-driven, with no route ledger or relay-to-relay requirement;
 13. reachability is useful local evidence, not authority;

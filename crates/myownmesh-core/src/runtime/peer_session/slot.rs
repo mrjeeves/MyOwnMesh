@@ -504,7 +504,6 @@ impl PromotedSessionSlot {
         self.slot.lock().is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn channel_count(&self) -> usize {
         let slot = self.slot.lock();
         let Some(session) = slot.as_ref() else {

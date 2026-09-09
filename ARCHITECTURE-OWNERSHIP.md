@@ -46,11 +46,21 @@ same-cell Role resolution from being reused as a cross-cell authority claim.
 and roster/peer-registry data are projections or runtime inputs and cannot
 authorize durable participation or application operations.
 
-The bounded closed-member opaque relay is the explicit exception to ordinary
-plaintext forwarding. A-B and B-C are independently authenticated and
-promoted; A, B, and C then use route-bound `Open`, `Offer`, and `Accept`
-controls. Endpoint sessions seal/open plaintext, while B forwards only opaque
-packets under exact route, current-owner, and allocation-generation witnesses.
+The bounded Closed-member opaque relay is an explicit forwarding profile; it is
+not permission to forward plaintext. A-B and B-C are independently
+authenticated and promoted; A, B, and C then use route-bound `Open`, `Offer`,
+and `Accept` controls. Endpoint sessions seal/open plaintext, while B forwards
+only opaque packets under exact route, current-owner, and allocation-generation
+witnesses.
+The separately owned Hub profile has different semantics: a Hub may introduce
+bounded direct endpoint demand, but owns no payload. If residual Hub transit is
+used, endpoints derive a fresh endpoint-to-endpoint E2E epoch bound to the
+exact mesh context and full endpoint keys. The Hub may copy/forward endpoint
+ciphertext and observe metadata, but cannot decrypt or read application
+plaintext; it has no Closed `Open`/`Offer`/`Accept` allocation semantics,
+membership authority, or veto over an independently viable path. Failure to
+establish that endpoint epoch is refusal. This is adopted Hub direction, not a
+qualification claim for the depicted LAN path.
 Relay state has no key material, and its allocations, packet bytes, queues,
 retention, and cleanup are finite under the configured profile. Admission
 refusal preserves pending custody. Generation tombstones make duplicate
@@ -64,7 +74,7 @@ contract. No legacy implementation is an executable authority path.
 
 Examples include:
 
-- ordinary mesh-member application forwarding;
+- unbounded or plaintext ordinary mesh-member application forwarding;
 - Closed admission through legacy `auto_approve`;
 - a connected socket, peer string, route, or IPC routing label acting as authority;
 - topology or carrier state mutating durable participation;

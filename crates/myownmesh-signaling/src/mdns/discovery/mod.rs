@@ -323,6 +323,7 @@ pub enum DiscoveryEvent {
     },
 }
 
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 #[derive(Debug)]
 struct CoalescedDiscoveryEvent {
     generation: u64,
@@ -330,6 +331,7 @@ struct CoalescedDiscoveryEvent {
     state: CoalescedDiscoveryState,
 }
 
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoalescedDiscoveryState {
     Active,
@@ -339,6 +341,7 @@ enum CoalescedDiscoveryState {
 /// A bounded latest-state table for events that are waiting for the delivery
 /// owner.  This table is deliberately keyed by the backend's exact service
 /// instance name; it never uses a device id decoded from TXT data.
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 pub(crate) struct DiscoveryEventCoalescer {
     pending: Mutex<HashMap<String, CoalescedDiscoveryEvent>>,
     next_generation: AtomicU64,
@@ -346,6 +349,7 @@ pub(crate) struct DiscoveryEventCoalescer {
     max_pending: usize,
 }
 
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DiscoveryEventAdmission {
     Started { generation: u64 },
@@ -353,6 +357,7 @@ pub(crate) enum DiscoveryEventAdmission {
     Refused,
 }
 
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 impl DiscoveryEventCoalescer {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
@@ -490,6 +495,7 @@ impl DiscoveryEventCoalescer {
     }
 }
 
+#[cfg(any(test, not(any(target_os = "ios", feature = "system-dnssd"))))]
 impl DiscoveryEvent {
     pub(crate) fn generation(&self) -> u64 {
         match self {

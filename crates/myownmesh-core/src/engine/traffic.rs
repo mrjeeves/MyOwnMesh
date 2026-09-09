@@ -43,6 +43,13 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::Unshelve(_)
         | MeshMessage::SessionControl(_)
         | MeshMessage::CapabilitiesUpdate(_)
+        | MeshMessage::HubAdvertisement(_)
+        | MeshMessage::HubDiscoveryRequest(_)
+        | MeshMessage::HubDiscoveryResponse(_)
+        | MeshMessage::HubTreeAttachRequest(_)
+        | MeshMessage::HubTreeAttachResponse(_)
+        | MeshMessage::HubIntroduction(_)
+        | MeshMessage::ApplicationFlowControl(_)
         | MeshMessage::ClosedRelayControl(_) => FrameClass::Control,
         MeshMessage::Fact(_)
         | MeshMessage::FactPage(_)
@@ -54,11 +61,6 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
         | MeshMessage::ClosedRelayData(_)
-        | MeshMessage::HubAdvertisement(_)
-        | MeshMessage::HubDiscoveryRequest(_)
-        | MeshMessage::HubDiscoveryResponse(_)
-        | MeshMessage::HubTreeAttachRequest(_)
-        | MeshMessage::HubTreeAttachResponse(_)
         | MeshMessage::RoutedApplication(_)
         | MeshMessage::RpcRequest(_)
         | MeshMessage::RpcResponse(_)
@@ -231,16 +233,19 @@ mod tests {
             *destination_key.verifying_key().as_bytes(),
         )
         .expect("destination device id");
+        let payload = crate::protocol::topology::ciphertext_payload_for_test(
+            crate::semantic::MeshContextId::from_bytes([33; 32]),
+            &origin,
+            &destination,
+            32,
+        );
         let routed = crate::protocol::RoutedApplicationEnvelope::new(
             crate::semantic::MeshContextId::from_bytes([33; 32]),
             origin,
             destination,
             [34; 16],
             1,
-            crate::protocol::ClosedRoutedPayload::ChannelFrame {
-                channel: "traffic-test".into(),
-                payload: serde_json::json!({"probe": true}),
-            },
+            payload,
             &origin_key,
         )
         .expect("routed application envelope");
@@ -249,6 +254,154 @@ mod tests {
             FrameClass::App
         );
     }
+
+    // BEGIN hub topology accounting controls
+    fn hub_topology_frames() -> [MeshMessage; 5] {
+        use crate::protocol::{hub, parenting};
+        use crate::semantic::{DeviceId, MeshContextId};
+
+        let parent_key = SigningKey::from_bytes(&[41; 32]);
+        let child_key = SigningKey::from_bytes(&[42; 32]);
+        let parent = DeviceId::from_public_key_bytes(parent_key.verifying_key().to_bytes())
+            .expect("canonical parent");
+        let child = DeviceId::from_public_key_bytes(child_key.verifying_key().to_bytes())
+            .expect("canonical child");
+        let context = MeshContextId::from_bytes([43; 32]);
+        let trickle = hub::HubTrickleProfile::new(100, 10_000, 3, 60_000, 4);
+        let hubs = [parent.clone()];
+        // These session-local DTOs have no embedded signature. Checked
+        // construction does not replace their authenticated carrier gate.
+        let advertisement = hub::HubAdvertisement::new(
+            context,
+            parent.clone(),
+            1,
+            hub::configuration_digest(&hubs, 1, trickle),
+        )
+        .expect("checked advertisement");
+        let discovery =
+            hub::HubDiscoveryRequest::new(context, 1, None, 1).expect("checked discovery request");
+        let discovered =
+            hub::HubDiscoveryResponse::for_request(&discovery, vec![child.clone()], None)
+                .expect("checked discovery response");
+        let digest = parenting::hub_tree_configuration_digest(
+            context,
+            parenting::HubTreeTopologyKind::ShallowV1,
+            &parent,
+            &hubs,
+            0,
+            trickle,
+        );
+        let attach = parenting::HubTreeAttachRequest::new(context, digest, 1, child, parent)
+            .expect("checked distinct child and parent");
+        let attached = parenting::HubTreeAttachResponse::accepted(&attach, 1)
+            .expect("checked accepted relation");
+        [
+            MeshMessage::HubAdvertisement(advertisement),
+            MeshMessage::HubDiscoveryRequest(discovery),
+            MeshMessage::HubDiscoveryResponse(discovered),
+            MeshMessage::HubTreeAttachRequest(attach),
+            MeshMessage::HubTreeAttachResponse(attached),
+        ]
+    }
+
+    #[test]
+    fn hub_topology_counts_as_control_without_changing_application_admission() {
+        for message in hub_topology_frames() {
+            let wire = serde_json::to_vec(&message).expect("complete Hub wire");
+            let decoded: MeshMessage = serde_json::from_slice(&wire).expect("valid Hub wire");
+            assert_eq!(class_of(&decoded), FrameClass::Control);
+            assert!(matches!(
+                super::super::message_admission(&decoded),
+                super::super::Admission::Application,
+            ));
+            let counters = TrafficCounters::default();
+            counters.record_tx(class_of(&decoded), wire.len());
+            counters.record_rx(class_of(&decoded), wire.len());
+            let expected_lane = LaneSnapshot {
+                frames: 1,
+                bytes: wire.len() as u64,
+            };
+            assert_eq!(
+                counters.snapshot(),
+                TrafficSnapshot {
+                    control_tx: expected_lane,
+                    control_rx: expected_lane,
+                    ..TrafficSnapshot::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn channel_rpc_and_signed_routed_frames_keep_application_accounting() {
+        let key = SigningKey::from_bytes(&[44; 32]);
+        let destination_key = SigningKey::from_bytes(&[45; 32]);
+        let origin =
+            crate::semantic::DeviceId::from_public_key_bytes(key.verifying_key().to_bytes())
+                .expect("canonical origin");
+        let destination = crate::semantic::DeviceId::from_public_key_bytes(
+            destination_key.verifying_key().to_bytes(),
+        )
+        .expect("canonical destination");
+        let context = crate::semantic::MeshContextId::from_bytes([46; 32]);
+        // Ciphertext representation suffices for accounting; this is not an
+        // AEAD or native-delivery control. The route signature is genuine.
+        let payload = crate::protocol::topology::ciphertext_payload_for_test(
+            context,
+            &origin,
+            &destination,
+            32,
+        );
+        let routed = crate::protocol::RoutedApplicationEnvelope::new(
+            context,
+            origin,
+            destination,
+            [47; 16],
+            1,
+            payload,
+            &key,
+        )
+        .expect("signed routed envelope");
+        routed.verify().expect("genuine route signature");
+        for message in [
+            MeshMessage::Channel {
+                channel: "accounting".into(),
+                payload: serde_json::json!([0, 255]),
+            },
+            MeshMessage::RpcRequest(crate::protocol::RpcRequestMessage {
+                request_id: "accounting-1".into(),
+                method: "echo".into(),
+                payload: serde_json::json!({"value": 1}),
+                streaming: false,
+            }),
+            MeshMessage::RoutedApplication(routed),
+        ] {
+            assert_eq!(class_of(&message), FrameClass::App);
+            assert!(matches!(
+                super::super::message_admission(&message),
+                super::super::Admission::Application,
+            ));
+            let bytes = serde_json::to_vec(&message)
+                .expect("complete application wire")
+                .len();
+            let counters = TrafficCounters::default();
+            counters.record_tx(class_of(&message), bytes);
+            counters.record_rx(class_of(&message), bytes);
+            let expected_lane = LaneSnapshot {
+                frames: 1,
+                bytes: bytes as u64,
+            };
+            assert_eq!(
+                counters.snapshot(),
+                TrafficSnapshot {
+                    app_tx: expected_lane,
+                    app_rx: expected_lane,
+                    ..TrafficSnapshot::default()
+                }
+            );
+        }
+    }
+    // END hub topology accounting controls
 
     #[test]
     fn counters_accumulate_and_snapshot() {

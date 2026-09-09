@@ -15,14 +15,141 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::endpoint_cipher::{CiphertextPacket, EpochBinding, KeyConfirmation, KeyShare};
+use crate::resource::{ResourceClaim, ResourceClass};
 use crate::semantic::{DeviceId, MeshContextId};
 
-/// The routed application payload may use at most the protocol receive-frame
-/// ceiling; the complete envelope is checked separately against that ceiling.
-pub const MAX_ROUTED_APPLICATION_PAYLOAD_BYTES: usize = super::RECEIVE_FRAME_BYTES;
+/// Ciphertext (including its AEAD tag), not a plaintext or JSON-value budget.
+/// The complete max-hop envelope is checked separately against the wire cap.
+pub const MAX_ROUTED_APPLICATION_PAYLOAD_BYTES: usize =
+    super::endpoint_cipher::MAX_CIPHERTEXT_BYTES;
 pub const MAX_ROUTED_HOP_BUDGET: u8 = 4;
-const ROUTED_APPLICATION_DOMAIN: &[u8] = b"myownmesh-routed-application-v1\0";
-const ROUTED_HOP_DOMAIN: &[u8] = b"myownmesh-routed-application-hop-v1\0";
+/// Conservative complete metadata reservation, including outer discriminator,
+/// worst numeric-array spellings, origin signature and all four hop records.
+/// A maximal serialized-shape control below pins this bound to the real DTOs.
+pub const ROUTED_CIPHERTEXT_METADATA_BYTES: usize = 8_192;
+pub const MAX_ROUTED_APPLICATION_PLAINTEXT_BYTES: usize = {
+    let wire_capacity = ((super::RECEIVE_FRAME_BYTES - ROUTED_CIPHERTEXT_METADATA_BYTES) / 4) * 3;
+    let ciphertext = if wire_capacity < MAX_ROUTED_APPLICATION_PAYLOAD_BYTES {
+        wire_capacity
+    } else {
+        MAX_ROUTED_APPLICATION_PAYLOAD_BYTES
+    };
+    ciphertext - super::endpoint_cipher::AEAD_TAG_BYTES
+};
+pub const fn max_routed_plaintext_bytes() -> usize {
+    MAX_ROUTED_APPLICATION_PLAINTEXT_BYTES
+}
+const MAX_ROUTED_HOP_ENCODED_BYTES: usize = 512;
+const ROUTED_APPLICATION_DOMAIN: &[u8] = b"myownmesh-routed-application-v2\0";
+const ROUTED_HOP_DOMAIN: &[u8] = b"myownmesh-routed-application-hop-v2\0";
+// Existing signed byte layout, not a new transcript: three length-prefixed
+// 32-byte coordinates, message id, hop budget and payload length prefix.
+const ROUTED_ORIGIN_FIXED_BYTES: usize =
+    ROUTED_APPLICATION_DOMAIN.len() + 3 * (4 + 32) + 16 + 1 + 4;
+const ROUTED_HOP_SIGNING_BYTES: usize =
+    ROUTED_HOP_DOMAIN.len() + 32 + 3 * (4 + 32) + 16 + (4 + 32) + 2;
+const ROUTED_CANONICAL_PAYLOAD_BYTES: usize = super::RECEIVE_FRAME_BYTES;
+const ROUTED_CANONICAL_ORIGIN_BYTES: usize =
+    ROUTED_ORIGIN_FIXED_BYTES + ROUTED_CANONICAL_PAYLOAD_BYTES;
+const ROUTED_SIGNATURE_WORK_BYTES: usize = 2 * 103 + 52 + 32 + 103 + 64;
+const ROUTED_SIGNATURE_OPERATIONS: usize = 2 * (MAX_ROUTED_HOP_BUDGET as usize + 1) + 2;
+
+// Two endpoints plus four forwarders, each independently frame-owned even
+// when keys repeat. No static interner node or capacity is created by decode.
+pub(super) const WIRE_DEVICE_COUNT: usize = 2 + MAX_ROUTED_HOP_BUDGET as usize;
+pub(super) const WIRE_DEVICE_TEXT_BYTES: usize = 52;
+pub(super) fn wire_device_work_bytes() -> Option<usize> {
+    DeviceId::uninterned_backing_bytes()
+        .checked_mul(WIRE_DEVICE_COUNT)
+        .and_then(|bytes| bytes.checked_add(WIRE_DEVICE_TEXT_BYTES))
+}
+
+/// Bounded canonical string wire, with private Arc/Box custody, never the
+/// ordinary semantic DeviceId deserializer (which interns globally).
+pub(super) fn bounded_device_id<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<DeviceId, D::Error> {
+    struct CanonicalDevice;
+    impl<'de> serde::de::Visitor<'de> for CanonicalDevice {
+        type Value = DeviceId;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a canonical 52-byte device key")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<DeviceId, E> {
+            if value.len() != WIRE_DEVICE_TEXT_BYTES {
+                return Err(E::custom("device key length"));
+            }
+            DeviceId::from_canonical_str_uninterned(value).map_err(E::custom)
+        }
+    }
+    d.deserialize_str(CanonicalDevice)
+}
+
+/// Raw bounded work for one routed construct/clone-or-decode, verification,
+/// one-hop forwarding and complete encoding transaction. `max_wire_bytes`
+/// bounds BOTH complete input/output; use 65535 before an unknown builder.
+/// Normalize/acquire once in the caller before any clone/Box/new/verify/encode,
+/// and retain its guard with the result until the terminal send completes.
+///
+/// The existing JSON structural claim covers decoded shape/fragments. Added
+/// requested capacity covers two wire buffers, one canonical payload + origin
+/// and a hop buffer, one independent boxed payload clone (including ciphertext),
+/// envelope root, eight hop slots during a fixed-capacity vector replacement,
+/// five retained signature strings and transient signature/DeviceId encoding.
+/// Six uninterned Arc+Box identity backings are charged separately using the
+/// identity owner's intrinsic layout, plus 52 bytes of parsed-text scratch;
+/// escaped JSON parser storage remains in the structural claim. Validation
+/// uses fixed stack canonical-key buffers, never reconstructs interned IDs.
+/// This is a conservative simultaneous-capacity ledger, not all allocations
+/// being live at once. No 8192-byte wire metadata reserve is used as heap money.
+///
+/// Excludes original epoch/AEAD/plaintext and caller input custody, route plan,
+/// command/mailbox/queue/node/native buffers and any additional retained clone.
+/// Those require the existing disjoint owner claims. Byte-work/opaque residual
+/// are accounting inputs, not measured CPU time, allocator RSS or exhaustive
+/// dependency crypto heap. No scope, lease or provider grant is created here.
+pub fn routed_work_claim(max_wire_bytes: usize) -> Result<ResourceClaim, RoutedApplicationError> {
+    if max_wire_bytes == 0 || max_wire_bytes > super::RECEIVE_FRAME_BYTES {
+        return Err(RoutedApplicationError::InvalidLimits);
+    }
+    let memory = max_wire_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(ROUTED_CANONICAL_PAYLOAD_BYTES))
+        .and_then(|n| n.checked_add(ROUTED_CANONICAL_ORIGIN_BYTES))
+        .and_then(|n| n.checked_add(ROUTED_HOP_SIGNING_BYTES))
+        .and_then(|n| n.checked_add(MAX_ROUTED_APPLICATION_PAYLOAD_BYTES))
+        .and_then(|n| n.checked_add(std::mem::size_of::<ClosedRoutedPayload>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<RoutedApplicationEnvelope>()))
+        .and_then(|n| {
+            n.checked_add(
+                std::mem::size_of::<RoutedHop>().checked_mul(2 * MAX_ROUTED_HOP_BUDGET as usize)?,
+            )
+        })
+        .and_then(|n| n.checked_add((MAX_ROUTED_HOP_BUDGET as usize + 1) * 103))
+        .and_then(|n| n.checked_add(ROUTED_SIGNATURE_WORK_BYTES))
+        .and_then(|n| n.checked_add(wire_device_work_bytes()?))
+        .ok_or(RoutedApplicationError::Encoding)?;
+    let byte_work = ROUTED_CANONICAL_ORIGIN_BYTES
+        .checked_mul(ROUTED_SIGNATURE_OPERATIONS + 6)
+        .and_then(|n| n.checked_add(max_wire_bytes.checked_mul(2)?))
+        .and_then(|n| n.checked_add(WIRE_DEVICE_COUNT * WIRE_DEVICE_TEXT_BYTES))
+        .ok_or(RoutedApplicationError::Encoding)?;
+    let convert = |value| u64::try_from(value).map_err(|_| RoutedApplicationError::Encoding);
+    let scratch = ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, convert(memory)?),
+        (ResourceClass::ParsingOrCpuWork, convert(byte_work)?),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            convert(12 + ROUTED_SIGNATURE_OPERATIONS + 2 * WIRE_DEVICE_COUNT)?,
+        ),
+    ])
+    .map_err(|_| RoutedApplicationError::Encoding)?;
+    crate::application_gateway::structural_json_claim(max_wire_bytes)
+        .map_err(|_| RoutedApplicationError::Encoding)?
+        .checked_add(scratch)
+        .map_err(|_| RoutedApplicationError::Encoding)
+}
 
 /// "I'm not going to send you application traffic for now — keep the
 /// data channel open as a heartbeat so we can flip back to active
@@ -39,14 +166,53 @@ pub struct ShelveMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnshelveMessage {}
 
-/// The only payload admitted by the routed application envelope.  In
-/// particular, handshake, fact, and nested routed-envelope values are not
-/// protocol payload variants.  The JSON value inside a channel frame is
-/// opaque application data and is bounded by the enclosing envelope.
+/// Routed application bodies are endpoint ciphertext; only the fixed typed
+/// endpoint key handshake may precede it. Facts, arbitrary handshake JSON and
+/// nested routed envelopes are not payload variants. Legacy channel values
+/// remain expressible only so callers receive a typed downgrade refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClosedRoutedPayload {
-    ChannelFrame { channel: String, payload: Value },
+    /// Kept as a source-level refusal discriminator. No constructor/verifier
+    /// accepts this legacy plaintext representation for routing.
+    ChannelFrame {
+        channel: String,
+        payload: Value,
+    },
+    EndpointCiphertext {
+        packet: CiphertextPacket,
+    },
+    /// Fixed cryptographic handshake only, never arbitrary application bytes.
+    EndpointControl {
+        control: EndpointCipherControl,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EndpointCipherControl {
+    Share(KeyShare),
+    Confirmation(KeyConfirmation),
+}
+impl EndpointCipherControl {
+    pub fn binding(&self) -> &EpochBinding {
+        match self {
+            Self::Share(value) => &value.binding,
+            Self::Confirmation(value) => &value.binding,
+        }
+    }
+    pub fn sender(&self) -> [u8; 32] {
+        match self {
+            Self::Share(value) => value.sender,
+            Self::Confirmation(value) => value.sender,
+        }
+    }
+    pub fn validate(&self) -> Result<(), super::endpoint_cipher::CipherError> {
+        match self {
+            Self::Share(value) => value.validate(),
+            Self::Confirmation(value) => value.validate(),
+        }
+    }
 }
 
 /// One authenticated handoff in a routed envelope's bounded hop chain.
@@ -54,10 +220,12 @@ pub enum ClosedRoutedPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutedHop {
+    #[serde(deserialize_with = "bounded_device_id")]
     pub forwarder: DeviceId,
     pub previous_remaining_ttl: u8,
     pub remaining_ttl: u8,
     pub prior_digest: [u8; 32],
+    #[serde(deserialize_with = "super::hub_introduction::bounded_text::<_, 103>")]
     pub signature: String,
 }
 
@@ -67,14 +235,19 @@ pub struct RoutedHop {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutedApplicationEnvelope {
+    version: u8,
     context_id: MeshContextId,
+    #[serde(deserialize_with = "bounded_device_id")]
     origin: DeviceId,
+    #[serde(deserialize_with = "bounded_device_id")]
     destination: DeviceId,
     message_id: [u8; 16],
     initial_hop_budget: u8,
     remaining_ttl: u8,
     payload: ClosedRoutedPayload,
+    #[serde(deserialize_with = "super::hub_introduction::bounded_text::<_, 103>")]
     origin_signature: String,
+    #[serde(deserialize_with = "super::hub_introduction::bounded_hops")]
     hops: Vec<RoutedHop>,
 }
 
@@ -148,6 +321,12 @@ pub enum RoutedApplicationError {
     ContextMismatch,
     #[error("routed envelope was not carried by the expected previous hop")]
     PreviousHopMismatch,
+    #[error("legacy plaintext routed application payload is refused")]
+    LegacyPlaintextRefused,
+    #[error("endpoint ciphertext/control binding is invalid")]
+    InvalidCiphertext,
+    #[error("unsupported routed envelope version")]
+    UnsupportedVersion,
 }
 
 impl RoutedApplicationEnvelope {
@@ -174,6 +353,9 @@ impl RoutedApplicationEnvelope {
         )
     }
 
+    // Explicit signed coordinates, moved payload and caller policy retain
+    // their existing ownership boundary without another aggregate or Box.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_limits(
         context_id: MeshContextId,
         origin: DeviceId,
@@ -184,13 +366,11 @@ impl RoutedApplicationEnvelope {
         signing_key: &SigningKey,
         limits: RoutedApplicationLimits,
     ) -> Result<Self, RoutedApplicationError> {
-        let expected_origin =
-            DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
-                .map_err(|_| RoutedApplicationError::OriginKeyMismatch)?;
-        if origin != expected_origin {
+        if origin.as_bytes() != *signing_key.verifying_key().as_bytes() {
             return Err(RoutedApplicationError::OriginKeyMismatch);
         }
         let envelope = Self {
+            version: 2,
             context_id,
             origin,
             destination,
@@ -199,9 +379,10 @@ impl RoutedApplicationEnvelope {
             remaining_ttl: initial_hop_budget,
             payload,
             origin_signature: String::new(),
-            hops: Vec::new(),
+            hops: Vec::with_capacity(MAX_ROUTED_HOP_BUDGET as usize),
         };
         envelope.validate_unsigned(limits)?;
+        envelope.validate_wire()?;
         let mut envelope = envelope;
         envelope.origin_signature =
             crate::signing::sign_with(signing_key, &envelope.origin_signing_bytes()?);
@@ -251,12 +432,53 @@ impl RoutedApplicationEnvelope {
         &self.origin_signature
     }
 
-    /// Count the exact compact JSON envelope without allocating an encoded
-    /// buffer. Routing admission uses this count before taking payload/dedup
-    /// custody; the count walks the same derived `Serialize` implementation
-    /// used for the eventual wire frame.
+    /// Count the bare compact JSON envelope for unit comparisons against the
+    /// complete MeshMessage encoding used by production routing admission.
+    #[cfg(test)]
     pub(crate) fn encoded_len(&self) -> Option<usize> {
         super::encoded_json_len(self)
+    }
+
+    /// Actual complete MeshMessage bytes, including its leading discriminator.
+    /// This is a length measurement, not a resource grant or authentication.
+    pub fn complete_encoded_len(&self) -> Option<usize> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            kind: &'static str,
+            #[serde(flatten)]
+            envelope: &'a RoutedApplicationEnvelope,
+        }
+        super::encoded_json_len(&Wire {
+            kind: "routed_application",
+            envelope: self,
+        })
+    }
+
+    /// Complete MeshMessage encoded under the caller's pre-acquired work and
+    /// output guards. This validates representation, not the current owner or
+    /// signature; those remain mandatory before effects in the caller.
+    pub fn encode_complete(&self) -> Result<Vec<u8>, RoutedApplicationError> {
+        self.validate_unsigned(RoutedApplicationLimits::default())?;
+        self.validate_wire()?;
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            kind: &'static str,
+            #[serde(flatten)]
+            envelope: &'a RoutedApplicationEnvelope,
+        }
+        let wire = Wire {
+            kind: "routed_application",
+            envelope: self,
+        };
+        let len = self
+            .complete_encoded_len()
+            .ok_or(RoutedApplicationError::Encoding)?;
+        let mut encoded = Vec::with_capacity(len);
+        serde_json::to_writer(&mut encoded, &wire).map_err(|_| RoutedApplicationError::Encoding)?;
+        if encoded.len() != len {
+            return Err(RoutedApplicationError::Encoding);
+        }
+        Ok(encoded)
     }
 
     /// Verify an envelope at its currently authenticated carrier.
@@ -281,10 +503,8 @@ impl RoutedApplicationEnvelope {
         limits: RoutedApplicationLimits,
     ) -> Result<(), RoutedApplicationError> {
         self.verify_for_previous_hop_with_limits(self.current_carrier(), self.context_id, limits)?;
-        let expected_forwarder =
-            DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
-                .map_err(|_| RoutedApplicationError::InvalidHopChain)?;
-        if forwarder != expected_forwarder {
+        Self::validate_device(&forwarder)?;
+        if forwarder.as_bytes() != *signing_key.verifying_key().as_bytes() {
             return Err(RoutedApplicationError::InvalidHopChain);
         }
         if self.hops.len() >= usize::from(limits.max_hop_budget)
@@ -305,11 +525,21 @@ impl RoutedApplicationEnvelope {
             signature: String::new(),
         };
         hop.signature = crate::signing::sign_with(signing_key, &self.hop_signing_bytes(&hop)?);
-        let mut candidate = self.clone();
-        candidate.hops.push(hop);
-        candidate.remaining_ttl = remaining_ttl;
-        candidate.validate_wire()?;
-        *self = candidate;
+        let old_ttl = self.remaining_ttl;
+        // A derived Clone may have capacity=len rather than four. Replace
+        // that storage explicitly so push cannot geometrically grow it.
+        if self.hops.capacity() < MAX_ROUTED_HOP_BUDGET as usize {
+            let mut hops = Vec::with_capacity(MAX_ROUTED_HOP_BUDGET as usize);
+            hops.append(&mut self.hops);
+            self.hops = hops;
+        }
+        self.hops.push(hop);
+        self.remaining_ttl = remaining_ttl;
+        if let Err(error) = self.validate_wire() {
+            self.hops.pop();
+            self.remaining_ttl = old_ttl;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -337,6 +567,7 @@ impl RoutedApplicationEnvelope {
             return Err(RoutedApplicationError::ContextMismatch);
         }
         self.validate_unsigned(limits)?;
+        self.validate_wire()?;
         if self.hops.len() > usize::from(limits.max_hop_budget)
             || self.hops.len() > usize::from(self.initial_hop_budget)
         {
@@ -393,6 +624,9 @@ impl RoutedApplicationEnvelope {
         &self,
         limits: RoutedApplicationLimits,
     ) -> Result<(), RoutedApplicationError> {
+        if self.version != 2 {
+            return Err(RoutedApplicationError::UnsupportedVersion);
+        }
         Self::validate_device(&self.origin)?;
         Self::validate_device(&self.destination)?;
         if self.origin == self.destination {
@@ -417,28 +651,54 @@ impl RoutedApplicationEnvelope {
         &self,
         limits: RoutedApplicationLimits,
     ) -> Result<(), RoutedApplicationError> {
-        let ClosedRoutedPayload::ChannelFrame { channel, payload } = &self.payload;
-        if channel.is_empty() || channel.len() > 256 {
-            return Err(RoutedApplicationError::InvalidChannel);
-        }
-        if canonical_json_bytes(payload)?.len() > limits.max_payload_bytes {
-            return Err(RoutedApplicationError::PayloadTooLarge);
+        let (binding, sender) = match &self.payload {
+            ClosedRoutedPayload::ChannelFrame { .. } => {
+                return Err(RoutedApplicationError::LegacyPlaintextRefused)
+            }
+            ClosedRoutedPayload::EndpointCiphertext { packet } => {
+                packet
+                    .validate()
+                    .map_err(|_| RoutedApplicationError::InvalidCiphertext)?;
+                if packet.ciphertext.len() > limits.max_payload_bytes {
+                    return Err(RoutedApplicationError::PayloadTooLarge);
+                }
+                (&packet.binding, packet.sender)
+            }
+            ClosedRoutedPayload::EndpointControl { control } => {
+                control
+                    .validate()
+                    .map_err(|_| RoutedApplicationError::InvalidCiphertext)?;
+                (control.binding(), control.sender())
+            }
+        };
+        if binding.context != *self.context_id.as_bytes()
+            || sender != self.origin.as_bytes()
+            || binding
+                .destination(&sender)
+                .map_err(|_| RoutedApplicationError::InvalidCiphertext)?
+                != self.destination.as_bytes()
+        {
+            return Err(RoutedApplicationError::InvalidCiphertext);
         }
         Ok(())
     }
 
     fn validate_device(device: &DeviceId) -> Result<(), RoutedApplicationError> {
-        let canonical = DeviceId::from_canonical_str(device)
+        let canonical = DeviceId::canonical_key_bytes(device)
             .map_err(|_| RoutedApplicationError::NonCanonicalDeviceId)?;
-        if canonical != *device {
+        if canonical != device.as_bytes() {
             return Err(RoutedApplicationError::NonCanonicalDeviceId);
         }
         Ok(())
     }
 
     fn origin_signing_bytes(&self) -> Result<Vec<u8>, RoutedApplicationError> {
+        let payload_len = canonical_payload_len(&self.payload)?;
+        let len = ROUTED_ORIGIN_FIXED_BYTES
+            .checked_add(payload_len)
+            .ok_or(RoutedApplicationError::Encoding)?;
         let payload = canonical_payload_bytes(&self.payload)?;
-        let mut bytes = Vec::with_capacity(128 + payload.len());
+        let mut bytes = Vec::with_capacity(len);
         bytes.extend_from_slice(ROUTED_APPLICATION_DOMAIN);
         append_len_prefixed(&mut bytes, self.context_id.as_bytes())?;
         append_len_prefixed(&mut bytes, self.origin.as_bytes().as_slice())?;
@@ -446,11 +706,14 @@ impl RoutedApplicationEnvelope {
         bytes.extend_from_slice(&self.message_id);
         bytes.push(self.initial_hop_budget);
         append_len_prefixed(&mut bytes, &payload)?;
+        if bytes.len() != len {
+            return Err(RoutedApplicationError::Encoding);
+        }
         Ok(bytes)
     }
 
     fn hop_signing_bytes(&self, hop: &RoutedHop) -> Result<Vec<u8>, RoutedApplicationError> {
-        let mut bytes = Vec::with_capacity(128);
+        let mut bytes = Vec::with_capacity(ROUTED_HOP_SIGNING_BYTES);
         bytes.extend_from_slice(ROUTED_HOP_DOMAIN);
         bytes.extend_from_slice(&hop.prior_digest);
         append_len_prefixed(&mut bytes, self.context_id.as_bytes())?;
@@ -460,6 +723,9 @@ impl RoutedApplicationEnvelope {
         append_len_prefixed(&mut bytes, hop.forwarder.as_bytes().as_slice())?;
         bytes.push(hop.previous_remaining_ttl);
         bytes.push(hop.remaining_ttl);
+        if bytes.len() != ROUTED_HOP_SIGNING_BYTES {
+            return Err(RoutedApplicationError::Encoding);
+        }
         Ok(bytes)
     }
 
@@ -487,11 +753,16 @@ impl RoutedApplicationEnvelope {
     }
 
     fn validate_wire(&self) -> Result<(), RoutedApplicationError> {
-        if serde_json::to_vec(self)
-            .map_err(|_| RoutedApplicationError::Encoding)?
-            .len()
-            > super::RECEIVE_FRAME_BYTES
-        {
+        let encoded = self
+            .complete_encoded_len()
+            .ok_or(RoutedApplicationError::Encoding)?;
+        let remaining_hops = usize::from(self.initial_hop_budget)
+            .checked_sub(self.hops.len())
+            .ok_or(RoutedApplicationError::InvalidHopChain)?;
+        let reserved = encoded
+            .checked_add(remaining_hops * MAX_ROUTED_HOP_ENCODED_BYTES)
+            .ok_or(RoutedApplicationError::WireTooLarge)?;
+        if reserved > super::RECEIVE_FRAME_BYTES {
             return Err(RoutedApplicationError::WireTooLarge);
         }
         Ok(())
@@ -505,63 +776,73 @@ fn append_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), RoutedAppl
     Ok(())
 }
 
-fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, RoutedApplicationError> {
-    let mut output = Vec::new();
-    write_canonical_json(value, &mut output)?;
-    Ok(output)
+fn canonical_payload_len(payload: &ClosedRoutedPayload) -> Result<usize, RoutedApplicationError> {
+    if matches!(payload, ClosedRoutedPayload::ChannelFrame { .. }) {
+        return Err(RoutedApplicationError::LegacyPlaintextRefused);
+    }
+    let len = super::encoded_json_len(payload).ok_or(RoutedApplicationError::Encoding)?;
+    if len > ROUTED_CANONICAL_PAYLOAD_BYTES {
+        return Err(RoutedApplicationError::WireTooLarge);
+    }
+    Ok(len)
 }
 
 fn canonical_payload_bytes(
     payload: &ClosedRoutedPayload,
 ) -> Result<Vec<u8>, RoutedApplicationError> {
-    let ClosedRoutedPayload::ChannelFrame { channel, payload } = payload;
-    let mut output = Vec::new();
-    // Keys are emitted in lexicographic order, independently of serde's wire
-    // field order, so signatures cover one canonical strict-payload form.
-    output.extend_from_slice(b"{\"channel\":");
-    serde_json::to_writer(&mut output, channel).map_err(|_| RoutedApplicationError::Encoding)?;
-    output.extend_from_slice(b",\"kind\":\"channel_frame\",\"payload\":");
-    write_canonical_json(payload, &mut output)?;
-    output.push(b'}');
-    Ok(output)
+    // Identical existing typed JSON bytes, counted before the only buffer is
+    // requested. The bounded base64 serializer streams without another String.
+    let len = canonical_payload_len(payload)?;
+    let mut bytes = Vec::with_capacity(len);
+    serde_json::to_writer(&mut bytes, payload).map_err(|_| RoutedApplicationError::Encoding)?;
+    if bytes.len() != len {
+        return Err(RoutedApplicationError::Encoding);
+    }
+    Ok(bytes)
 }
 
-fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), RoutedApplicationError> {
-    match value {
-        Value::Null => output.extend_from_slice(b"null"),
-        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Value::String(value) => output.extend_from_slice(
-            &serde_json::to_vec(value).map_err(|_| RoutedApplicationError::Encoding)?,
-        ),
-        Value::Array(values) => {
-            output.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(b']');
-        }
-        Value::Object(values) => {
-            let mut keys: Vec<&String> = values.keys().collect();
-            keys.sort_unstable();
-            output.push(b'{');
-            for (index, key) in keys.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(b',');
-                }
-                output.extend_from_slice(
-                    &serde_json::to_vec(key).map_err(|_| RoutedApplicationError::Encoding)?,
-                );
-                output.push(b':');
-                write_canonical_json(&values[key], output)?;
-            }
-            output.push(b'}');
-        }
+#[cfg(test)]
+pub(crate) fn ciphertext_payload_for_test(
+    context: MeshContextId,
+    origin: &DeviceId,
+    destination: &DeviceId,
+    ciphertext_bytes: usize,
+) -> ClosedRoutedPayload {
+    ClosedRoutedPayload::EndpointCiphertext {
+        packet: CiphertextPacket {
+            binding: EpochBinding {
+                version: 1,
+                suite: 1,
+                context: *context.as_bytes(),
+                initiator: origin.as_bytes(),
+                responder: destination.as_bytes(),
+                epoch: [255; 16],
+                introduction: Some([255; 16]),
+            },
+            sender: origin.as_bytes(),
+            sequence: u64::MAX,
+            ciphertext: vec![255; ciphertext_bytes],
+        },
     }
-    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn cold_wire_keys_for_test(domain: &[u8]) -> [SigningKey; 6] {
+    std::array::from_fn(|index| {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        hash.update([index as u8]);
+        let seed: [u8; 32] = hash.finalize().into();
+        SigningKey::from_bytes(&seed)
+    })
+}
+
+#[cfg(test)]
+pub(super) fn cold_wire_device_for_test(key: &SigningKey) -> DeviceId {
+    let text = data_encoding::BASE32_NOPAD
+        .encode(key.verifying_key().as_bytes())
+        .to_lowercase();
+    DeviceId::from_canonical_str_uninterned(&text).unwrap()
 }
 
 #[cfg(test)]
@@ -576,22 +857,288 @@ mod routed_tests {
         DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap()
     }
 
+    #[test]
+    fn cold_routed_wire_keys_are_frame_owned_through_verify_refusal_and_drop() {
+        // Domain-unique fixture keys: no ordinary DeviceId constructor is used
+        // until after the cold decode/verify/drop controls below.
+        let keys = cold_wire_keys_for_test(b"cold-routed-uninterned-wire-v1");
+        let source = cold_wire_device_for_test(&keys[0]);
+        let destination = cold_wire_device_for_test(&keys[1]);
+        let context = MeshContextId::from_bytes([71; 32]);
+        let payload = ciphertext_payload_for_test(context, &source, &destination, 32);
+        let mut value = RoutedApplicationEnvelope::new(
+            context,
+            source,
+            destination,
+            [71; 16],
+            4,
+            payload,
+            &keys[0],
+        )
+        .unwrap();
+        for key in &keys[2..] {
+            value
+                .append_hop(cold_wire_device_for_test(key), key)
+                .unwrap();
+        }
+        let wire = serde_json::to_vec(&value).unwrap();
+        let complete = value.encode_complete().unwrap();
+        let origin_bytes = value.origin_signing_bytes().unwrap();
+        let hops: Vec<_> = value
+            .hops
+            .iter()
+            .map(|hop| value.hop_signing_bytes(hop).unwrap())
+            .collect();
+        drop(value);
+
+        for tampered in [false, true] {
+            let mut decoded: RoutedApplicationEnvelope = serde_json::from_slice(&wire).unwrap();
+            let probes: Vec<_> = [&decoded.origin, &decoded.destination]
+                .into_iter()
+                .chain(decoded.hops.iter().map(|hop| &hop.forwarder))
+                .map(DeviceId::backing_liveness_for_test)
+                .collect();
+            assert_eq!(probes.len(), 6);
+            assert!(probes.iter().all(|alive| alive()));
+            assert_eq!(decoded.origin_signing_bytes().unwrap(), origin_bytes);
+            for (hop, expected) in decoded.hops.iter().zip(&hops) {
+                assert_eq!(&decoded.hop_signing_bytes(hop).unwrap(), expected);
+            }
+            assert_eq!(decoded.encode_complete().unwrap(), complete);
+            if tampered {
+                let replacement = if decoded.origin_signature.starts_with('a') {
+                    "b"
+                } else {
+                    "a"
+                };
+                decoded.origin_signature.replace_range(..1, replacement);
+                assert_eq!(
+                    decoded.verify(),
+                    Err(RoutedApplicationError::InvalidSignature)
+                );
+            } else {
+                decoded.verify().unwrap();
+                assert_eq!(
+                    decoded.verify_for_previous_hop(
+                        decoded.current_carrier(),
+                        MeshContextId::from_bytes([72; 32])
+                    ),
+                    Err(RoutedApplicationError::ContextMismatch)
+                );
+            }
+            assert!(probes.iter().all(|alive| alive()));
+            drop(decoded);
+            assert!(probes.iter().all(|alive| !alive()));
+            // Weak probes keep only the Arc control block until this drop.
+            drop(probes);
+        }
+        let original: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        for field in ["origin", "destination"] {
+            for bad in [
+                "a".repeat(53),
+                original[field].as_str().unwrap().to_uppercase(),
+            ] {
+                let mut malformed = original.clone();
+                malformed[field] = serde_json::Value::String(bad);
+                assert!(serde_json::from_value::<RoutedApplicationEnvelope>(malformed).is_err());
+            }
+        }
+        let mut malformed = original.clone();
+        malformed["hops"][0]["forwarder"] = serde_json::json!("x".repeat(53));
+        assert!(serde_json::from_value::<RoutedApplicationEnvelope>(malformed).is_err());
+        let mut fifth = original;
+        fifth["hops"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"not_a_hop": true}));
+        assert!(serde_json::from_value::<RoutedApplicationEnvelope>(fifth).is_err());
+
+        // No global-interner instrumentation is introduced. Distinct backing
+        // from a later ordinary constructor discriminates the cold visitor;
+        // the production callsite census covers no re-interning on validation.
+        let decoded: RoutedApplicationEnvelope = serde_json::from_slice(&wire).unwrap();
+        let ordinary = device(&keys[0]);
+        assert_eq!(decoded.origin, ordinary);
+        assert_ne!(decoded.origin.as_ptr(), ordinary.as_ptr());
+        drop(ordinary);
+        let alive = decoded.origin.backing_liveness_for_test();
+        drop(decoded);
+        assert!(!alive());
+        drop(alive);
+    }
+
+    #[test]
+    fn routed_work_claim_prices_structural_decode_and_bounded_scratch() {
+        for n in [1, super::super::RECEIVE_FRAME_BYTES] {
+            let claim = routed_work_claim(n).unwrap();
+            let parse = crate::application_gateway::structural_json_claim(n).unwrap();
+            let extra = claim.checked_sub(parse).unwrap();
+            let memory = 2 * n
+                + ROUTED_CANONICAL_PAYLOAD_BYTES
+                + ROUTED_CANONICAL_ORIGIN_BYTES
+                + ROUTED_HOP_SIGNING_BYTES
+                + MAX_ROUTED_APPLICATION_PAYLOAD_BYTES
+                + std::mem::size_of::<ClosedRoutedPayload>()
+                + std::mem::size_of::<RoutedApplicationEnvelope>()
+                + 2 * MAX_ROUTED_HOP_BUDGET as usize * std::mem::size_of::<RoutedHop>()
+                + (MAX_ROUTED_HOP_BUDGET as usize + 1) * 103
+                + ROUTED_SIGNATURE_WORK_BYTES
+                + 6 * DeviceId::uninterned_backing_bytes()
+                + 52;
+            assert_eq!(
+                extra.amount(ResourceClass::AccountedMemoryBytes),
+                memory as u64
+            );
+            assert_eq!(
+                extra.amount(ResourceClass::ParsingOrCpuWork),
+                (ROUTED_CANONICAL_ORIGIN_BYTES * (ROUTED_SIGNATURE_OPERATIONS + 6) + 2 * n + 6 * 52)
+                    as u64
+            );
+            assert_eq!(
+                extra.amount(ResourceClass::OpaqueDependencyResidual),
+                (12 + ROUTED_SIGNATURE_OPERATIONS + 12) as u64
+            );
+        }
+        for n in [0, super::super::RECEIVE_FRAME_BYTES + 1, usize::MAX] {
+            assert_eq!(
+                routed_work_claim(n),
+                Err(RoutedApplicationError::InvalidLimits)
+            );
+        }
+    }
+
+    #[test]
+    fn routed_exact_capacity_encoders_preserve_signed_bytes_at_maximum_hops() {
+        // Independent old-layout construction: do not share production length
+        // constants or append_len_prefixed with the signed-byte oracle.
+        fn old_field(out: &mut Vec<u8>, field: &[u8]) {
+            out.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(field);
+        }
+        let origin_key = key(61);
+        let origin = device(&origin_key);
+        let destination = device(&key(62));
+        let context = MeshContextId::from_bytes([255; 32]);
+        let payload = ciphertext_payload_for_test(
+            context,
+            &origin,
+            &destination,
+            MAX_ROUTED_APPLICATION_PAYLOAD_BYTES,
+        );
+        let old_payload = serde_json::to_vec(&payload).unwrap();
+        assert_eq!(canonical_payload_len(&payload).unwrap(), old_payload.len());
+        assert_eq!(canonical_payload_bytes(&payload).unwrap(), old_payload);
+        let mut envelope = RoutedApplicationEnvelope::new(
+            context,
+            origin,
+            destination,
+            [255; 16],
+            MAX_ROUTED_HOP_BUDGET,
+            payload,
+            &origin_key,
+        )
+        .unwrap();
+        let mut old_origin = b"myownmesh-routed-application-v2\0".to_vec();
+        old_field(&mut old_origin, context.as_bytes());
+        old_field(&mut old_origin, &envelope.origin.as_bytes());
+        old_field(&mut old_origin, &envelope.destination.as_bytes());
+        old_origin.extend_from_slice(&envelope.message_id);
+        old_origin.push(envelope.initial_hop_budget);
+        old_field(&mut old_origin, &old_payload);
+        assert_eq!(envelope.origin_signing_bytes().unwrap(), old_origin);
+        assert_eq!(
+            old_origin.len(),
+            ROUTED_ORIGIN_FIXED_BYTES + old_payload.len()
+        );
+        assert_eq!(
+            envelope.origin_signature,
+            crate::signing::sign_with(&origin_key, &old_origin)
+        );
+        let zero_hop_wire = envelope.encode_complete().unwrap();
+        assert_eq!(envelope.complete_encoded_len(), Some(zero_hop_wire.len()));
+        assert_eq!(
+            zero_hop_wire,
+            serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(
+                envelope.clone()
+            ))
+            .unwrap()
+        );
+        for seed in [63, 64, 65, 66] {
+            let hop_key = key(seed);
+            // Exercise clone capacity=len followed by bounded replacement.
+            envelope = envelope.clone();
+            envelope.append_hop(device(&hop_key), &hop_key).unwrap();
+            let hop = envelope.hops.last().unwrap();
+            let mut old_hop = b"myownmesh-routed-application-hop-v2\0".to_vec();
+            old_hop.extend_from_slice(&hop.prior_digest);
+            old_field(&mut old_hop, context.as_bytes());
+            old_field(&mut old_hop, &envelope.origin.as_bytes());
+            old_field(&mut old_hop, &envelope.destination.as_bytes());
+            old_hop.extend_from_slice(&envelope.message_id);
+            old_field(&mut old_hop, &hop.forwarder.as_bytes());
+            old_hop.push(hop.previous_remaining_ttl);
+            old_hop.push(hop.remaining_ttl);
+            assert_eq!(envelope.hop_signing_bytes(hop).unwrap(), old_hop);
+            assert_eq!(old_hop.len(), ROUTED_HOP_SIGNING_BYTES);
+            assert_eq!(hop.signature, crate::signing::sign_with(&hop_key, &old_hop));
+            envelope.verify().unwrap();
+            let encoded = envelope.encode_complete().unwrap();
+            assert_eq!(envelope.complete_encoded_len(), Some(encoded.len()));
+            assert_eq!(
+                encoded,
+                serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(
+                    envelope.clone()
+                ))
+                .unwrap()
+            );
+            assert!(encoded.len() <= super::super::RECEIVE_FRAME_BYTES);
+            let decoded: super::super::MeshMessage = serde_json::from_slice(&encoded).unwrap();
+            let super::super::MeshMessage::RoutedApplication(decoded) = decoded else {
+                panic!("complete encoder must retain the routed discriminator")
+            };
+            assert_eq!(decoded, envelope);
+            decoded.verify().unwrap();
+        }
+        assert_eq!(envelope.hops.len(), 4);
+        let extra_key = key(67);
+        assert_eq!(
+            envelope.append_hop(device(&extra_key), &extra_key),
+            Err(RoutedApplicationError::HopBudgetExhausted)
+        );
+        let mut oversized = envelope.clone();
+        let ClosedRoutedPayload::EndpointCiphertext { packet } = &mut oversized.payload else {
+            unreachable!()
+        };
+        packet.ciphertext.push(0);
+        assert_eq!(
+            oversized.encode_complete(),
+            Err(RoutedApplicationError::InvalidCiphertext)
+        );
+        let mut legacy = envelope;
+        legacy.payload = ClosedRoutedPayload::ChannelFrame {
+            channel: "not-a-fallback".into(),
+            payload: serde_json::json!({}),
+        };
+        assert_eq!(
+            legacy.encode_complete(),
+            Err(RoutedApplicationError::LegacyPlaintextRefused)
+        );
+    }
+
     fn envelope() -> (RoutedApplicationEnvelope, SigningKey, DeviceId) {
         let origin_key = key(7);
         let destination_key = key(8);
         let origin = device(&origin_key);
         let destination = device(&destination_key);
         let context = MeshContextId::from_bytes([3; 32]);
+        let payload = ciphertext_payload_for_test(context, &origin, &destination, 32);
         let envelope = RoutedApplicationEnvelope::new(
             context,
             origin,
             destination.clone(),
             [9; 16],
             4,
-            ClosedRoutedPayload::ChannelFrame {
-                channel: "chat".into(),
-                payload: serde_json::json!({"text": "hello", "n": 1}),
-            },
+            payload,
             &origin_key,
         )
         .unwrap();
@@ -637,27 +1184,36 @@ mod routed_tests {
         let origin_key = key(24);
         let origin = device(&origin_key);
         let destination = device(&key(25));
-        let text = "x".repeat(MAX_ROUTED_APPLICATION_PAYLOAD_BYTES - 1024 - 2);
+        let payload = ciphertext_payload_for_test(
+            MeshContextId::from_bytes([6; 32]),
+            &origin,
+            &destination,
+            MAX_ROUTED_APPLICATION_PAYLOAD_BYTES,
+        );
+        let ClosedRoutedPayload::EndpointCiphertext { packet } = &payload else {
+            unreachable!()
+        };
+        let allocation = packet.ciphertext.as_ptr();
         let envelope = RoutedApplicationEnvelope::new_with_limits(
             MeshContextId::from_bytes([6; 32]),
             origin,
             destination,
             [2; 16],
             1,
-            ClosedRoutedPayload::ChannelFrame {
-                channel: "chat".into(),
-                payload: Value::String(text.clone()),
-            },
+            payload,
             &origin_key,
-            RoutedApplicationLimits::checked(MAX_ROUTED_APPLICATION_PAYLOAD_BYTES - 1024, 1)
-                .unwrap(),
+            RoutedApplicationLimits::checked(MAX_ROUTED_APPLICATION_PAYLOAD_BYTES, 1).unwrap(),
         )
         .unwrap();
         match envelope.into_payload() {
-            ClosedRoutedPayload::ChannelFrame { channel, payload } => {
-                assert_eq!(channel, "chat");
-                assert_eq!(payload, Value::String(text));
+            ClosedRoutedPayload::EndpointCiphertext { packet } => {
+                assert_eq!(
+                    packet.ciphertext.len(),
+                    MAX_ROUTED_APPLICATION_PAYLOAD_BYTES
+                );
+                assert_eq!(packet.ciphertext.as_ptr(), allocation);
             }
+            _ => panic!("ciphertext payload variant changed"),
         }
     }
 
@@ -725,7 +1281,7 @@ mod routed_tests {
                 .is_err());
         }
         let mut wire = serde_json::to_value(&envelope).unwrap();
-        wire["payload"]["payload"]["text"] = serde_json::json!("tampered");
+        wire["payload"]["packet"]["sequence"] = serde_json::json!(2);
         let changed: RoutedApplicationEnvelope = serde_json::from_value(wire).unwrap();
         assert!(changed
             .verify_for_previous_hop(changed.origin(), changed.context_id())
@@ -763,6 +1319,255 @@ mod routed_tests {
             },
             &origin_key,
         );
-        assert_eq!(result, Err(RoutedApplicationError::PayloadTooLarge));
+        assert_eq!(result, Err(RoutedApplicationError::LegacyPlaintextRefused));
+    }
+
+    #[test]
+    fn ciphertext_max_hop_complete_wire_reservation_includes_all_metadata() {
+        let (mut value, key, destination) = envelope();
+        value.payload = ciphertext_payload_for_test(
+            value.context_id(),
+            value.origin(),
+            &destination,
+            MAX_ROUTED_APPLICATION_PAYLOAD_BYTES,
+        );
+        value.origin_signature =
+            crate::signing::sign_with(&key, &value.origin_signing_bytes().unwrap());
+        for seed in [20, 21, 22, 23] {
+            let key = key_for_bound(seed);
+            value.append_hop(device(&key), &key).unwrap();
+        }
+        value.verify().unwrap();
+        assert!(
+            serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(value.clone()))
+                .unwrap()
+                .len()
+                <= super::super::RECEIVE_FRAME_BYTES
+        );
+        // Deliberately maximal *representation* (not an authority fixture):
+        // each raw byte numeric field uses three decimal digits, u64 uses 20.
+        value.message_id = [255; 16];
+        value.origin_signature = "z".repeat(103);
+        for hop in &mut value.hops {
+            hop.prior_digest = [255; 32];
+            hop.signature = "z".repeat(103);
+            assert!(super::super::encoded_json_len(hop).unwrap() < MAX_ROUTED_HOP_ENCODED_BYTES);
+        }
+        let ClosedRoutedPayload::EndpointCiphertext { packet } = &mut value.payload else {
+            unreachable!()
+        };
+        packet.binding.context = [255; 32];
+        packet.binding.initiator = [255; 32];
+        packet.binding.responder = [255; 32];
+        packet.sender = [255; 32];
+        let encoded_body = (packet.ciphertext.len() * 8).div_ceil(6);
+        let counted = value.complete_encoded_len().unwrap();
+        let wire =
+            serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(value)).unwrap();
+        assert_eq!(counted, wire.len());
+        assert!(wire.len() - encoded_body <= ROUTED_CIPHERTEXT_METADATA_BYTES);
+        assert!(wire.len() <= super::super::RECEIVE_FRAME_BYTES);
+        assert_eq!(
+            max_routed_plaintext_bytes() + super::super::endpoint_cipher::AEAD_TAG_BYTES,
+            MAX_ROUTED_APPLICATION_PAYLOAD_BYTES
+        );
+    }
+
+    fn key_for_bound(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn ciphertext_and_control_outer_bindings_have_no_plaintext_downgrade() {
+        let (value, key, destination) = envelope();
+        let context = value.context_id();
+        let source = value.origin().clone();
+        let legacy = ClosedRoutedPayload::ChannelFrame {
+            channel: "secret-channel".into(),
+            payload: serde_json::json!("secret-body"),
+        };
+        assert_eq!(
+            RoutedApplicationEnvelope::new(
+                context,
+                source.clone(),
+                destination.clone(),
+                [1; 16],
+                4,
+                legacy,
+                &key
+            ),
+            Err(RoutedApplicationError::LegacyPlaintextRefused)
+        );
+        let mut packet = match value.payload.clone() {
+            ClosedRoutedPayload::EndpointCiphertext { packet } => packet,
+            _ => unreachable!(),
+        };
+        packet.ciphertext.push(0);
+        packet.binding.context = [9; 32];
+        assert_eq!(
+            RoutedApplicationEnvelope::new(
+                context,
+                source.clone(),
+                destination.clone(),
+                [1; 16],
+                4,
+                ClosedRoutedPayload::EndpointCiphertext {
+                    packet: packet.clone()
+                },
+                &key
+            ),
+            Err(RoutedApplicationError::InvalidCiphertext)
+        );
+        packet.binding.context = *context.as_bytes();
+        packet.ciphertext = vec![0; MAX_ROUTED_APPLICATION_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            RoutedApplicationEnvelope::new(
+                context,
+                source.clone(),
+                destination.clone(),
+                [1; 16],
+                4,
+                ClosedRoutedPayload::EndpointCiphertext {
+                    packet: packet.clone()
+                },
+                &key
+            ),
+            Err(RoutedApplicationError::InvalidCiphertext)
+        );
+        let control = EndpointCipherControl::Share(KeyShare {
+            binding: packet.binding,
+            sender: source.as_bytes(),
+            offered_max_plaintext_bytes: max_routed_plaintext_bytes() as u32,
+            ephemeral: [1; 32],
+            offer_hash: [0; 32],
+            signature: [0; 64],
+        });
+        let routed = RoutedApplicationEnvelope::new(
+            context,
+            source,
+            destination,
+            [1; 16],
+            4,
+            ClosedRoutedPayload::EndpointControl { control },
+            &key,
+        )
+        .unwrap();
+        routed.verify().unwrap(); // Endpoint must separately verify share/confirmation, never deliver this as data.
+        let wire = serde_json::to_string(&routed).unwrap();
+        assert!(!wire.contains("secret-channel"));
+        assert!(!wire.contains("secret-body"));
+    }
+
+    #[test]
+    fn endpoint_control_max_hop_wire_reservation_includes_signed_limit() {
+        use ed25519_dalek::Signer;
+        let (value, initiator_key, responder) = envelope();
+        let context = value.context_id();
+        let initiator = value.origin().clone();
+        let ClosedRoutedPayload::EndpointCiphertext { packet } = value.payload else {
+            unreachable!()
+        };
+        let responder_key = key(8);
+        let offer_limit = max_routed_plaintext_bytes() as u32;
+        for from_responder in [false, true] {
+            let (source, destination, signer) = if from_responder {
+                (responder.clone(), initiator.clone(), &responder_key)
+            } else {
+                (initiator.clone(), responder.clone(), &initiator_key)
+            };
+            let mut share = KeyShare {
+                binding: packet.binding.clone(),
+                sender: source.as_bytes(),
+                ephemeral: [255; 32],
+                offered_max_plaintext_bytes: offer_limit,
+                offer_hash: if from_responder { [255; 32] } else { [0; 32] },
+                signature: [0; 64],
+            };
+            share.signature = signer.sign(&share.signing_bytes()).to_bytes();
+            let confirmation = KeyConfirmation {
+                binding: packet.binding.clone(),
+                sender: source.as_bytes(),
+                transcript_hash: [255; 32],
+                tag: [255; 16],
+            };
+            for control in [
+                EndpointCipherControl::Share(share),
+                EndpointCipherControl::Confirmation(confirmation),
+            ] {
+                control.validate().unwrap();
+                let mut routed = RoutedApplicationEnvelope::new(
+                    context,
+                    source.clone(),
+                    destination.clone(),
+                    [255; 16],
+                    MAX_ROUTED_HOP_BUDGET,
+                    ClosedRoutedPayload::EndpointControl { control },
+                    signer,
+                )
+                .unwrap();
+                for seed in [20, 21, 22, 23] {
+                    let hop_key = key(seed);
+                    routed.append_hop(device(&hop_key), &hop_key).unwrap();
+                }
+                routed.verify().unwrap();
+                let counted = routed.complete_encoded_len().unwrap();
+                let wire = serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(
+                    routed.clone(),
+                ))
+                .unwrap();
+                assert_eq!(counted, wire.len());
+                assert!(wire.len() <= ROUTED_CIPHERTEXT_METADATA_BYTES);
+                assert!(wire.len() <= super::super::RECEIVE_FRAME_BYTES);
+                let super::super::MeshMessage::RoutedApplication(decoded) =
+                    serde_json::from_slice(&wire).unwrap()
+                else {
+                    panic!("control variant changed")
+                };
+                assert_eq!(decoded, routed);
+                decoded.verify().unwrap();
+
+                // Worst serialized representation, not a cryptographic
+                // confirmation/negotiation fixture: every raw byte field has
+                // three decimal digits and both signed local offers use the
+                // largest admissible value. Outer DeviceIds/context already
+                // have fixed-width canonical base32 representations.
+                routed.origin_signature = "z".repeat(103);
+                for hop in &mut routed.hops {
+                    hop.prior_digest = [255; 32];
+                    hop.signature = "z".repeat(103);
+                    assert!(
+                        super::super::encoded_json_len(hop).unwrap() < MAX_ROUTED_HOP_ENCODED_BYTES
+                    );
+                }
+                let ClosedRoutedPayload::EndpointControl { control } = &mut routed.payload else {
+                    unreachable!()
+                };
+                let binding = match control {
+                    EndpointCipherControl::Share(share) => {
+                        assert_eq!(share.offered_max_plaintext_bytes, offer_limit);
+                        share.sender = [255; 32];
+                        share.offer_hash = [255; 32];
+                        share.signature = [255; 64];
+                        &mut share.binding
+                    }
+                    EndpointCipherControl::Confirmation(confirmation) => {
+                        confirmation.sender = [255; 32];
+                        &mut confirmation.binding
+                    }
+                };
+                binding.context = [255; 32];
+                binding.initiator = [255; 32];
+                binding.responder = [255; 32];
+                binding.epoch = [255; 16];
+                binding.introduction = Some([255; 16]);
+                let counted = routed.complete_encoded_len().unwrap();
+                let wire =
+                    serde_json::to_vec(&super::super::MeshMessage::RoutedApplication(routed))
+                        .unwrap();
+                assert_eq!(counted, wire.len());
+                assert!(wire.len() <= ROUTED_CIPHERTEXT_METADATA_BYTES);
+                assert!(wire.len() <= super::super::RECEIVE_FRAME_BYTES);
+            }
+        }
     }
 }

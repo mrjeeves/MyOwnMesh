@@ -11,8 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 use crate::resource::{
-    FiniteResourceProvider, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
-    ResourceClaimArithmeticError, ResourceUnavailable,
+    LeasedMap, LocalApplicationResourceScope, ResourceClaimArithmeticError, ResourceUnavailable,
 };
 use crate::semantic::DeviceId;
 
@@ -60,6 +59,7 @@ pub(super) struct ObservationProvenance {
 /// Whether a sighting only claimed a locator or was authenticated locally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ObservationSighting {
+    #[cfg(all(test, feature = "transport-lab"))]
     ClaimedLocator,
     Authenticated,
 }
@@ -69,8 +69,11 @@ pub(super) enum ObservationSighting {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ObservationOutcome {
     Succeeded,
+    #[cfg(all(test, feature = "transport-lab"))]
     Failed,
+    #[cfg(all(test, feature = "transport-lab"))]
     Stale,
+    #[cfg(all(test, feature = "transport-lab"))]
     KeyMismatch,
 }
 
@@ -114,15 +117,6 @@ pub(super) struct LocalObservationLimits {
 }
 
 impl LocalObservationLimits {
-    pub(super) const fn disabled() -> Self {
-        Self {
-            max_records: 0,
-            max_records_per_subject: 0,
-            max_age_ticks: 0,
-            max_maintenance_work: 0,
-        }
-    }
-
     fn validate(self) -> Result<(), LocalObservationRefusal> {
         if self.max_records == 0
             || self.max_records_per_subject == 0
@@ -240,6 +234,7 @@ impl ObservationCounters {
     fn sighting(self, kind: ObservationSighting) -> Result<Self, LocalObservationRefusal> {
         let mut next = self;
         match kind {
+            #[cfg(all(test, feature = "transport-lab"))]
             ObservationSighting::ClaimedLocator => {
                 next.sightings.claimed = next
                     .sightings
@@ -271,8 +266,11 @@ impl ObservationCounters {
         let mut next = self;
         let counter = match outcome {
             ObservationOutcome::Succeeded => &mut next.outcomes.succeeded,
+            #[cfg(all(test, feature = "transport-lab"))]
             ObservationOutcome::Failed => &mut next.outcomes.failed,
+            #[cfg(all(test, feature = "transport-lab"))]
             ObservationOutcome::Stale => &mut next.outcomes.stale,
+            #[cfg(all(test, feature = "transport-lab"))]
             ObservationOutcome::KeyMismatch => &mut next.outcomes.key_mismatch,
         };
         *counter = counter
@@ -345,24 +343,6 @@ impl<C: ObservationClock> LocalObservationGraph<C> {
             retired: false,
             resources,
         })
-    }
-
-    /// The exact provider planning claim for a completely full cache.
-    /// `reservation_planning_charge` is applied per map entry before scaling,
-    /// because each provider reservation has its own bookkeeping record.
-    pub(super) fn planned_retained_claim(
-        limits: LocalObservationLimits,
-    ) -> Result<ResourceClaim, LocalObservationRefusal> {
-        limits.validate()?;
-        let node = LeasedMap::<ObservationKey, ObservationAggregate>::entry_claim()?;
-        let reservation = FiniteResourceProvider::reservation_planning_charge(node)
-            .map_err(LocalObservationRefusal::Provider)?;
-        reservation
-            .checked_scale(
-                u64::try_from(limits.max_records)
-                    .map_err(|_| LocalObservationRefusal::TimeOverflow)?,
-            )
-            .map_err(Into::into)
     }
 
     fn now(&mut self) -> Result<ObservationTick, LocalObservationRefusal> {
@@ -717,6 +697,7 @@ impl<C: ObservationClock> LocalObservationGraph<C> {
 
     /// Visit only one subject's live records.  Expired records are filtered
     /// even when the bounded maintenance cursor has not reached them.
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(super) fn for_subject(
         &mut self,
         subject: ObservationDeviceKey,
@@ -817,11 +798,6 @@ impl<C: ObservationClock> LocalObservationGraph<C> {
     pub(super) fn record_count_for_test(&self) -> usize {
         self.record_count
     }
-
-    #[cfg(test)]
-    pub(super) fn generation_for_test(&self) -> u64 {
-        self.generation
-    }
 }
 
 #[cfg(all(test, feature = "transport-lab"))]
@@ -831,7 +807,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    use crate::resource::{ResourceClass, ResourceProviderPort};
+    use crate::resource::{
+        FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
+    };
 
     #[derive(Clone)]
     struct TestClock(Arc<AtomicU64>);

@@ -284,6 +284,18 @@ impl Topology for HubsSelector {
     }
 }
 
+struct RankedCandidate<'a> {
+    direct: bool,
+    score: u64,
+    key: &'a str,
+    peer: &'a str,
+}
+
+struct RankedHub<'a> {
+    score: u64,
+    key: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,16 +602,4 @@ mod tests {
             .iter()
             .all(|hop| signing::pubkey_part(hop) != "hub-origin"));
     }
-}
-
-struct RankedCandidate<'a> {
-    direct: bool,
-    score: u64,
-    key: &'a str,
-    peer: &'a str,
-}
-
-struct RankedHub<'a> {
-    score: u64,
-    key: &'a str,
 }

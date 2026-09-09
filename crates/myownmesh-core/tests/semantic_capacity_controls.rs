@@ -643,7 +643,7 @@ async fn production_lifecycle_funds_exact_database_envelope_and_releases_it(
     let blocked_baseline = provider_view.in_use();
     let blocked = mesh
         .create_network(
-            lifecycle_config("semantic-capacity-blocked", semantic_policy.clone(), budget),
+            lifecycle_config("semantic-capacity-blocked", semantic_policy, budget),
             [0x31; 32],
         )
         .await;
@@ -665,7 +665,7 @@ async fn production_lifecycle_funds_exact_database_envelope_and_releases_it(
 
     let network = mesh
         .create_network(
-            lifecycle_config("semantic-capacity-exact", semantic_policy.clone(), budget),
+            lifecycle_config("semantic-capacity-exact", semantic_policy, budget),
             [0x32; 32],
         )
         .await?;

@@ -1087,6 +1087,7 @@ fn apply_hot_and_persist_with_rollback(
     next: &NetworkConfig,
     old: &NetworkConfig,
 ) -> Result<()> {
+    validate_network_update(old, next)?;
     run_hot_update_with_rollback(
         || {
             current
@@ -1166,14 +1167,9 @@ fn replacement_retirement_failure(result: RemoveResult) -> Option<String> {
     }
 }
 
-/// Update an already-joined network in place. Hot-reloadable edits
-/// (topology / label / auto_approve / roster path) apply without
-/// touching live sessions; transport edits (signaling / STUN / TURN /
-/// network_id) tear the network down and rejoin under the new config,
-/// because the ICE server set is baked into each `RTCPeerConnection`
-/// when it's created — there's no way to retrofit a new TURN server
-/// onto an existing connection. Either way config.json is rewritten so
-/// the change survives a daemon restart.
+/// Validate an edit before teardown or persistence. Label, auto-approve and
+/// ICE edits preserve live sessions; construction-time routing, pins and owner
+/// capacities use exact runtime replacement. Kind edits cannot mint authority.
 pub(in crate::control) async fn network_update(
     state: &Arc<ControlState>,
     config: NetworkConfig,
@@ -1212,12 +1208,17 @@ pub(in crate::control) async fn network_update(
         )));
     }
 
+    let old_config = joined.config_snapshot();
+    if let Err(error) = validate_network_update(&old_config, &config) {
+        return owner.finish(Err(format!("network update refused: {error}")));
+    }
+
     // Compare the incoming config against the engine's live config to
     // decide hot-apply vs. transport restart.
     let restart = joined.reconcile_status(&config);
     // Name the path taken so a config-driven flap is greppable: a hot-apply
     // keeps every live peer; a restart drops them. Network identity,
-    // signaling, closed-relay profile, semantic policy, scheduler, and
+    // signaling, routing/pins, closed-relay profile, semantic policy, scheduler, and
     // broadcaster capacities force the restart; STUN/TURN remain hot (see
     // `reconcile`).
     info!(
@@ -1227,6 +1228,8 @@ pub(in crate::control) async fn network_update(
         network_id_changed = restart.network_id_changed,
         closed_relay_changed = restart.closed_relay_changed,
         semantic_policy_changed = restart.semantic_policy_changed,
+        routing_policy_changed = old_config.routing_policy != config.routing_policy,
+        pinned_peers_changed = old_config.pinned_peers != config.pinned_peers,
         scheduler_changed = restart.scheduler_changed,
         event_capacity_changed = restart.event_capacity_changed,
         connection_trace_capacity_changed = restart.connection_trace_capacity_changed,
@@ -1239,12 +1242,11 @@ pub(in crate::control) async fn network_update(
     );
 
     if !restart.needs_restart {
-        // STUN/TURN / topology / label / auto_approve / roster — apply in
+        // STUN/TURN / topology / label / auto_approve — apply in
         // place, no peers dropped. ICE servers are read fresh on the next
         // connect, so a credential rotation reaches new connections without
         // tearing down the live ones (see `reconcile::apply_hot`). A disk
         // failure rolls both the live fields and the saved record back.
-        let old_config = joined.config_snapshot();
         let hot_result = state.registry.with_current(&config.id, &joined, |current| {
             apply_hot_and_persist_with_rollback(current, &config, &old_config)
         });
@@ -1281,12 +1283,11 @@ pub(in crate::control) async fn network_update(
     // survives on disk regardless, but a vanished network with no
     // recovery surface is a footgun. Then release our Arc clones so the
     // registry can begin its single owned teardown.
-    let old_config = joined.config_snapshot();
     // Start the authenticated departure and teardown together so teardown can
     // cancel a silent peer's DepartObserved waiter. The carrier hint remains
     // part of the departure future.
     let departure = joined.announce_leave();
-    let removal = state.registry.remove(&old_config.id);
+    let removal = state.registry.remove_if_current(&old_config.id, &joined);
     let (_, removal) = tokio::join!(departure, removal);
     drop(joined);
 
@@ -1441,6 +1442,11 @@ pub(in crate::control) async fn network_update(
     owner.finish(Ok(OperationReplyData::Updated(summary)))
 }
 
+fn validate_network_update(current: &NetworkConfig, next: &NetworkConfig) -> Result<()> {
+    myownmesh_core::engine::reconcile::validate_update(current, next)
+        .map_err(|error| anyhow!("{error}"))
+}
+
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {
     MeshConfig::transaction(|cfg| {
         // Append only if not already present — covers the case where
@@ -1469,7 +1475,29 @@ fn persist_network_remove(config_id: &str, network_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    // Only the scoped update future can consume this exact-config fault.
+    // Rollback sees None; unrelated tasks and child processes cannot inherit it.
+    static UPDATE_SAVE_FAULT: std::cell::RefCell<Option<NetworkConfig>>;
+}
+
 fn persist_network_update(net: &NetworkConfig) -> Result<()> {
+    #[cfg(test)]
+    if UPDATE_SAVE_FAULT
+        .try_with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref() == Some(net) {
+                slot.take();
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    {
+        return Err(anyhow!("injected exact-update pre-save failure"));
+    }
     MeshConfig::transaction(|cfg| {
         // Replace the matching record in place (by either alias). If it's
         // somehow absent — e.g. the user hand-deleted it between join and
@@ -1630,7 +1658,430 @@ mod tests {
     use super::purge_owned_state;
     use super::replacement_retirement_failure;
     use super::run_hot_update_with_rollback;
+    use super::validate_network_update;
     use super::RemoveResult;
+
+    const UPDATE_CHILD: &str = "MYOWNMESH_NETWORK_UPDATE_CHILD";
+    const UPDATE_SELECTOR: &str =
+        "control::dispatch::network::tests::actual_network_update_isolated_lifecycle";
+
+    // A child-only fixture: no test changes the parent process's HOME or
+    // MYOWNMESH_HOME. It uses the production global-path adapter unchanged.
+    #[test]
+    #[ignore = "isolated real daemon dispatch/SQLite/driver lifecycle"]
+    fn actual_network_update_isolated_lifecycle() {
+        if let Some(root) = std::env::var_os(UPDATE_CHILD) {
+            assert_eq!(std::env::var_os("MYOWNMESH_HOME"), Some(root.clone()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture runtime");
+            let report = runtime.block_on(actual_update_child(tokio::time::Instant::from_std(
+                deadline,
+            )));
+            drop(runtime);
+            // Synchronous destruction is not preempted by timeout_at. A late
+            // Ready or runtime drop must never turn into successful evidence.
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child runtime teardown deadline"
+            );
+            let report = report.expect("actual update lifecycle");
+            std::fs::write(
+                std::path::PathBuf::from(root).join("result.json"),
+                serde_json::to_vec(&report).unwrap(),
+            )
+            .expect("child evidence");
+            return;
+        }
+        let root = tempfile::tempdir().expect("isolated instance root");
+        let stdout = tempfile::tempfile().expect("child stdout");
+        let stderr = tempfile::tempfile().expect("child stderr");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stop_work = deadline - std::time::Duration::from_secs(2);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                UPDATE_SELECTOR,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UPDATE_CHILD, root.path())
+            .env("MYOWNMESH_HOME", root.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .expect("isolated test child");
+        let mut forced = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let observed = std::time::Instant::now();
+                    if observed >= deadline {
+                        forced = Some("child terminal exceeded absolute hang guard".into());
+                    } else if observed >= stop_work && forced.is_none() {
+                        forced = Some("child terminal observed after work cutoff".into());
+                    }
+                    break status;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    forced = Some(format!("child observation failed: {error}"));
+                    let _ = child.kill();
+                    break child.wait().expect("reap child after observation failure");
+                }
+            }
+            let oversized = stdout
+                .metadata()
+                .map(|m| m.len() > 1024 * 1024)
+                .unwrap_or(true)
+                || stderr
+                    .metadata()
+                    .map(|m| m.len() > 1024 * 1024)
+                    .unwrap_or(true);
+            if forced.is_none() && (oversized || std::time::Instant::now() >= stop_work) {
+                forced = Some(
+                    if oversized {
+                        "bounded child output exceeded"
+                    } else {
+                        "child deadline"
+                    }
+                    .into(),
+                );
+                if let Err(error) = child.kill() {
+                    forced = Some(format!("exact child termination failed: {error}"));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                // Reap the already-killed child even when the bounded observation
+                // missed terminal; this path is a failure, never qualification.
+                let status = child.wait().expect("reap killed child");
+                forced = Some("child terminal exceeded absolute hang guard".into());
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        use std::io::{Read, Seek};
+        let read_log = |mut file: std::fs::File| {
+            file.rewind().unwrap();
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024).read_to_end(&mut bytes).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        assert!(
+            stdout.metadata().unwrap().len() <= 1024 * 1024
+                && stderr.metadata().unwrap().len() <= 1024 * 1024,
+            "child output bound exceeded"
+        );
+        assert!(
+            forced.is_none() && status.success(),
+            "{forced:?} {status}; stdout={} stderr={}",
+            read_log(stdout),
+            read_log(stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("result.json")).expect("completed child report"),
+        )
+        .unwrap();
+        assert_eq!(report["cleanup_joined"], true);
+        let records = report["records"].as_array().unwrap();
+        assert_eq!(records.len(), 7);
+        for record in &records[..3] {
+            assert_eq!(record["reply"]["ok"], false);
+            assert_eq!(record["disk_before"], record["disk_after"]);
+            assert_eq!(record["same_owner"], true);
+        }
+        for record in &records[3..5] {
+            assert_eq!(record["reply"]["ok"], true);
+            assert_eq!(record["same_owner"], false);
+            assert_eq!(record["predecessor_joined"], true);
+        }
+        assert_eq!(records[5]["reply"]["ok"], true);
+        assert_eq!(records[5]["same_owner"], true);
+        assert_eq!(records[6]["reply"]["ok"], false);
+        assert_eq!(records[6]["fault_consumed"], true);
+        assert_eq!(records[6]["disk_before"], records[6]["disk_after"]);
+        let saved: myownmesh_core::MeshConfig =
+            serde_json::from_slice(&std::fs::read(root.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved.networks[0]).unwrap(),
+            report["final_config"]
+        );
+    }
+
+    async fn actual_update_child(
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<serde_json::Value> {
+        use crate::control::{
+            ClosedRelayRegistry, ControlState, RealtimeAdvert, RuntimeSupervisor,
+        };
+        use myownmesh_core::{Mesh, MeshConfig, NetworkConfig};
+        let work_deadline = deadline - std::time::Duration::from_secs(2);
+        let _exclusive =
+            tokio::time::timeout_at(work_deadline, crate::exclusive_connector_fixture()).await?;
+        let mesh = tokio::time::timeout_at(
+            deadline,
+            Mesh::open_connector_capable_with_identity(
+                MeshConfig::default(),
+                Arc::new(myownmesh_core::Identity::ephemeral()),
+                myownmesh_core::WebRtcConnectorCapablePolicy::new(
+                    crate::test_resource_provider(),
+                    myownmesh_core::WebRtcConnectorProfile::new(
+                        myownmesh_core::ConnectorCallbackPolicy::elastic_data_only(),
+                    ),
+                ),
+            ),
+        )
+        .await??;
+        let registry = crate::registry::NetworkRegistry::new();
+        let services = crate::services::ServiceManager::new(mesh.clone(), registry.clone());
+        let clients = crate::ipc::ClientRegistry::new(mesh.local_application_resource_scope()?)?;
+        let state = Arc::new(ControlState {
+            finished: tokio::sync::Notify::new(),
+            ended: std::sync::atomic::AtomicUsize::new(0),
+            abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
+            mesh,
+            registry,
+            services,
+            clients,
+            closed_relays: ClosedRelayRegistry::new(),
+            realtime: RealtimeAdvert {
+                supported: false,
+                encodings: Vec::new(),
+            },
+            supervisor: RuntimeSupervisor::new(),
+            json_line_bytes: None,
+            realtime_frame_bytes: None,
+            before_events_subscribe_commit: None,
+            at_events_stream_entry: None,
+            before_rpc_call: None,
+            before_begin_closing: None,
+            before_provisional_settle: None,
+            before_mfa_response_write: None,
+            #[cfg(feature = "transport-lab")]
+            mfa_transport_lab_barrier: None,
+        });
+        let result = tokio::time::timeout_at(work_deadline, async {
+            let mut config = NetworkConfig::from_network_id("actual-update", "actualupdate");
+            config.stun_servers.clear();
+            config.turn_servers.clear();
+            config.signaling.servers.clear();
+            config.signaling.strategy = "none".into();
+            config.signaling.mdns = false;
+            let joined = state.mesh.join(config.clone()).await?;
+            if let Some(refusal) = state.registry.insert(joined, None).into_refusal() {
+                if let Some(drivers) = refusal.drivers { drivers.shutdown().await; }
+                refusal.joined.shutdown().await?;
+                anyhow::bail!("initial exact registry insertion refused");
+            }
+            super::persist_network_update(&config)?;
+            let path = myownmesh_core::dirs::config_path()?;
+            let frames = super::FrameAdmission::new(state.mesh.local_application_resource_scope()?, None);
+            let mut records = Vec::new();
+            for index in 0..7 {
+                let current = state.registry.get(&config.id).ok_or_else(|| anyhow::anyhow!("missing owner"))?;
+                let before = current.config_snapshot();
+                let context = current.semantic_state_identity()?.context_id();
+                let disk_before = std::fs::read(&path)?;
+                let mut next = before.clone();
+                match index {
+                    0 => next.routing_policy.max_next_hops = 0,
+                    1 => next.kind = myownmesh_core::NetworkKind::Closed,
+                    2 => next.pinned_peers = vec!["invalid-peer".into()],
+                    3 => next.routing_policy.max_next_hops += 1,
+                    4 => next.pinned_peers = vec![myownmesh_core::Identity::ephemeral().public_id().into()],
+                    5 => {
+                        next.label = "actual-hot".into();
+                        next.auto_approve = !before.auto_approve;
+                        next.stun_servers = vec![myownmesh_core::StunServer { urls: vec!["stun:example.com:3478".into()] }];
+                        next.turn_servers = vec![myownmesh_core::TurnServer {
+                            urls: vec!["turn:example.com:3478".into()], username: Some("fixture".into()),
+                            credential: Some("fixture".into()),
+                        }];
+                    }
+                    6 => next.label = "must-rollback".into(),
+                    _ => unreachable!(),
+                }
+                let owner = super::ResponseOwner::acquire(&frames)?;
+                let (reply, fault_consumed) = if index == 6 {
+                    super::UPDATE_SAVE_FAULT.scope(std::cell::RefCell::new(Some(next.clone())), async {
+                        let reply = super::network_update(&state, next.clone(), owner).await;
+                        (reply, super::UPDATE_SAVE_FAULT.with(|slot| slot.borrow().is_none()))
+                    }).await
+                } else { (super::network_update(&state, next.clone(), owner).await, false) };
+                let reply = serde_json::to_value(reply)?;
+                let successor = state.registry.get(&config.id).ok_or_else(|| anyhow::anyhow!("owner lost"))?;
+                let same_owner = Arc::ptr_eq(&current, &successor);
+                anyhow::ensure!(successor.semantic_state_identity()?.context_id() == context,
+                    "config update changed cryptographic context");
+                let disk_after = std::fs::read(&path)?;
+                let expected = if index < 3 || index == 6 { &before } else { &next };
+                anyhow::ensure!(successor.config_snapshot() == *expected, "live config mismatch at {index}");
+                let saved: MeshConfig = serde_json::from_slice(&disk_after)?;
+                anyhow::ensure!(saved.networks.as_slice() == [expected.clone()], "saved config mismatch at {index}");
+                anyhow::ensure!(reply["ok"] == (3..6).contains(&index), "unexpected reply at {index}: {reply}");
+                anyhow::ensure!(same_owner != (index == 3 || index == 4), "wrong exact owner at {index}");
+                if index < 3 || index == 6 {
+                    anyhow::ensure!(disk_before == disk_after, "refusal/rollback changed saved bytes");
+                }
+                if index == 3 || index == 4 {
+                    // Do not infer termination from MeshPhase: it is not a
+                    // driver-join witness. Observe the exact retained owner's
+                    // idempotent shutdown without waiting for new work.
+                    use std::future::Future;
+                    let shutdown = current.shutdown();
+                    tokio::pin!(shutdown);
+                    let first = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(shutdown.as_mut().poll(cx))
+                    }).await;
+                    match first {
+                        std::task::Poll::Ready(result) => result?,
+                        std::task::Poll::Pending => {
+                            shutdown.await?;
+                            anyhow::bail!("predecessor join still pending after replacement reply");
+                        }
+                    }
+                }
+                anyhow::ensure!(index != 6 || fault_consumed, "save fault not exercised");
+                records.push(serde_json::json!({"index":index, "reply":reply,
+                    "same_owner":same_owner, "predecessor_joined":index == 3 || index == 4,
+                    "fault_consumed":fault_consumed, "disk_before":disk_before, "disk_after":disk_after}));
+                config = expected.clone();
+            }
+            Ok::<_, anyhow::Error>(serde_json::json!({"records":records,"final_config":config}))
+        }).await;
+        // timeout_at may accept a synchronously late Ready. Record the original
+        // work cutoff now, but still own cleanup before reporting that failure.
+        let work_late = tokio::time::Instant::now() >= work_deadline;
+        // Own cleanup even when a stage returns Err or its absolute deadline fires.
+        let cleanup = tokio::time::timeout_at(deadline, async {
+            let results = state.registry.shutdown_all().await;
+            let services = state.services.shutdown().await;
+            let relays = state.closed_relays.shutdown_all().await;
+            state.clients.begin_closing();
+            let abnormal = state.clients.drain_watchdogs().await;
+            state.clients.wait_for_tasks().await;
+            let terminal = state.clients.finish_closed();
+            anyhow::ensure!(
+                results.into_iter().all(|result| result.is_ok()),
+                "driver cleanup failed"
+            );
+            services?;
+            relays.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                abnormal == 0 && terminal == crate::ipc::Lifecycle::Closed,
+                "client cleanup failed"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        let cleanup_late = tokio::time::Instant::now() >= deadline;
+        drop(state);
+        anyhow::ensure!(
+            !cleanup_late && tokio::time::Instant::now() < deadline,
+            "child cleanup/state teardown deadline"
+        );
+        cleanup??;
+        anyhow::ensure!(!work_late, "child work completed after original deadline");
+        let mut report = result??;
+        report["cleanup_joined"] = serde_json::json!(true);
+        Ok(report)
+    }
+
+    #[test]
+    fn network_update_validation_covers_kind_routes_pins_before_persistence() {
+        use myownmesh_core::{NetworkConfig, NetworkKind};
+        let current = NetworkConfig::from_network_id("edit-validation", "edit-validation");
+        let mut route = current.clone();
+        route.routing_policy.max_next_hops += 1;
+        validate_network_update(&current, &route).expect("valid routing replacement");
+        assert!(myownmesh_core::engine::reconcile::requires_restart(
+            &current, &route
+        ));
+        let peer = myownmesh_core::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let mut pins = current.clone();
+        pins.pinned_peers = vec![peer];
+        validate_network_update(&current, &pins).expect("valid pin replacement");
+        assert!(myownmesh_core::engine::reconcile::requires_restart(
+            &current, &pins
+        ));
+
+        let mut kind = current.clone();
+        kind.kind = NetworkKind::Closed;
+        let mut invalid_route = current.clone();
+        invalid_route.routing_policy.max_parallel_routes =
+            invalid_route.routing_policy.max_next_hops + 1;
+        let mut invalid_pin = current.clone();
+        invalid_pin.pinned_peers = vec!["invalid".into()];
+        for next in [kind, invalid_route, invalid_pin] {
+            let saved = std::cell::RefCell::new(current.clone());
+            let result = run_hot_update_with_rollback(
+                || validate_network_update(&current, &next),
+                || {
+                    *saved.borrow_mut() = next.clone();
+                    Ok(())
+                },
+                || panic!("validation refusal must not require live rollback"),
+                || panic!("validation refusal must not touch disk"),
+            );
+            assert!(result.is_err());
+            assert_eq!(*saved.borrow(), current);
+        }
+    }
+
+    #[test]
+    fn hot_update_full_config_parity_and_save_failure_restore_both_copies() {
+        use myownmesh_core::NetworkConfig;
+        let old = NetworkConfig::from_network_id("edit-parity", "edit-parity");
+        let mut next = old.clone();
+        next.label = "edited".into();
+        next.auto_approve = !old.auto_approve;
+        next.stun_servers.clear();
+        next.turn_servers.clear();
+        validate_network_update(&old, &next).expect("valid hot fields");
+        assert!(!myownmesh_core::engine::reconcile::requires_restart(
+            &old, &next
+        ));
+        // This controls persistence/rollback orchestration with complete values.
+        // Core reconcile controls separately exercise the actual live hot mutation.
+        for fail_save in [false, true] {
+            let live = std::cell::RefCell::new(old.clone());
+            let disk = std::cell::RefCell::new(old.clone());
+            let result = run_hot_update_with_rollback(
+                || {
+                    *live.borrow_mut() = next.clone();
+                    Ok(())
+                },
+                || {
+                    *disk.borrow_mut() = next.clone();
+                    if fail_save {
+                        Err(anyhow::anyhow!("injected save failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    *live.borrow_mut() = old.clone();
+                    Ok(())
+                },
+                || {
+                    *disk.borrow_mut() = old.clone();
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_err(), fail_save);
+            let expected = if fail_save { &old } else { &next };
+            assert_eq!(&*live.borrow(), expected);
+            assert_eq!(&*disk.borrow(), expected);
+        }
+    }
 
     #[derive(Default)]
     struct AddRollbackProbe {

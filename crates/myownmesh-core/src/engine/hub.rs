@@ -2,8 +2,10 @@
 //!
 //! A hub controller is a local planner adapter.  It never elects a hub,
 //! applies remote configuration, signs facts, or forwards advertisements.
-//! The only wire value it emits is the advisory HubAdvertisement, sent through
-//! the normal exact-owner application gate.
+//! Unicast advertisements use Trickle's randomized second-half/doubling
+//! cadence, but never its shared-broadcast consistency suppression: another
+//! origin's notice does not cover this origin's recipients (RFC 6206 §8).
+//! Directory and parent maintenance retain their independent pacing.
 
 use std::num::NonZeroU32;
 use std::time::Instant;
@@ -464,14 +466,42 @@ impl HubController {
         if advertisement.sequence() <= current_sequence && !binding_changed {
             return false;
         }
-        if self.timer.observe_consistent().is_err() {
-            return false;
-        }
+        // An authenticated fresh notice is useful only as session-local
+        // advisory evidence. It is not redundant coverage of our unicast
+        // obligation, and neither suppresses nor resets our timer.
         let Some(cursor) = self.cursor_mut(advertisement.origin()) else {
             return false;
         };
         cursor.sequence = advertisement.sequence();
         true
+    }
+
+    /// Notify one genuine local promoted-owner transition. The caller must
+    /// hold the exact current authenticated/promoted owner fence through this
+    /// synchronous call; packet receipt alone is never such a transition.
+    /// A false result means no reset, not rejection of the owner operation.
+    pub(crate) fn note_local_authenticated_owner_change(&mut self, owner: &PeerOwnerToken) -> bool {
+        if owner.device_id() == self.local_id.to_string() || !self.configured_hub(owner.device_id())
+        {
+            return false;
+        }
+        self.note_local_topology_change()
+    }
+
+    /// Notify a locally committed relation/topology change, never a remote
+    /// configuration claim. Shared configuration/digest changes still require
+    /// controller reconstruction. Resets cannot bypass directory pacing.
+    pub(crate) fn note_local_topology_change(&mut self) -> bool {
+        let mut rng = rand_core::OsRng;
+        self.apply_local_change(self.now_ms(), &mut rng)
+    }
+
+    fn apply_local_change(&mut self, now_ms: u64, rng: &mut impl RngCore) -> bool {
+        self.local_is_hub()
+            && self
+                .timer
+                .bounded_local_change(now_ms, rng)
+                .unwrap_or(false)
     }
 
     /// Whether this controller's local identity is one of the configured hubs.
@@ -617,6 +647,8 @@ impl HubController {
         };
         let now = self.now_ms();
         let exploration_interval = self.policy.exploration_interval_ms;
+        // The explicit absence branch records a rejected response in lab builds.
+        #[cfg_attr(not(feature = "transport-lab"), allow(clippy::question_mark))]
         let Some(cursor_index) = self
             .cursors
             .iter()
@@ -755,10 +787,6 @@ impl HubController {
         }
     }
 
-    pub(crate) fn max_exploration_probes_per_pass(&self) -> usize {
-        usize::try_from(self.policy.max_exploration_probes_per_pass).unwrap_or(usize::MAX)
-    }
-
     /// Apply one finite inbound reply budget. This is deliberately aggregate
     /// rather than a peer-sized map: untrusted requesters cannot allocate
     /// persistent rate-limit state, while exact current-owner admission still
@@ -781,11 +809,19 @@ impl HubController {
     /// Prepare one bounded Trickle decision without doing transport work while
     /// the controller mutex is held.
     pub(crate) fn prepare_poll(&mut self) -> Option<(HubAdvertisement, usize)> {
+        let mut rng = rand_core::OsRng;
+        self.prepare_poll_at(self.now_ms(), &mut rng)
+    }
+
+    fn prepare_poll_at(
+        &mut self,
+        now_ms: u64,
+        rng: &mut impl RngCore,
+    ) -> Option<(HubAdvertisement, usize)> {
         if !self.local_is_hub() {
             return None;
         }
-        let mut rng = rand_core::OsRng;
-        let Ok(TricklePoll::Transmit { .. }) = self.timer.poll(self.now_ms(), &mut rng) else {
+        let Ok(TricklePoll::Transmit { .. }) = self.timer.poll(now_ms, rng) else {
             return None;
         };
         let sequence = self.timer.generation().saturating_add(1);
@@ -821,6 +857,187 @@ impl HubController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the real funded controller/advertisement adapter without a
+    // native worker. Detached control tokens do not prove authentication;
+    // the engine integration must separately test its current-owner fence.
+    #[cfg(feature = "transport-lab")]
+    mod unicast_adapter {
+        use super::*;
+        use crate::resource::{FiniteResourceProvider, ResourceProviderPort};
+
+        fn device(value: u8) -> DeviceId {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[value; 32]);
+            DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap()
+        }
+
+        fn fixture(local_is_hub: bool) -> (HubController, FiniteResourceProvider) {
+            let hubs = vec![device(1).to_string(), device(2).to_string()];
+            let backing = hubs.iter().map(String::len).sum::<usize>()
+                + hubs.len() * std::mem::size_of::<DeviceId>();
+            let claim = HubController::root_claim(hubs.len())
+                .unwrap()
+                .checked_add(ResourceClaim::single(
+                    ResourceClass::AccountedMemoryBytes,
+                    backing as u64,
+                ))
+                .unwrap();
+            let grant = FiniteResourceProvider::scope_planning_charge()
+                .checked_scale(2) // process root plus the local application child
+                .unwrap()
+                .checked_add(FiniteResourceProvider::reservation_planning_charge(claim).unwrap())
+                .unwrap();
+            let provider = FiniteResourceProvider::new(grant);
+            let port = ResourceProviderPort::new(provider.clone()).unwrap();
+            let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+            let policy = HubPolicyConfig {
+                max_parallel_dials: 1,
+                max_dials_per_pass: 1,
+                max_advertisements_per_pass: 1,
+                exploration_interval_ms: 100,
+                max_exploration_probes_per_pass: 1,
+                max_exploration_peers_per_reply: 1,
+                trickle_imin_ms: 10,
+                trickle_imax_ms: 40,
+                trickle_redundancy: 1,
+                trickle_reset_window_ms: 100,
+                trickle_max_resets_per_window: 1,
+            };
+            let mut controller = HubController::new(
+                policy,
+                &TopologyMode::Hubs {
+                    hubs,
+                    spoke_redundancy: Some(1),
+                },
+                MeshContextId::from_bytes([1; 32]),
+                device(if local_is_hub { 1 } else { 3 }),
+                &scope,
+            )
+            .unwrap()
+            .unwrap();
+            controller.timer = TrickleTimer::start(
+                TricklePolicy::checked(
+                    10,
+                    40,
+                    NonZeroU32::new(1).unwrap(),
+                    100,
+                    NonZeroU32::new(1).unwrap(),
+                )
+                .unwrap(),
+                0,
+                &mut FixedRng(u64::MAX),
+            )
+            .unwrap();
+            (controller, provider)
+        }
+
+        #[test]
+        fn selective_configured_hub_unicast_cannot_suppress_local_advertisement() {
+            let (mut controller, provider) = fixture(true);
+            let owner = PeerOwnerToken::detached_for_control(&device(2).to_string());
+            let timer_before = controller.timer;
+            for sequence in 1..=3 {
+                let advertisement = HubAdvertisement::new(
+                    controller.context_id,
+                    device(2),
+                    sequence,
+                    controller.digest,
+                )
+                .unwrap();
+                assert!(controller.observe_advertisement(&owner, &advertisement));
+            }
+            assert_eq!(
+                controller.timer, timer_before,
+                "fresh k=1 unicast notices cannot suppress/reset"
+            );
+            let transmit_at = controller.timer.transmit_at_ms();
+            let (advertisement, limit) = controller
+                .prepare_poll_at(transmit_at, &mut FixedRng(u64::MAX))
+                .unwrap();
+            assert_eq!(advertisement.origin(), &device(1));
+            assert_eq!(limit, 1);
+            assert!(controller
+                .prepare_poll_at(transmit_at, &mut FixedRng(u64::MAX))
+                .is_none());
+            drop(controller);
+            assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+        }
+
+        #[test]
+        fn foreign_replay_and_origin_mismatch_never_reset_or_suppress() {
+            let (mut controller, _) = fixture(true);
+            let owner = PeerOwnerToken::detached_for_control(&device(2).to_string());
+            let valid =
+                HubAdvertisement::new(controller.context_id, device(2), 1, controller.digest)
+                    .unwrap();
+            assert!(controller.observe_advertisement(&owner, &valid));
+            let timer_before = controller.timer;
+            assert!(!controller.observe_advertisement(&owner, &valid));
+            for advertisement in [
+                HubAdvertisement::new(
+                    MeshContextId::from_bytes([2; 32]),
+                    device(2),
+                    2,
+                    controller.digest,
+                )
+                .unwrap(),
+                HubAdvertisement::new(controller.context_id, device(2), 2, [0; 32]).unwrap(),
+                HubAdvertisement::new(controller.context_id, device(3), 2, controller.digest)
+                    .unwrap(),
+            ] {
+                assert!(!controller.observe_advertisement(&owner, &advertisement));
+            }
+            assert_eq!(controller.timer, timer_before);
+            assert_eq!(controller.cursor_mut(&device(2)).unwrap().sequence, 1);
+        }
+
+        #[test]
+        fn local_reset_is_budgeted_and_preserves_directory_and_parent_cadence() {
+            let (mut controller, provider) = fixture(true);
+            let in_use = provider.in_use();
+            let mut rng = FixedRng(u64::MAX);
+            let _ = controller.prepare_poll_at(10, &mut rng);
+            assert_eq!(controller.timer.interval_ms(), 20);
+            let generation = controller.timer.generation();
+            let directory_due = controller.next_exploration_ms;
+            let parent_due = controller.parent_attempt.next_due_ms;
+            assert!(controller.apply_local_change(11, &mut rng));
+            assert_eq!(controller.timer.interval_ms(), 10);
+            assert_eq!(controller.timer.interval_start_ms(), 11);
+            assert_eq!(controller.timer.generation(), generation + 1);
+            assert!(controller.timer.repair_needed());
+            let deadline = controller.timer.transmit_at_ms();
+            assert!(!controller.apply_local_change(12, &mut rng));
+            assert_eq!(controller.timer.transmit_at_ms(), deadline);
+            assert_eq!(controller.timer.generation(), generation + 1);
+            assert!(controller.prepare_poll_at(deadline, &mut rng).is_some());
+            assert!(controller.apply_local_change(100, &mut rng));
+            assert_eq!(controller.next_exploration_ms, directory_due);
+            assert_eq!(controller.parent_attempt.next_due_ms, parent_due);
+            assert_eq!(
+                provider.in_use(),
+                in_use,
+                "resets allocate no new retained state"
+            );
+        }
+
+        #[test]
+        fn local_hooks_ignore_nonhub_owners_and_spokes() {
+            let (mut hub, _) = fixture(true);
+            let outsider = PeerOwnerToken::detached_for_control(&device(3).to_string());
+            let owner = PeerOwnerToken::detached_for_control(&device(2).to_string());
+            let before = hub.timer;
+            assert!(!hub.note_local_authenticated_owner_change(&outsider));
+            assert_eq!(hub.timer, before);
+            assert!(hub.note_local_authenticated_owner_change(&owner));
+            assert!(hub.timer.repair_needed());
+            let (mut spoke, _) = fixture(false);
+            let before = spoke.timer;
+            assert!(!spoke.note_local_authenticated_owner_change(&owner));
+            assert!(!spoke.note_local_topology_change());
+            assert_eq!(spoke.timer, before);
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct FixedRng(u64);

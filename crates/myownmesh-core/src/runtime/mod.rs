@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 pub mod attempt;
+pub(crate) mod endpoint_cipher;
 /// What a promoted session owns on the application side. Crate-private for the
 /// same reason the broker is: reaching this state means holding the session that
 /// owns it, and a public path would be a way to name one without holding it.

@@ -37,8 +37,6 @@ use myownmesh_core::{
     WebRtcConnectorProfile,
 };
 
-mod support;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GraphSnapshot {
     identity: IdentitySnapshot,
@@ -503,6 +501,7 @@ fn config(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
         routing_policy: RoutingPolicyConfig::default(),
         hub: None,
         local_observations: None,
+        application_transport: None,
         tree: None,
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
@@ -607,7 +606,7 @@ async fn export_facts(
         }
         let next_cursor = page.next_cursor().expect("incomplete page has a cursor");
         assert!(
-            cursor.map_or(true, |previous| next_cursor > previous),
+            cursor.is_none_or(|previous| next_cursor > previous),
             "incomplete page cursor must advance strictly"
         );
         cursor = Some(next_cursor);

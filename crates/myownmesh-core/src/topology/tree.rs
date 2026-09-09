@@ -580,7 +580,7 @@ mod tests {
     fn five_thousand_member_primary_tree_is_bounded() {
         let root = key(20_000);
         let hubs: Vec<String> = (0..16).map(|index| key(21_000 + index)).collect();
-        let leaves: Vec<String> = (0..4_983).map(|index| key(index)).collect();
+        let leaves: Vec<String> = (0..4_983).map(key).collect();
         let selector = HubTreeSelector {
             root: root.clone(),
             hubs: hubs.clone(),

@@ -91,8 +91,44 @@ impl<T> SessionStream<T> {
     }
 
     /// Take the oldest item, releasing the node that held it.
+    #[cfg(test)]
     fn take(&self) -> Option<T> {
         self.items.lock().pop_front()
+    }
+
+    /// Detach the oldest item while retaining its funded queue node.
+    ///
+    /// The returned entry is the same allocation that was queued; callers
+    /// which must hold a borrowed view across an asynchronous handoff use it
+    /// as custody rather than cloning the value and releasing the node at the
+    /// dequeue boundary.
+    fn take_owned(&self) -> Option<crate::resource::queue::LeasedQueueEntry<T>> {
+        self.items.lock().pop_front_owned()
+    }
+
+    /// Inspect and remove the head under one queue lock. A predicate mismatch
+    /// leaves the head and its funding untouched for the tagged reader.
+    fn take_owned_if(
+        &self,
+        expected: impl FnOnce(&T) -> bool,
+    ) -> std::result::Result<Option<crate::resource::queue::LeasedQueueEntry<T>>, ()> {
+        let mut items = self.items.lock();
+        let Some(front) = items.front() else {
+            return Ok(None);
+        };
+        if !expected(front) {
+            return Err(());
+        }
+        Ok(items.pop_front_owned())
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.items.lock().is_empty()
+    }
+
+    pub(super) fn contains(&self, mut matches: impl FnMut(&T) -> bool) -> bool {
+        let mut items = self.items.lock();
+        items.iter().any(&mut matches)
     }
 
     /// Drop every queued item `discard` answers true for, in place.
@@ -157,6 +193,7 @@ impl<T> SessionStreamReader<T> {
     /// is dropped at the end of the `if let`, because a reader parked while
     /// holding one would keep the flow set alive and wait forever for an end
     /// it was itself preventing.
+    #[cfg(test)]
     pub(crate) async fn next(&self) -> Option<T> {
         loop {
             if let Some(stream) = self.stream.upgrade() {
@@ -170,17 +207,49 @@ impl<T> SessionStreamReader<T> {
         }
     }
 
-    /// The next item if one is already queued, without waiting.
-    ///
-    /// One take from the same queue, registering no waker and consuming no
-    /// wake. `None` covers both an empty live stream and a dropped one, because
-    /// neither answer involves waiting to find out which.
-    ///
-    /// Gated to the same conjunction as [`RealtimeInboundArrivals::try_next`],
-    /// because that wrapper is its only caller and this is compiled exactly when
-    /// it is.
+    /// The next funded entry, retaining the queue node until the returned
+    /// value is dropped. This is the ownership-preserving counterpart to
+    /// [`Self::next`].
+    pub(crate) async fn next_owned(&self) -> Option<crate::resource::queue::LeasedQueueEntry<T>> {
+        loop {
+            if let Some(stream) = self.stream.upgrade() {
+                if let Some(item) = stream.take_owned() {
+                    return Some(item);
+                }
+            } else {
+                return None;
+            }
+            self.ready.notified().await;
+        }
+    }
+
+    /// The next funded entry of the requested kind. A head of another kind
+    /// is a typed mismatch, not EOF, and remains queued for `next_arrival`.
+    pub(crate) async fn next_owned_if(
+        &self,
+        expected: impl Fn(&T) -> bool + Copy,
+    ) -> std::result::Result<Option<crate::resource::queue::LeasedQueueEntry<T>>, ()> {
+        loop {
+            if let Some(stream) = self.stream.upgrade() {
+                match stream.take_owned_if(expected) {
+                    Ok(Some(item)) => return Ok(Some(item)),
+                    Ok(None) => {}
+                    Err(()) => return Err(()),
+                }
+            } else {
+                return Ok(None);
+            }
+            self.ready.notified().await;
+        }
+    }
+
     #[cfg(all(test, feature = "transport-lab"))]
-    pub(crate) fn try_next(&self) -> Option<T> {
-        self.stream.upgrade()?.take()
+    pub(crate) fn try_next_owned_if(
+        &self,
+        expected: impl FnOnce(&T) -> bool,
+    ) -> std::result::Result<Option<crate::resource::queue::LeasedQueueEntry<T>>, ()> {
+        self.stream
+            .upgrade()
+            .map_or(Ok(None), |stream| stream.take_owned_if(expected))
     }
 }

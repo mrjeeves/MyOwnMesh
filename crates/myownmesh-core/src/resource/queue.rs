@@ -92,6 +92,28 @@ impl<T> FundedNode<T> {
     }
 }
 
+/// An oldest entry detached from its queue without releasing its funding.
+///
+/// The existing node allocation, node lease and value-owned payload custody
+/// move together. The node has no successor, so dropping the queue cannot
+/// destroy this entry and dropping this entry cannot walk the queue. Ordinary
+/// field drop uses `FundedNode`'s box-before-lease ordering.
+///
+/// Only shared access is exposed: no extraction, mutable replacement or cloned
+/// guard can separate the value from its node custody. Callers must retain this
+/// guard through their asynchronous handoff; any independent copy made through
+/// the value's own API needs its own retention funding.
+#[must_use = "retain the entry through the handoff that borrows its value"]
+pub(crate) struct LeasedQueueEntry<T> {
+    node: FundedNode<T>,
+}
+
+impl<T> LeasedQueueEntry<T> {
+    pub(crate) fn value(&self) -> &T {
+        &self.node.value
+    }
+}
+
 /// A first-in, first-out queue whose every entry is separately funded.
 ///
 /// Held as two chains rather than one so that appending is O(1) without any
@@ -223,14 +245,11 @@ impl<T> LeasedQueue<T> {
     /// Takes `&mut self` because answering may require moving the push chain
     /// across, which is a change to the representation and not to the contents.
     ///
-    /// Controls only. An owner that wants the oldest entry takes it —
-    /// [`Self::pop_front`] — because looking first and then taking is two views
-    /// of a queue that can change between them, and the borrow this returns
-    /// would have to be released before the take anyway. What the controls need
-    /// it for is the opposite: asserting *which* entry is at the front without
-    /// consuming it, so the ordering assertion and the release assertion can be
-    /// separate.
-    #[cfg(test)]
+    /// A typed consumer can inspect the head and refuse a mismatched kind
+    /// without consuming it. Keep the same enclosing queue lock (or exclusive
+    /// ownership) from this observation through any subsequent pop; releasing
+    /// it between check and take would permit the head to change. This method
+    /// itself neither removes a value nor releases its funding.
     pub(crate) fn front(&mut self) -> Option<&T> {
         self.expose_front();
         self.oldest.as_ref().map(|node| &node.value)
@@ -252,6 +271,23 @@ impl<T> LeasedQueue<T> {
         // allocation before releasing it. Any off-node retention travels with
         // the value under a lease owned by T.
         Some(node.into_value())
+    }
+
+    /// Detach the oldest entry, retaining its allocation and existing leases.
+    ///
+    /// No allocation or admission occurs here. The queue no longer owns the
+    /// entry, but its node remains funded until the returned guard is dropped.
+    /// Unlike `pop_front`, this supports borrowing the value through a native
+    /// or IPC write while retaining the node as well as value-owned payloads.
+    pub(crate) fn pop_front_owned(&mut self) -> Option<LeasedQueueEntry<T>> {
+        self.expose_front();
+        let mut node = self.oldest.take()?;
+        self.oldest = node.next.take();
+        self.len = self
+            .len
+            .checked_sub(1)
+            .expect("an entry was removed, so the count was not zero");
+        Some(LeasedQueueEntry { node })
     }
 
     /// Remove and return the newest entry, releasing only its node lease.
@@ -688,5 +724,153 @@ mod tests {
             entry.amount(ResourceClass::AccountedMemoryBytes),
             retention.amount(ResourceClass::AccountedMemoryBytes)
         );
+    }
+
+    #[test]
+    fn owned_entry_keeps_exact_node_and_payload_custody_after_queue_drain() {
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(1);
+        let baseline = provider.in_use();
+        let mut queue = LeasedQueue::new();
+        assert!(queue.pop_front_owned().is_none());
+        assert_eq!(provider.in_use(), baseline);
+        push_control_entry(&mut queue, &port, &scope, 1, &dropped);
+        let original = queue.front().expect("one entry") as *const ControlEntry;
+        let full = provider.in_use();
+        assert_eq!(full, control_grant(1), "the exact grant is exhausted");
+
+        let entry = queue.pop_front_owned().expect("one entry");
+        assert_eq!(entry.value() as *const ControlEntry, original);
+        assert!(entry.node.next.is_none());
+        assert_eq!(entry.value().order, 1);
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
+        assert!(queue.pop_front_owned().is_none());
+        assert_eq!(provider.in_use(), full, "detaching releases no claim");
+        assert!(
+            port.acquire(
+                &scope,
+                ResourceAuthorityClass::Admitted,
+                LeasedQueue::<ControlEntry>::entry_claim().expect("node claim"),
+            )
+            .is_err(),
+            "the detached node still consumes its exact grant"
+        );
+        drop(queue);
+        assert_eq!(provider.in_use(), full);
+        assert!(dropped_orders(&dropped).is_empty());
+
+        drop(entry);
+        assert_eq!(dropped_orders(&dropped), vec![1]);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "node and payload both released"
+        );
+        let mut replacement = LeasedQueue::new();
+        push_control_entry(&mut replacement, &port, &scope, 2, &dropped);
+        assert_eq!(provider.in_use(), full, "same grant admits a replacement");
+        drop(replacement);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[test]
+    fn owned_entry_fifo_and_queue_drop_are_independent_for_nonclone_values() {
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(3);
+        let baseline = provider.in_use();
+        let mut queue = LeasedQueue::new();
+        push_control_entry(&mut queue, &port, &scope, 1, &dropped);
+        push_control_entry(&mut queue, &port, &scope, 2, &dropped);
+        let first = queue.pop_front_owned().expect("first");
+        push_control_entry(&mut queue, &port, &scope, 3, &dropped);
+        let second = queue.pop_front_owned().expect("second");
+        assert_eq!((first.value().order, second.value().order), (1, 2));
+        assert!(first.node.next.is_none() && second.node.next.is_none());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().expect("third remains").order, 3);
+
+        drop(queue);
+        assert_eq!(dropped_orders(&dropped), vec![3]);
+        assert_eq!(provider.in_use(), control_grant(2));
+        drop(first);
+        assert_eq!(provider.in_use(), control_grant(1));
+        assert_eq!(second.value().order, 2);
+        drop(second);
+        assert_eq!(dropped_orders(&dropped), vec![3, 1, 2]);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[test]
+    fn head_mismatch_preserves_fifo_and_exact_retained_funding() {
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(2);
+        let baseline = provider.in_use();
+        let mut entries = LeasedQueue::new();
+        push_control_entry(&mut entries, &port, &scope, 1, &dropped);
+        push_control_entry(&mut entries, &port, &scope, 2, &dropped);
+        let full = provider.in_use();
+        let queue = Mutex::new(entries);
+
+        // The scalar is a queue-only discriminator; provider controls cover
+        // actual RTP/Opaque kinds. Both classification and optional removal
+        // use one lock, and a mismatch must not skip the head to find a match.
+        let attempt: Result<Option<LeasedQueueEntry<ControlEntry>>, ()> = {
+            let mut locked = queue.lock().expect("uncontended queue");
+            if locked.front().is_some_and(|entry| entry.order != 2) {
+                Err(())
+            } else {
+                Ok(locked.pop_front_owned())
+            }
+        };
+        assert!(attempt.is_err());
+        assert_eq!(provider.in_use(), full);
+        assert!(dropped_orders(&dropped).is_empty());
+        {
+            let mut locked = queue.lock().expect("uncontended queue");
+            assert_eq!(locked.len(), 2);
+            assert_eq!(locked.front().expect("head remains").order, 1);
+            let first = locked.pop_front_owned().expect("first");
+            let second = locked.pop_front_owned().expect("second");
+            assert_eq!((first.value().order, second.value().order), (1, 2));
+            assert!(locked.front().is_none());
+            assert_eq!(provider.in_use(), full);
+            drop(first);
+            drop(second);
+        }
+        drop(queue);
+        assert_eq!(dropped_orders(&dropped), vec![1, 2]);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[test]
+    fn owned_entry_pending_handoff_cancellation_releases_exact_custody() {
+        struct NoopWake;
+        impl std::task::Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let dropped = drop_log();
+        let (provider, port, scope) = control_provider(1);
+        let baseline = provider.in_use();
+        let mut queue = LeasedQueue::new();
+        push_control_entry(&mut queue, &port, &scope, 1, &dropped);
+        let entry = queue.pop_front_owned().expect("queued handoff");
+        let full = provider.in_use();
+        let mut handoff = Box::pin(async move {
+            let value = entry.value();
+            std::future::pending::<()>().await;
+            assert_eq!(value.order, 1);
+        });
+        let waker = std::task::Waker::from(Arc::new(NoopWake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(std::future::Future::poll(handoff.as_mut(), &mut context).is_pending());
+        drop(queue);
+        assert_eq!(provider.in_use(), full);
+        assert!(dropped_orders(&dropped).is_empty());
+
+        drop(handoff);
+        assert_eq!(dropped_orders(&dropped), vec![1]);
+        assert_eq!(provider.in_use(), baseline);
     }
 }

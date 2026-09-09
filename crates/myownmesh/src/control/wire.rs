@@ -61,6 +61,9 @@ pub enum RealtimePipeDirection {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+// Request deliberately keeps each wire operation's typed payload together;
+// boxing it would alter the funded request layout without changing the wire contract.
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     Status,
     NetworksList,
@@ -634,6 +637,58 @@ pub enum Request {
         client_id: crate::ipc::ClientId,
         client_capability: String,
         flow_capability: String,
+    },
+    /// Open one provider-backed, codec-opaque application flow.  The label is
+    /// raw application bytes rather than a daemon-owned string; it is scoped
+    /// to the exact session and the returned capability is the only authority
+    /// used by the binary pipe afterwards.
+    OpaqueFlowOpen {
+        network: String,
+        peer: String,
+        label: Vec<u8>,
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        direction: core_realtime::RealtimeFlowDirection,
+        mode: core_realtime::OpaqueFlowMode,
+        max_unit_bytes: u32,
+    },
+    /// Change only the ceiling of one exact, already-installed opaque flow.
+    /// The identity fields are repeated so the engine can reject any mismatch
+    /// against the stored move-only capability before preparing its change.
+    OpaqueFlowChange {
+        network: String,
+        label: Vec<u8>,
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        flow_capability: String,
+        direction: core_realtime::RealtimeFlowDirection,
+        mode: core_realtime::OpaqueFlowMode,
+        max_unit_bytes: u32,
+    },
+    /// Consume one exact opaque-flow capability and await its native/logical
+    /// retirement before acknowledging the close.
+    OpaqueFlowClose {
+        client_id: crate::ipc::ClientId,
+        client_capability: String,
+        flow_capability: String,
+    },
+    /// Convert this connection into a binary opaque application pipe. Outbound
+    /// frames are `[u32 little-endian body length][raw body]`; inbound frames
+    /// are `[u32 little-endian payload length][u8 label length][raw label][raw
+    /// body]`. JSON and base64 never carry application bodies. Binding rules
+    /// mirror `RealtimePipe`, but the body itself is intentionally not parsed
+    /// by the daemon.
+    OpaquePipe {
+        direction: RealtimePipeDirection,
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        client_id: Option<crate::ipc::ClientId>,
+        #[serde(default)]
+        client_capability: Option<String>,
+        #[serde(default)]
+        flow_capability: Option<String>,
     },
     /// Convert this connection into a dedicated **binary realtime pipe**:
     /// after the ack it carries only length-prefixed frames

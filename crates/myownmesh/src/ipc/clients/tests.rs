@@ -21,6 +21,510 @@ fn fresh_client(
     (handle, rx)
 }
 
+#[cfg(feature = "transport-lab")]
+fn require(condition: bool, message: impl Into<String>) -> Result<(), String> {
+    condition.then_some(()).ok_or_else(|| message.into())
+}
+
+#[cfg(feature = "transport-lab")]
+fn require_active_resource_baseline(
+    actual: &myownmesh_core::resource::ResourceReport,
+    baseline: &myownmesh_core::resource::ResourceReport,
+    operation: &'static str,
+) -> Result<(), String> {
+    for (actual, baseline) in actual
+        .pre_authentication
+        .iter()
+        .zip(&baseline.pre_authentication)
+    {
+        require(
+            actual.family == baseline.family
+                && actual.active == baseline.active
+                && actual.active_lease_count == baseline.active_lease_count,
+            format!(
+                "{operation}: pre-auth {:?} active resources changed: actual={:?}/{}, baseline={:?}/{}",
+                actual.family,
+                actual.active,
+                actual.active_lease_count,
+                baseline.active,
+                baseline.active_lease_count,
+            ),
+        )?;
+    }
+    for (actual, baseline) in actual
+        .post_authentication
+        .iter()
+        .zip(&baseline.post_authentication)
+    {
+        require(
+            actual.family == baseline.family
+                && actual.active == baseline.active
+                && actual.active_lease_count == baseline.active_lease_count,
+            format!(
+                "{operation}: post-auth {:?} active resources changed: actual={:?}/{}, baseline={:?}/{}",
+                actual.family,
+                actual.active,
+                actual.active_lease_count,
+                baseline.active,
+                baseline.active_lease_count,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "transport-lab")]
+fn live_slot_connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
+    myownmesh_core::WebRtcConnectorCapablePolicy::new(
+        crate::test_resource_provider(),
+        myownmesh_core::WebRtcConnectorProfile::new(
+            myownmesh_core::ConnectorCallbackPolicy::elastic_realtime(),
+        ),
+    )
+}
+
+#[cfg(feature = "transport-lab")]
+fn live_slot_network(id: &str) -> myownmesh_core::config::NetworkConfig {
+    let mut config =
+        myownmesh_core::config::NetworkConfig::from_network_id(id, "daemon-slot-control");
+    config.label = id.to_owned();
+    config.signaling = myownmesh_core::config::SignalingConfig {
+        strategy: "none".to_owned(),
+        mdns: false,
+        public_fallback: false,
+        ..myownmesh_core::config::SignalingConfig::default()
+    };
+    config.auto_approve = true;
+    config.application_transport = None;
+    config.validate().expect("live slot network validates");
+    config
+}
+
+#[cfg(feature = "transport-lab")]
+async fn live_slot_within<T>(
+    operation: &'static str,
+    deadline: tokio::time::Instant,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let value = tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| format!("{operation}: exceeded its absolute deadline"))?;
+    if tokio::time::Instant::now() > deadline {
+        return Err(format!(
+            "{operation}: completed after its absolute deadline"
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "transport-lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installed_realtime_slot_custody_is_linear_and_funded() {
+    let home = tempfile::tempdir().expect("isolated live slot fixture home");
+    std::env::set_var("MYOWNMESH_HOME", home.path());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let alice_identity = std::sync::Arc::new(myownmesh_core::Identity::ephemeral());
+    let bob_identity = std::sync::Arc::new(myownmesh_core::Identity::ephemeral());
+    let alice_id = alice_identity.public_id().to_owned();
+    let bob_id = bob_identity.public_id().to_owned();
+    let policy = live_slot_connector_policy();
+    let registry_grant =
+        registry_fixture_claim(2, 2, 16).expect("slot registry grant is representable");
+    let oversized_slot_demand = registry_grant
+        .amount(ResourceClass::AccountedMemoryBytes)
+        .checked_add(1)
+        .expect("the finite registry grant leaves room for one representable pressure unit");
+    let registry = ClientRegistry::over_grant(registry_grant);
+    let mut alice_mesh = None;
+    let mut bob_mesh = None;
+    let mut alice_baseline = None;
+    let mut bob_baseline = None;
+    let mut alice = None;
+    let mut bob = None;
+    let mut link = None;
+    let mut bob_inbound = None;
+    let mut uninstalled_flow = None;
+    let mut owner = None;
+    let mut installed_capability = None;
+    let mut removed_flow = None;
+    let mut captured_slot = None;
+    let result: Result<(), String> = async {
+        let opened_alice = live_slot_within(
+            "slot-alice-open",
+            deadline,
+            myownmesh_core::Mesh::open_connector_capable_with_identity(
+                myownmesh_core::MeshConfig::default(),
+                alice_identity,
+                policy.clone(),
+            ),
+        )
+        .await?
+        .map_err(|error| format!("Alice mesh refused: {error}"))?;
+        alice_baseline = Some(opened_alice.resource_report());
+        alice_mesh = Some(opened_alice);
+        let opened_bob = live_slot_within(
+            "slot-bob-open",
+            deadline,
+            myownmesh_core::Mesh::open_connector_capable_with_identity(
+                myownmesh_core::MeshConfig::default(),
+                bob_identity,
+                policy,
+            ),
+        )
+        .await?
+        .map_err(|error| format!("Bob mesh refused: {error}"))?;
+        bob_baseline = Some(opened_bob.resource_report());
+        bob_mesh = Some(opened_bob);
+        let joined_alice = live_slot_within(
+            "slot-alice-join",
+            deadline,
+            alice_mesh
+                .as_ref()
+                .ok_or_else(|| "Alice mesh disappeared before join".to_owned())?
+                .join(live_slot_network("alice")),
+        )
+        .await?
+        .map_err(|error| format!("Alice join refused: {error}"))?;
+        alice = Some(joined_alice);
+        let joined_bob = live_slot_within(
+            "slot-bob-join",
+            deadline,
+            bob_mesh
+                .as_ref()
+                .ok_or_else(|| "Bob mesh disappeared before join".to_owned())?
+                .join(live_slot_network("bob")),
+        )
+        .await?
+        .map_err(|error| format!("Bob join refused: {error}"))?;
+        bob = Some(joined_bob);
+        let alice_ref = alice
+            .as_ref()
+            .ok_or_else(|| "Alice network disappeared before link setup".to_owned())?;
+        let bob_ref = bob
+            .as_ref()
+            .ok_or_else(|| "Bob network disappeared before link setup".to_owned())?;
+        link = Some(
+            live_slot_within(
+                "slot-real-link",
+                deadline,
+                alice_ref.install_retirable_session_over_real_link(bob_ref),
+            )
+            .await?,
+        );
+        bob_inbound = Some(
+            bob_ref
+                .realtime_inbound(&alice_id)
+                .ok_or_else(|| "Bob could not claim the one exact inbound stream".to_owned())?,
+        );
+        let open = myownmesh_core::realtime::OpaqueFlowOpen::new(
+            vec![0, 0xff, b's', b'l', b'o', b't'],
+            myownmesh_core::realtime::RealtimeFlowDirection::Outbound,
+            myownmesh_core::realtime::OpaqueFlowMode::ReliableOrdered,
+            1024,
+        )
+        .ok_or_else(|| "slot flow request is not well formed".to_owned())?;
+        let flow = live_slot_within(
+            "slot-flow-open",
+            deadline,
+            alice_ref.open_opaque_flow(&bob_id, &open),
+        )
+        .await?
+        .map_err(|error| format!("real opaque flow refused: {error}"))?;
+        uninstalled_flow = Some(flow);
+        let (owner_tx, _owner_rx) =
+            myownmesh_core::resource_mailbox(crate::test_application_scope())
+                .map_err(|error| format!("slot owner mailbox refused: {error}"))?;
+        let owner_handle = registry
+            .register(owner_tx)
+            .map_err(|error| format!("slot owner registration refused: {error}"))?;
+        owner = Some(owner_handle);
+        let owner_ref = owner
+            .as_ref()
+            .ok_or_else(|| "slot owner disappeared after registration".to_owned())?;
+        let registry_baseline = registry.in_use().ok_or_else(|| {
+            "isolated registry exposes no usage after owner registration".to_owned()
+        })?;
+        let callback_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_probe = callback_called.clone();
+        let flow = match registry.install_if_live(
+            owner_ref,
+            LeasedMap::<String, OwnedRealtimeFlow>::entry_claim(),
+            realtime_flow_retained(REALTIME_CAPABILITY_BYTES, "alice"),
+            Ok(ResourceClaim::single(
+                ResourceClass::AccountedMemoryBytes,
+                oversized_slot_demand,
+            )),
+            uninstalled_flow.take().ok_or_else(|| {
+                "the uninstalled flow was lost before the refusal probe".to_owned()
+            })?,
+            move |flow, _entry, _retained, _slot| {
+                callback_probe.store(true, Ordering::Release);
+                flow
+            },
+        ) {
+            Err((flow, reason)) => {
+                require(
+                    matches!(
+                        &reason,
+                        RegistrationError::Admission(IpcAdmissionError::Resources(
+                            myownmesh_core::ResourceUnavailable::Pressure(pressure),
+                        )) if pressure.dimension == ResourceClass::AccountedMemoryBytes
+                    ),
+                    format!("slot reservation refused at the wrong stage: {reason}"),
+                )?;
+                flow
+            }
+            Ok(_) => return Err("the deliberately oversized slot reservation admitted".to_owned()),
+        };
+        require(
+            !callback_called.load(Ordering::Acquire),
+            "refused install ran its callback",
+        )?;
+        uninstalled_flow = Some(flow);
+        require(
+            registry.in_use() == Some(registry_baseline),
+            "entry and retained leases survived the refused slot reservation",
+        )?;
+        let flow = uninstalled_flow
+            .take()
+            .ok_or_else(|| "the refused real handle was not returned".to_owned())?;
+        require(
+            alice_ref.realtime_is_current(&flow),
+            "the refused handle was not still current",
+        )?;
+        let capability = registry
+            .install_realtime_flow(owner_ref, "alice".to_owned(), flow)
+            .map_err(|_| "the exact funded slot refused the real flow".to_owned())?;
+        installed_capability = Some(capability.clone());
+        let slot = owner_ref
+            .realtime_flow_slot(capability.expose(), "alice")
+            .ok_or_else(|| "installed flow exposes no exact funded slot".to_owned())?;
+        captured_slot = Some(slot.clone());
+        let busy_guard = slot.handle.try_lock().map_err(|_| {
+            "the control could not borrow the slot before the busy probe".to_owned()
+        })?;
+        let changed = myownmesh_core::realtime::OpaqueFlowOpen::new(
+            vec![0, 0xff, b's', b'l', b'o', b't'],
+            myownmesh_core::realtime::RealtimeFlowDirection::Outbound,
+            myownmesh_core::realtime::OpaqueFlowMode::ReliableOrdered,
+            512,
+        )
+        .ok_or_else(|| "busy Change request is not well formed".to_owned())?;
+        let busy_result = live_slot_within(
+            "slot-busy-change",
+            deadline,
+            slot.change_opaque(alice_ref, &changed),
+        )
+        .await?;
+        require(
+            busy_result == Err(myownmesh_core::realtime::RealtimeRefusal::FlowRefused),
+            format!("busy Change returned {busy_result:?}"),
+        )?;
+        drop(busy_guard);
+
+        let owned = owner_ref
+            .take_realtime_flow(capability.expose())
+            .ok_or_else(|| "row removal returned no installed flow".to_owned())?;
+        removed_flow = Some(owned);
+        require(
+            owner_ref
+                .realtime_flow_slot(capability.expose(), "alice")
+                .is_none(),
+            "removed row still resolves the old capability",
+        )?;
+        let owned = removed_flow
+            .take()
+            .ok_or_else(|| "removed flow was lost before close".to_owned())?;
+        let close_guard = slot
+            .handle
+            .try_lock()
+            .map_err(|_| "close probe could not borrow the exact slot".to_owned())?;
+        let mut close = Box::pin(owned.close_through(alice_ref));
+        let completed_while_held = tokio::select! {
+            biased;
+            _ = &mut close => true,
+            _ = tokio::task::yield_now() => false,
+        };
+        if completed_while_held {
+            drop(close_guard);
+            return Err("close completed while the exact slot was borrowed".to_owned());
+        }
+        drop(close_guard);
+        live_slot_within("slot-close", deadline, &mut close)
+            .await?
+            .map_err(|error| format!("exact flow close failed after slot release: {error}"))?;
+
+        let slot_charge = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+            funded_record_retained::<RealtimeFlowSlot>()
+                .map_err(|error| format!("slot claim is not representable: {error:?}"))?,
+        )
+        .map_err(|error| format!("slot reservation charge is not representable: {error:?}"))?;
+        let after_row = registry
+            .in_use()
+            .ok_or_else(|| "isolated registry did not expose usage after close".to_owned())?;
+        require(
+            after_row.checked_sub(registry_baseline) == Ok(slot_charge),
+            "captured slot did not remain exactly funded after row removal",
+        )?;
+        drop(slot);
+        captured_slot = None;
+        require(
+            registry.in_use() == Some(registry_baseline),
+            "final slot capture did not release its exact reservation",
+        )?;
+
+        let unregistered = registry
+            .unregister(owner_ref.id)
+            .ok_or_else(|| "owner unregister found no live client".to_owned())?;
+        drop(unregistered.handle);
+        let (successor_tx, _successor_rx) =
+            myownmesh_core::resource_mailbox(crate::test_application_scope())
+                .map_err(|error| format!("successor mailbox refused: {error}"))?;
+        let successor = registry
+            .register(successor_tx)
+            .map_err(|error| format!("successor registration refused: {error}"))?;
+        require(
+            successor.id != owner_ref.id,
+            "successor reused the disconnected client id",
+        )?;
+        require(
+            successor
+                .realtime_flow_slot(capability.expose(), "alice")
+                .is_none(),
+            "a disconnected successor reused the old flow capability",
+        )?;
+        installed_capability = None;
+        Ok(())
+    }
+    .await;
+
+    drop(bob_inbound.take());
+    let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut cleanup_failures = Vec::new();
+    if let Some(owned) = removed_flow.take() {
+        if let Some(network) = alice.as_ref() {
+            match live_slot_within(
+                "cleanup-flow-close",
+                cleanup_deadline,
+                owned.close_through(network),
+            )
+            .await
+            {
+                Ok(Ok(()))
+                | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("flow close: {error}")),
+                Err(error) => cleanup_failures.push(error),
+            }
+        } else {
+            cleanup_failures.push("flow close had no Alice network owner".to_owned());
+        }
+    }
+    if let Some(capability) = installed_capability.take() {
+        if let Some(owner) = owner.as_ref() {
+            if let Some(owned) = owner.take_realtime_flow(capability.expose()) {
+                if let Some(network) = alice.as_ref() {
+                    match live_slot_within(
+                        "cleanup-installed-flow-close",
+                        cleanup_deadline,
+                        owned.close_through(network),
+                    )
+                    .await
+                    {
+                        Ok(Ok(()))
+                        | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {
+                        }
+                        Ok(Err(error)) => {
+                            cleanup_failures.push(format!("installed flow close: {error}"))
+                        }
+                        Err(error) => cleanup_failures.push(error),
+                    }
+                } else {
+                    cleanup_failures
+                        .push("installed flow close had no Alice network owner".to_owned());
+                }
+            }
+        } else {
+            cleanup_failures.push("installed flow close had no client owner".to_owned());
+        }
+    }
+    if let Some(flow) = uninstalled_flow.take() {
+        if let Some(network) = alice.as_ref() {
+            match live_slot_within(
+                "cleanup-uninstalled-flow-close",
+                cleanup_deadline,
+                network.close_realtime(flow),
+            )
+            .await
+            {
+                Ok(Ok(()))
+                | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("uninstalled flow close: {error}")),
+                Err(error) => cleanup_failures.push(error),
+            }
+        } else {
+            cleanup_failures.push("uninstalled flow close had no Alice network owner".to_owned());
+        }
+    }
+    drop(captured_slot.take());
+    if let Some(link) = link.take() {
+        match live_slot_within(
+            "cleanup-real-link-retire",
+            cleanup_deadline,
+            link.retire_sessions(),
+        )
+        .await
+        {
+            Ok(results) => cleanup_failures.extend(
+                results
+                    .into_iter()
+                    .filter_map(Result::err)
+                    .map(|error| error.to_string()),
+            ),
+            Err(error) => cleanup_failures.push(error),
+        }
+    }
+    for (name, network) in [("alice", alice.as_ref()), ("bob", bob.as_ref())] {
+        if let Some(network) = network {
+            match live_slot_within(
+                "cleanup-network-shutdown",
+                cleanup_deadline,
+                network.shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("{name} shutdown: {error}")),
+                Err(error) => cleanup_failures.push(format!("{name} shutdown: {error}")),
+            }
+        }
+    }
+    drop((alice.take(), bob.take(), owner.take()));
+    let resource_result = match (
+        alice_mesh.as_ref(),
+        alice_baseline.as_ref(),
+        bob_mesh.as_ref(),
+        bob_baseline.as_ref(),
+    ) {
+        (Some(alice_mesh), Some(alice_baseline), Some(bob_mesh), Some(bob_baseline)) => {
+            let alice_report = alice_mesh.resource_report();
+            let bob_report = bob_mesh.resource_report();
+            require_active_resource_baseline(&alice_report, alice_baseline, "Alice slot cleanup")
+                .and_then(|_| {
+                    require_active_resource_baseline(&bob_report, bob_baseline, "Bob slot cleanup")
+                })
+        }
+        _ => Ok(()),
+    };
+    let cleanup_result = if cleanup_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("slot fixture cleanup failed: {cleanup_failures:?}"))
+    };
+    assert!(resource_result.is_ok(), "{}", resource_result.unwrap_err());
+    assert!(cleanup_result.is_ok(), "{}", cleanup_result.unwrap_err());
+    assert!(result.is_ok(), "slot custody control failed: {result:?}");
+}
+
 #[test]
 fn client_id_roundtrips_through_string() {
     let id = ClientId(42);
@@ -68,8 +572,9 @@ fn disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner() {
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
             Ok(ResourceClaim::ZERO),
+            Ok(ResourceClaim::ZERO),
             Completed(drops.clone()),
-            move |completed, _entry, _retained| {
+            move |completed, _entry, _retained, _slot| {
                 installed_probe.store(true, Ordering::Release);
                 completed
             },
@@ -105,8 +610,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
         &owner,
         LeasedMap::<ClaimKey, ()>::entry_claim(),
         Ok(ResourceClaim::ZERO),
+        Ok(ResourceClaim::ZERO),
         7_u32,
-        move |value, _entry, _retained| landed.lock().push(value),
+        move |value, _entry, _retained, _slot| landed.lock().push(value),
     )
     .expect("a registered, connected owner admits the install");
     assert_eq!(&*table.lock(), &[7], "the install ran");
@@ -130,8 +636,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
             Ok(ResourceClaim::ZERO),
+            Ok(ResourceClaim::ZERO),
             9_u32,
-            move |value, _entry, _retained| refused.lock().push(value)
+            move |value, _entry, _retained, _slot| refused.lock().push(value)
         )
         .is_err(),
         "the same owner admits nothing once it has disconnected"

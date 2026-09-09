@@ -317,7 +317,7 @@ impl ClosedRelayRegistry {
         let would_exceed = active
             .checked_add(reserved)
             .and_then(|count| count.checked_add(1))
-            .map_or(true, |count| count > limit);
+            .is_none_or(|count| count > limit);
         if would_exceed {
             return Err("closed relay allocation limit is full");
         }
@@ -2345,6 +2345,7 @@ mod tests {
             tree: None,
             hub: None,
             local_observations: None,
+            application_transport: None,
             semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),

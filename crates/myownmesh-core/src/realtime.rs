@@ -43,6 +43,129 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The largest application-owned opaque unit that can fit in one application
+/// flow frame.  The value is a wire-representation limit, not an owner policy
+/// or a queue ceiling: an application may negotiate any smaller positive
+/// value, while the provider still accounts each actual body through its
+/// existing resource leases.
+pub const MAX_OPAQUE_FLOW_UNIT_BYTES: usize = 65_535 - 28;
+
+/// Alias used by the application-flow wire adapter for the same fixed frame
+/// body ceiling. It is an alias, not another tunable limit.
+pub const MAX_APPLICATION_FLOW_BODY_BYTES: usize = MAX_OPAQUE_FLOW_UNIT_BYTES;
+
+/// Reliability semantics of one application-owned opaque flow.
+///
+/// These are the only native lane distinctions the WebRTC provider needs.  A
+/// provider may retain one persistent lane for each supported variant; logical
+/// flows are multiplexed on those lanes and do not create a new native channel
+/// per open.  The enum carries no codec identity, digest, queue capacity or
+/// authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpaqueFlowMode {
+    /// Ordered, fully reliable delivery.
+    ReliableOrdered,
+    /// Unordered delivery with a bounded retransmit count.
+    PartialUnordered { max_retransmits: u16 },
+}
+
+/// Provider-neutral request for one logical opaque byte flow.
+///
+/// `label` is session-scoped application data and is bounded by the existing
+/// flow-name representation. `max_unit_bytes` is a negotiated per-unit upper
+/// bound and must not exceed [`MAX_OPAQUE_FLOW_UNIT_BYTES`]. It is not a second
+/// resource budget: flow count, queue depth and retained bytes are admitted by
+/// the provider's existing leases.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpaqueFlowOpen {
+    pub label: Vec<u8>,
+    pub direction: RealtimeFlowDirection,
+    pub mode: OpaqueFlowMode,
+    pub max_unit_bytes: u32,
+}
+
+impl OpaqueFlowOpen {
+    /// Construct a well-formed request, refusing invalid label or unit bounds
+    /// before session lookup or any provider allocation.
+    pub fn new(
+        label: Vec<u8>,
+        direction: RealtimeFlowDirection,
+        mode: OpaqueFlowMode,
+        max_unit_bytes: u32,
+    ) -> Option<Self> {
+        if label.is_empty()
+            || label.len() > MAX_REALTIME_FLOW_LABEL_BYTES
+            || max_unit_bytes == 0
+            || usize::try_from(max_unit_bytes).ok()? > MAX_OPAQUE_FLOW_UNIT_BYTES
+        {
+            return None;
+        }
+        Some(Self {
+            label,
+            direction,
+            mode,
+            max_unit_bytes,
+        })
+    }
+
+    /// Whether this request satisfies only the representation constraints.
+    /// Admission and resource pressure remain provider decisions.
+    pub fn is_well_formed(&self) -> bool {
+        !self.label.is_empty()
+            && self.label.len() <= MAX_REALTIME_FLOW_LABEL_BYTES
+            && self.max_unit_bytes > 0
+            && usize::try_from(self.max_unit_bytes)
+                .is_ok_and(|bytes| bytes <= MAX_OPAQUE_FLOW_UNIT_BYTES)
+    }
+}
+
+/// Private custody retained by an inbound opaque arrival until the application
+/// drops or consumes that arrival. Providers implement this marker with their
+/// real payload/queue leases; no provider handle or authority is exposed.
+pub(crate) trait OpaqueInboundCustody: Send {}
+
+/// One opaque unit taken from a session's shared inbound stream.
+///
+/// The bytes and label are the application view, while `custody` keeps the
+/// provider's transferred payload (and, where supported, queue-record) claim
+/// alive for the same move-only arrival. No codec parser is involved.
+pub struct OpaqueInboundArrival {
+    pub label: Vec<u8>,
+    pub bytes: bytes::Bytes,
+    pub(crate) _custody: Option<Box<dyn OpaqueInboundCustody>>,
+}
+
+impl std::fmt::Debug for OpaqueInboundArrival {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpaqueInboundArrival")
+            .field("label", &self.label)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OpaqueInboundArrival {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && self.bytes == other.bytes
+    }
+}
+
+impl Eq for OpaqueInboundArrival {}
+
+impl OpaqueInboundArrival {
+    /// Whether provider custody is still attached to this arrival.
+    ///
+    /// This is crate-visible observation for adapters/tests; applications own
+    /// custody structurally by holding the arrival and need no lease API.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(crate) fn has_custody(&self) -> bool {
+        self._custody.is_some()
+    }
+}
+
 /// The largest label the encoded frame can carry.
 ///
 /// **A representation fact, not a policy ceiling and not tunable.** The frame's
@@ -117,6 +240,21 @@ impl RealtimeInboundStream {
 
     pub(crate) fn reader(&self) -> &crate::transport::webrtc::RealtimeInboundArrivals {
         &self.reader
+    }
+
+    /// Receive the next application-owned opaque body from this exact stream.
+    /// A queued RTP item is a typed mismatch and remains at the head for the
+    /// tagged reader; `None` therefore remains the terminal stream result.
+    pub(crate) async fn next_opaque(
+        &self,
+    ) -> std::result::Result<Option<OpaqueInboundArrival>, RealtimeRefusal> {
+        self.reader.next_opaque().await
+    }
+
+    /// Receive the next item without filtering RTP or opaque flows. This is
+    /// the lossless API for sessions carrying both kinds of flow.
+    pub async fn next_arrival(&self) -> Option<crate::transport::webrtc::RealtimeInboundArrival> {
+        self.reader.next_provider_arrival().await
     }
 }
 

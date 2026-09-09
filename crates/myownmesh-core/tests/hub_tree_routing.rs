@@ -19,7 +19,7 @@ use myownmesh_core::config::{
 use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort, ResourceReport,
 };
-use myownmesh_core::topology::{self, Topology};
+use myownmesh_core::topology;
 use myownmesh_core::{
     ConnectorCallbackPolicy, Identity, Mesh, MeshConfig, WebRtcConnectorCapablePolicy,
     WebRtcConnectorProfile,
@@ -1122,8 +1122,6 @@ async fn hub_tree_connected_full_prefix_uses_live_out_of_prefix_parent(
     let (f0_identity, _f0_seed) = choose_leaf_identity(&root_id, &hubs, &h0_id, 0x80..=0xbf);
     let (f1_identity, _f1_seed) = choose_leaf_identity(&root_id, &hubs, &h1_id, 0xc0..=0xfe);
     let target_id = target_identity.public_id().to_owned();
-    let f0_id = f0_identity.public_id().to_owned();
-    let f1_id = f1_identity.public_id().to_owned();
 
     let prefix_selector = topology::from_mode(&TopologyMode::HubTree {
         root: root_id.clone(),
