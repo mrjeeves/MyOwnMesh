@@ -782,7 +782,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await?;
                 continue;
             };
-            let (tx, rx) = crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY);
+            let (tx, rx) = media_source_queue();
             client.set_media_sink(tx);
             let ack = Response::ok(serde_json::json!({ "media_source_pipe": true }));
             writer
@@ -812,6 +812,8 @@ async fn run_media_track_pipe<R>(state: &Arc<ControlState>, mut reader: R) -> Re
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let detailed = tracing::enabled!(target: "myownmesh::video_timing", tracing::Level::DEBUG);
+    let mut last_slow_send = None::<std::time::Instant>;
     loop {
         let mut len_buf = [0u8; 4];
         // A clean EOF (client closed the pipe) ends the loop; a short read is
@@ -838,6 +840,7 @@ where
             continue;
         };
         let dur = std::time::Duration::from_micros(frame.duration_us);
+        let started = detailed.then(std::time::Instant::now);
         let result = match frame.kind {
             MEDIA_KIND_VIDEO => {
                 net.state()
@@ -854,6 +857,18 @@ where
                 continue;
             }
         };
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed >= std::time::Duration::from_millis(100)
+                && last_slow_send.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+            {
+                last_slow_send = Some(std::time::Instant::now());
+                debug!(target: "myownmesh::video_timing", network = %frame.network,
+                    peer = %frame.peer, lane = frame.stream, kind = frame.kind,
+                    send_wait_ms = elapsed.as_millis() as u64, failed = result.is_err(),
+                    "media sender transport wait");
+            }
+        }
         if let Err(e) = result {
             debug!("media-track send failed: {e}");
         }
@@ -874,11 +889,16 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let detailed = tracing::enabled!(target: "myownmesh::video_timing", tracing::Level::DEBUG);
+    let mut window = std::time::Instant::now();
+    let (mut bodies, mut bytes) = (0u64, 0u64);
+    let (mut max_queue, mut max_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     loop {
         tokio::select! {
             biased;
-            body = rx.recv() => {
-                let Some(body) = body else { return Ok(()) };
+            body = rx.recv_timed() => {
+                let Some((body, queue_age)) = body else { return Ok(()) };
+                let started = detailed.then(std::time::Instant::now);
                 let len = (body.len() as u32).to_le_bytes();
                 if writer.write_all(&len).await.is_err() {
                     return Ok(());
@@ -888,6 +908,26 @@ where
                 }
                 if writer.flush().await.is_err() {
                     return Ok(());
+                }
+                if let Some(started) = started {
+                    let now = std::time::Instant::now();
+                    bodies += 1;
+                    bytes += body.len() as u64;
+                    max_queue = max_queue.max(queue_age);
+                    max_write = max_write.max(now.duration_since(started));
+                    if now.duration_since(window) >= std::time::Duration::from_secs(5) {
+                        debug!(target: "myownmesh::video_timing",
+                            window_ms = now.duration_since(window).as_millis() as u64,
+                            bodies, bytes,
+                            queue_age_max_ms = max_queue.as_millis() as u64,
+                            write_max_ms = max_write.as_millis() as u64,
+                            last_kind = body.first().copied(), last_lane = body.get(2).copied(),
+                            last_rtp_timestamp = body.get(3..7).map(|b| u32::from_le_bytes(b.try_into().expect("four bytes"))),
+                            "media IPC writer timing");
+                        window = now;
+                        (bodies, bytes) = (0, 0);
+                        (max_queue, max_write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+                    }
                 }
             }
             // The client never writes after the handshake, so any completion of
@@ -2371,6 +2411,21 @@ pub const MAX_MEDIA_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// (peer/lane/timestamp), not individual paced samples; audio counts per packet.
 /// Aggregate queued bytes are separately bounded by MAX_MEDIA_FRAME_BYTES.
 pub const MEDIA_SOURCE_QUEUE_CAPACITY: usize = 8;
+/// Retain one already-admitted RTP repair batch, not an arbitrary larger
+/// playout buffer. The socket writer still drains immediately. Audio keeps
+/// its eight-packet cap; aggregate byte/sample limits remain unchanged.
+pub const VIDEO_SOURCE_QUEUE_CAPACITY: usize =
+    myownmesh_core::transport::webrtc::VIDEO_RECEIVE_REPAIR_MAX_FRAMES;
+
+pub(crate) fn media_source_queue() -> (
+    crate::ipc::media_queue::Sender,
+    crate::ipc::media_queue::Receiver,
+) {
+    crate::ipc::media_queue::channel_with_other_capacity(
+        VIDEO_SOURCE_QUEUE_CAPACITY,
+        MEDIA_SOURCE_QUEUE_CAPACITY,
+    )
+}
 
 /// One decoded media-track frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2444,6 +2499,76 @@ pub fn encode_inbound_frame(
 #[cfg(test)]
 mod media_frame_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repair_batch_crosses_busy_media_pipe_without_secondary_loss() {
+        let mut bodies = vec![encode_inbound_frame(
+            MEDIA_KIND_VIDEO_DISCONTINUITY,
+            false,
+            0,
+            0,
+            "peer",
+            &[],
+        )];
+        // The transport can release a gap followed by fifteen pictures. Keep
+        // several paced fragments per picture, as in the observed recovery.
+        for timestamp in 1..VIDEO_SOURCE_QUEUE_CAPACITY as u32 {
+            for fragment in 0..3u8 {
+                bodies.push(encode_inbound_frame(
+                    MEDIA_KIND_VIDEO,
+                    timestamp == 1,
+                    0,
+                    timestamp,
+                    "peer",
+                    &vec![fragment; 8192],
+                ));
+            }
+        }
+
+        for legacy in [true, false] {
+            let (tx, rx) = if legacy {
+                crate::ipc::media_queue::channel(MEDIA_SOURCE_QUEUE_CAPACITY)
+            } else {
+                media_source_queue()
+            };
+            let (daemon, mut client) = tokio::io::duplex(4096);
+            let (reader, mut writer) = tokio::io::split(daemon);
+            let pump =
+                tokio::spawn(async move { run_media_source_pipe(reader, &mut writer, rx).await });
+            let mut admitted = Vec::new();
+            for body in &bodies {
+                match tx.try_send(body.clone()) {
+                    Ok(()) => admitted.push(body.clone()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if legacy => {}
+                    result => panic!("bounded repair release lost locally: {result:?}"),
+                }
+                // Run the actual pipe writer, not merely an unscheduled
+                // receiver. It fills the small pipe while its reader is busy;
+                // yielding alone cannot preserve the rest of the repair.
+                tokio::task::yield_now().await;
+            }
+            if legacy {
+                assert!(
+                    admitted.len() < bodies.len(),
+                    "reproduce the eight-picture loss"
+                );
+            } else {
+                assert_eq!(admitted, bodies);
+            }
+            drop(tx);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                for expected in admitted {
+                    let len = client.read_u32_le().await.unwrap() as usize;
+                    let mut actual = vec![0; len];
+                    client.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, expected, "preserve order and picture fragments");
+                }
+                pump.await.unwrap().unwrap();
+            })
+            .await
+            .expect("drain immediately once the reader resumes");
+        }
+    }
 
     #[tokio::test]
     async fn repaired_picture_crosses_media_pipe_with_a_temporarily_busy_reader() {

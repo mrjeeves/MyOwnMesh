@@ -18,6 +18,16 @@ publish = false
 name = "myownmesh"
 path = "src/main.rs"
 
+# Build alongside a running Windows diagnostic binary, then launch a versioned
+# copy outside Cargo's output directory. Not part of ordinary release builds.
+[[bin]]
+name = "myownmesh-diag"
+path = "src/main.rs"
+required-features = ["diagnostic-cycle"]
+
+[features]
+diagnostic-cycle = []
+
 # Embeds the VERSIONINFO resource into the Windows exe (see build.rs).
 # Host-gated: build scripts compile for the host, and the Windows zip is
 # built on a Windows runner.

@@ -291,8 +291,11 @@ pub fn spawn_video_pump(network: &JoinedNetwork, network_key: String, registry: 
                                 .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
                         {
                             last_sink_pressure_log = Some(std::time::Instant::now());
+                            let (pictures, other, items, bytes) = sink.pressure();
                             debug!(%network_key, from = %inbound.from, lane = inbound.sample.lane,
                                 sequence = inbound.sample.sequence,
+                                queued_pictures = pictures, queued_other = other,
+                                queued_samples = items, queued_bytes = bytes,
                                 "video daemon IPC queue overflow; ordering a discontinuity");
                         }
                         match next {
@@ -987,6 +990,161 @@ async fn repaired_picture_handoff_does_not_invent_a_gap_for_a_busy_consumer() {
     assert_eq!(rx.try_recv().unwrap(), gap);
     assert_eq!(rx.try_recv().unwrap(), next_body);
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn repair_batch_survives_writer_scheduling_without_extra_capacity_growth() {
+    use crate::control::{encode_inbound_frame, MEDIA_KIND_VIDEO, MEDIA_KIND_VIDEO_DISCONTINUITY};
+    let limit = myownmesh_core::transport::webrtc::VIDEO_RECEIVE_REPAIR_MAX_FRAMES;
+    let (tx, mut rx) = crate::control::media_source_queue();
+    let mut expected = Vec::new();
+    let mut recovery = None;
+    // The real assembler's pending_window_still_bounds_distinct_frames test
+    // releases one discontinuity plus 15 pictures in a single repair pass.
+    // Keep the writer unscheduled for that bounded burst, as in the field.
+    let gap = encode_inbound_frame(MEDIA_KIND_VIDEO_DISCONTINUITY, false, 0, 0, "peer", &[]);
+    let (open, state) = handoff_video_to_media_sink(&tx, recovery, true, true, &gap, &gap).await;
+    assert!(open);
+    recovery = state;
+    expected.push(gap);
+    for timestamp in 1..limit as u32 {
+        for fragment in 0..3 {
+            let body = encode_inbound_frame(
+                MEDIA_KIND_VIDEO,
+                timestamp == 1,
+                0,
+                timestamp,
+                "peer",
+                &[fragment],
+            );
+            let gap = encode_inbound_frame(
+                MEDIA_KIND_VIDEO_DISCONTINUITY,
+                false,
+                0,
+                timestamp,
+                "peer",
+                &[],
+            );
+            let (open, state) =
+                handoff_video_to_media_sink(&tx, recovery, false, false, &gap, &body).await;
+            assert!(open);
+            assert_eq!(
+                state, None,
+                "local handoff must not destroy a valid repair batch"
+            );
+            recovery = state;
+            expected.push(body);
+        }
+    }
+    let next = encode_inbound_frame(MEDIA_KIND_VIDEO, false, 0, limit as u32, "peer", &[0]);
+    assert!(matches!(
+        tx.try_send(next),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+    ));
+    for body in expected {
+        assert_eq!(rx.try_recv().unwrap(), body);
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(tx.capacity(), limit);
+}
+
+#[test]
+fn repair_batch_capacity_keeps_audio_packet_limit() {
+    let (tx, mut rx) = crate::control::media_source_queue();
+    for _ in 0..crate::control::MEDIA_SOURCE_QUEUE_CAPACITY {
+        tx.try_send(vec![1]).unwrap();
+    }
+    assert!(matches!(
+        tx.try_send(vec![1]),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+    ));
+    for _ in 0..crate::control::MEDIA_SOURCE_QUEUE_CAPACITY {
+        assert_eq!(rx.try_recv().unwrap(), vec![1]);
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn repair_batch_crosses_engine_fanout_and_ipc_without_an_extra_gap() {
+    use crate::control::{encode_inbound_frame, MEDIA_KIND_VIDEO_DISCONTINUITY};
+    use myownmesh_core::engine::{video_fanout::VideoFanout, InboundVideoSample};
+    use myownmesh_core::transport::VideoSample;
+    let fanout = VideoFanout::default();
+    let mut sub = fanout.subscribe();
+    let mut expected = Vec::new();
+    let mut sequence = 0;
+    for timestamp in 0..myownmesh_core::transport::webrtc::VIDEO_RECEIVE_REPAIR_MAX_FRAMES as u32 {
+        let fragments = if timestamp == 0 { 1 } else { 8 };
+        for _ in 0..fragments {
+            sequence += 1;
+            let sample = VideoSample {
+                rtp_timestamp: timestamp,
+                sequence,
+                lane: 0,
+                key: timestamp == 1,
+                data: if timestamp == 0 {
+                    Vec::new().into()
+                } else {
+                    vec![1; 8192].into()
+                },
+            };
+            expected.push(encode_inbound_frame(
+                inbound_video_kind(&sample),
+                sample.key,
+                0,
+                timestamp,
+                "peer",
+                &sample.data,
+            ));
+            fanout
+                .send(InboundVideoSample {
+                    from: "peer".into(),
+                    sample,
+                })
+                .unwrap();
+        }
+    }
+    drop(fanout);
+    let (sink, mut pipe) = crate::control::media_source_queue();
+    let mut recovery = None;
+    for expected_body in &expected {
+        let inbound = sub.recv().await.expect("no internal fanout loss");
+        let discontinuity = inbound.sample.data.is_empty();
+        let gap = encode_inbound_frame(
+            MEDIA_KIND_VIDEO_DISCONTINUITY,
+            false,
+            0,
+            inbound.sample.rtp_timestamp,
+            "peer",
+            &[],
+        );
+        let (open, next) = handoff_video_to_media_sink(
+            &sink,
+            recovery,
+            discontinuity,
+            discontinuity,
+            &gap,
+            expected_body,
+        )
+        .await;
+        assert!(open);
+        assert_eq!(
+            next,
+            if discontinuity {
+                Some(MediaSinkVideoRecovery::GapSent)
+            } else {
+                None
+            }
+        );
+        recovery = next;
+    }
+    for body in expected {
+        assert_eq!(pipe.try_recv().unwrap(), body);
+    }
+    assert!(
+        pipe.try_recv().is_err(),
+        "only the original RTP gap reaches the consumer"
+    );
 }
 
 #[tokio::test]

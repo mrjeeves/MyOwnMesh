@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/interceptor", "vendor/webrtc-util"]
 members = [
     "crates/myownmesh-core",
     "crates/myownmesh-signaling",
@@ -16,6 +17,12 @@ license = "MIT"
 authors = ["Chris Paul"]
 repository = "https://github.com/mrjeeves/MyOwnMesh"
 description = "Pure-Rust peer-to-peer mesh networking on webrtc-rs."
+
+# Diagnostic branch: narrow fixes to NACK repair and an opt-in real UDP
+# socket configuration hook. Dependency versions remain unchanged.
+[patch.crates-io]
+interceptor = { path = "vendor/interceptor" }
+webrtc-util = { path = "vendor/webrtc-util" }
 
 [workspace.dependencies]
 # Internal crates

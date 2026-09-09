@@ -511,10 +511,9 @@ pub struct NetworkState {
     pub events_tx: broadcast::Sender<MeshEvent>,
     pub channel_subscribers: DashMap<String, broadcast::Sender<RawChannelFrame>>,
     /// Fan-out for assembled video access units arriving on peers'
-    /// track lanes. One broadcast per network (subscribers filter by
-    /// `from`); kept shallow — video is a freshness stream, a lagging
-    /// subscriber loses old frames, never delays new ones.
-    pub video_subscribers: broadcast::Sender<InboundVideoSample>,
+    /// track lanes. Bounded by pictures, not paced fragments; a lagging
+    /// subscriber loses old samples with an ordered discontinuity signal.
+    pub video_subscribers: super::video_fanout::VideoFanout,
     /// Fan-out for audio frames arriving on peers' audio lanes —
     /// deeper than video's (audio frames are tiny and a dropped one
     /// is an audible tick), still bounded so a lagging subscriber
@@ -760,9 +759,7 @@ impl NetworkState {
             .unwrap_or_else(|| config.topology.clone());
         let topology_impl = crate::topology::from_mode(&effective_topology);
         let (events_tx, _) = broadcast::channel(256);
-        // Shallow: at 30 fps a depth of 16 is half a second of slack —
-        // beyond that a slow consumer should lose frames, not delay them.
-        let (video_subscribers, _) = broadcast::channel(16);
+        let video_subscribers = super::video_fanout::VideoFanout::default();
         let (audio_subscribers, _) = broadcast::channel(64);
         // Deep enough to ride out a transition storm (a sleep/wake
         // fan-out re-handshaking every peer) without the watcher lagging;
@@ -1182,7 +1179,7 @@ impl NetworkState {
     /// Subscribe to assembled video access units from every peer on
     /// this network (filter by [`InboundVideoSample::from`]). Lagging
     /// loses old frames, never delays new ones — video is freshness.
-    pub fn subscribe_video(&self) -> broadcast::Receiver<InboundVideoSample> {
+    pub fn subscribe_video(&self) -> super::video_fanout::VideoReceiver {
         self.video_subscribers.subscribe()
     }
 

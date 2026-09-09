@@ -27,6 +27,7 @@ async-trait = { workspace = true }
 pin-project-lite = { workspace = true }
 
 webrtc = { workspace = true }
+socket2 = "0.6"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }

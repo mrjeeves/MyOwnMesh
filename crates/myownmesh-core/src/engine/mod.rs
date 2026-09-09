@@ -35,6 +35,7 @@ pub mod signaling_bridge;
 pub mod state;
 pub mod tick;
 pub mod traffic;
+pub mod video_fanout;
 pub mod wake;
 
 pub use signaling_bridge::{
@@ -2242,6 +2243,7 @@ async fn handle_transport_event(
                 pending_frames = diagnostic.pending_frames,
                 pending_packets = diagnostic.pending_packets,
                 blocked_ms = diagnostic.blocked_ms,
+                engine_event_age_ms = diagnostic.observed_at.elapsed().as_millis() as u64,
                 "RTP video recovery abandoned a sample");
             state.dispatch_video_discontinuity(&device_id, lane, rtp_timestamp, sequence);
             tokio::task::yield_now().await;

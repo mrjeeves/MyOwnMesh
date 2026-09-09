@@ -98,29 +98,33 @@ pub const APP_DATA_CHANNEL_LABEL: &str = "myownmesh";
 /// The stock webrtc-rs NACK generator remembers 8,192 sequence numbers and
 /// requests every unresolved hole again every 100 ms. A single discontinuity
 /// can therefore turn into hundreds of megabits of stale video retransmits.
-/// Keep enough history for one shaped AllMyStuff burst plus the packets that
-/// can arrive before the next feedback tick, but bound one feedback epoch to
-/// 512 packets and let eight newer packets settle before declaring a gap.
+/// Keep history for the current 96 KiB + 256 Mbps/20ms shaped burst. The old
+/// 512-packet history forgot early holes in ~627 KiB keyframes before their
+/// first NACK, even while the assembler was still waiting for those repairs.
+/// Remember 1024 packets, but retain the old maximum of 512 requested packets
+/// per feedback tick; history and retransmission work are separate bounds.
+/// Let eight newer packets settle before declaring a gap.
 /// The shorter tick is important: a large motion-heavy access unit must not
 /// advance an early hole out of the history before its first NACK is emitted.
 /// AllMyStuff's access-unit sequence and key/GDR recovery still owns losses
 /// that age out of this deliberately finite transport window.
-const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 3; // 64 << 3 = 512 packets
-const NACK_REORDER_TAIL_PACKETS: u16 = 8;
-const NACK_INTERVAL: Duration = Duration::from_millis(20);
+pub(super) const NACK_GENERATOR_LOG2_SIZE_MINUS_6: u8 = 4; // 64 << 4 = 1024 packets
+pub(super) const NACK_MAX_REQUESTS_PER_TICK: usize = 512;
+pub(super) const NACK_REORDER_TAIL_PACKETS: u16 = 8;
+pub(super) const NACK_INTERVAL: Duration = Duration::from_millis(20);
 const NACK_RESPONDER_LOG2_SIZE: u8 = 13; // retain 8,192 sent packets
 /// NACK resends the original SSRC/sequence, not an RTX stream. The encrypted
 /// receive window must therefore admit an unseen repair anywhere in the
 /// sender's retained history. The default 64-packet SRTP window rejected
 /// valid repairs before they reached NACK tracking or H.264 assembly.
 /// This is a replay bitmap, not a media queue; duplicate rejection stays on.
-const SRTP_REPLAY_WINDOW_PACKETS: usize = 1 << NACK_RESPONDER_LOG2_SIZE;
+pub(super) const SRTP_REPLAY_WINDOW_PACKETS: usize = 1 << NACK_RESPONDER_LOG2_SIZE;
 
 #[cfg(test)]
 const NACK_GENERATOR_PACKETS: usize = 64 << NACK_GENERATOR_LOG2_SIZE_MINUS_6;
-/// `TrackLocalStaticSample` packetizes against a 1,200-byte outbound MTU.
+/// 1,200-byte outbound MTU minus the RTP and FU-A headers.
 #[cfg(test)]
-const RTP_OUTBOUND_PACKET_BYTES: usize = 1_200;
+const RTP_OUTBOUND_PACKET_BYTES: usize = 1_200 - 12 - 2;
 
 fn register_media_interceptors(
     mut registry: Registry,
@@ -146,6 +150,7 @@ fn register_media_interceptors(
         Generator::builder()
             .with_log2_size_minus_6(NACK_GENERATOR_LOG2_SIZE_MINUS_6)
             .with_skip_last_n(NACK_REORDER_TAIL_PACKETS)
+            .with_max_nacks_per_tick(NACK_MAX_REQUESTS_PER_TICK)
             .with_interval(NACK_INTERVAL),
     ));
     registry = configure_rtcp_reports(registry);
@@ -210,6 +215,9 @@ pub enum TransportEvent {
 /// first abandoned sample in a loss episode rather than tracing every packet.
 #[derive(Debug, Clone)]
 pub struct VideoRecoveryDiagnostic {
+    /// Local monotonic time; separates recovery detection from a delayed
+    /// engine event consumer. Never serialized onto the media wire.
+    pub observed_at: Instant,
     pub reason: &'static str,
     pub pending_samples: usize,
     pub pending_frames: usize,
@@ -400,6 +408,9 @@ impl Transport {
         // intentionally *kept* (it's a real path); only the dead virtual
         // interfaces in `VIRTUAL_IFACE_PREFIXES` are dropped.
         let mut setting_engine = SettingEngine::default();
+        // Despite the upstream setter's name, this is a real OS network,
+        // retaining normal ICE candidate/port selection and socket ownership.
+        setting_engine.set_vnet(Some(Arc::new(super::udp_socket::real_network())));
         setting_engine.set_srtp_replay_protection_window(SRTP_REPLAY_WINDOW_PACKETS);
         setting_engine.set_interface_filter(Box::new(|name: &str| {
             let keep = !is_virtual_interface(name);
@@ -764,13 +775,46 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
     let lane = lane_of_track_id(&track.id());
     let mut assembler = H264AuAssembler::default();
     let mut sequence = 0u64;
+    // Detailed logs only. One aggregate per five seconds, no packet dump or
+    // extra polling task. Read await includes both network and scheduling time.
+    let detailed = tracing::enabled!(target: "myownmesh_core::video_timing", tracing::Level::DEBUG);
+    let mut window = Instant::now();
+    let (mut packets, mut forward_skips, mut reordered, mut max_release) =
+        (0u64, 0u64, 0u64, 0usize);
+    let (mut max_read, mut max_handoff) = (Duration::ZERO, Duration::ZERO);
+    let mut previous_seq: Option<u16> = None;
     loop {
+        let read_started = detailed.then(Instant::now);
         let pkt = match track.read_rtp().await {
             Ok((pkt, _)) => pkt,
             Err(_) => break, // track ended with its connection
         };
+        let arrived = read_started.map(|start| {
+            let now = Instant::now();
+            max_read = max_read.max(now.duration_since(start));
+            packets += 1;
+            let seq = pkt.header.sequence_number;
+            if let Some(previous) = previous_seq {
+                let advance = seq.wrapping_sub(previous) as i16;
+                if advance > 1 {
+                    forward_skips += (advance - 1) as u64;
+                }
+                if advance <= 0 {
+                    reordered += 1;
+                }
+                if advance > 0 {
+                    previous_seq = Some(seq);
+                }
+            } else {
+                previous_seq = Some(seq);
+            }
+            now
+        });
         match assembler.push_events(&pkt) {
             Ok(events) => {
+                if detailed {
+                    max_release = max_release.max(events.len());
+                }
                 for event in events {
                     sequence = sequence.wrapping_add(1);
                     if sequence == 0 {
@@ -806,6 +850,24 @@ async fn pump_video_track(track: Arc<TrackRemote>, tx: mpsc::UnboundedSender<Tra
             // the stream re-syncs on the next timestamp, and the
             // sender's periodic IDR bounds any visible damage.
             Err(e) => trace!("video depacketize: {e}"),
+        }
+        if let Some(arrived) = arrived {
+            let now = Instant::now();
+            max_handoff = max_handoff.max(now.duration_since(arrived));
+            if now.duration_since(window) >= Duration::from_secs(5) {
+                debug!(target: "myownmesh_core::video_timing",
+                    ssrc = track.ssrc(), lane, rtp_timestamp = pkt.header.timestamp,
+                    rtp_sequence = pkt.header.sequence_number,
+                    window_ms = now.duration_since(window).as_millis() as u64,
+                    packets, forward_skips, reordered, max_release,
+                    read_wait_max_ms = max_read.as_millis() as u64,
+                    handoff_max_ms = max_handoff.as_millis() as u64,
+                    pending_samples = assembler.pending.len(),
+                    "video RTP receive timing");
+                window = now;
+                (packets, forward_skips, reordered, max_release) = (0, 0, 0, 0);
+                (max_read, max_handoff) = (Duration::ZERO, Duration::ZERO);
+            }
         }
     }
 }
@@ -873,6 +935,11 @@ const MAX_AU_PARTS: usize = 2048;
 /// below remain independent. Cooperative downstream handoffs drain releases;
 /// their queue capacities must not define the RTP repair window.
 const MAX_PENDING_FRAMES: usize = 15;
+/// Maximum distinct picture timestamps released by one receive repair pass:
+/// the pending window plus the arriving picture that closes/overflows it.
+/// Local handoffs must accommodate this existing burst without manufacturing
+/// new loss merely because their socket writer has not been scheduled yet.
+pub const VIDEO_RECEIVE_REPAIR_MAX_FRAMES: usize = MAX_PENDING_FRAMES + 1;
 /// Aggregate per-track memory guard (roughly 5 MiB at normal RTP MTUs).
 const MAX_PENDING_PARTS: usize = 4096;
 /// Long enough for several NACK attempts plus the measured 55 ms live-path
@@ -1125,6 +1192,7 @@ impl H264AuAssembler {
                 events.push(H264AssemblyEvent::Discontinuity {
                     rtp_timestamp: abandoned.timestamp,
                     diagnostic: VideoRecoveryDiagnostic {
+                        observed_at: now,
                         reason: abandon_reason.unwrap_or("retransmit_deadline"),
                         pending_samples,
                         pending_frames,
@@ -2089,7 +2157,7 @@ mod tests {
         // interval. Otherwise an early packet loss in a high-motion frame can
         // age out before the receiver ever asks for it again.
         const ALLMYSTUFF_BURST_BYTES: usize = 96 * 1024;
-        const ALLMYSTUFF_GAME_CEILING_BPS: usize = 200_000_000;
+        const ALLMYSTUFF_GAME_CEILING_BPS: usize = 256_000_000;
 
         let bytes_during_feedback_interval =
             ALLMYSTUFF_GAME_CEILING_BPS * NACK_INTERVAL.as_millis() as usize / 8 / 1_000;
@@ -2307,6 +2375,138 @@ mod tests {
     const FU_S: &[u8] = &[0x7C, 0x85, 0x11];
     const FU_M: &[u8] = &[0x7C, 0x05, 0x22];
     const FU_E: &[u8] = &[0x7C, 0x45, 0x33];
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_burst_hole_is_nacked_and_repaired_before_assembly_deadline() {
+        use async_trait::async_trait;
+        use webrtc::interceptor::stream_info::{RTCPFeedback, StreamInfo};
+        use webrtc::interceptor::{Attributes, InterceptorBuilder, RTCPWriter, RTPReader};
+        use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
+        type RtcpPacket = Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>;
+        struct Input(parking_lot::Mutex<std::collections::VecDeque<webrtc::rtp::packet::Packet>>);
+        #[async_trait]
+        impl RTPReader for Input {
+            async fn read(
+                &self,
+                _: &mut [u8],
+                attributes: &Attributes,
+            ) -> std::result::Result<
+                (webrtc::rtp::packet::Packet, Attributes),
+                webrtc::interceptor::Error,
+            > {
+                Ok((self.0.lock().pop_front().unwrap(), attributes.clone()))
+            }
+        }
+        struct Feedback(mpsc::UnboundedSender<Vec<u16>>);
+        #[async_trait]
+        impl RTCPWriter for Feedback {
+            async fn write(
+                &self,
+                packets: &[RtcpPacket],
+                _: &Attributes,
+            ) -> std::result::Result<usize, webrtc::interceptor::Error> {
+                for packet in packets {
+                    if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
+                        self.0
+                            .send(
+                                nack.nacks
+                                    .iter()
+                                    .flat_map(|pair| pair.into_iter())
+                                    .collect(),
+                            )
+                            .unwrap();
+                    }
+                }
+                Ok(0)
+            }
+        }
+        for start in [1000u16, 65_500] {
+            for (size, repaired) in [(3, false), (NACK_GENERATOR_LOG2_SIZE_MINUS_6, true)] {
+                // ~627 KiB: within the current 96 KiB + 256 Mbps/20ms
+                // burst envelope and the large AUs observed on the sender.
+                let mut packets =
+                    std::collections::VecDeque::from([rtp_pkt(start, 50, true, IDR_NAL)]);
+                let mut missing = None;
+                for index in 1..=540u16 {
+                    let mut payload = vec![0x11; 1188];
+                    payload[0] = 0x7c;
+                    payload[1] = if index == 1 {
+                        0x85
+                    } else if index == 540 {
+                        0x45
+                    } else {
+                        0x05
+                    };
+                    let packet = rtp_pkt(start.wrapping_add(index), 100, index == 540, &payload);
+                    if index == 2 {
+                        missing = Some(packet);
+                    } else {
+                        packets.push_back(packet);
+                    }
+                }
+                packets.push_back(rtp_pkt(start.wrapping_add(541), 200, true, IDR_NAL));
+                let count = packets.len();
+                let input = Arc::new(Input(parking_lot::Mutex::new(packets)));
+                let info = StreamInfo {
+                    ssrc: 7,
+                    rtcp_feedback: vec![RTCPFeedback {
+                        typ: "nack".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let generator = Generator::builder()
+                    .with_log2_size_minus_6(size)
+                    .with_skip_last_n(NACK_REORDER_TAIL_PACKETS)
+                    .with_max_nacks_per_tick(NACK_MAX_REQUESTS_PER_TICK)
+                    .with_interval(NACK_INTERVAL)
+                    .build("motion-repair")
+                    .unwrap();
+                let reader = generator.bind_remote_stream(&info, input.clone()).await;
+                let mut asm = H264AuAssembler::default();
+                let at = Instant::now();
+                for index in 0..count {
+                    let (packet, _) = reader
+                        .read(&mut [0; 1500], &Attributes::new())
+                        .await
+                        .unwrap();
+                    let events = asm.push_at(&packet, at).unwrap();
+                    assert_eq!(
+                        events.len(),
+                        usize::from(index == 0),
+                        "wait for the actual hole"
+                    );
+                }
+                let (tx, mut feedback) = mpsc::unbounded_channel();
+                generator.bind_rtcp_writer(Arc::new(Feedback(tx))).await;
+                let nack = tokio::time::timeout(NACK_INTERVAL * 2, feedback.recv()).await;
+                if repaired {
+                    assert_eq!(
+                        nack.unwrap().unwrap(),
+                        vec![start.wrapping_add(2)],
+                        "the early hole must not be forgotten before the first NACK"
+                    );
+                    input.0.lock().push_back(missing.unwrap());
+                    let (repair, _) = reader
+                        .read(&mut [0; 1500], &Attributes::new())
+                        .await
+                        .unwrap();
+                    let events = asm.push_at(&repair, at + NACK_INTERVAL * 2).unwrap();
+                    assert!(
+                        matches!(events.as_slice(), [H264AssemblyEvent::Sample(first), H264AssemblyEvent::Sample(next)] if first.key && first.rtp_timestamp == 100 && next.rtp_timestamp == 200)
+                    );
+                } else {
+                    assert!(nack.is_err(), "old history silently forgets the hole");
+                    assert!(matches!(
+                        asm.collect_ready(at + RETRANSMIT_GRACE).unwrap().first(),
+                        Some(H264AssemblyEvent::Discontinuity { .. })
+                    ));
+                }
+                generator.unbind_remote_stream(&info).await;
+                generator.close().await.unwrap();
+            }
+        }
+    }
 
     #[test]
     fn encrypted_video_repair_reaches_assembler_after_packet_advance() {
