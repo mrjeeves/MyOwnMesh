@@ -1014,7 +1014,7 @@ impl H264AuAssembler {
                             .first_key_value()
                             .is_none_or(|(&first, _)| seq >= first)
                         || left.is_some_and(|au| {
-                            !newer_rtp_ts(ts, au.timestamp)
+                            (ts != au.timestamp && !newer_rtp_ts(ts, au.timestamp))
                                 || au
                                     .parts
                                     .last_key_value()
@@ -1024,6 +1024,9 @@ impl H264AuAssembler {
                         return self.collect_ready(now);
                     }
                     insert_at = next;
+                    // The left neighbor may be an earlier paced sample of
+                    // this same picture. Its marker/sequence bound, not strict
+                    // timestamp advancement, proves this sample is unretired.
                     // The newer picture exposed this hole already. Inserting
                     // its delayed predecessor must not restart repair grace.
                     blocked_since = right.blocked_since.or(Some(now));
@@ -1074,7 +1077,10 @@ impl H264AuAssembler {
                         timestamp: ts,
                         parts: tail,
                         marker_seq: previous_marker.filter(|end| *end > seq),
-                        blocked_since: None,
+                        // The later marker already exposed this hole before
+                        // its earlier boundary arrived. Splitting must not
+                        // restart the existing packet-repair grace.
+                        blocked_since: au.blocked_since,
                         overflowed: false,
                     });
                 }
@@ -2674,6 +2680,129 @@ mod tests {
                 && first.key
                 && second.key
         ));
+    }
+
+    #[test]
+    fn paced_repair_admits_late_sample_after_same_picture_marker() {
+        for base in [100u32, u32::MAX - 50] {
+            for marker_first in [false, true] {
+                let mut asm = H264AuAssembler::default();
+                let now = Instant::now();
+                asm.push_at(&rtp_pkt(9, base.wrapping_sub(100), true, IDR_NAL), now)
+                    .unwrap();
+                // Sample A has a hole. All of sample B is delayed, while
+                // sample C from the next picture overtakes it. A and B share
+                // the timestamp used by AMS's paced-slice protocol.
+                asm.push_at(&rtp_pkt(10, base, false, FU_S), now).unwrap();
+                asm.push_at(&rtp_pkt(12, base, true, FU_E), now).unwrap();
+                asm.push_at(&rtp_pkt(15, base.wrapping_add(100), true, IDR_NAL), now)
+                    .unwrap();
+                let repair_at = now + Duration::from_millis(55);
+                let packets = if marker_first {
+                    [(14, true, FU_E), (13, false, FU_S)]
+                } else {
+                    [(13, false, FU_S), (14, true, FU_E)]
+                };
+                for (seq, marker, payload) in packets {
+                    assert!(asm
+                        .push_at(&rtp_pkt(seq, base, marker, payload), repair_at)
+                        .unwrap()
+                        .is_empty());
+                }
+                let events = asm
+                    .push_at(&rtp_pkt(11, base, false, FU_M), repair_at)
+                    .unwrap();
+                assert!(
+                    matches!(events.as_slice(), [
+                    H264AssemblyEvent::Sample(a),
+                    H264AssemblyEvent::Sample(b),
+                    H264AssemblyEvent::Sample(c),
+                ] if a.rtp_timestamp == base && b.rtp_timestamp == base
+                    && c.rtp_timestamp == base.wrapping_add(100)
+                    && a.data.as_ref() == [0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33]
+                    && b.data.as_ref() == [0, 0, 0, 1, 0x65, 0x11, 0x33]),
+                    "every packet repaired before the deadline must release A, B, C"
+                );
+                assert!(asm.pending.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn paced_repair_preserves_samples_under_bounded_reordering() {
+        use rand::{seq::SliceRandom, SeedableRng};
+
+        for seed in 0..64 {
+            let mut asm = H264AuAssembler::default();
+            let now = Instant::now();
+            let start = 65520u16;
+            asm.push_at(&rtp_pkt(start.wrapping_sub(1), 50, true, IDR_NAL), now)
+                .unwrap();
+            let mut packets = Vec::new();
+            let mut expected = Vec::new();
+            for picture in 0..4u32 {
+                for sample in 0..4u16 {
+                    let seq = start.wrapping_add(picture as u16 * 12 + sample * 3);
+                    let timestamp = 100 + picture * 3000;
+                    packets.push(rtp_pkt(seq, timestamp, false, FU_S));
+                    packets.push(rtp_pkt(seq.wrapping_add(1), timestamp, false, FU_M));
+                    packets.push(rtp_pkt(seq.wrapping_add(2), timestamp, true, FU_E));
+                    expected.push(timestamp);
+                }
+            }
+            packets.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+            let mut received = Vec::new();
+            for packet in &packets {
+                for event in asm
+                    .push_at(packet, now + Duration::from_millis(55))
+                    .unwrap()
+                {
+                    match event {
+                        H264AssemblyEvent::Sample(sample) => {
+                            assert_eq!(
+                                sample.data.as_ref(),
+                                [0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33],
+                                "seed {seed}"
+                            );
+                            received.push(sample.rtp_timestamp);
+                        }
+                        H264AssemblyEvent::Discontinuity { .. } => {
+                            panic!("premature loss for seed {seed}")
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                received, expected,
+                "seed {seed}; every packet arrived before the recovery deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn paced_repair_late_marker_does_not_restart_visible_hole_deadline() {
+        let mut asm = H264AuAssembler::default();
+        let now = Instant::now();
+        asm.push_at(&rtp_pkt(9, 50, true, IDR_NAL), now).unwrap();
+        asm.push_at(&rtp_pkt(10, 100, false, FU_S), now).unwrap();
+        asm.push_at(&rtp_pkt(11, 100, false, FU_M), now).unwrap();
+        // A's marker (12) and B's start (13) are missing. B's marker
+        // exposes both holes now, even though we cannot split A/B yet.
+        asm.push_at(&rtp_pkt(14, 100, true, FU_E), now).unwrap();
+        let events = asm
+            .push_at(
+                &rtp_pkt(12, 100, true, FU_E),
+                now + RETRANSMIT_GRACE - Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(matches!(events.as_slice(), [H264AssemblyEvent::Sample(_)]));
+        let events = asm.collect_ready(now + RETRANSMIT_GRACE).unwrap();
+        assert!(
+            matches!(events.as_slice(), [H264AssemblyEvent::Discontinuity { diagnostic, .. }]
+            if diagnostic.reason == "retransmit_deadline" && diagnostic.blocked_ms == 150),
+            "learning an earlier marker must not give an existing hole another 150 ms"
+        );
+        assert!(asm.pending.is_empty());
     }
 
     #[test]

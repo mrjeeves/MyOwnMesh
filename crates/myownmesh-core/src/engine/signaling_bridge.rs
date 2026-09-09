@@ -240,7 +240,9 @@ fn dedup_key(msg: &SignalingInbound) -> Option<u64> {
             )
                 .hash(&mut h);
         }
-        SignalingInbound::PeerAnnounced { .. } | SignalingInbound::PeerLeft { .. } => return None,
+        SignalingInbound::PeerAnnounced { .. }
+        | SignalingInbound::DiscoveryLost { .. }
+        | SignalingInbound::PeerLeft { .. } => return None,
     }
     Some(h.finish())
 }
@@ -591,6 +593,8 @@ fn attach_mdns_with(
                     .map(|device_id| SignalingInbound::PeerAnnounced { device_id }),
                 MdnsInbound::PeerLeft { device_id } => canonical_wire_device_id(device_id)
                     .map(|device_id| SignalingInbound::PeerLeft { device_id }),
+                MdnsInbound::DiscoveryLost { device_id } => canonical_wire_device_id(device_id)
+                    .map(|device_id| SignalingInbound::DiscoveryLost { device_id }),
                 MdnsInbound::Message { from, msg } => translate_message(from, msg),
             };
             let Some(translated) = translated else {

@@ -18,7 +18,7 @@
 //!   forged frame can at worst waste a handshake attempt.
 //! - **Pluggable discovery backend.** The registration/browse half lives
 //!   behind [`super::discovery`]: the pure-Rust `mdns-sd` daemon by default
-//!   (per-driver socket set, coexists with a system daemon via
+//!   (process-wide socket set, coexists with a system daemon via
 //!   SO_REUSEADDR/SO_REUSEPORT), or the platform's own DNS-SD daemon through
 //!   the `dnssd` C API on iOS (raw multicast sockets are entitlement-gated
 //!   there; mDNSResponder isn't). The exchange below is backend-independent.
@@ -65,9 +65,10 @@ pub struct MdnsDriverConfig {
 pub enum MdnsInbound {
     /// A peer's advertisement resolved (or refreshed) in our room.
     PeerAnnounced { device_id: String },
-    /// A peer's advertisement was withdrawn (mDNS goodbye) or its
-    /// record expired from the cache.
+    /// An explicit Leave message arrived over the signaling exchange.
     PeerLeft { device_id: String },
+    /// Advisory discovery loss, not evidence that an authenticated session left.
+    DiscoveryLost { device_id: String },
     /// A peer addressed us directly over the TCP exchange.
     Message { from: String, msg: SignalingMessage },
 }
@@ -80,8 +81,8 @@ pub enum MdnsOutbound {
     /// the announce — mDNS handles repetition and query responses —
     /// so repeats are cheap no-ops.
     Announce,
-    /// Withdraw the advertisement (sends the mDNS goodbye, which
-    /// surfaces as `PeerLeft` on every browser).
+    /// Withdraw the advertisement. Existing transports observe their own close;
+    /// a DNS goodbye alone is not an authoritative session teardown.
     Leave,
     DirectedToPeer {
         to: String,
@@ -243,7 +244,7 @@ impl MdnsDriverHandle {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Goodbye first (peers get PeerLeft promptly), then shut the
+        // Goodbye first (withdraw the discovery endpoint), then shut the
         // backend down (closes the browse stream), then abort the
         // tokio tasks parked on accept/recv.
         self.discovery.unregister();
@@ -333,18 +334,24 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 });
             }
             DiscoveryEvent::Removed { key } => {
-                let peer = shared.key_to_peer.lock().remove(&key);
+                let peer = {
+                    let mut keys = shared.key_to_peer.lock();
+                    keys.remove(&key)
+                        .filter(|peer| !keys.values().any(|p| p == peer))
+                };
                 if let Some(peer) = peer {
                     shared.peers.lock().remove(&peer);
                     shared
                         .endpoint_health
                         .lock()
                         .retain(|(known_peer, _), _| known_peer != &peer);
-                    shared.conns.lock().remove(&peer);
-                    debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
+                    // Cache expiry / goodbye says nothing about a live TCP or
+                    // authenticated WebRTC connection. Keep those until their
+                    // own close/liveness path detects loss.
+                    debug!(peer = %&peer[..peer.len().min(16)], "mdns discovery endpoint removed; transport unchanged");
                     let _ = shared
                         .inbound_tx
-                        .send(MdnsInbound::PeerLeft { device_id: peer });
+                        .send(MdnsInbound::DiscoveryLost { device_id: peer });
                 }
             }
         }

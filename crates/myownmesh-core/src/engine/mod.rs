@@ -971,6 +971,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, sig: SignalingInbou
                 Action::NoPeer => {}
             }
         }
+        SignalingInbound::DiscoveryLost { device_id } => {
+            state.log_diag_with(
+                crate::events::DiagLevel::Debug,
+                "signaling",
+                format!("mDNS discovery lost; transport unchanged: {}", short_peer(&device_id)),
+                serde_json::json!({ "peer": device_id, "driver": "mdns", "action": "discovery_only" }),
+            );
+        }
         SignalingInbound::PeerLeft { device_id } => {
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
@@ -2053,7 +2061,23 @@ async fn handle_transport_event(
     // either. Either way, ignore the event (TRACE so the drop is still
     // greppable when chasing a transport bug).
     match state.peers.get(&device_id) {
-        Some(peer) if peer.epoch == epoch => {}
+        Some(peer) if peer.epoch == epoch => {
+            // SRTP media bypasses handle_inbound_frame, but it is still proof
+            // this transport is carrying inbound traffic. Without this touch,
+            // a video-only peer looks silent between data-channel messages and
+            // an announce/wake probe can tear down a healthy running stream.
+            // Keep the epoch guard and admission boundary: old-session or
+            // pre-authentication media must never keep a replacement alive.
+            if matches!(
+                &event,
+                TransportEvent::VideoSample(_) | TransportEvent::AudioSample(_)
+            ) {
+                let mut data = peer.state.write();
+                if data.is_admitted() {
+                    data.last_recv_at = Some(Instant::now());
+                }
+            }
+        }
         _ => {
             trace!(peer = %device_id, epoch, "ignoring transport event from stale/absent session");
             return;
@@ -4561,6 +4585,166 @@ mod tests {
             peer.state.read().last_liveness_probe_at.is_none(),
             "a peer we've heard from recently must not be probed"
         );
+    }
+
+    fn media_liveness_events() -> Vec<TransportEvent> {
+        use crate::transport::webrtc::{AudioSample, VideoSample};
+        vec![
+            TransportEvent::VideoSample(VideoSample {
+                rtp_timestamp: 90_000,
+                key: true,
+                lane: 0,
+                sequence: 1,
+                data: bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 1]),
+            }),
+            TransportEvent::AudioSample(AudioSample {
+                rtp_timestamp: 48_000,
+                lane: 0,
+                data: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn discovery_departure_preserves_fresh_media_but_explicit_leave_drops_it() {
+        let state = build_test_state("diagnostic-discovery-departure");
+        let peer_id = "streamer";
+        insert_session_less_peer(&state, peer_id, None);
+        set_admission(&state, peer_id, true, PeerStatus::Active);
+        let epoch = state.peers.get(peer_id).unwrap().epoch;
+        handle_transport_event(
+            &state,
+            peer_id.into(),
+            epoch,
+            media_liveness_events().remove(0),
+        )
+        .await;
+        assert!(state
+            .peers
+            .get(peer_id)
+            .unwrap()
+            .state
+            .read()
+            .last_recv_at
+            .is_some());
+        let mut events = state.events_tx.subscribe();
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::DiscoveryLost {
+                device_id: peer_id.into(),
+            },
+        )
+        .await;
+        assert!(
+            state.peers.contains_key(peer_id),
+            "discovery removal must not remove a receiving peer"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, MeshEvent::Peer(PeerEvent::Dropped { .. })));
+        }
+        assert_eq!(state.peers.get(peer_id).unwrap().epoch, epoch);
+        handle_signaling_inbound(
+            &state,
+            SignalingInbound::PeerLeft {
+                device_id: peer_id.into(),
+            },
+        )
+        .await;
+        assert!(!state.peers.contains_key(peer_id));
+        let mut observed_user_left = false;
+        while let Ok(event) = events.try_recv() {
+            observed_user_left |= matches!(
+                event,
+                MeshEvent::Peer(PeerEvent::Dropped {
+                    reason: DropReason::UserLeft,
+                    ..
+                })
+            );
+        }
+        assert!(observed_user_left);
+    }
+
+    #[tokio::test]
+    async fn media_liveness_prevents_reannounce_rebuilding_a_streaming_peer() {
+        for event in media_liveness_events() {
+            let state = build_test_state("media-liveness-fresh");
+            let old = stale_instant();
+            insert_session_less_peer(&state, "streamer", Some(old));
+            set_admission(&state, "streamer", true, PeerStatus::Active);
+            let epoch = state.peers.get("streamer").unwrap().epoch;
+            handle_transport_event(&state, "streamer".into(), epoch, event).await;
+            assert!(
+                state
+                    .peers
+                    .get("streamer")
+                    .unwrap()
+                    .state
+                    .read()
+                    .last_recv_at
+                    > Some(old),
+                "authenticated RTP must count as inbound traffic, not just data-channel frames"
+            );
+            confirm_active_session_on_announce(&state, "streamer").await;
+            assert!(state
+                .peers
+                .get("streamer")
+                .unwrap()
+                .state
+                .read()
+                .last_liveness_probe_at
+                .is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_liveness_answers_an_already_armed_announce_probe() {
+        let state = build_test_state("media-liveness-probe");
+        insert_session_less_peer(&state, "streamer", Some(stale_instant()));
+        set_admission(&state, "streamer", true, PeerStatus::Active);
+        let epoch = state.peers.get("streamer").unwrap().epoch;
+        confirm_active_session_on_announce(&state, "streamer").await;
+        tokio::task::yield_now().await;
+        handle_transport_event(
+            &state,
+            "streamer".into(),
+            epoch,
+            media_liveness_events().remove(0),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS + 1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            state.peers.contains_key("streamer"),
+            "live video must answer the silence probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_liveness_ignores_unadmitted_and_previous_session_media() {
+        for (authenticated, status, stale_epoch) in [
+            (false, PeerStatus::Active, false),
+            (true, PeerStatus::Handshaking, false),
+            (true, PeerStatus::Active, true),
+        ] {
+            let state = build_test_state("media-liveness-gated");
+            let old = stale_instant();
+            insert_session_less_peer(&state, "streamer", Some(old));
+            set_admission(&state, "streamer", authenticated, status);
+            let epoch = state.peers.get("streamer").unwrap().epoch + u64::from(stale_epoch);
+            for event in media_liveness_events() {
+                handle_transport_event(&state, "streamer".into(), epoch, event).await;
+            }
+            assert_eq!(
+                state
+                    .peers
+                    .get("streamer")
+                    .unwrap()
+                    .state
+                    .read()
+                    .last_recv_at,
+                Some(old)
+            );
+        }
     }
 
     #[tokio::test]
