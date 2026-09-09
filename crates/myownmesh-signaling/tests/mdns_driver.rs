@@ -120,16 +120,59 @@ async fn two_drivers_discover_and_exchange() {
     assert_eq!(got.0, "device-a");
     assert_eq!(got.1, offer);
 
-    // Withdrawal: B leaves; A hears PeerLeft via the mDNS goodbye.
+    // Advertisement withdrawal is advisory, not an explicit transport leave.
     b_out_tx.send(MdnsOutbound::Leave).expect("channel open");
     let left = loop {
         match timeout(DISCOVERY_GRACE, a_in_rx.recv()).await {
-            Ok(Some(MdnsInbound::PeerLeft { device_id })) => break device_id,
+            Ok(Some(MdnsInbound::DiscoveryLost { device_id })) => break device_id,
+            Ok(Some(MdnsInbound::PeerLeft { .. })) => {
+                panic!("goodbye incorrectly became transport leave")
+            }
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => panic!("goodbye never surfaced as PeerLeft"),
+            Ok(None) | Err(_) => panic!("goodbye never surfaced as DiscoveryLost"),
         }
     };
     assert_eq!(left, "device-b");
+
+    // A's cached endpoint is gone, but its already-open TCP exchange must
+    // remain usable. This would fail if discovery removal dropped conns.
+    a_out_tx
+        .send(MdnsOutbound::DirectedToPeer {
+            to: "device-b".into(),
+            msg: offer.clone(),
+        })
+        .unwrap();
+    loop {
+        match timeout(DISCOVERY_GRACE, b_in_rx.recv()).await {
+            Ok(Some(MdnsInbound::Message { from, msg })) => {
+                assert_eq!(from, "device-a");
+                assert_eq!(msg, offer);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            _ => panic!("discovery withdrawal broke the existing TCP exchange"),
+        }
+    }
+
+    // A real Leave frame is still distinct and delivered as PeerLeft.
+    b_out_tx
+        .send(MdnsOutbound::DirectedToPeer {
+            to: "device-a".into(),
+            msg: SignalingMessage::Leave {
+                peer_id: "device-b".into(),
+            },
+        })
+        .unwrap();
+    loop {
+        match timeout(DISCOVERY_GRACE, a_in_rx.recv()).await {
+            Ok(Some(MdnsInbound::PeerLeft { device_id })) => {
+                assert_eq!(device_id, "device-b");
+                break;
+            }
+            Ok(Some(_)) => continue,
+            _ => panic!("explicit Leave did not arrive"),
+        }
+    }
 
     a.stop();
     b.stop();
