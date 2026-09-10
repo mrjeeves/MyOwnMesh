@@ -1,5 +1,9 @@
 # MyOwnMesh implementation constraints and invariants
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
+In the current model, packet-relay allocation means configured standard TURN, not a mesh-member payload service. Nostr/signaling relay terminology refers only to its bounded control carrier. Existing accounting-dimension names do not grant payload-forwarding authority.
+
 Status: normative implementation contract for [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 This document states what a conforming implementation must and must not do. It deliberately keeps transport, signaling, connector, and session machinery inside MyOwnMesh while preventing transport placement from becoming semantic authority.
@@ -12,7 +16,8 @@ A conforming implementation must expose equivalent responsibilities to:
 ```text
 myownmesh-semantic-core
     canonical durable facts
-    Open and Closed durable projection
+    Closed durable authority projection
+    Open runtime-participant projection
     durable conflict and compaction rules
 
 myownmesh-durable-store
@@ -24,7 +29,7 @@ myownmesh-signaling-runtime
     carrier provenance and availability state
 
 myownmesh-connector-runtime
-    discovery, candidate gathering, racing, checks
+    discovery, candidate gathering, bounded remote ICE application, checks
     relay allocation, transport handshakes
     live measurement, migration, recovery
 
@@ -34,8 +39,8 @@ myownmesh-session-runtime
     session capability and application packet boundary
 
 connector-profile-*
-    direct LAN, ICE, TURN, generic relay,
-    Closed member relay, non-IP profiles
+    native direct WebRTC, ICE, configured standard TURN,
+    non-IP profiles
 
 myownmesh-application-api
     roster, reachability, session lifecycle,
@@ -90,15 +95,19 @@ SignedDurableFact {
 
 The core durable union must be closed for the selected mesh profile. Unknown domains, variants, fields, or encodings have no durable state transition.
 
-Durable facts may include:
+The base durable fact union is Closed authority/governance only:
 
 ```text
-OpenParticipation
-ClosedGovernance
-DurableCapabilityGrant
-DurableCapabilityRevocation
-reviewed OptionalApplicationContractFact
+RoleGrant | RoleRevoke | Evict | MembershipAdmit | EvictionProof |
+SelfStandDown | Attestation | Resolution | AuthorityLineageResolution
 ```
+
+Reviewed application contract facts, if enabled, use a separately selected
+domain and are not base Closed authority. Open has zero base durable semantic
+facts. Exact-context endpoint authentication and Device-key possession admit
+ephemeral Open participation; runtime join, leave, presence, and reconnect
+for both Open and Closed remain local observations and never enter semantic
+history.
 
 ### 2.2 Ephemeral signaling objects
 
@@ -110,8 +119,8 @@ EphemeralTransportSignal =
     | ConnectAnswer
     | CandidateHint
     | CandidateUpdate
-    | RelayRequest
-    | RelayResponse
+    | HubIntroductionRequest
+    | HubIntroductionResponse
     | CancelAttempt
     | RecoveryHint
 ```
@@ -158,7 +167,7 @@ TransportObservation {
 }
 ```
 
-They are not durable participation or authorization facts.
+They are not durable facts or authority inputs.
 
 ## 3. Durable semantic validation
 
@@ -171,13 +180,60 @@ Every durable fact follows this order:
 5. Reserve identity and signature work, then derive the Device ID and verify the signature strictly.
 6. Verify exact mesh context, scope, domain kind, shape, predecessor set, and protocol maxima.
 7. Reserve dependency work before retaining missing-parent state or requesting evidence.
-8. Verify the Open or Closed domain rule.
+8. Verify the selected Closed governance rule; an Open handshake is an
+   ephemeral session gate and never a durable-fact transition.
 9. Classify as existing or new without visible mutation.
 10. For new content, compute the hypothetical durable projection.
 11. Reserve storage, materialization, durable-effect, and compaction claims.
 12. Atomically commit the fact, proof, durable derived state, reservations, and pending durable effects.
 
 A stricter local budget may refuse otherwise protocol-valid content. The result is local overload, incomplete view, or unavailability. It is not failed authorship or authorization.
+
+### 3.1 Base-ledger admission and retention
+
+The semantic owner selects finite limits for retained fact count, canonical
+encoded bytes, causal-edge count, per-author count/bytes and retained
+lifetime, proof-verification work, dependency quarantine, and indexed database
+bytes.
+These limits are explicit owner policy, not hidden protocol defaults. Before
+any mutation, the owner computes the complete candidate delta and refuses the
+exact `N+1` fact or dependency if any selected dimension would be crossed.
+The refusal occurs before graph, projection, acknowledgement, identity, or
+authority change and consumes no retained semantic record.
+
+Missing-parent facts may enter only a bounded quarantine indexed by their
+exact dependencies. Quarantine entries, reverse indexes, proof history, and
+failure records consume the same finite budget. Duplicate Fact IDs are
+semantic no-ops and are rejected or idempotently reported without extending
+history;
+invalid, unauthorized, or stale inputs likewise cannot change identity or
+authority. An eligible-signer quarantine has the same owner-selected count,
+byte, per-author, lifetime, and proof-work ceilings as ordinary facts.
+
+The persistent implementation is a local-only indexed SQLite store with one
+semantic writer on one dedicated blocking thread and one ordinary SQLite
+connection using SQLite's default VFS, WAL journaling, `FULL` synchronous
+durability, and an
+explicit database plus WAL/reserve ceiling. For the `StorageBytes` dimension,
+one process-accounted claim is `B = M + W + S + R`: main database bytes, WAL
+bytes, shared-memory/sidecar bytes, and explicit reserve. Named-file
+containment or VFS accounting is not backing-disk, filesystem-metadata, or
+ENOSPC proof; those remain residuals until an exact provider contract proves
+them. Exact proof history is retained until an archive or authority-ratified
+checkpoint makes semantic deletion safe. The shipped compaction boundary is
+bounded checkpointing only; a full-copy SQLite `VACUUM` requires separately
+funded temporary-copy, metadata, and cleanup custody. No timer silently evicts
+or prunes semantic history. Per-author retained lifetime caps are cleanup
+bounds, not authority expiry: an expired retained entry is settled by its
+exact owner path and cannot rewrite a fact.
+
+For owner limits `C` (facts), `B` (bytes), `E` (edges), `A` (per-author), `P`
+(proof work), `Q` (quarantine), and `D` (database/WAL bytes), admitted growth
+is bounded by the finite vector and its indexed overhead. Failure spam is
+bounded by the same vector and per-author ceilings: once the next candidate
+would exceed a dimension it is refused before mutation, ACK, or identity
+change. A failed cleanup retains its exact charge until an observed terminal
+settlement rather than silently freeing or losing accounting.
 
 ## 4. `Project` and durable materialization
 
@@ -231,7 +287,7 @@ The implementation must declare which signaling operations each carrier can sati
 
 Accepted durable facts deduplicate by Fact ID. Separately bounded local receipts record which carriers and connection instances delivered them.
 
-Carrier provenance may guide availability policy and diagnostics. It cannot vote on fact validity, fork resolution, Open participation, Closed root selection, or endpoint identity.
+Carrier provenance may guide availability policy and diagnostics. It cannot vote on fact validity, fork resolution, Closed authority selection, or endpoint identity.
 
 ### 5.4 Signaling prohibitions
 
@@ -239,7 +295,7 @@ The signaling runtime must not:
 
 - expose a generic application-payload field;
 - deliver signaling content as application data;
-- synthesize Open withdrawal or Closed removal from disconnect;
+- synthesize a durable fact, withdrawal authority, or Closed removal from disconnect;
 - turn service identity into Device identity;
 - create an authenticated session directly;
 - allocate or retain protected resources without live provider leases.
@@ -281,7 +337,7 @@ The connector may allocate, under pre-authentication reservations:
 - candidate objects;
 - sockets and transport objects;
 - DNS, STUN, ICE, or connector-specific queries;
-- bounded TURN or relay allocation state;
+- bounded standard TURN allocation state;
 - transport handshake state;
 - bounded pre-authentication packet or media quarantine;
 - timers, tasks, and observations.
@@ -302,13 +358,23 @@ Before channel promotion, the connector and transport stack must not:
 
 A media profile may instantiate receivers or transport tracks before promotion. Samples remain in bounded quarantine or are discarded. Full application decode and delivery begin only after promotion unless the owner explicitly approves and measures a smaller safe pre-authentication decode stage.
 
-### 6.4 Candidate racing
+### 6.4 Bounded remote ICE-candidate application
 
-The connector may race direct, TURN, generic relay, Closed member relay, and other compatible candidates.
+The current WebRTC connector uses its bounded planner to order and apply the
+admitted queued remote ICE candidates. The planner's path identifiers describe
+those candidate applications only; they do not prove a production race among
+direct WebRTC and configured standard TURN paths; there is no custom member-relay channel family.
 
-No security rule requires every higher-priority candidate to fail before a relay is attempted. Last-resort-only behavior is an optional local cost policy, not a security predicate.
+ICE may still gather host, server-reflexive, and relay candidates according to
+the connector configuration. No security rule requires a higher-priority ICE
+candidate to fail before another admitted candidate is applied;
+last-resort-only behavior remains an optional local cost policy, not a security
+predicate.
 
-The connector may select the first channel that satisfies the required operational and promotion conditions, or retain multiple authenticated channels for resilience.
+Selection of a working connector channel and promotion into an authenticated
+session remain separate boundaries. A future cross-connector racer must own and
+bound its actual channel candidates rather than treating this remote-candidate
+application planner as that implementation.
 
 ### 6.5 No durable route identity
 
@@ -422,16 +488,14 @@ No scalar session generation or durable session high-watermark is required by th
 
 ### 8.1 Open
 
-A valid self-authored Open participation fact must not require:
-
-- sponsorship;
-- owner approval;
-- pair permission;
-- identity-count vote;
-- proof of work;
-- application approval.
-
-A valid Open participant or an untrusted hint may begin bounded candidate work. Session promotion still requires exact endpoint authentication and the current Open participation rule.
+Open has no durable participation fact or durable join/leave predicate. An
+exact-context endpoint handshake proving Device-key possession establishes
+ephemeral participation without sponsorship, owner approval, pair permission,
+identity-count vote, proof of work, or application approval. A valid Open
+participant or an untrusted hint may begin bounded candidate work. Session
+promotion still requires exact endpoint authentication and current local
+runtime policy; join, leave, presence, and reconnect never enter semantic
+history.
 
 ### 8.2 Closed
 
@@ -439,54 +503,46 @@ Closed promotion requires the exact locally accepted Closed authorization proof 
 
 The connector may perform bounded speculative work while Closed proof validation occurs. An unauthorized or unknown endpoint is closed or left unpromoted after the proof result. No application payload is exposed.
 
-Closed governance and relay authorization must not depend on carrier count, arrival order, socket health, or a central signaling service unless the selected Closed profile explicitly adopts such a premise.
+Closed governance and endpoint authorization must not depend on carrier count, arrival order, socket health, or a central signaling service unless the selected Closed profile explicitly adopts such a premise.
 
-## 9. Relays
+## 9. Standard TURN and bounded Hub introduction
 
-### 9.1 Infrastructure relay
+### 9.1 Endpoint packet carriage
 
-TURN and a generic opaque relay may carry endpoint packets for one exact A-C session. They are not mesh participants or application endpoints by that function.
+Application data uses native endpoint-authenticated WebRTC directly or through
+configured standard TURN. TURN is infrastructure, not a mesh member or an
+application endpoint by that function. Device/context authentication and
+Open/Closed policy gates remain mandatory independently of ICE success or
+TURN credentials.
 
-### 9.2 Closed member relay
+### 9.2 No Hub/member payload forwarding
 
-A Closed member relay is allowed when the selected Closed profile permits it.
+Hubs consolidate discovery and bounded introduction only. Neither Hubs nor
+ordinary Open/Closed members forward application plaintext or ciphertext.
+Existing typed semantic-control and setup/control remain supported signaling
+traffic; signaling cannot become an application-data tunnel. If no viable
+direct/TURN endpoint transport exists, refuse with the bounded failure result.
 
-The relay is visibly attributable to Device B. The basal profile must reject anonymous relay credentials.
+### 9.3 Configuration and service boundary
 
-Relay eligibility may be:
+Use `introduction: Option<HubIntroductionPolicyConfig>`. Removed
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy` fields and removed wire forms must refuse. No custom
+endpoint route cipher or member-relay allocation is an allowed compatibility
+path. Native opaque channels, realtime, and RPC remain endpoint operations.
 
-```text
-current Closed authorization for B
-+ current signed relay offer from B
-+ local policy at A, B, and C
-```
+TURN service is distinct even when cohosted with a Hub. Current service
+advertisements are URL-only; credentials are locally configured. No protected
+credential-distribution mechanism is claimed.
 
-A stricter Closed profile may additionally require a durable relay capability granted by the selected governance system.
+### 9.4 Resource and cleanup custody
 
-### 9.3 Relay allocation
-
-A relay allocation must be ephemeral live state and must bind:
-
-- exact mesh context;
-- exact endpoints A and C;
-- exact relay B or service instance;
-- exact allocation capabilities for each endpoint;
-- explicit provider lifetime state where the relay protocol requires it;
-- lease-backed buffering, bandwidth, retry, and queued work.
-
-The allocation must not accept:
-
-- arbitrary host or port supplied in each packet;
-- application fanout;
-- another relay as recursive destination in the basal profile;
-- application plaintext;
-- mesh governance or durable fact mutation.
-
-### 9.4 Relay authentication
-
-B may authenticate setup using its Device key or an already authenticated Device channel. A separate relay operational key is optional only for narrower private-key custody and process isolation. It must be visibly delegated by B and must not be anonymous.
-
-Relay packets must use transport or per-allocation packet authentication. B's long-term Device key is not used to sign every packet.
+Standard TURN/native transport work retains finite owner/provider accounting,
+including explicit opaque-dependency residuals and external-service limits.
+Do not apply deleted custom route-allocation semantics as if they were a
+standard TURN guarantee. Close/cancellation must settle existing owned work
+or report retained failure; a timeout alone is not task completion. A proposed
+new native-runtime owner is not an implemented architecture requirement.
 
 ## 10. Handoff and recovery
 
@@ -525,7 +581,9 @@ If no authenticated channel is currently usable, the session is `Suspended`. The
 
 ## 11. Reachability
 
-The runtime must keep durable participation or authorization separate from local reachability evidence.
+The runtime must keep the durable Closed authority projection separate from
+local reachability evidence. Open participation is ephemeral and has no
+durable projection.
 
 At minimum, it should distinguish:
 
@@ -539,9 +597,11 @@ Application session state
 
 Freshness uses local monotonic observation time.
 
-No missing observation, carrier disconnect, expired timer, or failed candidate may synthesize Open withdrawal, Closed removal, or application denial.
+No missing observation, carrier disconnect, expired timer, or failed candidate
+may synthesize a durable fact, Open runtime withdrawal authority, Closed
+removal, or application denial.
 
-A diagnostic API may expose latency, loss, carrier kind, relay identity, and local observation age. Those fields are observations, not authority.
+A diagnostic API may expose latency, loss, carrier kind, TURN service observation, and local observation age. Those fields are observations, not authority.
 
 ## 12. Persistence and compaction
 
@@ -581,6 +641,12 @@ A replacement durable basis must be:
 Predecessor-base storage is optional only when deleting it does not change base verification, durable projection, or permitted durable continuation validation.
 
 Compaction has no route, channel, or reachability meaning.
+
+The shipped operation is bounded checkpointing/reopen verification, not a
+funded full-copy rewrite. A checkpoint or WAL truncation may reclaim physical
+WAL space only within the single `StorageBytes` claim. A `VACUUM` or equivalent
+rewrite is outside this contract until temporary database bytes, metadata,
+copy work, and terminal cleanup are separately charged and observed.
 
 ## 13. Application interface
 
@@ -980,7 +1046,7 @@ The process component is checked regardless of identity. Per-ingress accounting 
 
 ### 14.4 Post-authentication resource class
 
-Post-authentication claims include authenticated sessions, application-facing queues, codec work, relay buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
+Post-authentication claims include authenticated sessions, application-facing queues, codec work, TURN/native transport buffering, recovery, callbacks, handles, and subscriptions. A successful pre-authentication lease cannot be reused as proof that post-authentication resources exist. Promotion performs an explicit resource transition.
 
 ### 14.5 Queue and delayed-work contracts
 
@@ -1047,9 +1113,12 @@ A usable networking implementation requires live signaling or discovery where ne
 
 `Project` never means route creation, route selection, topology truth, or forecasting.
 
-### I5. Open remains open
+### I5. Open is ephemeral and permissionless
 
-Open self-participation has no third-party admission predicate.
+Open self-participation has no durable fact or third-party admission
+predicate. Exact-context handshake and Device-key possession authenticate the
+runtime participant; join, leave, presence, and reconnect remain outside
+semantic history.
 
 ### I6. Closed alone adds governance authorization
 
@@ -1097,23 +1166,26 @@ A delayed callback cannot mutate a replacement object without the exact live cap
 
 ### I14. Carrier is not endpoint identity
 
-Direct, TURN, generic relay, and Closed member relay preserve the same A-C endpoint identity after promotion.
+Direct and configured standard TURN WebRTC preserve the same A-C endpoint identity after promotion.
 
-### I15. Closed member relay is visible
+### I15. Hubs are not payload carriers
 
-The relay is attributable to its Device identity. Anonymous relay attestation is prohibited in the basal profile.
+Hub discovery/introduction never forwards application plaintext or ciphertext.
 
-### I16. Relay allocation is exact and bounded
+### I16. TURN work is finite and separately owned
 
-A relay allocation has one exact endpoint pair, no arbitrary destination, no fanout, and finite resources.
+Configured standard TURN allocations retain finite local accounting and
+external-service limits; a service URL grants no endpoint authority.
 
-### I17. Relay cannot promote or switch
+### I17. Infrastructure cannot promote or switch
 
-A relay cannot add a channel to an endpoint's authenticated set or authorize a handoff.
+A Hub or TURN service cannot add a channel to an endpoint's authenticated set
+or authorize a handoff.
 
-### I18. No relay-to-relay handoff dependency
+### I18. No custom relay handoff dependency
 
-Replacement transport can be established without old-relay to new-relay signaling.
+Replacement endpoint transport does not depend on custom member-relay state
+transfer or a custom route cipher.
 
 ### I19. Handoff is endpoint-driven
 
@@ -1266,8 +1338,10 @@ P6 at this disposition: the shipped provider holds no pending demand and keeps n
 
 ### 16.5 Connectors and recovery
 
-- direct, TURN, generic relay, and Closed member relay positive controls;
-- candidate racing and first-working-path behavior;
+- direct and configured standard TURN positive controls, with Hub/member payload refusal controls;
+- bounded remote ICE-candidate application ordering, success, refusal, and
+  failure behavior; any future cross-connector racing requires its own
+  production owner and controls;
 - restrictive-network matrix;
 - two authenticated channels active concurrently;
 - handoff with no relay-to-relay messages;
@@ -1277,14 +1351,14 @@ P6 at this disposition: the shipped provider holds no pending demand and keeps n
 - fixed codec and application-media semantics are absent from the basal core;
 - pre-promotion track setup cannot reach application delivery.
 
-### 16.6 Relay
+### 16.6 TURN and introduction separation
 
-- exact endpoint allocation;
-- no arbitrary destination or fanout;
-- visible member-relay identity;
-- anonymous relay credential rejection;
-- relay endpoint-substitution negatives;
-- exact allocation ownership, lease-backed buffering and retry, provider bandwidth constraints, and optional local cost policy.
+- endpoint authentication/integrity through configured standard TURN;
+- finite allocation, native callback/task ownership, and honest residuals;
+- no application plaintext or ciphertext through Hub/signaling handlers;
+- removed config and wire forms refuse rather than restoring a custom route;
+- cohosted TURN retains distinct service and mesh authority;
+- URL advertisements do not imply protected credential exchange.
 
 ### 16.7 Reachability and application boundary
 
@@ -1300,6 +1374,20 @@ P6 at this disposition: the shipped provider holds no pending demand and keeps n
 - pending effect recovery is idempotent;
 - current durable basis is independently reopenable;
 - rollback without an independent witness preserves the documented impossibility result.
+- statement and preflight failures prove the old durable projection without
+  claiming rollback from an unobserved transaction drop;
+- WAL write/sync and COMMIT-return faults classify the caller-visible result as
+  outcome-unknown until exact reopen reconciliation proves old or new;
+- post-commit checkpoint/truncate maintenance faults are reported as maintenance
+  failures while preserving the already committed durable projection;
+- crash cutpoints before commit, during commit, after commit before response,
+  and during checkpoint are exercised with bounded stage markers and no sleeps;
+- duplicate/no-op delivery leaves projection, usage, and `StorageBytes`
+  accounting unchanged, and restart restores the exact Closed projection
+  without reviving live Open/Closed sessions or handles;
+- no architecture-compliance PASS is recorded from source or unit evidence
+  alone; durable runtime runs and their terminal provider baselines are
+  required.
 
 ## 17. Required implementation artifacts
 
@@ -1317,13 +1405,15 @@ A conforming implementation supplies:
 10. red-team evidence bundle for the target catalog;
 11. proof that application payload cannot reach signaling constructors or effects;
 12. proof that no durable route or monotonic path-generation dependency remains in the basal path.
+13. restart, corruption, transaction-rollback, WAL-checkpoint, and exact
+    provider-baseline controls against the supported bundled SQLite build.
 
 ## 18. Owner decisions
 
 The owner must select:
 
 - exact cryptographic profiles;
-- Closed governance proof and relay authorization profile;
+- Closed governance proof and independent endpoint authorization through direct/TURN transport;
 - signaling and connector profiles;
 - required egress and restrictive-network environments;
 - resource-provider integration and host isolation for each deployment form;

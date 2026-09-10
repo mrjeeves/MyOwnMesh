@@ -31,19 +31,24 @@ async fn test_server_reflexive_only_connection() -> Result<()> {
     let server_listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let server_port = server_listener.local_addr()?.port();
 
-    let server = turn::server::Server::new(turn::server::config::ServerConfig {
-        realm: "webrtc.rs".to_owned(),
-        auth_handler: Arc::new(OptimisticAuthHandler {}),
-        conn_configs: vec![turn::server::config::ConnConfig {
-            conn: server_listener,
-            relay_addr_generator: Box::new(turn::relay::relay_none::RelayAddressGeneratorNone {
-                address: "127.0.0.1".to_owned(),
-                net: Arc::new(util::vnet::net::Net::new(None)),
-            }),
-        }],
-        channel_bind_timeout: Duration::from_secs(0),
-        alloc_close_notify: None,
-    })
+    let server = turn::server::Server::new_with_resource_admission(
+        turn::server::config::ServerConfig {
+            realm: "webrtc.rs".to_owned(),
+            auth_handler: Arc::new(OptimisticAuthHandler {}),
+            conn_configs: vec![turn::server::config::ConnConfig {
+                conn: server_listener,
+                relay_addr_generator: Box::new(
+                    turn::relay::relay_none::RelayAddressGeneratorNone {
+                        address: "127.0.0.1".to_owned(),
+                        net: Arc::new(util::vnet::net::Net::new(None)),
+                    },
+                ),
+            }],
+            channel_bind_timeout: Duration::from_secs(0),
+            alloc_close_notify: None,
+        },
+        Arc::new(turn::resource::BoundedTestAdmission::new(1024)),
+    )
     .await?;
 
     let cfg0 = AgentConfig {

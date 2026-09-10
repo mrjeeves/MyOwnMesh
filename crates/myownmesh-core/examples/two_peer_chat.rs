@@ -9,38 +9,74 @@
 //! waiting for the handshake to complete, and exchanging typed
 //! messages on a named channel.
 
-use std::sync::Arc;
+#[cfg(feature = "transport-lab")]
 use std::time::Duration;
 
+#[cfg(feature = "transport-lab")]
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+#[cfg(feature = "transport-lab")]
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
-use myownmesh_core::{Channel, MeshEvent, PeerEvent};
+#[cfg(feature = "transport-lab")]
+use myownmesh_core::resource::{
+    FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
+};
+#[cfg(feature = "transport-lab")]
+use myownmesh_core::{
+    ConnectorCallbackPolicy, Mesh, MeshConfig, MeshEvent, PeerEvent, WebRtcConnectorCapablePolicy,
+    WebRtcConnectorProfile,
+};
+#[cfg(feature = "transport-lab")]
 use myownmesh_signaling::local::LocalBroker;
+#[cfg(feature = "transport-lab")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "transport-lab")]
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatLine {
     text: String,
 }
 
+#[cfg(feature = "transport-lab")]
 fn cfg(label: &str) -> NetworkConfig {
     NetworkConfig {
         id: label.into(),
         network_id: "two-peer-chat".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.into(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
+        hub: None,
+        local_observations: None,
+        introduction: None,
+        tree: None,
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
 }
 
+#[cfg(feature = "transport-lab")]
+fn connector_policy() -> WebRtcConnectorCapablePolicy {
+    let grant = ResourceClaim::try_from_entries(
+        ResourceClass::ALL
+            .into_iter()
+            .map(|class| (class, 100_000_000)),
+    )
+    .expect("example resource grant is representable");
+    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("example resource provider is valid");
+    WebRtcConnectorCapablePolicy::new(
+        resources,
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
+    )
+}
+
+#[cfg(feature = "transport-lab")]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -51,36 +87,41 @@ async fn main() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().unwrap();
+    let alice = Identity::ephemeral();
+    let bob = Identity::ephemeral();
+    let alice_device = alice.public_id().to_string();
+    let bob_device = bob.public_id().to_string();
+    let policy = connector_policy();
+    let alice_mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        std::sync::Arc::new(alice),
+        policy.clone(),
+    )
+    .await
+    .unwrap();
+    let bob_mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        std::sync::Arc::new(bob),
+        policy,
+    )
+    .await
+    .unwrap();
+    let alice_net = alice_mesh.join(cfg("alice")).await.unwrap();
+    let bob_net = bob_mesh.join(cfg("bob")).await.unwrap();
+    let mut alice_events = alice_mesh.events();
+    let mut bob_events = bob_mesh.events();
 
-    let alice = Arc::new(Identity::ephemeral());
-    let bob = Arc::new(Identity::ephemeral());
-
-    let (alice_net, _ad) = spawn_network(cfg("alice"), alice.clone(), transport.clone())
-        .await
-        .unwrap();
-    let (bob_net, _bd) = spawn_network(cfg("bob"), bob.clone(), transport.clone())
-        .await
-        .unwrap();
-
-    let mut alice_events = alice_net.events_tx.subscribe();
-    let mut bob_events = bob_net.events_tx.subscribe();
-
-    attach_local(&alice_net, &broker);
-    attach_local(&bob_net, &broker);
+    alice_net.attach_local(&broker);
+    bob_net.attach_local(&broker);
 
     // Wait for both sides to see the peer become Active.
     println!("waiting for handshake...");
-    wait_until_approved(&mut alice_events, bob.public_id()).await;
-    wait_until_approved(&mut bob_events, alice.public_id()).await;
-    println!(
-        "ALICE ({}) and BOB ({}) are connected.\n",
-        alice.public_id(),
-        bob.public_id()
-    );
+    wait_until_approved(&mut alice_events, &bob_device).await;
+    wait_until_approved(&mut bob_events, &alice_device).await;
+    println!("ALICE ({alice_device}) and BOB ({bob_device}) are connected.\n");
 
-    let alice_chan: Channel<ChatLine> = Channel::new("chat".into(), alice_net.clone());
-    let bob_chan: Channel<ChatLine> = Channel::new("chat".into(), bob_net.clone());
+    let alice_chan = alice_net.channel::<ChatLine>("chat");
+    let bob_chan = bob_net.channel::<ChatLine>("chat");
     let mut bob_sub = bob_chan
         .subscribe()
         .expect("Bob's live channel admits its subscription");
@@ -91,7 +132,7 @@ async fn main() {
     // Alice sends to Bob.
     alice_chan
         .send_to(
-            bob.public_id(),
+            &bob_device,
             &ChatLine {
                 text: "hello bob".into(),
             },
@@ -104,7 +145,7 @@ async fn main() {
     // Bob replies.
     bob_chan
         .send_to(
-            alice.public_id(),
+            &alice_device,
             &ChatLine {
                 text: "hey alice".into(),
             },
@@ -118,6 +159,12 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
+#[cfg(not(feature = "transport-lab"))]
+fn main() {
+    eprintln!("run this demo with --features transport-lab");
+}
+
+#[cfg(feature = "transport-lab")]
 async fn wait_until_approved(rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>, peer_id: &str) {
     while let Ok(event) = rx.recv().await {
         if let MeshEvent::Peer(PeerEvent::Approved { device_id, .. }) = event {

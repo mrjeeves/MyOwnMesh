@@ -1,7 +1,11 @@
 use portable_atomic::{AtomicBool, AtomicU64};
 
 use arc_swap::ArcSwapOption;
+use tokio::task::JoinHandle;
 use util::sync::Mutex as SyncMutex;
+
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use super::agent_transport::*;
 use super::*;
@@ -40,6 +44,15 @@ pub struct AgentInternal {
     pub(crate) on_selected_candidate_pair_change_hdlr:
         ArcSwapOption<Mutex<OnSelectedCandidatePairChangeHdlrFn>>,
     pub(crate) on_candidate_hdlr: ArcSwapOption<Mutex<OnCandidateHdlrFn>>,
+
+    /// Notification loops own callback dispatch. They remain here until
+    /// close has dropped every sender and joined their drain.
+    pub(crate) notification_tasks: SyncMutex<Vec<JoinHandle<()>>>,
+    notification_failure: SyncMutex<Option<String>>,
+    pub(crate) closing: AtomicBool,
+
+    #[cfg(test)]
+    pub(crate) recv_exit_gate: SyncMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 
     pub(crate) tie_breaker: AtomicU64,
     pub(crate) is_controlling: AtomicBool,
@@ -111,6 +124,13 @@ impl AgentInternal {
             on_connection_state_change_hdlr: ArcSwapOption::empty(),
             on_selected_candidate_pair_change_hdlr: ArcSwapOption::empty(),
             on_candidate_hdlr: ArcSwapOption::empty(),
+
+            notification_tasks: SyncMutex::new(Vec::new()),
+            notification_failure: SyncMutex::new(None),
+            closing: AtomicBool::new(false),
+
+            #[cfg(test)]
+            recv_exit_gate: SyncMutex::new(None),
 
             tie_breaker: AtomicU64::new(rand::random::<u64>()),
             is_controlling: AtomicBool::new(config.is_controlling),
@@ -259,7 +279,12 @@ impl AgentInternal {
             done_and_force_candidate_contact_rx
         {
             let ai = Arc::clone(self);
-            tokio::spawn(async move {
+            let mut tasks = self.notification_tasks.lock();
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
+            self.observe_finished_notification_tasks(&mut tasks);
+            tasks.push(tokio::spawn(async move {
                 loop {
                     let mut interval = DEFAULT_CHECK_INTERVAL;
 
@@ -298,7 +323,7 @@ impl AgentInternal {
                         }
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -612,12 +637,56 @@ impl AgentInternal {
         Ok(())
     }
 
+    pub(super) fn is_notification_task(&self) -> bool {
+        tokio::task::try_id().is_some_and(|id| {
+            self.notification_tasks
+                .lock()
+                .iter()
+                .any(|task| task.id() == id)
+        })
+    }
+
+    fn observe_finished_notification_tasks(&self, tasks: &mut Vec<JoinHandle<()>>) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut index = 0;
+        while index < tasks.len() {
+            if !tasks[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            match Pin::new(&mut tasks[index]).poll(&mut cx) {
+                std::task::Poll::Ready(Err(error)) => {
+                    *self.notification_failure.lock() =
+                        Some(format!("ICE notification task failed: {error}"));
+                }
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Pending => {
+                    index += 1;
+                    continue;
+                }
+            }
+            drop(tasks.swap_remove(index));
+        }
+    }
+
     pub(crate) async fn close(&self) -> Result<()> {
+        if self.is_notification_task() {
+            return Err(Error::Other(
+                "ICE close called from its own callback".into(),
+            ));
+        }
+        self.closing.store(true, Ordering::SeqCst);
         {
             let mut done_tx = self.done_tx.lock().await;
-            if done_tx.is_none() {
+            if done_tx.is_none() && self.agent_conn.done.load(Ordering::SeqCst) {
+                if let Some(error) = self.notification_failure.lock().as_ref() {
+                    return Err(Error::Other(error.clone()));
+                }
                 return Err(Error::ErrClosed);
             }
+            // An earlier cancelled close may have signalled done without
+            // finishing cleanup. Resume that cleanup rather than returning.
             done_tx.take();
         };
         self.delete_all_candidates().await;
@@ -643,8 +712,30 @@ impl AgentInternal {
             chan_state_tx.take();
         }
 
+        // Handles stay registered while Pending, even if this close future is
+        // cancelled. Only a synchronously observed terminal handle is removed.
+        std::future::poll_fn(|cx| {
+            let mut tasks = self.notification_tasks.lock();
+            while let Some(task) = tasks.last_mut() {
+                match Pin::new(task).poll(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Err(error)) => {
+                        *self.notification_failure.lock() =
+                            Some(format!("ICE notification task failed: {error}"));
+                    }
+                    std::task::Poll::Ready(Ok(())) => {}
+                }
+                tasks.pop();
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
+
         self.agent_conn.done.store(true, Ordering::SeqCst);
 
+        if let Some(error) = self.notification_failure.lock().as_ref() {
+            return Err(Error::Other(error.clone()));
+        }
         Ok(())
     }
 
@@ -1041,24 +1132,43 @@ impl AgentInternal {
             let conn = Arc::clone(conn);
             let addr = candidate.addr();
             let ai = Arc::clone(self);
-            tokio::spawn(async move {
+            let mut tasks = self.notification_tasks.lock();
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
+            self.observe_finished_notification_tasks(&mut tasks);
+            let task = tokio::spawn(async move {
                 let _ = ai
                     .recv_loop(cand, closed_ch_rx, initialized_ch, conn, addr)
                     .await;
+                #[cfg(test)]
+                let exit_gate = { ai.recv_exit_gate.lock().clone() };
+                #[cfg(test)]
+                if let Some((entered, release)) = exit_gate {
+                    entered.notify_one();
+                    release.notified().await;
+                    entered.notify_one();
+                }
             });
+            tasks.push(task);
         } else {
             log::error!("[{}]: Can't start due to conn is_none", self.get_name(),);
         }
     }
 
-    pub(super) fn start_on_connection_state_change_routine(
+    pub(super) async fn start_on_connection_state_change_routine(
         self: &Arc<Self>,
         mut chan_state_rx: mpsc::Receiver<ConnectionState>,
         mut chan_candidate_rx: mpsc::Receiver<Option<Arc<dyn Candidate + Send + Sync>>>,
         mut chan_candidate_pair_rx: mpsc::Receiver<()>,
     ) {
+        let mut tasks = self.notification_tasks.lock();
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        self.observe_finished_notification_tasks(&mut tasks);
         let ai = Arc::clone(self);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             // CandidatePair and ConnectionState are usually changed at once.
             // Blocking one by the other one causes deadlock.
             while chan_candidate_pair_rx.recv().await.is_some() {
@@ -1070,10 +1180,11 @@ impl AgentInternal {
                     f(&p.local, &p.remote).await;
                 }
             }
-        });
+        }));
 
+        self.observe_finished_notification_tasks(&mut tasks);
         let ai = Arc::clone(self);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     opt_state = chan_state_rx.recv() => {
@@ -1110,7 +1221,7 @@ impl AgentInternal {
                     }
                 }
             }
-        });
+        }));
     }
 
     async fn recv_loop(

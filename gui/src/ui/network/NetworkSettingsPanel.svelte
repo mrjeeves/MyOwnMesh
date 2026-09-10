@@ -19,14 +19,17 @@
     DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
     DEFAULT_NETWORK_TURN,
+    DEFAULT_SEMANTIC_POLICY,
+    SEMANTIC_POLICY_FIELDS,
     exportNetworkSettings,
+    validateSemanticPolicy,
     type TurnEntry,
   } from "../../network-settings";
   import {
     buildTopology,
-    topologyHubSet,
     type NetworkConfigInput,
     type NetworkSummary,
+    type SemanticPolicyConfig,
     type TopologyKind,
     type TopologyMode,
   } from "../../types";
@@ -49,6 +52,7 @@
   let stunDraft = $state<string[]>([]);
   let turnDraft = $state<TurnEntry[]>([]);
   let turnEntry = $state<TurnEntry>({ url: "", username: "", credential: "" });
+  let semanticPolicy = $state<SemanticPolicyConfig>({ ...DEFAULT_SEMANTIC_POLICY });
   let autoApprove = $state(false);
 
   let loaded = $state(false);
@@ -76,10 +80,6 @@
         } else {
           seedDefaults();
         }
-        // When a signed TopologyChange owns the shape, the draft edits
-        // THAT — the config value underneath is inert until ungoverned.
-        const g = governance.governedTopology(network.config_id);
-        if (g) seedTopoFrom(g);
       } catch (e) {
         actionError = `couldn't load current config: ${String(e)}`;
         seedDefaults();
@@ -113,6 +113,7 @@
       ...(t.username ? { username: t.username } : {}),
       ...(t.credential ? { credential: t.credential } : {}),
     }));
+    semanticPolicy = { ...DEFAULT_SEMANTIC_POLICY, ...cfg.semantic_policy };
     autoApprove = cfg.auto_approve ?? false;
   }
 
@@ -122,38 +123,15 @@
     signalingDraft = [...DEFAULT_NETWORK_SIGNALING];
     stunDraft = [...DEFAULT_NETWORK_STUN];
     turnDraft = DEFAULT_NETWORK_TURN.map((t) => ({ ...t }));
+    semanticPolicy = { ...DEFAULT_SEMANTIC_POLICY };
     autoApprove = false;
   }
 
-  // ---- governed topology (owner-signed, network-wide) -----------------
-  //
-  // Once a ratified TopologyChange owns the shape, the local picker
-  // above becomes read-only everywhere (the daemon refuses TopologySet
-  // and ignores the config field) and this section is the only writer —
-  // owner-gated, signed, and converging on every member via the log.
-
-  const selfPubkey = $derived(meshClient.identity?.pubkey ?? null);
-  const govState = $derived(governance.stateFor(network.config_id));
-  const governed = $derived(governance.governedTopology(network.config_id));
-  const myRole = $derived(
-    selfPubkey ? governance.localRole(network.config_id, selfPubkey) : "member",
-  );
-  const isOwner = $derived(myRole === "owner");
-  const isClosed = $derived(govState.kind === "closed");
-
-  /** Roster rows for the hub picker — id + label so the owner picks
-   *  hubs by name, not by pasting pubkeys. */
+  /** Roster rows provide labels for selecting topology hubs. */
   const rosterRows = $derived(
     meshClient.rostersByNetwork[network.config_id] ?? [],
   );
-
-  let proposeBusy = $state(false);
-  let proposeError = $state<string | null>(null);
-  let proposedAt = $state<number | null>(null);
   /** Custody code — revealed only after the daemon asks for one. */
-  let mfaCode = $state("");
-  let needsMfa = $state(false);
-
   function toggleHub(deviceId: string) {
     hubsDraft = hubsDraft.includes(deviceId)
       ? hubsDraft.filter((h) => h !== deviceId)
@@ -165,66 +143,6 @@
     if (!v) return;
     if (!hubsDraft.includes(v)) hubsDraft = [...hubsDraft, v];
     hubInput = "";
-  }
-
-  /** Current draft as a TopologyMode — shared by local save and the
-   *  governed propose so the two paths can't drift. */
-  function draftMode(): TopologyMode {
-    return buildTopology(topology, starHub || null, hubsDraft, hubRedundancy);
-  }
-
-  async function proposeGoverned() {
-    if (proposeBusy) return;
-    if (topology === "hubs" && hubsDraft.length === 0) {
-      proposeError = "Pick at least one hub device.";
-      return;
-    }
-    proposeBusy = true;
-    proposeError = null;
-    proposedAt = null;
-    const res = await governance.proposeTopology(
-      network.config_id,
-      draftMode(),
-      needsMfa && mfaCode ? mfaCode : undefined,
-    );
-    proposeBusy = false;
-    if (res.ok) {
-      proposedAt = Date.now();
-      needsMfa = false;
-      mfaCode = "";
-      return;
-    }
-    const reason = res.reason ?? "proposal failed";
-    if (/custody|mfa|totp|code/i.test(reason) && !needsMfa) {
-      needsMfa = true;
-      proposeError =
-        "This device holds a custody lock for the network — enter the code and propose again.";
-    } else {
-      proposeError = reason;
-    }
-  }
-
-  function hubLabel(id: string): string {
-    const row = rosterRows.find(
-      (r) => id === r.device_id || id.startsWith(`${r.device_id}-`),
-    );
-    return row?.label ? row.label : `${id.slice(0, 12)}…`;
-  }
-
-  function describeGoverned(m: TopologyMode): string {
-    switch (m.kind) {
-      case "full_mesh":
-        return "Full mesh — every pair connects directly.";
-      case "ring":
-        return `Ring — each node keeps ${m.n_preferred ?? 3} preferred neighbors.`;
-      case "star":
-        return `Star — everything routes through ${hubLabel(m.hub)}.`;
-      case "hubs":
-        return (
-          `Hub tier — ${m.hubs.map(hubLabel).join(", ")}; ` +
-          `each spoke keeps ${m.spoke_redundancy ?? 2} hub link${(m.spoke_redundancy ?? 2) === 1 ? "" : "s"}.`
-        );
-    }
   }
 
   // ---- relay/STUN/TURN list editors -----------------------------------
@@ -290,6 +208,15 @@
     stunDraft = [...DEFAULT_NETWORK_STUN];
   }
 
+  function semanticPolicyLabel(field: keyof SemanticPolicyConfig): string {
+    return field.replaceAll("_", " ");
+  }
+
+  function updateSemanticPolicy(field: keyof SemanticPolicyConfig, event: Event) {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    semanticPolicy = { ...semanticPolicy, [field]: value };
+  }
+
   // ---- save (atomic in-place update) ----------------------------------
 
   async function save() {
@@ -298,6 +225,10 @@
     actionError = null;
     let newCfg: NetworkConfigInput;
     try {
+      const policyError = validateSemanticPolicy(semanticPolicy);
+      if (policyError) {
+        throw new Error(`Semantic policy: ${policyError}`);
+      }
       // Build the new wire payload, carrying THIS network's existing
       // config id so the daemon edits the same record in place rather
       // than creating a duplicate.
@@ -310,8 +241,10 @@
         signalingServers: signalingDraft.filter((s) => s.trim() !== ""),
         stunUrls: stunDraft,
         turnEntries: turnDraft,
+        semanticPolicy,
         autoApprove,
       });
+      newCfg.kind = meshClient.networkKindsByNetwork[network.config_id] ?? "open";
     } catch (e) {
       actionError = `Invalid config: ${String(e)}`;
       busy = false;
@@ -322,8 +255,8 @@
     // auto-approve in place (no peers dropped) and only restarts the
     // transport for signaling/STUN/TURN edits — and if it rejects the
     // new config it rolls back to the previous one. The roster survives
-    // either path, so unlike the old remove + re-add dance a failed save
-    // can never strand the network.
+    // either path, so a failed save cannot strand the network's durable
+    // state.
     try {
       await meshClient.networkUpdate(newCfg);
       savedAt = Date.now();
@@ -336,9 +269,7 @@
 
   // ---- remove (danger zone) ------------------------------------------
 
-  /** Two-click remove: the first click expands a confirm-shaped row.
-   *  Modelled on the legacy NetworksSection pattern so users moving
-   *  between the two surfaces don't relearn the muscle memory. */
+  /** Two-click remove: the first click expands a confirm-shaped row. */
   let confirmingRemove = $state(false);
 
   async function removeNetwork() {
@@ -445,25 +376,8 @@
 
     <!-- Topology -->
     <div class="card">
-      <div class="card-title">
-        Topology
-        {#if governed}
-          <span class="gov-badge" title="Owner-signed network-wide shape — every member's daemon follows it">
-            governed
-          </span>
-        {/if}
-      </div>
+      <div class="card-title">Topology</div>
 
-      {#if governed && !isOwner}
-        <!-- Governed, and we're not the owner: the shape is the
-             owner's signed call; nothing here is writable. -->
-        <div class="gov-summary">{describeGoverned(governed)}</div>
-        <div class="hint subtle">
-          The owner signed this shape into the network's governance —
-          every member's daemon (this one included) follows it
-          automatically, and local topology settings are ignored.
-        </div>
-      {:else}
         <div class="topo-row">
           <button
             class="topo-btn"
@@ -567,58 +481,6 @@
           </div>
         {/if}
 
-        {#if isClosed && isOwner}
-          <div class="gov-cta">
-            {#if governed}
-              <div class="hint subtle">
-                This shape is governed: signing an update converges every
-                member's daemon onto it — no per-device setup.
-              </div>
-            {:else}
-              <div class="hint subtle">
-                You own this network. Signing the shape makes it
-                network-wide: every member's daemon converges onto it
-                automatically (headless boxes included) — the per-device
-                picker above stops mattering.
-              </div>
-            {/if}
-            {#if needsMfa}
-              <label class="field">
-                <span class="field-label">Custody code</span>
-                <input
-                  type="text"
-                  placeholder="123 456"
-                  bind:value={mfaCode}
-                  class="mono"
-                />
-              </label>
-            {/if}
-            {#if proposeError}
-              <div class="err">⚠ {proposeError}</div>
-            {/if}
-            {#if proposedAt}
-              <div class="ok">
-                ✓ signed — members converge as the log gossips to them
-              </div>
-            {/if}
-            <button
-              class="btn primary"
-              disabled={proposeBusy}
-              onclick={proposeGoverned}
-            >
-              {proposeBusy
-                ? "Signing…"
-                : governed
-                  ? "Sign updated network-wide topology"
-                  : "Sign & make network-wide"}
-            </button>
-          </div>
-        {:else if governed && isOwner}
-          <!-- governed open-network edge (shouldn't occur: governance
-               requires closed) — owner still sees the summary. -->
-          <div class="gov-summary">{describeGoverned(governed)}</div>
-        {/if}
-      {/if}
     </div>
 
     <!-- Signaling relays -->
@@ -721,6 +583,31 @@
       </div>
     </div>
 
+    <!-- Semantic policy -->
+    <div class="card">
+      <div class="card-title">Semantic fact policy</div>
+      <div class="hint subtle">
+        Owner-selected finite limits for durable facts, quarantine, proofs,
+        and dependency storage. These values are preserved across unrelated
+        edits and included in network-settings exports.
+      </div>
+      <div class="policy-grid">
+        {#each SEMANTIC_POLICY_FIELDS as field (field)}
+          <label class="field policy-field">
+            <span class="field-label">{semanticPolicyLabel(field)}</span>
+            <input
+              class="mono"
+              type="number"
+              min="1"
+              step="1"
+              value={semanticPolicy[field]}
+              oninput={(event) => updateSemanticPolicy(field, event)}
+            />
+          </label>
+        {/each}
+      </div>
+    </div>
+
     <!-- Auto-approve -->
     <div class="card">
       <div class="card-title">Approval policy</div>
@@ -757,16 +644,14 @@
       to write a <code>.network-settings.json</code> file you can
       send to another device — they import it via
       <em>Sidebar → + → Import…</em> to join the same network. For
-      out-of-band pre-authorisation (so a new device's first
-      connection is auto-approved), use the
-      <strong>Approval</strong> action on a rostered peer in the
-      Roster tab.
+      Peer authorization is handled by the daemon's authenticated
+      <strong>Approval</strong> action on a rostered peer in the Roster tab;
+      a settings export carries configuration only.
     </div>
 
     <!-- Danger zone: a clear, sticky path to remove a network from
          the daemon. Lives at the bottom so it's hard to miss but
-         also hard to hit by accident; the two-click confirm-then-
-         commit shape mirrors the existing legacy Networks tab. -->
+         also hard to hit by accident. -->
     <div class="danger-zone">
       <div class="danger-title">Danger zone</div>
       {#if confirmingRemove}
@@ -981,6 +866,14 @@
   input[type="number"]:focus {
     outline: none;
     border-color: #4a4a85;
+  }
+  .policy-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 0.35rem 0.7rem;
+  }
+  .policy-field {
+    margin-bottom: 0;
   }
   .topo-btn {
     padding: 0.3rem 0.7rem;

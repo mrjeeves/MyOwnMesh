@@ -99,13 +99,11 @@ pub(super) enum PreparedReply {
     Networks(crate::registry::FundedNetworksList),
     Peers(FundedDiagnostic<Vec<myownmesh_core::PeerInfo>>),
     Roster(FundedDiagnostic<Vec<myownmesh_core::AuthorizedPeer>>),
-    Governance(FundedDiagnostic<GovernanceDiagnostic>),
+    Bootstrap(FundedDiagnostic<myownmesh_core::semantic::BootstrapRecord>),
+    SemanticFactPage(FundedDiagnostic<myownmesh_core::semantic::SemanticFactPage>),
+    SemanticStateIdentity(FundedDiagnostic<myownmesh_core::semantic::SemanticStateIdentity>),
+    SemanticRecentFacts(FundedDiagnostic<myownmesh_core::semantic::SemanticRecentFacts>),
     Variable(FundedVariableReply),
-}
-
-pub(super) struct GovernanceDiagnostic {
-    pub(super) state: myownmesh_core::NetworkState,
-    pub(super) evicted: Vec<String>,
 }
 
 /// One broad response owner, acquired before the operation it answers for.
@@ -376,19 +374,50 @@ impl serde::Serialize for PreparedReply {
                 )?;
                 response.end()
             }
-            Self::Governance(governance) => {
-                #[derive(serde::Serialize)]
-                struct GovernanceData<'a> {
-                    state: &'a myownmesh_core::NetworkState,
-                    evicted: &'a [String],
-                }
+            Self::Bootstrap(bootstrap) => {
                 let mut response = serializer.serialize_struct("Response", 2)?;
                 response.serialize_field("ok", &true)?;
                 response.serialize_field(
                     "data",
-                    &GovernanceData {
-                        state: &governance.value.state,
-                        evicted: &governance.value.evicted,
+                    &Field {
+                        key: "bootstrap",
+                        value: &bootstrap.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticFactPage(page) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_fact_page",
+                        value: &page.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticStateIdentity(identity) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_state_identity",
+                        value: &identity.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticRecentFacts(facts) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_recent_facts",
+                        value: &facts.value,
                     },
                 )?;
                 response.end()
@@ -408,18 +437,14 @@ pub(super) enum FundedVariableReply {
     UpdaterCheck(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>),
     RpcCall(FundedRpcCallOutcome),
     MfaEnrollment(FundedMfaEnrollment),
+    MfaTransaction(FundedMfaTransaction),
     Operation(FundedOperationReply),
 }
 
 pub(super) enum OperationReplyData {
-    Approved(String),
     Removed(String),
     Topology(String),
     ProposalId(String),
-    Signed(String),
-    Denied(String),
-    Withdrawn(String),
-    NewNetworkId(String),
     Reconnecting(String),
     Connecting {
         peer: String,
@@ -445,6 +470,10 @@ pub(super) enum OperationReplyData {
         flow_label: String,
         capability: String,
     },
+    OpaqueChanged {
+        flow_capability: String,
+        max_unit_bytes: u32,
+    },
     Closed,
     RpcStreamStarted(String),
     ServicesStatus(crate::services::ServicesReport),
@@ -452,6 +481,24 @@ pub(super) enum OperationReplyData {
         error: String,
         code: String,
     },
+    GovernanceRefused {
+        error: String,
+        code: String,
+    },
+}
+
+/// Stable wire classes for security-sensitive governance failures. The
+/// diagnostic remains in `error`, but clients do not have to parse that text
+/// to distinguish MFA from authority or transport failure.
+pub(super) fn governance_error_code(error: &myownmesh_core::Error) -> &'static str {
+    match error {
+        myownmesh_core::Error::Custody(_) => "mfa",
+        myownmesh_core::Error::Roster(_) => "authority",
+        myownmesh_core::Error::SignatureInvalid => "signature_invalid",
+        myownmesh_core::Error::PeerDenied => "peer_denied",
+        myownmesh_core::Error::Network(_) => "network",
+        _ => "governance",
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -480,6 +527,15 @@ pub(super) struct FundedRpcCallOutcome {
 
 pub(super) struct FundedMfaEnrollment {
     result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+    transaction_id: Option<String>,
+    _owner: ResponseOwner,
+}
+
+pub(super) struct FundedMfaTransaction {
+    network: String,
+    transaction_id: String,
+    state: &'static str,
+    material: Option<myownmesh_core::custody::Enrolled>,
     _owner: ResponseOwner,
 }
 
@@ -511,10 +567,28 @@ impl FundedVariableReply {
 
     pub(super) fn mfa_enrollment(
         result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+        transaction_id: Option<String>,
         owner: ResponseOwner,
     ) -> Self {
         Self::MfaEnrollment(FundedMfaEnrollment {
             result,
+            transaction_id,
+            _owner: owner,
+        })
+    }
+
+    pub(super) fn mfa_transaction(
+        network: String,
+        transaction_id: String,
+        state: &'static str,
+        material: Option<myownmesh_core::custody::Enrolled>,
+        owner: ResponseOwner,
+    ) -> Self {
+        Self::MfaTransaction(FundedMfaTransaction {
+            network,
+            transaction_id,
+            state,
+            material,
             _owner: owner,
         })
     }
@@ -527,6 +601,7 @@ impl serde::Serialize for FundedVariableReply {
             Self::UpdaterCheck(value) => serialize_updater_result(serializer, value),
             Self::RpcCall(value) => serialize_rpc_call(serializer, value),
             Self::MfaEnrollment(value) => serialize_mfa_enrollment(serializer, value),
+            Self::MfaTransaction(value) => serialize_mfa_transaction(serializer, value),
             Self::Operation(value) => serialize_operation_reply(serializer, value),
         }
     }
@@ -538,7 +613,8 @@ fn serialize_operation_reply<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct as _;
     match &value.result {
-        Ok(OperationReplyData::RealtimeRefused { error, code }) => {
+        Ok(OperationReplyData::RealtimeRefused { error, code })
+        | Ok(OperationReplyData::GovernanceRefused { error, code }) => {
             #[derive(serde::Serialize)]
             struct RefusalData<'a> {
                 code: &'a str,
@@ -553,9 +629,6 @@ fn serialize_operation_reply<S: serde::Serializer>(
             #[derive(serde::Serialize)]
             #[serde(untagged)]
             enum OperationField<'a> {
-                Approved {
-                    approved: &'a str,
-                },
                 Removed {
                     removed: &'a str,
                 },
@@ -564,18 +637,6 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 },
                 ProposalId {
                     proposal_id: &'a str,
-                },
-                Signed {
-                    signed: &'a str,
-                },
-                Denied {
-                    denied: &'a str,
-                },
-                Withdrawn {
-                    withdrawn: &'a str,
-                },
-                NewNetworkId {
-                    new_network_id: &'a str,
                 },
                 Reconnecting {
                     reconnecting: &'a str,
@@ -617,6 +678,10 @@ fn serialize_operation_reply<S: serde::Serializer>(
                     flow_label: &'a str,
                     flow_capability: &'a str,
                 },
+                OpaqueChanged {
+                    flow_capability: &'a str,
+                    max_unit_bytes: u32,
+                },
                 Closed {
                     closed: bool,
                 },
@@ -628,20 +693,11 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 },
             }
             let field = match data {
-                OperationReplyData::Approved(value) => OperationField::Approved { approved: value },
                 OperationReplyData::Removed(value) => OperationField::Removed { removed: value },
                 OperationReplyData::Topology(value) => OperationField::Topology { topology: value },
                 OperationReplyData::ProposalId(value) => {
                     OperationField::ProposalId { proposal_id: value }
                 }
-                OperationReplyData::Signed(value) => OperationField::Signed { signed: value },
-                OperationReplyData::Denied(value) => OperationField::Denied { denied: value },
-                OperationReplyData::Withdrawn(value) => {
-                    OperationField::Withdrawn { withdrawn: value }
-                }
-                OperationReplyData::NewNetworkId(value) => OperationField::NewNetworkId {
-                    new_network_id: value,
-                },
                 OperationReplyData::Reconnecting(value) => OperationField::Reconnecting {
                     reconnecting: value,
                 },
@@ -690,6 +746,13 @@ fn serialize_operation_reply<S: serde::Serializer>(
                     flow_label,
                     flow_capability: capability,
                 },
+                OperationReplyData::OpaqueChanged {
+                    flow_capability,
+                    max_unit_bytes,
+                } => OperationField::OpaqueChanged {
+                    flow_capability,
+                    max_unit_bytes: *max_unit_bytes,
+                },
                 OperationReplyData::Closed => OperationField::Closed { closed: true },
                 OperationReplyData::RpcStreamStarted(request_id) => {
                     OperationField::RpcStreamStarted { request_id }
@@ -697,15 +760,18 @@ fn serialize_operation_reply<S: serde::Serializer>(
                 OperationReplyData::ServicesStatus(status) => {
                     OperationField::ServicesStatus { status }
                 }
-                OperationReplyData::RealtimeRefused { .. } => unreachable!("handled above"),
+                OperationReplyData::RealtimeRefused { .. }
+                | OperationReplyData::GovernanceRefused { .. } => {
+                    unreachable!("handled above")
+                }
             };
-            let mut response = serializer.serialize_struct("Response", 2)?;
+            let mut response = serializer.serialize_struct("Response", 3)?;
             response.serialize_field("ok", &true)?;
             response.serialize_field("data", &field)?;
             response.end()
         }
         Err(error) => {
-            let mut response = serializer.serialize_struct("Response", 2)?;
+            let mut response = serializer.serialize_struct("Response", 3)?;
             response.serialize_field("ok", &false)?;
             response.serialize_field("error", error)?;
             response.end()
@@ -731,6 +797,7 @@ fn serialize_mfa_enrollment<S: serde::Serializer>(
                 secret: &'a str,
                 otpauth_uri: &'a str,
                 recovery_codes: &'a [String],
+                transaction_id: &'a str,
             }
             let mut response = serializer.serialize_struct("Response", 2)?;
             response.serialize_field("ok", &true)?;
@@ -740,17 +807,70 @@ fn serialize_mfa_enrollment<S: serde::Serializer>(
                     secret: &enrollment.secret_b32,
                     otpauth_uri: &enrollment.otpauth_uri,
                     recovery_codes: &enrollment.recovery_codes,
+                    transaction_id: value.transaction_id.as_deref().unwrap_or_default(),
                 },
             )?;
             response.end()
         }
         Err(error) => {
-            let mut response = serializer.serialize_struct("Response", 2)?;
+            let mut response = serializer.serialize_struct("Response", 3)?;
             response.serialize_field("ok", &false)?;
             response.serialize_field("error", &DisplayRef(error))?;
+            #[derive(serde::Serialize)]
+            struct RefusalData<'a> {
+                code: &'a str,
+            }
+            response.serialize_field(
+                "data",
+                &RefusalData {
+                    code: governance_error_code(error),
+                },
+            )?;
             response.end()
         }
     }
+}
+
+fn serialize_mfa_transaction<S: serde::Serializer>(
+    serializer: S,
+    value: &FundedMfaTransaction,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    #[derive(serde::Serialize)]
+    struct TransactionData<'a> {
+        network: &'a str,
+        transaction_id: &'a str,
+        state: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        otpauth_uri: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_codes: Option<&'a [String]>,
+    }
+    let mut response = serializer.serialize_struct("Response", 2)?;
+    response.serialize_field("ok", &true)?;
+    response.serialize_field(
+        "data",
+        &TransactionData {
+            network: &value.network,
+            transaction_id: &value.transaction_id,
+            state: value.state,
+            secret: value
+                .material
+                .as_ref()
+                .map(|material| material.secret_b32.as_str()),
+            otpauth_uri: value
+                .material
+                .as_ref()
+                .map(|material| material.otpauth_uri.as_str()),
+            recovery_codes: value
+                .material
+                .as_ref()
+                .map(|material| material.recovery_codes.as_slice()),
+        },
+    )?;
+    response.end()
 }
 
 fn serialize_rpc_call<S: serde::Serializer>(

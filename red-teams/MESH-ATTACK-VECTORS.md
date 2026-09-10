@@ -1,5 +1,7 @@
 # MyOwnMesh hybrid-networking red-team catalog
 
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
+
 Status: target conformance and source-audit catalog for the restored hybrid networking architecture.
 
 This catalog supersedes architecture-dependent pass conditions that required every connector exchange to be a durable signed record, prohibited all transport allocation before Device authentication, or required durable route, path, negotiation-generation, or session-generation state.
@@ -30,7 +32,25 @@ working channel
     -> AuthenticatedPeerSession
 ```
 
-The target durable fact families are limited to long-lived semantic state such as Open participation, Closed governance, durable capability grants and revocations, and reviewed application contract facts. Ordinary candidates, route selection, path handoff, connectivity checks, relay allocation liveness, and packet flow are live connector state.
+The base durable fact families are Closed authority/governance only:
+`RoleGrant`, `RoleRevoke`, `Evict`, `MembershipAdmit`, `EvictionProof`,
+`SelfStandDown`, `Attestation`, `Resolution`, and
+`AuthorityLineageResolution`. Open has zero base durable semantic facts.
+Exact-context handshake and Device-key possession establish ephemeral Open
+participation. Runtime join, leave, presence, and reconnect for both Open and
+Closed are live observations, never semantic history. Reviewed application
+contract domains remain explicitly separate. Ordinary candidates, route
+selection, path handoff, connectivity checks, relay allocation liveness, and
+packet flow are live connector state.
+
+The owner selects finite fact-count, canonical-byte, causal-edge, per-author
+count/bytes and retained lifetime, proof-work,
+eligible-signer-quarantine, total-proof-history, and indexed SQLite/WAL-reserve
+ceilings. The exact `N+1` delta is refused before any
+semantic mutation, ACK, identity, or authority change. Duplicate delivery is
+a semantic no-op. Exact history remains until an archive or
+authority-ratified checkpoint permits deletion; checkpoint and `VACUUM` are
+physical reclamation only and no timer silently prunes semantic history.
 
 Signaling includes both durable semantic exchange and ephemeral transport control. Neither category carries ordinary application payload.
 
@@ -68,7 +88,7 @@ The suite includes:
 - a fresh authentic key without Closed authorization;
 - an admitted malicious endpoint;
 - a carrier that drops, delays, reorders, duplicates, injects, replays, or censors;
-- a malicious TURN, generic relay, or Closed member relay;
+- a malicious TURN service or Hub attempting forbidden application forwarding;
 - a restrictive network;
 - a malicious or unprivileged local application principal;
 - identity rotation intended to bypass per-identity resource accounting;
@@ -76,9 +96,9 @@ The suite includes:
 
 Complete availability under total eclipse is not claimed.
 
-## 5. Current-source finding reinterpretation
+## 5. Historical source finding reinterpretation
 
-The source baseline and source evidence remain those recorded in the preceding catalog. The restored target classification is:
+The table retains the source baseline and evidence recorded in the preceding catalog. Its deletion and closure statements describe that historical baseline, not verification of the 2026-09-09 cutover. The current requirement is exclusion of all custom Hub/member application transit, including ciphertext; HYB-027–031 below define replacement obligations without claiming execution. Historical classifications follow:
 
 | ID | Source observation | Restored target interpretation | Priority |
 |---|---|---|---|
@@ -137,17 +157,37 @@ Alter every state-deriving durable field, Fact ID, author key, signature, mesh c
 
 **Pass:** Only the exact canonical signed positive control reaches durable projection. Invalid input creates no accepted durable receipt, durable head, or durable effect.
 
+### HYB-001a. Ledger quota and quarantine boundary
+
+Fill each owner-selected ledger dimension to `N`, then submit valid `N+1`
+fact, causal-edge, per-author, proof-history, eligible-signer, quarantine,
+and database/WAL-reserve candidates, including a duplicate Fact ID and a
+semantic no-op.
+
+**Pass:** The complete delta is refused before graph, projection, ACK,
+identity, or authority mutation. Missing-parent candidates use only the
+bounded dependency index; duplicate and no-op candidates do not extend exact
+history. Per-author retained lifetime caps and proof-work limits are enforced
+without timer deletion. SQLite remains local-only, single-writer, WAL/FULL,
+and physical checkpoint/`VACUUM` reclamation cannot delete semantic history
+without an archive or authority-ratified checkpoint. Failed cleanup retains
+the exact charge.
+
 ### HYB-002. Carrier non-authorship
 
 Deliver a valid A-authored fact through a B-controlled carrier and a B-authored carrier envelope that claims A.
 
 **Pass:** The valid fact remains authored by A. The carrier claim grants no authorship.
 
-### HYB-003. Open permissionless positive control
+### HYB-003. Open ephemeral permissionless positive control
 
-Have a fresh Device key publish valid self-authored Open participation.
+Have a fresh Device key complete an exact-context endpoint handshake proving
+key possession, without publishing a durable participation record.
 
-**Pass:** It may project as an Open participant without sponsor, pair grant, identity vote, or application approval, subject only to protocol validation and local resource admission.
+**Pass:** It may participate ephemerally without sponsor, pair grant,
+identity vote, or application approval, subject only to endpoint protocol
+validation and local resource admission. No durable fact, join, leave, or
+presence record is created.
 
 ### HYB-004. Closed unauthorized key
 
@@ -175,7 +215,8 @@ Open the same durable basis after normal restart, long storage, copy, and transp
 
 ### HYB-008. Open-to-Closed separation
 
-Replay Open participation and application-like claims into a Closed context.
+Replay an Open handshake/observation and application-like claims into a Closed
+context.
 
 **Pass:** Only the selected Closed governance proof supplies Closed authority.
 
@@ -197,7 +238,9 @@ Attempt to place a marked application byte string into every public durable and 
 
 Disconnect signaling carriers, remove mDNS advertisements, and send service-authored Leave messages.
 
-**Pass:** Carrier events affect delivery and transport observations only. They cannot synthesize Open withdrawal, Closed removal, or session closure.
+**Pass:** Carrier events affect delivery and transport observations only. They
+cannot synthesize a durable Open fact, runtime withdrawal authority, Closed
+removal, or session closure.
 
 ### HYB-012. Connected censoring carrier
 
@@ -227,7 +270,7 @@ Use many fresh keys and unauthenticated hints to create candidate work.
 
 ### HYB-016. Candidate racing
 
-Make direct, TURN, generic relay, and Closed member-relay candidates complete in different orders and with different quality.
+Make direct and configured standard TURN candidates complete in different orders and with different quality. A Hub is not a third application carrier.
 
 **Pass:** The connector may use the first or locally preferred promotable channel. No durable route record or exhaustive-failure proof is required.
 
@@ -305,41 +348,58 @@ Exercise messages, RPC, media, datagrams, and every application send API in ever
 
 ### HYB-026. Current policy loss
 
-After promotion, accept an applicable Open withdrawal or Closed removal and race it against queued sends and callbacks.
+After promotion, accept an applicable runtime Open departure or Closed removal
+and race it against queued sends and callbacks.
 
 **Pass:** New protected use fails after the committed policy change. Cleanup remains possible. A later re-add or re-presentation requires a newly valid session promotion, not revival of the old handle.
 
-## 11. Relay tests
+## 11. TURN and forbidden member-transit tests
 
-### HYB-027. Adversarial TURN and generic relay
+These are current required controls, not new execution PASS claims. Historical
+HYB-028/029/030 member-relay cases are superseded; their prior results remain
+attached to their original source and profiles.
 
-Drop, delay, duplicate, reorder, truncate, and modify endpoint ciphertext. Attempt endpoint substitution.
+### HYB-027. Adversarial standard TURN
 
-**Pass:** Relay denial and metadata visibility are allowed residuals. Relay cannot become A or C, change accepted plaintext, or obtain application plaintext.
+Drop, delay, duplicate, reorder, truncate, or modify WebRTC-protected packets
+and attempt endpoint substitution.
 
-### HYB-028. Closed member relay positive control
+**Pass:** Endpoint authentication/integrity remain required. TURN cannot gain
+application plaintext or endpoint authority under the stated WebRTC premises;
+denial and metadata observation remain residuals.
 
-Authorize B under the selected Closed profile. Establish A-C through B.
+### HYB-028. Configured TURN positive control
 
-**Pass:** B is visibly identified, forwards only opaque A-C packets for one bounded allocation, and never becomes the application endpoint.
+Prevent direct connectivity in an isolated authorized testbed and configure a
+standard TURN service. Establish the endpoint WebRTC session.
 
-### HYB-029. Anonymous relay credential rejection
+**Pass:** Exact endpoint-authenticated application bytes reach the intended
+endpoint through TURN, not a Hub/member or signaling payload tunnel. Record
+actual selected-path evidence; do not infer TURN use from configuration alone.
 
-Offer a relay credential proving only that some member is authorized without identifying B.
+### HYB-029. Removed custom route surface refusal
 
-**Pass:** The basal Closed member-relay profile rejects it.
+Present removed `closed_relay`, `application_transport`, `endpoint_cipher`,
+and `routing_policy` config fields and removed wire messages.
 
-### HYB-030. Exact relay destination
+**Pass:** Refusal occurs without starting a compatibility member relay/cipher.
+The current optional `introduction` policy supplies no payload authority.
 
-Attempt to change C, add fanout, supply arbitrary host or port per packet, or recursively forward through another relay.
+### HYB-030. Hub/signaling payload injection
 
-**Pass:** The allocation is confined to exact A-C endpoint packets and finite resources.
+Attempt both plaintext and ciphertext forwarding through Hub discovery,
+introduction, setup/control, and typed semantic-control handlers.
 
-### HYB-031. Relay use without exhaustive candidate failure
+**Pass:** No application tunnel is created. When cohosted, standard TURN remains
+a distinct service; its URL advertisement and locally configured credentials
+do not constitute implemented protected credential distribution.
 
-Race a valid relay against a slow direct path.
+### HYB-031. TURN candidate selection
 
-**Pass:** Relay use is permitted by local policy without a signed or durable exhaustion proof.
+Race configured TURN with a slow direct candidate under bounded local policy.
+
+**Pass:** Selection does not require a signed exhaustion proof, does not grant
+endpoint authority, and never falls back to Hub/member application forwarding.
 
 ## 12. Handoff and replay tests
 
@@ -383,7 +443,7 @@ Let A temporarily send over D while C still sends over B.
 
 ### HYB-038. Cross-protocol listener confusion
 
-Co-locate signaling, TURN, generic relay, Closed member relay, and application service endpoints. Send each message type to every wrong listener.
+Co-locate signaling, standard TURN, Hub introduction, and application service endpoints. Send each message type to every wrong listener.
 
 **Pass:** No cross-parser or cross-effect substitution occurs. Co-location claims no physical compromise isolation that deployment does not provide.
 
@@ -391,7 +451,7 @@ Co-locate signaling, TURN, generic relay, Closed member relay, and application s
 
 Establish A-B and B-C sessions but no A-C session. Ask A to send application data to C through ordinary mesh APIs.
 
-**Pass:** No implicit forwarding occurs. A-C requires its own promoted session or an explicit application intermediary.
+**Pass:** Neither plaintext nor ciphertext is forwarded by the mesh/Hub. A-C requires its own promoted direct/TURN session or an explicit application intermediary.
 
 ### HYB-040. Explicit application intermediary positive control
 
@@ -407,7 +467,7 @@ Receive a fresh signed presence response while every data connector fails.
 
 **Pass:** Reachability view shows the exact evidence classes and returns no viable peer transport.
 
-### HYB-042. Path is not durable participation
+### HYB-042. Path is not durable authority
 
 Keep a working authenticated channel while delivering a durable withdrawal or Closed removal.
 

@@ -166,15 +166,20 @@ impl RpcInboundBuilder<'_> {
     }
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for RpcInboundBuilder<'_> {
-    fn retained_claim(&self) -> Result<ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for RpcInboundBuilder<'_> {
+    fn measured_claim(
+        &self,
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
         // Two halves from two places, and both are the real one. The bytes and
         // the JSON tree are measured over a mirror that encodes byte-for-byte as
         // the frame; the inline layout is taken from `ServerOut`, the type that
         // will actually sit in the queue, because the mirror is a row of borrows
         // and pricing its own size would understate what is stored by the
         // difference between a reference and the buffer it points at.
-        myownmesh_core::serialized_mailbox_item_claim_as::<ServerOut>(&self.view())
+        myownmesh_core::measure_serialized_mailbox_item::<ServerOut>(&self.view())
     }
 
     fn build(self) -> ServerOut {
@@ -202,7 +207,7 @@ impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for RpcInboundBuilder
 /// subscriber, at whatever rate the peer sent.
 ///
 /// Every field here is a borrow of the funded delivery the pump is holding, so
-/// [`Self::retained_claim`] can answer what the frame will cost without any of
+/// [`Self::measured_claim`] can answer what the frame will cost without any of
 /// it existing yet, and [`Self::build`] runs only for a subscriber the mailbox
 /// has already admitted.
 struct ChannelInboundBuilder<'a> {
@@ -231,13 +236,18 @@ impl ChannelInboundBuilder<'_> {
     }
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for ChannelInboundBuilder<'_> {
-    fn retained_claim(&self) -> Result<ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for ChannelInboundBuilder<'_> {
+    fn measured_claim(
+        &self,
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
         // Measured over the mirror, priced as the `ServerOut` that will sit in
         // the queue — the same split, and for the same reason, as
         // [`RpcInboundBuilder`]: the mirror is a row of references and its own
         // size would understate the buffers those references point at.
-        myownmesh_core::serialized_mailbox_item_claim_as::<ServerOut>(&self.view())
+        myownmesh_core::measure_serialized_mailbox_item::<ServerOut>(&self.view())
     }
 
     fn build(self) -> ServerOut {
@@ -528,9 +538,8 @@ async fn stream_handler_call(
             ))
         }
     };
-    let watchdog_registry = registry.clone();
-    tokio::spawn(async move {
-        let _task = task;
+    let watchdog_registry = registry.downgrade();
+    let watchdog = async move {
         tokio::select! {
             () = close_probe.closed() => {}
             () = ticket.cancelled() => {}
@@ -540,11 +549,20 @@ async fn stream_handler_call(
             // long as the peer chose. Every arm below drops the ticket
             // and the probe, so shutting down settles the pending entry
             // exactly as a close would.
-            () = watchdog_registry.closing() => {}
+            () = async move {
+                if let Some(registry) = watchdog_registry.upgrade() {
+                    registry.closing().await;
+                }
+            } => {}
         }
         drop(close_probe);
         drop(ticket);
-    });
+    };
+    if let Err((_task, _watchdog, reason)) = registry.spawn_retained_task(task, watchdog) {
+        return Err(format!(
+            "inbound streaming RPC watchdog could not be retained: {reason}"
+        ));
+    }
     Ok(rx)
 }
 
@@ -800,9 +818,14 @@ impl HandlerDisplacedBuilder {
     }
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for HandlerDisplacedBuilder {
-    fn retained_claim(&self) -> Result<ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<ServerOut>(&self.view())
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<ServerOut> for HandlerDisplacedBuilder {
+    fn measured_claim(
+        &self,
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
+        myownmesh_core::measure_serialized_mailbox_item::<ServerOut>(&self.view())
     }
 
     fn build(self) -> ServerOut {
@@ -886,13 +909,14 @@ mod tests {
     };
     use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey, RegistrationError};
     use crate::ipc::wire::ServerOut;
+    use myownmesh_core::ResourceMailboxItemBuilder;
     // The shared real link, at the crate root because the control
     // dispatcher's streaming controls need the same one: two copies of a
     // two-peer handshake are two things free to drift, and a control passing
     // against a link its sibling does not build is exactly the failure that
     // would hide.
     use crate::test_link::{fresh_network, test_transport, two_peer_rpc};
-    use myownmesh_core::engine::spawn_network;
+    use myownmesh_core::engine::transport_lab::spawn_network;
     use myownmesh_core::identity::Identity;
     use serde_json::Value;
     use std::sync::Arc;
@@ -916,13 +940,15 @@ mod tests {
     async fn one_engine_rpc(
         wire_id: &str,
     ) -> (
-        Arc<myownmesh_core::engine::NetworkState>,
+        Arc<myownmesh_core::engine::transport_lab::NetworkState>,
         myownmesh_core::rpc::Rpc,
         tokio::task::JoinHandle<()>,
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("MYOWNMESH_HOME", tmp.path());
         std::mem::forget(tmp); // leak — test scope only
+                               // This is intentionally an unjoined Open state: the control is
+                               // entirely local and exercises no peer promotion or carrier path.
         let (state, driver) = spawn_network(
             fresh_network("solo", wire_id),
             Arc::new(Identity::ephemeral()),
@@ -930,7 +956,7 @@ mod tests {
         )
         .await
         .expect("the solo engine starts");
-        let rpc = myownmesh_core::rpc::Rpc::attach(&state)
+        let rpc = myownmesh_core::engine::transport_lab::rpc(&state)
             .expect("the live gateway admits its RPC owner");
         (state, rpc, driver)
     }
@@ -1161,7 +1187,7 @@ mod tests {
     /// mirror actually has.
     #[test]
     fn v4_r3_daemon_a_measured_channel_frame_matches_the_frame_it_becomes() {
-        use myownmesh_core::{ResourceMailboxItem, ResourceMailboxItemBuilder};
+        use myownmesh_core::ResourceMailboxSender;
 
         let builds = std::sync::atomic::AtomicUsize::new(0);
         let payload = serde_json::json!({
@@ -1176,14 +1202,13 @@ mod tests {
             builds: &builds,
         };
         let measured_bytes = serde_json::to_vec(&builder.view()).expect("the mirror encodes");
-        let measured_claim = builder
-            .retained_claim()
-            .expect("the mirror's claim is representable");
+        let measured_claim =
+            ResourceMailboxSender::<ServerOut>::building_item_planning_charge(&builder)
+                .expect("the mirror's claim is representable");
 
         let built = builder.build();
         let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
-        let built_claim = built
-            .retained_claim()
+        let built_claim = ResourceMailboxSender::<ServerOut>::accepted_item_planning_charge(&built)
             .expect("the frame's claim is representable");
 
         assert_eq!(
@@ -1208,9 +1233,7 @@ mod tests {
     /// [`ServerOutView`]: crate::ipc::wire::ServerOutView
     #[test]
     fn v4_r2_daemon_a_measured_inbound_frame_matches_the_frame_it_becomes() {
-        // Both traits, because the control compares what the two sides answer:
-        // the builder's borrowed measurement and the built frame's own.
-        use myownmesh_core::{ResourceMailboxItem, ResourceMailboxItemBuilder};
+        use myownmesh_core::ResourceMailboxSender;
 
         let builder = RpcInboundBuilder {
             network: "solo/mesh",
@@ -1227,14 +1250,13 @@ mod tests {
             },
         };
         let measured_bytes = serde_json::to_vec(&builder.view()).expect("the mirror encodes");
-        let measured_claim = builder
-            .retained_claim()
-            .expect("the mirror's claim is representable");
+        let measured_claim =
+            ResourceMailboxSender::<ServerOut>::building_item_planning_charge(&builder)
+                .expect("the mirror's claim is representable");
 
         let built = builder.build();
         let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
-        let built_claim = built
-            .retained_claim()
+        let built_claim = ResourceMailboxSender::<ServerOut>::accepted_item_planning_charge(&built)
             .expect("the frame's claim is representable");
 
         assert_eq!(
@@ -1259,7 +1281,7 @@ mod tests {
 
     #[test]
     fn v4_r2_daemon_a_displacement_frame_is_measured_before_its_id_string_exists() {
-        use myownmesh_core::{ResourceMailboxItem, ResourceMailboxItemBuilder};
+        use myownmesh_core::ResourceMailboxSender;
 
         let builder = HandlerDisplacedBuilder {
             network: "network-with-owned-coordinate".to_string(),
@@ -1267,10 +1289,13 @@ mod tests {
             by: crate::ipc::clients::ClientId(42),
         };
         let measured_bytes = serde_json::to_vec(&builder.view()).expect("the mirror encodes");
-        let measured_claim = builder.retained_claim().expect("the mirror is measurable");
+        let measured_claim =
+            ResourceMailboxSender::<ServerOut>::building_item_planning_charge(&builder)
+                .expect("the mirror is measurable");
         let built = builder.build();
         let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
-        let built_claim = built.retained_claim().expect("the frame is measurable");
+        let built_claim = ResourceMailboxSender::<ServerOut>::accepted_item_planning_charge(&built)
+            .expect("the frame is measurable");
 
         assert_eq!(
             measured_bytes, built_bytes,
@@ -1348,7 +1373,7 @@ mod tests {
         // refusal would have turned that into a mysteriously silent peer.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve("echo", move |call| {
                 let registry = registry_for_handler.clone();
@@ -1488,7 +1513,7 @@ mod tests {
         // admissions rather than discarding them.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve_stream("stream_echo", move |call| {
                 let registry = registry_for_handler.clone();
@@ -1665,7 +1690,7 @@ mod tests {
         // Spawn a pump that mirrors `bridge::spawn_channel_pump`
         // but uses the engine state directly.
         let chan: myownmesh_core::Channel<serde_json::Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let mut sub = chan.subscribe().expect("subscription admitted");
         let registry_for_pump = registry.clone();
         let key_for_pump = key.clone();
@@ -1703,7 +1728,7 @@ mod tests {
 
         // Bob sends to Alice on the channel.
         let bob_chan: myownmesh_core::Channel<serde_json::Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
         bob_chan
             .send_to(
                 _alice_id_arg(&alice_state),
@@ -1843,7 +1868,7 @@ mod tests {
         };
 
         let channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let sub = channel
             .subscribe()
             .expect("the fixture's channel admits a subscription");
@@ -1872,7 +1897,7 @@ mod tests {
         );
 
         let bob_channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
 
         // Positive. The isolated subscriber is the only member, its grant funds
         // exactly this frame, and one publish costs exactly one build.
@@ -2025,7 +2050,7 @@ mod tests {
         // funding the task and minting the cancellation; all three are done here
         // the same way it does them.
         let channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let sub = channel
             .subscribe()
             .expect("the fixture's channel admits a subscription");
@@ -2070,7 +2095,7 @@ mod tests {
              clone and a real measurement rather than a formality"
         );
         let bob_channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
         bob_channel
             .send_to(_alice_id_arg(&alice_state), &payload)
             .await
@@ -2121,7 +2146,7 @@ mod tests {
         drivers.shutdown().await;
     }
 
-    fn _alice_id_arg(state: &Arc<myownmesh_core::engine::NetworkState>) -> &str {
+    fn _alice_id_arg(state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>) -> &str {
         state.identity.public_id()
     }
 }

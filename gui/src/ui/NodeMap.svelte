@@ -80,53 +80,6 @@
     };
   }
 
-  // Inline action state. Scoped to the currently-selected peer; we
-  // reset both whenever the selection changes via the $effect below
-  // so a stale error from one peer doesn't bleed into the next.
-  let actionBusy = $state(false);
-  let actionError = $state<string | null>(null);
-
-  $effect(() => {
-    // Reset action state when the selected peer changes.
-    void selectedPeerId;
-    actionBusy = false;
-    actionError = null;
-  });
-
-  async function approveSelected() {
-    if (!selectedPeer || actionBusy) return;
-    actionBusy = true;
-    actionError = null;
-    try {
-      await meshClient.rosterApprove(
-        network.config_id,
-        selectedPeer.device_id,
-        selectedPeer.label,
-      );
-    } catch (e) {
-      actionError = String(e);
-    } finally {
-      actionBusy = false;
-    }
-  }
-
-  async function denySelected() {
-    if (!selectedPeer || actionBusy) return;
-    actionBusy = true;
-    actionError = null;
-    try {
-      // Roster-remove on a not-yet-approved peer drops the in-flight
-      // session and refuses re-approval until the user explicitly
-      // approves again. Matches the Roster tab's Remove action.
-      await meshClient.rosterRemove(network.config_id, selectedPeer.device_id);
-      onSelectPeer(null);
-    } catch (e) {
-      actionError = String(e);
-    } finally {
-      actionBusy = false;
-    }
-  }
-
   // Canvas dimensions are reactive so the layout recomputes on
   // window resize. We track the SVG element's actual size via a
   // ResizeObserver rather than viewport units so the graph fits
@@ -1022,40 +975,9 @@
           {#if pending.kind === "waiting-peer"}
             <!-- Local approve already sent; only the revoke escape
                  hatch remains until the peer approves their side. -->
-            <div class="pending-buttons">
-              <button
-                class="btn-deny"
-                onclick={denySelected}
-                disabled={actionBusy}
-                title="Revoke this approval and tear down the half-handshaken session."
-              >
-                Revoke
-              </button>
-            </div>
+            <div class="pending-hint">Awaiting daemon admission and exact named role policy.</div>
           {:else if pending.kind === "approve" || pending.kind === "confirm"}
-            <div class="pending-buttons">
-              <button
-                class="btn-approve"
-                onclick={approveSelected}
-                disabled={actionBusy}
-              >
-                {actionBusy
-                  ? "Approving…"
-                  : pending.kind === "confirm"
-                    ? "Confirm"
-                    : "Approve"}
-              </button>
-              <button
-                class="btn-deny"
-                onclick={denySelected}
-                disabled={actionBusy}
-              >
-                Deny
-              </button>
-            </div>
-          {/if}
-          {#if actionError}
-            <div class="pending-error">{actionError}</div>
+            <div class="pending-hint">Awaiting daemon admission and exact named role policy.</div>
           {/if}
         </div>
       {/if}
@@ -1394,7 +1316,7 @@
     color: #ffd166;
   }
   .pending-buttons {
-    display: flex;
+    display: none;
     gap: 0.4rem;
   }
   .btn-approve,

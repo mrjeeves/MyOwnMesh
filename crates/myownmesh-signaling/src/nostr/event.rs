@@ -89,13 +89,7 @@ impl NostrIdentity {
     fn sign_digest(&self, digest: &[u8; 32]) -> [u8; 64] {
         let secp = Secp256k1::new();
         let sig = secp.sign_schnorr_no_aux_rand(&digest[..], &self.keypair);
-        // `Signature::serialize` is deprecated in favor of
-        // `to_byte_array` in secp256k1 ≥ 0.30; both return the
-        // same 64-byte BIP-340 encoding. Keep an explicit allow
-        // so a future rename doesn't silently break the wire
-        // shape.
-        #[allow(deprecated)]
-        sig.serialize()
+        sig.to_byte_array()
     }
 }
 

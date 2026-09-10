@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::SystemTime;
 
 use agent_config::*;
@@ -34,6 +34,7 @@ use stun::integrity::*;
 use stun::message::*;
 use stun::xoraddr::*;
 use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use util::vnet::net::*;
 use util::Buffer;
@@ -118,7 +119,13 @@ pub struct Agent {
     pub(crate) urls: Vec<Url>,
     pub(crate) network_types: Vec<NetworkType>,
 
-    pub(crate) gather_candidate_cancel: Option<GatherCandidateCancelFn>,
+    /// The parent owns the child `WaitGroup`; close joins this handle before
+    /// dropping the agent's candidate channels or callback roots.
+    pub(crate) gather_candidate_task: StdMutex<Option<JoinHandle<()>>>,
+    gather_candidate_failure: StdMutex<Option<String>>,
+    close_lock: Mutex<()>,
+    /// Prevents a new detached gather from being installed after close starts.
+    pub(crate) closing: AtomicBool,
 }
 
 impl Agent {
@@ -213,14 +220,20 @@ impl Agent {
             urls: config.urls.clone(),
             network_types: config.network_types.clone(),
 
-            gather_candidate_cancel: None, //TODO: add cancel
+            gather_candidate_task: StdMutex::new(None),
+            gather_candidate_failure: StdMutex::new(None),
+            close_lock: Mutex::new(()),
+            closing: AtomicBool::new(false),
         };
 
-        agent.internal.start_on_connection_state_change_routine(
-            chan_state_rx,
-            chan_candidate_rx,
-            chan_candidate_pair_rx,
-        );
+        agent
+            .internal
+            .start_on_connection_state_change_routine(
+                chan_state_rx,
+                chan_candidate_rx,
+                chan_candidate_pair_rx,
+            )
+            .await;
 
         // Restart is also used to initialize the agent for the first time
         if let Err(err) = agent.restart(config.local_ufrag, config.local_pwd).await {
@@ -337,9 +350,40 @@ impl Agent {
 
     /// Cleans up the Agent.
     pub async fn close(&self) -> Result<()> {
-        if let Some(gather_candidate_cancel) = &self.gather_candidate_cancel {
-            gather_candidate_cancel();
+        // A callback cannot join its own dispatcher. Check before waiting for
+        // another closer, which may already be waiting for that callback.
+        if self.internal.is_notification_task() {
+            return Err(Error::Other(
+                "ICE close called from its own callback".into(),
+            ));
         }
+        self.closing.store(true, Ordering::SeqCst);
+        let _close = self.close_lock.lock().await;
+
+        // Borrow-poll the registered handle: cancelling close leaves it owned
+        // by the Agent, so the next close resumes terminal observation.
+        std::future::poll_fn(|cx| {
+            let mut slot = self
+                .gather_candidate_task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(task) = slot.as_mut() {
+                match Pin::new(task).poll(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Err(error)) => {
+                        *self
+                            .gather_candidate_failure
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(format!("ICE gather task failed: {error}"));
+                    }
+                    std::task::Poll::Ready(Ok(())) => {}
+                }
+                slot.take();
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
 
         if let UDPNetwork::Muxed(ref udp_mux) = self.udp_network {
             let (ufrag, _) = self.get_local_user_credentials().await;
@@ -348,8 +392,18 @@ impl Agent {
 
         Self::close_multicast_conn(&self.mdns_conn).await;
 
-        //FIXME: deadlock here
-        self.internal.close().await
+        // Drain even after a gather failure; never turn a failed join into a
+        // successful close, including on a later close after cancellation.
+        let result = self.internal.close().await;
+        if let Some(error) = self
+            .gather_candidate_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            return Err(Error::Other(error.clone()));
+        }
+        result
     }
 
     /// Returns the selected pair or nil if there is none
@@ -438,19 +492,25 @@ impl Agent {
 
     /// Initiates the trickle based gathering process.
     pub fn gather_candidates(&self) -> Result<()> {
+        let mut gather_task = self
+            .gather_candidate_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(Error::ErrClosed);
+        }
         if self.gathering_state.load(Ordering::SeqCst) != GatheringState::New as u8 {
             return Err(Error::ErrMultipleGatherAttempted);
         }
 
+        if gather_task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return Err(Error::ErrMultipleGatherAttempted);
+        }
+        gather_task.take();
+
         if self.internal.on_candidate_hdlr.load().is_none() {
             return Err(Error::ErrNoOnCandidateHandler);
         }
-
-        if let Some(gather_candidate_cancel) = &self.gather_candidate_cancel {
-            gather_candidate_cancel(); // Cancel previous gathering routine
-        }
-
-        //TODO: a.gatherCandidateCancel = cancel
 
         let params = GatherCandidatesInternalParams {
             udp_network: self.udp_network.clone(),
@@ -468,9 +528,9 @@ impl Agent {
             chan_candidate_tx: Arc::clone(&self.internal.chan_candidate_tx),
             include_loopback: self.include_loopback,
         };
-        tokio::spawn(async move {
+        *gather_task = Some(tokio::spawn(async move {
             Self::gather_candidates_internal(params).await;
-        });
+        }));
 
         Ok(())
     }

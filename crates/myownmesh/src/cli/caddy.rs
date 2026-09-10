@@ -177,10 +177,12 @@ async fn install_and_configure(domain: &str) -> Result<()> {
 /// Fallback for when the daemon isn't running: persist the loopback bind
 /// (and enable signaling) to config.json so it takes effect on next start.
 fn persist_signaling_loopback() -> Result<()> {
-    let mut cfg = MeshConfig::load().unwrap_or_default();
-    cfg.services.signaling.enabled = true;
-    cfg.services.signaling.bind = "127.0.0.1".to_string();
-    cfg.save().context("save config")
+    MeshConfig::transaction(|cfg| {
+        cfg.services.signaling.enabled = true;
+        cfg.services.signaling.bind = "127.0.0.1".to_string();
+        Ok(())
+    })
+    .context("save config")
 }
 
 // ---- pure helpers (unit-tested) ------------------------------------------

@@ -106,7 +106,8 @@ async fn main() {
     // C+D. open_peer + create_offer with EMPTY ICE servers.
     if let Some(Ok((session, _rx))) = staged(
         "C open_peer(Offerer, no ICE servers)",
-        t.open_peer(
+        myownmesh_core::engine::transport_lab::open_peer(
+            &t,
             myownmesh_core::transport::Role::Offerer,
             &[],
             &[],
@@ -128,7 +129,8 @@ async fn main() {
     let turn = myownmesh_core::config::default_turn_servers();
     if let Some(Ok((session, _rx))) = staged(
         "E open_peer(Offerer, public-venue STUN+TURN)",
-        t.open_peer(
+        myownmesh_core::engine::transport_lab::open_peer(
+            &t,
             myownmesh_core::transport::Role::Offerer,
             &stun,
             &turn,

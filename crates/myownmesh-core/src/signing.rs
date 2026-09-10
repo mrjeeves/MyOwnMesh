@@ -33,12 +33,12 @@ pub(crate) fn sign_with(key: &SigningKey, message: &[u8]) -> String {
 /// Verify a signature against a claimed Device ID. Accepts the same
 /// base32-lowercase encoding the rest of the mesh uses. Returns `true`
 /// if and only if the signature is valid for `message` under the
-/// pubkey portion of `device_id`. Suffix on the Device ID (the
-/// `-XXXXX` display tag) is stripped before parsing — peers exchange
-/// raw pubkeys on the wire, but the UI surfaces the display form, so
-/// either is accepted here.
+/// pubkey portion of `device_id`. The canonical wire form and the
+/// deterministic `-XXXXX` display form are accepted; a mistyped display
+/// suffix is rejected rather than silently stripped.
 pub fn verify(device_id: &str, message: &[u8], signature_b32: &str) -> Result<bool> {
-    let pubkey_part_str = pubkey_part(device_id);
+    let pubkey_part_str = crate::identity::normalize_device_id(device_id)
+        .map_err(|e| Error::Signing(e.to_string()))?;
     let pubkey_bytes = BASE32_NOPAD
         .decode(pubkey_part_str.to_uppercase().as_bytes())
         .map_err(|e| Error::Signing(format!("device_id is not valid base32: {e}")))?;
@@ -137,9 +137,12 @@ mod tests {
         let (sk, pubkey) = fixture_key();
         let msg = b"hello mesh";
         let sig = sign_with(&sk, msg);
-        // Display form includes the -XXXXX suffix; verify() strips it.
-        let display = format!("{pubkey}-abc12");
+        let display = format!(
+            "{pubkey}-{}",
+            crate::identity::display_suffix(pubkey.as_bytes())
+        );
         assert!(verify(&display, msg, &sig).unwrap());
+        assert!(verify(&format!("{pubkey}-00000"), msg, &sig).is_err());
     }
 
     #[test]

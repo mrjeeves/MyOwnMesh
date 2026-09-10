@@ -8,6 +8,21 @@ service, which is what makes a
 Cloudflare TURN, no public Nostr relay required: one always-on device
 (or a few) can supply every piece of plumbing a closed fleet needs.
 
+This page describes device-wide hosted services. TURN is the application-data
+relay service. A Hub provides discovery and endpoint setup; it does not forward
+application payloads through mesh sessions.
+
+This V4 candidate's self-hosted TURN service is UDP-only. The new upstream
+TCP/TLS self-hosting bridge and Caddy TURN passthrough are not supported here;
+configured standard TURN endpoints remain available to endpoint WebRTC clients.
+Service advertisements provide URLs, not protected credential distribution.
+
+Hosted-service adverts, presence, joins, leaves, reconnects, and listener
+health are runtime transport observations. They never enter the semantic
+ledger or create Open participation or Closed authority. Closed governance
+facts remain in the owner-selected durable ledger; service configuration and
+topology remain local configuration/projection.
+
 A device is **any combination** of a mesh node and these hosted
 services. A dedicated box can be pure infrastructure (signaling +
 STUN + TURN, not itself a member). The hosted services are **off by
@@ -34,19 +49,18 @@ TURN (advertising itself purely as an edge / ingress-egress point) and
 joins no networks itself.
 
 Toggling `node` live joins or leaves every configured network in place;
-no restart needed.
+no restart needed. Those runtime membership transitions are not durable
+semantic facts; on Open they are authenticated only by the exact-context
+handshake and Device-key possession, while Closed admission still requires
+the current Closed governance projection.
 
-### There is no member payload relay
+### Hubs and application transport
 
-A device never forwards another member's application payload. Application
-data goes endpoint to endpoint over that pair's own authenticated session,
-and a mesh member is not a hop on that path — TURN relays packets at the ICE
-layer without ever holding an application frame, which is a different thing
-entirely.
-
-There is no `services.relay` key to set, no `relay` name the CLI or GUI will
-toggle, no relay field in the status report, and no relay role in the
-capability advert. A peer has nothing to point at.
+A Hub helps endpoints discover each other and exchange connection-setup
+messages. Application traffic uses their authenticated WebRTC session, with
+TURN selected by ICE when required. A machine may host both a Hub and TURN;
+these are separate roles and protocols. Signaling never carries an application
+payload fallback, whether plaintext or encrypted.
 
 ### Signaling
 
@@ -64,7 +78,9 @@ joiner discovers everyone already in the room; negotiation events
 offer can't bind a fresh connection. The relay does not verify event
 signatures. It is a forwarder, and the mesh runs its own ed25519 mutual
 auth over the resulting WebRTC channel, so a forged Nostr event buys an
-attacker nothing but a failed handshake.
+attacker nothing but a failed handshake. This bounded service-cache retention
+is not semantic-ledger retention and never silently evicts or prunes a
+durable Closed fact.
 
 #### Intelligent coordination
 
@@ -165,7 +181,7 @@ Services live under `services` in `~/.myownmesh/config.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "services": {
     "node":      { "enabled": true },
     "signaling": {
@@ -199,6 +215,11 @@ Services live under `services` in `~/.myownmesh/config.json`:
 > `node` is on by default and `services.signaling.limits` fills in safe
 > defaults, so neither needs to appear in a hand-written config. They are
 > shown here for completeness.
+
+Configure client TURN URLs and credentials in each network's `turn_servers`.
+The optional `introduction` policy controls bounded Hub-assisted endpoint
+setup. Old `closed_relay`, `application_transport` and `routing_policy` keys
+are rejected.
 
 > Because TURN also serves STUN, the example above would try to bind both
 > on `3478` and the second would fail. Run one of them on `3478`, or give
@@ -261,9 +282,9 @@ endpoint URLs in a structured `services` blob inside its capability
 } }
 ```
 
-There is no relay field or `service:relay` tag. Those named the ordinary-member
-application relay, not TURN — a device that hosts TURN advertises `turn_url`
-and the `service:turn` tag, which is a separate thing.
+Hosted service adverts describe signaling, STUN, and TURN only. TURN
+advertises `turn_url` and `service:turn`. Credentials remain local configuration
+and are not included in service adverts or presence records.
 
 A peer reads this with `ServiceAdvert::from_extra(...)` and can drop the
 URLs straight into its own network config.

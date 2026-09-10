@@ -17,7 +17,7 @@ export type MeshPhase =
 
 // ---- topology ---------------------------------------------------------
 //
-// TopologyMode is internally tagged in the Rust source — every
+// TopologyMode is internally tagged in the Rust source â€” every
 // variant carries a `kind` field with the snake_case discriminant.
 // See `crates/myownmesh-core/src/config.rs` (the `topology_serde_tags_by_kind`
 // test pins this shape down).
@@ -38,7 +38,7 @@ export function topologyHub(t: TopologyMode): string | null {
   return t.kind === "star" ? t.hub : null;
 }
 
-/** Every device acting as a hub under this mode — the star's single
+/** Every device acting as a hub under this mode â€” the star's single
  *  hub or the hubs tier's whole set; empty for shapes with no hub
  *  concept. */
 export function topologyHubSet(t: TopologyMode): string[] {
@@ -69,8 +69,8 @@ export function buildTopology(
 }
 
 /** Encode a TopologyMode into the (`topology`, `hub`) string pair the
- *  daemon's `TopologySet` / `GovernanceProposeTopology` ops take —
- *  `hubs` rides the `id1,id2[,…][:redundancy]` spec. */
+ *  daemon's config-owned `TopologySet` operation takes â€”
+ *  `hubs` rides the `id1,id2[,â€¦][:redundancy]` spec. */
 export function topologyToOpArgs(t: TopologyMode): {
   topology: string;
   hub: string | null;
@@ -91,22 +91,53 @@ export function topologyToOpArgs(t: TopologyMode): {
   }
 }
 
-// ---- network config (write shape — sent into NetworkAdd) -------------
+// ---- network config (write shape â€” sent into NetworkAdd) -------------
 //
 // Mirrors `myownmesh_core::NetworkConfig`. Most fields are
 // `#[serde(default)]` on the Rust side, so the GUI only sets what
 // the user actually edited; missing fields fill from defaults.
 
-// These mirror the engine's on-disk shapes — see
+// These mirror the engine's on-disk shapes â€” see
 // `crates/myownmesh-core/src/config.rs`. The user-facing import /
 // export envelope (`NetworkSettingsExport`) flattens these to plain
 // URL strings; conversion lives in `network-settings.ts`.
 
 export interface SignalingConfig {
   strategy?: string;
+  mdns?: boolean;
   servers?: string[];
   redundancy?: number;
   denylist?: string[];
+  public_fallback?: boolean;
+  mdns_policy?: MdnsPolicyConfig;
+}
+
+/** Fully materialised signaling config returned by `ConfigShow`. */
+export interface SignalingConfigSnapshot {
+  strategy: string;
+  mdns: boolean;
+  servers: string[];
+  redundancy: number;
+  denylist: string[];
+  public_fallback: boolean;
+  mdns_policy: MdnsPolicyConfig;
+}
+
+/** Finite owner-selected DNS-SD workload and timing policy. Durations are
+ *  integer milliseconds on the control wire, matching the daemon config. */
+export interface MdnsPolicyConfig {
+  max_active_connections: number;
+  max_discovered_peers: number;
+  outbound_queue_capacity: number;
+  max_resolve_owners: number;
+  event_capacity: number;
+  max_event_epochs: number;
+  dial_timeout_ms: number;
+  connection_idle_timeout_ms: number;
+  inbound_idle_timeout_ms: number;
+  reannounce_interval_ms: number;
+  query_deadline_ms: number;
+  accept_error_backoff_ms: number;
 }
 
 export interface StunServer {
@@ -119,27 +150,128 @@ export interface TurnServer {
   credential?: string | null;
 }
 
+/** Fully materialised TURN entry returned by `ConfigShow`. */
+export interface TurnServerSnapshot {
+  urls: string[];
+  username: string | null;
+  credential: string | null;
+}
+
+/** Owner-selected bounds for the durable semantic fact graph. These values
+ *  are persisted with each network and must survive GUI edits and settings
+ *  sharing; they are not authority or membership controls. */
+export interface SemanticPolicyConfig {
+  max_fact_encoded_bytes: number;
+  max_dependencies_per_fact: number;
+  max_authority_uses_per_fact: number;
+  max_authority_predecessors_per_use: number;
+  max_admitted_facts: number;
+  max_admitted_bytes: number;
+  max_quarantined_facts: number;
+  max_quarantined_bytes: number;
+  max_quarantined_facts_per_author: number;
+  max_quarantined_bytes_per_author: number;
+  max_retained_facts_per_author: number;
+  max_retained_bytes_per_author: number;
+  max_dependency_edges: number;
+  max_ready_batch: number;
+  max_pending_proofs: number;
+  max_pending_proof_bytes: number;
+  max_proof_records: number;
+  max_proof_bytes: number;
+  max_proof_links: number;
+  max_author_usage_rows: number;
+  max_provisional_rows: number;
+  max_transaction_dirty_main_pages: number;
+  max_uncheckpointed_wal_frames: number;
+  max_freelist_pages: number;
+  max_fragmented_pages: number;
+  max_main_journal_bytes: number;
+  max_database_bytes: number;
+  max_wal_bytes: number;
+  wal_checkpoint_threshold_bytes: number;
+  emergency_reserve_bytes: number;
+}
+
+/** Setup-only Hub introduction limits; never authorize member payload transit. */
+export interface HubIntroductionPolicyConfig {
+  max_records: number;
+  max_waiters_per_target: number;
+  max_signaling_bytes: number;
+  max_candidates_per_attempt: number;
+  attempt_timeout_ms: number;
+  terminal_retention_ms: number;
+  max_transient_links: number;
+  idle_timeout_ms: number;
+  max_maintenance_per_tick: number;
+}
+
 export interface NetworkConfigInput {
   id: string;
   network_id: string;
+  event_capacity?: number;
+  connection_trace_capacity?: number;
   label?: string;
+  kind?: NetworkKind;
   topology?: TopologyMode;
   signaling?: SignalingConfig;
+  introduction?: HubIntroductionPolicyConfig | null;
+  semantic_policy?: SemanticPolicyConfig;
   stun_servers?: StunServer[];
   turn_servers?: TurnServer[];
-  roster_path?: string | null;
+  pinned_peers?: string[];
   auto_approve?: boolean;
+}
+
+/** Exact materialised `NetworkConfig` shape used by `ConfigShow`. */
+export interface NetworkConfigSnapshot {
+  id: string;
+  network_id: string;
+  event_capacity: number;
+  connection_trace_capacity: number;
+  label: string;
+  kind: NetworkKind;
+  topology: TopologyMode;
+  signaling: SignalingConfigSnapshot;
+  introduction?: HubIntroductionPolicyConfig;
+  semantic_policy: SemanticPolicyConfig;
+  stun_servers: StunServer[];
+  turn_servers: TurnServerSnapshot[];
+  pinned_peers: string[];
+  auto_approve: boolean;
+}
+
+export interface AutoUpdateConfig {
+  enabled: boolean;
+  channel: string;
+  auto_apply: string;
+  check_interval_hours: number;
+  feed_request_timeout_ms: number;
+  artifact_download_timeout_ms: number;
+  stable_url: string | null;
+  beta_url: string | null;
+}
+
+export interface AutoCleanupConfig {
+  updates: boolean;
+}
+
+export interface DaemonConfig {
+  enabled: boolean;
+  control_socket: string | null;
+  log_level: string;
 }
 
 // ---- mesh config (read-only shape from ConfigShow) -------------------
 
 export interface MeshConfigSnapshot {
   version: number;
-  identity_path?: string | null;
-  networks: NetworkConfigInput[];
-  // Other fields (auto_update, auto_cleanup, daemon) exist on the
-  // wire but aren't surfaced in the UI yet; ignore them.
-  [key: string]: unknown;
+  identity_path: string | null;
+  auto_update: AutoUpdateConfig;
+  auto_cleanup: AutoCleanupConfig;
+  daemon: DaemonConfig;
+  services: ServicesConfig;
+  networks: NetworkConfigSnapshot[];
 }
 
 // ---- infrastructure services (signaling / STUN / TURN) ---------------
@@ -193,6 +325,9 @@ export interface TurnServiceConfig {
   /** Per-connection (per-allocation) relayed-bandwidth cap in bytes per
    *  second, each direction. 0 = unlimited. */
   max_bps_per_connection: number;
+  /** Inclusive UDP allocation window. min=0 uses the OS ephemeral range. */
+  relay_port_min: number;
+  relay_port_max: number;
 }
 
 export interface ServicesConfig {
@@ -203,7 +338,7 @@ export interface ServicesConfig {
   turn: TurnServiceConfig;
 }
 
-/** Live activity for the signaling relay — `connections: 0` is the tell
+/** Live activity for the signaling relay â€” `connections: 0` is the tell
  *  that peers aren't reaching it (DNS / TLS / firewall). */
 export interface RelayStatsSnapshot {
   connections: number;
@@ -213,7 +348,7 @@ export interface RelayStatsSnapshot {
 }
 
 /** Live status of one network-listener service (signaling / STUN /
- *  TURN). `running` differs from `enabled` when a start failed — e.g. a
+ *  TURN). `running` differs from `enabled` when a start failed â€” e.g. a
  *  port already in use, or TURN enabled without credentials. `activity`
  *  is present only for the signaling relay. */
 export interface EndpointReport {
@@ -255,7 +390,7 @@ export type PeerStatus =
   | "offline"
   | "error";
 
-// Serialised tier — the Rust enum uses serde's externally tagged form
+// Serialised tier â€” the Rust enum uses serde's externally tagged form
 // for tuple-style variants. We only inspect the discriminant tag in
 // the UI, so a coarse `Record<string, unknown>` is enough.
 export type ConnectionTier =
@@ -298,11 +433,11 @@ export interface PeerInfo {
    *  distinct "suffix" tile during pending-approval, where users
    *  read it aloud to confirm the right device is on the other end. */
   device_suffix: string;
-  /** Verification code the PEER sent us in their `hello` — i.e.
+  /** Verification code the PEER sent us in their `hello` â€” i.e.
    *  the peer's own code, displayed as "theirs" in the approval
    *  UI. 6 chars `[a-z0-9]`. `null` until we receive their hello. */
   verification_code_received: string | null;
-  /** Verification code WE sent the peer in our `hello` — i.e. our
+  /** Verification code WE sent the peer in our `hello` â€” i.e. our
    *  own code, displayed as "ours" in the approval UI. The pair
    *  (received, sent) is what the user reads aloud to the other
    *  side: both sides display the same four values (this device's
@@ -318,16 +453,16 @@ export interface PeerInfo {
   local_approve_sent: boolean;
   /** True once the peer has sent us their Approve. When set while
    *  `local_approve_sent` is still false, the UI surfaces "the
-   *  peer has already approved you — confirm to complete." */
+   *  peer has already approved you â€” confirm to complete." */
   remote_approve_seen: boolean;
   /** Engine has decided the peer is unreachable without a TURN
-   *  relay — repeated ICE failures and zero relay candidates on
+   *  relay â€” repeated ICE failures and zero relay candidates on
    *  either side. The graph paints a "needs TURN" badge on these
    *  so the user doesn't have to grep the Activity log to learn
    *  why the data pipe never comes up. */
   needs_turn: boolean;
   /** Counts of ICE candidate kinds we gathered locally for this
-   *  peer. The graph uses them to decide how to draw the link —
+   *  peer. The graph uses them to decide how to draw the link â€”
    *  host-host pairs sit next to "you" as LAN; anything with srflx
    *  or relay sits on the far side of the Internet node. */
   local_candidates: IceCandidateStats;
@@ -337,7 +472,7 @@ export interface PeerInfo {
   remote_candidates: IceCandidateStats;
   /** The ICE candidate pair the agent actually selected for sending
    *  packets. Set once ICE reaches Connected. Authoritative input
-   *  for link classification — supersedes the heuristic over
+   *  for link classification â€” supersedes the heuristic over
    *  `local_candidates` / `remote_candidates`. */
   selected_pair: SelectedCandidatePair | null;
 }
@@ -362,7 +497,7 @@ export interface IceCandidateStats {
   unknown: number;
 }
 
-/** Coarse classification of the link to a peer — drives where the
+/** Coarse classification of the link to a peer â€” drives where the
  *  peer node is placed on the graph and how the edge is drawn.
  *
  *   - `lan`     direct: both sides surfaced a host candidate, no
@@ -372,7 +507,7 @@ export interface IceCandidateStats {
  *               through the Internet node.
  *   - `turn`    a relay candidate is in the mix on at least one
  *               side: data path runs through a TURN server.
- *   - `blocked` `needs_turn` flag is set — signaling sees the peer
+ *   - `blocked` `needs_turn` flag is set â€” signaling sees the peer
  *               but ICE can't punch through and there's no relay.
  *   - `unknown` ICE hasn't gathered enough to classify yet, or the
  *               peer is offline/sighted-only. */
@@ -380,17 +515,17 @@ export type LinkKind = "lan" | "stun" | "turn" | "blocked" | "unknown";
 
 /** Infer the link kind from a peer's selected ICE pair + flags.
  *  The selected pair (populated once ICE reaches Connected) is the
- *  authoritative input — gathered-candidate counts only tell us what
+ *  authoritative input â€” gathered-candidate counts only tell us what
  *  was tried. We only fall back to candidate counts when ICE hasn't
  *  reported a selection yet.
  *
- *    1. `needs_turn`                      → `blocked`
- *    2. selected_pair has any relay       → `turn`
- *    3. selected_pair is host ↔ host      → `lan`
- *    4. selected_pair otherwise present   → `stun`
- *    5. no pair yet but relay candidates  → `turn` (best guess)
- *    6. no pair yet, srflx gathered       → `stun`
- *    7. otherwise                         → `unknown` */
+ *    1. `needs_turn`                      â†’ `blocked`
+ *    2. selected_pair has any relay       â†’ `turn`
+ *    3. selected_pair is host â†” host      â†’ `lan`
+ *    4. selected_pair otherwise present   â†’ `stun`
+ *    5. no pair yet but relay candidates  â†’ `turn` (best guess)
+ *    6. no pair yet, srflx gathered       â†’ `stun`
+ *    7. otherwise                         â†’ `unknown` */
 export function linkKindOf(p: PeerInfo): LinkKind {
   if (p.needs_turn) return "blocked";
   const sp = p.selected_pair;
@@ -423,26 +558,22 @@ export interface AuthorizedPeer {
   role: Role;
 }
 
-// ---- governance (closed networks) ------------------------------------
+// ---- governance projection (closed networks) -------------------------
 //
-// These mirror the daemon's signed closed-network state — the kind, the
-// role map, the append-only transition log, and in-flight proposals. The
-// engine owns and enforces all of it (every transition is a signed
-// `network_state_*` frame verified against the quorum table in
-// `docs/NETWORK-TYPES.md`); the GUI reads snapshots through
-// `network-governance.svelte.ts` and issues mutations over the control
-// socket.
+// The GUI exposes config-owned kind/topology and a read-only roster
+// projection. Named role operations and transactional MFA are sent to the
+// daemon over the control socket; no unsigned snapshot or proposal log is
+// treated as authority.
 
 /** Network kind. `open` is the default and matches the engine's
  *  current behaviour. `closed` adds role-based roster authority +
- *  signed network-state transitions. `silent` is open governance with
+ *  role-based authority. `silent` is open governance with
  *  no auto-dial on presence (co-present peers surface as Sighted without
  *  a session until deliberately dialed) and no roster gossip. */
 export type NetworkKind = "open" | "closed" | "silent";
 
-/** Three role tiers in a closed network. Members can only propose;
- *  controllers can add members; owners can add anything and approve
- *  network-kind transitions. */
+/** Three role tiers in a closed network. Named role operations are
+ *  authorized by the daemon according to these tiers. */
 export type Role = "owner" | "controller" | "member";
 
 /** Per-role authority levels, exposed for UI gating logic. Pure
@@ -470,81 +601,11 @@ export function roleColor(r: Role): string {
   }
 }
 
-/** A pending signed-state proposal on a network. Carried in the
- *  governance store + surfaced as Approvals-tab cards on every
- *  member who needs to sign. */
-export interface PendingProposal {
-  id: string;
-  /** Wall-clock ms the proposer floated the proposal. */
-  created_at: number;
-  /** Pubkey of the member who issued the proposal. */
-  proposer: string;
-  variant: PendingProposalVariant;
-  /** Signers who've already ack'd `sign`. Always includes the proposer. */
-  signers: string[];
-  /** Members who've ack'd `deny`. Non-empty = proposal dead. */
-  deniers: string[];
-  /** True once the proposer has fired the split fallback. */
-  split_spawned: boolean;
-}
-
-export type PendingProposalVariant =
-  | { kind: "kind_change"; to: NetworkKind }
-  | { kind: "role_grant"; target: string; to: Role }
-  | { kind: "role_revoke"; target: string }
-  | {
-      kind: "split";
-      /** Deterministic id of the network spawned by this split. */
-      new_network_id: string;
-      /** Members the proposer is bringing into the new closed network. */
-      members: string[];
-    };
-
-/** Snapshot of a network's signed governance state — the kind, the
- *  per-peer role map, the transition log, and any in-flight proposals.
- *  Owned and emitted by the daemon; read here via the control socket. */
-export interface NetworkStateView {
-  kind: NetworkKind;
-  /** Pubkey → role assignments. Pubkeys not in this map default to
-   *  `member`. Open networks keep this empty (the role tag is
-   *  cosmetic when no closed-network rules are enforced). */
-  roles: Record<string, Role>;
-  /** Append-only signed log of every transition this network has
-   *  gone through. Most recent last. Empty on open networks that
-   *  have never gone through a kind change. */
-  transitions: NetworkTransition[];
-  /** Proposals awaiting signatures or in deny/split-fallback. */
-  pending: PendingProposal[];
-  /** Last-known split derivations from this network (each spawning
-   *  a new closed network with the listed members). Used to render
-   *  the "also runs *N'*" chip on the Connections tab. */
-  splits: SplitRecord[];
-  /** Governed topology, when a ratified owner-signed TopologyChange
-   *  owns the network's shape. `null`/absent = not governed — each
-   *  device's local config topology applies (and the local picker in
-   *  network settings stays writable). */
-  topology?: TopologyMode | null;
-}
-
-export interface NetworkTransition {
-  at: number;
-  variant: PendingProposalVariant;
-  /** Pubkeys that signed this transition. */
-  signers: string[];
-}
-
-export interface SplitRecord {
-  new_network_id: string;
-  spawned_at: number;
-  spawned_by: string;
-  members: string[];
-}
-
 // ---- network summary (from NetworksList) -----------------------------
 
 export interface NetworkSummary {
   /** Auto-generated local config record id (`net_<rand>_<stamp>`).
-   *  Stable key for control-protocol ops — NOT the friendly display
+   *  Stable key for control-protocol ops â€” NOT the friendly display
    *  name. Use [`networkDisplayName`] for anything user-facing. */
   config_id: string;
   /** Wire-level rendezvous handle that peers share to find each
@@ -609,6 +670,8 @@ export interface UpdateStatus {
   /** `patch` | `minor` | `all` | `none`. */
   auto_apply: string;
   check_interval_hours: number;
+  feed_request_timeout_ms: number;
+  artifact_download_timeout_ms: number;
   /** Unix seconds of the last successful feed check, or null. */
   last_check_at: number | null;
   /** Version staged and waiting to apply on next daemon start, or null. */
@@ -636,6 +699,8 @@ export interface UpdatePrefs {
   channel?: string;
   auto_apply?: string;
   check_interval_hours?: number;
+  feed_request_timeout_ms?: number;
+  artifact_download_timeout_ms?: number;
   stable_url?: string;
   beta_url?: string;
 }
@@ -645,7 +710,7 @@ export interface UpdatePrefs {
 export type DiagLevel = "debug" | "info" | "warn" | "error";
 
 export interface DiagEntry {
-  /** Unix epoch milliseconds — the time the daemon produced the
+  /** Unix epoch milliseconds â€” the time the daemon produced the
    *  entry, rendered as HH:MM:SS in the Activity log. */
   ts: number;
   network_id: string;
@@ -709,7 +774,7 @@ export type PhaseEvent = {
 
 /** Top-level mesh event. The outer family discriminator is
  *  `event_kind` (not `kind`) because both `PeerEvent` and
- *  `PhaseEvent` use `kind` for their internal variant tag — a
+ *  `PhaseEvent` use `kind` for their internal variant tag â€” a
  *  single `kind` on both layers produced duplicate JSON keys where
  *  the inner one silently won the parse, leaving the GUI unable to
  *  tell families apart. With distinct tag names a consumer first
@@ -721,7 +786,7 @@ export type MeshEvent =
   | { event_kind: "phase"; kind: string; [k: string]: unknown }
   | { event_kind: "diag"; [k: string]: unknown };
 
-// Wrapper emitted by the daemon's event stream — distinguishes a
+// Wrapper emitted by the daemon's event stream â€” distinguishes a
 // regular event from a "lagged" notification (slow subscriber).
 export type StreamFrame =
   | { kind: "event"; event: MeshEvent }

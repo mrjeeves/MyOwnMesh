@@ -1,6 +1,9 @@
 //! The retained local capability advertisement for a joined network.
 
-use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
+use crate::resource::{
+    FiniteResourceProvider, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceLease, ResourceUnavailable,
+};
 
 /// Why a local capability advertisement was not committed.
 pub(crate) enum CapabilityReplaceRefusal {
@@ -44,16 +47,7 @@ impl LocalCapabilityState {
                 "local capability advertisement is too large to account".to_string(),
             )
         })?;
-        let bytes = u64::try_from(encoded_len).map_err(|_| {
-            CapabilityReplaceRefusal::Unavailable(
-                "local capability advertisement is too large to account".to_string(),
-            )
-        })?;
-        let claim = ResourceClaim::try_from_entries([
-            (ResourceClass::AccountedMemoryBytes, bytes),
-            (ResourceClass::OpaqueDependencyResidual, 1),
-        ])
-        .map_err(|_| {
+        let claim = retained_capability_advert_claim(encoded_len).map_err(|_| {
             CapabilityReplaceRefusal::Unavailable(
                 "local capability advertisement claim overflowed".to_string(),
             )
@@ -101,7 +95,51 @@ impl LocalCapabilityState {
     }
 }
 
+fn retained_capability_advert_claim(
+    encoded_len: usize,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let bytes = u64::try_from(encoded_len).map_err(|_| ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+/// Exact provider planning charge for one retained local capability advert.
+///
+/// `encoded_len` is the value returned by the production advertisement
+/// measurement, not a guessed object size. The helper applies the same
+/// reservation bookkeeping charge the production provider adds at admission,
+/// so an external finite fixture can fund the retained gateway advert without
+/// restating either production formula.
+pub fn capability_advert_planning_claim(
+    encoded_len: usize,
+) -> Result<ResourceClaim, ResourceUnavailable> {
+    let claim = retained_capability_advert_claim(encoded_len).map_err(|_| {
+        ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
 impl super::ApplicationGateway {
+    /// Queue a committed local advertisement for the engine's exact per-owner
+    /// fan-out. The gateway owns the application value; the engine owns the
+    /// transport command and its bounded execution lifecycle.
+    pub(crate) fn fanout_capabilities(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        caps: crate::protocol::CapabilityAdvert,
+    ) -> crate::error::Result<()> {
+        Ok(state
+            .cmd_tx
+            .send(crate::engine::state::NetworkCmd::FanoutCapabilities { caps })
+            .map_err(|error| error.into_admission_error())?)
+    }
+
     /// Replace the retained advert only while this gateway is still live.
     ///
     /// The second close check is under the same mutex that `clear` takes. A

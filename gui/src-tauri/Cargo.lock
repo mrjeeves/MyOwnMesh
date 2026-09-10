@@ -1870,11 +1870,12 @@ dependencies = [
 
 [[package]]
 name = "myownmesh-gui"
-version = "0.3.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
  "interprocess",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1885,6 +1886,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -8,8 +8,13 @@
 //! # Quick tour
 //!
 //! ```no_run
-//! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
-//! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
+//! # async fn _ex(
+//! #     connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
+//! #     semantic_policy: myownmesh_core::config::SemanticPolicyConfig,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
+//! use myownmesh_core::{
+//!     HubIntroductionPolicyConfig, Mesh, MeshConfig, NetworkConfig, TopologyMode,
+//! };
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
 //! let mesh = Mesh::open_connector_capable(
@@ -24,17 +29,26 @@
 //!     network_id: "my-mesh".into(),
 //!     label: "Home".into(),
 //!     kind: Default::default(),                            // Open (default)
+//!     scheduler: Default::default(),
+//!     // Resource retention is an owner decision; the library supplies no
+//!     // hidden production ceiling.
+//!     semantic_policy,
+//!     introduction: None,
+//!     tree: None,
+//!     hub: None,
+//!     local_observations: None,
+//!     event_capacity: 256,
+//!     connection_trace_capacity: 512,
 //!     topology: TopologyMode::default(),
 //!     signaling: Default::default(),
 //!     stun_servers: Default::default(),
 //!     turn_servers: Default::default(),
-//!     roster_path: None,
 //!     pinned_peers: Vec::new(),
 //!     auto_approve: false,
 //! }).await?;
 //!
 //! // Attach a signaling driver.
-//! let _nostr = myownmesh_core::engine::attach_nostr(&net.state());
+//! let _drivers = net.attach_signaling()?;
 //!
 //! // Subscribe to events.
 //! let mut events = mesh.events();
@@ -50,9 +64,10 @@
 //! - [`Identity`] — long-lived ed25519 device identity persisted at
 //!   `~/.myownmesh/.secrets/identity.json` (mode 0600 on Unix). The
 //!   public key is the Device ID surfaced on the wire.
-//! - [`Roster`] — per-network list of approved peer Device IDs.
-//!   Reconnects from rostered peers auto-allow without re-prompting
-//!   the user.
+//! - [`Roster`] — per-network local/UI projection of peer metadata derived
+//!   from canonical signed policy. It is not an admission authority: a
+//!   reconnect is admitted only when canonical policy permits it and the
+//!   explicit `NetworkConfig::auto_approve` setting is enabled.
 //! - [`protocol`] — wire format: `hello` / `auth_response` / `approve`
 //!   / `deny` / `ping` / `pong` / `shelve` / `unshelve` /
 //!   `capabilities_update` / generic RPC frames. See `docs/PROTOCOL.md`.
@@ -99,8 +114,8 @@
 //!
 //! A user-visible 6-char verification code lets a human
 //! eyeball-confirm the handshake over voice/video at first-meeting
-//! time; thereafter the peer's pubkey is in the roster and
-//! auto-approved on reconnect.
+//! time; subsequent reconnect approval still requires the exact canonical
+//! policy and the explicit `NetworkConfig::auto_approve` setting.
 //!
 //! # Where to look next
 //!
@@ -125,7 +140,6 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
-pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
 pub mod realtime;
@@ -133,41 +147,46 @@ pub mod resource;
 pub mod roster;
 pub mod rpc;
 pub mod runtime;
+/// Canonical V4 durable semantic facts and authority. Roster values are
+/// advisory projections, not an independent source of authority or fact identity.
+pub mod semantic;
 pub mod services;
 pub mod signing;
 pub mod topology;
 pub mod transport;
 pub mod verification;
 
+pub use application_gateway::capability_advert_planning_claim;
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, ServicesConfig,
-    SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode,
-    TurnCredential, TurnServer, TurnServiceConfig,
+    AutoUpdateConfig, HubIntroductionPolicyConfig, MeshConfig, NetworkConfig, NetworkKind,
+    NodeServiceConfig, ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer,
+    StunServiceConfig, TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
-/// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
-/// it answers the same question under a different contract: measured before it
-/// is built, and refusable at four separate points.
+pub use engine::signaling_bridge::{
+    mdns_connection_identity_planning_claim, mdns_connection_planning_claim,
+};
+/// Common error and result types for core operations.
 pub use error::{Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
+pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 /// The real-link fixture owner, exported at the root for the same reason the
 /// fixture exists: the controls that need it live in another crate.
 #[cfg(feature = "transport-lab")]
-pub use handle::TransportLabPromotedPeer;
-pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
-pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
-pub use network_state::{
-    NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
-    SIGN_DOMAIN_TAG_STATE,
+pub use handle::{
+    TransportLabIntroductionPhase, TransportLabIntroductionRecord,
+    TransportLabIntroductionSnapshot, TransportLabPromotedPeer, TransportLabRetirableSession,
 };
+pub use identity::{generate_network_id, normalize_device_id, normalize_network_id, Identity};
+pub use myownmesh_signaling::local::LocalBroker;
 pub use protocol::CapabilityAdvert;
 pub use resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim,
-    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
-    serialized_mailbox_item_claim_as, FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap,
-    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    checked_measure_add, mailbox_measure_serialized, measure_serialized_mailbox_item,
+    measure_serialized_mailbox_item_after_funded, prepare_resource_mailbox, resource_mailbox,
+    FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap, LeasedMapInsertRefusal,
+    LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError, MailboxMeasurement,
     PreparedResourceMailbox, ProcessResourceRoot, ResourceAuthorityClass, ResourceClaim,
     ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
     ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
@@ -178,13 +197,16 @@ pub use resource::{
     RESOURCE_CLASS_COUNT,
 };
 pub use roster::{AuthorizedPeer, Roster};
-pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
+pub use rpc::{
+    rpc_dispatcher_attachment_planning_claim, rpc_dispatcher_planning_claim, Rpc, RpcCall,
+    RpcError, RpcResponse,
+};
 pub use runtime::attempt::{
     connector_resource_structural_claims, ConnectorCallbackPolicy, ConnectorResourceOwnerPort,
     ConnectorResourceOwnerReport, ConnectorResourceStructuralClaims, MeshConnectorResourceReport,
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
-pub use runtime::session_broker::session_reservation_planning_claim;
+pub use runtime::session_broker::session_reservation_planning_claim_for_correlation;
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]
@@ -193,17 +215,19 @@ pub use transport::{
     transport_lab_remote_description_fixture_grant, TransportLabCallbackGrant,
     TransportLabCallbackWorkload, TransportLabRealtimeWorkload,
 };
-/// Every realtime name at the crate root is `WebRtc`-qualified.
+/// Provider-specific realtime names at the crate root are `WebRtc`-qualified;
+/// the one unqualified `RealtimeInboundArrival` is the provider-neutral tagged
+/// mixed-stream boundary and carries either a WebRTC RTP or opaque arrival.
 ///
 /// The generic realtime vocabulary lives in [`realtime`] and names no codec, no
 /// media kind and no RTP fact; everything that does is a property of the WebRTC
 /// provider and says so in its own name. There is no unqualified spelling and no
 /// compatibility alias — a caller names the qualified type or does not compile.
 pub use transport::{
-    WebRtcConnectorProfile, WebRtcConnectorProfileError, WebRtcRealtimeCodec,
-    WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming, WebRtcRealtimeInboundArrival,
-    WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit, WebRtcRealtimeProfile,
-    WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
+    RealtimeInboundArrival, WebRtcConnectorProfile, WebRtcConnectorProfileError,
+    WebRtcRealtimeCodec, WebRtcRealtimeFlowOpen, WebRtcRealtimeFraming,
+    WebRtcRealtimeInboundArrival, WebRtcRealtimeInboundUnit, WebRtcRealtimeOutboundUnit,
+    WebRtcRealtimeProfile, WebRtcRealtimeProfileError, WebRtcRealtimeRtcpFeedback, WebRtcRtpKind,
 };
 
 /// App-id used to derive the Trystero room handle. Two MyOwnMesh peers
@@ -213,7 +237,8 @@ pub use transport::{
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version for the one current alpha profile. A receiver refuses
-/// any kind this build does not implement; there is no feature-negotiated or
-/// mixed-version fallback. Bump when the closed profile's wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire-protocol version for the current direct-peer profile. A receiver
+/// refuses a previous, future, or missing version before endpoint
+/// authentication; there is no feature-negotiated or mixed-version fallback.
+/// This bump records removal of the legacy member-relay wire set.
+pub const PROTOCOL_VERSION: u32 = 3;

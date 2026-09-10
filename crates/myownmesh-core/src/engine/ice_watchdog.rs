@@ -1,5 +1,5 @@
 //! Tier 2.5 — per-peer ICE watchdog. Fires at
-//! `ICE_DISCONNECTED_RESTART_MS` after a peer's ICE state goes
+//! the configured disconnected-restart interval after a peer's ICE state goes
 //! `disconnected` — earlier than the underlying WebRTC stack's
 //! own consent-freshness timer would notice a stale network.
 //!
@@ -20,9 +20,6 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
 use super::peer_registry::PeerOwnerToken;
-use super::scheduler::{
-    DATA_CHANNEL_OPEN_TIMEOUT_MS, ICE_DISCONNECTED_RESTART_MS, RESTART_TRAFFIC_GRACE_MS,
-};
 use super::state::NetworkState;
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
@@ -38,6 +35,11 @@ const NO_TURN_DIAG_AFTER_FAILURES: u32 = 3;
 /// threshold. Cheap to call on every tick: it's an O(N) scan
 /// over the peers map with no per-peer locks held across awaits.
 pub async fn poll_all(state: &Arc<NetworkState>) {
+    let policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     let now = Instant::now();
     let candidates: Vec<String> = state.peers.collect_map(|peer| {
         let data = peer.state.read();
@@ -45,7 +47,9 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             return None;
         }
         let since = data.ice_disconnected_since?;
-        if now.saturating_duration_since(since).as_millis() as u64 >= ICE_DISCONNECTED_RESTART_MS {
+        if now.saturating_duration_since(since).as_millis() as u64
+            >= policy.ice_disconnected_restart_ms
+        {
             Some(peer.device_id.clone())
         } else {
             None
@@ -101,7 +105,7 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // trail. Self-limiting: a peer only sits in Checking briefly before it
     // connects, fails, or hits the connect-timeout.
     let checking: Vec<String> = state.peers.collect_map(|peer| {
-        let session = peer.session.lock().clone()?;
+        let session = peer.current_worker()?;
         if session.ice_connection_state() == RTCIceConnectionState::Checking {
             Some(peer.device_id.clone())
         } else {
@@ -126,7 +130,8 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             return None;
         }
         let started = data.session_started_at?;
-        (now.saturating_duration_since(started).as_millis() as u64 >= DATA_CHANNEL_OPEN_TIMEOUT_MS)
+        (now.saturating_duration_since(started).as_millis() as u64
+            >= policy.data_channel_open_timeout_ms)
             .then(|| peer.device_id.clone())
     });
     for peer_id in timed_out {
@@ -147,21 +152,16 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             ConnectionTier::IceRestart { started } => started,
             _ => return None,
         };
-        let ice_up = peer
-            .session
-            .lock()
-            .as_ref()
-            .map(|s| {
-                matches!(
-                    s.ice_connection_state(),
-                    RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
-                )
-            })
-            .unwrap_or(false);
+        let ice_up = peer.current_worker().is_some_and(|session| {
+            matches!(
+                session.ice_connection_state(),
+                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+            )
+        });
         let deadline = if ice_up {
-            RESTART_TRAFFIC_GRACE_MS
+            policy.restart_traffic_grace_ms
         } else {
-            DATA_CHANNEL_OPEN_TIMEOUT_MS
+            policy.data_channel_open_timeout_ms
         };
         (now.saturating_duration_since(started).as_millis() as u64 >= deadline)
             .then(|| peer.device_id.clone())
@@ -186,6 +186,11 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
 /// unblocks candidate delivery for the rebuilt session. The re-announce is
 /// rate-limited so a wave of timeouts can't flood the relays.
 async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
+    let policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     // While the host is offline (no primary interface) every peer will time
     // out, but tearing them all down now just means re-discovering them a
     // second later when the interface returns. Hold in place — the
@@ -199,12 +204,12 @@ async fn on_connect_timeout(state: &Arc<NetworkState>, device_id: &str) {
         "ice",
         format!(
             "data channel never opened within {}s for {} — rebuilding",
-            DATA_CHANNEL_OPEN_TIMEOUT_MS / 1000,
+            policy.data_channel_open_timeout_ms / 1000,
             super::short_peer(device_id),
         ),
         serde_json::json!({
             "peer": device_id,
-            "connect_timeout_ms": DATA_CHANNEL_OPEN_TIMEOUT_MS,
+            "connect_timeout_ms": policy.data_channel_open_timeout_ms,
         }),
     );
     // The full snapshot (candidates + per-pair states + a plain-language

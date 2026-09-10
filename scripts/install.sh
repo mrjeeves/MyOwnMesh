@@ -72,22 +72,40 @@ fi
 
 install_binary() {
   src="$1"
-  mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
+  if ! mkdir -p "$PREFIX_DIR" 2>/dev/null && ! sudo mkdir -p "$PREFIX_DIR"; then
+    err "Could not create install prefix: $PREFIX_DIR"
+    return 1
+  fi
   if [ -w "$PREFIX_DIR" ]; then
-    install -m 0755 "$src" "$PREFIX_DIR/myownmesh"
+    if ! install -m 0755 "$src" "$PREFIX_DIR/myownmesh"; then
+      err "Could not install daemon binary: $PREFIX_DIR/myownmesh"
+      return 1
+    fi
   else
-    sudo install -m 0755 "$src" "$PREFIX_DIR/myownmesh"
+    if ! sudo install -m 0755 "$src" "$PREFIX_DIR/myownmesh"; then
+      err "Could not install daemon binary: $PREFIX_DIR/myownmesh"
+      return 1
+    fi
   fi
   log "Installed: $PREFIX_DIR/myownmesh"
 }
 
 install_gui_binary() {
   src="$1"
-  mkdir -p "$PREFIX_DIR" 2>/dev/null || sudo mkdir -p "$PREFIX_DIR"
+  if ! mkdir -p "$PREFIX_DIR" 2>/dev/null && ! sudo mkdir -p "$PREFIX_DIR"; then
+    err "Could not create install prefix: $PREFIX_DIR"
+    return 1
+  fi
   if [ -w "$PREFIX_DIR" ]; then
-    install -m 0755 "$src" "$PREFIX_DIR/myownmesh-gui"
+    if ! install -m 0755 "$src" "$PREFIX_DIR/myownmesh-gui"; then
+      err "Could not install GUI binary: $PREFIX_DIR/myownmesh-gui"
+      return 1
+    fi
   else
-    sudo install -m 0755 "$src" "$PREFIX_DIR/myownmesh-gui"
+    if ! sudo install -m 0755 "$src" "$PREFIX_DIR/myownmesh-gui"; then
+      err "Could not install GUI binary: $PREFIX_DIR/myownmesh-gui"
+      return 1
+    fi
   fi
   log "Installed: $PREFIX_DIR/myownmesh-gui"
 }
@@ -138,6 +156,63 @@ _cleanup_try_release() {
   _TRY_RELEASE_TMP=""
 }
 
+verify_sha256_sidecar() {
+  _sha_payload="$1"
+  _sha_sidecar="$2"
+  _sha_name="$3"
+
+  if [ ! -f "$_sha_payload" ]; then
+    err "Checksum payload is missing: $_sha_name"
+    return 1
+  fi
+  if [ ! -f "$_sha_sidecar" ]; then
+    err "SHA256 sidecar is missing for $_sha_name"
+    return 1
+  fi
+  if ! _sha_expected="$(awk -v expected="$_sha_name" '
+    NR != 1 { valid = 0; next }
+    NF != 2 { valid = 0; next }
+    {
+      hash = $1
+      name = $2
+      sub(/^\*/, "", name)
+      if (length(hash) != 64 || hash ~ /[^0-9A-Fa-f]/ || name != expected) {
+        valid = 0
+      } else {
+        valid = 1
+      }
+    }
+    END {
+      if (NR != 1 || valid != 1) exit 1
+      print tolower(hash)
+    }
+  ' "$_sha_sidecar" 2>/dev/null)"; then
+    err "Malformed or orphaned SHA256 sidecar for $_sha_name"
+    return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    if ! _sha_actual="$(sha256sum "$_sha_payload" | awk '{print tolower($1)}')"; then
+      err "Unable to hash $_sha_name"
+      return 1
+    fi
+  elif command -v shasum >/dev/null 2>&1; then
+    if ! _sha_actual="$(shasum -a 256 "$_sha_payload" | awk '{print tolower($1)}')"; then
+      err "Unable to hash $_sha_name"
+      return 1
+    fi
+  else
+    err "No SHA-256 implementation is available; refusing $_sha_name"
+    return 1
+  fi
+
+  if [ "$_sha_expected" != "$_sha_actual" ]; then
+    err "SHA256 mismatch for $_sha_name"
+    return 1
+  fi
+  log "SHA256 OK"
+}
+
 try_release() {
   if ! command -v curl >/dev/null 2>&1; then
     warn "curl missing; skipping release download."
@@ -161,17 +236,37 @@ try_release() {
     return 0
   fi
   _TRY_RELEASE_TMP="$(mktemp -d)"
-  trap _cleanup_try_release EXIT INT TERM
-  curl -fsSL "$url" -o "$_TRY_RELEASE_TMP/$ASSET"
-  if curl -fsSL "$sha_url" -o "$_TRY_RELEASE_TMP/$ASSET.sha256" 2>/dev/null; then
-    (cd "$_TRY_RELEASE_TMP" && (sha256sum -c "$ASSET.sha256" 2>/dev/null || shasum -a 256 -c "$ASSET.sha256"))
-  else
-    warn "No SHA256 sidecar; skipping integrity check."
+  trap _cleanup_try_release 0 2 15
+  if ! curl -fsSL "$url" -o "$_TRY_RELEASE_TMP/$ASSET"; then
+    err "Failed to download $ASSET; refusing release install."
+    _cleanup_try_release
+    trap - 0 2 15
+    return 1
   fi
-  tar -xzf "$_TRY_RELEASE_TMP/$ASSET" -C "$_TRY_RELEASE_TMP"
-  install_binary "$_TRY_RELEASE_TMP/myownmesh"
+  if ! curl -fsSL "$sha_url" -o "$_TRY_RELEASE_TMP/$ASSET.sha256" 2>/dev/null; then
+    err "SHA256 sidecar is missing for $ASSET; refusing release install."
+    _cleanup_try_release
+    trap - 0 2 15
+    return 1
+  fi
+  if ! verify_sha256_sidecar "$_TRY_RELEASE_TMP/$ASSET" "$_TRY_RELEASE_TMP/$ASSET.sha256" "$ASSET"; then
+    _cleanup_try_release
+    trap - 0 2 15
+    return 1
+  fi
+  if ! tar -xzf "$_TRY_RELEASE_TMP/$ASSET" -C "$_TRY_RELEASE_TMP"; then
+    err "Failed to extract $ASSET; refusing release install."
+    _cleanup_try_release
+    trap - 0 2 15
+    return 1
+  fi
+  if ! install_binary "$_TRY_RELEASE_TMP/myownmesh"; then
+    _cleanup_try_release
+    trap - 0 2 15
+    return 1
+  fi
   _cleanup_try_release
-  trap - EXIT INT TERM
+  trap - 0 2 15
   return 0
 }
 
@@ -209,17 +304,37 @@ try_release_gui() {
     return 0
   fi
   _TRY_GUI_TMP="$(mktemp -d)"
-  trap _cleanup_try_gui EXIT INT TERM
-  curl -fsSL "$url" -o "$_TRY_GUI_TMP/$GUI_ASSET"
-  if curl -fsSL "$sha_url" -o "$_TRY_GUI_TMP/$GUI_ASSET.sha256" 2>/dev/null; then
-    (cd "$_TRY_GUI_TMP" && (sha256sum -c "$GUI_ASSET.sha256" 2>/dev/null || shasum -a 256 -c "$GUI_ASSET.sha256"))
-  else
-    warn "No SHA256 sidecar for GUI; skipping integrity check."
+  trap _cleanup_try_gui 0 2 15
+  if ! curl -fsSL "$url" -o "$_TRY_GUI_TMP/$GUI_ASSET"; then
+    err "Failed to download $GUI_ASSET; refusing GUI release install."
+    _cleanup_try_gui
+    trap - 0 2 15
+    return 1
   fi
-  tar -xzf "$_TRY_GUI_TMP/$GUI_ASSET" -C "$_TRY_GUI_TMP"
-  install_gui_binary "$_TRY_GUI_TMP/myownmesh-gui"
+  if ! curl -fsSL "$sha_url" -o "$_TRY_GUI_TMP/$GUI_ASSET.sha256" 2>/dev/null; then
+    err "SHA256 sidecar is missing for $GUI_ASSET; refusing GUI release install."
+    _cleanup_try_gui
+    trap - 0 2 15
+    return 1
+  fi
+  if ! verify_sha256_sidecar "$_TRY_GUI_TMP/$GUI_ASSET" "$_TRY_GUI_TMP/$GUI_ASSET.sha256" "$GUI_ASSET"; then
+    _cleanup_try_gui
+    trap - 0 2 15
+    return 1
+  fi
+  if ! tar -xzf "$_TRY_GUI_TMP/$GUI_ASSET" -C "$_TRY_GUI_TMP"; then
+    err "Failed to extract $GUI_ASSET; refusing GUI release install."
+    _cleanup_try_gui
+    trap - 0 2 15
+    return 1
+  fi
+  if ! install_gui_binary "$_TRY_GUI_TMP/myownmesh-gui"; then
+    _cleanup_try_gui
+    trap - 0 2 15
+    return 1
+  fi
   _cleanup_try_gui
-  trap - EXIT INT TERM
+  trap - 0 2 15
   return 0
 }
 

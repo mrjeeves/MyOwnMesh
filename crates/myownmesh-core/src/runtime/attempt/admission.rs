@@ -7,6 +7,35 @@ pub(super) struct ConnectorCandidateReservation {
 }
 
 impl ConnectorCandidateReservation {
+    fn late_transport_custodian_claim(
+    ) -> Result<crate::resource::ResourceClaim, crate::resource::ResourceUnavailable> {
+        super::resource_owner::late_transport_custodian_claim().map_err(|error| {
+            crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: match error {
+                    crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                    | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                        dimension
+                    }
+                },
+            }
+        })
+    }
+
+    fn current_claim(&self) -> crate::resource::ResourceClaim {
+        let full = {
+            let lease = self
+                .state
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lease
+                .as_ref()
+                .expect("a live connector candidate owns one resource lease")
+                .claim()
+        };
+        full
+    }
+
     fn release_after_cleanup_success(&mut self) {
         let mut cleanup = self
             .state
@@ -75,16 +104,12 @@ impl ConnectorCandidateReservation {
             .lease
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lease.is_none() {
+        let Some(lease_ref) = lease.as_mut() else {
             return;
-        }
-        if lease.as_ref().is_some_and(|lease| {
-            lease.authority() != crate::resource::ResourceAuthorityClass::Cleanup
-        }) {
-            let claim = lease.as_ref().expect("checked above").claim();
-            if lease
-                .as_mut()
-                .expect("checked above")
+        };
+        if lease_ref.authority() != crate::resource::ResourceAuthorityClass::Cleanup {
+            let claim = lease_ref.claim();
+            if lease_ref
                 .transition_to(crate::resource::ResourceAuthorityClass::Cleanup, claim)
                 .is_err()
             {
@@ -94,9 +119,7 @@ impl ConnectorCandidateReservation {
                 );
             }
         }
-        let lease = lease
-            .take()
-            .expect("the cleanup failure still owns its exact lease");
+        let Some(lease) = lease.take() else { return };
         retain_failed_reservation(
             lease,
             &self.state.process_diagnostics,
@@ -183,13 +206,11 @@ impl Drop for ConnectorCleanupCapability {
 /// The private field prevents public IDs, wire values, and serialized state
 /// from being treated as a permit. The permit is intentionally neither
 /// `Clone` nor serializable.
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 pub struct PreAuthAttemptPermit {
     pub(super) attempt: Arc<AttemptOwnership>,
     pub(super) resource_scope: MeshConnectorResourceScope,
 }
 
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 impl PreAuthAttemptPermit {
     // The attempt owner will call this only after the resource owner admits
     // the work. It stays private until that production port is migrated.
@@ -222,6 +243,7 @@ impl PreAuthAttemptPermit {
     /// The attempt permit remains alive and may issue more child reservations
     /// from the same aggregate. The closure is never called when admission
     /// fails.
+    #[cfg(test)]
     pub(super) fn allocate_connector_candidate<T>(
         &self,
         claim: ConnectorCandidateResourceClaim,
@@ -234,6 +256,11 @@ impl PreAuthAttemptPermit {
 
     /// Reserve the opening claim before asynchronous connector construction.
     /// The attempt permit remains available for other racing candidates.
+    ///
+    /// This lossy Option adapter exists only for in-crate fixtures. Production
+    /// callers use [`Self::reserve_connector_candidate_checked`] so provider
+    /// pressure remains distinct from an attempt that retired in the race.
+    #[cfg(test)]
     pub(crate) fn reserve_connector_candidate(
         &self,
         claim: ConnectorCandidateResourceClaim,
@@ -243,9 +270,9 @@ impl PreAuthAttemptPermit {
             .flatten()
     }
 
-    /// Typed provider admission used by the connector owner. Compatibility
-    /// call sites may temporarily map this error to `None`, but the resource
-    /// dimension is preserved here.
+    /// Typed provider admission used by the connector owner. A retired
+    /// attempt returns `Ok(None)`; provider pressure remains the typed
+    /// `Err(ResourceUnavailable)` path and is never collapsed by production.
     pub(crate) fn reserve_connector_candidate_checked(
         &self,
         claim: ConnectorCandidateResourceClaim,
@@ -261,6 +288,10 @@ impl PreAuthAttemptPermit {
             attempt: Arc::clone(&self.attempt),
             reservation,
             connected_claim: claim.connected,
+            late_transport_lease: None,
+            late_transport_claim: None,
+            #[cfg(test)]
+            split_before_custodian_acquire: None,
         }))
     }
 }
@@ -296,14 +327,18 @@ pub(crate) fn admit_single_connector_candidate(
 /// let public_peer_id = String::new();
 /// let _candidate = ConnectorCandidateCapability::from(public_peer_id);
 /// ```
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 pub struct ConnectorCandidateCapability {
     attempt: Arc<AttemptOwnership>,
     reservation: ConnectorCandidateReservation,
     connected_claim: crate::resource::ResourceClaim,
+    late_transport_lease: Option<crate::resource::ResourceLease>,
+    /// This marker survives moving the lease into the close owner. Promotion
+    /// uses the already-residual connected claim exactly once.
+    late_transport_claim: Option<crate::resource::ResourceClaim>,
+    #[cfg(test)]
+    split_before_custodian_acquire: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 impl ConnectorCandidateCapability {
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
         &self.attempt.runtime
@@ -315,12 +350,83 @@ impl ConnectorCandidateCapability {
         }
     }
 
+    pub(crate) fn prepare_late_transport_custodian(
+        mut self,
+    ) -> Result<Self, crate::resource::ResourceUnavailable> {
+        if self.late_transport_claim.is_some() {
+            return Ok(self);
+        }
+        let custodian = ConnectorCandidateReservation::late_transport_custodian_claim()?;
+        let opening = self.reservation.current_claim();
+        let residual_opening = opening.checked_sub(custodian).map_err(|error| {
+            crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: match error {
+                    crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                    | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                        dimension
+                    }
+                },
+            }
+        })?;
+        let residual_connected =
+            self.connected_claim
+                .checked_sub(custodian)
+                .map_err(
+                    |error| crate::resource::ResourceUnavailable::ProviderInvariant {
+                        dimension: match error {
+                            crate::resource::ResourceClaimArithmeticError::Overflow {
+                                dimension,
+                            }
+                            | crate::resource::ResourceClaimArithmeticError::Underflow {
+                                dimension,
+                            } => dimension,
+                        },
+                    },
+                )?;
+
+        self.reservation.transition(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            residual_opening,
+        )?;
+        #[cfg(test)]
+        if let Some(hook) = self.split_before_custodian_acquire.take() {
+            hook();
+        }
+        let lease = self.reservation.state.work_scope.acquire(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            custodian,
+        )?;
+        self.connected_claim = residual_connected;
+        self.late_transport_claim = Some(custodian);
+        self.late_transport_lease = Some(lease);
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_split_before_custodian_acquire_hook(
+        &mut self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.split_before_custodian_acquire = Some(Box::new(hook));
+    }
+
+    pub(crate) fn take_late_transport_lease(&mut self) -> crate::resource::ResourceLease {
+        assert!(
+            self.late_transport_claim.is_some(),
+            "late transport lease exists only after its exact claim was split"
+        );
+        self.late_transport_lease
+            .take()
+            .expect("candidate reserves one late-transport custodian lease")
+    }
+
     /// Resource authority for callback, parsing, queue, and other work owned
     /// by this exact connector candidate.
     pub(crate) fn work_resource_scope(&self) -> ConnectorWorkResourceScope {
         self.reservation.state.work_scope.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_live(&self) -> bool {
         let Ok(_transition) = self.attempt.transition.lock() else {
             return false;
@@ -344,10 +450,6 @@ impl ConnectorCandidateCapability {
         self.reservation.issue_cleanup_capability()
     }
 
-    pub(crate) fn promote_if_live<T>(self, promote: impl FnOnce(Self) -> T) -> Option<T> {
-        self.try_promote_if_live(promote).ok()
-    }
-
     /// Promote without losing cleanup ownership when retirement or a
     /// fail-closed aggregate refuses the transition.
     #[allow(
@@ -366,11 +468,12 @@ impl ConnectorCandidateCapability {
         if !attempt.active.load(Ordering::Acquire) {
             return Err(self);
         }
+        let promoted_claim = self.connected_claim;
         if self
             .reservation
             .transition(
                 crate::resource::ResourceAuthorityClass::Admitted,
-                self.connected_claim,
+                promoted_claim,
             )
             .is_err()
         {

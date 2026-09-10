@@ -1,0 +1,113 @@
+> Historical upstream investigation retained from `59143cb`. This is not a
+> current V4 contract or candidate qualification result. Legacy media APIs,
+> diagnostic hooks and resource/recovery designs described below may be
+> deliberately superseded; see [integration disposition](UPSTREAM-INTEGRATION-59143cb.md).
+
+# Picture-aware receive repair and IPC handoff
+
+This patch addresses two independently reproduced receive-path failures.
+It does not change bitrate, resolution, FPS, encoder recovery mode, or the
+150 ms RTP repair grace. The binary media protocol is unchanged.
+
+## Repair before handoff
+
+The RTP assembler used to accept late packets only when their timestamp
+already had a pending entry. If every packet of a picture arrived after a
+newer picture, it rejected all of the older picture's repairs. The newer
+picture then remained blocked behind the sequence hole those packets could
+have repaired.
+
+The assembler now inserts a previously unseen older timestamp into a known,
+unretired sequence hole. Its sequence must fall after the emitted anchor and
+between the observed neighboring pictures. It does not rewind the newest
+timestamp or revive retired data. The inserted entry inherits the hole's
+existing deadline, so late arrival cannot buy another repair interval.
+
+The regression `entirely_reordered_picture_is_repaired_before_newer_picture`
+failed on the old implementation and passes with this change, including RTP
+timestamp wraparound. Companion tests cover deadline inheritance and invalid
+sequence boundaries. Existing fragment, marker, sequence-wrap, encrypted
+repair, and genuine-loss bounds remain covered.
+
+## Preserve repaired fragments through IPC
+
+One encoded picture can consist of many paced, marker-delimited RTP samples.
+The daemon-to-client queue formerly counted eight **samples**, so a single
+repaired picture could overflow it while the socket reader was briefly busy.
+A scheduler yield cannot make a blocked socket writable.
+
+Admission now counts distinct `(peer, lane, RTP timestamp)` pictures, retaining
+the eight-slot limit. Audio and unrecognized bodies consume individual slots.
+This intentionally allows more than eight fragments of one picture, while
+bounding total queued payload to the existing 64 MiB wire-body limit and
+metadata to 4096 samples. These are maximum queue bounds, not a target buffer
+level; each body is offered to the writer immediately. The writer can have
+one additional in-flight body, as before. No complete-picture wait or playout
+delay is introduced. Real overflow still orders a discontinuity before
+subsequent video, leaving codec recovery policy with the application.
+
+`repaired_picture_crosses_media_pipe_with_a_temporarily_busy_reader` sends 32
+24 KiB fragments through the actual binary pipe writer, using a 4 KiB duplex
+pipe whose reader remains busy during admission. The legacy eight-sample
+queue rejects the ninth sample; the new path delivers every body in order.
+The bridge regression additionally checks that this release does not invent
+a discontinuity, while a genuinely full picture budget still does. Queue
+tests cover byte, item, peer/lane and audio bounds, and cleanup on disconnect.
+
+### Bounded multi-picture repair release
+
+The eight-picture implementation can still reject a valid release containing
+a discontinuity and fifteen pictures from the existing RTP repair window.
+The production queue now admits those sixteen timestamps. Audio remains
+limited to eight packets, and aggregate byte/sample bounds are unchanged.
+This is a larger maximum queue, not a playout target or a new timer: a blocked
+reader can retain more pictures, while a ready writer drains immediately.
+
+`repair_batch_crosses_busy_media_pipe_without_secondary_loss` runs the actual
+binary pipe writer against a 4 KiB duplex pipe, with three 8 KiB fragments per
+picture. The reader is held busy during admission. The test reproduces drops
+with the eight-picture channel and verifies complete, ordered delivery with
+the production factory. Existing bridge tests check discontinuity ordering
+and rejection beyond the bounded release, including the unchanged audio cap.
+
+This prevents the reproduced secondary local loss; it does not explain the
+initial RTP hole or guarantee that multiple repair releases, competing lanes,
+or a persistently blocked consumer cannot overflow a finite queue.
+
+### Engine fan-out uses the same units
+
+A subsequent receiver-only field check had zero IPC overflows but 52 engine
+video-subscription lag reports during a 3.175-second recovery episode. The
+preceding Tokio broadcast ring still counted sixteen **samples**, so even one
+fragmented picture could exhaust it while the bridge task was briefly busy.
+Cooperative yields do not guarantee that the subscriber runs between sends.
+
+Video fan-out now uses independent, immediately readable subscriber queues,
+bounded to sixteen `(peer, lane, timestamp)` pictures, 64 MiB including peer
+names, and 4096 samples. It never waits for a complete picture or for a reader.
+Oldest samples are evicted on real pressure, with `RecvError::Lagged` delivered
+before remaining samples; the bridge still owns ordered IPC discontinuities.
+Audio and ordinary event broadcasts are unchanged. Payloads use shared `Bytes`,
+not per-subscriber payload copies. No history is replayed to new subscribers.
+
+The core repair regression explicitly fails the old sixteen-sample broadcast
+and preserves gap + fifteen eight-fragment pictures on the corrected fan-out.
+Companion tests cover slow/fast subscriber independence, picture/byte/fragment
+bounds, peer/lane separation, and send/close wakeups. The daemon regression
+passes this burst through both the engine fan-out and actual IPC admission,
+checking that it produces only the original transport discontinuity.
+
+Embedding API note: `NetworkState::subscribe_video` now returns `VideoReceiver`
+instead of Tokio's broadcast receiver. Its async `recv()` retains the same
+sample and `RecvError::{Lagged, Closed}` contract. Direct users of the previous
+concrete receiver type must update that annotation. The media wire protocol
+and AMS client API are unchanged.
+
+## Validation boundary
+
+These tests establish the two specific defects and their corrections. They
+do not identify every possible source of initial RTP loss or scheduling delay,
+and do not prove every observed field stall has the same cause. The application
+must use a daemon containing both changes before a paired field comparison is
+meaningful. No live application settings or processes need to be changed to
+run the focused tests.

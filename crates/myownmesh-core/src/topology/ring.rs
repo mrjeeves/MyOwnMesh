@@ -60,22 +60,60 @@ impl Topology for RingSelector {
         true
     }
 
-    fn next_hops(&self, self_id: &str, dest: &str, connected: &[String]) -> Vec<String> {
-        // Greedy ring routing: hand the frame to the connected peer
-        // lexicographically closest to the destination (the ring is
-        // the sorted id space). The per-node dedup ring and the TTL
-        // make transient disagreement safe.
-        let mut best: Option<(usize, &String)> = None;
-        for c in connected {
-            if signing::pubkey_part(c) == signing::pubkey_part(self_id) {
+    fn next_hops(
+        &self,
+        self_id: &str,
+        dest: &str,
+        connected: &[String],
+        limit: usize,
+    ) -> Vec<String> {
+        let wanted = limit.min(self.n_preferred as usize);
+        if wanted == 0 {
+            return Vec::new();
+        }
+        let self_key = signing::pubkey_part(self_id);
+        let dest_key = signing::pubkey_part(dest);
+        let mut candidates = Vec::with_capacity(wanted);
+        for peer in connected {
+            let key = signing::pubkey_part(peer).to_string();
+            if key == self_key {
                 continue;
             }
-            let d = ring_distance(signing::pubkey_part(c), signing::pubkey_part(dest));
-            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                best = Some((d, c));
+            let candidate = RankedHop {
+                distance: ring_distance(&key, dest_key),
+                key,
+                peer: peer.clone(),
+            };
+            if let Some(existing) = candidates
+                .iter_mut()
+                .find(|existing: &&mut RankedHop| existing.key == candidate.key)
+            {
+                if candidate.peer < existing.peer {
+                    existing.peer = candidate.peer;
+                }
+                continue;
+            }
+            if candidates.len() < wanted {
+                candidates.push(candidate);
+                continue;
+            }
+            let mut worst = 0;
+            for index in 1..candidates.len() {
+                if compare_ranked_hops(&candidates[worst], &candidates[index])
+                    == std::cmp::Ordering::Less
+                {
+                    worst = index;
+                }
+            }
+            if compare_ranked_hops(&candidate, &candidates[worst]) == std::cmp::Ordering::Less {
+                candidates[worst] = candidate;
             }
         }
-        best.map(|(_, c)| vec![c.clone()]).unwrap_or_default()
+        candidates.sort_by(compare_ranked_hops);
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.peer)
+            .collect()
     }
 
     fn flood_ttl(&self) -> u8 {
@@ -297,9 +335,10 @@ mod tests {
     fn next_hops_picks_the_connected_peer_nearest_the_destination() {
         let sel = RingSelector { n_preferred: 3 };
         let connected: Vec<String> = ["bbbb", "cccc"].iter().map(|x| x.to_string()).collect();
-        let hops = sel.next_hops("aaaa", "cccd", &connected);
-        assert_eq!(hops, vec!["cccc".to_string()]);
-        assert!(sel.next_hops("aaaa", "zzzz", &[]).is_empty());
+        let hops = sel.next_hops("aaaa", "cccd", &connected, 3);
+        assert_eq!(hops[0], "cccc");
+        assert_eq!(hops.len(), 2, "available peers remain bounded failover");
+        assert!(sel.next_hops("aaaa", "zzzz", &[], 3).is_empty());
     }
 
     #[test]
@@ -316,4 +355,53 @@ mod tests {
         let r2 = select_ring_neighbors("a", &s(&["f", "e", "d", "c", "b"]), 3);
         assert_eq!(r1, r2);
     }
+
+    #[test]
+    fn next_hops_are_bounded_stable_and_self_free_with_duplicates() {
+        let sel = RingSelector { n_preferred: 2 };
+        let first = vec![
+            "bbbb".to_string(),
+            "cccc".to_string(),
+            "bbbb".to_string(),
+            "aaaa".to_string(),
+        ];
+        let mut reordered = first.clone();
+        reordered.reverse();
+        let a = sel.next_hops("aaaa", "cccd", &first, 2);
+        let b = sel.next_hops("aaaa", "cccd", &reordered, 2);
+        assert_eq!(a, b, "connected input order must not affect failover");
+        assert!(a.len() <= 2);
+        assert!(a.iter().all(|hop| signing::pubkey_part(hop) != "aaaa"));
+        assert_eq!(
+            a.iter()
+                .map(|hop| signing::pubkey_part(hop))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            a.len()
+        );
+    }
+
+    #[test]
+    fn next_hops_honors_zero_one_and_n_limits() {
+        let sel = RingSelector { n_preferred: 3 };
+        let connected = s(&["bbbb", "cccc", "dddd", "eeee"]);
+        assert!(sel.next_hops("aaaa", "cccd", &connected, 0).is_empty());
+        assert_eq!(sel.next_hops("aaaa", "cccd", &connected, 1).len(), 1);
+        assert_eq!(sel.next_hops("aaaa", "cccd", &connected, 3).len(), 3);
+        assert_eq!(sel.next_hops("aaaa", "cccd", &connected, 9).len(), 3);
+    }
+}
+
+#[derive(Debug)]
+struct RankedHop {
+    distance: usize,
+    key: String,
+    peer: String,
+}
+
+fn compare_ranked_hops(left: &RankedHop, right: &RankedHop) -> std::cmp::Ordering {
+    left.distance
+        .cmp(&right.distance)
+        .then_with(|| left.key.cmp(&right.key))
+        .then_with(|| left.peer.cmp(&right.peer))
 }

@@ -88,6 +88,14 @@ const TEST_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 #[cfg(test)]
 const TEST_IPC_CLIENT_MAILBOXES: u64 = 64;
 
+/// IPC task owners this daemon-wide fixture may hold concurrently.
+///
+/// This is a separately named cohort from connector workers. Its reservation
+/// is priced by the IPC task owner, so adding task headroom cannot silently
+/// enlarge the connector capacity.
+#[cfg(test)]
+const TEST_IPC_TASKS: u64 = 16;
+
 /// Outbound frames one fixture client may hold queued at once.
 ///
 /// The mailbox is count-unbounded by design — nothing in the daemon names a
@@ -140,6 +148,13 @@ const TEST_IPC_REGISTRY_COORDINATE_BYTES: usize = 256;
 #[cfg(test)]
 const TEST_CONTROL_INBOUND_FRAMES: u64 = 16;
 
+/// Maximum simultaneously live semantic network owners in one daemon-library
+/// test. The transport pair fixture and the two-network control/registry
+/// fixtures are the largest in this binary; single-network fixtures do not
+/// increase this bound.
+#[cfg(test)]
+const TEST_SEMANTIC_NETWORKS_PER_WORKER: u64 = 2;
+
 /// One explicitly finite provider shared by daemon-library tests.
 ///
 /// These are fixture resources, not production defaults. The callback and
@@ -180,6 +195,21 @@ fn test_resource_pair() -> (
     PROVIDER
         .get_or_init(|| {
             let connectors = TEST_PROCESS_CONNECTOR_CAPACITY as u64;
+            let test_workers = std::env::var("RUST_TEST_THREADS")
+                .ok()
+                .map(|raw| {
+                    raw.parse::<std::num::NonZeroUsize>()
+                        .expect("RUST_TEST_THREADS must be a nonzero integer")
+                })
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .expect("daemon test worker concurrency must be observable")
+                });
+            let test_workers =
+                u64::try_from(test_workers.get()).expect("daemon test workers fit u64");
+            let semantic_owner_count = test_workers
+                .checked_mul(TEST_SEMANTIC_NETWORKS_PER_WORKER)
+                .expect("daemon semantic owner concurrency is representable");
             let callback_items_per_connector = 32_u64;
             // Each class funds its own callback slots from its own stated
             // ceiling, summed — not one figure spread across both.
@@ -286,6 +316,26 @@ fn test_resource_pair() -> (
                 TEST_IPC_REGISTRY_COORDINATE_BYTES,
             )
             .expect("daemon test IPC registry grant is representable");
+            // IPC watchdog and pump tasks are a separate finite cohort from
+            // connector workers. Charge the exact task reservation, including
+            // its provider bookkeeping record, through the owner module rather
+            // than restating its WorkerOrTask shape here.
+            let ipc_tasks = crate::ipc::clients::task_reservation_planning_charge_for_test()
+                .expect("daemon test IPC task reservation is representable")
+                .checked_scale(TEST_IPC_TASKS)
+                .expect("daemon test IPC task cohort grant is representable");
+            // One process-owned route join worker, plus the actual separately
+            // acquired route custody reservations for the existing task cohort.
+            let ipc_route_custody = crate::ipc::clients::route_join_root_planning_charge()
+                .and_then(|root| {
+                    root.checked_add(
+                        crate::ipc::clients::route_custody_planning_charge()?
+                            .checked_scale(TEST_IPC_TASKS)
+                            .map_err(crate::ipc::clients::IpcAdmissionError::Claim)?,
+                    )
+                    .map_err(crate::ipc::clients::IpcAdmissionError::Claim)
+                })
+                .expect("daemon route terminal custody is representable");
             // Inbound control frames, buffered and funded as they are read.
             let control_inbound = myownmesh_core::ResourceClaim::try_from_entries([(
                 myownmesh_core::ResourceClass::AccountedMemoryBytes,
@@ -294,13 +344,69 @@ fn test_resource_pair() -> (
                     .expect("daemon test control inbound grant is representable"),
             )])
             .expect("daemon test control inbound claim is representable");
+            // One embedded daemon per active test worker. Standalone control
+            // fixtures fund their own outside root explicitly instead. These
+            // are the owning modules' exact added claims, not worker headroom.
+            let embedded_cleanup = myownmesh_services::ServiceCleanupOwner::planning_charge()
+                .expect("embedded service root plan")
+                .checked_add(
+                    myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                        crate::embedded::cleanup_storage_claim()
+                            .expect("embedded transfer storage"),
+                    )
+                    .expect("embedded transfer storage normalization"),
+                )
+                .and_then(|claim| claim.checked_scale(test_workers))
+                .expect("one embedded cleanup root per active test worker");
+            // The live-service runtime-destruction embedded control owns one
+            // STUN. Armed-startup/cancelled-shutdown now uses its own private
+            // Mesh/STUN provider, as do the hosted constructor controls.
+            let embedded_stun = myownmesh_services::StunServer::startup_planning_charge()
+                .expect("embedded live STUN constructor plan");
             let claim = structural
                 .checked_add(workload)
                 .and_then(|claim| claim.checked_add(json_input_work))
                 .and_then(|claim| claim.checked_add(ipc_mailboxes))
                 .and_then(|claim| claim.checked_add(ipc_registry))
+                .and_then(|claim| claim.checked_add(ipc_tasks))
+                .and_then(|claim| claim.checked_add(ipc_route_custody))
                 .and_then(|claim| claim.checked_add(control_inbound))
+                .and_then(|claim| claim.checked_add(embedded_cleanup))
+                .and_then(|claim| claim.checked_add(embedded_stun))
                 .expect("daemon test resource grant is representable");
+            // Every live NetworkState retains one semantic database. Charge
+            // the real default policy budget once per possible live owner and
+            // apply the provider's exact reservation bookkeeping before
+            // scaling; scaling the raw claim would omit one record per owner.
+            let semantic_policy = myownmesh_core::config::SemanticPolicyConfig::default();
+            let semantic_storage_claim = myownmesh_core::ResourceClaim::single(
+                myownmesh_core::ResourceClass::StorageBytes,
+                semantic_policy.max_database_bytes,
+            );
+            let semantic_storage_grant =
+                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                    semantic_storage_claim,
+                )
+                .expect("daemon semantic storage reservation is representable")
+                .checked_scale(semantic_owner_count)
+                .expect("daemon semantic storage owner capacity is representable");
+            assert_eq!(
+                semantic_storage_grant.amount(myownmesh_core::ResourceClass::StorageBytes),
+                semantic_policy
+                    .max_database_bytes
+                    .checked_mul(semantic_owner_count)
+                    .expect("daemon semantic storage byte capacity is representable"),
+                "daemon semantic storage equals the default policy per live owner"
+            );
+            assert_eq!(
+                semantic_storage_grant
+                    .amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual,),
+                semantic_owner_count,
+                "daemon semantic storage includes one reservation record per live owner"
+            );
+            let claim = claim
+                .checked_add(semantic_storage_grant)
+                .expect("daemon semantic storage grant combines without overflow");
             let provider = myownmesh_core::FiniteResourceProvider::new(claim);
             let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
                 .expect("daemon test resource provider admits its process scope");

@@ -18,8 +18,7 @@
    *
    *    3. Import (collapsed by default). Accepts a JSON file in
    *       the network-settings envelope shape. File picker only —
-   *       MyOwnLLM removed paste because every export path writes
-   *       a file by default. */
+   *       every export path writes a file by default. */
 
   import { onMount } from "svelte";
   import { meshClient } from "../../mesh-client.svelte";
@@ -27,18 +26,20 @@
     DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
     DEFAULT_NETWORK_TURN,
+    DEFAULT_SEMANTIC_POLICY,
+    SEMANTIC_POLICY_FIELDS,
     buildNetworkConfig,
     generateNetworkId,
     normalizeNetworkId,
     tryParseNetworkSettings,
+    validateSemanticPolicy,
     type NetworkSettingsExport,
     type TurnEntry,
   } from "../../network-settings";
   import {
-    tryParsePortable,
-    type IdentityExport,
-  } from "../../identity-portable";
-  import { buildTopology } from "../../types";
+    buildTopology,
+    type SemanticPolicyConfig,
+  } from "../../types";
 
   const {
     onClose,
@@ -69,16 +70,11 @@
   let stunDraft = $state<string[]>([...DEFAULT_NETWORK_STUN]);
   let turnDraft = $state<TurnEntry[]>(DEFAULT_NETWORK_TURN.map((t) => ({ ...t })));
   let turnEntry = $state<TurnEntry>({ url: "", username: "", credential: "" });
+  let semanticPolicy = $state<SemanticPolicyConfig>({ ...DEFAULT_SEMANTIC_POLICY });
 
   let importDraft = $state<NetworkSettingsExport | null>(null);
   let importExpanded = $state(false);
   let fileInput = $state<HTMLInputElement | null>(null);
-
-  /** When the import was an approval bundle, hold the approver's
-   *  identity so we can pre-authorise them on the local roster
-   *  after the network is added. The actual `rosterApprove` call
-   *  runs inside `save()` after `networkAdd` returns. */
-  let pendingApprover = $state<IdentityExport | null>(null);
 
   /** True once the user has touched any advanced/import field.
    *  Drives the save-button label so the user knows whether they're
@@ -88,7 +84,8 @@
       // Any edit away from the seeded MyOwnMesh defaults.
       JSON.stringify(signalingDraft) !== JSON.stringify(DEFAULT_NETWORK_SIGNALING) ||
       JSON.stringify(stunDraft) !== JSON.stringify(DEFAULT_NETWORK_STUN) ||
-      JSON.stringify(turnDraft) !== JSON.stringify(DEFAULT_NETWORK_TURN),
+      JSON.stringify(turnDraft) !== JSON.stringify(DEFAULT_NETWORK_TURN) ||
+      JSON.stringify(semanticPolicy) !== JSON.stringify(DEFAULT_SEMANTIC_POLICY),
   );
 
   onMount(() => {
@@ -105,6 +102,7 @@
     signalingDraft = [...blob.signaling_servers];
     stunDraft = blob.stun_servers.length > 0 ? [...blob.stun_servers] : [...DEFAULT_NETWORK_STUN];
     turnDraft = blob.turn_servers.map((t) => ({ ...t }));
+    semanticPolicy = { ...DEFAULT_SEMANTIC_POLICY, ...blob.semantic_policy };
   }
 
   async function onGenerate() {
@@ -124,43 +122,15 @@
     file
       .text()
       .then((text) => {
-        // Three accepted file kinds, sniffed in this order so a
-        // well-formed envelope wins over a malformed lookalike:
-        //
-        //   1. .approval.json  — network settings + approver
-        //      identity. Adopts the network and remembers the
-        //      approver to pre-authorise after save.
-        //   2. .identity.json  — a peer's pubkey alone. Useless
-        //      for adding a network (no settings); surface a
-        //      clear "you also need the network" message rather
-        //      than silently accepting and producing an empty
-        //      network row.
-        //   3. .network-settings.json — the legacy path.
-        const portable = tryParsePortable(text);
-        if (portable?.kind === "approval") {
-          error = "";
-          adoptImport(portable.value.network);
-          pendingApprover = portable.value.approver;
-          return;
-        }
-        if (portable?.kind === "identity") {
-          error =
-            "That's an identity file (a peer's pubkey). To join a network you " +
-            "need either a network-settings file or an approval bundle. The " +
-            "identity file by itself only pre-authorises a peer on a network " +
-            "you've already joined — open Networks → Roster → Import identity.";
-          return;
-        }
         const parsed = tryParseNetworkSettings(text);
         if (!parsed) {
           error =
             'File doesn\'t contain a MyOwnMesh network-settings blob ' +
-            '(expected `"kind": "myownmesh.network-settings"` or `"myownmesh.approval"`).';
+            '(expected `"kind": "myownmesh.network-settings"`).';
           return;
         }
         error = "";
         adoptImport(parsed);
-        pendingApprover = null;
       })
       .catch((e) => {
         error = `Couldn't read file: ${String(e)}`;
@@ -169,7 +139,6 @@
 
   function clearImport() {
     importDraft = null;
-    pendingApprover = null;
     // Don't wipe network_id / advanced drafts — toggling import on
     // and off shouldn't be destructive.
   }
@@ -204,6 +173,15 @@
     turnDraft = turnDraft.filter((_, idx) => idx !== i);
   }
 
+  function semanticPolicyLabel(field: keyof SemanticPolicyConfig): string {
+    return field.replaceAll("_", " ");
+  }
+
+  function updateSemanticPolicy(field: keyof SemanticPolicyConfig, event: Event) {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    semanticPolicy = { ...semanticPolicy, [field]: value };
+  }
+
   async function save() {
     const trimmed = networkIdDraft.trim();
     if (!trimmed) {
@@ -213,6 +191,11 @@
     saving = true;
     error = "";
     try {
+      const policyError = validateSemanticPolicy(semanticPolicy);
+      if (policyError) {
+        error = `Invalid semantic policy: ${policyError}`;
+        return;
+      }
       const normalized = await normalizeNetworkId(trimmed);
       const config = buildNetworkConfig({
         networkId: normalized,
@@ -221,30 +204,9 @@
         signalingServers: signalingDraft.map((s) => s.trim()).filter((s) => s !== ""),
         stunUrls: stunDraft.map((s) => s.trim()).filter((s) => s !== ""),
         turnEntries: turnDraft.filter((t) => t.url.trim() !== ""),
+        semanticPolicy,
       });
       await meshClient.networkAdd(config);
-
-      // If the import was an approval bundle, the approver pre-
-      // authorised this device on their side — reciprocate by
-      // landing their pubkey in our roster so their first
-      // connection auto-approves here too. Non-fatal: a failure
-      // doesn't roll back the add; the user can still add them
-      // through the normal Approve flow when they appear.
-      if (pendingApprover) {
-        try {
-          await meshClient.rosterApprove(
-            config.id,
-            pendingApprover.pubkey,
-            pendingApprover.label ?? "",
-          );
-        } catch (approveErr) {
-          console.warn(
-            "Failed to pre-approve approver from imported bundle:",
-            approveErr,
-          );
-        }
-      }
-
       onAdded(config.id);
     } catch (e) {
       error = String(e);
@@ -470,6 +432,30 @@
             </button>
           </div>
         </div>
+
+        <div class="adv-block">
+          <div class="adv-label">Semantic fact policy</div>
+          <p class="advanced-hint">
+            Owner-selected finite limits for durable facts, quarantine, proofs,
+            and dependency storage. Values are validated before save and are
+            preserved when this network is exported or imported.
+          </p>
+          <div class="policy-grid">
+            {#each SEMANTIC_POLICY_FIELDS as field (field)}
+              <label class="field policy-field">
+                <span class="field-label">{semanticPolicyLabel(field)}</span>
+                <input
+                  class="text-input mono"
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={semanticPolicy[field]}
+                  oninput={(event) => updateSemanticPolicy(field, event)}
+                />
+              </label>
+            {/each}
+          </div>
+        </div>
       </div>
     {/if}
 
@@ -482,7 +468,7 @@
     >
       <span class="disclosure-chevron">{importExpanded ? "▾" : "▸"}</span>
       Import from JSON
-      {#if importDraft}<span class="import-pill">{pendingApprover ? "approval" : "applied"}</span>{/if}
+      {#if importDraft}<span class="import-pill">applied</span>{/if}
     </button>
     {#if importExpanded}
       <div class="advanced">
@@ -490,9 +476,6 @@
           <div class="import-card">
             <div class="import-card-head">
               Imported network settings
-              {#if pendingApprover}
-                <span class="approval-tag">via approval bundle</span>
-              {/if}
             </div>
             <dl class="import-summary">
               <dt>network_id</dt>
@@ -515,20 +498,6 @@
                   ? "(none)"
                   : importDraft.turn_servers.map((t) => t.url).join(", ")}
               </dd>
-              {#if pendingApprover}
-                <dt>approver</dt>
-                <dd>
-                  {pendingApprover.label || "—"}
-                  <code class="approver-pubkey">
-                    {pendingApprover.pubkey.slice(0, 12)}…
-                  </code>
-                  <div class="approver-hint">
-                    Will be added to this network's roster automatically
-                    after save — their first connection skips the
-                    verification-code dance.
-                  </div>
-                </dd>
-              {/if}
             </dl>
             <button class="btn-small ghost" onclick={clearImport}>
               Discard import
@@ -537,11 +506,9 @@
         {:else}
           <p class="advanced-hint">
             Pick a <code>.json</code> file exported from another device.
-            Accepted shapes:
-            <code>"myownmesh.network-settings"</code> (settings only) or
-            <code>"myownmesh.approval"</code> (settings + the approver's
-            identity, which lands on this network's roster pre-approved
-            after save).
+            Only the <code>"myownmesh.network-settings"</code> settings
+            envelope is accepted. Peer authorization remains a daemon-backed
+            governance operation in the network roster.
           </p>
           <div class="import-actions">
             <button class="btn-small" onclick={() => fileInput?.click()}>
@@ -811,6 +778,14 @@
     flex-direction: column;
     gap: 0.35rem;
   }
+  .policy-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    gap: 0.35rem 0.6rem;
+  }
+  .policy-field {
+    margin-bottom: 0;
+  }
   .adv-label {
     font-size: 0.7rem;
     color: #aaa;
@@ -880,30 +855,6 @@
     align-items: center;
     gap: 0.4rem;
     flex-wrap: wrap;
-  }
-  .approval-tag {
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #b9f5cc;
-    background: #112a1c;
-    border: 1px solid #1c4a30;
-    padding: 0.05rem 0.4rem;
-    border-radius: 999px;
-    line-height: 1;
-  }
-  .approver-pubkey {
-    font-size: 0.7rem;
-    background: #131318;
-    padding: 0.02rem 0.3rem;
-    border-radius: 3px;
-    margin-left: 0.3rem;
-  }
-  .approver-hint {
-    color: #888;
-    font-size: 0.7rem;
-    line-height: 1.4;
-    margin-top: 0.2rem;
   }
   .import-summary {
     display: grid;

@@ -1,0 +1,38 @@
+use myownmesh_core::config::SemanticPolicyConfig;
+
+pub fn ordinary_semantic_policy() -> SemanticPolicyConfig {
+    SemanticPolicyConfig {
+        max_fact_encoded_bytes: 65_535,
+        max_dependencies_per_fact: 64,
+        max_authority_uses_per_fact: 32,
+        max_authority_predecessors_per_use: 64,
+        max_admitted_facts: 100_000,
+        max_admitted_bytes: 128 * 1024 * 1024,
+        max_quarantined_facts: 4_096,
+        max_quarantined_bytes: 16 * 1024 * 1024,
+        max_quarantined_facts_per_author: 256,
+        max_quarantined_bytes_per_author: 4 * 1024 * 1024,
+        max_retained_facts_per_author: 10_000,
+        max_retained_bytes_per_author: 16 * 1024 * 1024,
+        max_hot_history_facts: 64,
+        max_dependency_edges: 1_000_000,
+        max_ready_batch: 256,
+        max_pending_proofs: 10_000,
+        max_pending_proof_bytes: 16 * 1024 * 1024,
+        max_proof_records: 100_000,
+        max_proof_bytes: 64 * 1024 * 1024,
+        max_proof_links: 100_000,
+        max_author_usage_rows: 100_000,
+        max_provisional_rows: 100_000,
+        max_transaction_dirty_main_pages: 1_024,
+        max_uncheckpointed_wal_frames: 1_018,
+        max_freelist_pages: 1_024,
+        max_fragmented_pages: 1_024,
+        max_main_journal_bytes: 8 * 1024 * 1024,
+        max_live_checkpoint_bytes: 8 * 1024 * 1024,
+        max_database_bytes: 2 * 1024 * 1024 * 1024,
+        max_wal_bytes: 8_413_072,
+        wal_checkpoint_threshold_bytes: 32 + 1_018 * (4_096 + 24),
+        emergency_reserve_bytes: 8 * 1024 * 1024,
+    }
+}

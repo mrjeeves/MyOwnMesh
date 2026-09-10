@@ -18,9 +18,10 @@ use crate::control::reply::{
 };
 
 /// Replace the device services config: persist it, then reconcile the
-/// running services. Persist first so a daemon restart re-applies the
-/// same config even if the live reconcile partly fails (a failed service
-/// start is logged inside `apply`, not surfaced as an error here).
+/// running services. Persist first so a daemon restart re-applies the same
+/// desired config even if live reconciliation partly fails. The persisted
+/// value is restart intent, not proof that every requested service is running;
+/// `apply` returns a reconciliation error for any unobserved transition.
 pub(in crate::control) async fn services_set(
     state: &Arc<ControlState>,
     services: ServicesConfig,
@@ -37,16 +38,17 @@ pub(in crate::control) async fn services_set(
     }
     let status = match state.services.apply(services).await {
         Ok(status) => status,
-        Err(e) => return owner.finish(Err(format!("services policy rejected: {e}"))),
+        Err(e) => return owner.finish(Err(format!("services reconciliation failed: {e}"))),
     };
     owner.finish(Ok(OperationReplyData::ServicesStatus(status)))
 }
 
 fn persist_services(services: &ServicesConfig) -> Result<()> {
-    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
-    cfg.services = services.clone();
-    cfg.save().map_err(anyhow::Error::msg)?;
-    Ok(())
+    MeshConfig::transaction(|cfg| {
+        cfg.services = services.clone();
+        Ok(())
+    })
+    .map_err(anyhow::Error::msg)
 }
 
 /// What the device services are doing right now.

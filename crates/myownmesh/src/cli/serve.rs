@@ -46,7 +46,10 @@ pub async fn run() -> Result<()> {
             tracing::info!("daemon runtime requested shutdown — returning so the service supervisor can start a fresh instance");
         }
     }
-    daemon.shutdown().await;
+    daemon
+        .shutdown()
+        .await
+        .map_err(|error| anyhow!("daemon shutdown failed: {error}"))?;
     Ok(())
 }
 

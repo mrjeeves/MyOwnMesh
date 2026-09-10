@@ -255,13 +255,9 @@ impl<K, V> LeasedMap<K, V> {
 
     /// How many entries are live.
     ///
-    /// Controls only, including cross-crate transport-lab controls. No owner
-    /// asks a leased map its size: what an owner is bounded by is its grant, and
-    /// the entry count is a second number that could disagree with it. The
-    /// count exists because controls have to check that settlement removed
-    /// exactly one node and no more, which the resource ledger alone cannot
-    /// say.
-    #[cfg(any(test, feature = "transport-lab"))]
+    /// Constant-time count for explicit entry limits, quiescence observations,
+    /// and settlement controls. A count does not replace resource admission:
+    /// each entry and its retained values still require their own funding.
     pub(crate) const fn len(&self) -> usize {
         self.len
     }

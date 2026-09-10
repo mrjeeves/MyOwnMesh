@@ -140,8 +140,7 @@
         {@const peers = meshClient.peersByNetwork[net.config_id] ?? []}
         {@const expanded = isExpanded(net)}
         {@const isFocused = net.config_id === focusedConfigId}
-        {@const kind = governance.stateFor(net.config_id).kind}
-        {@const pendingProposals = governance.stateFor(net.config_id).pending.length}
+        {@const kind = meshClient.networkKindsByNetwork[net.config_id] ?? "open"}
         <div class="net" class:focused={isFocused}>
           <div class="net-row-wrap">
             <button
@@ -174,9 +173,6 @@
               title="Settings & roster for {networkDisplayName(net)}"
               aria-label="Open network settings"
             >
-              {#if pendingProposals > 0}
-                <span class="gear-badge" aria-hidden="true"></span>
-              {/if}
               <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
                 <path
                   fill="currentColor"

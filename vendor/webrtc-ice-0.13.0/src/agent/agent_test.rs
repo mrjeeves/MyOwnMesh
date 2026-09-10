@@ -5,6 +5,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use stun::message::*;
 use stun::textattrs::Username;
+use tokio::sync::Notify;
 use util::vnet::*;
 use util::Conn;
 use waitgroup::{WaitGroup, Worker};
@@ -45,6 +46,116 @@ async fn test_pair_search() -> Result<()> {
 
     a.close().await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_close_resumes_after_candidate_recv_task_is_released() -> Result<()> {
+    async fn wait_for_last_recv_task(agent: &Agent) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let finished = agent
+                    .internal
+                    .notification_tasks
+                    .lock()
+                    .last()
+                    .expect("registered receive task")
+                    .is_finished();
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receive task reaches terminal state without handle observation");
+    }
+
+    let agent = Arc::new(Agent::new(AgentConfig::default()).await?);
+    let internal_weak = Arc::downgrade(&agent.internal);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *agent.internal.recv_exit_gate.lock() = Some((entered.clone(), release.clone()));
+    let baseline_tasks = agent.internal.notification_tasks.lock().len();
+
+    let candidate: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockPacketConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    agent.internal.add_candidate(&candidate).await?;
+
+    let duplicate: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockPacketConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    agent.internal.add_candidate(&duplicate).await?;
+    entered.notified().await;
+    release.notify_one();
+    entered.notified().await;
+    wait_for_last_recv_task(&agent).await;
+    *agent.internal.recv_exit_gate.lock() = None;
+
+    let duplicate_again: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        CandidateHostConfig {
+            base_config: CandidateBaseConfig {
+                network: "udp".to_owned(),
+                address: "192.168.0.2".to_owned(),
+                port: 777,
+                component: 1,
+                conn: Some(Arc::new(MockPacketConn {})),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .new_candidate_host()?,
+    );
+    agent.internal.add_candidate(&duplicate_again).await?;
+    assert_eq!(
+        agent.internal.notification_tasks.lock().len(),
+        baseline_tasks + 2
+    );
+    // Let this duplicate finish while its exit gate is disabled, before
+    // installing the gate that must park only the original receive task.
+    wait_for_last_recv_task(&agent).await;
+    *agent.internal.recv_exit_gate.lock() = Some((entered.clone(), release.clone()));
+
+    let closing_agent = Arc::clone(&agent);
+    let first_close = tokio::spawn(async move { closing_agent.close().await });
+    entered.notified().await;
+    assert!(!first_close.is_finished());
+    first_close.abort();
+    assert!(first_close.await.is_err());
+    assert_eq!(
+        agent.internal.notification_tasks.lock().len(),
+        baseline_tasks + 1
+    );
+
+    release.notify_one();
+    agent.close().await?;
+    assert!(agent.internal.notification_tasks.lock().is_empty());
+
+    drop(agent);
+    assert!(internal_weak.upgrade().is_none());
     Ok(())
 }
 

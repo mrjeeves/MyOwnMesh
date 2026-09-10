@@ -6,6 +6,7 @@ use crate::resource::{
     ResourceScope, ResourceUnavailable,
 };
 use futures_util::FutureExt;
+use std::sync::Weak;
 
 /// Point-in-time diagnostics for one exact live Mesh connector scope.
 ///
@@ -289,7 +290,7 @@ impl MeshConnectorResourceScope {
     /// lease acquired beforehand.
     pub(crate) fn cleanup_submission_port(&self) -> ConnectorCleanupSubmissionPort {
         ConnectorCleanupSubmissionPort {
-            owner: Arc::clone(&self.token.owner),
+            owner: Arc::downgrade(&self.token.owner),
         }
     }
 
@@ -391,7 +392,7 @@ impl MeshConnectorResourceScope {
 /// capability: a job still has to bring its own exact lease.
 #[derive(Clone)]
 pub(crate) struct ConnectorCleanupSubmissionPort {
-    owner: Arc<ConnectorResourceOwnerInner>,
+    owner: Weak<ConnectorResourceOwnerInner>,
 }
 
 impl ConnectorCleanupSubmissionPort {
@@ -414,14 +415,13 @@ impl ConnectorCleanupSubmissionPort {
         on_complete: ConnectorCleanupCompletion,
         on_failure: ConnectorCleanupFailure,
     ) -> ConnectorCleanupSubmission {
-        self.owner
-            .cleanup_executor
-            .submit(ConnectorCleanupJob::subordinate(
-                funding,
-                cleanup,
-                on_complete,
-                on_failure,
-            ))
+        let cleanup = ConnectorCleanupJob::subordinate(funding, cleanup, on_complete, on_failure);
+        let Some(owner) = self.owner.upgrade() else {
+            let mut cleanup = cleanup;
+            cleanup.fail("cleanup resource owner is unavailable".to_string());
+            return ConnectorCleanupSubmission::refused(cleanup);
+        };
+        owner.cleanup_executor.submit(cleanup)
     }
 }
 
@@ -484,6 +484,34 @@ pub(crate) fn cleanup_job_claim(
         (ResourceClass::WorkerOrTask, 1),
         (ResourceClass::CallbackOrScheduledWork, 1),
         (ResourceClass::OpaqueDependencyResidual, 4),
+    ])
+}
+
+/// Exact finite claim for the one late-transport terminal custodian retained
+/// by each connector.  The custodian owns one bounded command slot, one OS
+/// worker, and the opaque platform/thread state that Rust cannot size.
+pub(crate) fn late_transport_custodian_claim(
+) -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let bytes = std::mem::size_of::<std::sync::mpsc::SyncSender<()>>()
+        .checked_add(std::mem::size_of::<std::thread::JoinHandle<()>>())
+        .and_then(|value| {
+            value.checked_add(std::mem::size_of::<Vec<tokio::task::JoinHandle<()>>>())
+        })
+        .and_then(|value| value.checked_add(std::mem::size_of::<std::sync::Arc<()>>()))
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::WorkerOrTask, 1),
+        // Command enum payload, thread stack, and platform channel state are
+        // dependency-owned and remain explicit opaque residuals.
+        (ResourceClass::OpaqueDependencyResidual, 3),
     ])
 }
 
@@ -810,6 +838,32 @@ impl ConnectorCleanupExecutor {
         self.forced_termination.notify_one();
         if let Ok(mut state) = self.state.lock() {
             state.sender.take();
+        }
+    }
+}
+
+impl Drop for ConnectorCleanupExecutor {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.sender.take();
+        let Some(thread) = state.thread.take() else {
+            return;
+        };
+        // The close-owner path relinquishes its resource scope before this
+        // executor can be destroyed, so this join is reached only by the
+        // external owner that outlives queued cleanup. A self-join would be a
+        // structural bug rather than a recoverable cleanup failure.
+        assert_ne!(
+            thread.thread().id(),
+            std::thread::current().id(),
+            "cleanup executor cannot join itself"
+        );
+        if thread.join().is_err() {
+            self.health.failed_jobs.fetch_add(1, Ordering::AcqRel);
+            self.health.executor_failed.store(true, Ordering::Release);
         }
     }
 }

@@ -6,6 +6,10 @@ use crate::resource::LocalApplicationResourceScope;
 use super::{ApplicationGateway, GatewayRefusal};
 
 impl ApplicationGateway {
+    pub(crate) fn rpc_resource_scope_planning_charge() -> crate::resource::ResourceClaim {
+        crate::resource::FiniteResourceProvider::scope_planning_charge()
+    }
+
     pub(crate) fn rpc(&self) -> Option<crate::resource::FundedArc<crate::rpc::RpcInner>> {
         self.rpc.read().clone()
     }
@@ -56,7 +60,7 @@ impl ApplicationGateway {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, app| {
                     app.rpc_mut()
                         .register_local_request_prepared::<S>(peer, session)
@@ -83,7 +87,7 @@ impl ApplicationGateway {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, app| app.rpc_mut().register_local_request(peer, session, effect),
             )
             .ok_or(crate::rpc::RpcRegistrationRefusal::SessionNotCurrent)?
@@ -101,7 +105,7 @@ impl ApplicationGateway {
         let _ = state.peers.with_live_session_state(
             &owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, app| app.rpc_mut().abandon_local_request(filed),
         );
     }

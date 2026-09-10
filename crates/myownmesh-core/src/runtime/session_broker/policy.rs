@@ -1,19 +1,17 @@
-//! The narrow temporary adapter from current policy to a promotion input.
+//! The canonical typed promotion input derived from current policy.
 //!
 //! The promotion guard requires "Open or Closed policy currently allows the
 //! peer". The live tree's answer to that question is
 //! `PeerStateData::is_admitted()` — proven Device identity plus mutual approval.
-//! This adapter is the one place that reads it for promotion purposes, and it
-//! exists so the broker depends on a *proof value* rather than on a boolean it
-//! could re-derive differently.
+//! This input is the one place that carries it for promotion purposes, so the
+//! broker depends on a *proof value* rather than on a boolean it could re-derive
+//! differently.
 //!
 //! Deliberately not a governance framework. It adds no policy, no Closed profile
 //! selection, and no new authority: it carries the current answer, once, from the
-//! fence that computed it to the promotion that consumes it. When the target
-//! Semantic Node owns Open/Closed evaluation directly, this module is deleted and
-//! the broker takes that owner's output in its place — which is why the value is
-//! constructed only under the registry fence and cannot be stored, cloned, or
-//! re-presented.
+//! fence that computed it to the promotion that consumes it. The typed answer
+//! is consumed directly by the broker and cannot be stored, cloned, or
+//! and cannot be presented a second time.
 
 use crate::endpoint_auth::AuthenticatedChannelCapability;
 

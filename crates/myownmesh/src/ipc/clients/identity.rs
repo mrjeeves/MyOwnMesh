@@ -40,6 +40,9 @@ impl std::str::FromStr for ClientId {
             .strip_prefix('c')
             .ok_or_else(|| format!("ClientId must start with 'c', got '{s}'"))?;
         let n: u64 = n_str.parse().map_err(|e| format!("ClientId parse: {e}"))?;
+        if ClientId(n).to_string() != s {
+            return Err(format!("ClientId is not canonical: '{s}'"));
+        }
         Ok(ClientId(n))
     }
 }

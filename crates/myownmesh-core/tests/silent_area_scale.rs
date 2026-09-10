@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! A silent area at scale, measured: one operator node and N member
 //! boxes on a **Silent** mesh, over the real engine + WebRTC transport
 //! (in-process `LocalBroker` signaling, loopback ICE). This is the
@@ -30,14 +32,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::transport_lab::NetworkState;
+use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
-use myownmesh_core::Channel;
-use myownmesh_core::NetworkKind;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 
@@ -51,13 +51,20 @@ fn silent_cfg(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: NETWORK_ID.into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        semantic_policy: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        hub: None,
+        local_observations: None,
+        tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -313,7 +320,7 @@ async fn run_area(n_spokes: usize) {
         // run. `recv` separates the two endings the old receiver merged: `None`
         // is the channel going away with the network, `Err` is one frame that
         // did not decode.
-        let mut rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone())
+        let mut rx = channel::<serde_json::Value>(CHANNEL.to_owned(), spoke.state.clone())
             .subscribe()
             .expect("member subscription admitted");
         let echo_state = spoke.state.clone();
@@ -338,7 +345,7 @@ async fn run_area(n_spokes: usize) {
             }
         });
     }
-    let mut echo_rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone())
+    let mut echo_rx = channel::<serde_json::Value>(CHANNEL.to_owned(), operator.state.clone())
         .subscribe()
         .expect("operator subscription admitted");
     let pings_per_spoke: usize = 10;

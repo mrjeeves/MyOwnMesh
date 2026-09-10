@@ -23,13 +23,16 @@ pub(crate) use mailbox::strings_measure;
 /// outside this crate has the same obligation to fund a snapshot before it
 /// allocates one, and reimplementing these would be a second source of truth
 /// for the same arithmetic.
-pub use mailbox::{checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim};
 pub use mailbox::{
-    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
-    serialized_mailbox_item_claim_as, PreparedResourceMailbox, ResourceMailboxAdmissionError,
-    ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
-    ResourceMailboxItemBuilder, ResourceMailboxItemError, ResourceMailboxPlanningError,
-    ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender,
+    checked_measure_add, mailbox_measure_serialized, measure_serialized_mailbox_item,
+    measure_serialized_mailbox_item_after_funded,
+};
+pub use mailbox::{
+    prepare_resource_mailbox, resource_mailbox, MailboxMeasurement, PreparedResourceMailbox,
+    ResourceMailboxAdmissionError, ResourceMailboxCreateError, ResourceMailboxDelivery,
+    ResourceMailboxItem, ResourceMailboxItemBuilder, ResourceMailboxItemError,
+    ResourceMailboxPlanningError, ResourceMailboxReceiver, ResourceMailboxSendError,
+    ResourceMailboxSender,
 };
 pub use map::{LeasedMap, LeasedMapInsertRefusal};
 pub(crate) use queue::LeasedQueue;

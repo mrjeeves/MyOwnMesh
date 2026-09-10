@@ -229,22 +229,25 @@ pub(crate) async fn add_vnet_stun(wan_net: Arc<net::Net>) -> Result<turn::server
         ))?)
         .await?;
 
-    let server = turn::server::Server::new(turn::server::config::ServerConfig {
-        conn_configs: vec![turn::server::config::ConnConfig {
-            conn,
-            relay_addr_generator: Box::new(
-                turn::relay::relay_static::RelayAddressGeneratorStatic {
-                    relay_address: IpAddr::from_str(VNET_STUN_SERVER_IP)?,
-                    address: "0.0.0.0".to_owned(),
-                    net: wan_net,
-                },
-            ),
-        }],
-        realm: "webrtc.rs".to_owned(),
-        auth_handler: Arc::new(TestAuthHandler::new()),
-        channel_bind_timeout: Duration::from_secs(0),
-        alloc_close_notify: None,
-    })
+    let server = turn::server::Server::new_with_resource_admission(
+        turn::server::config::ServerConfig {
+            conn_configs: vec![turn::server::config::ConnConfig {
+                conn,
+                relay_addr_generator: Box::new(
+                    turn::relay::relay_static::RelayAddressGeneratorStatic {
+                        relay_address: IpAddr::from_str(VNET_STUN_SERVER_IP)?,
+                        address: "0.0.0.0".to_owned(),
+                        net: wan_net,
+                    },
+                ),
+            }],
+            realm: "webrtc.rs".to_owned(),
+            auth_handler: Arc::new(TestAuthHandler::new()),
+            channel_bind_timeout: Duration::from_secs(0),
+            alloc_close_notify: None,
+        },
+        Arc::new(turn::resource::BoundedTestAdmission::new(1024)),
+    )
     .await?;
 
     Ok(server)

@@ -382,7 +382,7 @@ pub(in crate::control) struct StreamCall {
 /// inbound-RPC and channel builders this one does not exist to avoid a clone.
 /// It exists to keep the outer queue from charging the process grant a second
 /// time for a graph core is already holding a reservation on. See
-/// [`Self::retained_claim`].
+/// [`Self::measured_claim`].
 struct StreamChunkBuilder<'a> {
     /// Borrowed from the forwarding task, which owns it for the whole stream.
     /// The frame's owned copy is made by [`Self::build`], past admission.
@@ -390,31 +390,22 @@ struct StreamChunkBuilder<'a> {
     chunk: myownmesh_core::rpc::RpcStreamChunk,
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for StreamChunkBuilder<'_> {
-    fn retained_claim(
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut>
+    for StreamChunkBuilder<'_>
+{
+    fn measured_claim(
         &self,
-    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        let outer = myownmesh_core::serialized_mailbox_item_claim_as::<crate::ipc::ServerOut>(
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<crate::ipc::ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
+        myownmesh_core::measure_serialized_mailbox_item_after_funded::<crate::ipc::ServerOut>(
             &crate::ipc::wire::ServerOutView::RpcCallStreamChunk {
                 request_id: self.request_id,
                 payload: self.chunk.value(),
             },
-        )?;
-        // What core still holds for this exact payload, recomputed from the
-        // same value by the same function that funded it, so it cannot drift
-        // from the reservation it names.
-        //
-        // The subtraction cannot underflow. The frame's encoding contains the
-        // payload's encoding verbatim, so every dimension of the inner claim is
-        // bounded by the same dimension of the outer one, and the outer claim
-        // carries strictly more besides: `size_of::<ServerOut>()`, the queue's
-        // parsing/CPU term, and one further allocation for the frame itself.
-        //
-        // The queue node is deliberately *not* subtracted. `pop` already
-        // returned it, so it is not part of what is still outstanding, and
-        // `send_building` acquires the new node separately anyway.
-        let already_funded = self.chunk.funded_claim()?;
-        Ok(outer.checked_sub(already_funded)?)
+            self.chunk.funded_claim()?,
+        )
     }
 
     fn build(self) -> crate::ipc::ServerOut {
@@ -437,11 +428,16 @@ struct StreamEndBuilder<'a> {
     reason: crate::ipc::wire::TerminalReasonView<'a>,
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for StreamEndBuilder<'_> {
-    fn retained_claim(
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut>
+    for StreamEndBuilder<'_>
+{
+    fn measured_claim(
         &self,
-    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<crate::ipc::ServerOut>(
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<crate::ipc::ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
+        myownmesh_core::measure_serialized_mailbox_item::<crate::ipc::ServerOut>(
             &crate::ipc::wire::ServerOutView::RpcCallStreamEnd {
                 request_id: self.request_id,
                 error: self.reason,
@@ -574,6 +570,8 @@ pub(in crate::control) async fn call_stream_funded(
         // this call.
         ending_state: Arc::clone(state),
         client_id,
+        #[cfg(test)]
+        panic_after_start: false,
     };
     (
         owner.finish(Ok(OperationReplyData::RpcStreamStarted(request_id))),
@@ -600,6 +598,8 @@ pub(in crate::control) struct PendingStreamForward {
     request_id: String,
     ending_state: Arc<ControlState>,
     client_id: crate::ipc::ClientId,
+    #[cfg(test)]
+    panic_after_start: bool,
 }
 
 impl PendingStreamForward {
@@ -614,9 +614,15 @@ impl PendingStreamForward {
             request_id: req_id_for_task,
             ending_state,
             client_id,
+            #[cfg(test)]
+            panic_after_start,
         } = self;
-        tokio::spawn(async move {
-            let _task = task;
+        let ending_clients = ending_state.clients.clone();
+        let forwarding = async move {
+            #[cfg(test)]
+            if panic_after_start {
+                panic!("injected RPC stream forwarder panic");
+            }
             loop {
                 // `recv_funded`, not `recv`: the ordinary public `recv` converts a
                 // terminal into an application-owned `String` and releases core's
@@ -676,14 +682,22 @@ impl PendingStreamForward {
                 crate::ipc::wire::TerminalReasonView::Clean,
             )
             .await;
-        });
+        };
+        if let Err((_task, _forwarding, refusal)) =
+            ending_clients.spawn_retained_task(task, forwarding)
+        {
+            // Retention and spawn are one fenced operation. A refusal returns
+            // both owned inputs before a JoinHandle exists, so there is no
+            // unowned task to abort or await and no detached cleanup path.
+            tracing::warn!("RPC stream forwarder refused: {refusal}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myownmesh_core::{ResourceMailboxItem as _, ResourceMailboxItemBuilder as _};
+    use myownmesh_core::ResourceMailboxItemBuilder;
 
     /// The borrowed mirrors must encode byte-for-byte as the frames they stand
     /// in for. If they ever diverge the mailbox admitted one frame and queued a
@@ -720,14 +734,16 @@ mod tests {
                 error: builder.reason,
             })
             .expect("the mirror encodes");
-            let measured_claim = builder
-                .retained_claim()
+            let measured_claim =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::
+                    building_item_planning_charge(&builder)
                 .expect("the mirror's claim is representable");
 
             let built = builder.build();
             let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
-            let built_claim = built
-                .retained_claim()
+            let built_claim =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::
+                    accepted_item_planning_charge(&built)
                 .expect("the frame's claim is representable");
 
             assert_eq!(
@@ -811,6 +827,7 @@ mod tests {
             request_id: request_id.to_owned(),
             ending_state: Arc::clone(state),
             client_id: client.id,
+            panic_after_start: false,
         }
     }
 
@@ -830,36 +847,42 @@ mod tests {
     /// cancellation is inert, so what this proves is the forwarding half —
     /// the gateway-side withdrawal a dropped receiver performs is core's and is
     /// tested there.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_an_unhanded_stream_setup_forwards_nothing() {
-        let state = crate::control::joinless_control_state().await;
-        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
-        let client = state
-            .clients
-            .register(tx.clone())
-            .expect("the fixture registry admits one client");
+    #[test]
+    fn v4_r6_daemon_a1_an_unhanded_stream_setup_forwards_nothing() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
 
-        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
-        let scope = crate::test_application_scope();
-        inbox
-            .push(&scope, serde_json::json!("chunk"))
-            .expect("the fixture scope funds one chunk");
-        let pending = pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-unhanded");
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let scope = crate::test_application_scope();
+                inbox
+                    .push(&scope, serde_json::json!("chunk"))
+                    .expect("the fixture scope funds one chunk");
+                let pending =
+                    pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-unhanded");
 
-        ProvisionalHandoff::RpcStream(pending)
-            .settle(&state, false)
-            .await;
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, false)
+                    .await;
 
-        // Driven as far as the runtime will go. A task that had been spawned
-        // would have had every opportunity to run; the negative is that the
-        // writer is still empty after that, not that a duration elapsed.
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            rx.try_recv().is_none(),
-            "no frame was ever written for a stream the client was never told \
+                // Driven as far as the runtime will go. A task that had been spawned
+                // would have had every opportunity to run; the negative is that the
+                // writer is still empty after that, not that a duration elapsed.
+                for _ in 0..1_000 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    rx.try_recv().is_none(),
+                    "no frame was ever written for a stream the client was never told \
              about"
+                );
+            },
         );
     }
 
@@ -868,36 +891,356 @@ mod tests {
     /// Without this the control above would be satisfied by a build that never
     /// forwarded anything. The chunk that was waiting arrives, under the exact
     /// request id the client was answered with.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_a_delivered_stream_setup_starts_forwarding() {
-        let state = crate::control::joinless_control_state().await;
-        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
-        let client = state
-            .clients
-            .register(tx.clone())
-            .expect("the fixture registry admits one client");
+    #[test]
+    fn v4_r6_daemon_a1_a_delivered_stream_setup_starts_forwarding() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, mut rx, provider, port) = writer_over_grant(unpressured_grant());
+                let setup_baseline = provider.in_use();
+                assert_ne!(
+                    setup_baseline,
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "the private writer setup must hold its funded root before forwarding"
+                );
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
 
-        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
-        let scope = crate::test_application_scope();
-        inbox
-            .push(&scope, serde_json::json!("chunk"))
-            .expect("the fixture scope funds one chunk");
-        let pending = pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-handed");
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let scope = crate::test_application_scope();
+                inbox
+                    .push(&scope, serde_json::json!("chunk"))
+                    .expect("the fixture scope funds one chunk");
+                let pending =
+                    pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-handed");
 
-        ProvisionalHandoff::RpcStream(pending)
-            .settle(&state, true)
-            .await;
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, true)
+                    .await;
 
-        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
-            .await
-            .expect("hang guard: the forwarding task writes the waiting chunk")
-            .expect("the writer mailbox is open, so the chunk is delivered");
-        match delivered.value() {
-            crate::ipc::ServerOut::RpcCallStreamChunk { request_id, .. } => {
-                assert_eq!(request_id.as_str(), "ipc-stream-handed");
-            }
-            _ => panic!("the forwarded frame is this stream's chunk"),
-        }
+                let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("hang guard: the forwarding task writes the waiting chunk")
+                    .expect("the writer mailbox is open, so the chunk is delivered");
+                match delivered.value() {
+                    crate::ipc::ServerOut::RpcCallStreamChunk { request_id, .. } => {
+                        assert_eq!(request_id.as_str(), "ipc-stream-handed");
+                    }
+                    _ => panic!("the forwarded frame is this stream's chunk"),
+                }
+
+                inbox.finish_clean();
+                let terminal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("hang guard: the forwarding task writes the natural terminal")
+                    .expect("the writer mailbox remains open for the natural terminal");
+                assert!(
+                    matches!(
+                        terminal.value(),
+                        crate::ipc::ServerOut::RpcCallStreamEnd { error: None, .. }
+                    ),
+                    "natural completion is forwarded as a clean stream ending"
+                );
+                drop(delivered);
+                drop(terminal);
+                drop(
+                    state
+                        .clients
+                        .unregister(client.id)
+                        .expect("the exact client remains registered after natural completion"),
+                );
+                assert!(state.clients.begin_closing());
+                assert_eq!(state.clients.drain_watchdogs().await, 0);
+                state.clients.wait_for_tasks().await;
+                assert_eq!(state.clients.finish_closed(), crate::ipc::Lifecycle::Closed);
+                drop(client);
+                drop(tx);
+                drop(rx);
+                drop(port);
+                assert_eq!(
+                    provider.in_use(),
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "all private writer owners, including its process scope, are released"
+                );
+                assert_eq!(
+                    state.clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                );
+            },
+        );
+    }
+
+    /// A delivered setup response retains the forwarding handle, and a panic
+    /// is observed by the same shutdown drain as every other watchdog.
+    #[test]
+    fn v4_r6_daemon_a_delivered_stream_panic_is_joined_and_classified() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, rx, provider, port) = writer_over_grant(unpressured_grant());
+                let setup_baseline = provider.in_use();
+                assert_ne!(
+                    setup_baseline,
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "the private writer setup must hold its funded root before forwarding"
+                );
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let mut pending =
+                    pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-panic");
+                pending.panic_after_start = true;
+
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, true)
+                    .await;
+                assert_eq!(
+                    state.clients.residue().watchdogs,
+                    1,
+                    "a delivered stream is retained before shutdown observes it"
+                );
+                assert_eq!(
+                    state.clients.residue().live_tasks,
+                    1,
+                    "the retained forward still owns its task admission"
+                );
+
+                drop(
+                    state
+                        .clients
+                        .unregister(client.id)
+                        .expect("the exact client is still registered before shutdown"),
+                );
+                assert!(state.clients.begin_closing());
+                assert_eq!(
+                    state.clients.drain_watchdogs().await,
+                    1,
+                    "the injected forwarder panic is observed exactly once"
+                );
+                state.clients.wait_for_tasks().await;
+                assert_eq!(state.clients.residue().watchdogs, 0);
+                assert_eq!(state.clients.residue().live_tasks, 0);
+                assert_eq!(state.clients.finish_closed(), crate::ipc::Lifecycle::Closed);
+                drop(client);
+                drop(tx);
+                drop(rx);
+                drop(port);
+                assert_eq!(
+                    provider.in_use(),
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "all private writer owners, including its process scope, are released"
+                );
+                assert_eq!(
+                    state.clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                );
+            },
+        );
+    }
+
+    /// The production `before_provisional_settle` race: the setup response has
+    /// been delivered, shutdown enters Closing, and commit then refuses before
+    /// creating a forwarding handle. A queued chunk proves that no forwarder
+    /// ran, and the whole registry still reaches the exact empty terminal.
+    #[test]
+    fn v4_r6_daemon_a_delivered_stream_loses_to_closing_before_settle() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, mut rx, provider, port) = writer_over_grant(unpressured_grant());
+                let setup_baseline = provider.in_use();
+                assert_ne!(
+                    setup_baseline,
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "the private writer setup must hold its funded root before forwarding"
+                );
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let scope = crate::test_application_scope();
+                inbox
+                    .push(&scope, serde_json::json!("must-not-forward"))
+                    .expect("the fixture scope funds one queued chunk");
+                let pending = pending_forward(
+                    &state,
+                    &client,
+                    &tx,
+                    inbox.stream(),
+                    "ipc-stream-closing-race",
+                );
+
+                assert!(state.clients.begin_closing());
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, true)
+                    .await;
+                assert!(
+                    rx.try_recv().is_none(),
+                    "the Closing fence refuses before any forwarder can write"
+                );
+                drop(
+                    state
+                        .clients
+                        .unregister(client.id)
+                        .expect("the exact client is still registered during the race"),
+                );
+                state.clients.wait_for_tasks().await;
+                assert_eq!(state.clients.drain_watchdogs().await, 0);
+                assert_eq!(state.clients.finish_closed(), crate::ipc::Lifecycle::Closed);
+                assert_eq!(
+                    state.clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "Closing-before-settle leaves no client, stream, watchdog, or task residue"
+                );
+                drop(client);
+                drop(tx);
+                drop(rx);
+                drop(port);
+                assert_eq!(
+                    provider.in_use(),
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "all private writer owners, including its process scope, are released"
+                );
+            },
+        );
+    }
+
+    /// A normal open stream is stopped by the exact client disconnect and its
+    /// retained handle is then joined before the registry can become Closed.
+    #[test]
+    fn v4_r6_daemon_a_open_stream_shutdown_is_joined_cleanly() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, rx, provider, port) = writer_over_grant(unpressured_grant());
+                let setup_baseline = provider.in_use();
+                assert_ne!(
+                    setup_baseline,
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "the private writer setup must hold its funded root before forwarding"
+                );
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let pending =
+                    pending_forward(&state, &client, &tx, inbox.stream(), "ipc-stream-shutdown");
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, true)
+                    .await;
+                assert_eq!(state.clients.residue().watchdogs, 1);
+
+                let client_id = client.id;
+                drop(
+                    state
+                        .clients
+                        .unregister(client_id)
+                        .expect("the exact open-stream client is still registered"),
+                );
+                assert!(state.clients.begin_closing());
+                assert_eq!(state.clients.drain_watchdogs().await, 0);
+                state.clients.wait_for_tasks().await;
+                assert_eq!(state.clients.residue().watchdogs, 0);
+                assert_eq!(state.clients.residue().live_tasks, 0);
+                assert_eq!(state.clients.finish_closed(), crate::ipc::Lifecycle::Closed);
+                drop(client);
+                drop(tx);
+                drop(rx);
+                drop(port);
+                assert_eq!(
+                    provider.in_use(),
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "all private writer owners, including its process scope, are released"
+                );
+                assert_eq!(
+                    state.clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "the normal open-stream shutdown leaves no registry residue"
+                );
+            },
+        );
+    }
+
+    /// A late disconnect for an old id cannot tear down a successor client;
+    /// the forwarding task remains bound to the original exact handle.
+    #[test]
+    fn v4_r6_daemon_a_forward_disconnect_is_exact_to_the_original_client() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, rx, provider, port) = writer_over_grant(unpressured_grant());
+                let setup_baseline = provider.in_use();
+                assert_ne!(
+                    setup_baseline,
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "the private writer setup must hold its funded root before forwarding"
+                );
+                let first = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits the first client");
+                let first_id = first.id;
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                let pending =
+                    pending_forward(&state, &first, &tx, inbox.stream(), "ipc-stream-exact");
+                ProvisionalHandoff::RpcStream(pending)
+                    .settle(&state, true)
+                    .await;
+
+                drop(
+                    state
+                        .clients
+                        .unregister(first_id)
+                        .expect("the first exact client is registered"),
+                );
+                let successor = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the successor client is independently admitted");
+                assert_ne!(first_id, successor.id, "client ids are never reused");
+                assert!(state.clients.client(successor.id).is_some());
+                assert!(
+                    state.clients.unregister(first_id).is_none(),
+                    "a late old-id disconnect cannot remove the successor"
+                );
+
+                assert!(state.clients.begin_closing());
+                assert_eq!(state.clients.drain_watchdogs().await, 0);
+                state.clients.wait_for_tasks().await;
+                drop(
+                    state
+                        .clients
+                        .unregister(successor.id)
+                        .expect("the successor is still registered at shutdown"),
+                );
+                assert_eq!(state.clients.finish_closed(), crate::ipc::Lifecycle::Closed);
+                drop(first);
+                drop(successor);
+                drop(tx);
+                drop(rx);
+                drop(port);
+                assert_eq!(
+                    provider.in_use(),
+                    myownmesh_core::ResourceClaim::ZERO,
+                    "all private writer owners, including its process scope, are released"
+                );
+                assert_eq!(
+                    state.clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                );
+            },
+        );
     }
 
     /// A stream whose chunk *and* whose substitute terminal are both refused
@@ -914,57 +1257,62 @@ mod tests {
     /// The refusal is real capacity pressure over a private grant, and the
     /// terminal is a peer-sized one from a stream that genuinely ended, so what
     /// the writer refuses is a frame worth refusing.
-    #[tokio::test]
-    async fn v4_r6_daemon_a2_a_client_whose_terminal_is_refused_is_disconnected() {
-        let state = crate::control::joinless_control_state().await;
-        let scope = crate::test_application_scope();
-        let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
-        inbox
-            .finish_owned(&scope, "z".repeat(32 * 1024))
-            .expect("the fixture scope funds one terminal of this width");
-        let terminal = match inbox.recv_funded().await {
-            Some(Err(terminal)) => terminal,
-            _ => panic!("the stream ends with the terminal it was finished with"),
-        };
+    #[test]
+    fn v4_r6_daemon_a2_a_client_whose_terminal_is_refused_is_disconnected() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let scope = crate::test_application_scope();
+                let inbox = myownmesh_core::rpc::TransportLabStreamInbox::new();
+                inbox
+                    .finish_owned(&scope, "z".repeat(32 * 1024))
+                    .expect("the fixture scope funds one terminal of this width");
+                let terminal = match inbox.recv_funded().await {
+                    Some(Err(terminal)) => terminal,
+                    _ => panic!("the stream ends with the terminal it was finished with"),
+                };
 
-        let (tx, _rx, _provider, _port) = writer_over_grant(starved_grant());
-        let client = state
-            .clients
-            .register(tx.clone())
-            .expect("the fixture registry admits one client");
-        let client_id = client.id;
-        assert!(
-            state.clients.client(client_id).is_some(),
-            "non-vacuity: the client is registered before the ending"
-        );
+                let (tx, _rx, _provider, _port) = writer_over_grant(starved_grant());
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
+                let client_id = client.id;
+                assert!(
+                    state.clients.client(client_id).is_some(),
+                    "non-vacuity: the client is registered before the ending"
+                );
 
-        // The chunk was already refused; this is the substitute terminal, and
-        // the writer will not take it either.
-        end_stream(
-            &state,
-            client_id,
-            &tx,
-            "ipc-stream-refused",
-            crate::ipc::wire::TerminalReasonView::Remote(&terminal),
-        )
-        .await;
+                // The chunk was already refused; this is the substitute terminal, and
+                // the writer will not take it either.
+                end_stream(
+                    &state,
+                    client_id,
+                    &tx,
+                    "ipc-stream-refused",
+                    crate::ipc::wire::TerminalReasonView::Remote(&terminal),
+                )
+                .await;
 
-        assert!(
-            state.clients.client(client_id).is_none(),
-            "the exact client is unregistered, which is what ends its connection \
+                assert!(
+                    state.clients.client(client_id).is_none(),
+                    "the exact client is unregistered, which is what ends its connection \
              and with it the operation nothing could settle"
+                );
+                // Its own record says so too, which is what the connection loop observes
+                // on its way to end of file. The bound is a failure detector and nothing
+                // else: the wait returns because the record was marked disconnected, and
+                // a regression fails here by name rather than as a suite that timed out
+                // with nothing named.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.wait_disconnected(),
+                )
+                .await
+                .expect("the unregistered client's own record is marked disconnected");
+            },
         );
-        // Its own record says so too, which is what the connection loop observes
-        // on its way to end of file. The bound is a failure detector and nothing
-        // else: the wait returns because the record was marked disconnected, and
-        // a regression fails here by name rather than as a suite that timed out
-        // with nothing named.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client.wait_disconnected(),
-        )
-        .await
-        .expect("the unregistered client's own record is marked disconnected");
     }
 
     /// The positive twin: a terminal the writer accepts ends the stream and
@@ -975,39 +1323,44 @@ mod tests {
     /// refusal it replaces. The queued frame is read back, so this is also the
     /// statement that the client was told *about this stream* rather than merely
     /// left alone.
-    #[tokio::test]
-    async fn v4_r6_daemon_a2_a_client_whose_terminal_lands_stays_connected() {
-        let state = crate::control::joinless_control_state().await;
-        let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
-        let client = state
-            .clients
-            .register(tx.clone())
-            .expect("the fixture registry admits one client");
-        let client_id = client.id;
+    #[test]
+    fn v4_r6_daemon_a2_a_client_whose_terminal_lands_stays_connected() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (tx, mut rx, _provider, _port) = writer_over_grant(unpressured_grant());
+                let client = state
+                    .clients
+                    .register(tx.clone())
+                    .expect("the fixture registry admits one client");
+                let client_id = client.id;
 
-        end_stream(
-            &state,
-            client_id,
-            &tx,
-            "ipc-stream-clean",
-            crate::ipc::wire::TerminalReasonView::Clean,
-        )
-        .await;
+                end_stream(
+                    &state,
+                    client_id,
+                    &tx,
+                    "ipc-stream-clean",
+                    crate::ipc::wire::TerminalReasonView::Clean,
+                )
+                .await;
 
-        assert!(
-            state.clients.client(client_id).is_some(),
-            "a landed terminal disconnects nobody"
-        );
-        match rx.recv().await {
-            Some(item) => match item.value() {
-                crate::ipc::ServerOut::RpcCallStreamEnd { request_id, error } => {
-                    assert_eq!(request_id.as_str(), "ipc-stream-clean");
-                    assert!(error.is_none(), "a clean ending carries no error");
+                assert!(
+                    state.clients.client(client_id).is_some(),
+                    "a landed terminal disconnects nobody"
+                );
+                match rx.recv().await {
+                    Some(item) => match item.value() {
+                        crate::ipc::ServerOut::RpcCallStreamEnd { request_id, error } => {
+                            assert_eq!(request_id.as_str(), "ipc-stream-clean");
+                            assert!(error.is_none(), "a clean ending carries no error");
+                        }
+                        _ => panic!("the queued frame is this stream's ending"),
+                    },
+                    None => panic!("the terminal was admitted, so it is queued"),
                 }
-                _ => panic!("the queued frame is this stream's ending"),
             },
-            None => panic!("the terminal was admitted, so it is queued"),
-        }
+        );
     }
 
     /// A writer mailbox over a grant of exactly `grant`, and the provider that
@@ -1141,7 +1494,7 @@ mod tests {
         // wider than anything a short-string bug could hide behind.
         let reason = "q".repeat(32 * 1024);
         let handler_reason = reason.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve_stream("terminal_only", move |_call| {
                 let reason = handler_reason.clone();

@@ -47,7 +47,6 @@ use crate::runtime::RuntimeIncarnation;
 ///
 /// application_operation(&connected_channel());
 /// ```
-#[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
 pub struct ConnectedChannelCapability {
     candidate: ConnectorCandidateCapability,
 }
@@ -58,7 +57,7 @@ pub struct ConnectedChannelCapability {
 /// This stays private so only the connector owner can perform the transition.
 /// Arc 03 moves the call behind the connector worker's successful channel
 /// event.
-#[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
+#[cfg(test)]
 pub(crate) fn mark_connected(
     candidate: ConnectorCandidateCapability,
 ) -> Option<ConnectedChannelCapability> {
@@ -78,7 +77,6 @@ pub(crate) fn try_mark_connected(
     candidate.try_promote_if_live(|candidate| ConnectedChannelCapability { candidate })
 }
 
-#[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
 impl ConnectedChannelCapability {
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
         self.candidate.runtime()

@@ -4,38 +4,23 @@
 //! client can dispatch on it without trying to guess from
 //! shape.
 //!
-//! Backward compat: `Event` / `Lagged` were the only `kind`s
-//! the original event stream emitted, and new variants land
-//! additively without breaking the existing MyOwnMesh GUI
-//! client. That tolerance is real, but it is not where this
-//! comment used to say it was — there is no `kind` match in
-//! `gui/src-tauri/src/main.rs::run_event_pump` to have a
-//! default arm. That pump never inspects a frame at all: it
-//! relays each line to the frontend verbatim as a
-//! `mesh://event`. The dispatch lives one layer further out,
-//! in `gui/src/mesh-client.svelte.ts`, which branches on the
-//! `kind` it recognises and renders anything else generically.
-//! A client that must act on a new variant still has to learn
-//! it; what is guaranteed is that not knowing one is not an
-//! error.
+//! Current event handling: every line is forwarded to the frontend verbatim
+//! as `mesh://event`; the frontend dispatches on recognized `kind` values and
+//! renders other current server frames generically.
+//! The serializer for these frames is the enum below.
 
 use serde::Serialize;
 use serde_json::Value;
 
 use myownmesh_core::events::MeshEvent;
-use myownmesh_core::{ResourceClaim, ResourceMailboxItemError};
 
 /// Server → client wire frame on a duplex event socket.
 ///
-/// Pre-`EventsSubscribe`, the daemon emits the untagged
-/// [`crate::control::Response`] shape so the one-shot
-/// request/response clients keep working. Untagged rather than
-/// legacy: it carries no `kind` because it does not need one —
-/// a response is the answer to the request on the same
-/// connection, and there is nothing to discriminate. After
-/// `EventsSubscribe` the connection stops being
-/// request/response, so every server-initiated line is a tagged
-/// `ServerOut` JSON object.
+/// Before `EventsSubscribe`, the daemon emits the untagged
+/// [`crate::control::Response`] shape for one-shot request/response calls. The
+/// response has no `kind` because it is already
+/// associated with the request on that connection. After `EventsSubscribe`,
+/// every server-initiated line is a tagged `ServerOut` JSON object.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerOut {
@@ -246,8 +231,11 @@ impl Serialize for LocalRefusalText<'_> {
 /// costing, which meant one question — what does a JSON-shaped value retain —
 /// had two answers in two crates that could drift apart independently. There is
 /// one answer now, and it lives with the trait it serves.
-impl myownmesh_core::ResourceMailboxItem for ServerOut {
-    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim(self)
+unsafe impl myownmesh_core::ResourceMailboxItem for ServerOut {
+    fn measured_claim(
+        &self,
+    ) -> Result<myownmesh_core::MailboxMeasurement<Self>, myownmesh_core::ResourceMailboxItemError>
+    {
+        myownmesh_core::measure_serialized_mailbox_item::<Self>(self)
     }
 }

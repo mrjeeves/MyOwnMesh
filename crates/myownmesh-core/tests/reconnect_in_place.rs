@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! Regression test for the "refresh button strands the peer" bug: the GUI's
 //! reconnect / refresh control used to leave-and-rejoin the network, which
 //! announces a departure (`Leave`) and tears the peer's session down on the
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -23,13 +25,20 @@ fn fresh_network(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: "reconnect-in-place-test".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        hub: None,
+        local_observations: None,
+        tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }

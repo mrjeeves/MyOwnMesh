@@ -1,32 +1,12 @@
 //! State that is not this daemon's until the client has been told about it.
 //!
-//! Three operations answer with the caller's *only* copy of something: the
-//! capability naming a realtime flow, the coordinate naming a started RPC
-//! stream, and the secret and recovery codes of an MFA enrollment. None of the
-//! three is queryable afterwards. If the response line is refused, or the
-//! socket ends before it is written, the daemon is left holding live state
-//! whose only handle went nowhere — a flow nobody can close, a stream nobody
-//! can read, a custody lock nobody can satisfy.
-//!
-//! So each of those three hands its new state back to the connection loop
-//! rather than keeping it, and the loop settles it against the one fact only
-//! the loop has: whether the answer was actually written.
-//!
-//! Two of the three are not the daemon's until the loop commits them. The MFA
-//! enrollment is the exception and is deliberately the other way round: the lock
-//! is installed *before* the response, so a success response names a lock that
-//! already exists, and what the loop settles is whether to keep or remove it.
-//! Deferring the write instead would let two clients both be told they enrolled,
-//! because neither installed lock would exist to refuse the other.
-//!
-//! This is deliberately not a transaction framework. There is one value, it
-//! moves, and it has exactly two outcomes. Operations with queryable or
-//! idempotent results — labels, ordinary governance mutations, dials, joins —
-//! do not use it and do not need it.
+//! Realtime and RPC operations answer with the caller's *only* copy of a
+//! capability or stream coordinate. If the response line is refused, or the
+//! socket ends before it is written, the daemon releases only the exact local
+//! handle. Queryable and idempotent domain operations do not use this local
+//! handoff.
 
 use std::sync::Arc;
-
-use tracing::warn;
 
 use super::ControlState;
 
@@ -61,17 +41,87 @@ pub(in crate::control) enum ProvisionalHandoff {
     /// survives an unhanded setup response" true by construction rather than by
     /// cancellation.
     RpcStream(super::dispatch::rpc::PendingStreamForward),
-    /// A custody lock that is installed but whose material has not been
-    /// delivered.
-    MfaEnrollment(myownmesh_core::custody::ProvisionalEnrollment),
+}
+
+/// Keeps a provisional handoff armed across the response write itself.
+///
+/// The write and the ordinary settlement are adjacent in the connection loop,
+/// but the task can still be dropped at that boundary (for example while the
+/// runtime is tearing down the connection).  The payloads each have an exact
+/// synchronous drop path, so this guard closes the small gap without spawning
+/// an unowned cleanup task.  A successful write takes the value out before
+/// committing; a failed write keeps it armed until the existing asynchronous
+/// close has completed.
+#[must_use = "a provisional handoff must remain armed until its write is settled"]
+pub(in crate::control) struct HandoffGuard {
+    handoff: Option<ProvisionalHandoff>,
+}
+
+impl HandoffGuard {
+    pub(in crate::control) fn new(handoff: ProvisionalHandoff) -> Self {
+        Self {
+            handoff: Some(handoff),
+        }
+    }
+
+    pub(in crate::control) async fn settle(&mut self, state: &Arc<ControlState>, sent: bool) {
+        if sent {
+            if let Some(handoff) = self.handoff.take() {
+                handoff.commit();
+            }
+            return;
+        }
+
+        // Keep the guard itself armed while an exact realtime close awaits.
+        // If the task is cancelled at that await, its flow has already been
+        // removed from the exact client's table and the local `flow` is dropped
+        // by cancellation, while the guard's second lookup is harmless.
+        let realtime = match self.handoff.as_ref() {
+            Some(ProvisionalHandoff::RealtimeFlow { client, capability }) => {
+                Some((client.clone(), capability.clone()))
+            }
+            _ => None,
+        };
+        if let Some((client, capability)) = realtime {
+            let Some(flow) = client.take_realtime_flow(&capability) else {
+                self.handoff.take();
+                return;
+            };
+            if let Some(net) = state.registry.get(flow.network()) {
+                let _ = flow.close_through(&net).await;
+            } else {
+                // Dropping the exact owned flow invokes its synchronous native
+                // cleanup even when the network has already gone away.
+                drop(flow);
+            }
+            self.handoff.take();
+            return;
+        }
+
+        // RPC and MFA rollback have no cancellation point: dropping the exact
+        // value withdraws the filed stream or runs the armed custody rollback.
+        if let Some(handoff) = self.handoff.take() {
+            handoff.roll_back(state).await;
+        }
+    }
+}
+
+impl Drop for HandoffGuard {
+    fn drop(&mut self) {
+        let Some(handoff) = self.handoff.take() else {
+            return;
+        };
+        handoff.rollback_on_drop();
+    }
 }
 
 impl ProvisionalHandoff {
     /// Settle against the write disposition.
     ///
     /// `sent` is true only for [`Wrote::Sent`](super::Wrote::Sent) — a refused
-    /// line and an ended socket are both "the client does not have this", and
-    /// both roll back. Nothing here consults a duration or retries anything.
+    /// line and an ended socket release the local owner. MFA remains durable
+    /// and is settled only by its explicit command; no timer or retry is used.
+    #[cfg(test)]
     pub(in crate::control) async fn settle(self, state: &Arc<ControlState>, sent: bool) {
         if sent {
             self.commit();
@@ -88,11 +138,6 @@ impl ProvisionalHandoff {
             // is reading, and only now does the client hold the coordinate that
             // names what it will carry.
             Self::RpcStream(pending) => pending.spawn(),
-            // Nothing is written and nothing can fail: the lock was installed
-            // before the response named it, so a caller told it enrolled is
-            // holding the secret to a lock that already exists. This only
-            // disarms the undo that owned it until now.
-            Self::MfaEnrollment(provisional) => provisional.keep(),
         }
     }
 
@@ -118,20 +163,28 @@ impl ProvisionalHandoff {
             // Dropping the pending forward drops the filed stream's receiver,
             // which withdraws it, and no task was ever spawned to outlive it.
             Self::RpcStream(pending) => drop(pending),
-            // The lock exists and its secret went nowhere, so remove exactly
-            // that lock — by its installed identity, so a rollback that runs
-            // after the operator enrolled again leaves the successor alone. A
-            // store this cannot reach is reported here rather than only inside
-            // the drop, which has nowhere to say it.
-            Self::MfaEnrollment(provisional) => {
-                let network = provisional.network_id().to_owned();
-                if let Err(error) = provisional.roll_back() {
-                    warn!(
-                        %network,
-                        "an unhanded MFA enrollment could not be removed: {error}"
-                    );
-                }
+            // This local handoff never settles durable MFA custody; it only
+            // releases the exact local handle. Transaction commands decide the
+            // durable state, including the recovered material path.
+            // NotSent is not an implicit custody decision. The same exact
+            // transaction can be queried, redelivered, committed, or aborted.
+        }
+    }
+
+    /// Synchronous exact fallback for a task dropped before settlement.
+    ///
+    /// This path deliberately does not try to await a network operation.  The
+    /// realtime table removal is exact and dropping the returned owned flow
+    /// invokes its existing synchronous native cleanup; the RPC and MFA
+    /// payloads have the same exact Drop contracts.  Normal refusal still uses
+    /// [`Self::roll_back`] so it can await and report the explicit close.
+    fn rollback_on_drop(self) {
+        match self {
+            Self::None => {}
+            Self::RealtimeFlow { client, capability } => {
+                drop(client.take_realtime_flow(&capability));
             }
+            Self::RpcStream(pending) => drop(pending),
         }
     }
 }
@@ -205,46 +258,51 @@ mod tests {
     /// The second client is what makes this *exact* rather than approximate: it
     /// holds its own flow under its own capability, and the rollback of the
     /// first leaves it alone.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_an_unhanded_realtime_flow_leaves_its_client_holding_nothing() {
-        let state = crate::control::joinless_control_state().await;
-        let (client, _writer) = registered_client(&state);
-        let (bystander, _bystander_writer) = registered_client(&state);
+    #[test]
+    fn v4_r6_daemon_a1_an_unhanded_realtime_flow_leaves_its_client_holding_nothing() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
+                let (bystander, _bystander_writer) = registered_client(&state);
 
-        let capability = install_flow(
-            &state,
-            &client,
-            "device-b",
-            b"flow-a",
-            "the registry installs one flow on a registered client",
-        );
-        let bystander_capability = install_flow(
-            &state,
-            &bystander,
-            "device-c",
-            b"flow-b",
-            "and one on the second client",
-        );
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
+                let bystander_capability = install_flow(
+                    &state,
+                    &bystander,
+                    "device-c",
+                    b"flow-b",
+                    "and one on the second client",
+                );
 
-        ProvisionalHandoff::RealtimeFlow {
-            client: client.clone(),
-            capability: capability.clone(),
-        }
-        .settle(&state, false)
-        .await;
+                ProvisionalHandoff::RealtimeFlow {
+                    client: client.clone(),
+                    capability: capability.clone(),
+                }
+                .settle(&state, false)
+                .await;
 
-        assert!(
-            client.take_realtime_flow(&capability).is_none(),
-            "the exact capability names nothing on the exact client: the \
+                assert!(
+                    client.take_realtime_flow(&capability).is_none(),
+                    "the exact capability names nothing on the exact client: the \
              rollback took the flow out and handed it to the close path"
-        );
-        assert!(
-            bystander
-                .take_realtime_flow(&bystander_capability)
-                .is_some(),
-            "and the other client's flow is untouched — the undo is keyed to \
+                );
+                assert!(
+                    bystander
+                        .take_realtime_flow(&bystander_capability)
+                        .is_some(),
+                    "and the other client's flow is untouched — the undo is keyed to \
              the handle and the capability it was given, not to a client id or \
              a label"
+                );
+            },
         );
     }
 
@@ -254,30 +312,72 @@ mod tests {
     /// every open, which is worse than never undoing one. The capability still
     /// resolves to a flow afterwards, which is the whole of what the client was
     /// promised.
-    #[tokio::test]
-    async fn v4_r6_daemon_a1_a_delivered_realtime_flow_stays_installed() {
-        let state = crate::control::joinless_control_state().await;
-        let (client, _writer) = registered_client(&state);
+    #[test]
+    fn v4_r6_daemon_a1_a_delivered_realtime_flow_stays_installed() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
 
-        let capability = install_flow(
-            &state,
-            &client,
-            "device-b",
-            b"flow-a",
-            "the registry installs one flow on a registered client",
-        );
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
 
-        ProvisionalHandoff::RealtimeFlow {
-            client: client.clone(),
-            capability: capability.clone(),
-        }
-        .settle(&state, true)
-        .await;
+                ProvisionalHandoff::RealtimeFlow {
+                    client: client.clone(),
+                    capability: capability.clone(),
+                }
+                .settle(&state, true)
+                .await;
 
-        assert!(
-            client.take_realtime_flow(&capability).is_some(),
-            "the client holds the capability, so the flow it names is the \
+                assert!(
+                    client.take_realtime_flow(&capability).is_some(),
+                    "the client holds the capability, so the flow it names is the \
              daemon's to keep"
+                );
+            },
+        );
+    }
+
+    /// A task dropped after the response write but before its ordinary settle
+    /// still withdraws the exact flow.  This is the hard-death edge that a
+    /// direct `ProvisionalHandoff` value cannot cover: the value itself has no
+    /// synchronous Drop cleanup, while the connection task can disappear at
+    /// this boundary.
+    #[test]
+    fn v4_r2_handoff_guard_drop_rolls_back_exact_realtime_flow() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let state = crate::control::joinless_control_state(cleanup_port.clone()).await;
+                let (client, _writer) = registered_client(&state);
+                let capability = install_flow(
+                    &state,
+                    &client,
+                    "device-b",
+                    b"flow-a",
+                    "the registry installs one flow on a registered client",
+                );
+
+                {
+                    let _guard = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
+                        client: client.clone(),
+                        capability: capability.clone(),
+                    });
+                    // The connection task may be dropped here, immediately after the
+                    // socket write has completed and before the normal settle call.
+                }
+
+                assert!(
+                    client.take_realtime_flow(&capability).is_none(),
+                    "dropping the armed handoff removes only its exact flow"
+                );
+            },
         );
     }
 }

@@ -237,8 +237,10 @@ pub(crate) async fn connect(
 pub(crate) struct LinkBeforeEngineOpen {
     pub(crate) left: Arc<WebRtcConnectorWorker>,
     /// Lifetime anchor. Dropping it stops the connector's event pump, which
-    /// would retire the very link the controls are asserting is live.
-    pub(crate) _left_events: WebRtcConnectorEventReceiver,
+    /// would retire the very link the controls are asserting is live. The
+    /// receiver is optional because a production-shaped pump may take it and
+    /// own it until connector shutdown.
+    pub(crate) _left_events: Option<WebRtcConnectorEventReceiver>,
     pub(crate) right: Arc<WebRtcConnectorWorker>,
     /// The far connector's event stream.
     ///
@@ -314,9 +316,10 @@ impl LinkBeforeEngineOpen {
     /// Only a control that is itself standing in for the near engine has any
     /// business here — an ordinary control's near side is driven by the engine
     /// under test.
-    #[cfg(test)]
     pub(crate) fn left_events_mut(&mut self) -> &mut WebRtcConnectorEventReceiver {
-        &mut self._left_events
+        self._left_events
+            .as_mut()
+            .expect("the left event stream is taken exactly once")
     }
 
     /// Borrow the far connector's event stream, to scan it for an expected
@@ -334,6 +337,16 @@ impl LinkBeforeEngineOpen {
         self.right_events
             .take()
             .expect("the far event stream is taken exactly once")
+    }
+
+    /// Take the left connector's event stream to drive the production open
+    /// callback from an owning pump. Exactly once per fixture; after this,
+    /// [`Self::left_events_mut`] refuses rather than borrowing an absent
+    /// receiver or silently creating a second consumer.
+    pub(crate) fn take_left_events(&mut self) -> WebRtcConnectorEventReceiver {
+        self._left_events
+            .take()
+            .expect("the left event stream is taken exactly once")
     }
 
     /// Take the genuine native open callback. Exactly once per fixture.
@@ -371,6 +384,7 @@ impl LinkBeforeEngineOpen {
         for worker in [&left, &right] {
             outcomes.push(worker.retire_and_close().await);
         }
+        drop(_left_events);
         drop(right_events);
         drop(left_open_event);
         outcomes
@@ -548,7 +562,7 @@ async fn connect_before_engine_open_inner(
     (
         LinkBeforeEngineOpen {
             left,
-            _left_events: left_events,
+            _left_events: Some(left_events),
             right,
             right_events: Some(right_events),
             left_open_event: Some(left_open_event.expect("left data channel opens")),

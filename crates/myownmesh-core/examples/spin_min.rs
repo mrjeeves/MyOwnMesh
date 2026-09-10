@@ -39,16 +39,16 @@ fn main() {
         .unwrap();
     rt.block_on(async {
         let t = myownmesh_core::transport::Transport::new().unwrap();
-        let (session, _rx) = t
-            .open_peer(
-                myownmesh_core::transport::Role::Offerer,
-                &[],
-                &[],
-                callback_policy(),
-                callback_grant(),
-            )
-            .await
-            .unwrap();
+        let (session, _rx) = myownmesh_core::engine::transport_lab::open_peer(
+            &t,
+            myownmesh_core::transport::Role::Offerer,
+            &[],
+            &[],
+            callback_policy(),
+            callback_grant(),
+        )
+        .await
+        .unwrap();
         eprintln!("[min] entering create_offer");
         let offer = session.create_offer().await.unwrap();
         eprintln!("[min] create_offer done: {} sdp bytes", offer.sdp.len());

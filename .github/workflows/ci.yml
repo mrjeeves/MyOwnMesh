@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main, "claude/**", "arc/**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +33,97 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Python verification unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          normalized="$(mktemp)"
+          cleanup() { rm -f "$log" "$normalized"; }
+          trap cleanup EXIT
+          python -m unittest \
+            scripts.tests.test_verify_v4_cutover \
+            scripts.tests.test_verify_release_artifact 2>&1 | tee "$log"
+          sed 's/\r$//' "$log" > "$normalized"
+          grep -Eq '^Ran [1-9][0-9]* tests?( |$)' "$normalized"
+
+      # The GUI has its own package workspace and lockfile. Keep its wire
+      # serialization tests in the same required check matrix as the daemon;
+      # this is a real pnpm test invocation, not a source-only grep.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: gui/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: gui/pnpm-lock.yaml
+
+      - name: Install GUI dependencies
+        working-directory: gui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install GUI Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev xdg-utils
+
+      - name: GUI wire protocol tests
+        working-directory: gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          normalized="$(mktemp)"
+          cleanup() { rm -f "$log" "$normalized"; }
+          trap cleanup EXIT
+          pnpm test 2>&1 | tee "$log"
+          sed 's/\r$//' "$log" > "$normalized"
+          grep -Eq '^# tests [1-9][0-9]*$' "$normalized"
+
+      - name: GUI type check
+        working-directory: gui
+        run: pnpm check
+
+      - name: GUI build
+        working-directory: gui
+        run: pnpm build
+
+      - name: Install GUI Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+
+      - name: GUI Rust format check
+        working-directory: gui/src-tauri
+        run: cargo fmt --all --check --manifest-path Cargo.toml
+
+      - name: GUI Rust clippy
+        working-directory: gui/src-tauri
+        run: cargo clippy --all-targets --locked --manifest-path Cargo.toml -- -D warnings
+
+      - name: GUI Rust tests
+        working-directory: gui/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          normalized="$(mktemp)"
+          cleanup() { rm -f "$log" "$normalized"; }
+          trap cleanup EXIT
+          cargo test --all-targets --locked --manifest-path Cargo.toml 2>&1 | tee "$log"
+          sed 's/\r$//' "$log" > "$normalized"
+          grep -Eq '^running [1-9][0-9]* tests?$' "$normalized"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
@@ -44,20 +134,42 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace --no-fail-fast
+        # Several integration fixtures intentionally exercise child processes
+        # through the process-global MYOWNMESH_HOME; keep those roots isolated.
+        run: cargo test --workspace --no-fail-fast -- --test-threads=1
 
-      # `--workspace` above runs default features only, so the transport-lab
-      # controls never compile there. One suite-wide run with the lab feature
-      # covers them. `transport-lab` is now the only optional feature in the
-      # workspace, so this is the whole non-default surface.
+      # Workspace dev-dependencies can unify transport-lab onto core. Keep an
+      # explicit core feature run so its coverage does not depend on that
+      # unification, and exercise the shipped daemon/CLI feature separately;
+      # that package forwards the same core seam to the external R2 control.
       - name: Suite-wide transport-lab tests
-        run: cargo test -p myownmesh-core --features "transport-lab" --no-fail-fast
+        run: cargo test -p myownmesh-core --features "transport-lab" --no-fail-fast -- --test-threads=1
+
+      - name: Shipped CLI transport-lab tests
+        run: cargo test -p myownmesh --features "transport-lab" --no-fail-fast -- --test-threads=1
+
+      - name: Verify release feature boundary
+        run: python scripts/verify-release-artifact.py --workflow .github/workflows/release.yml --manifest crates/myownmesh/Cargo.toml
+
+      - name: Verify V4 hard-cutover boundary
+        run: python scripts/verify-v4-cutover.py
+
+      - name: Build native release daemon boundary
+        run: cargo build --release --no-default-features --bin myownmesh
+
+      - name: Scan native release daemon boundary
+        shell: bash
+        run: |
+          set -e
+          BIN=target/release/myownmesh
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          python scripts/verify-release-artifact.py --binary "$BIN"
 
   # Keep one focused Ubuntu invocation for each native path: a direct in-process
   # handshake, the same behaviour over a real TURN relay, and one ignored native
   # connector lifecycle case. The direct and TURN controls also run in their
   # applicable suite-wide jobs; naming them here keeps these three integration
-  # paths separately visible without an exact-name parsing harness.
+  # paths separately visible. TURN controls also require exactly one test.
   integration:
     name: Direct, TURN and native connector integration
     runs-on: ubuntu-22.04
@@ -82,16 +194,243 @@ jobs:
             loopback_handshake_opens_data_channel -- --test-threads=1
 
       - name: TURN-relayed endpoint authentication
+        shell: bash
         run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
           cargo test -p myownmesh-services --test turn_webrtc_endpoint_auth \
             turn_selected_session_authenticates_endpoints_before_bidirectional_data \
-            -- --test-threads=1
+            -- --exact --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
+
+      # This is the real Linux-only TURN departure control. The test starts
+      # the repository's TURN service in-process, uses relay-only ICE, and is
+      # ignored by ordinary workspace runs because it owns native sockets.
+      # Keep the explicit ignored invocation here so Depart/DepartObserved is
+      # exercised honestly without changing compile behavior on other hosts.
+      - name: TURN-relayed authenticated departure
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          cargo test -p myownmesh-services --test turn_peer_leave \
+            authenticated_depart_observed_over_actual_turn \
+            -- --exact --ignored --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
 
       - name: Native connector replacement and cleanup
         run: |
           cargo test -p myownmesh-core --lib --features "transport-lab" \
             v4_arc03j_native_local_ice_restart_commits_exact_replacement \
             -- --test-threads=1 --ignored
+
+      - name: Speculative W0/W1/W2 exact proof outcome
+        run: |
+          cargo test -p myownmesh-core --lib --features "transport-lab" \
+            v4_b2_speculative_proof_ack_is_bound_to_exact_w1 \
+            -- --test-threads=1 --ignored
+
+      # These selectors keep the new hard-cutover controls visible and prove
+      # each target really ran one test. Feature-gated and Unix-only targets
+      # are invoked with their exact package/features below.
+      - name: Hard-cutover focused controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_exact() {
+            local package="$1"
+            local target="$2"
+            local test_name="$3"
+            shift 3
+            local log
+            log="$(mktemp)"
+            trap 'rm -f "$log"' RETURN
+            cargo test -p "$package" --locked --test "$target" "$@" \
+              "$test_name" -- --exact --test-threads=1 2>&1 | tee "$log"
+            grep -Fxq 'running 1 test' "$log"
+          }
+          run_exact myownmesh-core protocol_cutover_absence \
+            retired_lowercase_tags_fail_closed_at_mesh_message_decode
+          run_exact myownmesh-core fact_inventory_convergence \
+            multi_page_inventory_converges_with_loss_reorder_duplicates_and_quiescence
+          run_exact myownmesh-core network_broadcast_capacity \
+            mesh_event_capacity_refuses_zero_and_too_large_before_side_effects
+          run_exact myownmesh-core closed_relay_resource_accounting \
+            closed_relay_resource_policy_is_not_deserializable_after_cutover
+          run_exact myownmesh-core peer_event_pump_shutdown \
+            shutdown_joins_a_late_peer_event_pump --features transport-lab
+          run_exact myownmesh-core hub_introduction \
+            coalesced_hub_introduction_creates_one_direct_endpoint_path --features transport-lab
+          run_exact myownmesh-core opaque_flows \
+            opaque_bytes_modes_reopen_bounds_and_stale_owner_use_real_session --features transport-lab
+          run_exact myownmesh-services service_restart_custody \
+            awaited_stun_stop_releases_exact_listener_for_immediate_restart
+
+      - name: V1 task ownership and introduction settlement controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          run_core_count() {
+            local expected="$1"
+            local selector="$2"
+            shift 2
+            cargo test --locked -p myownmesh-core --features transport-lab --lib \
+              "$selector" -- --test-threads=1 "$@" 2>&1 | tee "$log"
+            if [[ "$expected" == 1 ]]; then
+              grep -Fxq 'running 1 test' "$log"
+            else
+              grep -Fxq "running $expected tests" "$log"
+            fi
+            grep -Eq "^test result: ok\. ${expected} passed; 0 failed; 0 ignored;" "$log"
+          }
+          run_core_count 6 shutdown_task_registry_tests
+          run_core_count 3 engine::tests::task_lifetime::
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::v1_introduced_pump_pressure_precedes_placeholder_and_native_binding --exact
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::expired_introduction_joins_native_and_engine_pump_before_fallback --exact --ignored
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::canceled_introduction_settlement_restores_record_for_shutdown_drain --exact --ignored
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::authenticated_terminal_join_preserves_replacement_installation --exact --ignored
+
+      - name: Vendored RTP history correctness controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          for selector in \
+            nack::generator::generator_stream::test::stale_repair_does_not_acknowledge_newer_ring_alias \
+            nack::responder::responder_stream::test::retained_slot_must_match_exact_requested_sequence
+          do
+            cargo test --locked --manifest-path vendor/interceptor/Cargo.toml --lib \
+              "$selector" -- --exact --test-threads=1 2>&1 | tee "$log"
+            grep -Fxq 'running 1 test' "$log"
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+
+      - name: Exact ignored semantic-store purge control
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/network-purge-r2.log"
+          cargo test -p myownmesh --locked --test network_purge_r2 --features transport-lab \
+            purge_socket_success_deletes_exact_semantic_store \
+            -- --exact --ignored --test-threads=1 2>&1 | tee "$log"
+          grep -Fxq 'running 1 test' "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+
+      # Keep rejection of the retired member application relay visible as
+      # exact selectors. The exact test-count assertion prevents a stale
+      # symbol, feature gate, or renamed target from turning a skipped test
+      # into a green command.
+      - name: Retired member relay rejection controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_exact_rejection() {
+            local target="$1"
+            local test_name="$2"
+            local log
+            log="$(mktemp)"
+            cargo test -p myownmesh-core --test "$target" --features "transport-lab" \
+              "$test_name" -- --exact --test-threads=1 2>&1 | tee "$log"
+            grep -Fxq 'running 1 test' "$log"
+            rm -f "$log"
+          }
+          run_exact_rejection closed_member_relay_production \
+            closed_member_relay_wire_and_config_names_are_not_compatibility_aliases
+          run_exact_rejection closed_member_opaque_relay \
+            retired_member_payload_variants_fail_closed_at_the_wire_boundary
+
+  # Exercise the opt-in system DNS-SD backend separately from the embedded
+  # default and the no-default release boundary.  The compatibility package
+  # supplies Avahi's reviewed libdns_sd shim; the focused selectors cover both
+  # the feature-gated signaling fixture and the backend's checked ownership
+  # and stale-worker controls, followed by live signaling/core paths against
+  # the installed daemon.
+  system-dnssd:
+    name: system-dnssd / Avahi compatibility backend
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Avahi DNS-SD compatibility library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y avahi-daemon libavahi-compat-libdnssd-dev
+
+      - name: Start Avahi daemon
+        run: sudo systemctl start avahi-daemon
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: system-dnssd
+
+      - name: System-dnssd signaling fixture
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --test mdns_driver discovery_retention_maps_each_backend_and_refusal_is_pre_backend \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd backend formula control (supplemental)
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::tests::backend_residency_is_distinct_checked_and_bounded \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd live signaling daemon
+        run: |
+          cargo test -p myownmesh-signaling --locked --no-default-features \
+            --features system-dnssd --lib \
+            mdns::discovery::system::tests::registers_and_browses_via_the_system_daemon \
+            -- --exact --ignored --test-threads=1
+
+      - name: System-dnssd core feature compile
+        run: |
+          cargo check -p myownmesh-core --locked --no-default-features \
+            --features system-dnssd
+
+      - name: System-dnssd core envelope formula control
+        run: |
+          cargo test -p myownmesh-core --locked --no-default-features \
+            --features "system-dnssd transport-lab" --test mdns_signaling \
+            mdns_core_budget_checks_full_resolve_envelope_before_backend_start \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd live core mDNS path
+        run: |
+          cargo test -p myownmesh-core --locked --no-default-features \
+            --features "system-dnssd transport-lab" --test mdns_signaling \
+            two_peers_handshake_over_mdns_only \
+            -- --exact --ignored --test-threads=1
+
+      - name: System-dnssd daemon feature compile
+        run: |
+          cargo check -p myownmesh --locked --no-default-features \
+            --features system-dnssd
+
+      - name: System-dnssd stale-worker controls
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::system::tests::worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty \
+            -- --exact --test-threads=1
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::system::tests::worker_registry_reaps_stale_terminal_full_before_admitting_successor \
+            -- --exact --test-threads=1
 
   # Validate the static-musl appliance daemons actually cross-compile on every
   # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
@@ -120,6 +459,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -135,4 +479,4 @@ jobs:
           cargo install cargo-zigbuild --locked
 
       - name: Cross-build daemon
-        run: cargo zigbuild --release --bin myownmesh --target ${{ matrix.target }}
+        run: cargo zigbuild --release --no-default-features --bin myownmesh --target ${{ matrix.target }}

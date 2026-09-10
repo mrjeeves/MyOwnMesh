@@ -5,14 +5,17 @@ a JSON object tagged by a `kind` discriminator. The source of truth
 for these types is `crates/myownmesh-core/src/protocol/`.
 
 ```
-PROTOCOL_VERSION  = 1
+PROTOCOL_VERSION  = 3
 TRYSTERO_APP_ID   = "myownmesh-cloud-mesh-v1"
 ```
 
 This hard-alpha protocol has a closed frame set. An unknown `kind` is
 refused during decoding and reaches no protocol state. The `features`
 list on `hello` carries only the required endpoint-authentication profile;
-it is a compatibility precondition, not optional-frame negotiation.
+it is a compatibility precondition, not optional-frame negotiation. The core
+wire version is exact: older, newer, missing or wrong versions are refused
+before endpoint authentication. Retired member-relay and routed-cipher kinds
+are rejected. There is no mixed-version or downgrade fallback.
 
 ## Frame envelope
 
@@ -26,6 +29,129 @@ it is a compatibility precondition, not optional-frame negotiation.
 Each variant below lists its discriminator and the fields it carries.
 All field names are snake_case.
 
+The governance semantic profile is the hard-alpha V4 cut described below. It
+does not accept v1/v2 fact envelopes or mixed-version fallbacks. The transport
+version shown above remains the closed JSON frame-profile version; the fact
+schema carries its own `version: 4` domain-separated field.
+
+---
+
+## Authenticated session departure
+
+`session_control` is authenticated by, and applies only to, the exact session
+that carries it. It never contains a target Device ID. A deliberate leave is
+one correlated pair:
+
+```jsonc
+{
+  "kind": "session_control",
+  "op": "depart",
+  "correlation": "opaque-local-value"
+}
+```
+
+The receiver sends the matching receipt on that same authenticated session:
+
+```jsonc
+{
+  "kind": "session_control",
+  "op": "depart_observed",
+  "correlation": "opaque-local-value"
+}
+```
+
+`correlation` is non-empty UTF-8 and at most 128 bytes. It is routing metadata
+for this one observation only: it is not a session identity, generation,
+retry/ack token, timer key, or durable authority. Duplicate matching frames
+are idempotent. There is no retry, grace period, or compatibility departure
+shape; ordinary connector closure/lifecycle cancellation resolves a lost
+departure.
+
+---
+
+## Canonical V4 facts
+
+Authority is carried only by signed, content-addressed `fact` frames or their
+`fact_bundle` grouping. A bundle is not authority by itself: each fact must
+verify independently before reduction.
+
+The semantic owner defines the canonical `FactContent` tuple:
+
+```text
+domain = governance | eviction_proof
+mesh_context
+typed FactBody
+author
+sorted causal parent FactIds
+```
+
+The FactId is the semantic owner's 32-byte SHA-256 digest of its explicit
+length-delimited canonical encoding, domain-separated by `myownmesh-semantic-v4`
+and schema 4. The typed `FactBody` union is exactly `RoleGrant`, `RoleRevoke`,
+`Evict`, `MembershipAdmit`, `EvictionProof`,
+`SelfStandDown`, `Attestation`, ordinary cell-local `Resolution`, and typed
+cross-cell `AuthorityLineageResolution`. Ordinary `Resolution` selects only
+one exclusive cell; the AuthorityLineage variant is the only persistent
+cross-cell selector and must cite the complete current lineage set. Parent
+ordering is canonicalized by the semantic owner. The signature covers the
+exact FactId, and verification recomputes the semantic content digest before
+checking the author's signature. Any change to context, author, body, domain,
+or causal parent set therefore produces a different FactId and cannot retain
+the old signature.
+
+The base ledger is durable Closed authority/governance only. Open has zero
+base durable semantic facts: exact-context endpoint authentication and Device
+key possession establish ephemeral participation. Runtime join, leave,
+presence, and reconnect for either network kind remain local observations and
+never enter semantic history. A roster or reachability view is a projection,
+not an authority source.
+
+The semantic owner selects finite limits for fact count, encoded bytes,
+causal edges, per-author count/bytes, proof-verification work, and indexed
+database bytes. Before a mutation it computes the complete delta and refuses
+the exact `N+1` candidate before changing the graph, projection, ACK,
+identity, or authority. Missing dependencies use a bounded,
+dependency-indexed quarantine; duplicate delivery is idempotent and failed
+proof or cleanup paths retain or release the exact custody rather than
+silently dropping it. Closed facts persist through indexed `O(delta)` commits;
+the local store is single-writer SQLite with WAL and `FULL` synchronous
+durability, and reopen must recover the exact semantic identity. Exact history
+is retained until an archive or authority-ratified checkpoint authorizes
+semantic deletion. For the `StorageBytes` dimension, one process-accounted
+claim is `B = M + W + S + R`: main database, WAL, shared-memory/sidecar, and
+explicit reserve bytes. Named-file or VFS accounting does not prove backing
+disk capacity, filesystem metadata capacity, or `ENOSPC` behavior. The shipped
+compaction boundary is bounded checkpointing only; a full-copy `VACUUM`
+requires separately funded temporary-copy, metadata, and cleanup custody.
+These finite dimensions bound ordinary growth and failure spam: rejected
+attempts consume no fact or ACK, while per-author and proof limits prevent one
+source from exhausting the selected budget.
+
+Final production compliance remains pending until durable runs demonstrate
+Open/Closed separation, scale and exact `N+1` refusal, duplicate/no-op
+invariance, exact Closed restart/reopen identity, deterministic fault/crash
+reconciliation, and terminal provider/resource baselines. Source or unit
+evidence alone is not a final compliance PASS.
+
+There is no roster wire family in protocol version 3: `roster_summary`,
+`roster_request`, and `roster_entries` are retired and absent from
+`MeshMessage`. The roster is a local projection/cache only. Membership and
+role changes must arrive as signed V4 facts; `fact_inventory` and
+`fact_request` are non-authoritative exact-context dependency traffic and are
+never silently promoted into authority.
+
+### `fact_inventory` and `fact_request`
+
+These are non-authoritative exact-context anti-entropy frames. An inventory
+names canonical `FactId`s known to the sender; a request names IDs the receiver
+is missing. Both are canonicalized and split into pages by the exact compact
+JSON encoding of the complete `MeshMessage`, bounded by the receive-safe frame
+limit. There is no item-count or timer-based page policy. A signed fact bundle
+uses the same byte boundary. Missing or reordered pages are repaired by the
+next inventory pass, and a foreign context or stale logical route is refused
+before any graph or projection mutation. Only independently verified signed
+facts can change authority; LAN discovery, inventory, and requests never do.
+
 ---
 
 ## Handshake
@@ -35,7 +161,7 @@ First frame on a fresh data channel from each side.
 
 | Field | Type | Notes |
 |---|---|---|
-| `protocol` | u32 | Wire-protocol version. v1 today. |
+| `protocol` | u32 | Exact current closed wire-profile version (`3`); older and newer profiles are not accepted. |
 | `device_id` | string | Bare-pubkey Device ID (base32-lowercase, 52 chars). |
 | `label` | string | Self-reported human label. Cosmetic. |
 | `nonce` | string | Random 32-byte challenge, base32-lowercase. |
@@ -202,6 +328,15 @@ the authority that accepted it.
 | `error` | string? | Set when the stream terminated abnormally. |
 
 ---
+
+## Application transport boundary
+
+Hub discovery, introductions, SDP and ICE candidates establish an endpoint
+connection. They do not carry application payloads. Application channels, RPC
+and native opaque flows use the authenticated endpoint WebRTC session.
+Configured TURN may relay WebRTC packets; the Hub is not a payload-forwarding
+hop. A missing usable endpoint path produces a refusal, never a fallback
+through signaling or a custom encrypted member route.
 
 ## Application channels
 

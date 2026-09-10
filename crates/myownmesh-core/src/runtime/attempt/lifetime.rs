@@ -50,10 +50,6 @@ impl AttemptLiveness {
         self.attempt.active.load(Ordering::Acquire)
     }
 
-    #[allow(
-        dead_code,
-        reason = "production admitted workers will select this signal with connector retirement"
-    )]
     pub(crate) fn subscribe_retirement(&self) -> watch::Receiver<bool> {
         self.attempt.retired.subscribe()
     }

@@ -1,6 +1,6 @@
 //! Periodic ping / pong on every active peer. A peer whose
-//! `last_recv_at` gap exceeds
-//! `HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS` is treated as
+//! `last_recv_at` gap exceeds the checked heartbeat timeout plus the
+//! configured wake-detection allowance is treated as
 //! a dead transport and dropped for rebuild (see [`tick`]).
 
 use std::sync::Arc;
@@ -8,17 +8,22 @@ use std::time::Instant;
 
 use tracing::trace;
 
+use crate::config::SchedulerPolicyConfig;
 use crate::protocol::keepalive::{PingMessage, PongMessage};
 use crate::protocol::MeshMessage;
 
 use super::connection::PeerStatus;
-use super::scheduler::{HEARTBEAT_TIMEOUT_MS, WAKE_DETECTION_THRESHOLD_MS};
 use super::state::NetworkState;
 
 /// Periodic engine tick — fired by the driver every
-/// `HEARTBEAT_INTERVAL_MS`. Sends a ping to every active peer and
-/// drops + rebuilds any peer silent past `HEARTBEAT_TIMEOUT_MS`.
+/// the configured heartbeat interval. Sends a ping to every active peer and
+/// drops + rebuilds any peer silent past the configured heartbeat timeout.
 pub async fn tick(state: &Arc<NetworkState>) {
+    let policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     let now = Instant::now();
     let to_ping: Vec<String> = state.peers.collect_map(|peer| {
         matches!(
@@ -33,24 +38,35 @@ pub async fn tick(state: &Arc<NetworkState>) {
 
     // Fold this tick's per-peer clock-skew estimates into the network
     // verdict (passive — built entirely from pings peers already sent us).
-    watch_clock_skew(state);
+    watch_clock_skew(state, &policy);
 
     // Check for silent peers past the heartbeat timeout. Drop + rebuild
     // any that exceed the (timeout + wake threshold) combined window —
     // the wake-threshold buffer prevents a long-paused tokio runtime
     // from immediately tearing down every peer the moment it resumes.
-    let stale_cutoff_ms = HEARTBEAT_TIMEOUT_MS + WAKE_DETECTION_THRESHOLD_MS;
-    let stale: Vec<String> = state.peers.collect_map(|peer| {
+    let stale_cutoff_ms = policy
+        .heartbeat_timeout_ms
+        .checked_add(
+            policy
+                .heartbeat_interval_ms
+                .checked_mul(2)
+                .expect("validated scheduler heartbeat interval is representable"),
+        )
+        .expect("validated scheduler stale cutoff is representable");
+    let mut stale = Vec::new();
+    state.peers.visit_owners(|owner| {
+        let peer = owner.connection();
         let data = peer.state.read();
         if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
-            return None;
+            return;
         }
         let elapsed = data
             .last_recv_at
             .map(|t| now.duration_since(t).as_millis() as u64);
-        match elapsed {
-            Some(ms) if ms > stale_cutoff_ms => Some(peer.device_id.clone()),
-            _ => None,
+        let is_stale = matches!(elapsed, Some(ms) if ms > stale_cutoff_ms);
+        drop(data);
+        if is_stale {
+            stale.push(owner);
         }
     });
     // Silence past the ping/pong window means the *transport* is dead, not
@@ -62,19 +78,28 @@ pub async fn tick(state: &Arc<NetworkState>) {
     // Handshaking for minutes after a network change). Rebuild instead and
     // let discovery re-establish a fresh connection.
     if !stale.is_empty() {
-        for peer_id in &stale {
+        let mut any_retirement_attempted = false;
+        for owner in &stale {
+            let peer_id = owner.device_id();
+            if state.peers.get_if_current(owner).is_none() {
+                continue;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
                 "heartbeat",
                 format!("peer silent past heartbeat timeout — rebuilding: {peer_id}"),
                 serde_json::json!({ "peer": peer_id }),
             );
-            super::drop_peer(state, peer_id, crate::events::DropReason::HeartbeatTimeout).await;
+            super::drop_peer_if_current(state, owner, crate::events::DropReason::HeartbeatTimeout)
+                .await;
+            any_retirement_attempted = true;
         }
         // Re-seed discovery so the rebuilt peers rediscover promptly rather
         // than waiting for their next scheduled announce. Rate-limited, so
         // a wave of timeouts collapses into one publish.
-        super::maybe_reactive_announce(state);
+        if any_retirement_attempted {
+            super::maybe_reactive_announce(state);
+        }
     }
 }
 
@@ -128,16 +153,16 @@ pub(super) async fn on_ping(
         let now = monotonic_ms();
         // A superseded installation simply contributes no sample; the estimate
         // is a median over whoever is live, so there is nothing to handle.
-        let _ = dispatch.with_captured_peer(&state.peers, |peer| {
-            let mut data = peer.state.write();
-            let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
-            let sample = ping.t + half_rtt - now;
-            data.clock_skew_samples.push(sample);
-            if data.clock_skew_samples.len() > SKEW_WINDOW {
-                data.clock_skew_samples.remove(0);
-            }
-            data.clock_skew_ms = median(&data.clock_skew_samples);
-        });
+        let _ = state
+            .peers
+            .with_same_session(dispatch.logical_reply_operation(), |operation| {
+                operation.record_inbound(|peer| {
+                    let mut data = peer.state.write();
+                    let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
+                    let sample = ping.t + half_rtt - now;
+                    data.clock_skew_ms = data.record_clock_skew_sample(sample);
+                });
+            });
     }
     // Echo back unchanged so the sender can compute RTT against its own clock —
     // through the captured owner, so the echo cannot be delivered to (or
@@ -156,13 +181,21 @@ pub(super) async fn on_pong(
     pong: PongMessage,
 ) {
     let now = monotonic_ms();
-    let _ = dispatch.with_captured_peer(&state.peers, |peer| {
-        let mut data = peer.state.write();
-        if data.last_ping_t == Some(pong.t) {
-            let rtt = (now - pong.t).max(0) as u32;
-            data.rtt_ms = Some(rtt);
-        }
-    });
+    let _ = state
+        .peers
+        .with_same_session(dispatch.logical_reply_operation(), |operation| {
+            operation.record_inbound(|peer| {
+                let mut data = peer.state.write();
+                if data.last_ping_t == Some(pong.t) {
+                    let rtt = (now - pong.t).max(0) as u32;
+                    data.rtt_ms = Some(rtt);
+                }
+            });
+        });
+    // This is a local diagnostic sighting only. The state method repeats the
+    // exact current authenticated/promoted-owner fence and ignores all cache
+    // refusals, so observation cannot affect heartbeat or mesh behavior.
+    state.observe_authenticated_peer(dispatch.owner());
 }
 
 fn monotonic_ms() -> i64 {
@@ -186,15 +219,17 @@ fn monotonic_ms() -> i64 {
 /// Per-peer sample window: 5 pings ≈ 2½ minutes of history — enough to
 /// median out a one-off delivery stall, short enough to converge quickly
 /// after an NTP step or a suspend/resume.
-pub(super) const SKEW_WINDOW: usize = 5;
 /// |skew| at which a peer counts as disagreeing with our clock (10 s: far
 /// beyond NTP jitter or RTT noise, well under TOTP/LWW damage territory).
+#[cfg(test)]
 pub const SKEW_WARN_MS: i64 = 10_000;
 /// |skew| the network estimate must fall back under before a raised warning
 /// clears — hysteresis so the diag doesn't flap at the threshold.
+#[cfg(test)]
 pub const SKEW_CLEAR_MS: i64 = 5_000;
 /// Consecutive over-threshold ticks (30 s apart) before warning — a slow
 /// double-check, not a single-glitch alarm.
+#[cfg(test)]
 pub const SKEW_WARN_TICKS: u8 = 3;
 
 /// Median of `samples` (odd length), or the **smaller-magnitude** middle
@@ -203,18 +238,30 @@ pub const SKEW_WARN_TICKS: u8 = 3;
 /// off before the estimate crosses the threshold — with two peers split
 /// [0 s, 60 s], the verdict is 0 (it's that peer's clock that's wrong, and
 /// its own daemon will notice against *its* peers).
-pub(super) fn median(samples: &[i64]) -> Option<i64> {
+pub(crate) fn median(samples: &[i64]) -> Option<i64> {
     if samples.is_empty() {
         return None;
     }
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    let n = sorted.len();
+    let n = samples.len();
+    let nth = |rank: usize| {
+        samples
+            .iter()
+            .find_map(|candidate| {
+                let less = samples.iter().filter(|value| *value < candidate).count();
+                let equal = samples.iter().filter(|value| *value == candidate).count();
+                (less <= rank && rank < less + equal).then_some(*candidate)
+            })
+            .expect("a non-empty sample set has every rank")
+    };
     if n % 2 == 1 {
-        return Some(sorted[n / 2]);
+        return Some(nth(n / 2));
     }
-    let (a, b) = (sorted[n / 2 - 1], sorted[n / 2]);
-    Some(if a.abs() <= b.abs() { a } else { b })
+    let (a, b) = (nth(n / 2 - 1), nth(n / 2));
+    Some(if a.unsigned_abs() <= b.unsigned_abs() {
+        a
+    } else {
+        b
+    })
 }
 
 /// What a [`ClockSkewWatch::observe`] tick concluded, when it concluded
@@ -222,10 +269,11 @@ pub(super) fn median(samples: &[i64]) -> Option<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkewVerdict {
     /// Our clock has disagreed with the network past
-    /// [`SKEW_WARN_MS`] for [`SKEW_WARN_TICKS`] consecutive ticks.
+    /// the configured warning threshold for the configured number of
+    /// consecutive ticks.
     Warn { skew_ms: i64, peers: usize },
     /// A raised warning cleared — the estimate fell back under
-    /// [`SKEW_CLEAR_MS`].
+    /// the configured clear threshold.
     Clear { skew_ms: i64 },
 }
 
@@ -243,20 +291,38 @@ impl ClockSkewWatch {
     /// per-peer skews, over `peers` measurable peers). `None` estimate =
     /// nothing measurable this tick: the streak resets but a raised
     /// warning stays raised (no peers is no evidence the clock healed).
+    #[cfg(test)]
     pub fn observe(&mut self, estimate: Option<i64>, peers: usize) -> Option<SkewVerdict> {
+        self.observe_with_policy(
+            estimate,
+            peers,
+            SchedulerPolicyConfig::DEFAULT.skew_warn_ms as i64,
+            SchedulerPolicyConfig::DEFAULT.skew_clear_ms as i64,
+            SchedulerPolicyConfig::DEFAULT.skew_warn_ticks,
+        )
+    }
+
+    pub fn observe_with_policy(
+        &mut self,
+        estimate: Option<i64>,
+        peers: usize,
+        warn_ms: i64,
+        clear_ms: i64,
+        warn_ticks: u8,
+    ) -> Option<SkewVerdict> {
         let Some(skew_ms) = estimate else {
             self.over_ticks = 0;
             return None;
         };
-        if skew_ms.abs() >= SKEW_WARN_MS {
+        if skew_ms.abs() >= warn_ms {
             self.over_ticks = self.over_ticks.saturating_add(1);
-            if self.over_ticks >= SKEW_WARN_TICKS && !self.warned {
+            if self.over_ticks >= warn_ticks && !self.warned {
                 self.warned = true;
                 return Some(SkewVerdict::Warn { skew_ms, peers });
             }
         } else {
             self.over_ticks = 0;
-            if self.warned && skew_ms.abs() <= SKEW_CLEAR_MS {
+            if self.warned && skew_ms.abs() <= clear_ms {
                 self.warned = false;
                 return Some(SkewVerdict::Clear { skew_ms });
             }
@@ -267,7 +333,7 @@ impl ClockSkewWatch {
 
 /// Evaluate this tick's network clock-skew estimate and emit the diag on a
 /// verdict. Called from [`tick`]; split out so the shape stays readable.
-fn watch_clock_skew(state: &Arc<NetworkState>) {
+fn watch_clock_skew(state: &Arc<NetworkState>, policy: &SchedulerPolicyConfig) {
     let skews: Vec<i64> = state.peers.collect_map(|peer| {
         let data = peer.state.read();
         matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
@@ -275,7 +341,13 @@ fn watch_clock_skew(state: &Arc<NetworkState>) {
             .flatten()
     });
     let estimate = median(&skews);
-    let verdict = state.clock_skew_watch.lock().observe(estimate, skews.len());
+    let verdict = state.clock_skew_watch.lock().observe_with_policy(
+        estimate,
+        skews.len(),
+        policy.skew_warn_ms as i64,
+        policy.skew_clear_ms as i64,
+        policy.skew_warn_ticks,
+    );
     match verdict {
         Some(SkewVerdict::Warn { skew_ms, peers }) => {
             let secs = skew_ms.abs() as f64 / 1000.0;
@@ -323,9 +395,58 @@ mod tests {
         // peer disagrees must NOT read as "our clock is off".
         assert_eq!(median(&[0, 60_000]), Some(0));
         assert_eq!(median(&[-60_000, -50]), Some(-50));
+        assert_eq!(median(&[i64::MIN, -1]), Some(-1));
         // Even, both middles genuinely off: still reports off.
         assert_eq!(median(&[58_000, 60_000]), Some(58_000));
         assert_eq!(median(&[]), None);
+    }
+
+    #[test]
+    fn six_admitted_samples_roll_inline_without_resource_charge() {
+        let provider = crate::resource::FiniteResourceProvider::new(
+            crate::resource::ResourceClaim::try_from_entries(
+                crate::resource::ResourceClass::ALL
+                    .into_iter()
+                    .map(|class| (class, 1 << 20)),
+            )
+            .expect("heartbeat control grant is representable"),
+        );
+        let observed = provider.clone();
+        let port = crate::resource::ResourceProviderPort::new(provider)
+            .expect("heartbeat control installs its provider");
+        let process = crate::resource::ProcessResourceRoot::isolated();
+        process
+            .install_local_application_provider(port)
+            .expect("heartbeat control installs its local provider");
+        let scope = process
+            .issue_local_application_scope()
+            .expect("heartbeat control issues its local scope");
+        let mut peer = super::super::connection::PeerStateData {
+            hello_retention: Some(
+                scope
+                    .acquire(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::StorageObject,
+                        1,
+                    ))
+                    .expect("heartbeat peer fixture retains one funded marker"),
+            ),
+            ..Default::default()
+        };
+        let resource_before = observed.in_use();
+        for sample in [900, 100, 700, 300, 500, 1_100] {
+            let estimate = peer.record_clock_skew_sample(sample);
+            peer.clock_skew_ms = estimate;
+        }
+        assert_eq!(
+            peer.clock_skew_samples.as_slice(),
+            &[100, 700, 300, 500, 1_100]
+        );
+        assert_eq!(peer.clock_skew_ms, Some(500));
+        assert_eq!(
+            observed.in_use(),
+            resource_before,
+            "the production sample admission path acquires no provider claim"
+        );
     }
 
     #[test]

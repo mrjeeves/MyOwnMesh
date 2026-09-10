@@ -23,6 +23,25 @@ pub(super) struct RealtimeFlowKey(usize);
 /// therefore consume no monotonic identity space.
 struct RealtimeFlowIdentity;
 
+/// Shared funding and cancellation state for one staged opaque Change.  Both
+/// the flow record and its caller token retain this same object, so retirement
+/// of either owner cannot leave the atomic marker's allocation unpriced.
+pub(super) struct OpaqueChangeMarker {
+    pub(super) active: std::sync::atomic::AtomicBool,
+    pub(super) _root: ResourceLease,
+}
+
+impl OpaqueChangeMarker {
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(super) fn cancel(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl RealtimeFlowKey {
     fn from_identity(identity: &Arc<RealtimeFlowIdentity>) -> Self {
         Self(Arc::as_ptr(identity) as usize)
@@ -443,6 +462,41 @@ impl RealtimeFlowRegistry {
         ])
     }
 
+    /// The claim held by an application-owned opaque handle on the existing
+    /// flow record.  The record already prices the inline `Option` through its
+    /// map-node claim; this lease prices the one additional retained
+    /// application claim and keeps remote-created dormant records from being
+    /// used without an owner-funded local claim.
+    pub(super) fn opaque_application_claim(
+    ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        Self::claim([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                Self::measured_bytes(std::mem::size_of::<Option<ResourceLease>>())?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+    }
+
+    pub(super) fn acquire_opaque_application_claim(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::opaque_application_claim())
+    }
+
+    /// The one cancellation marker owned by a staged opaque Change.  The
+    /// marker is shared with the caller token so dropping either owner keeps
+    /// the marker allocation funded until the final holder goes away.
+    pub(super) fn opaque_change_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        Self::flow_root_claim(std::mem::size_of::<OpaqueChangeMarker>())
+    }
+
+    pub(super) fn acquire_opaque_change(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::opaque_change_claim())
+    }
+
     pub(super) fn flow_map_node_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         crate::resource::LeasedMap::<RealtimeFlowKey, RealtimeFlowQueue>::entry_claim()
             .map_err(Self::claim_arithmetic_unavailable)
@@ -469,7 +523,7 @@ impl RealtimeFlowRegistry {
     /// on its side would keep passing after the queue's calibration changed,
     /// which is the failure a resource control exists to catch. So the type
     /// stays in and the number comes out.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(super) fn queued_event_node_claim(
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         Self::queue_node_claim::<QueuedRealtimeEvent>()
@@ -570,6 +624,26 @@ impl RealtimeFlowRegistry {
         ])
     }
 
+    /// The exact allocation claim for a provider custody box.  The queue entry
+    /// inside the box already carries its own node and payload leases; this
+    /// prices only the wrapper allocation itself so dequeue cannot expose an
+    /// unfunded move-only arrival.
+    pub(super) fn boxed_claim<T>() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        Self::claim([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                Self::measured_bytes(std::mem::size_of::<T>())?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+    }
+
+    pub(super) fn acquire_boxed<T>(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::boxed_claim::<T>())
+    }
+
     pub(super) fn retained_payload_claim(
         content_bytes: usize,
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
@@ -665,6 +739,46 @@ impl RealtimeFlowRegistry {
     ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
         self.acquire(Self::flow_root_claim(content_bytes))
             .map_err(|reason| self.record_drop(None, reason, 0))
+    }
+
+    /// One native pump/retirement's scheduling obligation.  It is acquired
+    /// before the asynchronous owner is published and travels with that owner
+    /// until its native work reaches a terminal result.
+    pub(super) fn native_tail_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
+        Self::claim([(ResourceClass::WorkerOrTask, 1)])
+    }
+
+    pub(super) fn acquire_native_tail(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.acquire(Self::native_tail_claim())
+    }
+
+    /// Fund the one shared counter block used by a promoted session's native
+    /// tail witness. Its lease is retained by that block while delayed owners
+    /// still hold an `Arc` to it.
+    pub(super) fn acquire_native_tail_state(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        let counters = std::mem::size_of::<usize>()
+            .checked_mul(2)
+            .ok_or(ResourceUnavailable::ProviderInvariant {
+                dimension: ResourceClass::AccountedMemoryBytes,
+            })
+            .map_err(RealtimeFlowDropReason::ResourceUnavailable)?;
+        let bytes =
+            std::mem::size_of::<crate::transport::webrtc::session_flow::RealtimeNativeTailState>()
+                .checked_add(counters)
+                .ok_or(ResourceUnavailable::ProviderInvariant {
+                    dimension: ResourceClass::AccountedMemoryBytes,
+                })
+                .map_err(RealtimeFlowDropReason::ResourceUnavailable)?;
+        let measured =
+            Self::measured_bytes(bytes).map_err(RealtimeFlowDropReason::ResourceUnavailable)?;
+        self.acquire(Self::claim([
+            (ResourceClass::AccountedMemoryBytes, measured),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ]))
     }
 
     pub(super) fn native_read_claim() -> std::result::Result<ResourceClaim, ResourceUnavailable> {
@@ -1593,6 +1707,13 @@ impl RealtimeFlowPort {
     ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
         self.lifetime.registry.acquire_queue_record::<T>()
     }
+
+    /// Fund one provider-owned wrapper allocation before it is boxed.
+    pub(super) fn reserve_boxed_checked<T>(
+        &self,
+    ) -> std::result::Result<ResourceLease, RealtimeFlowDropReason> {
+        self.lifetime.registry.acquire_boxed::<T>()
+    }
 }
 
 /// One in-progress assembly and the funding for the whole of it.
@@ -1806,6 +1927,18 @@ pub(super) struct RealtimePayloadLease {
 }
 
 impl RealtimePayloadLease {
+    /// Reserve one additional provider-owned copy derived from this exact
+    /// flow. Used for the public label copy made at inbound handoff; the
+    /// returned lease must travel with that copy and is not a second flow
+    /// admission or registry.
+    pub(super) fn reserve_supplemental_output(&self, bytes: usize) -> Option<RealtimePayloadLease> {
+        self.reservation
+            .registry
+            .reserve_output_checked(self.reservation.key, bytes)
+            .ok()
+            .map(RealtimeOutputReservation::into_payload_lease)
+    }
+
     fn transition_to_retained_payload(
         &mut self,
     ) -> std::result::Result<(), RealtimeFlowDropReason> {

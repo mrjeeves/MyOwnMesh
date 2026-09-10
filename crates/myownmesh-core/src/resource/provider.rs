@@ -1000,13 +1000,17 @@ mod finite {
             self.lock_state().retained_after_failed_cleanup
         }
 
-        #[cfg(test)]
-        pub(crate) fn active_reservations(&self) -> usize {
+        /// Read-only cardinality for exact terminal provider accounting.
+        #[cfg(any(test, feature = "transport-lab"))]
+        #[doc(hidden)]
+        pub fn active_reservations(&self) -> usize {
             self.lock_state().reservations.len()
         }
 
-        #[cfg(test)]
-        pub(crate) fn active_scopes(&self) -> usize {
+        /// Read-only cardinality; exposes no scope or reservation authority.
+        #[cfg(any(test, feature = "transport-lab"))]
+        #[doc(hidden)]
+        pub fn active_scopes(&self) -> usize {
             self.lock_state().scopes.len()
         }
 

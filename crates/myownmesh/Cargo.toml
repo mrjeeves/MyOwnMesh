@@ -14,6 +14,14 @@ categories = ["command-line-utilities", "network-programming"]
 # Releases matrix (`myownmesh-<platform>.{tar.gz,zip}`); see RELEASE.md.
 publish = false
 
+[features]
+# Keep the shipped daemon feature-free by default; transport-lab is reserved
+# for the explicit integration controls and never enters release artifacts.
+default = []
+transport-lab = ["myownmesh-core/transport-lab"]
+# Forward the opt-in system DNS-SD backend through core to signaling.
+system-dnssd = ["myownmesh-core/system-dnssd"]
+
 [[bin]]
 name = "myownmesh"
 path = "src/main.rs"

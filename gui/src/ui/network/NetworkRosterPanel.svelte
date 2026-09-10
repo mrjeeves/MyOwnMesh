@@ -1,357 +1,82 @@
 <script lang="ts">
-  /** Roster panel for a network (Settings → Networks → Roster).
-   *  Approved peers + their role in the network's governance model.
-   *
-   *  Role column is always shown so the affordance is discoverable
-   *  even on `open` networks (where the role tag is cosmetic until
-   *  the network goes `closed`). On `closed` networks the role
-   *  selector enforces grant-authority — members can't promote
-   *  anyone, controllers can grant up to `controller`, owners can
-   *  grant anything. */
-
-  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+  /** Read-only roster projection plus exact named role operations. Membership
+   *  is never edited from the renderer; the daemon applies canonical facts. */
   import { meshClient } from "../../mesh-client.svelte";
   import { governance } from "../../network-governance.svelte";
-  import type {
-    AuthorizedPeer,
-    NetworkConfigInput,
-    NetworkSummary,
-    Role,
-  } from "../../types";
-  import { canGrant, ROLE_RANK } from "../../types";
-  import {
-    exportNetworkSettings,
-  } from "../../network-settings";
-  import {
-    buildApprovalExport,
-    buildIdentityExport,
-    isIdentityExport,
-    suggestedFilename,
-    tryParsePortable,
-    writePortableFile,
-    type IdentityExport,
-  } from "../../identity-portable";
+  import type { AuthorizedPeer, NetworkSummary, Role } from "../../types";
+  import { canGrant } from "../../types";
   import RoleChip from "./RoleChip.svelte";
   import NetworkKindBadge from "./NetworkKindBadge.svelte";
 
-  const {
-    network,
-  }: {
-    network: NetworkSummary;
-  } = $props();
-
+  const { network }: { network: NetworkSummary } = $props();
   let roster = $state<AuthorizedPeer[]>([]);
-  let rosterError = $state<string | null>(null);
-  let actionError = $state<string | null>(null);
+  let error = $state<string | null>(null);
   let busy = $state<string | null>(null);
-
-  const govView = $derived(governance.stateFor(network.config_id));
+  const projection = $derived(governance.stateFor(network.config_id));
   const selfPubkey = $derived(meshClient.identity?.pubkey ?? null);
   const myRole = $derived(governance.localRole(network.config_id, selfPubkey));
 
-  async function refresh() {
-    try {
-      roster = await meshClient.rosterList(network.config_id);
-      rosterError = null;
-    } catch (e) {
-      rosterError = String(e);
-    }
+  function refresh() {
+    meshClient.rosterList(network.config_id).then((value) => {
+      roster = value;
+      error = null;
+    }).catch((e) => (error = String(e)));
   }
 
   $effect(() => {
-    // Ratified governance transitions update the daemon-owned role mirrored
-    // into each roster row. Track the snapshot before `refresh` awaits so a
-    // later ratification re-lists this component's local roster state.
-    void govView;
-    void refresh();
+    void projection;
+    refresh();
   });
 
-  function shortId(id: string): string {
-    if (id.length <= 16) return id;
-    return id.slice(0, 8) + "…" + id.slice(-6);
+  function shortId(id: string) {
+    return id.length <= 16 ? id : id.slice(0, 8) + "…" + id.slice(-6);
   }
 
-  function fmtDate(epoch: number): string {
-    return new Date(epoch * 1000).toLocaleString();
-  }
-
-  /** Strip a roster entry's display-suffix to get the bare pubkey
-   *  the governance store keys on. Roster entries are stored as
-   *  raw pubkeys today, but in case a display-id ever leaks
-   *  through (e.g. user pasted one into a CLI), tolerate it. */
-  function devicePubkey(deviceId: string): string {
-    const dash = deviceId.lastIndexOf("-");
-    if (dash === -1) return deviceId;
-    const tail = deviceId.slice(dash + 1);
-    if (tail.length === 5 && /^[0-9A-F]+$/.test(tail)) {
-      return deviceId.slice(0, dash);
-    }
-    return deviceId;
+  function canSet(role: Role) {
+    return projection.kind === "open" || canGrant(myRole, role);
   }
 
   async function setRole(peer: AuthorizedPeer, role: Role) {
-    if (!selfPubkey) {
-      actionError = "Local identity not loaded yet — try again in a moment.";
-      return;
-    }
+    if (!selfPubkey || !canSet(role)) return;
     busy = peer.device_id;
-    actionError = null;
-    const peerPub = devicePubkey(peer.device_id);
+    error = null;
     const result = role === "member"
-      ? await governance.clearPeerRole(network.config_id, selfPubkey, peerPub)
-      : await governance.setPeerRole(network.config_id, selfPubkey, peerPub, role);
-    if (!result.ok) {
-      actionError = result.reason ?? "Couldn't change role.";
-    }
+      ? await governance.clearPeerRole(network.config_id, selfPubkey, peer.device_id)
+      : await governance.setPeerRole(network.config_id, selfPubkey, peer.device_id, role);
+    if (!result.ok) error = result.reason ?? "Role operation refused";
     busy = null;
-  }
-
-  async function removePeer(peer: AuthorizedPeer) {
-    busy = peer.device_id;
-    actionError = null;
-    try {
-      await meshClient.rosterRemove(network.config_id, peer.device_id);
-      await refresh();
-    } catch (e) {
-      actionError = String(e);
-    } finally {
-      busy = null;
-    }
-  }
-
-  // ---- identity import (pre-authorise a peer) -------------------------
-
-  let importBusy = $state(false);
-  let importInfo = $state<string | null>(null);
-  let fileInput = $state<HTMLInputElement | null>(null);
-
-  function clickImport() {
-    fileInput?.click();
-  }
-
-  function onFilePicked(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const file = input.files && input.files.length > 0 ? input.files[0] : null;
-    input.value = "";
-    if (!file) return;
-    file
-      .text()
-      .then((text) => importIdentity(text))
-      .catch((e) => {
-        actionError = `Couldn't read file: ${String(e)}`;
-      });
-  }
-
-  async function importIdentity(text: string) {
-    actionError = null;
-    importInfo = null;
-    const parsed = tryParsePortable(text);
-    if (!parsed) {
-      actionError =
-        'File doesn\'t look like a MyOwnMesh identity export. Expected JSON with "kind": "myownmesh.identity".';
-      return;
-    }
-    // Both `myownmesh.identity` and `myownmesh.approval` carry a
-    // pubkey we can roster-approve. Identity is the common path;
-    // approval bundles work too (we lift the `approver` block).
-    const id: IdentityExport =
-      parsed.kind === "identity"
-        ? parsed.value
-        : parsed.value.approver;
-    if (!isIdentityExport(id) && parsed.kind !== "approval") {
-      actionError = "Imported file's identity block is malformed.";
-      return;
-    }
-
-    importBusy = true;
-    try {
-      // `roster_approve` accepts any device_id — when no live
-      // session exists yet, the approval is persisted to the
-      // on-disk roster file and the daemon auto-approves on the
-      // peer's first handshake. Exactly the pre-auth flow we want.
-      await meshClient.rosterApprove(
-        network.config_id,
-        id.pubkey,
-        id.label ?? "",
-      );
-      importInfo = `Pre-approved ${id.label || id.pubkey.slice(0, 12)}… on this network. ` +
-        `They'll auto-approve on first connection.`;
-      await refresh();
-    } catch (e) {
-      actionError = `Pre-approval failed: ${String(e)}`;
-    } finally {
-      importBusy = false;
-    }
-  }
-
-  // ---- approval export (issue out-of-band approval for a roster entry) ----
-
-  async function exportApproval(peer: AuthorizedPeer) {
-    if (!meshClient.identity) {
-      actionError = "Local identity not loaded yet.";
-      return;
-    }
-    busy = peer.device_id;
-    actionError = null;
-    try {
-      const cfg = await meshClient.configShow();
-      const net = cfg.networks.find(
-        (n: NetworkConfigInput) =>
-          n.id === network.config_id || n.network_id === network.network_id,
-      );
-      if (!net) {
-        actionError =
-          "Network has no saved config to bundle into the approval.";
-        return;
-      }
-      const envelope = buildApprovalExport({
-        network: exportNetworkSettings(net),
-        approver: buildIdentityExport({
-          pubkey: meshClient.identity.pubkey,
-          deviceId: meshClient.identity.device_id,
-          label: meshClient.identity.label,
-        }),
-        approvedPubkey: devicePubkey(peer.device_id),
-        approvedLabel: peer.label,
-      });
-      const path = await saveDialog({
-        defaultPath: suggestedFilename(envelope),
-        filters: [{ name: "MyOwnMesh approval", extensions: ["json"] }],
-      });
-      if (!path) return;
-      await writePortableFile(path, envelope);
-    } catch (e) {
-      actionError = `Approval export failed: ${String(e)}`;
-    } finally {
-      busy = null;
-    }
-  }
-
-  function whyDisabled(target: Role): string | null {
-    if (govView.kind === "open") return null;
-    if (!canGrant(myRole, target)) {
-      if (myRole === "member") {
-        return "Members can't grant roles in a closed network.";
-      }
-      if (ROLE_RANK[myRole] < ROLE_RANK[target]) {
-        return `Your role (${myRole}) can't grant ${target}.`;
-      }
-    }
-    return null;
   }
 </script>
 
 <div class="tab">
   <div class="head">
     <h3>Roster</h3>
-    <div class="head-meta">
-      <NetworkKindBadge kind={govView.kind} size={13} />
-      <span>{roster.length} approved {roster.length === 1 ? "device" : "devices"}</span>
-    </div>
+    <div class="head-meta"><NetworkKindBadge kind={projection.kind} size={13} />
+      <span>{roster.length} approved {roster.length === 1 ? "device" : "devices"}</span></div>
   </div>
-
-  {#if rosterError}
-    <div class="err">⚠ {rosterError}</div>
-  {/if}
-  {#if actionError}
-    <div class="err">⚠ {actionError}</div>
-  {/if}
-  {#if importInfo}
-    <div class="ok">{importInfo}</div>
-  {/if}
-
-  <div class="import-row">
-    <button
-      class="row-btn"
-      disabled={importBusy}
-      onclick={clickImport}
-      title="Import a .identity.json file from another device to pre-authorise them on this network. The next time they connect, they auto-approve without the verification-code dance."
-    >
-      {importBusy ? "Importing…" : "+ Import identity…"}
-    </button>
-    <span class="hint">
-      Pre-authorise a peer before they connect.
-    </span>
-    <input
-      bind:this={fileInput}
-      type="file"
-      accept=".json,application/json"
-      onchange={onFilePicked}
-      style="display: none"
-    />
-  </div>
-
+  <div class="hint">Membership is projected from daemon-owned authenticated roster state. Pending peers appear in Approvals.</div>
+  {#if error}<div class="err">⚠ {error}</div>{/if}
   {#if roster.length === 0}
-    <div class="empty">
-      No approved devices yet. Approvals land here once you accept
-      a pending peer in the <strong>Approvals</strong> tab — or
-      import an identity file (above) to pre-authorise a peer that
-      hasn't connected yet.
-    </div>
+    <div class="empty">No approved devices yet.</div>
   {:else}
     <table class="peers">
-      <thead>
-        <tr>
-          <th>Device</th>
-          {#if govView.kind === "closed"}
-            <th>Role</th>
-          {/if}
-          <th>Approved</th>
-          <th></th>
-        </tr>
-      </thead>
+      <thead><tr><th>Device</th>{#if projection.kind === "closed"}<th>Role</th>{/if}<th>Approved</th></tr></thead>
       <tbody>
-        {#each roster as r (r.device_id)}
-          {@const role = r.role}
-          {@const isBusy = busy === r.device_id}
+        {#each roster as peer (peer.device_id)}
+          {@const isBusy = busy === peer.device_id}
           <tr>
-            <td>
-              <div class="peer-label">{r.label || "—"}</div>
-              <div class="peer-id mono" title={r.device_id}>
-                {shortId(r.device_id)}
-              </div>
-            </td>
-            {#if govView.kind === "closed"}
-              <td>
-                <div class="role-cell">
-                  <RoleChip {role} size="sm" />
-                  <div class="role-menu">
-                    {#each ["owner", "controller", "member"] as r2}
-                      {@const disabled = !!whyDisabled(r2 as Role)}
-                      <button
-                        class="role-opt"
-                        class:active={role === r2}
-                        {disabled}
-                        title={whyDisabled(r2 as Role) ?? `Set role to ${r2}`}
-                        onclick={() => setRole(r, r2 as Role)}
-                      >
-                        {r2}
-                      </button>
-                    {/each}
-                  </div>
+            <td><div>{peer.label || "—"}</div><div class="peer-id mono" title={peer.device_id}>{shortId(peer.device_id)}</div></td>
+            {#if projection.kind === "closed"}
+              <td><div class="role-cell"><RoleChip role={peer.role} size="sm" />
+                <div class="role-menu">
+                  {#each ["owner", "controller", "member"] as candidate}
+                    {@const role = candidate as Role}
+                    <button class:active={peer.role === role} disabled={isBusy || !canSet(role)} title={canSet(role) ? "Set role to " + role : "Your role (" + myRole + ") cannot grant " + role} onclick={() => setRole(peer, role)}>{role}</button>
+                  {/each}
                 </div>
-              </td>
+              </div></td>
             {/if}
-            <td class="muted">{fmtDate(r.approved_at)}</td>
-            <td>
-              <div class="row-actions">
-                <button
-                  class="row-btn"
-                  disabled={isBusy}
-                  onclick={() => exportApproval(r)}
-                  title="Issue an out-of-band approval bundle for this peer. Writes a .approval.json containing this network's settings + your identity + the peer's pubkey. They import it elsewhere to join the same network with you already in their roster."
-                >
-                  Approval…
-                </button>
-                <button
-                  class="row-btn danger"
-                  disabled={isBusy}
-                  onclick={() => removePeer(r)}
-                >
-                  Remove
-                </button>
-              </div>
-            </td>
+            <td class="muted">{new Date(peer.approved_at * 1000).toLocaleString()}</td>
           </tr>
         {/each}
       </tbody>
@@ -360,164 +85,19 @@
 </div>
 
 <style>
-  .tab {
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-  .head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 0.6rem;
-    margin-bottom: 0.2rem;
-  }
-  h3 {
-    margin: 0;
-    font-size: 0.92rem;
-    font-weight: 600;
-    color: #e8e8e8;
-  }
-  .head-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.74rem;
-    color: #888;
-  }
-  .muted {
-    color: #888;
-  }
-  .err {
-    background: #3a1717;
-    color: #ffb4b4;
-    border: 1px solid #5a2424;
-    border-radius: 5px;
-    padding: 0.45rem 0.6rem;
-    font-size: 0.78rem;
-  }
-  .ok {
-    background: #112a1c;
-    color: #b9f5cc;
-    border: 1px solid #1c4a30;
-    border-radius: 5px;
-    padding: 0.45rem 0.6rem;
-    font-size: 0.78rem;
-  }
-  .import-row {
-    display: flex;
-    align-items: center;
-    gap: 0.55rem;
-    flex-wrap: wrap;
-  }
-  .import-row .hint {
-    color: #888;
-    font-size: 0.74rem;
-  }
-  .row-actions {
-    display: flex;
-    gap: 0.35rem;
-  }
-  .empty {
-    color: #888;
-    font-style: italic;
-    padding: 0.6rem 0.85rem;
-    font-size: 0.85rem;
-    background: #131318;
-    border: 1px solid #1e1e25;
-    border-radius: 6px;
-  }
-  table.peers {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.82rem;
-    background: #131318;
-    border: 1px solid #1e1e25;
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .peers thead th {
-    text-align: left;
-    color: #888;
-    font-weight: 500;
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.45rem 0.7rem;
-    border-bottom: 1px solid #1e1e25;
-    background: #16161c;
-  }
-  .peers tbody td {
-    padding: 0.55rem 0.7rem;
-    border-bottom: 1px solid #1a1a20;
-    vertical-align: top;
-  }
-  .peers tbody tr:last-child td {
-    border-bottom: none;
-  }
-  .peer-label {
-    font-weight: 500;
-  }
-  .peer-id {
-    color: #777;
-    font-size: 0.72rem;
-  }
-  .mono {
-    font-family: ui-monospace, SFMono-Regular, monospace;
-  }
-  .role-cell {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-  }
-  .role-menu {
-    display: flex;
-    gap: 0.2rem;
-  }
-  .role-opt {
-    padding: 0.15rem 0.45rem;
-    background: #1a1a22;
-    border: 1px solid #2a2a35;
-    border-radius: 3px;
-    color: #888;
-    cursor: pointer;
-    font: inherit;
-    font-size: 0.66rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .role-opt.active {
-    color: #b8b8ff;
-    border-color: #4a4a85;
-    background: #1a1a2a;
-  }
-  .role-opt:hover:not(:disabled):not(.active) {
-    border-color: #4a4a55;
-    color: #e8e8e8;
-  }
-  .role-opt:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-  .row-btn {
-    padding: 0.25rem 0.6rem;
-    background: #1a1a22;
-    border: 1px solid #2a2a35;
-    border-radius: 4px;
-    color: #ccc;
-    cursor: pointer;
-    font: inherit;
-    font-size: 0.74rem;
-  }
-  .row-btn.danger {
-    color: #fca5a5;
-    border-color: #4a2222;
-  }
-  .row-btn.danger:hover:not(:disabled) {
-    background: #2a1414;
-  }
-  .row-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
+  .tab { display: flex; flex-direction: column; gap: .6rem; }
+  .head { display: flex; align-items: baseline; justify-content: space-between; }
+  h3 { margin: 0; color: #e8e8e8; font-size: .92rem; }
+  .head-meta { display: flex; gap: .4rem; align-items: center; color: #888; font-size: .74rem; }
+  .hint, .muted { color: #8b98a4; font-size: .76rem; }
+  .err { color: #ff9d9d; font-size: .8rem; }
+  .empty { color: #9da9b3; padding: 1rem; border: 1px dashed #34404a; border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; color: #d7e0e7; font-size: .8rem; }
+  th, td { text-align: left; padding: .45rem; border-bottom: 1px solid #202a33; }
+  .peer-id { color: #8493a0; font-size: .7rem; }
+  .role-cell { display: flex; align-items: center; gap: .5rem; }
+  .role-menu { display: flex; gap: .2rem; }
+  .role-menu button { background: transparent; color: #aab7c3; border: 1px solid #34424e; border-radius: 3px; padding: .2rem .35rem; font-size: .7rem; }
+  .role-menu button.active { color: #fff; border-color: #579bc0; }
+  .role-menu button:disabled { opacity: .45; }
 </style>

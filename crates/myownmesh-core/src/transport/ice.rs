@@ -11,6 +11,73 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 
 use crate::config::{StunServer, TurnServer};
 
+/// The transport-only identity and metadata used when ordering candidate
+/// paths.  `id` is an opaque caller-owned path handle; no application data or
+/// data-channel capability is carried by this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IceCandidatePath {
+    pub id: u64,
+    pub local: super::diag::IceCandidateKind,
+    pub remote: super::diag::IceCandidateKind,
+    pub priority: u32,
+}
+
+impl IceCandidatePath {
+    pub const fn new(
+        id: u64,
+        local: super::diag::IceCandidateKind,
+        remote: super::diag::IceCandidateKind,
+        priority: u32,
+    ) -> Self {
+        Self {
+            id,
+            local,
+            remote,
+            priority,
+        }
+    }
+}
+
+/// A deterministic transport preference for a candidate pair.  Direct paths
+/// are preferred, while reflexive and relay paths remain eligible fallbacks.
+/// The score is only a tie-breaker after the caller-provided ICE priority.
+pub fn candidate_path_preference(
+    local: super::diag::IceCandidateKind,
+    remote: super::diag::IceCandidateKind,
+) -> u8 {
+    use super::diag::IceCandidateKind as Kind;
+
+    match (local, remote) {
+        (Kind::Host, Kind::Host) => 5,
+        (Kind::Host, Kind::ServerReflexive)
+        | (Kind::ServerReflexive, Kind::Host)
+        | (Kind::ServerReflexive, Kind::ServerReflexive) => 4,
+        (Kind::PeerReflexive, Kind::Host)
+        | (Kind::Host, Kind::PeerReflexive)
+        | (Kind::PeerReflexive, Kind::ServerReflexive)
+        | (Kind::ServerReflexive, Kind::PeerReflexive)
+        | (Kind::PeerReflexive, Kind::PeerReflexive) => 3,
+        (Kind::Relay, _) | (_, Kind::Relay) => 2,
+        _ => 1,
+    }
+}
+
+/// Sort candidate paths by the caller's ICE priority, then by the stable
+/// transport preference, then by opaque path ID.  The final key makes equal
+/// priority/path-kind inputs deterministic across runs and runtimes.
+pub fn rank_candidate_paths(paths: &mut [IceCandidatePath]) {
+    paths.sort_unstable_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| {
+                candidate_path_preference(right.local, right.remote)
+                    .cmp(&candidate_path_preference(left.local, left.remote))
+            })
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 /// Build the webrtc-rs [`RTCConfiguration`] from our user-facing
 /// config. ICE candidate pool size is left at the default; the
 /// engine's own offer-pool-flush-on-drop policy handles refreshing
@@ -146,5 +213,43 @@ mod tests {
             classify_candidate_sdp("malformed"),
             IceCandidateKind::Unknown
         );
+    }
+
+    #[test]
+    fn candidate_paths_rank_deterministically_without_payload_capability() {
+        let mut paths = vec![
+            IceCandidatePath::new(9, IceCandidateKind::Relay, IceCandidateKind::Relay, 100),
+            IceCandidatePath::new(2, IceCandidateKind::Host, IceCandidateKind::Host, 100),
+            IceCandidatePath::new(
+                1,
+                IceCandidateKind::ServerReflexive,
+                IceCandidateKind::Host,
+                200,
+            ),
+        ];
+
+        rank_candidate_paths(&mut paths);
+
+        assert_eq!(
+            paths.iter().map(|path| path.id).collect::<Vec<_>>(),
+            [1, 2, 9]
+        );
+        assert_eq!(
+            candidate_path_preference(paths[1].local, paths[1].remote),
+            5
+        );
+    }
+
+    #[test]
+    fn equal_paths_use_opaque_id_as_the_final_tie_breaker() {
+        let mut paths = vec![
+            IceCandidatePath::new(8, IceCandidateKind::Host, IceCandidateKind::Host, 7),
+            IceCandidatePath::new(3, IceCandidateKind::Host, IceCandidateKind::Host, 7),
+        ];
+
+        rank_candidate_paths(&mut paths);
+
+        assert_eq!(paths[0].id, 3);
+        assert_eq!(paths[1].id, 8);
     }
 }

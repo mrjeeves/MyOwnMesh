@@ -14,7 +14,7 @@
 //!    a data channel that never opened, a restart that never carried traffic,
 //!    a reconnect that needs another nudge, a primary-IP that quietly moved.
 //!    No event can signal "nothing happened", so a single periodic pass (the
-//!    state-watch tick, [`super::scheduler::STATE_WATCH_INTERVAL_MS`]) confirms
+//!    state-watch tick, configured by `NetworkConfig::scheduler`) confirms
 //!    everything still looks right and repairs what doesn't.
 //!
 //! A [`Ticker`] is one such time-based subsystem. The driver builds a
@@ -58,7 +58,12 @@ pub(crate) struct TickRegistry {
 impl TickRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            tickers: Vec::new(),
+            tickers: vec![
+                Box::new(HubTicker),
+                Box::new(HubIntroductionTicker),
+                Box::new(ParentingTicker),
+                Box::new(LocalObservationTicker),
+            ],
         }
     }
 
@@ -79,6 +84,65 @@ impl TickRegistry {
     /// Names of the registered tickers, for the startup diagnostic.
     pub(crate) fn names(&self) -> Vec<&'static str> {
         self.tickers.iter().map(|t| t.name()).collect()
+    }
+}
+
+/// Bounded RFC6206 maintenance for the optional configured hub tier.
+pub(crate) struct HubTicker;
+
+#[async_trait]
+impl Ticker for HubTicker {
+    fn name(&self) -> &'static str {
+        "hub-advertisement"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        state.poll_hub().await;
+    }
+}
+
+/// Bounded HubTree parent registration and expiry maintenance.  This shares
+/// the existing state-watch cadence and never creates a detached task.
+pub(crate) struct ParentingTicker;
+
+/// Local monotonic introduction deadlines and replay-record retention share
+/// the existing watch cadence. One pass is capped by the explicit policy.
+pub(crate) struct HubIntroductionTicker;
+
+#[async_trait]
+impl Ticker for HubIntroductionTicker {
+    fn name(&self) -> &'static str {
+        "hub-introduction"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        state.maintain_hub_introductions().await;
+    }
+}
+
+#[async_trait]
+impl Ticker for ParentingTicker {
+    fn name(&self) -> &'static str {
+        "hub-tree-parenting"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        state.poll_parenting().await;
+    }
+}
+
+/// Bounded maintenance for the optional node-local observation aggregate.
+/// The graph is diagnostic-only; its refusal path is intentionally ignored.
+pub(crate) struct LocalObservationTicker;
+
+#[async_trait]
+impl Ticker for LocalObservationTicker {
+    fn name(&self) -> &'static str {
+        "local-observation"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        state.maintain_local_observation();
     }
 }
 
@@ -126,22 +190,20 @@ impl Ticker for NetworkWatchTicker {
     }
 }
 
-/// Offerer-side reconnect supervisor — the backstop for the reconnect
-/// intents events couldn't already resolve. Re-offers each peer we owe an
-/// offer to whose backoff has come due, and ages out the ones past the
-/// reconnecting grace. The event paths (relay-reconnect flush, inbound
-/// announce) handle the common case; this guarantees forward progress when
-/// no event arrives.
-pub(crate) struct ReconnectSupervisor;
+/// Canonical fact anti-entropy backstop. Event-driven advertisements remain
+/// the fast path; this bounded, byte-paged inventory pass repairs a fact lost
+/// while a peer's data channel was transiently unavailable. It snapshots exact
+/// current owners before each page send and keeps every page context-bound.
+pub(crate) struct FactInventoryTicker;
 
 #[async_trait]
-impl Ticker for ReconnectSupervisor {
+impl Ticker for FactInventoryTicker {
     fn name(&self) -> &'static str {
-        "reconnect-supervisor"
+        "fact-inventory"
     }
 
     async fn tick(&mut self, state: &Arc<NetworkState>) {
-        super::service_reconnect_intents(state).await;
+        super::governance::broadcast_fact_inventory(state).await;
     }
 }
 
@@ -163,9 +225,10 @@ impl Ticker for TopologyShapeTicker {
     }
 }
 
-/// Coalesced renegotiation — one in-place offer per peer whose track set
-/// changed since the last pass (see
-/// `engine::service_media_renegotiations`). No-op when nothing moved.
+/// Recovery backstop for coalesced renegotiation. The WebRTC
+/// `negotiationneeded` callback drives the ordinary path immediately; this
+/// pass retries debt that could not run because signaling was not stable or a
+/// prior attempt failed. No-op when nothing is pending.
 pub(crate) struct MediaRenegotiationTicker;
 
 #[async_trait]

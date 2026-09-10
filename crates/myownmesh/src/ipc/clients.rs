@@ -43,10 +43,10 @@
 //! above stays exactly as private as it was. A sibling module or an outside
 //! caller still reaches none of it.
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
@@ -97,6 +97,8 @@ pub enum IpcAdmissionError {
     /// retry — is identical for all three arms.
     #[error("the control runtime is closing and admits nothing further")]
     Closing,
+    #[error("IPC final watchdog custody is unavailable")]
+    CustodyUnavailable,
 }
 
 /// Everything one registry is still holding, at one instant.
@@ -110,6 +112,7 @@ pub enum IpcAdmissionError {
 pub struct RegistryResidue {
     pub lifecycle: Lifecycle,
     pub live_tasks: u64,
+    pub watchdogs: u64,
     pub clients: u64,
     pub realtime_flows: u64,
     pub handler_claims: u64,
@@ -145,6 +148,7 @@ impl RegistryResidue {
         Self {
             lifecycle,
             live_tasks: 0,
+            watchdogs: 0,
             clients: 0,
             realtime_flows: 0,
             handler_claims: 0,
@@ -474,27 +478,32 @@ pub struct TaskAdmission {
 }
 
 impl TaskAdmission {
-    fn new(lease: ResourceLease, inner: Arc<RegistryInner>) -> Self {
+    fn new(lease: ResourceLease, inner: &Arc<RegistryInner>) -> Self {
         Self {
             _lease: lease,
-            _gate: TaskGate { inner },
+            _gate: TaskGate {
+                inner: Arc::downgrade(inner),
+            },
         }
     }
 }
 
 /// The decrement half of [`TaskAdmission`], as its own drop.
 struct TaskGate {
-    inner: Arc<RegistryInner>,
+    inner: std::sync::Weak<RegistryInner>,
 }
 
 impl Drop for TaskGate {
     fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
         // Waking only on the transition to zero, rather than on every task end,
         // keeps a busy daemon from repeatedly waking a drain that is not
         // running. The wake is outside the lock: waking under it would put the
         // woken drain straight into a method that takes the same lock.
         let last = {
-            let mut tables = self.inner.tables.lock();
+            let mut tables = inner.tables.lock();
             tables.live_tasks = tables
                 .live_tasks
                 .checked_sub(1)
@@ -502,7 +511,7 @@ impl Drop for TaskGate {
             tables.live_tasks == 0
         };
         if last {
-            self.inner.idle.notify_waiters();
+            inner.idle.notify_waiters();
         }
     }
 }
@@ -520,6 +529,45 @@ fn task_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         (ResourceClass::WorkerOrTask, 1),
         (ResourceClass::OpaqueDependencyResidual, 1),
     ])
+}
+
+/// The exact one-task claim exposed to the daemon test grant and its controls.
+///
+/// Keeping this seam beside [`task_claim`] makes the process-wide fixture pay
+/// for the same worker and residual terms that [`ClientRegistry::lease_task`]
+/// acquires, rather than maintaining a second formula in the crate root.
+#[cfg(test)]
+pub(crate) fn task_claim_for_test() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    task_claim()
+}
+
+/// One IPC task's exact provider reservation charge for test-grant planning.
+///
+/// The provider's own planning helper adds the reservation record that exists
+/// when the task lease is held; callers must fund that record before acquiring
+/// the task claim, just as they do for every other finite test reservation.
+#[cfg(test)]
+pub(crate) fn task_reservation_planning_charge_for_test(
+) -> Result<ResourceClaim, myownmesh_core::ResourceUnavailable> {
+    let claim = task_claim().expect("the fixed IPC task claim is representable");
+    myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
+/// Price an isolated cohort from the exact number of task owners the fixture
+/// will hold. The owner count belongs to the caller because only the fixture
+/// can know how many leases it actually retains; this helper owns the shape of
+/// one task and the provider's reservation record, so no caller can restate
+/// either term when building its private grant.
+#[cfg(test)]
+pub(crate) fn task_cohort_reservation_planning_charge_for_test(
+    owners: usize,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let owners = u64::try_from(owners).map_err(|_| ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::WorkerOrTask,
+    })?;
+    let per_owner = task_reservation_planning_charge_for_test()
+        .expect("the fixed IPC task reservation is representable");
+    per_owner.checked_scale(owners)
 }
 
 /// [`task_claim`] plus the heap a task's captured state holds for its lifetime.
@@ -845,6 +893,11 @@ pub(crate) fn registry_fixture_claim(
         .checked_add(planned(
             LeasedMap::<String, OwnedRealtimeFlow>::entry_claim()?,
         ))?
+        .checked_add(planned(realtime_flow_retained(
+            REALTIME_CAPABILITY_BYTES,
+            &"x".repeat(coordinate),
+        )?))?
+        .checked_add(planned(funded_record_retained::<RealtimeFlowSlot>()?))?
         .checked_add(planned(pending_cancellation_claim()?))?;
     // The off-node half, priced from the same helpers the registry charges
     // with. A `PendingKey` carries four coordinates and a `ClaimKey` two, and
@@ -893,6 +946,43 @@ pub use identity::{ClaimKey, ClientCapability, ClientId, RealtimeFlowCapability}
 /// The network travels with the handle because closing needs a `JoinedNetwork`
 /// to close *through*, and asking the client which network its own flow is on
 /// would be taking a routing decision from the party being authorized.
+/// The one exact flow handle held by a client capability.
+///
+/// The asynchronous mutex is deliberately inside the already-funded slot:
+/// synchronous pipes use `try_lock`, while Change and close retain this guard
+/// across their own await.  The registry table mutex is never held across an
+/// await, and no raw pointer or second flow authority is needed.
+pub(crate) struct RealtimeFlowSlot {
+    handle: tokio::sync::Mutex<Option<myownmesh_core::realtime::RealtimeFlowHandle>>,
+}
+
+impl RealtimeFlowSlot {
+    fn new(flow: myownmesh_core::realtime::RealtimeFlowHandle) -> Self {
+        Self {
+            handle: tokio::sync::Mutex::new(Some(flow)),
+        }
+    }
+
+    pub(crate) async fn change_opaque(
+        &self,
+        network: &myownmesh_core::JoinedNetwork,
+        open: &myownmesh_core::realtime::OpaqueFlowOpen,
+    ) -> Result<(), myownmesh_core::realtime::RealtimeRefusal> {
+        // Change is one bounded operation, not a queue of requests behind the
+        // exact capability.  Close may await the guard during teardown, but a
+        // concurrent second Change must refuse immediately rather than outlive
+        // the caller's request deadline or race a later close/successor.
+        let guard = self
+            .handle
+            .try_lock()
+            .map_err(|_| myownmesh_core::realtime::RealtimeRefusal::FlowRefused)?;
+        let flow = guard
+            .as_ref()
+            .ok_or(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)?;
+        network.change_opaque_flow(flow, open).await
+    }
+}
+
 pub(crate) struct OwnedRealtimeFlow {
     /// The node this flow will occupy in the disconnect drain's list.
     ///
@@ -902,12 +992,9 @@ pub(crate) struct OwnedRealtimeFlow {
     /// builds no node.
     cleanup: Option<ResourceLease>,
     network: String,
-    flow: Option<myownmesh_core::realtime::RealtimeFlowHandle>,
-    /// The capability key's bytes and this network name's, funded together and
-    /// released when this value drops — which, taken out through
-    /// `pop_first_entry`, is after the owned key has gone wherever it is going.
-    /// The node lease cannot carry this: it ends inside the removal call. It is
-    /// last so it outlives the values whose retained allocation it funds.
+    flow: FundedArc<RealtimeFlowSlot>,
+    /// The capability key and network string remain funded with the owned row;
+    /// only the separate slot lease may outlive this row during Change.
     _retained: ResourceLease,
 }
 
@@ -917,13 +1004,14 @@ impl OwnedRealtimeFlow {
     }
 
     pub(crate) async fn close_through(
-        mut self,
+        self,
         network: &myownmesh_core::JoinedNetwork,
     ) -> Result<(), myownmesh_core::realtime::RealtimeRefusal> {
-        let flow = self
-            .flow
+        let mut guard = self.flow.handle.lock().await;
+        let flow = guard
             .take()
-            .expect("an owned realtime flow is consumed only once");
+            .ok_or(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)?;
+        drop(guard);
         network.close_realtime(flow).await
     }
 }
@@ -1122,6 +1210,10 @@ impl ClientHandle {
         self.capability.expose()
     }
 
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
     pub(crate) const fn capability_encoded_len() -> usize {
         ClientCapability::ENCODED_LEN
     }
@@ -1240,9 +1332,12 @@ impl ClientHandle {
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
         entry: ResourceLease,
         retained: ResourceLease,
+        slot: ResourceLease,
         cleanup: ResourceLease,
     ) -> RealtimeFlowCapability {
         let capability = RealtimeFlowCapability::mint();
+        let flow = FundedArc::new(RealtimeFlowSlot::new(flow), slot)
+            .expect("an admitted realtime-flow slot lease may be shared");
         self.realtime_flows
             .lock()
             .insert(
@@ -1250,7 +1345,7 @@ impl ClientHandle {
                 OwnedRealtimeFlow {
                     cleanup: Some(cleanup),
                     network,
-                    flow: Some(flow),
+                    flow,
                     _retained: retained,
                 },
                 entry,
@@ -1289,8 +1384,25 @@ impl ClientHandle {
         if owned.network != network {
             return None;
         }
-        let flow = owned.flow.as_ref()?;
+        let slot = owned.flow.clone();
+        drop(flows);
+        let guard = slot.handle.try_lock().ok()?;
+        let flow = guard.as_ref()?;
         Some(effect(flow))
+    }
+
+    /// Capture the funded slot for one exact capability without retaining the
+    /// table mutex.  The caller must keep the authenticated client handle and
+    /// use the returned slot's guarded operation; removing the row concurrently
+    /// cannot invalidate this slot or create a successor alias.
+    pub(crate) fn realtime_flow_slot(
+        &self,
+        capability: &str,
+        network: &str,
+    ) -> Option<FundedArc<RealtimeFlowSlot>> {
+        let flows = self.realtime_flows.lock();
+        let owned = flows.get(capability)?;
+        (owned.network == network).then(|| owned.flow.clone())
     }
 
     /// Take one of this client's flows out, for a close that will consume it.
@@ -1547,6 +1659,13 @@ struct RegistryTables {
     /// for tasks. One lock over both means an admission either happens entirely
     /// before the transition or is refused by it.
     live_tasks: u64,
+    /// Inbound stream watchdogs retained until shutdown observes each result.
+    /// Keeping the handle here prevents bridge code from detaching a task and
+    /// makes its node allocation independently funded.
+    watchdogs: crate::ipc::LeasedList<tokio::task::JoinHandle<()>>,
+    /// Reserved before the first watchdog admission, and kept alive until a
+    /// dropped registry's final batch has been terminally observed.
+    final_watchdog_custody: Option<FinalWatchdogCustody>,
     clients: LeasedMap<ClientId, FundedArc<ClientHandle>>,
     handler_claims: LeasedMap<ClaimKey, Funded<ClientId>>,
     /// Subscribers per (network, channel), as a funded set of funded members.
@@ -1867,7 +1986,19 @@ impl RouteReady {
 /// returns. The flag is what a late-arriving waiter reads instead.
 struct PumpOwner {
     cancel: FundedArc<RouteCancellation>,
-    join: tokio::task::JoinHandle<()>,
+    join: Option<tokio::task::JoinHandle<()>>,
+    retirement: FundedArc<RouteRetirementCustodian>,
+}
+
+impl Drop for PumpOwner {
+    fn drop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        self.cancel.cancel();
+        join.abort();
+        self.retirement.submit(join);
+    }
 }
 
 /// The pump's stop signal: a flag, a notification, and the funding for its own
@@ -1886,14 +2017,20 @@ struct PumpOwner {
 pub(crate) struct RouteCancellation {
     cancelled: AtomicBool,
     woken: tokio::sync::Notify,
+    retirement: FundedArc<RouteRetirementCustodian>,
 }
 
 impl RouteCancellation {
-    fn new() -> Self {
+    fn new(retirement: FundedArc<RouteRetirementCustodian>) -> Self {
         Self {
             cancelled: AtomicBool::new(false),
             woken: tokio::sync::Notify::new(),
+            retirement,
         }
+    }
+
+    fn retirement(&self) -> FundedArc<RouteRetirementCustodian> {
+        self.retirement.clone()
     }
 
     fn cancel(&self) {
@@ -1975,7 +2112,487 @@ impl ChannelRoute {
 /// than stopping it — the pump would keep running against a channel with no
 /// subscribers, which is the exact failure the route lifecycle exists to end.
 #[must_use = "a removed route still owes its pump a join or its followers an answer"]
-pub(crate) struct RetiredRoute(Retired);
+pub(crate) struct RetiredRoute(Option<Retired>);
+
+impl Drop for RetiredRoute {
+    fn drop(&mut self) {
+        if let Some(Retired::Installing(ready)) = self.0.take() {
+            ready.settle_failed();
+        }
+        // A `Retired::Pump` drops its `PumpOwner`, whose Drop path aborts and
+        // transfers the exact handle to the already-established custodian.
+    }
+}
+
+/// A runtime-independent, one-shot owner for a route pump's join handle.
+///
+/// The route's normal retirement awaits its handle, but that await belongs to
+/// a cancellable control task.  If that task is dropped while the join is
+/// pending, the guard below aborts the pump and transfers the exact handle to
+/// this already-running thread.  The channel and worker are both established
+/// before the pump can exist, so the transfer has no late spawn or unbounded
+/// fallback path.
+// The Owner is never captured by route tasks. Ports do not join on Drop.
+struct RouteJoinOwner {
+    port: RouteJoinPort,
+    worker: Option<std::thread::JoinHandle<()>>,
+    _worker_lease: ResourceLease,
+}
+
+#[derive(Clone)]
+struct RouteJoinPort(FundedArc<RouteJoinQueue>);
+
+struct RouteJoinQueue {
+    state: std::sync::Mutex<RouteJoinState>,
+    changed: std::sync::Condvar,
+}
+
+struct RouteJoinState {
+    accepting: bool,
+    outstanding: usize,
+    head: Option<RouteJoinEntry>,
+    #[cfg(test)]
+    waiting_after_close: bool,
+}
+
+// The node lease is OUTSIDE the Box and follows its deallocation.
+struct RouteJoinEntry {
+    node: Box<RouteJoinNode>,
+    lease: ResourceLease,
+}
+
+struct RouteJoinNode {
+    next: Option<RouteJoinEntry>,
+    workers: [Option<std::thread::JoinHandle<()>>; 2],
+    pair_funding: Option<ResourceLease>,
+    terminal: FundedArc<RouteRetirementTerminal>,
+}
+
+struct RouteRetirementTerminal {
+    // Published only after BOTH joins, pair release and node deallocation.
+    observed: AtomicBool,
+    join_errors: AtomicUsize,
+    #[cfg(test)]
+    exited: std::sync::Mutex<u8>,
+    #[cfg(test)]
+    exited_changed: std::sync::Condvar,
+}
+
+fn route_join_lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // A poisoned custody fence cannot be bypassed by dropping owned handles.
+    lock.lock().unwrap_or_else(|_| std::process::abort())
+}
+
+fn route_join_worker_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::WorkerOrTask, 1),
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+impl RouteJoinOwner {
+    fn reserve(resources: &RegistryResources) -> Result<Self, IpcAdmissionError> {
+        let worker_lease = resources
+            .acquire(route_join_worker_claim().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let queue_lease = resources
+            .acquire(funded_record_retained::<RouteJoinQueue>().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let queue = FundedArc::new(
+            RouteJoinQueue {
+                state: std::sync::Mutex::new(RouteJoinState {
+                    accepting: true,
+                    outstanding: 0,
+                    head: None,
+                    #[cfg(test)]
+                    waiting_after_close: false,
+                }),
+                changed: std::sync::Condvar::new(),
+            },
+            queue_lease,
+        )
+        .unwrap_or_else(|_| unreachable!("the join queue uses admitted funding"));
+        let port = RouteJoinPort(queue);
+        let worker_port = port.clone();
+        let worker = std::thread::Builder::new()
+            .name("myownmesh-ipc-route-join".to_string())
+            .spawn(move || worker_port.run())
+            .map_err(|_| IpcAdmissionError::CustodyUnavailable)?;
+        Ok(Self {
+            port,
+            worker: Some(worker),
+            _worker_lease: worker_lease,
+        })
+    }
+
+    fn close(&self) {
+        let mut state = route_join_lock(&self.port.0.state);
+        state.accepting = false;
+        self.port.0.changed.notify_all();
+    }
+}
+
+impl Drop for RouteJoinOwner {
+    fn drop(&mut self) {
+        self.close();
+        if let Some(worker) = self.worker.take() {
+            // Only an outside process/isolated owner may execute this join.
+            // Admitted-but-unqueued nodes keep the worker alive after close.
+            if worker.join().is_err() {
+                std::process::abort();
+            }
+        }
+    }
+}
+
+impl RouteJoinPort {
+    fn register(&self) -> Result<(), IpcAdmissionError> {
+        let mut state = route_join_lock(&self.0.state);
+        if !state.accepting {
+            return Err(IpcAdmissionError::Closing);
+        }
+        state.outstanding = state
+            .outstanding
+            .checked_add(1)
+            .ok_or(IpcAdmissionError::CustodyUnavailable)?;
+        Ok(())
+    }
+
+    fn submit(&self, mut entry: RouteJoinEntry) {
+        let mut state = route_join_lock(&self.0.state);
+        // Closing forbids only new registration, never an admitted handoff.
+        if state.outstanding == 0 || entry.node.next.is_some() {
+            std::process::abort();
+        }
+        entry.node.next = state.head.take();
+        state.head = Some(entry);
+        self.0.changed.notify_all();
+    }
+
+    fn complete(&self, mut entry: RouteJoinEntry) {
+        let mut errors = 0;
+        for worker in &mut entry.node.workers {
+            if let Some(worker) = worker.take() {
+                // A failed join is recorded; it never skips the other handle.
+                errors += usize::from(worker.join().is_err());
+            }
+        }
+        let terminal = entry.node.terminal.clone();
+        drop(entry.node.pair_funding.take());
+        drop(entry.node);
+        drop(entry.lease);
+        terminal.join_errors.store(errors, Ordering::Release);
+        terminal.observed.store(true, Ordering::Release);
+        // The independently funded witness may survive this disposition.
+        // Outstanding is removed only after terminal work and node funding end.
+        let mut state = route_join_lock(&self.0.state);
+        state.outstanding = state
+            .outstanding
+            .checked_sub(1)
+            .unwrap_or_else(|| std::process::abort());
+        self.0.changed.notify_all();
+    }
+
+    fn run(&self) {
+        loop {
+            let batch = {
+                let mut state = route_join_lock(&self.0.state);
+                loop {
+                    if state.head.is_some() {
+                        break state.head.take();
+                    }
+                    if !state.accepting && state.outstanding == 0 {
+                        return;
+                    }
+                    #[cfg(test)]
+                    if !state.accepting {
+                        state.waiting_after_close = true;
+                        self.0.changed.notify_all();
+                    }
+                    state = self
+                        .0
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|_| std::process::abort());
+                }
+            };
+            // Drain this finite detached batch; producers never wait on joins.
+            let mut batch = batch;
+            while let Some(mut entry) = batch {
+                batch = entry.node.next.take();
+                self.complete(entry);
+            }
+        }
+    }
+}
+
+static ROUTE_JOIN_OWNER: std::sync::OnceLock<std::sync::Mutex<Option<RouteJoinOwner>>> =
+    std::sync::OnceLock::new();
+
+fn process_route_join_port(
+    resources: &RegistryResources,
+) -> Result<RouteJoinPort, IpcAdmissionError> {
+    let slot = ROUTE_JOIN_OWNER.get_or_init(|| std::sync::Mutex::new(None));
+    let mut owner = route_join_lock(slot);
+    if owner.is_none() {
+        // Private registry controls must not strand their private grant in a
+        // process-lived owner. Their ordinary path explicitly uses the separately
+        // planned daemon-test process root; isolated root controls inject a Port.
+        #[cfg(test)]
+        let process_resources;
+        #[cfg(test)]
+        let resources = match resources {
+            RegistryResources::Isolated { .. } => {
+                process_resources = RegistryResources::Application(crate::test_application_scope());
+                &process_resources
+            }
+            RegistryResources::Application(_) => resources,
+        };
+        *owner = Some(RouteJoinOwner::reserve(resources)?);
+    }
+    Ok(owner
+        .as_ref()
+        .expect("the process route owner was established")
+        .port
+        .clone())
+}
+
+struct RouteRetirementCustodian {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<tokio::task::JoinHandle<()>>>>,
+    fallback_sender:
+        std::sync::Mutex<Option<std::sync::mpsc::SyncSender<tokio::task::JoinHandle<()>>>>,
+    entry: std::sync::Mutex<Option<RouteJoinEntry>>,
+    port: RouteJoinPort,
+    terminal: FundedArc<RouteRetirementTerminal>,
+    #[cfg(test)]
+    join_started: tokio::sync::Notify,
+}
+
+impl RouteRetirementCustodian {
+    fn reserve(
+        resources: &RegistryResources,
+        port: RouteJoinPort,
+    ) -> Result<FundedArc<Self>, IpcAdmissionError> {
+        let retained = resources
+            .acquire(funded_record_retained::<Self>().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let node_lease = resources
+            .acquire(funded_record_retained::<RouteJoinNode>().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let witness_lease = resources
+            .acquire(
+                funded_record_retained::<RouteRetirementTerminal>()
+                    .map_err(IpcAdmissionError::Claim)?,
+            )
+            .map_err(IpcAdmissionError::Resources)?;
+        let funding = resources
+            .acquire(route_retirement_claim().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let terminal = FundedArc::new(
+            RouteRetirementTerminal {
+                observed: AtomicBool::new(false),
+                join_errors: AtomicUsize::new(0),
+                #[cfg(test)]
+                exited: std::sync::Mutex::new(0),
+                #[cfg(test)]
+                exited_changed: std::sync::Condvar::new(),
+            },
+            witness_lease,
+        )
+        .unwrap_or_else(|_| unreachable!("the route witness uses admitted funding"));
+        let entry = RouteJoinEntry {
+            node: Box::new(RouteJoinNode {
+                next: None,
+                workers: [None, None],
+                pair_funding: Some(funding),
+                terminal: terminal.clone(),
+            }),
+            lease: node_lease,
+        };
+        // All storage is reserved/preallocated, and no observer exists yet.
+        port.register()?;
+        Ok(FundedArc::new(
+            Self {
+                sender: std::sync::Mutex::new(None),
+                fallback_sender: std::sync::Mutex::new(None),
+                entry: std::sync::Mutex::new(Some(entry)),
+                port,
+                terminal,
+                #[cfg(test)]
+                join_started: tokio::sync::Notify::new(),
+            },
+            retained,
+        )
+        .unwrap_or_else(|_| unreachable!("the route custodian uses admitted funding")))
+    }
+
+    fn start(&self, #[cfg(test)] fail_at: Option<usize>) -> Result<(), IpcAdmissionError> {
+        // Called only after the funded cancellation record itself exists.
+        // Both bounded receiver/sender allocations precede either observer.
+        let channels = [
+            std::sync::mpsc::sync_channel(1),
+            std::sync::mpsc::sync_channel(1),
+        ];
+        for (index, (sender, receiver)) in channels.into_iter().enumerate() {
+            #[cfg(test)]
+            let observer_terminal = self.terminal.clone();
+            #[cfg(test)]
+            let fail = fail_at == Some(index);
+            #[cfg(not(test))]
+            let fail = false;
+            let worker = if fail {
+                Err(std::io::Error::other(
+                    "injected route observer startup failure",
+                ))
+            } else {
+                std::thread::Builder::new()
+                    .name(
+                        if index == 0 {
+                            "myownmesh-ipc-route-reaper"
+                        } else {
+                            "myownmesh-ipc-route-fallback"
+                        }
+                        .to_string(),
+                    )
+                    .spawn(move || {
+                        while let Ok(handle) = receiver.recv() {
+                            let _ = join_without_runtime(handle);
+                        }
+                        #[cfg(test)]
+                        {
+                            let mut exited = route_join_lock(&observer_terminal.exited);
+                            *exited |= 1 << index;
+                            observer_terminal.exited_changed.notify_all();
+                        }
+                    })
+            };
+            match worker {
+                Ok(worker) => {
+                    let mut entry = route_join_lock(&self.entry);
+                    entry
+                        .as_mut()
+                        .expect("startup owns the registered node")
+                        .node
+                        .workers[index] = Some(worker);
+                    let destination = if index == 0 {
+                        &self.sender
+                    } else {
+                        &self.fallback_sender
+                    };
+                    *route_join_lock(destination) = Some(sender);
+                }
+                Err(_) => {
+                    drop(sender);
+                    // No pump can exist yet: rollback joins are safe here.
+                    self.close_and_join();
+                    return Err(IpcAdmissionError::CustodyUnavailable);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn mark_join_started(&self) {
+        self.join_started.notify_waiters();
+    }
+
+    fn submit(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut handle = handle;
+        for sender in [&self.sender, &self.fallback_sender] {
+            let sender = route_join_lock(sender);
+            if let Some(sender) = sender.as_ref() {
+                match sender.try_send(handle) {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::TrySendError::Full(returned))
+                    | Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                        handle = returned
+                    }
+                }
+            }
+        }
+        // Still owns handle here. There is no safe synchronous fallback from
+        // a pump destructor, nor permission to silently detach on refusal.
+        std::process::abort();
+    }
+
+    fn close_senders(&self) {
+        drop(route_join_lock(&self.sender).take());
+        drop(route_join_lock(&self.fallback_sender).take());
+    }
+
+    fn close_and_join(&self) {
+        self.close_senders();
+        let entry = route_join_lock(&self.entry).take();
+        if let Some(entry) = entry {
+            self.port.complete(entry);
+        }
+        let _ = self.terminal.observed.load(Ordering::Acquire);
+    }
+}
+
+impl Drop for RouteRetirementCustodian {
+    fn drop(&mut self) {
+        self.close_senders();
+        if let Some(entry) = route_join_lock(&self.entry).take() {
+            self.port.submit(entry);
+        }
+    }
+}
+
+fn route_retirement_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::WorkerOrTask, 2),
+        (ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+}
+
+#[cfg(test)]
+pub(crate) fn route_join_root_planning_charge() -> Result<ResourceClaim, IpcAdmissionError> {
+    let planned = |raw: Result<ResourceClaim, ResourceClaimArithmeticError>| {
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+            raw.map_err(IpcAdmissionError::Claim)?,
+        )
+        .map_err(IpcAdmissionError::Resources)
+    };
+    planned(route_join_worker_claim())?
+        .checked_add(planned(funded_record_retained::<RouteJoinQueue>())?)
+        .map_err(IpcAdmissionError::Claim)
+}
+
+#[cfg(test)]
+pub(crate) fn route_custody_planning_charge() -> Result<ResourceClaim, IpcAdmissionError> {
+    let planned = myownmesh_core::FiniteResourceProvider::reservation_planning_charge;
+    let mut claim = ResourceClaim::ZERO;
+    for raw in [
+        route_cancellation_retained(),
+        funded_record_retained::<RouteRetirementCustodian>(),
+        funded_record_retained::<RouteJoinNode>(),
+        funded_record_retained::<RouteRetirementTerminal>(),
+        route_retirement_claim(),
+    ] {
+        let raw = raw.map_err(IpcAdmissionError::Claim)?;
+        claim = claim
+            .checked_add(planned(raw).map_err(IpcAdmissionError::Resources)?)
+            .map_err(IpcAdmissionError::Claim)?;
+    }
+    Ok(claim)
+}
+
+struct PumpJoinGuard {
+    join: Option<tokio::task::JoinHandle<()>>,
+    retirement: FundedArc<RouteRetirementCustodian>,
+}
+
+impl Drop for PumpJoinGuard {
+    fn drop(&mut self) {
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        join.abort();
+        self.retirement.submit(join);
+    }
+}
 
 /// What a removed route left behind. Private: the stage is this module's
 /// business, and every caller's obligation is the same either way.
@@ -1989,10 +2606,10 @@ enum Retired {
 
 impl RetiredRoute {
     fn from_state(state: RouteState) -> Self {
-        Self(match state {
+        Self(Some(match state {
             RouteState::Live(pump) => Retired::Pump(pump),
             RouteState::Installing(ready) => Retired::Installing(ready),
-        })
+        }))
     }
 
     /// A pump that was built for a route that no longer wants it.
@@ -2000,7 +2617,12 @@ impl RetiredRoute {
         cancel: FundedArc<RouteCancellation>,
         join: tokio::task::JoinHandle<()>,
     ) -> Self {
-        Self(Retired::Pump(PumpOwner { cancel, join }))
+        let retirement = cancel.retirement();
+        Self(Some(Retired::Pump(PumpOwner {
+            cancel,
+            join: Some(join),
+            retirement,
+        })))
     }
 
     /// Settle what this route owes: signal the pump and wait for it to actually
@@ -2016,13 +2638,36 @@ impl RetiredRoute {
     /// do about it here and nothing to report to: the route is gone either way,
     /// and the point of this call is that the task is no longer running.
     pub(crate) async fn retire(self) {
-        match self.0 {
-            Retired::Pump(pump) => {
+        let mut route = self;
+        match route
+            .0
+            .take()
+            .expect("a retired route is settled at most once")
+        {
+            Retired::Pump(mut pump) => {
                 pump.cancel.cancel();
                 // Reads as a no-op and is not: `cancel` stores the flag *and*
                 // notifies, so a pump that has not yet parked still sees the
                 // flag when it does.
-                let _ = pump.join.await;
+                let retirement = pump.retirement.clone();
+                let join = pump
+                    .join
+                    .take()
+                    .expect("the pump join is present before retirement");
+                let mut pending = PumpJoinGuard {
+                    join: Some(join),
+                    retirement: retirement.clone(),
+                };
+                #[cfg(test)]
+                retirement.mark_join_started();
+                let _ = pending
+                    .join
+                    .as_mut()
+                    .expect("the pump join is present before retirement")
+                    .await;
+                pending.join.take();
+                drop(pending);
+                retirement.close_and_join();
             }
             Retired::Installing(ready) => ready.settle_failed(),
         }
@@ -2150,12 +2795,808 @@ impl WeakClientRegistry {
     }
 }
 
+/// One final watchdog handoff. The list remains funded until every child
+/// handle has been observed by the custodian worker.
+struct FinalWatchdogBatch {
+    terminal: crate::ipc::LeasedList<tokio::task::JoinHandle<()>>,
+}
+
+enum FinalWatchdogMessage {
+    Batch(FinalWatchdogBatch),
+    Single(tokio::task::JoinHandle<()>),
+}
+
+/// A per-registry bounded owner for final watchdog batches. There is one
+/// batch at most because `RegistryTables` is dropped once; the sync channel is
+/// therefore capacity-one rather than an unbounded process-global queue.
+///
+/// The worker retains an `Arc` to this object until it has finished the batch,
+/// then removes its own thread handle before returning. That ownership split
+/// is deliberate: `RegistryTables::drop` can run from one of the watchdogs it
+/// is handing off, so it must never synchronously join the worker which is
+/// polling that watchdog's handle. The worker is an already-established,
+/// runtime-independent terminal owner; `terminal` is the bounded external
+/// witness that records that it has consumed the batch.
+struct FinalWatchdogCustodian {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<FinalWatchdogMessage>>>,
+    fallback_sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<FinalWatchdogMessage>>>,
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    fallback_worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    _terminal: Arc<FinalWatchdogTerminalWitness>,
+}
+
+struct FinalWatchdogCustody {
+    custodian: Arc<FinalWatchdogCustodian>,
+}
+
+impl Clone for FinalWatchdogCustody {
+    fn clone(&self) -> Self {
+        Self {
+            custodian: Arc::clone(&self.custodian),
+        }
+    }
+}
+
+/// A one-shot, per-registry terminal witness. It is intentionally separate
+/// from the watchdog list and the worker handle: a caller can observe exact
+/// child settlement without owning either the task or the runtime that made
+/// it. There is no process-global queue or retry path behind this bit.
+struct FinalWatchdogTerminalWitness {
+    observed: AtomicBool,
+}
+
+/// Funding shared by the two already-established non-Tokio observers. The
+/// single reservation covers both worker obligations and is released only
+/// after both receivers have closed, so a fallback observer cannot outlive the
+/// custody that paid for it.
+struct FinalWatchdogWorkerState {
+    funding: std::sync::Mutex<Option<ResourceLease>>,
+    remaining: AtomicUsize,
+    terminal: Arc<FinalWatchdogTerminalWitness>,
+}
+
+#[cfg(test)]
+static FINAL_WATCHDOG_REAPED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static FINAL_WATCHDOG_REAPED_WAIT: std::sync::OnceLock<(std::sync::Mutex<()>, std::sync::Condvar)> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn final_watchdog_reaped_wait() -> &'static (std::sync::Mutex<()>, std::sync::Condvar) {
+    FINAL_WATCHDOG_REAPED_WAIT
+        .get_or_init(|| (std::sync::Mutex::new(()), std::sync::Condvar::new()))
+}
+
+impl FinalWatchdogCustody {
+    /// The worker and one bounded final batch are the only custody allocations
+    /// this registry creates. The claim is acquired before any watchdog node
+    /// can be admitted, and the lease is moved into the worker until its
+    /// channel closes after terminal observation.
+    fn reserve(resources: &RegistryResources) -> Result<Self, IpcAdmissionError> {
+        Self::reserve_with_startup(resources, true)
+    }
+
+    fn reserve_with_startup(
+        resources: &RegistryResources,
+        start_worker: bool,
+    ) -> Result<Self, IpcAdmissionError> {
+        let funding = resources
+            .acquire(final_watchdog_claim().map_err(IpcAdmissionError::Claim)?)
+            .map_err(IpcAdmissionError::Resources)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (fallback_sender, fallback_receiver) = std::sync::mpsc::sync_channel(1);
+        let terminal = Arc::new(FinalWatchdogTerminalWitness {
+            observed: AtomicBool::new(false),
+        });
+        let workers = Arc::new(FinalWatchdogWorkerState {
+            funding: std::sync::Mutex::new(Some(funding)),
+            remaining: AtomicUsize::new(2),
+            terminal: Arc::clone(&terminal),
+        });
+        if !start_worker {
+            drop(workers);
+            return Err(IpcAdmissionError::CustodyUnavailable);
+        }
+        let custodian = Arc::new(FinalWatchdogCustodian {
+            sender: std::sync::Mutex::new(Some(sender)),
+            fallback_sender: std::sync::Mutex::new(Some(fallback_sender)),
+            worker: std::sync::Mutex::new(None),
+            fallback_worker: std::sync::Mutex::new(None),
+            _terminal: terminal,
+        });
+        let worker_owner = Arc::clone(&custodian);
+        let worker_state = Arc::clone(&workers);
+        let worker = std::thread::Builder::new()
+            .name("myownmesh-ipc-watchdog-reaper".to_string())
+            .spawn(move || {
+                run_final_watchdog_custodian(receiver, Arc::clone(&worker_state));
+                // The worker owns the state until its batch is observed. It
+                // must remove its own JoinHandle before the final Arc drops;
+                // attempting to join it here would be a self-join.
+                let mut worker = worker_owner
+                    .worker
+                    .lock()
+                    .expect("the final watchdog worker owner is not poisoned");
+                let _ = worker.take();
+            })
+            .map_err(|_| IpcAdmissionError::CustodyUnavailable)?;
+        custodian
+            .worker
+            .lock()
+            .expect("the final watchdog worker owner is not poisoned")
+            .replace(worker);
+        let fallback_owner = Arc::clone(&custodian);
+        let fallback_state = Arc::clone(&workers);
+        let fallback_worker = match std::thread::Builder::new()
+            .name("myownmesh-ipc-watchdog-fallback".to_string())
+            .spawn(move || {
+                run_final_watchdog_custodian(fallback_receiver, fallback_state);
+                let mut worker = fallback_owner
+                    .fallback_worker
+                    .lock()
+                    .expect("the final watchdog fallback owner is not poisoned");
+                let _ = worker.take();
+            }) {
+            Ok(worker) => worker,
+            Err(_) => {
+                workers.remaining.store(1, Ordering::Release);
+                let _ = custodian
+                    .sender
+                    .lock()
+                    .expect("the final watchdog sender owner is not poisoned")
+                    .take();
+                let worker = custodian
+                    .worker
+                    .lock()
+                    .expect("the final watchdog worker owner is not poisoned")
+                    .take();
+                if let Some(worker) = worker {
+                    let _ = worker.join();
+                }
+                return Err(IpcAdmissionError::CustodyUnavailable);
+            }
+        };
+        custodian
+            .fallback_worker
+            .lock()
+            .expect("the final watchdog fallback owner is not poisoned")
+            .replace(fallback_worker);
+        Ok(Self { custodian })
+    }
+
+    fn finish(self, terminal: crate::ipc::LeasedList<tokio::task::JoinHandle<()>>) {
+        let custodian = self.custodian;
+        let sender = custodian
+            .sender
+            .lock()
+            .expect("the final watchdog sender owner is not poisoned")
+            .take();
+        let fallback_sender = custodian
+            .fallback_sender
+            .lock()
+            .expect("the final watchdog fallback sender owner is not poisoned")
+            .take();
+        let Some(sender) = sender else {
+            unreachable!("the primary watchdog custody sender is reserved until final drop")
+        };
+        let batch = FinalWatchdogMessage::Batch(FinalWatchdogBatch { terminal });
+        let batch = match sender.try_send(batch) {
+            Ok(()) => None,
+            Err(std::sync::mpsc::TrySendError::Full(batch))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => Some(batch),
+        };
+        if let Some(batch) = batch {
+            let Some(fallback_sender) = fallback_sender else {
+                unreachable!("the fallback watchdog custody sender is reserved until final drop")
+            };
+            if fallback_sender.try_send(batch).is_err() {
+                unreachable!("the established watchdog custody observers cannot both refuse")
+            }
+        }
+        // The workers remove their own JoinHandles after observing their
+        // channels. Dropping the senders here closes both bounded channels and
+        // lets the external observers finish without synchronously polling a
+        // watchdog that may be the destructor's current task.
+    }
+
+    fn finish_one(&self, handle: tokio::task::JoinHandle<()>) {
+        let message = FinalWatchdogMessage::Single(handle);
+        let message = {
+            let sender = self
+                .custodian
+                .sender
+                .lock()
+                .expect("the final watchdog sender owner is not poisoned");
+            match sender.as_ref() {
+                Some(sender) => match sender.try_send(message) {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::TrySendError::Full(message))
+                    | Err(std::sync::mpsc::TrySendError::Disconnected(message)) => message,
+                },
+                None => message,
+            }
+        };
+        let fallback = self
+            .custodian
+            .fallback_sender
+            .lock()
+            .expect("the final watchdog fallback sender owner is not poisoned");
+        let _ = fallback.as_ref().map(|sender| sender.try_send(message));
+    }
+}
+
+/// Owns a watchdog handle across its terminal await. If the enclosing drain is
+/// cancelled, the exact handle is aborted and transferred to the registry's
+/// already-established external custodian rather than being detached.
+struct WatchdogJoinGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    custody: FinalWatchdogCustody,
+}
+
+#[cfg(test)]
+static WATCHDOG_GUARD_CREATED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static WATCHDOG_GUARD_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn watchdog_guard_notify() -> &'static tokio::sync::Notify {
+    WATCHDOG_GUARD_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+impl Drop for WatchdogJoinGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        handle.abort();
+        self.custody.finish_one(handle);
+    }
+}
+
+fn final_watchdog_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::WorkerOrTask, 2),
+        (ResourceClass::OpaqueDependencyResidual, 2),
+    ])
+}
+
+fn run_final_watchdog_custodian(
+    receiver: std::sync::mpsc::Receiver<FinalWatchdogMessage>,
+    workers: Arc<FinalWatchdogWorkerState>,
+) {
+    while let Ok(batch) = receiver.recv() {
+        match batch {
+            FinalWatchdogMessage::Batch(batch) => run_final_watchdog_batch(batch),
+            FinalWatchdogMessage::Single(handle) => {
+                handle.abort();
+                let _ = join_without_runtime(handle);
+            }
+        }
+    }
+    if workers.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        // Release the custodian's own admission before publishing terminal
+        // progress. A provider-baseline observer must never wake between child
+        // observation and this final retained allocation being returned.
+        drop(
+            workers
+                .funding
+                .lock()
+                .expect("the final watchdog funding is not poisoned")
+                .take(),
+        );
+        workers.terminal.observed.store(true, Ordering::Release);
+        #[cfg(test)]
+        {
+            FINAL_WATCHDOG_REAPED.fetch_add(1, Ordering::AcqRel);
+            if let Some((_, wake)) = FINAL_WATCHDOG_REAPED_WAIT.get() {
+                wake.notify_all();
+            }
+        }
+    }
+}
+
+fn run_final_watchdog_batch(mut batch: FinalWatchdogBatch) {
+    while let Some(handle) = batch.terminal.pop() {
+        let _ = join_without_runtime(handle);
+    }
+}
+
+struct ThreadUnparker(thread::Thread);
+
+impl Wake for ThreadUnparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn join_without_runtime(
+    mut task: tokio::task::JoinHandle<()>,
+) -> std::result::Result<(), tokio::task::JoinError> {
+    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut task = std::pin::Pin::new(&mut task);
+    loop {
+        match std::future::Future::poll(task.as_mut(), &mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+impl Drop for RegistryTables {
+    fn drop(&mut self) {
+        // A synchronous drop cannot await, so abort each child in place and
+        // hand the still-funded batch to this registry's already-established
+        // bounded custodian. The custodian is deliberately not joined here:
+        // this Drop may be running inside one of the watchdogs being handed
+        // off, and joining its polling worker would wait on the destructor's
+        // own task. The worker retains its state until every child is
+        // terminally observed; only a failed handoff is drained synchronously.
+        let mut pending = std::mem::take(&mut self.watchdogs);
+        let terminal = pending.split_where(|handle| {
+            handle.abort();
+            true
+        });
+        let Some(custody) = self.final_watchdog_custody.take() else {
+            debug_assert!(
+                terminal.is_empty(),
+                "every registry has a pre-established watchdog terminal owner"
+            );
+            return;
+        };
+        custody.finish(terminal);
+    }
+}
+
 /// Every operation this registry performs on the tables declared above.
 ///
 /// A descendant, so it reaches every private field here without any of them
 /// being widened for it. What the state *is* stays with the claims that fund
 /// it; what is *done* with it lives there.
 mod registry;
+
+impl ClientRegistry {
+    /// Spawn one already-funded task and retain its handle under the same
+    /// lifecycle fence that admits watchdogs.
+    ///
+    /// The task admission is taken before the caller builds the future, but
+    /// the watchdog node is not acquired until this operation. Both the
+    /// lifecycle check and that node acquisition happen before `spawn`, under
+    /// the tables lock; a refusal therefore returns the task and future before
+    /// a `JoinHandle` exists. Once this returns `Ok`, the handle is already in
+    /// the watchdog list and the normal shutdown drain owns its one join.
+    pub(crate) fn spawn_retained_task<F>(
+        &self,
+        task: TaskAdmission,
+        future: F,
+    ) -> Result<(), (TaskAdmission, F, IpcAdmissionError)>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let claim = match crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim() {
+            Ok(claim) => claim,
+            Err(reason) => return Err((task, future, IpcAdmissionError::Claim(reason))),
+        };
+        let mut tables = self.inner.tables.lock();
+        let lifecycle = match tables.lifecycle {
+            Lifecycle::Running => Ok(()),
+            Lifecycle::Closing | Lifecycle::Closed => Err(IpcAdmissionError::Closing),
+        };
+        if let Err(reason) = lifecycle {
+            return Err((task, future, reason));
+        }
+        let node = match self
+            .inner
+            .resources
+            .acquire(claim)
+            .map_err(IpcAdmissionError::Resources)
+        {
+            Ok(node) => node,
+            Err(reason) => return Err((task, future, reason)),
+        };
+        let join = tokio::spawn(async move {
+            let _task = task;
+            future.await;
+        });
+        tables.watchdogs.push(join, node);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::{
+        final_watchdog_reaped_wait, watchdog_guard_notify, ClientRegistry, IpcAdmissionError,
+        FINAL_WATCHDOG_REAPED, WATCHDOG_GUARD_CREATED,
+    };
+    use std::sync::atomic::Ordering;
+
+    struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_completion_panic_and_shutdown_are_joined_once() {
+        let registry = ClientRegistry::default();
+
+        let completion_admission = registry.lease_task().expect("completion is funded");
+        let completion = tokio::spawn(async move {
+            drop(completion_admission);
+        });
+        registry
+            .retain_watchdog(completion)
+            .expect("completion handle is retained");
+
+        let panic_admission = registry.lease_task().expect("panic is funded");
+        let panic_task = tokio::spawn(async move {
+            drop(panic_admission);
+            panic!("watchdog control panic");
+        });
+        registry
+            .retain_watchdog(panic_task)
+            .expect("panic handle is retained");
+
+        let shutdown_registry = registry.clone();
+        let shutdown_admission = registry.lease_task().expect("shutdown is funded");
+        let shutdown_task = tokio::spawn(async move {
+            shutdown_registry.closing().await;
+            drop(shutdown_admission);
+        });
+        registry
+            .retain_watchdog(shutdown_task)
+            .expect("shutdown handle is retained");
+
+        assert!(registry.begin_closing(), "the first close fences admission");
+        assert_eq!(
+            registry.drain_watchdogs().await,
+            1,
+            "completion and shutdown are observed, and only panic is abnormal"
+        );
+        assert_eq!(registry.residue().watchdogs, 0);
+        registry.wait_for_tasks().await;
+    }
+
+    /// A current-thread runtime may disappear immediately after its registry
+    /// is dropped. The final custodian is deliberately outside that runtime:
+    /// it must observe the aborted child and return the funded provider to its
+    /// terminally observe the aborted child rather than releasing the list
+    /// node with its join still unobserved.
+    #[test]
+    fn final_watchdog_custodian_observes_after_current_thread_runtime_drop() {
+        let scope = myownmesh_core::FiniteResourceProvider::scope_planning_charge();
+        let task = super::task_reservation_planning_charge_for_test()
+            .expect("the watchdog task charge is representable");
+        let node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the watchdog node claim is representable");
+        let node = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(node)
+            .expect("the watchdog node charge is representable");
+        let grant = scope
+            .checked_add(task)
+            .and_then(|grant| grant.checked_add(node))
+            .expect("the exact watchdog grant is representable");
+        let registry = ClientRegistry::over_grant(grant);
+        let target = FINAL_WATCHDOG_REAPED.load(Ordering::Acquire) + 1;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the control runtime starts");
+        runtime.block_on(async move {
+            let task = registry.lease_task().expect("the watchdog task is funded");
+            let handle = tokio::spawn(async move {
+                drop(task);
+                std::future::pending::<()>().await;
+            });
+            registry
+                .retain_watchdog(handle)
+                .expect("the watchdog is retained before runtime teardown");
+            tokio::task::yield_now().await;
+            drop(registry);
+        });
+        drop(runtime);
+
+        let (lock, wake) = final_watchdog_reaped_wait();
+        let mut guard = lock.lock().expect("the reaper witness is not poisoned");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while FINAL_WATCHDOG_REAPED.load(Ordering::Acquire) < target {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let (next, timeout) = wake
+                .wait_timeout(guard, remaining)
+                .expect("the reaper witness is not poisoned");
+            guard = next;
+            assert!(
+                !timeout.timed_out(),
+                "the external watchdog reaper did not settle"
+            );
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn final_watchdog_startup_refusal_releases_its_pre_admission_funding() {
+        let scope = myownmesh_core::FiniteResourceProvider::scope_planning_charge();
+        let custody = super::final_watchdog_claim().expect("the final custody claim is valid");
+        let custody = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(custody)
+            .expect("the final custody charge is representable");
+        let grant = scope
+            .checked_add(custody)
+            .expect("the exact custody grant is representable");
+        let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the exact custody grant funds its process scope");
+        let resources = super::RegistryResources::Isolated {
+            _provider: provider.clone(),
+            scope: port.process_scope(),
+            port,
+        };
+        let baseline = provider.in_use();
+        let Err(refusal) = super::FinalWatchdogCustody::reserve_with_startup(&resources, false)
+        else {
+            panic!("the injected startup refusal unexpectedly admitted custody");
+        };
+        assert!(matches!(refusal, IpcAdmissionError::CustodyUnavailable));
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[tokio::test]
+    async fn watchdog_admission_refuses_full_and_closed_without_detaching() {
+        // over_grant adds final custody; fund its process scope, but no list node.
+        let full = ClientRegistry::over_grant(
+            myownmesh_core::FiniteResourceProvider::scope_planning_charge(),
+        );
+        let full_task = tokio::spawn(async {});
+        let (full_task, refusal) = full
+            .retain_watchdog(full_task)
+            .expect_err("a startup-only grant cannot retain a watchdog node");
+        assert!(matches!(refusal, IpcAdmissionError::Resources(_)));
+        full_task.abort();
+        let _ = full_task.await;
+        assert_eq!(full.residue().watchdogs, 0);
+
+        let closed = ClientRegistry::default();
+        assert!(closed.begin_closing());
+        let closed_task = tokio::spawn(async {});
+        let (closed_task, refusal) = closed
+            .retain_watchdog(closed_task)
+            .expect_err("a closing registry cannot retain a watchdog");
+        assert!(matches!(refusal, IpcAdmissionError::Closing));
+        closed_task
+            .await
+            .expect("the refused handle remains owned by this control");
+        assert_eq!(closed.residue().watchdogs, 0);
+    }
+
+    /// A forwarder cannot be spawned unless its watchdog node is funded and
+    /// the registry is still Running. Both refusal arms return the future
+    /// before a handle exists, so its owned probe is dropped once and neither
+    /// its start nor terminal witness can fire.
+    #[test]
+    fn retained_task_refusal_is_pre_spawn_and_returns_exact_ownership() {
+        fn assert_refused(
+            registry: ClientRegistry,
+            expected: fn(&IpcAdmissionError) -> bool,
+            expected_lifecycle: super::Lifecycle,
+            close_before_spawn: bool,
+        ) {
+            let baseline = registry.in_use();
+            let task = registry.lease_task().expect("the task itself is funded");
+            if close_before_spawn {
+                assert!(registry.begin_closing());
+            }
+            let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let probe = DropProbe(dropped.clone());
+            let started_in_task = started.clone();
+            let terminal_in_task = terminal.clone();
+            let future = async move {
+                let _probe = probe;
+                started_in_task.store(true, std::sync::atomic::Ordering::Release);
+                terminal_in_task.store(true, std::sync::atomic::Ordering::Release);
+            };
+            let Err((task, future, reason)) = registry.spawn_retained_task(task, future) else {
+                panic!("the refused retained task unexpectedly spawned");
+            };
+            assert!(expected(&reason));
+            drop(task);
+            drop(future);
+            assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!terminal.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                dropped.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "the returned future is dropped exactly once"
+            );
+            assert_eq!(registry.in_use(), baseline);
+            assert_eq!(
+                registry.residue(),
+                super::RegistryResidue::empty(expected_lifecycle)
+            );
+        }
+
+        let task = super::task_claim().expect("the task claim is representable");
+        let grant = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(task)
+            .expect("the task reservation charge is representable")
+            .checked_add(myownmesh_core::FiniteResourceProvider::scope_planning_charge())
+            .expect("the exact scope-plus-task grant is representable");
+        assert_refused(
+            ClientRegistry::over_grant(grant),
+            |reason| matches!(reason, IpcAdmissionError::Resources(_)),
+            super::Lifecycle::Running,
+            false,
+        );
+
+        let closing = ClientRegistry::default();
+        assert_refused(
+            closing,
+            |reason| matches!(reason, IpcAdmissionError::Closing),
+            super::Lifecycle::Closing,
+            true,
+        );
+    }
+
+    #[test]
+    fn task_admission_does_not_retain_the_registry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the current-thread runtime starts");
+        runtime.block_on(async {
+            let registry = ClientRegistry::default();
+            let weak = std::sync::Arc::downgrade(&registry.inner);
+            let admission = registry.lease_task().expect("the task is funded");
+            drop(registry);
+            assert!(
+                weak.upgrade().is_none(),
+                "a task admission must not keep the registry alive"
+            );
+            drop(admission);
+        });
+    }
+
+    #[test]
+    fn cancelled_watchdog_drain_transfers_the_popped_handle() {
+        let target = WATCHDOG_GUARD_CREATED.load(Ordering::Acquire) + 1;
+        let reaped_target = FINAL_WATCHDOG_REAPED.load(Ordering::Acquire) + 1;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the current-thread runtime starts");
+        runtime.block_on(async {
+            let registry = ClientRegistry::default();
+            let admission = registry.lease_task().expect("the watchdog task is funded");
+            let child = tokio::spawn(async move {
+                drop(admission);
+                std::future::pending::<()>().await;
+            });
+            registry
+                .retain_watchdog(child)
+                .expect("the watchdog is retained");
+
+            let draining = tokio::spawn({
+                let registry = registry.clone();
+                async move { registry.drain_watchdogs().await }
+            });
+            while WATCHDOG_GUARD_CREATED.load(Ordering::Acquire) < target {
+                let notified = watchdog_guard_notify().notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if WATCHDOG_GUARD_CREATED.load(Ordering::Acquire) >= target {
+                    break;
+                }
+                notified.as_mut().await;
+            }
+            draining.abort();
+            let _ = draining.await;
+            drop(registry);
+        });
+        drop(runtime);
+
+        let (lock, wake) = final_watchdog_reaped_wait();
+        let mut guard = lock.lock().expect("the reaper witness is not poisoned");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while FINAL_WATCHDOG_REAPED.load(Ordering::Acquire) < reaped_target {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let (next, timeout) = wake
+                .wait_timeout(guard, remaining)
+                .expect("the reaper witness is not poisoned");
+            guard = next;
+            assert!(
+                !timeout.timed_out(),
+                "the cancelled watchdog was not observed"
+            );
+        }
+        assert!(
+            WATCHDOG_GUARD_CREATED.load(Ordering::Acquire) >= target,
+            "the production drain reached its cancellation guard"
+        );
+    }
+}
+
+#[cfg(test)]
+mod route_retirement_tests {
+    use super::{ClientRegistry, RetiredRoute};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn cancelled_route_retirement_transfers_the_exact_join() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the route retirement runtime starts");
+        let retirement = runtime.block_on(async {
+            let registry = ClientRegistry::default();
+            let cancel = registry
+                .route_cancellation()
+                .expect("the route retirement owner is funded");
+            let retirement = cancel.retirement();
+            let child = tokio::spawn(async {
+                std::future::pending::<()>().await;
+            });
+            let retired = RetiredRoute::orphaned_pump(cancel, child);
+            let task = tokio::spawn(retired.retire());
+            {
+                let started = retirement.join_started.notified();
+                tokio::pin!(started);
+                started.as_mut().enable();
+                started.await;
+            }
+            task.abort();
+            let _ = task.await;
+            drop(registry);
+            retirement
+        });
+        retirement.close_and_join();
+        assert!(
+            retirement.terminal.observed.load(Ordering::Acquire),
+            "the external route owner observed the cancelled pump"
+        );
+        drop(runtime);
+    }
+
+    #[test]
+    fn route_retirement_survives_current_thread_runtime_destruction() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the route retirement runtime starts");
+        let retirement = runtime.block_on(async {
+            let registry = ClientRegistry::default();
+            let cancel = registry
+                .route_cancellation()
+                .expect("the route retirement owner is funded");
+            let retirement = cancel.retirement();
+            let child = tokio::spawn(async {
+                std::future::pending::<()>().await;
+            });
+            let retired = RetiredRoute::orphaned_pump(cancel, child);
+            let _task = tokio::spawn(retired.retire());
+            {
+                let started = retirement.join_started.notified();
+                tokio::pin!(started);
+                started.as_mut().enable();
+                started.await;
+            }
+            drop(registry);
+            retirement
+        });
+        drop(runtime);
+        retirement.close_and_join();
+        assert!(
+            retirement.terminal.observed.load(Ordering::Acquire),
+            "runtime destruction leaves the exact pump with the external owner"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -40,7 +40,7 @@ use super::*;
 /// Imported rather than re-spelled here. Which way a flow runs is true of any
 /// transport, so a provider-local copy would be the two-enums-for-one-fact
 /// mistake this module exists to undo, in the opposite direction.
-use crate::realtime::RealtimeFlowDirection;
+use crate::realtime::{OpaqueFlowOpen, RealtimeFlowDirection, MAX_APPLICATION_FLOW_BODY_BYTES};
 
 /// What an application asks the WebRTC provider for when it opens one flow.
 ///
@@ -117,11 +117,49 @@ pub struct WebRtcRealtimeInboundUnit {
 /// at once needs to know which one produced each unit, and the label is the only
 /// thing that distinguishes them. It is still not authority — it names a flow
 /// within one session and means nothing outside it.
-#[derive(Clone, Debug)]
 pub struct WebRtcRealtimeInboundArrival {
     /// A copy of the flow's name. The leased label stays inside the connector.
     pub label: Vec<u8>,
     pub unit: WebRtcRealtimeInboundUnit,
+    /// Provider custody stays private to the crate while the public arrival
+    /// remains move-only. The tagged receive path attaches the exact funded
+    /// queue entry here before any application copy escapes.
+    pub(crate) _custody: Option<Box<dyn crate::realtime::OpaqueInboundCustody>>,
+}
+
+impl std::fmt::Debug for WebRtcRealtimeInboundArrival {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebRtcRealtimeInboundArrival")
+            .field("label", &self.label)
+            .field("unit", &self.unit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebRtcRealtimeInboundArrival {
+    pub(crate) fn with_custody(
+        label: Vec<u8>,
+        unit: WebRtcRealtimeInboundUnit,
+        custody: Box<dyn crate::realtime::OpaqueInboundCustody>,
+    ) -> Self {
+        Self {
+            label,
+            unit,
+            _custody: Some(custody),
+        }
+    }
+}
+
+/// One item from a promoted session's single inbound consumer.
+///
+/// This tagged surface is the lossless receive API when RTP and application
+/// opaque flows coexist. The older typed helpers remain compatibility views;
+/// they never consume the other variant and return no item when their next
+/// queued item has the opposite kind.
+pub enum RealtimeInboundArrival {
+    Rtp(WebRtcRealtimeInboundArrival),
+    Opaque(crate::realtime::OpaqueInboundArrival),
 }
 
 // ---- conversions at the provider edge ---------------------------------------
@@ -175,6 +213,36 @@ impl TryFrom<WebRtcRealtimeFlowOpen> for RealtimeFlowSpec {
             direction: open.direction.into(),
             name,
             encoding,
+        })
+    }
+}
+
+impl TryFrom<OpaqueFlowOpen> for OpaqueFlowSpec {
+    type Error = crate::realtime::RealtimeRefusal;
+
+    /// Validate representation bounds before session resolution or provider
+    /// acquisition. Capacity remains the existing registry/provider decision;
+    /// this conversion only produces the connector-local request shape.
+    fn try_from(open: OpaqueFlowOpen) -> std::result::Result<Self, Self::Error> {
+        let max_unit_bytes = usize::try_from(open.max_unit_bytes)
+            .map_err(|_| crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)?;
+        if !open.is_well_formed() || max_unit_bytes > MAX_APPLICATION_FLOW_BODY_BYTES {
+            return Err(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid);
+        }
+        if matches!(
+            open.mode,
+            crate::realtime::OpaqueFlowMode::PartialUnordered { max_retransmits } if max_retransmits != 0
+        ) {
+            return Err(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid);
+        }
+        let name = crate::transport::webrtc::RealtimeFlowName::new(open.label)
+            .ok_or(crate::realtime::RealtimeRefusal::ProviderConfigurationInvalid)?;
+        Ok(OpaqueFlowSpec {
+            direction: open.direction.into(),
+            opener_direction: open.direction,
+            mode: open.mode,
+            max_unit_bytes,
+            name,
         })
     }
 }
@@ -344,6 +412,7 @@ mod tests {
                 data: Bytes::from_static(b"unit"),
             }
             .into(),
+            _custody: None,
         };
         assert_eq!(arrival.label, b"seven".to_vec());
         assert_eq!(arrival.unit.rtp_timestamp, 90_000);

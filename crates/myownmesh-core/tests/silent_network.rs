@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! End-to-end engine integration test for a **Silent** network: two
 //! co-present peers on a Silent mesh discover each other (`Sighted`) but do
 //! NOT auto-connect — no handshake runs until one side issues an explicit
@@ -8,10 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::{MeshEvent, NetworkKind, PeerEvent};
+use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 
@@ -19,13 +21,20 @@ fn silent_network(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: "silent-two-peer".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        semantic_policy: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        hub: None,
+        local_observations: None,
+        tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -52,7 +61,6 @@ async fn silent_peers_are_sighted_but_do_not_connect_until_dialed() {
         spawn_network(silent_network("bob"), bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
-
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
 

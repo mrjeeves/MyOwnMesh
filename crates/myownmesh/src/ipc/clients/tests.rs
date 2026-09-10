@@ -21,6 +21,510 @@ fn fresh_client(
     (handle, rx)
 }
 
+#[cfg(feature = "transport-lab")]
+fn require(condition: bool, message: impl Into<String>) -> Result<(), String> {
+    condition.then_some(()).ok_or_else(|| message.into())
+}
+
+#[cfg(feature = "transport-lab")]
+fn require_active_resource_baseline(
+    actual: &myownmesh_core::resource::ResourceReport,
+    baseline: &myownmesh_core::resource::ResourceReport,
+    operation: &'static str,
+) -> Result<(), String> {
+    for (actual, baseline) in actual
+        .pre_authentication
+        .iter()
+        .zip(&baseline.pre_authentication)
+    {
+        require(
+            actual.family == baseline.family
+                && actual.active == baseline.active
+                && actual.active_lease_count == baseline.active_lease_count,
+            format!(
+                "{operation}: pre-auth {:?} active resources changed: actual={:?}/{}, baseline={:?}/{}",
+                actual.family,
+                actual.active,
+                actual.active_lease_count,
+                baseline.active,
+                baseline.active_lease_count,
+            ),
+        )?;
+    }
+    for (actual, baseline) in actual
+        .post_authentication
+        .iter()
+        .zip(&baseline.post_authentication)
+    {
+        require(
+            actual.family == baseline.family
+                && actual.active == baseline.active
+                && actual.active_lease_count == baseline.active_lease_count,
+            format!(
+                "{operation}: post-auth {:?} active resources changed: actual={:?}/{}, baseline={:?}/{}",
+                actual.family,
+                actual.active,
+                actual.active_lease_count,
+                baseline.active,
+                baseline.active_lease_count,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "transport-lab")]
+fn live_slot_connector_policy() -> myownmesh_core::WebRtcConnectorCapablePolicy {
+    myownmesh_core::WebRtcConnectorCapablePolicy::new(
+        crate::test_resource_provider(),
+        myownmesh_core::WebRtcConnectorProfile::new(
+            myownmesh_core::ConnectorCallbackPolicy::elastic_realtime(),
+        ),
+    )
+}
+
+#[cfg(feature = "transport-lab")]
+fn live_slot_network(id: &str) -> myownmesh_core::config::NetworkConfig {
+    let mut config =
+        myownmesh_core::config::NetworkConfig::from_network_id(id, "daemon-slot-control");
+    config.label = id.to_owned();
+    config.signaling = myownmesh_core::config::SignalingConfig {
+        strategy: "none".to_owned(),
+        mdns: false,
+        public_fallback: false,
+        ..myownmesh_core::config::SignalingConfig::default()
+    };
+    config.auto_approve = true;
+    config.introduction = None;
+    config.validate().expect("live slot network validates");
+    config
+}
+
+#[cfg(feature = "transport-lab")]
+async fn live_slot_within<T>(
+    operation: &'static str,
+    deadline: tokio::time::Instant,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let value = tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| format!("{operation}: exceeded its absolute deadline"))?;
+    if tokio::time::Instant::now() > deadline {
+        return Err(format!(
+            "{operation}: completed after its absolute deadline"
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "transport-lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installed_realtime_slot_custody_is_linear_and_funded() {
+    let home = tempfile::tempdir().expect("isolated live slot fixture home");
+    std::env::set_var("MYOWNMESH_HOME", home.path());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+    let alice_identity = std::sync::Arc::new(myownmesh_core::Identity::ephemeral());
+    let bob_identity = std::sync::Arc::new(myownmesh_core::Identity::ephemeral());
+    let alice_id = alice_identity.public_id().to_owned();
+    let bob_id = bob_identity.public_id().to_owned();
+    let policy = live_slot_connector_policy();
+    let registry_grant =
+        registry_fixture_claim(2, 2, 16).expect("slot registry grant is representable");
+    let oversized_slot_demand = registry_grant
+        .amount(ResourceClass::AccountedMemoryBytes)
+        .checked_add(1)
+        .expect("the finite registry grant leaves room for one representable pressure unit");
+    let registry = ClientRegistry::over_grant(registry_grant);
+    let mut alice_mesh = None;
+    let mut bob_mesh = None;
+    let mut alice_baseline = None;
+    let mut bob_baseline = None;
+    let mut alice = None;
+    let mut bob = None;
+    let mut link = None;
+    let mut bob_inbound = None;
+    let mut uninstalled_flow = None;
+    let mut owner = None;
+    let mut installed_capability = None;
+    let mut removed_flow = None;
+    let mut captured_slot = None;
+    let result: Result<(), String> = async {
+        let opened_alice = live_slot_within(
+            "slot-alice-open",
+            deadline,
+            myownmesh_core::Mesh::open_connector_capable_with_identity(
+                myownmesh_core::MeshConfig::default(),
+                alice_identity,
+                policy.clone(),
+            ),
+        )
+        .await?
+        .map_err(|error| format!("Alice mesh refused: {error}"))?;
+        alice_baseline = Some(opened_alice.resource_report());
+        alice_mesh = Some(opened_alice);
+        let opened_bob = live_slot_within(
+            "slot-bob-open",
+            deadline,
+            myownmesh_core::Mesh::open_connector_capable_with_identity(
+                myownmesh_core::MeshConfig::default(),
+                bob_identity,
+                policy,
+            ),
+        )
+        .await?
+        .map_err(|error| format!("Bob mesh refused: {error}"))?;
+        bob_baseline = Some(opened_bob.resource_report());
+        bob_mesh = Some(opened_bob);
+        let joined_alice = live_slot_within(
+            "slot-alice-join",
+            deadline,
+            alice_mesh
+                .as_ref()
+                .ok_or_else(|| "Alice mesh disappeared before join".to_owned())?
+                .join(live_slot_network("alice")),
+        )
+        .await?
+        .map_err(|error| format!("Alice join refused: {error}"))?;
+        alice = Some(joined_alice);
+        let joined_bob = live_slot_within(
+            "slot-bob-join",
+            deadline,
+            bob_mesh
+                .as_ref()
+                .ok_or_else(|| "Bob mesh disappeared before join".to_owned())?
+                .join(live_slot_network("bob")),
+        )
+        .await?
+        .map_err(|error| format!("Bob join refused: {error}"))?;
+        bob = Some(joined_bob);
+        let alice_ref = alice
+            .as_ref()
+            .ok_or_else(|| "Alice network disappeared before link setup".to_owned())?;
+        let bob_ref = bob
+            .as_ref()
+            .ok_or_else(|| "Bob network disappeared before link setup".to_owned())?;
+        link = Some(
+            live_slot_within(
+                "slot-real-link",
+                deadline,
+                alice_ref.install_retirable_session_over_real_link(bob_ref),
+            )
+            .await?,
+        );
+        bob_inbound = Some(
+            bob_ref
+                .realtime_inbound(&alice_id)
+                .ok_or_else(|| "Bob could not claim the one exact inbound stream".to_owned())?,
+        );
+        let open = myownmesh_core::realtime::OpaqueFlowOpen::new(
+            vec![0, 0xff, b's', b'l', b'o', b't'],
+            myownmesh_core::realtime::RealtimeFlowDirection::Outbound,
+            myownmesh_core::realtime::OpaqueFlowMode::ReliableOrdered,
+            1024,
+        )
+        .ok_or_else(|| "slot flow request is not well formed".to_owned())?;
+        let flow = live_slot_within(
+            "slot-flow-open",
+            deadline,
+            alice_ref.open_opaque_flow(&bob_id, &open),
+        )
+        .await?
+        .map_err(|error| format!("real opaque flow refused: {error}"))?;
+        uninstalled_flow = Some(flow);
+        let (owner_tx, _owner_rx) =
+            myownmesh_core::resource_mailbox(crate::test_application_scope())
+                .map_err(|error| format!("slot owner mailbox refused: {error}"))?;
+        let owner_handle = registry
+            .register(owner_tx)
+            .map_err(|error| format!("slot owner registration refused: {error}"))?;
+        owner = Some(owner_handle);
+        let owner_ref = owner
+            .as_ref()
+            .ok_or_else(|| "slot owner disappeared after registration".to_owned())?;
+        let registry_baseline = registry.in_use().ok_or_else(|| {
+            "isolated registry exposes no usage after owner registration".to_owned()
+        })?;
+        let callback_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_probe = callback_called.clone();
+        let flow = match registry.install_if_live(
+            owner_ref,
+            LeasedMap::<String, OwnedRealtimeFlow>::entry_claim(),
+            realtime_flow_retained(REALTIME_CAPABILITY_BYTES, "alice"),
+            Ok(ResourceClaim::single(
+                ResourceClass::AccountedMemoryBytes,
+                oversized_slot_demand,
+            )),
+            uninstalled_flow.take().ok_or_else(|| {
+                "the uninstalled flow was lost before the refusal probe".to_owned()
+            })?,
+            move |flow, _entry, _retained, _slot| {
+                callback_probe.store(true, Ordering::Release);
+                flow
+            },
+        ) {
+            Err((flow, reason)) => {
+                require(
+                    matches!(
+                        &reason,
+                        RegistrationError::Admission(IpcAdmissionError::Resources(
+                            myownmesh_core::ResourceUnavailable::Pressure(pressure),
+                        )) if pressure.dimension == ResourceClass::AccountedMemoryBytes
+                    ),
+                    format!("slot reservation refused at the wrong stage: {reason}"),
+                )?;
+                flow
+            }
+            Ok(_) => return Err("the deliberately oversized slot reservation admitted".to_owned()),
+        };
+        require(
+            !callback_called.load(Ordering::Acquire),
+            "refused install ran its callback",
+        )?;
+        uninstalled_flow = Some(flow);
+        require(
+            registry.in_use() == Some(registry_baseline),
+            "entry and retained leases survived the refused slot reservation",
+        )?;
+        let flow = uninstalled_flow
+            .take()
+            .ok_or_else(|| "the refused real handle was not returned".to_owned())?;
+        require(
+            alice_ref.realtime_is_current(&flow),
+            "the refused handle was not still current",
+        )?;
+        let capability = registry
+            .install_realtime_flow(owner_ref, "alice".to_owned(), flow)
+            .map_err(|_| "the exact funded slot refused the real flow".to_owned())?;
+        installed_capability = Some(capability.clone());
+        let slot = owner_ref
+            .realtime_flow_slot(capability.expose(), "alice")
+            .ok_or_else(|| "installed flow exposes no exact funded slot".to_owned())?;
+        captured_slot = Some(slot.clone());
+        let busy_guard = slot.handle.try_lock().map_err(|_| {
+            "the control could not borrow the slot before the busy probe".to_owned()
+        })?;
+        let changed = myownmesh_core::realtime::OpaqueFlowOpen::new(
+            vec![0, 0xff, b's', b'l', b'o', b't'],
+            myownmesh_core::realtime::RealtimeFlowDirection::Outbound,
+            myownmesh_core::realtime::OpaqueFlowMode::ReliableOrdered,
+            512,
+        )
+        .ok_or_else(|| "busy Change request is not well formed".to_owned())?;
+        let busy_result = live_slot_within(
+            "slot-busy-change",
+            deadline,
+            slot.change_opaque(alice_ref, &changed),
+        )
+        .await?;
+        require(
+            busy_result == Err(myownmesh_core::realtime::RealtimeRefusal::FlowRefused),
+            format!("busy Change returned {busy_result:?}"),
+        )?;
+        drop(busy_guard);
+
+        let owned = owner_ref
+            .take_realtime_flow(capability.expose())
+            .ok_or_else(|| "row removal returned no installed flow".to_owned())?;
+        removed_flow = Some(owned);
+        require(
+            owner_ref
+                .realtime_flow_slot(capability.expose(), "alice")
+                .is_none(),
+            "removed row still resolves the old capability",
+        )?;
+        let owned = removed_flow
+            .take()
+            .ok_or_else(|| "removed flow was lost before close".to_owned())?;
+        let close_guard = slot
+            .handle
+            .try_lock()
+            .map_err(|_| "close probe could not borrow the exact slot".to_owned())?;
+        let mut close = Box::pin(owned.close_through(alice_ref));
+        let completed_while_held = tokio::select! {
+            biased;
+            _ = &mut close => true,
+            _ = tokio::task::yield_now() => false,
+        };
+        if completed_while_held {
+            drop(close_guard);
+            return Err("close completed while the exact slot was borrowed".to_owned());
+        }
+        drop(close_guard);
+        live_slot_within("slot-close", deadline, &mut close)
+            .await?
+            .map_err(|error| format!("exact flow close failed after slot release: {error}"))?;
+
+        let slot_charge = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+            funded_record_retained::<RealtimeFlowSlot>()
+                .map_err(|error| format!("slot claim is not representable: {error:?}"))?,
+        )
+        .map_err(|error| format!("slot reservation charge is not representable: {error:?}"))?;
+        let after_row = registry
+            .in_use()
+            .ok_or_else(|| "isolated registry did not expose usage after close".to_owned())?;
+        require(
+            after_row.checked_sub(registry_baseline) == Ok(slot_charge),
+            "captured slot did not remain exactly funded after row removal",
+        )?;
+        drop(slot);
+        captured_slot = None;
+        require(
+            registry.in_use() == Some(registry_baseline),
+            "final slot capture did not release its exact reservation",
+        )?;
+
+        let unregistered = registry
+            .unregister(owner_ref.id)
+            .ok_or_else(|| "owner unregister found no live client".to_owned())?;
+        drop(unregistered.handle);
+        let (successor_tx, _successor_rx) =
+            myownmesh_core::resource_mailbox(crate::test_application_scope())
+                .map_err(|error| format!("successor mailbox refused: {error}"))?;
+        let successor = registry
+            .register(successor_tx)
+            .map_err(|error| format!("successor registration refused: {error}"))?;
+        require(
+            successor.id != owner_ref.id,
+            "successor reused the disconnected client id",
+        )?;
+        require(
+            successor
+                .realtime_flow_slot(capability.expose(), "alice")
+                .is_none(),
+            "a disconnected successor reused the old flow capability",
+        )?;
+        installed_capability = None;
+        Ok(())
+    }
+    .await;
+
+    drop(bob_inbound.take());
+    let cleanup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut cleanup_failures = Vec::new();
+    if let Some(owned) = removed_flow.take() {
+        if let Some(network) = alice.as_ref() {
+            match live_slot_within(
+                "cleanup-flow-close",
+                cleanup_deadline,
+                owned.close_through(network),
+            )
+            .await
+            {
+                Ok(Ok(()))
+                | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("flow close: {error}")),
+                Err(error) => cleanup_failures.push(error),
+            }
+        } else {
+            cleanup_failures.push("flow close had no Alice network owner".to_owned());
+        }
+    }
+    if let Some(capability) = installed_capability.take() {
+        if let Some(owner) = owner.as_ref() {
+            if let Some(owned) = owner.take_realtime_flow(capability.expose()) {
+                if let Some(network) = alice.as_ref() {
+                    match live_slot_within(
+                        "cleanup-installed-flow-close",
+                        cleanup_deadline,
+                        owned.close_through(network),
+                    )
+                    .await
+                    {
+                        Ok(Ok(()))
+                        | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {
+                        }
+                        Ok(Err(error)) => {
+                            cleanup_failures.push(format!("installed flow close: {error}"))
+                        }
+                        Err(error) => cleanup_failures.push(error),
+                    }
+                } else {
+                    cleanup_failures
+                        .push("installed flow close had no Alice network owner".to_owned());
+                }
+            }
+        } else {
+            cleanup_failures.push("installed flow close had no client owner".to_owned());
+        }
+    }
+    if let Some(flow) = uninstalled_flow.take() {
+        if let Some(network) = alice.as_ref() {
+            match live_slot_within(
+                "cleanup-uninstalled-flow-close",
+                cleanup_deadline,
+                network.close_realtime(flow),
+            )
+            .await
+            {
+                Ok(Ok(()))
+                | Ok(Err(myownmesh_core::realtime::RealtimeRefusal::SessionNotCurrent)) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("uninstalled flow close: {error}")),
+                Err(error) => cleanup_failures.push(error),
+            }
+        } else {
+            cleanup_failures.push("uninstalled flow close had no Alice network owner".to_owned());
+        }
+    }
+    drop(captured_slot.take());
+    if let Some(link) = link.take() {
+        match live_slot_within(
+            "cleanup-real-link-retire",
+            cleanup_deadline,
+            link.retire_sessions(),
+        )
+        .await
+        {
+            Ok(results) => cleanup_failures.extend(
+                results
+                    .into_iter()
+                    .filter_map(Result::err)
+                    .map(|error| error.to_string()),
+            ),
+            Err(error) => cleanup_failures.push(error),
+        }
+    }
+    for (name, network) in [("alice", alice.as_ref()), ("bob", bob.as_ref())] {
+        if let Some(network) = network {
+            match live_slot_within(
+                "cleanup-network-shutdown",
+                cleanup_deadline,
+                network.shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup_failures.push(format!("{name} shutdown: {error}")),
+                Err(error) => cleanup_failures.push(format!("{name} shutdown: {error}")),
+            }
+        }
+    }
+    drop((alice.take(), bob.take(), owner.take()));
+    let resource_result = match (
+        alice_mesh.as_ref(),
+        alice_baseline.as_ref(),
+        bob_mesh.as_ref(),
+        bob_baseline.as_ref(),
+    ) {
+        (Some(alice_mesh), Some(alice_baseline), Some(bob_mesh), Some(bob_baseline)) => {
+            let alice_report = alice_mesh.resource_report();
+            let bob_report = bob_mesh.resource_report();
+            require_active_resource_baseline(&alice_report, alice_baseline, "Alice slot cleanup")
+                .and_then(|_| {
+                    require_active_resource_baseline(&bob_report, bob_baseline, "Bob slot cleanup")
+                })
+        }
+        _ => Ok(()),
+    };
+    let cleanup_result = if cleanup_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("slot fixture cleanup failed: {cleanup_failures:?}"))
+    };
+    assert!(resource_result.is_ok(), "{}", resource_result.unwrap_err());
+    assert!(cleanup_result.is_ok(), "{}", cleanup_result.unwrap_err());
+    assert!(result.is_ok(), "slot custody control failed: {result:?}");
+}
+
 #[test]
 fn client_id_roundtrips_through_string() {
     let id = ClientId(42);
@@ -29,6 +533,7 @@ fn client_id_roundtrips_through_string() {
     assert_eq!(parsed, id);
     assert!("not-an-id".parse::<ClientId>().is_err());
     assert!("c-99".parse::<ClientId>().is_err());
+    assert!("c042".parse::<ClientId>().is_err());
 }
 
 #[test]
@@ -67,8 +572,9 @@ fn disconnect_winner_returns_completed_install_to_its_sole_cleanup_owner() {
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
             Ok(ResourceClaim::ZERO),
+            Ok(ResourceClaim::ZERO),
             Completed(drops.clone()),
-            move |completed, _entry, _retained| {
+            move |completed, _entry, _retained, _slot| {
                 installed_probe.store(true, Ordering::Release);
                 completed
             },
@@ -104,8 +610,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
         &owner,
         LeasedMap::<ClaimKey, ()>::entry_claim(),
         Ok(ResourceClaim::ZERO),
+        Ok(ResourceClaim::ZERO),
         7_u32,
-        move |value, _entry, _retained| landed.lock().push(value),
+        move |value, _entry, _retained, _slot| landed.lock().push(value),
     )
     .expect("a registered, connected owner admits the install");
     assert_eq!(&*table.lock(), &[7], "the install ran");
@@ -129,8 +636,9 @@ fn an_install_that_wins_the_seam_survives_the_disconnect_that_must_clean_it_up()
             &owner,
             LeasedMap::<ClaimKey, ()>::entry_claim(),
             Ok(ResourceClaim::ZERO),
+            Ok(ResourceClaim::ZERO),
             9_u32,
-            move |value, _entry, _retained| refused.lock().push(value)
+            move |value, _entry, _retained, _slot| refused.lock().push(value)
         )
         .is_err(),
         "the same owner admits nothing once it has disconnected"
@@ -817,6 +1325,443 @@ async fn a_resubscription_cannot_inherit_an_in_flight_frame() {
         delivered.push(client.id);
     }
     assert_eq!(delivered, vec![a.id, b.id]);
+    eprintln!("route-resubscription: membership assertions complete; before scope teardown");
+}
+
+/// Unlike the retirement controls that keep an external custodian alive, only
+/// weak observations escape this runtime. The child really owns and uses the
+/// funded cancellation, so its destruction can release the last custodian.
+/// The manager's external process envelope bounds a hang; a timeout is never
+/// success, and this control does not replace teardown with explicit retirement.
+#[test]
+fn route_last_owner_runtime_drop_releases_captured_cancellation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the last-owner fixture runtime builds");
+    let (cancel_observer, retirement_observer, registry_observer, installed) =
+        runtime.block_on(async {
+            let reg = ClientRegistry::default();
+            let (client, _receiver) = fresh_client(&reg);
+            let key = ("net".to_string(), "last-owner".to_string());
+            let ChannelJoin::Install(installing) = reg
+                .subscribe_channel(key.clone(), client.id)
+                .expect("the original exact membership is admitted")
+            else {
+                panic!("the first subscriber owns installation")
+            };
+            let cancel = reg
+                .route_cancellation()
+                .expect("the existing daemon grant funds the exact pump cancellation");
+            let cancel_observer = cancel.downgrade();
+            let retirement_observer = cancel.retirement.downgrade();
+            let registry_observer = Arc::downgrade(&reg.inner);
+            let waiting = cancel.clone();
+            let join = tokio::spawn(async move { waiting.cancelled().await });
+            let orphan = reg.finish_channel_install(&key, &installing, Some((cancel, join)));
+            let installed = orphan.is_none();
+            // Preserve the existing abort/handoff Drop path even on an
+            // unexpected install refusal; no orphaned join is detached here.
+            drop(orphan);
+            (
+                cancel_observer,
+                retirement_observer,
+                registry_observer,
+                installed,
+            )
+        });
+
+    eprintln!("route-last-owner: before runtime destruction");
+    drop(runtime);
+    eprintln!("route-last-owner: after runtime destruction");
+
+    assert!(installed, "the exact original pump was installed");
+    assert_eq!(cancel_observer.strong_count(), 0);
+    assert!(
+        cancel_observer.upgrade().is_none(),
+        "no funded cancellation owner survives runtime destruction"
+    );
+    assert!(
+        retirement_observer.upgrade().is_none(),
+        "the exact retirement custodian has been destroyed"
+    );
+    assert!(
+        registry_observer.upgrade().is_none(),
+        "the original registry has no surviving owner"
+    );
+    // Weak expiry and runtime destruction are the available terminal evidence.
+    // The shared fixture provider is not an isolated zero-census oracle, and
+    // the custodian's shared terminal bit is not proof both threads joined.
+}
+
+// An explicitly owned root: its finite provider is never installed in OnceLock.
+// The registry remains alive across the before/after comparison, so its process
+// scope and independently owned final-watchdog custody have identical lifetimes.
+fn isolated_route_join_fixture() -> (
+    ClientRegistry,
+    myownmesh_core::FiniteResourceProvider,
+    RouteJoinOwner,
+    ResourceClaim,
+) {
+    let grant = registry_fixture_claim(1, 1, 10)
+        .map_err(IpcAdmissionError::Claim)
+        .and_then(|claim| {
+            claim
+                .checked_add(route_join_root_planning_charge()?)
+                .map_err(IpcAdmissionError::Claim)
+        })
+        .and_then(|claim| {
+            claim
+                .checked_add(
+                    route_custody_planning_charge()?
+                        .checked_scale(2)
+                        .map_err(IpcAdmissionError::Claim)?,
+                )
+                .map_err(IpcAdmissionError::Claim)
+        })
+        .expect("two exact route custodians and one isolated join root are representable");
+    let registry = ClientRegistry::over_grant(grant);
+    let RegistryResources::Isolated {
+        _provider: provider,
+        ..
+    } = &registry.inner.resources
+    else {
+        unreachable!("over_grant owns an isolated provider")
+    };
+    let provider = provider.clone();
+    let baseline = provider.in_use();
+    let owner = RouteJoinOwner::reserve(&registry.inner.resources)
+        .expect("the exact root planning claim admits its owner");
+    (registry, provider, owner, baseline)
+}
+
+#[test]
+fn route_join_isolated_last_owner_runtime_drop_joins_and_releases_every_owner() {
+    let (registry, provider, owner, _registry_baseline) = isolated_route_join_fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the isolated last-owner runtime starts");
+    let port = owner.port.clone();
+    let (cancel_weak, retirement_weak, registry_weak, terminal, watchdogs, installed) = runtime
+        .block_on(async move {
+            let (client, _receiver) = fresh_client(&registry);
+            let key = ("net".to_string(), "last-owner".to_string());
+            let ChannelJoin::Install(installing) = registry
+                .subscribe_channel(key.clone(), client.id)
+                .expect("the exact isolated membership is admitted")
+            else {
+                panic!("the first member owns installation")
+            };
+            let cancel = registry
+                .route_cancellation_with_port(port, None)
+                .expect("the isolated owner admits the actual funded cancellation");
+            let terminal = cancel.retirement.terminal.clone();
+            let cancel_weak = cancel.downgrade();
+            let retirement_weak = cancel.retirement.downgrade();
+            let registry_weak = Arc::downgrade(&registry.inner);
+            let waiting = cancel.clone();
+            let pump_registry = registry.clone();
+            let child = tokio::spawn(async move {
+                let _registry = pump_registry;
+                waiting.cancelled().await;
+            });
+            let orphan = registry.finish_channel_install(&key, &installing, Some((cancel, child)));
+            let installed = orphan.is_none();
+            drop(orphan);
+            // The unrelated registry watchdog owner also owns native threads.
+            // Take their actual handles while its senders are still open so
+            // this isolated control can join ALL fixture owners after teardown.
+            // No watchdog/registry/cancellation owner Arc escapes this block.
+            let watchdogs = {
+                let tables = registry.inner.tables.lock();
+                let custody = tables
+                    .final_watchdog_custody
+                    .as_ref()
+                    .expect("the registry has its original watchdog custody");
+                let primary = route_join_lock(&custody.custodian.worker).take();
+                let fallback = route_join_lock(&custody.custodian.fallback_worker).take();
+                [primary, fallback]
+            };
+            (
+                cancel_weak,
+                retirement_weak,
+                registry_weak,
+                terminal,
+                watchdogs,
+                installed,
+            )
+        });
+    eprintln!("route-isolated-last-owner: before runtime destruction");
+    drop(runtime);
+    eprintln!("route-isolated-last-owner: after runtime destruction");
+    // Only the independent Owner can join the root. The funded terminal
+    // witness retains neither cancellation nor custodian nor registry.
+    drop(owner);
+    let watchdogs_joined = watchdogs.map(|handle| match handle {
+        Some(handle) => handle.join().is_ok(),
+        None => false,
+    });
+    let joined = terminal.observed.load(Ordering::Acquire);
+    let errors = terminal.join_errors.load(Ordering::Acquire);
+    let expired = cancel_weak.strong_count() == 0
+        && cancel_weak.upgrade().is_none()
+        && retirement_weak.upgrade().is_none()
+        && registry_weak.upgrade().is_none();
+    drop((terminal, cancel_weak, retirement_weak, registry_weak));
+    let final_claim = provider.in_use();
+    let final_reservations = provider.active_reservations();
+    let final_scopes = provider.active_scopes();
+    assert!(
+        installed && expired && joined,
+        "installed={installed}, exact owners expired={expired}, both observers joined={joined}"
+    );
+    assert_eq!(errors, 0);
+    assert!(watchdogs_joined.into_iter().all(|joined| joined));
+    assert_eq!(final_claim, ResourceClaim::ZERO);
+    assert_eq!(final_reservations, 0);
+    assert_eq!(final_scopes, 0);
+}
+
+#[test]
+fn route_join_close_waits_for_registered_unqueued_custody() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let cancel = registry
+        .route_cancellation_with_port(owner.port.clone(), None)
+        .expect("the route registers before its observers start");
+    let terminal = cancel.retirement.terminal.clone();
+    let port = owner.port.clone();
+    owner.close();
+    let registered_unqueued = {
+        let mut state = route_join_lock(&port.0.state);
+        while !state.waiting_after_close {
+            state = port
+                .0
+                .changed
+                .wait(state)
+                .expect("the test custody fence is not poisoned");
+        }
+        !state.accepting && state.outstanding == 1 && state.head.is_none()
+    };
+    let root_still_waiting = !owner
+        .worker
+        .as_ref()
+        .expect("the owner retains its join")
+        .is_finished();
+    let refused = matches!(
+        registry.route_cancellation_with_port(port.clone(), None),
+        Err(IpcAdmissionError::Closing)
+    );
+    // The already registered node must still be accepted AFTER close.
+    drop(cancel);
+    drop(owner);
+    let joined = terminal.observed.load(Ordering::Acquire);
+    let join_errors = terminal.join_errors.load(Ordering::Acquire);
+    let outstanding = route_join_lock(&port.0.state).outstanding;
+    drop((terminal, port));
+    let restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(registered_unqueued && root_still_waiting && refused);
+    assert!(joined);
+    assert_eq!(join_errors, 0);
+    assert_eq!(outstanding, 0);
+    assert!(
+        restored,
+        "the isolated root itself and every route lease returned"
+    );
+}
+
+#[test]
+fn route_join_constructor_refusals_leave_no_registered_node() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let root_baseline = provider.in_use();
+    let mut refused = [false; 2];
+    let mut restored = [false; 2];
+    for index in 0..2 {
+        refused[index] = matches!(
+            registry.route_cancellation_with_port(owner.port.clone(), Some(index)),
+            Err(IpcAdmissionError::CustodyUnavailable)
+        );
+        restored[index] = provider.in_use() == root_baseline
+            && route_join_lock(&owner.port.0.state).outstanding == 0;
+    }
+    // Scope plus registry watchdog custody only: no cancellation-record lease
+    // can be acquired, and no observer or registered node may be produced.
+    let starved = ClientRegistry::over_grant(
+        registry_fixture_claim(0, 0, 0).expect("the scope claim is representable"),
+    );
+    let before = starved.in_use();
+    let record_refused = matches!(
+        starved.route_cancellation_with_port(owner.port.clone(), None),
+        Err(IpcAdmissionError::Resources(_))
+    );
+    let refusal_clean =
+        starved.in_use() == before && route_join_lock(&owner.port.0.state).outstanding == 0;
+    drop(starved);
+    drop(owner);
+    let root_restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(refused.into_iter().all(|value| value));
+    assert!(restored.into_iter().all(|value| value));
+    assert!(record_refused && refusal_clean && root_restored);
+}
+
+#[test]
+fn route_join_two_queued_pairs_retain_funding_through_fallback_join() {
+    let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+    let root_baseline = provider.in_use();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the pair-gate runtime starts");
+    let mut primary_gates = Vec::new();
+    let mut fallback_gates = Vec::new();
+    let mut primary_done = Vec::new();
+    let mut fallback_done = Vec::new();
+    let mut witnesses = Vec::new();
+    for _ in 0..2 {
+        let cancel = registry
+            .route_cancellation_with_port(owner.port.clone(), None)
+            .expect("both exact paired-observer reservations are admitted");
+        witnesses.push(cancel.retirement.terminal.clone());
+        for (index, destination) in [
+            &cancel.retirement.sender,
+            &cancel.retirement.fallback_sender,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let (finished, done) = tokio::sync::oneshot::channel::<()>();
+            let task = runtime.spawn(async move {
+                let _ = wait.await;
+                let _ = finished.send(());
+            });
+            // Exercise both actual observer receivers, not a synthetic funding
+            // flag. Each receives its one exact task while that task is gated.
+            let sender = route_join_lock(destination);
+            if let Err(refused) = sender
+                .as_ref()
+                .expect("the observer sender is live")
+                .try_send(task)
+            {
+                let _retained_handle = refused;
+                std::process::abort();
+            }
+            if index == 0 {
+                primary_gates.push(release);
+                primary_done.push(done);
+            } else {
+                fallback_gates.push(release);
+                fallback_done.push(done);
+            }
+        }
+        drop(cancel);
+    }
+    owner.close();
+    let pair_workers = route_retirement_claim()
+        .expect("the pair claim is valid")
+        .amount(ResourceClass::WorkerOrTask)
+        .checked_mul(2)
+        .expect("two pairs fit");
+    let expected_workers = root_baseline
+        .amount(ResourceClass::WorkerOrTask)
+        .checked_add(pair_workers)
+        .expect("root and two pairs fit");
+    let both_pairs_held = provider.in_use().amount(ResourceClass::WorkerOrTask) == expected_workers;
+    for gate in primary_gates {
+        let _ = gate.send(());
+    }
+    runtime.block_on(async {
+        for done in primary_done {
+            let _ = done.await;
+        }
+    });
+    // Observe each real primary's terminal body, not just its child's signal.
+    // The fallback tasks remain gated throughout this observation.
+    for terminal in &witnesses {
+        let mut exited = route_join_lock(&terminal.exited);
+        while *exited & 1 == 0 {
+            exited = terminal
+                .exited_changed
+                .wait(exited)
+                .expect("the observer-exit fence is not poisoned");
+        }
+    }
+    let fallback_still_holds_pairs = provider.in_use().amount(ResourceClass::WorkerOrTask)
+        == expected_workers
+        && witnesses
+            .iter()
+            .all(|terminal| !terminal.observed.load(Ordering::Acquire));
+    for gate in fallback_gates {
+        let _ = gate.send(());
+    }
+    runtime.block_on(async {
+        for done in fallback_done {
+            let _ = done.await;
+        }
+    });
+    drop(runtime);
+    drop(owner);
+    let joined = witnesses.iter().all(|terminal| {
+        terminal.observed.load(Ordering::Acquire)
+            && terminal.join_errors.load(Ordering::Acquire) == 0
+    });
+    drop(witnesses);
+    let restored = provider.in_use() == baseline;
+    drop(registry);
+    assert!(both_pairs_held && fallback_still_holds_pairs);
+    assert!(joined && restored);
+}
+
+#[test]
+fn route_join_isolated_normal_and_cancelled_retirement_restore_baseline() {
+    for cancelled in [false, true] {
+        let (registry, provider, owner, baseline) = isolated_route_join_fixture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the retirement runtime starts");
+        let terminal = runtime.block_on(async {
+            let cancel = registry
+                .route_cancellation_with_port(owner.port.clone(), None)
+                .expect("the actual cancellation record and observers are funded");
+            let retirement = cancel.retirement();
+            let terminal = retirement.terminal.clone();
+            let waiting = cancel.clone();
+            let child = tokio::spawn(async move { waiting.cancelled().await });
+            let retired = RetiredRoute::orphaned_pump(cancel, child);
+            if cancelled {
+                // Poll the actual retire future to its child-join boundary,
+                // then drop that future while the child is still unpolled.
+                let mut retiring = std::pin::pin!(retired.retire());
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::future::Future::poll(retiring.as_mut(), cx).is_pending(),
+                    )
+                })
+                .await;
+                // No assertion before cleanup; record unexpected readiness as
+                // a scalar alongside the independently funded terminal witness.
+                // Leaving this branch drops pin!'s underlying retire future,
+                // before the runtime and isolated join owner are destroyed.
+                (terminal, pending)
+            } else {
+                retired.retire().await;
+                (terminal, true)
+            }
+        });
+        drop(runtime);
+        drop(owner);
+        let joined = terminal.0.observed.load(Ordering::Acquire);
+        let errors = terminal.0.join_errors.load(Ordering::Acquire);
+        let pending = terminal.1;
+        drop(terminal);
+        let restored = provider.in_use() == baseline;
+        drop(registry);
+        assert!(joined && pending && restored);
+        assert_eq!(errors, 0);
+    }
 }
 
 /// A route that was replaced answers `Gone` to its predecessor's pump, and the
@@ -1505,7 +2450,7 @@ fn only_the_first_caller_owns_the_drain() {
 /// what a finishing task does.
 #[tokio::test]
 async fn the_task_join_resolves_only_once_the_last_task_is_gone() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     let task = reg
         .lease_task()
         .expect("the daemon test grant funds one task");
@@ -1541,7 +2486,7 @@ async fn the_task_join_resolves_only_once_the_last_task_is_gone() {
 /// come and `serve` would never return.
 #[tokio::test]
 async fn a_task_ending_during_the_wait_still_wakes_it() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     let task = reg
         .lease_task()
         .expect("the daemon test grant funds one task");
@@ -1565,7 +2510,7 @@ async fn a_task_ending_during_the_wait_still_wakes_it() {
 /// `Closed` learns that instead of publishing it.
 #[test]
 fn closed_is_never_published_early() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     assert_eq!(
         reg.finish_closed(),
         Lifecycle::Running,
@@ -1590,6 +2535,20 @@ fn closed_is_never_published_early() {
     assert!(matches!(reg.lease_task(), Err(IpcAdmissionError::Closing)));
 }
 
+/// An isolated registry whose grant contains exactly its process scope and one
+/// task reservation. The three lifecycle controls below each hold one task;
+/// they must not borrow the process-wide daemon fixture or a connector proxy.
+fn one_task_registry() -> ClientRegistry {
+    let grant = registry_fixture_claim(0, 0, 0)
+        .expect("the isolated task registry scope claim is representable")
+        .checked_add(
+            super::task_reservation_planning_charge_for_test()
+                .expect("the isolated task reservation is representable"),
+        )
+        .expect("the isolated one-task registry grant is representable");
+    ClientRegistry::over_grant(grant)
+}
+
 /// The closing signal is already-signalled for a task that arrives late.
 ///
 /// A connection accepted microseconds before the drain, or a pump whose select
@@ -1605,6 +2564,83 @@ async fn the_closing_signal_resolves_for_a_task_that_arrives_after_it() {
     tokio::time::timeout(std::time::Duration::from_millis(500), reg.closing())
         .await
         .expect("a late arrival sees the state, not the missed wake");
+}
+
+/// One isolated fixture can fund an exact IPC task cohort beside a connector
+/// structural floor without changing the process-wide daemon grant.
+///
+/// The connector floor is held first, then the exact owner list's IPC task
+/// cohort is held beside it. The next task refuses for the worker dimension,
+/// proving the cohort is finite and that it did not silently consume a
+/// connector slot.
+/// Dropping both owners must return the private provider to the exact baseline;
+/// this control never reads or mutates the process-wide fixture provider.
+#[test]
+fn isolated_task_cohort_is_admitted_without_borrowing_connector_floor() {
+    let structural = myownmesh_core::connector_resource_structural_claims();
+    let connector = structural.connector_opening();
+    let connector_charge =
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(connector)
+            .expect("the connector opening reservation is representable");
+    let task = super::task_claim_for_test().expect("the IPC task claim is representable");
+    // Keep the cohort isolated to this control. Its owner list is explicit and
+    // the grant is priced from that list, so N is the number of leases this
+    // fixture really retains rather than a process-wide guessed constant.
+    let task_owners: Vec<usize> = (0..crate::TEST_PROCESS_CONNECTOR_CAPACITY).collect();
+    let task_charge = super::task_cohort_reservation_planning_charge_for_test(task_owners.len())
+        .expect("the IPC task cohort reservation is representable");
+    let grant = myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_add(connector_charge)
+        .and_then(|grant| grant.checked_add(task_charge))
+        .expect("the connector and IPC task grant is representable");
+    let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+    let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+        .expect("the private grant funds its process scope");
+    let scope = port.process_scope();
+    let baseline = provider.in_use();
+
+    let connector_lease = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            connector,
+        )
+        .expect("the connector floor is admitted before IPC tasks");
+    let mut tasks = Vec::new();
+    for index in &task_owners {
+        tasks.push(
+            port.acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                task,
+            )
+            .unwrap_or_else(|error| panic!("IPC task {index} must be admitted: {error:?}")),
+        );
+    }
+    assert_eq!(tasks.len(), task_owners.len());
+    let refusal = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            task,
+        )
+        .expect_err("the N+1 IPC task exceeds its named finite cohort");
+    assert!(
+        matches!(
+            refusal,
+            myownmesh_core::ResourceUnavailable::Pressure(pressure)
+                if pressure.dimension == myownmesh_core::ResourceClass::WorkerOrTask
+        ),
+        "the refusal is IPC task pressure, not connector-floor pressure: {refusal:?}"
+    );
+
+    drop(tasks);
+    drop(connector_lease);
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "dropping the connector and IPC task owners returns the exact baseline"
+    );
 }
 
 // ---- off-node retention -------------------------------------------------

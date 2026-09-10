@@ -26,9 +26,10 @@
 mod control_client;
 mod daemon_spawn;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use control_client::{ControlClient, Request, Response};
+use control_client::{ControlClient, Request, Response, Role};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 use tokio::sync::mpsc;
@@ -40,8 +41,8 @@ use tokio::sync::mpsc;
 /// `daemon_child` holds the spawned `myownmesh serve` process (if
 /// the GUI launched one); it's optional because the user may have
 /// already had a daemon running, in which case we use that instead
-/// of spawning a duplicate. Dropping the wrapped value at app exit
-/// kills the child via its `Drop` impl.
+/// of spawning a duplicate. Exit explicitly consumes and observes the
+/// child; `Drop` remains only an emergency fallback for abrupt teardown.
 ///
 /// `last_subscription_status` mirrors the most recent
 /// `mesh://subscription` payload. The Tauri event system is
@@ -55,7 +56,319 @@ use tokio::sync::mpsc;
 struct AppState {
     client: Arc<ControlClient>,
     daemon_child: Mutex<Option<daemon_spawn::DaemonChild>>,
+    event_pump: Mutex<Option<EventPump>>,
+    daemon_lifecycle: Arc<DaemonLifecycle>,
     last_subscription_status: Mutex<serde_json::Value>,
+}
+
+struct EventPump {
+    cancellation: control_client::EventPumpCancellation,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl EventPump {
+    fn start(app: AppHandle, client: Arc<ControlClient>) -> Self {
+        let cancellation = control_client::EventPumpCancellation::new();
+        let join = tokio::spawn(run_event_pump(app, client, cancellation.clone()));
+        Self { cancellation, join }
+    }
+
+    async fn shutdown(self) {
+        self.cancellation.cancel();
+        if let Err(error) = self.join.await {
+            tracing::error!("GUI event pump did not terminate cleanly: {error:#}");
+        }
+    }
+}
+
+/// Error envelope returned by Tauri commands. Keeping the daemon's response
+/// data beside the human-readable error preserves refusal codes and marks a
+/// lost post-write response as requiring an authoritative refresh.
+#[derive(Debug, serde::Serialize)]
+struct CommandError {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+type CommandResult<T> = std::result::Result<T, CommandError>;
+
+impl CommandError {
+    fn message(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            data: None,
+        }
+    }
+
+    fn outcome_unknown(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            data: Some(serde_json::json!({ "outcome": "unknown" })),
+        }
+    }
+}
+
+impl From<control_client::RequestError> for CommandError {
+    fn from(error: control_client::RequestError) -> Self {
+        match error {
+            control_client::RequestError::OutcomeUnknown => Self::outcome_unknown(
+                "outcome unknown: the daemon may have committed the request; query state before retrying",
+            ),
+            control_client::RequestError::Transport(error) => Self::message(error.to_string()),
+        }
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(error: String) -> Self {
+        if error.starts_with("outcome unknown:") {
+            Self::outcome_unknown(error)
+        } else {
+            Self::message(error)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonLifecyclePhase {
+    Starting,
+    RunningOwned,
+    RunningExternal,
+    Closing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupOutcome {
+    Owned,
+    External,
+    Failed,
+}
+
+struct DaemonStartup {
+    done: AtomicBool,
+    outcome: Mutex<Option<StartupOutcome>>,
+    notify: tokio::sync::Notify,
+    completion_lock: std::sync::Mutex<()>,
+    completion: std::sync::Condvar,
+    #[cfg(test)]
+    blocking_wait_started: AtomicBool,
+    #[cfg(test)]
+    blocking_wait_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct PublicationGate {
+    parked: AtomicBool,
+    parked_notify: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    released: AtomicBool,
+}
+
+#[cfg(test)]
+impl PublicationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: AtomicBool::new(false),
+            parked_notify: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    async fn wait_until_parked(&self) {
+        while !self.parked.load(Ordering::Acquire) {
+            let notified = self.parked_notify.notified();
+            if self.parked.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+impl DaemonStartup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            done: AtomicBool::new(false),
+            outcome: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+            completion_lock: std::sync::Mutex::new(()),
+            completion: std::sync::Condvar::new(),
+            #[cfg(test)]
+            blocking_wait_started: AtomicBool::new(false),
+            #[cfg(test)]
+            blocking_wait_notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn complete(&self, outcome: StartupOutcome) {
+        *self.outcome.lock() = Some(outcome);
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+        self.completion.notify_all();
+    }
+
+    async fn wait(&self) {
+        while !self.done.load(Ordering::Acquire) {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    fn wait_blocking(&self) {
+        #[cfg(test)]
+        {
+            self.blocking_wait_started.store(true, Ordering::Release);
+            self.blocking_wait_notify.notify_waiters();
+        }
+        let mut guard = self
+            .completion_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !self.done.load(Ordering::Acquire) {
+            guard = self
+                .completion
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn outcome(&self) -> Option<StartupOutcome> {
+        *self.outcome.lock()
+    }
+
+    #[cfg(test)]
+    async fn wait_until_blocking_wait_started(&self) {
+        while !self.blocking_wait_started.load(Ordering::Acquire) {
+            let notified = self.blocking_wait_notify.notified();
+            if self.blocking_wait_started.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct DaemonLifecycle {
+    phase: Mutex<DaemonLifecyclePhase>,
+    startup: Mutex<Option<Arc<DaemonStartup>>>,
+    #[cfg(test)]
+    publication_gate: Mutex<Option<Arc<PublicationGate>>>,
+}
+
+fn finish_exit(
+    lifecycle: &DaemonLifecycle,
+    child_slot: &Mutex<Option<daemon_spawn::DaemonChild>>,
+    event_pump_slot: &Mutex<Option<EventPump>>,
+) {
+    let startup = lifecycle.begin_closing();
+    let event_pump = event_pump_slot.lock().take();
+    if let Some(event_pump) = event_pump {
+        tauri::async_runtime::block_on(event_pump.shutdown());
+    }
+    let child = child_slot.lock().take();
+    if let Some(child) = child {
+        if let Err(error) = tauri::async_runtime::block_on(child.terminate_and_wait()) {
+            tracing::error!("GUI-owned daemon did not terminate cleanly during Exit: {error:#}");
+        }
+    }
+    if let Some(startup) = startup {
+        startup.wait_blocking();
+    }
+}
+
+impl DaemonLifecycle {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            phase: Mutex::new(DaemonLifecyclePhase::Starting),
+            startup: Mutex::new(None),
+            #[cfg(test)]
+            publication_gate: Mutex::new(None),
+        })
+    }
+
+    fn begin_startup(&self) -> Arc<DaemonStartup> {
+        let startup = DaemonStartup::new();
+        *self.startup.lock() = Some(Arc::clone(&startup));
+        startup
+    }
+
+    fn begin_closing(&self) -> Option<Arc<DaemonStartup>> {
+        *self.phase.lock() = DaemonLifecyclePhase::Closing;
+        self.startup.lock().clone()
+    }
+
+    fn is_closing(&self) -> bool {
+        *self.phase.lock() == DaemonLifecyclePhase::Closing
+    }
+
+    async fn publish_owned(
+        &self,
+        child_slot: &Mutex<Option<daemon_spawn::DaemonChild>>,
+        child: daemon_spawn::DaemonChild,
+    ) -> Result<(), daemon_spawn::DaemonChild> {
+        #[cfg(test)]
+        let gate = {
+            let guard = self.publication_gate.lock();
+            guard.clone()
+        };
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.parked.store(true, Ordering::Release);
+            gate.parked_notify.notify_waiters();
+            if !gate.released.load(Ordering::Acquire) {
+                let notified = gate.release.notified();
+                if !gate.released.load(Ordering::Acquire) {
+                    notified.await;
+                }
+            }
+        }
+        let mut phase = self.phase.lock();
+        if *phase != DaemonLifecyclePhase::Starting {
+            return Err(child);
+        }
+        *phase = DaemonLifecyclePhase::RunningOwned;
+        *child_slot.lock() = Some(child);
+        Ok(())
+    }
+
+    fn publish_event_pump(
+        &self,
+        event_pump_slot: &Mutex<Option<EventPump>>,
+        event_pump: EventPump,
+    ) -> Result<(), EventPump> {
+        let phase = self.phase.lock();
+        if *phase == DaemonLifecyclePhase::Closing {
+            return Err(event_pump);
+        }
+        *event_pump_slot.lock() = Some(event_pump);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_publication_gate(&self) -> Arc<PublicationGate> {
+        let gate = PublicationGate::new();
+        *self.publication_gate.lock() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn publish_external(&self) -> bool {
+        let mut phase = self.phase.lock();
+        if *phase != DaemonLifecyclePhase::Starting {
+            return false;
+        }
+        *phase = DaemonLifecyclePhase::RunningExternal;
+        true
+    }
 }
 
 /// Cache `value` and emit it as a `mesh://subscription` event. All
@@ -70,16 +383,19 @@ fn update_subscription_status(handle: &AppHandle, value: serde_json::Value) {
 
 /// Helper: turn a daemon `Response` into a result the JS side can
 /// handle. Tauri serialises the Ok branch as the JSON payload and
-/// the Err branch as a string the frontend can show in a toast.
-fn unwrap_response(resp: Response) -> Result<serde_json::Value, String> {
+/// the Err branch as an envelope retaining daemon refusal data.
+fn unwrap_response(resp: Response) -> CommandResult<serde_json::Value> {
     if !resp.ok {
-        return Err(resp.error.unwrap_or_else(|| "(no error message)".into()));
+        return Err(CommandError {
+            error: resp.error.unwrap_or_else(|| "(no error message)".into()),
+            data: resp.data,
+        });
     }
     Ok(resp.data.unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
-async fn mesh_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::Status)
@@ -89,7 +405,7 @@ async fn mesh_status(state: State<'_, AppState>) -> Result<serde_json::Value, St
 }
 
 #[tauri::command]
-async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_identity(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::IdentityShow)
@@ -102,7 +418,7 @@ async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, 
 async fn mesh_identity_set_label(
     state: State<'_, AppState>,
     label: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::IdentitySetLabel { label })
@@ -112,7 +428,7 @@ async fn mesh_identity_set_label(
 }
 
 #[tauri::command]
-async fn mesh_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_networks(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworksList)
@@ -125,7 +441,7 @@ async fn mesh_networks(state: State<'_, AppState>) -> Result<serde_json::Value, 
 async fn mesh_peers(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::PeersList { network })
@@ -138,43 +454,10 @@ async fn mesh_peers(
 async fn mesh_roster_list(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::RosterList { network })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
-async fn mesh_roster_approve(
-    state: State<'_, AppState>,
-    network: String,
-    device_id: String,
-    label: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::RosterApprove {
-            network,
-            device_id,
-            label,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
-async fn mesh_roster_remove(
-    state: State<'_, AppState>,
-    network: String,
-    device_id: String,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::RosterRemove { network, device_id })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -186,7 +469,7 @@ async fn mesh_topology_set(
     network: String,
     topology: String,
     hub: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::TopologySet {
@@ -200,7 +483,7 @@ async fn mesh_topology_set(
 }
 
 #[tauri::command]
-async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_network_id_generate(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkIdGenerate)
@@ -213,7 +496,7 @@ async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<serde_js
 async fn mesh_network_id_normalize(
     state: State<'_, AppState>,
     input: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkIdNormalize { input })
@@ -223,7 +506,7 @@ async fn mesh_network_id_normalize(
 }
 
 #[tauri::command]
-async fn mesh_config_show(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_config_show(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ConfigShow)
@@ -236,7 +519,7 @@ async fn mesh_config_show(state: State<'_, AppState>) -> Result<serde_json::Valu
 async fn mesh_network_add(
     state: State<'_, AppState>,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkAdd { config })
@@ -249,10 +532,15 @@ async fn mesh_network_add(
 async fn mesh_network_remove(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
-        .request(&Request::NetworkRemove { network })
+        .request(&Request::NetworkRemove {
+            network,
+            // The GUI's ordinary remove keeps durable governance state. A
+            // deliberate purge remains a separate daemon control operation.
+            purge: false,
+        })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -262,7 +550,7 @@ async fn mesh_network_remove(
 /// signed state + roster; keeps the device identity). The daemon exits after
 /// responding so it reloads clean; the caller follows with `restart_app`.
 #[tauri::command]
-async fn mesh_forget_all_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_forget_all_networks(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ForgetAllNetworks)
@@ -275,7 +563,7 @@ async fn mesh_forget_all_networks(state: State<'_, AppState>) -> Result<serde_js
 /// config, all networks). The daemon exits so a fresh one mints a new identity;
 /// the caller follows with `restart_app`.
 #[tauri::command]
-async fn mesh_factory_reset(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_factory_reset(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::FactoryReset)
@@ -288,11 +576,40 @@ async fn mesh_factory_reset(state: State<'_, AppState>) -> Result<serde_json::Va
 /// every layer restarts on the now-clean state — the daemon (which the reset
 /// told to exit), the Tauri backend, and the webview — instead of any of them
 /// serving a stale in-memory cache that would resurrect what was just wiped.
-/// The short wait lets the daemon finish exiting so the relaunched app spawns a
-/// fresh one via `ensure_daemon_running` rather than reconnecting to the old.
 #[tauri::command]
-async fn restart_app(app: AppHandle) -> Result<(), String> {
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+async fn restart_app(app: AppHandle) -> CommandResult<()> {
+    let (startup, child, client) = {
+        let state = app.state::<AppState>();
+        let startup = state.daemon_lifecycle.begin_closing();
+        let child = state.daemon_child.lock().take();
+        let client = Arc::clone(&state.client);
+        (startup, child, client)
+    };
+    if let Some(startup) = startup.as_ref() {
+        // Claim the same startup completion that setup owns. A late child is
+        // either handed to the slot before this fence or reaped by the
+        // startup task after it observes Closing.
+        startup.wait().await;
+    }
+    if let Some(child) = child {
+        // This is the exact process the GUI spawned. Waiting on its handle
+        // observes terminal state without killing or racing a relaunch.
+        child
+            .wait_for_exit()
+            .await
+            .map_err(|error| error.to_string())?;
+    } else if startup
+        .as_ref()
+        .and_then(|startup| startup.outcome())
+        .is_some_and(|outcome| outcome == StartupOutcome::External)
+    {
+        // An externally-owned service is never killed by the GUI. Its control
+        // listener is the only identity we own, so wait for that old listener
+        // to become unavailable before restarting over it.
+        daemon_spawn::wait_for_listener_terminal(&client)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     app.restart();
     #[allow(unreachable_code)]
     Ok(())
@@ -300,13 +617,12 @@ async fn restart_app(app: AppHandle) -> Result<(), String> {
 
 /// Atomic in-place network edit. The daemon hot-applies label / topology
 /// / auto-approve and only restarts transport for signaling/STUN/TURN
-/// changes — the roster survives either way. Replaces the GUI's previous
-/// remove + re-add edit dance.
+/// changes; the roster survives either way.
 #[tauri::command]
 async fn mesh_network_update(
     state: State<'_, AppState>,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkUpdate { config })
@@ -320,7 +636,7 @@ async fn mesh_network_update(
 /// native `<input type="file">` on the renderer side (matches the
 /// MyOwnLLM pattern), so there's no symmetric `mesh_network_import_file`.
 #[tauri::command]
-async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Result<(), String> {
+async fn mesh_network_export_file(path: String, config: serde_json::Value) -> CommandResult<()> {
     let body = serde_json::to_string_pretty(&config).map_err(|e| format!("serialise: {e}"))?;
     std::fs::write(&path, body).map_err(|e| format!("write {path}: {e}"))?;
     Ok(())
@@ -329,7 +645,7 @@ async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Re
 // ---- infrastructure services (relay / signaling / STUN / TURN) --------
 
 #[tauri::command]
-async fn mesh_services_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_services_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ServicesStatus)
@@ -342,7 +658,7 @@ async fn mesh_services_status(state: State<'_, AppState>) -> Result<serde_json::
 async fn mesh_services_set(
     state: State<'_, AppState>,
     services: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ServicesSet { services })
@@ -369,45 +685,13 @@ fn mesh_subscription_state(state: State<'_, AppState>) -> serde_json::Value {
 // Err branch is the `error` string.
 
 #[tauri::command]
-async fn mesh_governance_state(
-    state: State<'_, AppState>,
-    network: String,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::GovernanceState { network })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
-async fn mesh_governance_propose_kind_change(
-    state: State<'_, AppState>,
-    network: String,
-    to: String,
-    mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::GovernanceProposeKindChange {
-            network,
-            to,
-            mfa_code,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
 async fn mesh_governance_propose_role_grant(
     state: State<'_, AppState>,
     network: String,
     target: String,
-    role: String,
+    role: Role,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceProposeRoleGrant {
@@ -427,7 +711,7 @@ async fn mesh_governance_propose_role_revoke(
     network: String,
     target: String,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceProposeRoleRevoke {
@@ -441,19 +725,17 @@ async fn mesh_governance_propose_role_revoke(
 }
 
 #[tauri::command]
-async fn mesh_governance_propose_topology(
+async fn mesh_governance_propose_evict(
     state: State<'_, AppState>,
     network: String,
-    topology: String,
-    hub: Option<String>,
+    target: String,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
-        .request(&Request::GovernanceProposeTopology {
+        .request(&Request::GovernanceProposeEvict {
             network,
-            topology,
-            hub,
+            target,
             mfa_code,
         })
         .await
@@ -462,18 +744,29 @@ async fn mesh_governance_propose_topology(
 }
 
 #[tauri::command]
-async fn mesh_governance_sign(
+async fn mesh_governance_mfa_prepare(
     state: State<'_, AppState>,
     network: String,
-    proposal_id: String,
-    mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
-        .request(&Request::GovernanceSign {
+        .request(&Request::GovernanceMfaPrepare { network })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_query(
+    state: State<'_, AppState>,
+    network: String,
+    transaction_id: String,
+) -> CommandResult<serde_json::Value> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaQuery {
             network,
-            proposal_id,
-            mfa_code,
+            transaction_id,
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -481,13 +774,51 @@ async fn mesh_governance_sign(
 }
 
 #[tauri::command]
-async fn mesh_governance_mfa_enroll(
+async fn mesh_governance_mfa_redeliver(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+    transaction_id: String,
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
-        .request(&Request::GovernanceMfaEnroll { network })
+        .request(&Request::GovernanceMfaRedeliver {
+            network,
+            transaction_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_commit(
+    state: State<'_, AppState>,
+    network: String,
+    transaction_id: String,
+) -> CommandResult<serde_json::Value> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaCommit {
+            network,
+            transaction_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    unwrap_response(resp)
+}
+
+#[tauri::command]
+async fn mesh_governance_mfa_abort(
+    state: State<'_, AppState>,
+    network: String,
+    transaction_id: String,
+) -> CommandResult<serde_json::Value> {
+    let resp = state
+        .client
+        .request(&Request::GovernanceMfaAbort {
+            network,
+            transaction_id,
+        })
         .await
         .map_err(|e| e.to_string())?;
     unwrap_response(resp)
@@ -497,7 +828,7 @@ async fn mesh_governance_mfa_enroll(
 async fn mesh_governance_mfa_status(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaStatus { network })
@@ -511,7 +842,7 @@ async fn mesh_governance_mfa_disable(
     state: State<'_, AppState>,
     network: String,
     code: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaDisable { network, code })
@@ -520,66 +851,16 @@ async fn mesh_governance_mfa_disable(
     unwrap_response(resp)
 }
 
-#[tauri::command]
-async fn mesh_governance_deny(
-    state: State<'_, AppState>,
-    network: String,
-    proposal_id: String,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::GovernanceDeny {
-            network,
-            proposal_id,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
-async fn mesh_governance_withdraw(
-    state: State<'_, AppState>,
-    network: String,
-    proposal_id: String,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::GovernanceWithdraw {
-            network,
-            proposal_id,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
-#[tauri::command]
-async fn mesh_governance_spawn_split(
-    state: State<'_, AppState>,
-    network: String,
-    proposal_id: String,
-) -> Result<serde_json::Value, String> {
-    let resp = state
-        .client
-        .request(&Request::GovernanceSpawnSplit {
-            network,
-            proposal_id,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    unwrap_response(resp)
-}
-
 // ---- self-update ------------------------------------------------------
 //
-// Thin pass-throughs to the daemon's updater. The daemon owns the actual
-// check / stage / apply (it's the process whose binary gets swapped — the
-// GUI is updated in lockstep beside it), so the GUI never touches the
-// updater crate directly; it just surfaces status and forwards intent.
+// Thin pass-throughs to the daemon's updater. The daemon is updated first;
+// GUI staging/application is best effort, and a failed staged GUI remains
+// pending for recovery or retry. The GUI never changes the embedded signing
+// trust root: an alternate release feed must provide compatible artifacts,
+// while changing the signing authority requires a rebuild.
 
 #[tauri::command]
-async fn update_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateStatus)
@@ -589,7 +870,7 @@ async fn update_status(state: State<'_, AppState>) -> Result<serde_json::Value, 
 }
 
 #[tauri::command]
-async fn update_check(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_check(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateCheck)
@@ -599,7 +880,7 @@ async fn update_check(state: State<'_, AppState>) -> Result<serde_json::Value, S
 }
 
 #[tauri::command]
-async fn update_apply(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_apply(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateApply)
@@ -612,7 +893,7 @@ async fn update_apply(state: State<'_, AppState>) -> Result<serde_json::Value, S
 async fn update_set_prefs(
     state: State<'_, AppState>,
     prefs: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateSetPrefs { prefs })
@@ -626,17 +907,24 @@ async fn update_set_prefs(
 /// On disconnect we wait a beat and re-subscribe — the daemon may be
 /// restarting or the user may have just started it after launching
 /// the GUI.
-async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
+async fn run_event_pump(
+    app: AppHandle,
+    client: Arc<ControlClient>,
+    cancellation: control_client::EventPumpCancellation,
+) {
     loop {
+        if cancellation.is_cancelled() {
+            break;
+        }
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(256);
-        match client.subscribe_events(tx).await {
-            Ok(()) => {
+        let reader = match tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            result = client.subscribe_events(tx, cancellation.clone()) => result,
+        } {
+            Ok(reader) => {
                 update_subscription_status(&app, serde_json::json!({ "status": "live" }));
-                while let Some(value) = rx.recv().await {
-                    let _ = app.emit("mesh://event", value);
-                }
-                // Subscription channel closed — daemon disconnected.
-                update_subscription_status(&app, serde_json::json!({ "status": "disconnected" }));
+                Some(reader)
             }
             Err(e) => {
                 tracing::warn!("event subscribe failed: {e} — will retry");
@@ -644,9 +932,41 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
                     &app,
                     serde_json::json!({ "status": "disconnected", "error": e.to_string() }),
                 );
+                None
+            }
+        };
+        let Some(reader) = reader else {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+            }
+            continue;
+        };
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                value = rx.recv() => match value {
+                    Some(value) => { let _ = app.emit("mesh://event", value); }
+                    None => break,
+                },
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if cancellation.is_cancelled() {
+            let _ = reader.await;
+            break;
+        }
+        if let Err(error) = reader.await {
+            tracing::warn!("event stream task did not terminate cleanly: {error:#}");
+        }
+        // Subscription channel closed — daemon disconnected.
+        update_subscription_status(&app, serde_json::json!({ "status": "disconnected" }));
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+        }
     }
 }
 
@@ -714,6 +1034,8 @@ fn main() {
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
+            event_pump: Mutex::new(None),
+            daemon_lifecycle: DaemonLifecycle::new(),
             last_subscription_status: Mutex::new(serde_json::json!({ "status": "connecting" })),
         })
         .invoke_handler(tauri::generate_handler![
@@ -723,8 +1045,6 @@ fn main() {
             mesh_networks,
             mesh_peers,
             mesh_roster_list,
-            mesh_roster_approve,
-            mesh_roster_remove,
             mesh_topology_set,
             mesh_network_id_generate,
             mesh_network_id_normalize,
@@ -736,16 +1056,14 @@ fn main() {
             mesh_services_status,
             mesh_services_set,
             mesh_subscription_state,
-            mesh_governance_state,
-            mesh_governance_propose_kind_change,
             mesh_governance_propose_role_grant,
             mesh_governance_propose_role_revoke,
-            mesh_governance_propose_topology,
-            mesh_governance_sign,
-            mesh_governance_deny,
-            mesh_governance_withdraw,
-            mesh_governance_spawn_split,
-            mesh_governance_mfa_enroll,
+            mesh_governance_propose_evict,
+            mesh_governance_mfa_prepare,
+            mesh_governance_mfa_query,
+            mesh_governance_mfa_redeliver,
+            mesh_governance_mfa_commit,
+            mesh_governance_mfa_abort,
             mesh_governance_mfa_status,
             mesh_governance_mfa_disable,
             update_status,
@@ -759,6 +1077,11 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             let client = client.clone();
+            let lifecycle = {
+                let state = handle.state::<AppState>();
+                Arc::clone(&state.daemon_lifecycle)
+            };
+            let startup = lifecycle.begin_startup();
             // Auto-spawn the daemon before the event pump starts —
             // a fresh daemon needs a moment to bind the socket, and
             // running the pump before then just produces spurious
@@ -767,15 +1090,50 @@ fn main() {
             // waiting, in which case the pump's retry loop takes
             // over).
             tauri::async_runtime::spawn(async move {
+                let event_pump = EventPump::start(handle.clone(), client.clone());
+                let state = handle.state::<AppState>();
+                if let Err(event_pump) =
+                    lifecycle.publish_event_pump(&state.event_pump, event_pump)
+                {
+                    event_pump.shutdown().await;
+                    startup.complete(StartupOutcome::Failed);
+                    return;
+                }
                 match daemon_spawn::ensure_daemon_running(&client).await {
                     Ok(child) => {
                         if let Some(child) = child {
                             let state = handle.state::<AppState>();
-                            *state.daemon_child.lock() = Some(child);
+                            match lifecycle
+                                .publish_owned(&state.daemon_child, child)
+                                .await
+                            {
+                                Ok(()) => startup.complete(StartupOutcome::Owned),
+                                Err(child) => {
+                                    tracing::info!(
+                                        "daemon startup completed after GUI close; reaping child"
+                                    );
+                                    if let Err(error) = child.terminate_and_wait().await {
+                                        tracing::error!(
+                                            "late daemon startup child did not terminate cleanly: {error:#}"
+                                        );
+                                    }
+                                    startup.complete(StartupOutcome::Owned);
+                                }
+                            }
+                        } else {
+                            if !lifecycle.publish_external() {
+                                startup.complete(StartupOutcome::External);
+                                return;
+                            }
+                            startup.complete(StartupOutcome::External);
                         }
                     }
                     Err(e) => {
                         tracing::error!("daemon auto-spawn failed: {e:#}");
+                        startup.complete(StartupOutcome::Failed);
+                        if lifecycle.is_closing() {
+                            return;
+                        }
                         update_subscription_status(
                             &handle,
                             serde_json::json!({
@@ -785,7 +1143,6 @@ fn main() {
                         );
                     }
                 }
-                run_event_pump(handle, client).await;
             });
             Ok(())
         })
@@ -793,15 +1150,10 @@ fn main() {
         .expect("error while building MyOwnMesh GUI")
         .run(|app, event| {
             // RunEvent::Exit fires after the last window closes (or
-            // after we explicitly call `app.exit()`). Drop the
-            // managed daemon child here so it's killed deterministically
+            // after we explicitly call `app.exit()`). The shared
+            // helper below consumes and observes the exact owned child
+            // before this callback returns.
             // — relying on `DaemonChild::Drop` alone wasn't enough
-            // in practice: Tauri's process tear-down on Windows
-            // can short-circuit destructors on managed state, which
-            // left the spawned `myownmesh serve` orphaned every
-            // time the user closed the GUI. Pull it out explicitly
-            // so its Drop impl runs before we return from this
-            // closure (and the OS reaps us).
             if let RunEvent::Exit = event {
                 // Pull `take()` out of the `if let` scrutinee — under
                 // Rust 2021 if-let temporary-scope rules the
@@ -811,10 +1163,140 @@ fn main() {
                 // `let` statement the guard drops at the `;`, leaving
                 // a plain `Option<DaemonChild>` for the match.
                 let state = app.state::<AppState>();
-                let child = state.daemon_child.lock().take();
-                if let Some(c) = child {
-                    drop(c);
-                }
+                finish_exit(
+                    &state.daemon_lifecycle,
+                    &state.daemon_child,
+                    &state.event_pump,
+                );
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_error_preserves_refusal_data_and_unknown_marker() {
+        let refusal = unwrap_response(Response {
+            ok: false,
+            error: Some("request refused".into()),
+            data: Some(serde_json::json!({ "code": "unauthorized_role" })),
+        })
+        .expect_err("refusal must be an error");
+        let encoded = serde_json::to_value(refusal).expect("error serializes");
+        assert_eq!(encoded["error"], "request refused");
+        assert_eq!(encoded["data"]["code"], "unauthorized_role");
+
+        let unknown = CommandError::from(control_client::RequestError::OutcomeUnknown);
+        let encoded = serde_json::to_value(unknown).expect("unknown serializes");
+        assert_eq!(encoded["data"]["outcome"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn closing_fences_late_owned_startup_publication() {
+        let lifecycle = DaemonLifecycle::new();
+        let startup = lifecycle.begin_startup();
+        let child_slot = Mutex::new(None);
+
+        assert!(lifecycle.begin_closing().is_some());
+        assert!(!lifecycle.publish_external());
+        assert!(lifecycle
+            .publish_owned(&child_slot, daemon_spawn::DaemonChild::empty_for_test())
+            .await
+            .is_err());
+        assert!(child_slot.lock().is_none());
+
+        startup.complete(StartupOutcome::Owned);
+        assert_eq!(startup.outcome(), Some(StartupOutcome::Owned));
+    }
+
+    #[test]
+    fn startup_completion_remains_claimable_after_closing() {
+        let lifecycle = DaemonLifecycle::new();
+        let startup = lifecycle.begin_startup();
+        let claimed = lifecycle.begin_closing().expect("startup cell retained");
+
+        startup.complete(StartupOutcome::External);
+        assert_eq!(claimed.outcome(), Some(StartupOutcome::External));
+    }
+
+    #[tokio::test]
+    async fn exit_gate_reaps_late_child_before_slot_can_publish() {
+        let lifecycle = DaemonLifecycle::new();
+        let startup = lifecycle.begin_startup();
+        let gate = lifecycle.install_publication_gate();
+        let child_slot = Arc::new(Mutex::new(None));
+        let publishing = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let child_slot = Arc::clone(&child_slot);
+            tokio::spawn(async move {
+                let result = lifecycle
+                    .publish_owned(&child_slot, daemon_spawn::DaemonChild::empty_for_test())
+                    .await;
+                if let Err(child) = result {
+                    child.terminate_and_wait().await.expect("reap late child");
+                    startup.complete(StartupOutcome::Owned);
+                }
+            })
+        };
+
+        gate.wait_until_parked().await;
+        let claimed = lifecycle.begin_closing().expect("startup retained at Exit");
+        gate.release();
+        publishing.await.expect("publication task joined");
+        claimed.wait().await;
+        assert_eq!(claimed.outcome(), Some(StartupOutcome::Owned));
+        assert!(child_slot.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn exit_helper_waits_for_terminal_child_and_startup_completion() {
+        let lifecycle = DaemonLifecycle::new();
+        let startup = lifecycle.begin_startup();
+        let startup_observer = Arc::clone(&startup);
+        let gate = lifecycle.install_publication_gate();
+        let witness = daemon_spawn::TerminalObservationWitness::new();
+        let child_slot = Arc::new(Mutex::new(Some(
+            daemon_spawn::DaemonChild::with_terminal_witness(Arc::clone(&witness)),
+        )));
+        let publishing = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let child_slot = Arc::clone(&child_slot);
+            tokio::spawn(async move {
+                let result = lifecycle
+                    .publish_owned(&child_slot, daemon_spawn::DaemonChild::empty_for_test())
+                    .await;
+                if let Err(child) = result {
+                    child.terminate_and_wait().await.expect("reap late child");
+                    startup.complete(StartupOutcome::Owned);
+                }
+            })
+        };
+
+        gate.wait_until_parked().await;
+        let helper_done = Arc::new(AtomicBool::new(false));
+        let helper = {
+            let lifecycle = Arc::clone(&lifecycle);
+            let child_slot = Arc::clone(&child_slot);
+            let helper_done = Arc::clone(&helper_done);
+            tokio::task::spawn_blocking(move || {
+                let event_pump_slot = Mutex::new(None);
+                finish_exit(&lifecycle, &child_slot, &event_pump_slot);
+                helper_done.store(true, Ordering::Release);
+            })
+        };
+
+        witness.wait_until_started();
+        assert!(!helper_done.load(Ordering::Acquire));
+        witness.release();
+        witness.wait_until_terminal();
+        startup_observer.wait_until_blocking_wait_started().await;
+        assert!(!helper_done.load(Ordering::Acquire));
+        gate.release();
+        publishing.await.expect("publication task joined");
+        helper.await.expect("Exit helper joined");
+        assert!(helper_done.load(Ordering::Acquire));
+        assert!(child_slot.lock().is_none());
+    }
 }

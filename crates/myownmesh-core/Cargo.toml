@@ -18,6 +18,9 @@ path = "src/lib.rs"
 [features]
 default = []
 transport-lab = []
+# Select the platform DNS-SD backend through the signaling crate. Kept
+# explicit so the default and no-default release boundaries remain unchanged.
+system-dnssd = ["myownmesh-signaling/system-dnssd"]
 
 [[example]]
 name = "spin_min"
@@ -27,21 +30,27 @@ required-features = ["transport-lab"]
 name = "spin_probe"
 required-features = ["transport-lab"]
 
+# Drives the authenticated-departure path through `depart_for_lab`, which only
+# exists behind `transport-lab`. Gated here rather than with an inner `cfg` so
+# an ordinary build does not build the target at all.
+[[test]]
+name = "peer_leave"
+path = "tests/peer_leave.rs"
+required-features = ["transport-lab"]
+
 [dependencies]
 myownmesh-signaling = { workspace = true }
 
 tokio = { workspace = true }
-tokio-util = { workspace = true }
-tokio-stream = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
-pin-project-lite = { workspace = true }
 
 webrtc = { workspace = true }
 
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+rusqlite = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
@@ -55,12 +64,14 @@ hex = { workspace = true }
 bytes = { workspace = true }
 
 serde = { workspace = true }
+bincode = { workspace = true }
 serde_json = { workspace = true }
 
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 if-addrs = "0.15"
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

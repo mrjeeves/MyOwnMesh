@@ -285,17 +285,22 @@ the source files carry the rationale; this section is the index.
    ever sees an approval request for a peer who's already proven
    they own the keypair they claim.
 
-3. **Roster is the only persistent trust.** Verification codes
-   are ephemeral. Long-term "I know this peer" lives entirely in
-   `~/.myownmesh/mesh/rosters/{network_id}.json`.
+3. **Retired pre-V4 claim: roster as persistent trust.** Verification codes
+   remain ephemeral, but V4 durable Closed authority lives in the signed
+   semantic `FactGraph` and its canonical store. The roster JSON is only a
+   non-authoritative UI/diagnostic projection. The old statement that trust
+   lived entirely in `~/.myownmesh/mesh/rosters/{network_id}.json` is retained
+   here only as historical context and must not be implemented.
 
 4. **Per-network isolation.** Rosters, approvals, and topology
    selectors are per-`network_id`. Switching networks atomically
    swaps to the new roster — no cross-contamination.
 
-5. **Forward-compatible frames.** Receivers silently drop
-   unknown `kind` values rather than failing the stream. New
-   message kinds gate at the [`features`][features] matrix.
+5. **Retired pre-V4 claim: forward-compatible frames.** V4 uses a strict
+   protocol-version cutover and denies unknown fields or message kinds. The
+   former behavior — silently dropping unknown `kind` values and gating new
+   kinds through a feature matrix — is historical evidence, not the current
+   wire contract.
 
 ## Anti-patterns
 

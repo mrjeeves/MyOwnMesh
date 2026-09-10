@@ -1,7 +1,7 @@
 //! The one closed handshake-profile identifier advertised in
 //! `HelloMessage::features`.
 //!
-//! This alpha does not negotiate optional protocol features or mixed-version
+//! This protocol does not negotiate optional protocol features or mixed-version
 //! fallbacks. Post-authentication traffic belongs to the one current profile.
 //! The advertised identifier below is instead a hard precondition for endpoint
 //! authentication: a peer either speaks that exact profile or is refused.

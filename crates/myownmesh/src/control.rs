@@ -14,6 +14,8 @@
 //! this to forward live mesh events into the frontend.
 
 use std::path::PathBuf;
+#[cfg(feature = "transport-lab")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -56,7 +58,6 @@ impl AdmittedRequest {
 /// below this line decides those, and nothing in there knows the protocol.
 mod listener;
 
-pub use listener::default_socket_name;
 use listener::{bind_listener, resolve_socket, verify_local_peer};
 
 /// The request and response vocabulary itself: every `op` a client may send,
@@ -120,6 +121,13 @@ pub(crate) struct ControlHooks {
     /// left behind. Fired once, immediately after construction.
     #[cfg(test)]
     registry: Option<tokio::sync::oneshot::Sender<crate::ipc::ClientRegistry>>,
+    /// Replaces the mesh-issued registry for one production-shaped control.
+    ///
+    /// The override is test-only and per-serve. It lets a control fund the
+    /// exact task and join-node owners it will hold without enlarging the
+    /// process-wide mesh grant.
+    #[cfg(test)]
+    registry_override: Option<crate::ipc::ClientRegistry>,
     /// Pauses one connection task at the instant `EventsSubscribe` becomes a
     /// live stream.
     ///
@@ -132,6 +140,84 @@ pub(crate) struct ControlHooks {
     /// returns when the stream is over.
     #[cfg(test)]
     at_events_stream_entry: Option<Arc<DispatchBarrier>>,
+    /// Pauses one connection immediately before a unary RPC enters the core
+    /// call path.  The control uses this only to separate request decoding
+    /// from the filed-call observation; it never supplies a production
+    /// cancellation or timeout.
+    #[cfg(test)]
+    before_rpc_call: Option<Arc<DispatchBarrier>>,
+    /// Pauses the shutdown task immediately before the registry atomically
+    /// enters `Closing`, after shutdown has been requested but before it can
+    /// notify connection cancellation or drain pending work.
+    ///
+    /// This gives a non-vacuous filed -> shutdown-ownership handoff: the
+    /// control can prove the pending operation still exists at this edge, then
+    /// release the production transition that withdraws it. It does not alter
+    /// cancellation or provide a production synchronization path.
+    #[cfg(test)]
+    before_begin_closing: Option<Arc<DispatchBarrier>>,
+    /// Pauses after a provisional response has been written and before its
+    /// handoff is committed or rolled back. The handoff guard remains armed
+    /// across this exact edge, so a test can terminate the connection task and
+    /// prove that the write cannot strand its sole custody owner.
+    #[cfg(test)]
+    before_provisional_settle: Option<Arc<DispatchBarrier>>,
+    /// Pauses after durable MFA preparation and response encoding, but before
+    /// the response bytes are handed to the socket. This is the exact edge
+    /// where a client may lose the first response while the transaction must
+    /// remain queryable and redeliverable.
+    #[cfg(test)]
+    before_mfa_response_write: Option<Arc<DispatchBarrier>>,
+}
+
+/// Cross-process transport-lab pause for the first MFA response.
+///
+/// This is compiled only with the explicit `transport-lab` feature and is enabled only by the
+/// explicit `MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER` environment variable. It is
+/// deliberately a loopback rendezvous rather than a process-global flag: the
+/// test observes a marker containing no transaction or material, then decides
+/// when the response write may proceed. Normal daemon builds have no field,
+/// parser, listener, or pause path for it.
+#[cfg(feature = "transport-lab")]
+struct TransportLabMfaBarrier {
+    address: std::net::SocketAddr,
+    used: AtomicBool,
+}
+
+#[cfg(feature = "transport-lab")]
+impl TransportLabMfaBarrier {
+    fn from_env() -> Result<Option<Arc<Self>>> {
+        let Some(raw) = std::env::var_os("MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER") else {
+            return Ok(None);
+        };
+        let raw = raw
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("MFA transport-lab barrier address is not UTF-8"))?;
+        let address = raw.parse().with_context(|| {
+            format!("MFA transport-lab barrier address is not a socket address: {raw}")
+        })?;
+        Ok(Some(Arc::new(Self {
+            address,
+            used: AtomicBool::new(false),
+        })))
+    }
+
+    async fn pause_once(&self) -> Result<()> {
+        if self.used.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut stream = tokio::net::TcpStream::connect(self.address)
+            .await
+            .context("connect MFA transport-lab barrier")?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"PREPARED\n")
+            .await
+            .context("announce MFA transport-lab preparation")?;
+        let mut release = [0_u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut release)
+            .await
+            .context("wait for MFA transport-lab release")?;
+        Ok(())
+    }
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -151,11 +237,8 @@ pub(crate) struct DispatchBarrier {
 impl DispatchBarrier {
     /// The barrier and the two ends a control drives it by.
     ///
-    /// Gated to match its one caller. The terminal-shutdown control that drives
-    /// this needs a real accepted connection over a Unix socket, so it does not
-    /// exist on Windows -- and neither, therefore, does anything that builds a
-    /// barrier for it. The type itself stays available to both, because
-    /// `ControlHooks` names it on every platform.
+    /// The paired constructor is for Unix socket tests; the barrier and its
+    /// wait hook remain available to test-only control paths on every target.
     #[cfg(unix)]
     fn paired() -> (
         Arc<Self>,
@@ -405,6 +488,25 @@ where
     }
 }
 
+/// Cross the production write boundary and settle one provisional handoff.
+///
+/// The test-only barrier is deliberately between the successful write/flush
+/// and the exact settlement. In a release build this is just the existing
+/// settlement call; no timer, retry, or detached cleanup task is introduced.
+async fn settle_provisional_handoff(
+    state: &Arc<ControlState>,
+    provisional: &mut handoff::HandoffGuard,
+    wrote: &Result<Wrote>,
+) {
+    #[cfg(test)]
+    if let Some(barrier) = &state.before_provisional_settle {
+        barrier.pass().await;
+    }
+    provisional
+        .settle(state, matches!(wrote, Ok(Wrote::Sent)))
+        .await;
+}
+
 /// One value a connection-long mode keeps, and the funding for exactly the
 /// buffers it owns.
 ///
@@ -551,6 +653,10 @@ async fn serve_with_hooks(
         realtime,
         supervisor,
     } = surface;
+    #[cfg(test)]
+    let mut hooks = hooks;
+    #[cfg(feature = "transport-lab")]
+    let mfa_transport_lab_barrier = TransportLabMfaBarrier::from_env()?;
     // Read before the listener binds and kept for the whole accept loop. The
     // request it resolves on is a latched state, so a reset that lands between
     // this line and the first poll below is not a lost wake.
@@ -574,13 +680,22 @@ async fn serve_with_hooks(
     // went away. Taken before the listener binds, so a daemon that cannot fund
     // its own registry fails to start rather than accepting a connection it
     // cannot register.
+    #[cfg(test)]
+    let clients = if let Some(clients) = hooks.registry_override.take() {
+        clients
+    } else {
+        crate::ipc::ClientRegistry::new(
+            mesh.local_application_resource_scope()
+                .context("issue the IPC registry's local application resource scope")?,
+        )?
+    };
+    #[cfg(not(test))]
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .context("issue the IPC registry's local application resource scope")?,
-    );
+    )?;
     #[cfg(test)]
     let hooks = {
-        let mut hooks = hooks;
         if let Some(publish) = hooks.registry.take() {
             let _ = publish.send(clients.clone());
         }
@@ -592,6 +707,7 @@ async fn serve_with_hooks(
     let state = Arc::new(ControlState {
         finished: tokio::sync::Notify::new(),
         ended: std::sync::atomic::AtomicUsize::new(0),
+        abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
         services,
@@ -604,6 +720,16 @@ async fn serve_with_hooks(
         before_events_subscribe_commit: hooks.before_events_subscribe_commit,
         #[cfg(test)]
         at_events_stream_entry: hooks.at_events_stream_entry,
+        #[cfg(test)]
+        before_rpc_call: hooks.before_rpc_call,
+        #[cfg(test)]
+        before_begin_closing: hooks.before_begin_closing,
+        #[cfg(test)]
+        before_provisional_settle: hooks.before_provisional_settle,
+        #[cfg(test)]
+        before_mfa_response_write: hooks.before_mfa_response_write,
+        #[cfg(feature = "transport-lab")]
+        mfa_transport_lab_barrier,
     });
     #[cfg(not(test))]
     let _ = hooks;
@@ -638,7 +764,10 @@ async fn serve_with_hooks(
             // signal races; see its own note for why that wait terminates
             // without a timer.
             () = state.finished.notified() => {
-                join_finished(&state.ended, &mut accepted).await;
+                let abnormal = join_finished(&state.ended, &mut accepted).await;
+                state
+                    .abnormal_connections
+                    .fetch_add(abnormal, std::sync::atomic::Ordering::AcqRel);
             }
             res = listener.accept() => {
                 match res {
@@ -672,7 +801,10 @@ async fn serve_with_hooks(
                         // one funded node per connection it had *ever* accepted
                         // and would eventually refuse a live client on behalf of
                         // tasks that finished hours ago.
-                        join_finished(&state.ended, &mut accepted).await;
+                        let abnormal = join_finished(&state.ended, &mut accepted).await;
+                        state
+                            .abnormal_connections
+                            .fetch_add(abnormal, std::sync::atomic::Ordering::AcqRel);
                         // The node that will hold this connection's handle,
                         // funded before the task it will name exists. Refused,
                         // the connection is closed here rather than spawned into
@@ -765,7 +897,12 @@ async fn serve_with_hooks(
     //    step 3 as well. Without those the count could stay above zero for as
     //    long as an idle client chose to stay connected, and this wait would be
     //    the hang rather than the join.
-    if state.clients.begin_closing() {
+    #[cfg(test)]
+    if let Some(barrier) = &state.before_begin_closing {
+        barrier.pass().await;
+    }
+    let owns_closing = state.clients.begin_closing();
+    if owns_closing {
         // One client at a time, released before the next is taken, and asked for
         // one at a time too. The registry answers an id rather than a record for
         // exactly this reason: a record carries the client's retired routes and
@@ -790,23 +927,52 @@ async fn serve_with_hooks(
     // released its admission exactly like one that returned. Each node is freed
     // before its own funding is released, and the list is empty by the time this
     // returns.
-    join_all(&mut accepted).await;
+    let mut shutdown_failures = Vec::new();
+    let abnormal_connections = state
+        .abnormal_connections
+        .load(std::sync::atomic::Ordering::Acquire)
+        .saturating_add(join_all(&mut accepted).await);
+    if abnormal_connections != 0 {
+        shutdown_failures.push(format!(
+            "{abnormal_connections} control connection task(s) ended abnormally"
+        ));
+    }
+    let abnormal_watchdogs = state.clients.drain_watchdogs().await;
+    if abnormal_watchdogs != 0 {
+        warn!(
+            abnormal_watchdogs,
+            "inbound-stream watchdogs ended abnormally during control shutdown"
+        );
+        shutdown_failures.push(format!(
+            "{abnormal_watchdogs} inbound-stream watchdog(s) ended abnormally"
+        ));
+    }
     // And then the count, which covers what this list does not: the channel
     // pumps and inbound-stream watchdogs the registry admitted on connections'
     // behalf. It should already be zero -- retiring a route joins its pump --
     // and waiting on it is what makes that a checked fact rather than an
     // assumption.
     state.clients.wait_for_tasks().await;
-    // Answers the state rather than asserting one, so a second `serve` over the
-    // same registry — which drained nothing — cannot publish `Closed` on the
-    // strength of having waited. Logged rather than panicked: a daemon on its
-    // way out should say what it found, not abort on it.
-    match state.clients.finish_closed() {
-        crate::ipc::Lifecycle::Closed => info!("control surface closed"),
-        other => warn!(?other, "control surface did not reach Closed"),
+    // Only the caller that won the lifecycle transition may publish a clean
+    // close. A concurrent or late `serve` therefore cannot report success on
+    // the strength of having waited for its own handles.
+    if !owns_closing {
+        shutdown_failures.push("control surface close was already claimed by another owner".into());
     }
-
-    Ok(())
+    if owns_closing {
+        match state.clients.finish_closed() {
+            crate::ipc::Lifecycle::Closed => {}
+            other => {
+                shutdown_failures.push(format!("control surface did not reach Closed: {other:?}"))
+            }
+        }
+    }
+    if shutdown_failures.is_empty() {
+        info!("control surface closed");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(shutdown_failures.join("; ")))
+    }
 }
 
 /// Join every accepted connection that has already finished.
@@ -914,6 +1080,10 @@ struct ControlState {
     /// decremented by the join that consumes it, so it can only be nonzero while
     /// there is really something to reap.
     ended: std::sync::atomic::AtomicUsize,
+    /// Abnormal connection joins observed by background reaping. These are
+    /// retained until shutdown so an earlier panic cannot be forgotten before
+    /// the control surface reports its terminal result.
+    abnormal_connections: std::sync::atomic::AtomicUsize,
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
     services: Arc<ServiceManager>,
@@ -928,6 +1098,22 @@ struct ControlState {
     /// See [`ControlHooks::at_events_stream_entry`].
     #[cfg(test)]
     at_events_stream_entry: Option<Arc<DispatchBarrier>>,
+    /// Test-only witness for the exact point where a decoded unary RPC enters
+    /// the core call path.
+    #[cfg(test)]
+    before_rpc_call: Option<Arc<DispatchBarrier>>,
+    /// Test-only witness immediately before the registry's atomic transition
+    /// to `Closing`.
+    #[cfg(test)]
+    before_begin_closing: Option<Arc<DispatchBarrier>>,
+    /// See [`ControlHooks::before_provisional_settle`].
+    #[cfg(test)]
+    before_provisional_settle: Option<Arc<DispatchBarrier>>,
+    /// See [`ControlHooks::before_mfa_response_write`].
+    #[cfg(test)]
+    before_mfa_response_write: Option<Arc<DispatchBarrier>>,
+    #[cfg(feature = "transport-lab")]
+    mfa_transport_lab_barrier: Option<Arc<TransportLabMfaBarrier>>,
 }
 
 /// One control surface with nothing joined, for the controls that are about
@@ -944,7 +1130,9 @@ struct ControlState {
 /// need the same value, and a copy in each would be three things to keep in
 /// step with this struct.
 #[cfg(test)]
-pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
+pub(in crate::control) async fn joinless_control_state(
+    cleanup_port: myownmesh_services::ServiceCleanupPort,
+) -> Arc<ControlState> {
     let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
         myownmesh_core::MeshConfig::default(),
         Arc::new(myownmesh_core::Identity::ephemeral()),
@@ -953,14 +1141,16 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
     .await
     .expect("the daemon test grant opens an infrastructure-only mesh");
     let registry = NetworkRegistry::new();
-    let services = ServiceManager::new(mesh.clone(), registry.clone());
+    let services = ServiceManager::new(mesh.clone(), registry.clone(), cleanup_port);
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .expect("the fixture grant issues the registry's scope"),
-    );
+    )
+    .expect("the fixture starts the IPC final watchdog custodian");
     Arc::new(ControlState {
         finished: tokio::sync::Notify::new(),
         ended: std::sync::atomic::AtomicUsize::new(0),
+        abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
         services,
@@ -974,6 +1164,12 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         realtime_frame_bytes: None,
         before_events_subscribe_commit: None,
         at_events_stream_entry: None,
+        before_rpc_call: None,
+        before_begin_closing: None,
+        before_provisional_settle: None,
+        before_mfa_response_write: None,
+        #[cfg(feature = "transport-lab")]
+        mfa_transport_lab_barrier: None,
     })
 }
 
@@ -1253,7 +1449,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                             .context("trace-subscribe response text was not admitted")?
                     },
                 };
-                let rx = net.state().subscribe_conn_trace();
+                let rx = net.subscribe_conn_trace();
                 // A trace client has no registry entry to be unregistered, so
                 // the runtime's close is its only cancellation -- and without
                 // one, a connected trace client on a quiet network held the
@@ -1535,6 +1731,189 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 result?;
                 break;
             }
+            Request::OpaquePipe {
+                direction,
+                network,
+                peer,
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                let plan = match opaque_pipe::opaque_pipe_binding_plan(
+                    direction,
+                    &network,
+                    peer.as_deref(),
+                    flow_capability.as_deref(),
+                ) {
+                    Ok(plan) => plan,
+                    Err(message) => {
+                        let resp = PreparedReply::StaticError(message);
+                        match write_line(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            ControlOut::Prepared(&resp),
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    }
+                };
+                let pipe_owner = {
+                    let (Some(client_id), Some(capability)) =
+                        (client_id, client_capability.as_deref())
+                    else {
+                        match write_static_error(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            "opaque_pipe requires client_id and client_capability: the pipe \
+                             is owned by the client that opened the exact flow",
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    let Some(owner) = state.clients.authenticate(client_id, capability) else {
+                        match write_static_error(
+                            &mut writer,
+                            &json_lines,
+                            &cancel,
+                            "invalid local client authority",
+                        )
+                        .await?
+                        {
+                            Wrote::Sent => continue,
+                            Wrote::Ended => break,
+                        }
+                    };
+                    owner
+                };
+                let lengths = plan.retained_lengths();
+                let bound = Retained::admit_building(lengths, &json_lines, || plan.build())?;
+                drop((network, peer, client_capability, flow_capability, decoded));
+                let cancel = ConnectionCancel::owned_by(&state.clients, &pipe_owner);
+                let Some(net) = state.registry.get(bound.network()) else {
+                    let text = PreparedText::acquiring(
+                        format!("unknown network: {}", bound.network()),
+                        &json_lines,
+                    )
+                    .context("opaque pipe unknown-network refusal was not admitted")?;
+                    let resp = PreparedReply::Error(text);
+                    match write_line(
+                        &mut writer,
+                        &json_lines,
+                        &cancel,
+                        ControlOut::Prepared(&resp),
+                    )
+                    .await?
+                    {
+                        Wrote::Sent => continue,
+                        Wrote::Ended => break,
+                    }
+                };
+                let inbound_stream = match &*bound {
+                    opaque_pipe::OpaquePipeBinding::Inbound { peer, .. } => {
+                        match net.realtime_inbound(peer) {
+                            Some(stream) => Some(stream),
+                            None => {
+                                match write_static_error(
+                                    &mut writer,
+                                    &json_lines,
+                                    &cancel,
+                                    "no inbound opaque stream for the current peer session, or a \
+                                 live opaque pipe already holds it",
+                                )
+                                .await?
+                                {
+                                    Wrote::Sent => continue,
+                                    Wrote::Ended => break,
+                                }
+                            }
+                        }
+                    }
+                    opaque_pipe::OpaquePipeBinding::Outbound {
+                        network,
+                        flow_capability,
+                    } => {
+                        if pipe_owner
+                            .with_realtime_flow(flow_capability, network, |_flow| ())
+                            .is_none()
+                        {
+                            match write_static_error(
+                                &mut writer,
+                                &json_lines,
+                                &cancel,
+                                "unknown opaque flow_capability on this network: it was never \
+                                 issued to this client, or it has already been closed",
+                            )
+                            .await?
+                            {
+                                Wrote::Sent => continue,
+                                Wrote::Ended => break,
+                            }
+                        }
+                        None
+                    }
+                };
+                let ack = PreparedReply::Bool {
+                    key: "opaque_pipe",
+                    value: true,
+                };
+                match write_line(
+                    &mut writer,
+                    &json_lines,
+                    &cancel,
+                    ControlOut::Prepared(&ack),
+                )
+                .await?
+                {
+                    Wrote::Sent => {}
+                    Wrote::Ended => break,
+                }
+                let pipe = async {
+                    match (inbound_stream, &*bound) {
+                        (
+                            None,
+                            opaque_pipe::OpaquePipeBinding::Outbound {
+                                network,
+                                flow_capability,
+                            },
+                        ) => {
+                            opaque_pipe::run_opaque_outbound_pipe(
+                                &net,
+                                &pipe_owner,
+                                flow_capability,
+                                network,
+                                reader.frames(),
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        (Some(stream), opaque_pipe::OpaquePipeBinding::Inbound { .. }) => {
+                            opaque_pipe::run_opaque_inbound_pipe(
+                                &net,
+                                &stream,
+                                &mut writer,
+                                &realtime_frames,
+                            )
+                            .await
+                        }
+                        _ => Ok(()),
+                    }
+                };
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Ok(()),
+                    result = pipe => result,
+                };
+                result?;
+                break;
+            }
             Request::Status => {
                 let (reply, output) = dispatch::network::node_status(&state, &json_lines)?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
@@ -1602,13 +1981,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The capability naming this flow is the client's only copy, so
                 // the flow is not this daemon's until the line carrying it has
                 // actually been written.
                 let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote.context("realtime response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -1632,6 +2010,99 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 match write_variable(&mut writer, &json_lines, &cancel, variable)
                     .await
                     .context("realtime response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowOpen {
+                network,
+                peer,
+                label,
+                client_id,
+                client_capability,
+                direction,
+                mode,
+                max_unit_bytes,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow operation result was not admitted")?;
+                let (variable, provisional) = dispatch::opaque::flow_open(
+                    &state,
+                    owner,
+                    dispatch::opaque::FlowOpen {
+                        network,
+                        peer,
+                        label,
+                        direction,
+                        mode,
+                        max_unit_bytes,
+                    },
+                    client_id,
+                    client_capability,
+                )
+                .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
+                let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
+                match wrote.context("opaque flow response line was not admitted")? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowChange {
+                network,
+                label,
+                client_id,
+                client_capability,
+                flow_capability,
+                direction,
+                mode,
+                max_unit_bytes,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow change result was not admitted")?;
+                let variable = dispatch::opaque::flow_change(
+                    &state,
+                    owner,
+                    dispatch::opaque::FlowChange {
+                        network,
+                        label,
+                        direction,
+                        mode,
+                        max_unit_bytes,
+                    },
+                    client_id,
+                    client_capability,
+                    flow_capability,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("opaque flow change response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::OpaqueFlowClose {
+                client_id,
+                client_capability,
+                flow_capability,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("opaque flow operation result was not admitted")?;
+                let variable = dispatch::opaque::flow_close(
+                    &state,
+                    owner,
+                    client_id,
+                    client_capability,
+                    flow_capability,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("opaque flow close response line was not admitted")?
                 {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -1661,14 +2132,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The request id is the client's only handle on this stream.
                 // Until the setup line is written, the stream is filed but
                 // nothing forwards it; the settle below either starts the
                 // forwarding or withdraws the stream.
                 let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote.context("RPC stream setup response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -1717,51 +2187,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceState { network } => {
-                let (reply, output) =
-                    dispatch::governance::governance_state(&state, &json_lines, network).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("GovernanceState response exceeded its measured ceiling")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            // Twelve arms, not one arm that bound a whole `Request` and re-matched
-            // it. The grouped form needed a `_ => unreachable!()` underneath, so a
-            // thirteenth transition would have compiled into that panic instead of
-            // failing the build as a missing arm here.
-            Request::RosterApprove {
-                network,
-                device_id,
-                label,
-            } => {
-                let (reply, output) = dispatch::governance::roster_approve(
-                    &state,
-                    &json_lines,
-                    network,
-                    device_id,
-                    label,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::RosterRemove { network, device_id } => {
-                let (reply, output) =
-                    dispatch::governance::roster_remove(&state, &json_lines, network, device_id)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
             Request::TopologySet {
                 network,
                 topology,
@@ -1770,26 +2195,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let (reply, output) =
                     dispatch::governance::topology_set(&state, &json_lines, network, topology, hub)
                         .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceProposeKindChange {
-                network,
-                to,
-                mfa_code,
-            } => {
-                let (reply, output) = dispatch::governance::propose_kind_change(
-                    &state,
-                    &json_lines,
-                    network,
-                    to,
-                    mfa_code,
-                )
-                .await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("governance/network response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
@@ -1859,84 +2264,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceProposeTopology {
-                network,
-                topology,
-                hub,
-                mfa_code,
-            } => {
-                let (reply, output) = dispatch::governance::propose_topology(
-                    &state,
-                    &json_lines,
-                    network,
-                    topology,
-                    hub,
-                    mfa_code,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceSign {
-                network,
-                proposal_id,
-                mfa_code,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::sign(&state, &json_lines, network, proposal_id, mfa_code)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceDeny {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::deny(&state, &json_lines, network, proposal_id).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceWithdraw {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::withdraw(&state, &json_lines, network, proposal_id)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::GovernanceSpawnSplit {
-                network,
-                proposal_id,
-            } => {
-                let (reply, output) =
-                    dispatch::governance::spawn_split(&state, &json_lines, network, proposal_id)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
             Request::NetworkReconnect { network, peer } => {
                 let owner = ResponseOwner::acquire(&json_lines)
                     .context("network reconnect result was not admitted")?;
@@ -1957,6 +2284,106 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await
                     .context("network add response line was not admitted")?
                 {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkCreateClosed { config } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("Closed network create result was not admitted")?;
+                let variable =
+                    dispatch::network::network_create_closed(&state, config, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("Closed network create response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkImportClosed {
+                config,
+                expected_context_id,
+                bootstrap,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("Closed network import result was not admitted")?;
+                let variable = dispatch::network::network_import_closed(
+                    &state,
+                    config,
+                    expected_context_id,
+                    bootstrap,
+                    owner,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("Closed network import response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkBootstrapExport { network } => {
+                let (reply, output) =
+                    dispatch::governance::bootstrap_export(&state, &json_lines, network)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed bootstrap response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticFactPageExport { network, request } => {
+                let (reply, output) = dispatch::governance::semantic_fact_page_export(
+                    &state,
+                    &json_lines,
+                    network,
+                    request,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic fact page response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticFactPageImport { network, page } => {
+                let (reply, output) = dispatch::governance::semantic_fact_page_import(
+                    &state,
+                    &json_lines,
+                    network,
+                    page,
+                )
+                .await?;
+                let line =
+                    AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                        .context("semantic fact page import response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticStateIdentity { network } => {
+                let (reply, output) =
+                    dispatch::governance::semantic_state_identity(&state, &json_lines, network)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic state identity response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticRecentFacts { network, request } => {
+                let (reply, output) = dispatch::governance::semantic_recent_facts(
+                    &state,
+                    &json_lines,
+                    network,
+                    request,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic recent-facts response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2076,6 +2503,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 method,
                 payload,
             } => {
+                #[cfg(test)]
+                if let Some(barrier) = &state.before_rpc_call {
+                    barrier.pass().await;
+                }
                 // The only operation that can answer with nothing: a call the
                 // connection's shutdown cancelled never produced a result to
                 // report, so there is no line to write and the loop ends.
@@ -2117,33 +2548,93 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceMfaEnroll { network } => {
-                let ((reply, output), provisional) =
-                    dispatch::governance::mfa_enroll(&json_lines, network)?;
+            Request::GovernanceMfaPrepare { network } => {
+                let (reply, output) = dispatch::governance::mfa_prepare(&json_lines, network)?;
                 // The lock is already installed. It has to be: a success
                 // response has to name an enrollment that exists, and deferring
                 // the write until this line would let two clients both be told
                 // they enrolled, because neither installed lock would exist to
-                // refuse the other. What is provisional is ownership, not the
-                // write — the enrollment is rollback-owned until this line
-                // reaches `Wrote::Sent`, and settled either way below. The
-                // secret and the recovery codes are still shown exactly once
-                // and are not recoverable from disk, which is why an unhanded
-                // enrollment has to be removed rather than left installed.
-                let line =
-                    match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
-                        Ok(line) => line,
-                        Err(error) => {
-                            provisional.settle(&state, false).await;
-                            return Err(error)
-                                .context("MFA enrollment response changed after measurement");
-                        }
-                    };
+                // refuse the other. The durable transaction remains Prepared
+                // across every write outcome; only an explicit transaction
+                // commit or abort decides custody after the client has received
+                // (or declined) this material. The exact transaction remains
+                // queryable and redeliverable until that explicit command.
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA enrollment response changed after measurement")?;
+                #[cfg(test)]
+                if let Some(barrier) = &state.before_mfa_response_write {
+                    barrier.pass().await;
+                }
+                #[cfg(feature = "transport-lab")]
+                if let Some(barrier) = &state.mfa_transport_lab_barrier {
+                    barrier
+                        .pause_once()
+                        .await
+                        .context("MFA transport-lab response barrier failed")?;
+                }
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
                 match wrote? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaQuery {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::mfa_query(&json_lines, network, transaction_id)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction query response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaRedeliver {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::mfa_redeliver(&json_lines, network, transaction_id)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA redelivery response changed after measurement")?;
+                let wrote = write_admitted_line(&mut writer, &cancel, line).await;
+                match wrote? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaCommit {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) = dispatch::governance::mfa_commit_or_abort(
+                    &json_lines,
+                    network,
+                    transaction_id,
+                    true,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction commit response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaAbort {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) = dispatch::governance::mfa_commit_or_abort(
+                    &json_lines,
+                    network,
+                    transaction_id,
+                    false,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction abort response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -2491,6 +2982,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
 /// It decides nothing about admission — the binding is checked before either
 /// pump starts, and every refusal it can meet comes from core.
 mod handoff;
+mod opaque_pipe;
 mod realtime_pipe;
 
 #[cfg(test)]
@@ -2857,6 +3349,73 @@ mod request_wire_tests {
         assert_eq!(value["peer"], "peerpubkey");
         let back: Request = serde_json::from_value(value).expect("re-decode");
         assert!(matches!(back, Request::NetworkConnectPeer { .. }));
+    }
+
+    #[test]
+    fn governance_requests_require_an_explicit_mfa_field() {
+        for (op, extra) in [
+            ("governance_propose_role_grant", r#","role":"member""#),
+            ("governance_propose_role_revoke", ""),
+            ("governance_propose_evict", ""),
+        ] {
+            let json = format!(r#"{{"op":"{op}","network":"n","target":"t"{extra}}}"#);
+            assert!(
+                serde_json::from_str::<Request>(&json).is_err(),
+                "{op} must not silently default its security-sensitive MFA field"
+            );
+        }
+    }
+
+    #[test]
+    fn governance_requests_preserve_present_mfa_values_and_reject_malformed_values() {
+        let requests = [
+            (
+                r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":null}"#,
+                None,
+            ),
+            (
+                r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+            (
+                r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+            (
+                r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":"246810"}"#,
+                Some("246810"),
+            ),
+        ];
+
+        for (json, expected) in requests {
+            let request: Request = serde_json::from_str(json).expect("present MFA field parses");
+            let actual = match request {
+                Request::GovernanceProposeRoleGrant { mfa_code, .. }
+                | Request::GovernanceProposeRoleRevoke { mfa_code, .. }
+                | Request::GovernanceProposeEvict { mfa_code, .. } => mfa_code,
+                _ => panic!("fixture must decode as a governance proposal"),
+            };
+            assert_eq!(actual.as_deref(), expected);
+        }
+
+        for json in [
+            r#"{"op":"governance_propose_role_grant","network":"n","target":"t","role":"member","mfa_code":7}"#,
+            r#"{"op":"governance_propose_role_revoke","network":"n","target":"t","mfa_code":7}"#,
+            r#"{"op":"governance_propose_evict","network":"n","target":"t","mfa_code":7}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Request>(json).is_err(),
+                "malformed MFA value must be refused"
+            );
+        }
     }
 }
 
@@ -3515,170 +4074,557 @@ mod terminal_shutdown_tests {
         myownmesh_core::NetworkConfig {
             id: id.to_string(),
             network_id: network_id.to_string(),
+            event_capacity: myownmesh_core::NetworkConfig::from_network_id("", "").event_capacity,
+            connection_trace_capacity: myownmesh_core::NetworkConfig::from_network_id("", "")
+                .connection_trace_capacity,
             label: id.to_string(),
             kind: Default::default(),
+            scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
+            tree: None,
+            hub: None,
+            local_observations: None,
+            introduction: None,
+            semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
-            roster_path: None,
             pinned_peers: Vec::new(),
             auto_approve: true,
         }
     }
 
-    #[tokio::test]
-    async fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
-        let _fixture = crate::exclusive_connector_fixture().await;
-        let near_mesh = connector_mesh().await;
-        let far_mesh = connector_mesh().await;
-        let near = near_mesh
-            .join(network_config("near-control", "terminal-rpc-mesh"))
-            .await
-            .expect("near network joins");
-        let far = far_mesh
-            .join(network_config("far-control", "terminal-rpc-mesh"))
-            .await
-            .expect("far network joins");
-        let (handler_entered_tx, handler_entered_rx) = tokio::sync::oneshot::channel();
-        let handler_entered = std::sync::Mutex::new(Some(handler_entered_tx));
-        let _parked_handler = far
-            .rpc()
-            .prepare_serve("park", move |_call| {
-                let entered = handler_entered
-                    .lock()
-                    .expect("the handler-entry witness is not poisoned")
-                    .take()
-                    .expect("the parked handler is entered exactly once");
-                entered
-                    .send(())
-                    .expect("the handler-entry witness remains observed");
-                async {
-                    std::future::pending::<Result<myownmesh_core::rpc::RpcResponse, String>>().await
-                }
-            })
-            .expect("the far gateway prepares the parked handler")
-            .commit()
-            .into_result()
-            .expect("the far gateway installs the parked handler");
-        let link = near.install_promoted_peer_over_real_link(&far).await;
-        let peer = link.peer_device_id().to_string();
+    /// Exact private funding for the parked-RPC control's live owners: the
+    /// registry scope, its accepted connection task, and the retained join
+    /// list node. No process-wide task or connector headroom is borrowed.
+    fn parked_rpc_registry() -> crate::ipc::ClientRegistry {
+        let registry = crate::ipc::clients::registry_fixture_claim(0, 0, 0)
+            .expect("the parked-RPC registry scope claim is representable");
+        let task = crate::ipc::clients::task_reservation_planning_charge_for_test()
+            .expect("the parked-RPC task reservation is representable");
+        let join_node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the parked-RPC join node claim is representable");
+        let join_node =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(join_node)
+                .expect("the parked-RPC join-node reservation is representable");
+        let grant = registry
+            .checked_add(task)
+            .and_then(|grant| grant.checked_add(join_node))
+            .expect("the parked-RPC exact registry grant is representable");
+        crate::ipc::ClientRegistry::over_grant(grant)
+    }
 
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
-        let networks = NetworkRegistry::new();
-        assert!(
-            networks.insert(near, None).into_refusal().is_none(),
-            "the near network is reachable by the control registry"
-        );
-        let observed = networks
-            .get("near-control")
-            .expect("the inserted network is visible");
-        let services = ServiceManager::new(near_mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh: near_mesh,
-                registry: networks.clone(),
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                at_events_stream_entry: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is valid");
-        let stream = guarded("RPC client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (mut client_reader, mut client_writer) = stream.split();
-        let request = Request::RpcCall {
-            network: "near-control".to_string(),
-            peer: peer.clone(),
-            method: "park".to_string(),
-            payload: serde_json::Value::Null,
-        };
-        let mut encoded = serde_json::to_vec(&request).expect("the RPC request encodes");
-        encoded.push(b'\n');
-        client_writer
-            .write_all(&encoded)
-            .await
-            .expect("the client sends the RPC");
+    /// Exact private funding for the real streaming-RPC race below: one event
+    /// client, three accepted/retained task owners (event socket, command
+    /// socket and the post-response stream forwarder), and their three join
+    /// nodes. The forwarder is intentionally funded even though the test makes
+    /// it lose the provisional-settle race; admission of that owner is what
+    /// makes the refusal observable rather than an accidental undergrant.
+    fn parked_rpc_stream_registry() -> crate::ipc::ClientRegistry {
+        let registry = crate::ipc::clients::registry_fixture_claim(1, 0, 0)
+            .expect("the streaming-RPC registry scope claim is representable");
+        let tasks = crate::ipc::clients::task_cohort_reservation_planning_charge_for_test(3)
+            .expect("the streaming-RPC task cohort is representable");
+        let join_node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the streaming-RPC join node claim is representable");
+        let join_nodes =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(join_node)
+                .expect("the streaming-RPC join-node reservation is representable")
+                .checked_scale(3)
+                .expect("the streaming-RPC join-node cohort is representable");
+        let grant = registry
+            .checked_add(tasks)
+            .and_then(|grant| grant.checked_add(join_nodes))
+            .expect("the streaming-RPC exact registry grant is representable");
+        crate::ipc::ClientRegistry::over_grant(grant)
+    }
 
-        guarded("the RPC is filed under the promoted session", async {
-            loop {
-                if observed.pending_call_count_for_test(&peer) == Some(1) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        guarded("the remote parked handler is entered", handler_entered_rx)
-            .await
-            .expect("the far handler reports its first entry");
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
-        );
-        guarded("serve begins closing", clients.closing()).await;
-        guarded("the parked RPC is withdrawn", async {
-            loop {
-                if observed.pending_call_count_for_test(&peer) == Some(0) {
-                    break;
-                }
+    #[test]
+    fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let _fixture = crate::exclusive_connector_fixture().await;
+                let near_mesh = connector_mesh().await;
+                let far_mesh = connector_mesh().await;
+                let near = near_mesh
+                    .join(network_config("near-control", "terminal-rpc-mesh"))
+                    .await
+                    .expect("near network joins");
+                let far = far_mesh
+                    .join(network_config("far-control", "terminal-rpc-mesh"))
+                    .await
+                    .expect("far network joins");
+                let mut near_events = near_mesh.events();
+                let mut far_events = far_mesh.events();
+                let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+                near.attach_local(&_local_broker);
+                far.attach_local(&_local_broker);
+                let near_device = near_mesh.device_id();
+                let far_device = far_mesh.device_id();
+                crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+                crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
+                let (handler_entered_tx, handler_entered_rx) = tokio::sync::oneshot::channel();
+                let handler_entered = std::sync::Mutex::new(Some(handler_entered_tx));
+                let _parked_handler = far
+                    .rpc()
+                    .prepare_serve("park", move |_call| {
+                        let entered = handler_entered
+                            .lock()
+                            .expect("the handler-entry witness is not poisoned")
+                            .take()
+                            .expect("the parked handler is entered exactly once");
+                        entered
+                            .send(())
+                            .expect("the handler-entry witness remains observed");
+                        async {
+                            std::future::pending::<
+                                    Result<myownmesh_core::rpc::RpcResponse, String>,
+                                >()
+                                .await
+                        }
+                    })
+                    .expect("the far gateway prepares the parked handler")
+                    .commit()
+                    .into_result()
+                    .expect("the far gateway installs the parked handler");
+                let link = near.install_promoted_peer_over_real_link(&far).await;
+                let peer = link.peer_device_id().to_string();
+
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (rpc_barrier, rpc_entered, rpc_release) = DispatchBarrier::paired();
+                let (shutdown_barrier, shutdown_owned, shutdown_release) =
+                    DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let networks = NetworkRegistry::new();
                 assert!(
-                    observed.pending_call_count_for_test(&peer).is_some(),
-                    "the promoted session must remain present while withdrawal is observed"
+                    networks.insert(near, None).into_refusal().is_none(),
+                    "the near network is reachable by the control registry"
                 );
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                let observed = networks
+                    .get("near-control")
+                    .expect("the inserted network is visible");
+                let services =
+                    ServiceManager::new(near_mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh: near_mesh,
+                        registry: networks.clone(),
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: Some(parked_rpc_registry()),
+                        at_events_stream_entry: None,
+                        before_rpc_call: Some(rpc_barrier),
+                        before_begin_closing: Some(shutdown_barrier),
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is valid");
+                let stream = guarded("RPC client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (mut client_reader, mut client_writer) = stream.split();
+                let request = Request::RpcCall {
+                    network: "near-control".to_string(),
+                    peer: peer.clone(),
+                    method: "park".to_string(),
+                    payload: serde_json::Value::Null,
+                };
+                let mut encoded = serde_json::to_vec(&request).expect("the RPC request encodes");
+                encoded.push(b'\n');
+                client_writer
+                    .write_all(&encoded)
+                    .await
+                    .expect("the client sends the RPC");
+
+                // First establish that the real control connection decoded the
+                // request and reached the unary RPC boundary.  Releasing this barrier
+                // then lets the production call file its pending operation; the
+                // pending-count observation below is consequently a filed/withdrawn
+                // witness rather than a race with request parsing.
+                guarded("the RPC reaches its dispatch boundary", rpc_entered)
+                    .await
+                    .expect("the RPC dispatch barrier remains observed");
+                rpc_release
+                    .send(())
+                    .expect("the RPC dispatch barrier is still parked");
+
+                guarded("the RPC is filed under the promoted session", async {
+                    loop {
+                        if observed.pending_call_count_for_test(&peer) == Some(1) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                guarded("the remote parked handler is entered", handler_entered_rx)
+                    .await
+                    .expect("the far handler reports its first entry");
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded(
+                    "shutdown reaches parked-RPC withdrawal handoff",
+                    shutdown_owned,
+                )
+                .await
+                .expect("shutdown reaches the pre-begin-closing ownership barrier");
+                assert_eq!(
+                    observed.pending_call_count_for_test(&peer),
+                    Some(1),
+                    "the shutdown handoff is non-vacuous: the RPC is still filed"
+                );
+                shutdown_release
+                    .send(())
+                    .expect("the shutdown ownership barrier is still parked");
+                guarded("serve begins closing", clients.closing()).await;
+                guarded("the parked RPC is withdrawn", async {
+                    loop {
+                        if observed.pending_call_count_for_test(&peer) == Some(0) {
+                            break;
+                        }
+                        assert!(
+                            observed.pending_call_count_for_test(&peer).is_some(),
+                            "the promoted session must remain present while withdrawal is observed"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed)
+                );
+                drop(client_writer);
+                let mut terminal = Vec::new();
+                guarded(
+                    "the socket reaches a typed terminal answer or EOF",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut terminal),
+                )
+                .await
+                .expect("the client reads the terminal socket state");
+                if !terminal.is_empty() {
+                    let response: Response = serde_json::from_slice(&terminal)
+                        .expect("a non-EOF terminal answer is a typed response");
+                    assert!(!response.ok, "a cancelled parked RPC cannot report success");
+                }
+                let _ = networks.shutdown_all().await;
+                let _ = link.retire().await;
+                drop(far);
+            },
         );
-        drop(client_writer);
-        let mut terminal = Vec::new();
-        guarded(
-            "the socket reaches a typed terminal answer or EOF",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut terminal),
-        )
-        .await
-        .expect("the client reads the terminal socket state");
-        if !terminal.is_empty() {
-            let response: Response = serde_json::from_slice(&terminal)
-                .expect("a non-EOF terminal answer is a typed response");
-            assert!(!response.ok, "a cancelled parked RPC cannot report success");
-        }
-        let _ = networks.shutdown_all().await;
-        let _ = link.retire().await;
-        drop(far);
+    }
+
+    /// A delivered streaming-RPC setup cannot strand its forwarder when the
+    /// runtime closes at the exact provisional handoff. This uses both real
+    /// control sockets: `EventsSubscribe` supplies the authenticated client,
+    /// while `RpcCallStream` writes its setup response before the production
+    /// `before_provisional_settle` barrier. The remote handler queues a real
+    /// chunk before that barrier is released; closing then makes the retained
+    /// forwarder lose admission, so the event socket closes without forwarding
+    /// that chunk and the registry/provider return to their exact baselines.
+    #[test]
+    fn v4_r6_daemon_a_real_stream_settle_race_closes_without_forwarder() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let _fixture = crate::exclusive_connector_fixture().await;
+                let near_mesh = connector_mesh().await;
+                let far_mesh = connector_mesh().await;
+                let near = near_mesh
+                    .join(network_config("near-stream-race", "terminal-stream-race"))
+                    .await
+                    .expect("near network joins");
+                let far = far_mesh
+                    .join(network_config("far-stream-race", "terminal-stream-race"))
+                    .await
+                    .expect("far network joins");
+                let mut near_events = near_mesh.events();
+                let mut far_events = far_mesh.events();
+                let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+                near.attach_local(&_local_broker);
+                far.attach_local(&_local_broker);
+                let near_device = near_mesh.device_id();
+                let far_device = far_mesh.device_id();
+                crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+                crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
+                let link = near.install_promoted_peer_over_real_link(&far).await;
+                let peer = link.peer_device_id().to_string();
+
+                let (remote_ready_tx, remote_ready_rx) = tokio::sync::oneshot::channel();
+                let remote_ready = Arc::new(std::sync::Mutex::new(Some(remote_ready_tx)));
+                let _stream_handler = far
+                    .rpc()
+                    .prepare_serve_stream("race-stream", {
+                        let remote_ready = Arc::clone(&remote_ready);
+                        move |_call| {
+                            let remote_ready = Arc::clone(&remote_ready);
+                            async move {
+                                let scope = crate::test_application_scope();
+                                let (tx, rx) = myownmesh_core::resource_mailbox(scope)
+                                    .map_err(|_| "stream fixture mailbox was refused".to_owned())?;
+                                tx.send(myownmesh_core::rpc::RpcStreamItem::Chunk(
+                                    serde_json::json!("must-not-forward"),
+                                ))
+                                .map_err(|_| "stream fixture chunk was refused".to_owned())?;
+                                tx.send(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
+                                    .map_err(|_| "stream fixture end was refused".to_owned())?;
+                                if let Some(ready) = remote_ready
+                                    .lock()
+                                    .expect("the stream-ready witness is not poisoned")
+                                    .take()
+                                {
+                                    ready
+                                        .send(())
+                                        .expect("the stream-ready witness remains observed");
+                                }
+                                Ok(rx)
+                            }
+                        }
+                    })
+                    .expect("the far gateway prepares the streaming handler")
+                    .commit()
+                    .into_result()
+                    .expect("the far gateway installs the streaming handler");
+
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (settle_barrier, settle_entered, settle_release) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let registry = parked_rpc_stream_registry();
+                let registry_baseline = registry
+                    .in_use()
+                    .expect("the isolated streaming registry exposes its baseline");
+                let networks = NetworkRegistry::new();
+                assert!(
+                    networks.insert(near, None).into_refusal().is_none(),
+                    "the near network is reachable by the streaming control registry"
+                );
+                let networks_for_cleanup = networks.clone();
+                let services =
+                    ServiceManager::new(near_mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh: near_mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: Some(registry.clone()),
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: Some(settle_barrier),
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its streaming registry", registry_rx)
+                    .await
+                    .expect("serve publishes the isolated streaming registry");
+
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the streaming control socket path is valid");
+                let event_stream = guarded("event client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (event_reader, mut event_writer) = event_stream.split();
+                let mut event_reader = BufReader::new(event_reader);
+                event_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the event client sends its subscribe");
+                let mut event_ack = String::new();
+                guarded(
+                    "the event subscription is acked",
+                    event_reader.read_line(&mut event_ack),
+                )
+                .await
+                .expect("the event subscription answer arrives");
+                let event_ack: Response =
+                    serde_json::from_str(event_ack.trim()).expect("the event ack is a response");
+                assert!(
+                    event_ack.ok,
+                    "the event subscription succeeds: {:?}",
+                    event_ack.error
+                );
+                let event_data = event_ack.data.expect("the event ack carries data");
+                let client_id: crate::ipc::ClientId = serde_json::from_value(
+                    event_data
+                        .get("client_id")
+                        .cloned()
+                        .expect("the event ack carries the client id"),
+                )
+                .expect("the event client id has its wire shape");
+                let client_capability = event_data
+                    .get("client_capability")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("the event ack carries the client capability")
+                    .to_owned();
+                assert_eq!(clients.residue().clients, 1, "the event client is live");
+
+                let command_stream = guarded("stream command client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (command_reader, mut command_writer) = command_stream.split();
+                let mut command_reader = BufReader::new(command_reader);
+                let request = Request::RpcCallStream {
+                    client_id,
+                    client_capability,
+                    network: "near-stream-race".to_owned(),
+                    peer,
+                    method: "race-stream".to_owned(),
+                    payload: serde_json::Value::Null,
+                };
+                let mut encoded =
+                    serde_json::to_vec(&request).expect("the streaming request encodes");
+                encoded.push(b'\n');
+                command_writer
+                    .write_all(&encoded)
+                    .await
+                    .expect("the command client sends the streaming request");
+
+                let mut setup_line = String::new();
+                guarded(
+                    "the streaming setup response arrives",
+                    command_reader.read_line(&mut setup_line),
+                )
+                .await
+                .expect("the setup response is delivered before provisional settle");
+                let setup: Response = serde_json::from_str(setup_line.trim())
+                    .expect("the streaming setup line is a response");
+                assert!(setup.ok, "the stream setup succeeds: {:?}", setup.error);
+                let request_id = setup
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("request_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .expect("the setup response carries the stream request id");
+                assert!(request_id.starts_with("ipc-stream-"));
+
+                guarded(
+                    "the production provisional-settle barrier arrives",
+                    settle_entered,
+                )
+                .await
+                .expect("the stream setup reaches the exact settle edge");
+                guarded("the remote stream queues its real chunk", remote_ready_rx)
+                    .await
+                    .expect("the remote handler queues the chunk before shutdown");
+                assert_eq!(
+                    clients.residue().clients,
+                    1,
+                    "the exact event client remains filed"
+                );
+                assert_eq!(
+                    clients.residue().live_tasks,
+                    3,
+                    "the two accepted socket tasks and the unsettled forwarder task are filed"
+                );
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("the streaming registry enters closing", clients.closing()).await;
+                settle_release
+                    .send(())
+                    .expect("the provisional-settle barrier is still waiting");
+                guarded("the real streaming control returns", serving)
+                    .await
+                    .expect("the streaming control task did not panic")
+                    .expect("the streaming control returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "the real stream race leaves no registry residue"
+                );
+                assert_eq!(
+                    registry
+                        .in_use()
+                        .expect("the isolated registry remains readable"),
+                    registry_baseline,
+                    "the real stream race releases every isolated registry lease"
+                );
+
+                drop(command_writer);
+                let mut command_tail = Vec::new();
+                guarded(
+                    "the command socket closes after setup",
+                    tokio::io::AsyncReadExt::read_to_end(&mut command_reader, &mut command_tail),
+                )
+                .await
+                .expect("the command socket reaches EOF");
+                drop(event_writer);
+                let mut event_tail = Vec::new();
+                guarded(
+                    "the event socket closes without forwarding a chunk",
+                    tokio::io::AsyncReadExt::read_to_end(&mut event_reader, &mut event_tail),
+                )
+                .await
+                .expect("the event socket reaches EOF");
+                assert!(
+                    !String::from_utf8_lossy(&event_tail).contains("rpc_call_stream_chunk"),
+                    "the queued chunk is not forwarded after Closing: {}",
+                    String::from_utf8_lossy(&event_tail)
+                );
+
+                let _ = networks_for_cleanup.shutdown_all().await;
+                let _ = link.retire().await;
+                drop(far);
+            },
+        );
     }
 
     /// A live `EventsSubscribe` ends with the runtime, and `serve` returns
@@ -3704,105 +4650,116 @@ mod terminal_shutdown_tests {
     /// them first would let the client's own close end the connection, and this
     /// control would then pass against a `serve` that cancelled nothing. End of
     /// file is read afterwards, as the witness that the daemon closed its end.
-    #[tokio::test]
-    async fn v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime() {
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+    #[test]
+    fn v4_r2_daemon_a_live_events_subscriber_ends_with_the_runtime() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
+
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the client sends its subscribe");
+
+                // (1) The ack is the causal barrier: past it the connection is in the
+                // registry and parked in the stream loop.
+                let mut ack = String::new();
+                guarded(
+                    "the subscription is acked",
+                    client_reader.read_line(&mut ack),
+                )
+                .await
+                .expect("the daemon answers the subscribe");
+                let ack: Response =
+                    serde_json::from_str(ack.trim()).expect("the ack is a control response");
+                assert!(ack.ok, "the subscription succeeded: {:?}", ack.error);
+                let residue = clients.residue();
+                assert_eq!(residue.clients, 1, "non-vacuity: one live subscriber");
+                assert_eq!(residue.live_tasks, 1, "carried by one accepted task");
+                assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
+
+                // (2) The drain begins.
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("serve begins closing", clients.closing()).await;
+
+                // (3) And `serve` returns, which it cannot do with an accepted task
+                // still live.
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+
+                // (4) Holding nothing.
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "no client, flow, handler, subscription, pending call or task lease remains"
+                );
+
+                // The socket witness, read only now.
+                drop(client_writer);
+                let mut rest = Vec::new();
+                guarded(
+                    "the client's connection ended",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+                )
+                .await
+                .expect("the client's half reads to end");
             },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                at_events_stream_entry: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
-
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(b"{\"op\":\"events_subscribe\"}\n")
-            .await
-            .expect("the client sends its subscribe");
-
-        // (1) The ack is the causal barrier: past it the connection is in the
-        // registry and parked in the stream loop.
-        let mut ack = String::new();
-        guarded(
-            "the subscription is acked",
-            client_reader.read_line(&mut ack),
-        )
-        .await
-        .expect("the daemon answers the subscribe");
-        let ack: Response =
-            serde_json::from_str(ack.trim()).expect("the ack is a control response");
-        assert!(ack.ok, "the subscription succeeded: {:?}", ack.error);
-        let residue = clients.residue();
-        assert_eq!(residue.clients, 1, "non-vacuity: one live subscriber");
-        assert_eq!(residue.live_tasks, 1, "carried by one accepted task");
-        assert_eq!(residue.lifecycle, crate::ipc::Lifecycle::Running);
-
-        // (2) The drain begins.
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
         );
-        guarded("serve begins closing", clients.closing()).await;
-
-        // (3) And `serve` returns, which it cannot do with an accepted task
-        // still live.
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-
-        // (4) Holding nothing.
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "no client, flow, handler, subscription, pending call or task lease remains"
-        );
-
-        // The socket witness, read only now.
-        drop(client_writer);
-        let mut rest = Vec::new();
-        guarded(
-            "the client's connection ended",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
-        )
-        .await
-        .expect("the client's half reads to end");
     }
 
     /// A padded `EventsSubscribe` holds none of its line's parse capacity once
@@ -3838,143 +4795,154 @@ mod terminal_shutdown_tests {
     ///    registry;
     /// 3. and the connection is still a real one afterwards: the shutdown ends
     ///    it, `serve` returns, and the registry closes holding nothing.
-    #[tokio::test]
+    #[test]
     #[ignore = "reads the test binary's shared resource ledger and must run alone"]
-    async fn v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live() {
-        // Whitespace, so the line is long and the value it decodes to is empty:
-        // `events_subscribe` carries no fields at all, which is the asymmetry a
-        // client would reach for.
-        let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
-        // (1) Non-vacuity, taken from the same function the daemon admits with.
-        let padded_work =
-            myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
-                .expect("the padded line's claim is representable")
-                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
-        assert!(
-            padded_work > 0,
-            "non-vacuity: a padded line reserves parse capacity, so there is \
+    fn v4_r2_daemon_a_padded_events_subscribe_holds_no_parse_capacity_once_live() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                // Whitespace, so the line is long and the value it decodes to is empty:
+                // `events_subscribe` carries no fields at all, which is the asymmetry a
+                // client would reach for.
+                let padded = format!("{}{{\"op\":\"events_subscribe\"}}\n", " ".repeat(4096));
+                // (1) Non-vacuity, taken from the same function the daemon admits with.
+                let padded_work =
+                    myownmesh_core::application_gateway::json_input_work_claim(padded.len() - 1)
+                        .expect("the padded line's claim is representable")
+                        .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+                assert!(
+                    padded_work > 0,
+                    "non-vacuity: a padded line reserves parse capacity, so there is \
              something for the release below to be about"
-        );
+                );
 
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let socket = directory.path().join("private").join("control.sock");
-        let (barrier, live, resume) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let socket = directory.path().join("private").join("control.sock");
+                let (barrier, live, resume) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: None,
-                registry: Some(registry_tx),
-                at_events_stream_entry: Some(barrier),
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: None,
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: Some(barrier),
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
 
-        // The reading to compare against: `serve` is up and listening, and no
-        // connection exists. Taken after the registry is published so the
-        // listener's own acquisitions are already in it.
-        let ledger = crate::test_resource_ledger();
-        let idle = ledger
-            .in_use()
-            .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
+                // The reading to compare against: `serve` is up and listening, and no
+                // connection exists. Taken after the registry is published so the
+                // listener's own acquisitions are already in it.
+                let ledger = crate::test_resource_ledger();
+                let idle = ledger
+                    .in_use()
+                    .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork);
 
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(padded.as_bytes())
-            .await
-            .expect("the client sends its padded subscribe");
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(padded.as_bytes())
+                    .await
+                    .expect("the client sends its padded subscribe");
 
-        // (2) The daemon itself says when the stream is live, from the line
-        // between the ack and the first poll of the loop.
-        guarded("the subscription goes live", live)
-            .await
-            .expect("the connection task reached the stream barrier");
-        let residue = clients.residue();
-        assert_eq!(
-            residue.clients, 1,
-            "non-vacuity: the padded subscribe really is subscribed"
-        );
-        assert_eq!(
-            residue.live_tasks, 1,
-            "and its connection is a live accepted task"
-        );
-        assert_eq!(
-            residue.lifecycle,
-            crate::ipc::Lifecycle::Running,
-            "with nothing shutting down yet"
-        );
-        assert_eq!(
-            ledger
-                .in_use()
-                .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
-            idle,
-            "the padded line's parse capacity is back where it was before this \
+                // (2) The daemon itself says when the stream is live, from the line
+                // between the ack and the first poll of the loop.
+                guarded("the subscription goes live", live)
+                    .await
+                    .expect("the connection task reached the stream barrier");
+                let residue = clients.residue();
+                assert_eq!(
+                    residue.clients, 1,
+                    "non-vacuity: the padded subscribe really is subscribed"
+                );
+                assert_eq!(
+                    residue.live_tasks, 1,
+                    "and its connection is a live accepted task"
+                );
+                assert_eq!(
+                    residue.lifecycle,
+                    crate::ipc::Lifecycle::Running,
+                    "with nothing shutting down yet"
+                );
+                assert_eq!(
+                    ledger
+                        .in_use()
+                        .amount(myownmesh_core::ResourceClass::ParsingOrCpuWork),
+                    idle,
+                    "the padded line's parse capacity is back where it was before this \
              connection existed, while the stream it opened is live -- so the \
              connection kept none of it, and a client that subscribes and never \
              leaves pins none of it"
-        );
+                );
 
-        // (3) And it is a real connection, ended by the runtime rather than by
-        // its client. Both halves are held across `serving` deliberately: a
-        // control that dropped them first would let the client's own close stand
-        // in for the cancellation this asserts, and would pass against a `serve`
-        // that never cancelled anything.
-        resume.send(()).expect("the paused task is still waiting");
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
+                // (3) And it is a real connection, ended by the runtime rather than by
+                // its client. Both halves are held across `serving` deliberately: a
+                // control that dropped them first would let the client's own close stand
+                // in for the cancellation this asserts, and would pass against a `serve`
+                // that never cancelled anything.
+                resume.send(()).expect("the paused task is still waiting");
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                guarded("serve begins closing", clients.closing()).await;
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "and the padded subscriber left nothing behind"
+                );
+                // The socket witness, read only now: the client half was open the whole
+                // time, so end of file here is the daemon having closed its end.
+                drop(client_writer);
+                let mut rest = Vec::new();
+                guarded(
+                    "the client's connection ended",
+                    tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
+                )
+                .await
+                .expect("the client's half reads to end");
+            },
         );
-        guarded("serve begins closing", clients.closing()).await;
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "and the padded subscriber left nothing behind"
-        );
-        // The socket witness, read only now: the client half was open the whole
-        // time, so end of file here is the daemon having closed its end.
-        drop(client_writer);
-        let mut rest = Vec::new();
-        guarded(
-            "the client's connection ended",
-            tokio::io::AsyncReadExt::read_to_end(&mut client_reader, &mut rest),
-        )
-        .await
-        .expect("the client's half reads to end");
     }
 
     /// A shutdown arriving while an `EventsSubscribe` is mid-commit loses
@@ -4008,132 +4976,143 @@ mod terminal_shutdown_tests {
     /// directory itself would exercise the refusal path on Unix hosts where
     /// that directory is group- or other-accessible, leaving the client to wait
     /// for a listener that was correctly never created.
-    #[tokio::test]
-    async fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
-        let directory = tempfile::tempdir().expect("temporary control root");
-        let parent = directory.path().join("private");
-        let socket = parent.join("control.sock");
-        assert!(
-            !parent.exists(),
-            "non-vacuity: production must create and secure the socket parent"
-        );
-        let (barrier, arrived, release) = DispatchBarrier::paired();
-        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
-        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+    #[test]
+    fn a_subscribe_barriered_at_its_commit_loses_to_shutdown_and_leaves_nothing() {
+        crate::services::with_service_cleanup(
+            crate::services::test_cleanup_scope(),
+            |cleanup_port| async move {
+                let directory = tempfile::tempdir().expect("temporary control root");
+                let parent = directory.path().join("private");
+                let socket = parent.join("control.sock");
+                assert!(
+                    !parent.exists(),
+                    "non-vacuity: production must create and secure the socket parent"
+                );
+                let (barrier, arrived, release) = DispatchBarrier::paired();
+                let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+                let supervisor = crate::supervisor::RuntimeSupervisor::new();
 
-        let mesh = test_mesh().await;
-        let networks = NetworkRegistry::new();
-        let services = ServiceManager::new(mesh.clone(), networks.clone());
-        let serving = tokio::spawn(serve_with_hooks(
-            ControlSurface {
-                mesh,
-                registry: networks,
-                services,
-                realtime: RealtimeAdvert {
-                    supported: false,
-                    encodings: Vec::new(),
-                },
-                supervisor: supervisor.clone(),
-            },
-            Some(socket.clone()),
-            ControlHooks {
-                before_events_subscribe_commit: Some(barrier),
-                registry: Some(registry_tx),
-                at_events_stream_entry: None,
-            },
-        ));
-        let clients = guarded("serve publishes its registry", registry_rx)
-            .await
-            .expect("serve publishes the registry it built");
+                let mesh = test_mesh().await;
+                let networks = NetworkRegistry::new();
+                let services =
+                    ServiceManager::new(mesh.clone(), networks.clone(), cleanup_port.clone());
+                let serving = tokio::spawn(serve_with_hooks(
+                    ControlSurface {
+                        mesh,
+                        registry: networks,
+                        services,
+                        realtime: RealtimeAdvert {
+                            supported: false,
+                            encodings: Vec::new(),
+                        },
+                        supervisor: supervisor.clone(),
+                    },
+                    Some(socket.clone()),
+                    ControlHooks {
+                        before_events_subscribe_commit: Some(barrier),
+                        registry: Some(registry_tx),
+                        registry_override: None,
+                        at_events_stream_entry: None,
+                        before_rpc_call: None,
+                        before_begin_closing: None,
+                        before_provisional_settle: None,
+                        before_mfa_response_write: None,
+                    },
+                ));
+                let clients = guarded("serve publishes its registry", registry_rx)
+                    .await
+                    .expect("serve publishes the registry it built");
 
-        // A real client, over the socket `serve` is really listening on.
-        let name = socket
-            .as_path()
-            .to_fs_name::<GenericFilePath>()
-            .expect("the control socket path is a valid fs name");
-        let stream = guarded("client connects", async {
-            loop {
-                // The listener binds inside the spawned `serve`, so the first
-                // connect can lose the race with it. Retrying is not a timing
-                // assumption — the hang guard is what fails if the listener
-                // never appears at all.
-                match LocalSocketStream::connect(name.clone()).await {
-                    Ok(stream) => return stream,
-                    Err(_) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await;
-        let (client_reader, mut client_writer) = stream.split();
-        let mut client_reader = BufReader::new(client_reader);
-        client_writer
-            .write_all(b"{\"op\":\"events_subscribe\"}\n")
-            .await
-            .expect("the client sends its subscribe");
+                // A real client, over the socket `serve` is really listening on.
+                let name = socket
+                    .as_path()
+                    .to_fs_name::<GenericFilePath>()
+                    .expect("the control socket path is a valid fs name");
+                let stream = guarded("client connects", async {
+                    loop {
+                        // The listener binds inside the spawned `serve`, so the first
+                        // connect can lose the race with it. Retrying is not a timing
+                        // assumption — the hang guard is what fails if the listener
+                        // never appears at all.
+                        match LocalSocketStream::connect(name.clone()).await {
+                            Ok(stream) => return stream,
+                            Err(_) => tokio::task::yield_now().await,
+                        }
+                    }
+                })
+                .await;
+                let (client_reader, mut client_writer) = stream.split();
+                let mut client_reader = BufReader::new(client_reader);
+                client_writer
+                    .write_all(b"{\"op\":\"events_subscribe\"}\n")
+                    .await
+                    .expect("the client sends its subscribe");
 
-        // (1) The connection task is parked at the commit, holding an accepted
-        // `TaskAdmission`, with nothing filed in any table.
-        guarded("the subscribe reaches its commit", arrived)
-            .await
-            .expect("the connection task reached the barrier");
-        assert_eq!(
+                // (1) The connection task is parked at the commit, holding an accepted
+                // `TaskAdmission`, with nothing filed in any table.
+                guarded("the subscribe reaches its commit", arrived)
+                    .await
+                    .expect("the connection task reached the barrier");
+                assert_eq!(
             clients.residue(),
             crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Running).with_tasks(1),
             "nothing is filed yet, but the connection carrying the paused              subscribe is itself an accepted task and is counted as one"
         );
 
-        assert!(
-            supervisor.request_shutdown(),
-            "the runtime shutdown is requested exactly once here"
-        );
-        // Observed, not waited out: this resolves on the registry's own signal,
-        // which `begin_closing` publishes from inside `serve`'s terminal path.
-        // Past this line the drain has provably started.
-        guarded("serve begins closing", clients.closing()).await;
+                assert!(
+                    supervisor.request_shutdown(),
+                    "the runtime shutdown is requested exactly once here"
+                );
+                // Observed, not waited out: this resolves on the registry's own signal,
+                // which `begin_closing` publishes from inside `serve`'s terminal path.
+                // Past this line the drain has provably started.
+                guarded("serve begins closing", clients.closing()).await;
 
-        // (2) And `serve` has not returned, because a task it accepted is still
-        // alive.
-        assert!(
-            !serving.is_finished(),
-            "serve returned while a connection task it accepted was still live"
-        );
-        assert_eq!(clients.lifecycle(), crate::ipc::Lifecycle::Closing);
+                // (2) And `serve` has not returned, because a task it accepted is still
+                // alive.
+                assert!(
+                    !serving.is_finished(),
+                    "serve returned while a connection task it accepted was still live"
+                );
+                assert_eq!(clients.lifecycle(), crate::ipc::Lifecycle::Closing);
 
-        // (3) Released, the paused request is answered truthfully.
-        release.send(()).expect("the paused task is still waiting");
-        let mut answer = String::new();
-        guarded(
-            "the client is answered",
-            client_reader.read_line(&mut answer),
-        )
-        .await
-        .expect("the daemon answers on the still-open socket");
-        let answer: Response =
-            serde_json::from_str(answer.trim()).expect("the answer is a control response");
-        assert!(
-            !answer.ok,
-            "a subscription refused by the drain is not reported as one that succeeded"
-        );
-        assert!(
-            answer
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("closing")),
-            "and the client is told why: {:?}",
-            answer.error
-        );
+                // (3) Released, the paused request is answered truthfully.
+                release.send(()).expect("the paused task is still waiting");
+                let mut answer = String::new();
+                guarded(
+                    "the client is answered",
+                    client_reader.read_line(&mut answer),
+                )
+                .await
+                .expect("the daemon answers on the still-open socket");
+                let answer: Response =
+                    serde_json::from_str(answer.trim()).expect("the answer is a control response");
+                assert!(
+                    !answer.ok,
+                    "a subscription refused by the drain is not reported as one that succeeded"
+                );
+                assert!(
+                    answer
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("closing")),
+                    "and the client is told why: {:?}",
+                    answer.error
+                );
 
-        // (4) Only now does `serve` return, and it leaves nothing behind.
-        drop(client_writer);
-        drop(client_reader);
-        guarded("serve returns", serving)
-            .await
-            .expect("the serve task did not panic")
-            .expect("serve returns without error");
-        assert_eq!(
-            clients.residue(),
-            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
-            "no client, flow, handler, subscription, pending call or task lease remains"
+                // (4) Only now does `serve` return, and it leaves nothing behind.
+                drop(client_writer);
+                drop(client_reader);
+                guarded("serve returns", serving)
+                    .await
+                    .expect("the serve task did not panic")
+                    .expect("serve returns without error");
+                assert_eq!(
+                    clients.residue(),
+                    crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+                    "no client, flow, handler, subscription, pending call or task lease remains"
+                );
+            },
         );
     }
 }

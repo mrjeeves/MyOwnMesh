@@ -225,16 +225,15 @@ impl ConnTracer {
 
             // Transport-derived states — sync reads, lock released
             // before we touch the per-peer RwLock below.
-            let (ice_state, pc_state) = {
-                let guard = peer.session.lock();
-                match guard.as_ref() {
-                    Some(s) => (
-                        Some(format!("{:?}", s.ice_connection_state())),
-                        Some(format!("{:?}", s.connection_state())),
-                    ),
-                    None => (None, None),
-                }
-            };
+            let (ice_state, pc_state) = peer
+                .current_worker()
+                .map(|session| {
+                    (
+                        Some(format!("{:?}", session.ice_connection_state())),
+                        Some(format!("{:?}", session.connection_state())),
+                    )
+                })
+                .unwrap_or((None, None));
 
             let (snap, last_recv_age_ms, rtt_ms) = {
                 let data = peer.state.read();

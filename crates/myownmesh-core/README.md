@@ -2,11 +2,13 @@
 
 The mesh runtime. This is the crate embedders depend on.
 
-Pull via git tag. The library crates are not on crates.io yet:
+Pull the exact repository tag selected for the release; replace `vX.Y.Z`
+below with that tag. The library crates are not published by the release
+workflow to crates.io:
 
 ```toml
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.30" }  # Nostr driver
+myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX.Y.Z" }
+myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX.Y.Z" }  # signaling drivers
 ```
 
 See [`../../RELEASE.md`](../../RELEASE.md) for the published-artifact
@@ -15,9 +17,10 @@ catalogue and the path to crates.io.
 ## What's in here
 
 - **Identity:** long-lived ed25519 keypair, base32-lowercase device id.
-- **Roster:** per-network approved-peers file (0600 on Unix).
+- **Semantic authority:** per-network signed `FactGraph` with a canonical durable SQLite store.
+- **Roster:** non-authoritative per-network UI/diagnostic projection (0600 on Unix).
 - **Wire protocol:** `MeshMessage` variants and capability matrix.
-- **Topology:** FullMesh (default), Ring, and Star selectors. Pure functions that are symmetric across peers.
+- **Topology:** FullMesh (default), Ring, and Star selectors. Required edge predicates are symmetric; local preferred and shortcut selections are deterministic without being universally pairwise symmetric.
 - **Transport:** webrtc-rs wrapper. One `PeerSession` per peer, with event queues drained by the engine.
 - **Engine:** `hello` → `auth_response` handshake, ping/pong heartbeat, recovery driven by reliable transport signals, and topology shelving. Recovery uses in-place ICE restart confirmed by inbound traffic, then a clean rebuild on failure.
 - **Channels:** typed pub/sub via `Channel<T>`.
@@ -37,8 +40,9 @@ let rpc  = net.rpc();
 ```
 
 Full surface: `Mesh`, `MeshHandle`, `JoinedNetwork`, `MeshConfig`,
-`NetworkConfig`, `TopologyMode`, `Identity`, `DeviceId`, `Roster`,
-`AuthorizedPeer`, `MeshEvent`, `PeerEvent`, `MeshPhase`,
+`NetworkConfig`, `TopologyMode`, `Identity`, `DeviceId`, and the semantic
+governance API. `Roster` and `AuthorizedPeer` are projection DTOs rather than
+authority-bearing state. Event and application surfaces include `MeshEvent`, `PeerEvent`, `MeshPhase`,
 `DiagEntry`, `CapabilityAdvert`, `ConnectionTier`, `Channel`,
 `ChannelMessage`, `ChannelError`, `Rpc`, `RpcCall`, `RpcResponse`,
 `RpcError`. Helpers: `generate_network_id`, `normalize_network_id`.
@@ -52,8 +56,10 @@ topology, shutdown.
 
 ```
 ~/.myownmesh/
-├── .secrets/identity.json       (0600, ed25519 keypair)
-└── mesh/rosters/{network_id}.json  (0600, per-network approved peers)
+├── .secrets/identity.json          (0600, ed25519 keypair)
+└── mesh/
+    ├── semantic/{slot}-store.sqlite3  (canonical signed semantic state)
+    └── rosters/{network_id}.json      (non-authoritative UI projection)
 ```
 
 Override the root via `MYOWNMESH_HOME=~/.youapp/mesh` so embedders

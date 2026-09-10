@@ -97,7 +97,7 @@ pub(crate) async fn submit(
     state.peers.with_live_session_state(
         &owner,
         state.session_broker.as_ref(),
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         |session, record| {
             let (payload, reply) = handoff
                 .take()
@@ -131,7 +131,7 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
             .with_live_session_state(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, record| record.next_unsent(session),
             )
             .flatten();
@@ -165,7 +165,7 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
         state.peers.with_live_session_state(
             owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, record| record.mark_sent(seq),
         );
         // The copy and the lease that funded it die together, here, once the
@@ -175,7 +175,7 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
 }
 
 /// Settle the frames one inbound acknowledgement covers, **inside the registry
-/// admission fence**.
+/// admission fence** and through the logical-session lender.
 ///
 /// Called from the fence rather than after it because an acknowledgement
 /// admitted for installation A and applied after A was replaced would settle
@@ -198,12 +198,12 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
 /// with the frame, so the dispatch side runs both, together, under its own
 /// fence.
 pub(super) fn admit_inbound_reliable(
-    admitted: &super::peer_registry::AdmittedSessionOperation<'_>,
+    admitted: &super::peer_registry::LogicalSessionOperation,
     msg: &MeshMessage,
 ) {
     if let MeshMessage::ChannelAck { stream, up_to } = msg {
-        admitted.with_session_state(|_session, record| {
-            record.acknowledge(*stream, *up_to);
+        admitted.with_logical_state(|operation| {
+            operation.state().acknowledge(*stream, *up_to);
         });
     }
 }
@@ -271,17 +271,18 @@ pub(super) async fn on_channel_seq_admitted(
     // Gateway acceptance is a resource-backed fan-out: it never blocks on a
     // subscriber and never re-enters the registry, so it is safe under the
     // mutation lock.
-    let Some((outcome, witness)) =
-        dispatch.with_captured_session_state(&state.peers, |session, record| {
-            // Taken here, inside the capture, so a refusal below names the session
-            // that actually refused rather than whichever one holds the device id
-            // by the time the retirement runs.
-            let witness = session.validity_witness();
-            let outcome = record.try_receive(stream, seq, payload, |payload| {
+    let Some(outcome) = dispatch.with_captured_logical_state(&state.peers, |operation| {
+        // Keep the logical funding witness independent of the mutable state
+        // borrow held by `try_receive`; the witness is the retention authority
+        // for this admitted effect and does not select a carrying channel.
+        let validity = operation.validity().clone();
+        let outcome = operation
+            .state()
+            .try_receive(stream, seq, payload, |payload| {
                 state
                     .application_gateway
                     .accept_channel(
-                        session,
+                        &validity,
                         claim,
                         retention,
                         &channel,
@@ -290,9 +291,8 @@ pub(super) async fn on_channel_seq_admitted(
                     )
                     .map(|_accepted| ())
             });
-            (outcome, witness)
-        })
-    else {
+        outcome
+    }) else {
         // Superseded installation, or one holding no live session: the frame
         // moved nothing and reached nobody, so there is nothing to acknowledge
         // either. Acknowledging here would tell the sender a payload had been
@@ -317,16 +317,19 @@ pub(super) async fn on_channel_seq_admitted(
                 }
                 _ => None,
             };
-            // Reached only on the arms that are about to retire, and only after
-            // the witness above has named the session they will retire: this is
-            // the window in which a control can promote a replacement and prove
-            // the identity check refuses to end it. Nothing in a production
-            // build.
+            // Reached only on the arms that are about to retire. The dispatch's
+            // logical operation names the session admitted for this frame, so a
+            // replacement promoted in the interval fails the identity check and
+            // remains untouched.
             if terminal.is_some() {
                 state.reach_exact_retirement_barrier();
             }
             match terminal {
-                Some(reason) if state.peers.retire_exact_session(owner, &witness) => {
+                Some(reason)
+                    if state
+                        .peers
+                        .retire_exact_session(dispatch.logical_reply_operation()) =>
+                {
                     trace!(
                         peer = %super::short_peer(owner.device_id()),
                         channel,

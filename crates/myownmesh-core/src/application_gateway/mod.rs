@@ -17,17 +17,23 @@
 
 mod capabilities;
 mod channels;
+mod flows;
 mod frame;
 mod mailbox;
 mod principal;
 mod rpc;
 
+pub use capabilities::capability_advert_planning_claim;
 pub use frame::json_input_work_claim;
 pub use principal::LocalPrincipalCapability;
 
 pub(crate) use capabilities::{CapabilityReplaceRefusal, LocalCapabilityState};
 pub(crate) use channels::{ChannelSubscriber, GatewayChannelFrame};
-pub(crate) use frame::{structural_json_claim, AdmittedApplicationFrame, DecodedApplicationFrame};
+pub(crate) use flows::{validate_native_application_lane, FundedOpaqueControl, OpaqueControlView};
+pub(crate) use frame::{
+    structural_json_claim, AdmittedApplicationFrame, DecodedApplicationFrame,
+    DecodedApplicationMessage,
+};
 pub(crate) use mailbox::{GatewayAccepted, GatewayDelivery, GatewayMailbox};
 
 use crate::resource::{LeasedMap, LocalApplicationResourceScope, ResourceUnavailable};

@@ -7,7 +7,7 @@ pub mod attempt;
 /// same reason the broker is: reaching this state means holding the session that
 /// owns it, and a public path would be a way to name one without holding it.
 pub(crate) mod peer_session;
-pub mod relay;
+pub(crate) mod signaling;
 // Crate-private: every production caller is inside this crate (the engine's
 // registry fence and the connector), and applications reach a session through
 // the daemon control boundary rather than by naming the type. A public path
@@ -23,20 +23,12 @@ pub(crate) mod session_broker;
 /// Every future authority consumer must compare this witness with the Runtime
 /// Supervisor's current witness before use.
 #[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "Arc 02 links this witness before production capability migration"
-)]
 pub(crate) struct RuntimeIncarnation {
     marker: Arc<RuntimeMarker>,
 }
 
 struct RuntimeMarker;
 
-#[allow(
-    dead_code,
-    reason = "Arc 02 links this witness before production capability migration"
-)]
 impl RuntimeIncarnation {
     pub(crate) fn new() -> Self {
         Self {

@@ -31,6 +31,30 @@ const FIXTURE_JSON_FRAME_BYTES: usize = 8 * 1024;
 /// refuse everything after it; more would be capacity with no nameable holder.
 const FIXTURE_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 
+/// One application owner per libtest worker is the largest concurrent
+/// application workload in the integration fixtures. Each such owner can
+/// retain one RPC dispatcher and one local capability advertisement.
+const FIXTURE_APPLICATIONS_PER_WORKER: u64 = 1;
+
+/// Each fixture worker keeps two live network/application owners (sender and
+/// receiver). This names their local gateway scopes separately from the one
+/// RPC child scope retained by the application workload below.
+const FIXTURE_APPLICATION_SCOPES_PER_WORKER: u64 = 2;
+
+/// The largest encoded capability advert used by the integration fixtures.
+/// The R3 advert is below this exact byte ceiling; its provider charge is
+/// derived by the production gateway planner rather than by a copied formula.
+const FIXTURE_CAPABILITY_ADVERT_BYTES: usize = 128;
+
+/// `mint_attempt` encodes eight random bytes as 13 unpadded base32 characters.
+/// The fixture uses this exact shape to price the promoted channel's owned
+/// correlation allocation through the broker planner.
+const FIXTURE_CHANNEL_CORRELATION: &str = "aaaaaaaaaaaaa";
+
+/// Canonical base32 wire representation of one 32-byte Ed25519 device id.
+/// This is a fixture representation length, not a product capacity selector.
+const FIXTURE_MDNS_DEVICE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 /// Explicit integration-test resource owner.
 ///
 /// These values cover the known in-process multi-device test fixtures. They
@@ -182,10 +206,125 @@ pub fn test_transport() -> Transport {
         // Unconditional because default-feature connectors promote the same
         // sessions as transport-lab connectors. Omitting this exact broker term
         // would make promotion depend on unrelated residual slack.
-        let grant = myownmesh_core::session_reservation_planning_claim()
-            .checked_scale(connectors)
-            .and_then(|sessions| grant.checked_add(sessions))
-            .expect("the fixture session reservation capacity is representable");
+        let grant = myownmesh_core::session_reservation_planning_claim_for_correlation(
+            FIXTURE_CHANNEL_CORRELATION,
+        )
+        .checked_scale(connectors)
+        .and_then(|sessions| grant.checked_add(sessions))
+        .expect("the fixture session reservation capacity is representable");
+        let applications = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATIONS_PER_WORKER)
+            .expect("fixture application concurrency fits u64");
+        let application_scopes = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATION_SCOPES_PER_WORKER)
+            .expect("fixture local application scope concurrency fits u64");
+        let application_scope_claim =
+            myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                .checked_scale(application_scopes)
+                .expect("the fixture application scope capacity is representable");
+        // Each live network/application owner retains one semantic database.
+        // Charge the real default database budget once per owner, then apply
+        // the provider's exact reservation bookkeeping charge before scaling;
+        // scaling the raw storage claim would underfund one reservation record
+        // for every additional owner.
+        let semantic_policy = myownmesh_core::config::SemanticPolicyConfig::default();
+        let semantic_storage_owner_count = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATION_SCOPES_PER_WORKER)
+            .expect("fixture semantic storage owner concurrency fits u64");
+        assert_eq!(
+            semantic_storage_owner_count, application_scopes,
+            "semantic storage is funded for exactly the live application-owner bound"
+        );
+        let semantic_storage_claim = ResourceClaim::single(
+            ResourceClass::StorageBytes,
+            semantic_policy.max_database_bytes,
+        );
+        let semantic_storage_grant =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                semantic_storage_claim,
+            )
+            .expect("the fixture semantic storage reservation is representable")
+            .checked_scale(semantic_storage_owner_count)
+            .expect("the fixture semantic storage owner capacity is representable");
+        assert_eq!(
+            semantic_storage_grant.amount(ResourceClass::StorageBytes),
+            semantic_policy
+                .max_database_bytes
+                .checked_mul(semantic_storage_owner_count)
+                .expect("the fixture semantic storage byte capacity is representable"),
+            "semantic storage bytes equal the default policy per live owner"
+        );
+        assert_eq!(
+            semantic_storage_grant.amount(ResourceClass::OpaqueDependencyResidual),
+            semantic_storage_owner_count,
+            "semantic storage includes one reservation record per live owner"
+        );
+        let grant = grant
+            .checked_add(semantic_storage_grant)
+            .expect("the fixture semantic storage grant combines without overflow");
+        // Rpc::attach retains one dispatcher per application and advertise
+        // retains one encoded local advert. Both terms are provider-planned by
+        // the production constructors, and both are bounded by the explicit
+        // one-application-per-worker fixture workload above.
+        let application_claim = myownmesh_core::rpc_dispatcher_attachment_planning_claim()
+            .expect("the fixture RPC dispatcher claim is representable")
+            .checked_scale(applications)
+            .and_then(|claim| {
+                myownmesh_core::capability_advert_planning_claim(FIXTURE_CAPABILITY_ADVERT_BYTES)
+                    .expect("the fixture capability advert claim is representable")
+                    .checked_scale(applications)
+                    .and_then(|adverts| claim.checked_add(adverts))
+            })
+            .expect("the fixture application retention capacity is representable");
+        let grant = grant
+            .checked_add(application_scope_claim)
+            .and_then(|grant| grant.checked_add(application_claim))
+            .expect("the fixture application retention grant is representable");
+        // One bounded two-peer mDNS fixture retains one known-peer outbound
+        // endpoint, one unknown-peer inbound endpoint, and one inbound sender
+        // identity buffer. Price each exact production plan, including the
+        // finite provider's reservation bookkeeping, and scale only by the
+        // existing test-worker concurrency.
+        let mdns_limits = myownmesh_signaling::mdns::driver::MdnsLimits::default();
+        let mdns_outbound = myownmesh_core::mdns_connection_planning_claim(
+            Some(FIXTURE_MDNS_DEVICE_ID),
+            mdns_limits.outbound_queue_capacity,
+        )
+        .expect("the exact mDNS outbound plan is available");
+        let mdns_inbound = myownmesh_core::mdns_connection_planning_claim(
+            None,
+            mdns_limits.outbound_queue_capacity,
+        )
+        .expect("the exact mDNS inbound plan is available");
+        let mdns_identity =
+            myownmesh_core::mdns_connection_identity_planning_claim(FIXTURE_MDNS_DEVICE_ID)
+                .expect("the exact mDNS identity plan is available");
+        let mdns_connection_pair = mdns_outbound
+            .checked_add(mdns_inbound)
+            .and_then(|pair| pair.checked_add(mdns_identity))
+            .and_then(|pair| pair.checked_scale(mesh_scopes))
+            .expect("the bounded mDNS connection-pair workload is representable");
+        let grant = grant
+            .checked_add(mdns_connection_pair)
+            .expect("the fixture mDNS connection grant is representable");
+        // The transport-lab mDNS workload has two live network owners per
+        // test worker. Fund each owner's four startup reservations from the
+        // same policy/backend planners used by attachment, independently of
+        // the TCP pair above. No startup term is borrowed from connector slack.
+        #[cfg(feature = "transport-lab")]
+        let grant = {
+            let startup =
+                myownmesh_core::engine::transport_lab::mdns_startup_planning_claim_for_lab(
+                    &myownmesh_core::config::MdnsPolicyConfig::default(),
+                )
+                .expect("the configured mDNS startup reservations are representable");
+            let startup = startup
+                .checked_scale(application_scopes)
+                .expect("the two-owner mDNS startup workload is representable");
+            grant
+                .checked_add(startup)
+                .expect("the fixture mDNS startup grant combines without overflow")
+        };
         ResourceProviderPort::new(FiniteResourceProvider::new(grant))
             .expect("the fixture provider accounts for its process scope")
     });

@@ -1,10 +1,12 @@
 //! Named application channels: the subscriber queues and the gateway
 //! operations that install, retire, and deliver into them.
 
+#[cfg(test)]
+use crate::resource::measure_serialized_mailbox_item;
 use crate::resource::{
     FundedArc, FundedWeak, LeasedMap, LeasedQueue, ResourceClaim, ResourceClass, ResourceLease,
 };
-use crate::runtime::session_broker::SessionCapability;
+use crate::runtime::peer_session::LogicalSessionValidityWitness;
 
 use super::{ApplicationGateway, GatewayAccepted, GatewayDelivery, GatewayMailbox, GatewayRefusal};
 
@@ -104,7 +106,60 @@ impl Drop for GatewayChannel {
     }
 }
 
+/// Retire weak subscription nodes whose funded strong owner has already gone
+/// away, then return the exact number of candidates that can receive.  The
+/// count feeds the scratch reservation below, so stale nodes must not make a
+/// live route fail for capacity it cannot use.
+fn retain_live_subscriber_count(channel: &mut GatewayChannel) -> usize {
+    channel
+        .subscribers
+        .retain(|subscriber| subscriber.strong_count() != 0);
+    channel.subscribers.iter().count()
+}
+
 impl ApplicationGateway {
+    /// Submit one locally-originated channel frame through the engine's
+    /// owner-bound transport command port.
+    ///
+    /// The gateway owns the application operation; the engine still owns the
+    /// signaling/transport implementation. Keeping that distinction explicit
+    /// prevents a public channel handle from manufacturing a worker, peer
+    /// session, or signaling authority of its own.
+    pub(crate) async fn send_channel_frame(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<()> {
+        state.send_channel_frame(peer, channel, payload).await
+    }
+
+    /// Submit one locally-originated reliable channel frame through the same
+    /// typed gateway boundary. Retention and acknowledgement remain owned by
+    /// the exact live session selected by the engine.
+    pub(crate) async fn send_channel_reliable(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<()> {
+        state.send_channel_reliable(peer, channel, payload).await
+    }
+
+    /// Submit a best-effort fan-out through the engine's per-owner transport
+    /// selection. The returned count is a send-success count, not a delivery
+    /// guarantee.
+    pub(crate) async fn broadcast_channel_frame(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<usize> {
+        state.broadcast_channel_frame(channel, payload).await
+    }
+
     pub(crate) fn subscribe_channel(
         &self,
         name: &str,
@@ -214,7 +269,7 @@ impl ApplicationGateway {
 
     pub(crate) fn accept_channel(
         &self,
-        session: &SessionCapability,
+        validity: &LogicalSessionValidityWitness,
         claim: ResourceClaim,
         parse_retention: ResourceLease,
         name: &str,
@@ -224,7 +279,7 @@ impl ApplicationGateway {
         let mut registry = self.channels.lock();
         let candidate_count = registry
             .get_mut(name)
-            .map_or(0, |channel| channel.subscribers.iter().count());
+            .map_or(0, retain_live_subscriber_count);
         if candidate_count == 0 {
             return Err(GatewayRefusal::NoReceiver);
         }
@@ -257,7 +312,7 @@ impl ApplicationGateway {
             (ResourceClass::OpaqueDependencyResidual, 2),
         ])
         .map_err(|_| GatewayRefusal::Malformed)?;
-        let _scratch = session
+        let _scratch = validity
             .reserve_retained(scratch_claim)
             .map_err(GatewayRefusal::Pressure)?;
         let subscribers = {
@@ -280,13 +335,13 @@ impl ApplicationGateway {
         let mut original_payload = Some(payload);
         let mut prepared = Vec::with_capacity(candidate_count);
         for (index, subscriber) in subscribers.iter().enumerate() {
-            let retention = session.reserve_retained(entry_claim).map_err(|error| {
+            let retention = validity.reserve_retained(entry_claim).map_err(|error| {
                 for subscriber in &subscribers {
                     subscriber.note_pressure();
                 }
                 GatewayRefusal::Pressure(error)
             })?;
-            let node = session.reserve_retained(node_claim).map_err(|error| {
+            let node = validity.reserve_retained(node_claim).map_err(|error| {
                 for subscriber in &subscribers {
                     subscriber.note_pressure();
                 }
@@ -487,8 +542,9 @@ mod tests {
     #[test]
     fn v4_r5_core_f1_one_subscriber_cannot_retain_two_decoded_graphs_under_one_residual() {
         let payload = serde_json::Value::String("decoded-result".to_owned());
-        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
-            .expect("the payload claim is measurable");
+        let payload_claim = measure_serialized_mailbox_item::<serde_json::Value>(&payload)
+            .expect("the payload claim is measurable")
+            .into_claim();
         let retention = channel_delivery_claim(payload_claim, "")
             .expect("the per-delivery claim is representable");
         assert_eq!(
@@ -580,8 +636,9 @@ mod tests {
         .expect("an admitted subscriber allocation may be shared");
 
         let payload = serde_json::Value::String("held-a".to_owned());
-        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
-            .expect("the payload claim is measurable");
+        let payload_claim = measure_serialized_mailbox_item::<serde_json::Value>(&payload)
+            .expect("the payload claim is measurable")
+            .into_claim();
         let retention = channel_delivery_claim(payload_claim, "peer")
             .expect("the delivery claim is representable");
         let node = GatewayMailbox::<GatewayChannelFrame>::node_claim()
@@ -660,6 +717,39 @@ mod tests {
             provider.in_use(),
             baseline,
             "and everything it was charged for comes back when it leaves"
+        );
+    }
+
+    /// A dropped subscription can leave a weak node until the route is next
+    /// inspected.  That node has no receiver and must not consume scratch
+    /// reservation or make a live route report pressure for an unreachable
+    /// candidate.
+    #[test]
+    fn stale_subscription_nodes_are_pruned_before_candidate_counting() {
+        let (_provider, gateway) = gateway_fixture();
+        let subscriber = gateway
+            .subscribe_channel("stale")
+            .expect("the control grant funds one subscription");
+        drop(subscriber);
+
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("stale"),
+            1,
+            "the deliberately stale weak node is present before route inspection"
+        );
+        let candidates = {
+            let mut registry = gateway.channels.lock();
+            retain_live_subscriber_count(
+                registry
+                    .get_mut("stale")
+                    .expect("the channel remains while its stale node is queued"),
+            )
+        };
+        assert_eq!(candidates, 0);
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("stale"),
+            0,
+            "pruning removes the unreachable node before any scratch claim"
         );
     }
 

@@ -26,20 +26,146 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{Arc, Condvar, Mutex};
+
 use anyhow::{anyhow, Context, Result};
 
 use crate::control_client::{ControlClient, Request};
+
+#[cfg(test)]
+pub(crate) struct TerminalObservationWitness {
+    state: Mutex<TerminalObservationState>,
+    condvar: Condvar,
+}
+
+#[cfg(test)]
+struct TerminalObservationState {
+    started: bool,
+    released: bool,
+    terminal: bool,
+}
+
+#[cfg(test)]
+impl TerminalObservationWitness {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(TerminalObservationState {
+                started: false,
+                released: false,
+                terminal: false,
+            }),
+            condvar: Condvar::new(),
+        })
+    }
+
+    fn observe_terminal(&self) {
+        let mut state = self.state.lock().expect("terminal witness lock");
+        state.started = true;
+        self.condvar.notify_all();
+        while !state.released {
+            state = self
+                .condvar
+                .wait(state)
+                .expect("terminal witness release wait");
+        }
+        state.terminal = true;
+        self.condvar.notify_all();
+    }
+
+    pub(crate) fn wait_until_started(&self) {
+        let mut state = self.state.lock().expect("terminal witness lock");
+        while !state.started {
+            state = self
+                .condvar
+                .wait(state)
+                .expect("terminal witness start wait");
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().expect("terminal witness lock");
+        state.released = true;
+        self.condvar.notify_all();
+    }
+
+    pub(crate) fn wait_until_terminal(&self) {
+        let mut state = self.state.lock().expect("terminal witness lock");
+        while !state.terminal {
+            state = self
+                .condvar
+                .wait(state)
+                .expect("terminal witness terminal wait");
+        }
+    }
+}
 
 /// Owned wrapper around a spawned `myownmesh serve` child. The GUI
 /// holds this in its global app state; dropping it (process exit,
 /// or explicit teardown) kills the child.
 pub struct DaemonChild {
     child: Option<Child>,
+    #[cfg(test)]
+    terminal_witness: Option<Arc<TerminalObservationWitness>>,
 }
 
 impl DaemonChild {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            #[cfg(test)]
+            terminal_witness: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            child: None,
+            terminal_witness: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_terminal_witness(witness: Arc<TerminalObservationWitness>) -> Self {
+        Self {
+            child: None,
+            terminal_witness: Some(witness),
+        }
+    }
+
+    /// Observe this exact GUI-owned daemon process reaching terminal state.
+    ///
+    /// Consuming the wrapper transfers the process handle into the blocking
+    /// wait, so the fallback `Drop` path cannot kill it or leave it detached.
+    pub async fn wait_for_exit(mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || child.wait().context("wait for daemon exit"))
+            .await
+            .context("observe daemon process")??;
+        Ok(())
+    }
+
+    /// Terminate and reap a late startup child after the GUI has entered
+    /// Closing. The startup task owns the exact handle, so no detached child
+    /// can survive an Exit race.
+    pub async fn terminate_and_wait(mut self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(witness) = self.terminal_witness.take() {
+            witness.observe_terminal();
+        }
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            let _ = child.kill();
+            child.wait().context("reap terminated daemon")
+        })
+        .await
+        .context("terminate daemon process")??;
+        Ok(())
     }
 }
 
@@ -65,6 +191,23 @@ impl Drop for DaemonChild {
 /// readiness).
 pub async fn probe(client: &ControlClient) -> bool {
     client.request(&Request::Status).await.is_ok()
+}
+
+/// Observe the old externally-owned daemon listener becoming unavailable.
+///
+/// An externally-managed service is never killed by the GUI. Reset/factory
+/// operations tell that daemon to exit, so the listener itself is the only
+/// identity available here; we wait conservatively until the endpoint rejects
+/// a connection before relaunching the GUI. There is intentionally no correctness
+/// deadline: returning early could reconnect to the old instance or to a
+/// service-manager restart without observing the terminal gap.
+pub async fn wait_for_listener_terminal(client: &ControlClient) -> Result<()> {
+    loop {
+        if !client.listener_reachable().await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Find the `myownmesh` binary using the documented search order.

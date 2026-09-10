@@ -182,7 +182,11 @@ where
     /// [`crate::JoinedNetwork::channel`] instead — this is the
     /// raw constructor for advanced callers that hold the
     /// engine state directly (e.g. integration tests).
-    pub fn new(name: String, network: Arc<NetworkState>) -> Self {
+    pub(crate) fn new(name: String, network: Arc<NetworkState>) -> Self {
+        Self::new_inner(name, network)
+    }
+
+    fn new_inner(name: String, network: Arc<NetworkState>) -> Self {
         Self {
             name: Arc::new(name),
             network,
@@ -201,7 +205,8 @@ where
     pub async fn send_to(&self, peer: &str, body: &T) -> Result<(), ChannelError> {
         let payload = serde_json::to_value(body)?;
         self.network
-            .send_channel_frame(peer, &self.name, payload)
+            .application_gateway
+            .send_channel_frame(&self.network, peer, &self.name, payload)
             .await
             .map_err(|e| match e {
                 crate::error::Error::Network(msg) if msg.contains("not found") => {
@@ -232,7 +237,8 @@ where
     pub async fn send_to_acked(&self, peer: &str, body: &T) -> Result<(), ChannelError> {
         let payload = serde_json::to_value(body)?;
         self.network
-            .send_channel_reliable(peer, &self.name, payload)
+            .application_gateway
+            .send_channel_reliable(&self.network, peer, &self.name, payload)
             .await
             .map_err(|e| match e {
                 crate::error::Error::ResourceMailboxAdmission(
@@ -257,7 +263,8 @@ where
     pub async fn broadcast(&self, body: &T) -> Result<usize, ChannelError> {
         let payload = serde_json::to_value(body)?;
         self.network
-            .broadcast_channel_frame(&self.name, payload)
+            .application_gateway
+            .broadcast_channel_frame(&self.network, &self.name, payload)
             .await
             .map_err(|error| match error {
                 crate::error::Error::ResourceMailboxAdmission(

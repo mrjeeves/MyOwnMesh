@@ -238,31 +238,28 @@ foreach ($item in $selected) {
         "data-only" {
             Invoke-MeasuredTest -Label $item -Environment @{
                 MYOWNMESH_ARC03_OBSERVE_RAW = 1
-            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03h_generic_realtime_without_provider_allocates_no_codec_tracks" -Ignored
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03h_data_only_and_generic_realtime_without_flows_allocate_no_media_lines" -Ignored
         }
         "h264" {
-            Invoke-MeasuredTest -Label $item -Environment @{
-                MYOWNMESH_ARC03_OBSERVE_RAW = 1
-            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::loopback_video_lane_carries_h264_samples"
+            Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::v4_arc03_guarded_video_reordered_unit_transfers_exact_output_claim"
         }
         "opus" {
-            Invoke-MeasuredTest -Label $item -Environment @{
-                MYOWNMESH_ARC03_OBSERVE_RAW = 1
-            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::tests::loopback_audio_lane_carries_opus_frames"
+            Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --lib" -TestName "transport::webrtc::session_flow::tests::v4_macro1_a_an_encoding_names_a_family_not_a_payload_type"
         }
         "reconnect" {
-            Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --test reconnect_in_place" -TestName "in_place_reconnect_does_not_announce_a_leave"
+            Invoke-MeasuredTest -Label $item -CargoTargetArguments "-p myownmesh-core --features transport-lab --test reconnect_in_place" -TestName "in_place_reconnect_does_not_announce_a_leave"
         }
         "multi-peer" {
             Invoke-MeasuredTest -Label $item -Environment @{
                 SILENT_SCALE_SPOKES = $MultiPeerCount
-            } -CargoTargetArguments "-p myownmesh-core --test silent_area_scale" -TestName "silent_area_soak" -Ignored
+            } -CargoTargetArguments "-p myownmesh-core --features transport-lab --test silent_area_scale" -TestName "silent_area_soak" -Ignored
         }
         "multi-mesh" {
             Invoke-MeasuredTest -Label $item -Environment @{
                 MYOWNMESH_ARC03_OBSERVE_MESHES = $MultiMeshCount
                 MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH = $CandidatesPerMesh
-            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "runtime::attempt::tests::v4_arc03f_measure_multi_mesh_connector_scopes_without_selecting_a_budget" -Ignored
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
+            } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "runtime::attempt::tests::v4_arc03_mesh_scopes_share_one_grant_and_creation_does_not_multiply_it"
         }
         "close-success" {
             Invoke-MeasuredTest -Label $item -Environment @{
