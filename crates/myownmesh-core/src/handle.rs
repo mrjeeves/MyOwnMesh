@@ -478,6 +478,7 @@ pub struct JoinedNetwork {
     lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
 fn peer_registry_key(device_id: &str) -> &str {
     crate::signing::pubkey_part(device_id)
 }
