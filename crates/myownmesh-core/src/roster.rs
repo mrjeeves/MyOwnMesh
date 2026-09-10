@@ -451,21 +451,31 @@ where
 fn roster_store(root: Option<&Path>, create: bool) -> Result<DirectoryCapability> {
     let path = match root {
         Some(root) => root.to_path_buf(),
-        None => crate::dirs::rosters_dir()?,
+        None => crate::dirs::data_dir()?,
     };
-    let root_cap = DirectoryCapability::open_path(&path, create).map_err(|error| {
+    open_roster_store(&path, root.is_none(), create).map_err(|error| {
         Error::Roster(format!(
             "open roster capability at {}: {error}",
             path.display()
         ))
-    })?;
-    if root.is_some() {
-        root_cap
-            .open_dir("rosters", create)
-            .map_err(|error| Error::Roster(format!("open keyed rosters capability: {error}")))
+    })
+}
+
+/// Only the application/instance root is caller-selected. All managed
+/// components stay relative to retained no-follow capabilities. Keep the raw
+/// I/O result so deletion can distinguish missing storage from refusal.
+fn open_roster_store(
+    selected_root: &Path,
+    append_mesh: bool,
+    create: bool,
+) -> std::io::Result<DirectoryCapability> {
+    let root = DirectoryCapability::open_selected_root(selected_root, create)?;
+    let parent = if append_mesh {
+        root.open_dir("mesh", create)?
     } else {
-        Ok(root_cap)
-    }
+        root
+    };
+    parent.open_dir("rosters", create)
 }
 
 fn roster_io(error: std::io::Error, action: &str) -> Error {
@@ -1211,8 +1221,8 @@ pub fn save(roster: &Roster) -> Result<()> {
 /// lingering on disk. Idempotent: missing files are fine.
 pub fn delete(network_id: &str) -> Result<()> {
     let network_id = canonical_network_id(network_id)?;
-    let store_path = crate::dirs::rosters_dir()?;
-    let store = match DirectoryCapability::open_path(&store_path, false) {
+    let store_path = crate::dirs::data_dir()?;
+    let store = match open_roster_store(&store_path, true, false) {
         Ok(store) => store,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(roster_io(error, "open roster store capability")),
@@ -1597,7 +1607,12 @@ mod tests {
             approved_at: changed.authorized_devices[0].approved_at,
         })
         .expect("new row");
-        let directory_cap = DirectoryCapability::open_path(&directory, false).expect("directory");
+        let directory_cap = DirectoryCapability::open_selected_root(root.path(), false)
+            .expect("selected root")
+            .open_dir("rosters", false)
+            .expect("rosters")
+            .open_dir("net-recovery", false)
+            .expect("directory");
         let transaction_cap = directory_cap
             .open_dir(".txn", true)
             .expect("transaction directory");
@@ -1625,6 +1640,86 @@ mod tests {
         assert_eq!(loaded.authorized_devices[0].label, "old");
         assert_eq!(std::fs::read(&target).expect("recovered row"), old);
         assert!(!directory.join(".txn").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_root_alias_preserves_keyed_roster_and_default_layout() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().expect("roster selection sandbox");
+        let parent = sandbox.path().join("physical");
+        let alias = sandbox.path().join("alias");
+        std::fs::create_dir(&parent).unwrap();
+        symlink(&parent, &alias).unwrap();
+        let selected = alias.join("instance");
+        let mut roster = empty_for_at(Some(&selected), "net-selected");
+        add_peer_in(&mut roster, "peer-a", "A");
+        let keys = ["peer-a".to_string()].into_iter().collect();
+        save_affected(&roster, &keys).expect("selected-root keyed save");
+        let loaded = load_at(Some(&selected), "net-selected").expect("keyed reopen");
+        assert_eq!(loaded.authorized_devices.len(), 1);
+        assert!(parent
+            .join("instance/rosters/net-selected/peer-a.json")
+            .is_file());
+
+        // Exercise the exact default-layout helper without changing the
+        // process-global MYOWNMESH_HOME used by concurrent tests.
+        let selected_default = alias.join("default-home");
+        assert_eq!(
+            open_roster_store(&selected_default, true, false)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!parent.join("default-home").exists());
+        let default_store = open_roster_store(&selected_default, true, true).unwrap();
+        default_store
+            .write_new("marker", b"default-layout", 0o600)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(parent.join("default-home/mesh/rosters/marker")).unwrap(),
+            b"default-layout"
+        );
+        assert!(!parent.join("default-home/rosters").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_root_never_resolves_managed_mesh_or_rosters_links() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().expect("roster selection sandbox");
+        let selected = sandbox.path().join("state");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+
+        let mesh = selected.join("mesh");
+        symlink(&outside, &mesh).unwrap();
+        for create in [false, true] {
+            assert!(open_roster_store(&selected, true, create).is_err());
+        }
+        assert!(!outside.join("rosters").exists());
+        std::fs::remove_file(&mesh).unwrap();
+        std::fs::create_dir(&mesh).unwrap();
+        symlink(&outside, mesh.join("rosters")).unwrap();
+        for create in [false, true] {
+            assert!(open_roster_store(&selected, true, create).is_err());
+        }
+
+        symlink(&outside, selected.join("rosters")).unwrap();
+        let mut roster = empty_for_at(Some(&selected), "net-outside");
+        add_peer_in(&mut roster, "peer-a", "A");
+        let keys = ["peer-a".to_string()].into_iter().collect();
+        assert!(save_affected(&roster, &keys).is_err());
+        assert!(!outside.join("net-outside").exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
     }
 
     #[cfg(unix)]
@@ -1676,7 +1771,8 @@ mod tests {
 
         // The capability is the synchronization boundary. The path is
         // deliberately swapped only after both descriptors are acquired.
-        let store = DirectoryCapability::open_path(root.path(), false).expect("root handle");
+        let store =
+            DirectoryCapability::open_selected_root(root.path(), false).expect("root handle");
         let store = store.open_dir("rosters", false).expect("rosters handle");
         let network_cap = store.open_dir("net-swap", false).expect("network handle");
         let moved = root.path().join("rosters").join("net-swap-old");
@@ -1717,7 +1813,8 @@ mod tests {
         let network = root.path().join("rosters").join("net-swap");
         std::fs::create_dir_all(&network).expect("network directory");
 
-        let store = DirectoryCapability::open_path(root.path(), false).expect("root handle");
+        let store =
+            DirectoryCapability::open_selected_root(root.path(), false).expect("root handle");
         let store = store.open_dir("rosters", false).expect("rosters handle");
         let network_cap = store.open_dir("net-swap", false).expect("network handle");
         let moved = root.path().join("rosters").join("net-swap-old");

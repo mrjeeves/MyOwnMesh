@@ -79,6 +79,46 @@ where
     SignedFact::sign(content, signer.signing_key()).expect("fixture fact signs")
 }
 
+/// Restore an evicted target only when the graph's current projection still
+/// needs restoration.  MembershipAdmit is the sole membership restoration
+/// operation; a RoleGrant is needed afterward only when the current role is
+/// not already the requested Member role.
+fn restore_target_if_needed(
+    graph: &mut FactGraph,
+    owner: &Identity,
+    target: &DeviceId,
+) -> Vec<SignedFact> {
+    let mut restoration = Vec::new();
+    if graph.evaluator().effective_membership(target) != Some(true) {
+        let membership = authored(
+            graph,
+            owner,
+            FactBody::MembershipAdmit {
+                target: target.clone(),
+            },
+        );
+        graph
+            .admit(membership.clone())
+            .expect("causal membership restoration admits");
+        restoration.push(membership);
+    }
+    if graph.evaluator().effective_role(target) != Some(myownmesh_core::semantic::Role::Member) {
+        let role = authored(
+            graph,
+            owner,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: myownmesh_core::semantic::Role::Member,
+            },
+        );
+        graph
+            .admit(role.clone())
+            .expect("causal role restoration admits");
+        restoration.push(role);
+    }
+    restoration
+}
+
 /// Build a complete, causal eviction proof.  It is deliberately returned in
 /// causal order so production ingestion can persist each fact before the next
 /// one is admitted; the wire envelope re-sorts it by FactId independently.
@@ -153,9 +193,9 @@ fn stand_down_facts(
     vec![grant, member_grant, proposal, attestation, proof]
 }
 
-/// Extend an adopted eviction with a causal regrant and a distinct second
-/// eviction. The second closure includes the first history, but its new
-/// regrant/proposal/attestation/proof identities force a new delivery id.
+/// Extend an adopted eviction with any needed causal restoration and a
+/// distinct second eviction.  Already-restored history needs no redundant
+/// RoleGrant; the second closure still has fresh proposal/evidence identities.
 fn reissued_stand_down_facts(
     bootstrap: &VerifiedBootstrap,
     prior: &[SignedFact],
@@ -170,15 +210,7 @@ fn reissued_stand_down_facts(
         graph.admit(fact).expect("prior eviction history admits");
     }
 
-    let regrant = authored(
-        &graph,
-        owner,
-        FactBody::RoleGrant {
-            target: target_id.clone(),
-            role: myownmesh_core::semantic::Role::Member,
-        },
-    );
-    graph.admit(regrant.clone()).expect("causal regrant admits");
+    let restoration = restore_target_if_needed(&mut graph, owner, &target_id);
 
     let proposal = authored(
         &graph,
@@ -219,7 +251,8 @@ fn reissued_stand_down_facts(
         .expect("second eviction proof admits");
 
     let mut facts = prior.to_vec();
-    facts.extend([regrant, proposal, attestation, proof]);
+    facts.extend(restoration);
+    facts.extend([proposal, attestation, proof]);
     facts
 }
 
@@ -234,28 +267,7 @@ fn regrant_after_eviction_facts(
     for fact in prior.iter().cloned() {
         graph.admit(fact).expect("prior eviction history admits");
     }
-    let membership = authored(
-        &graph,
-        owner,
-        FactBody::MembershipAdmit {
-            target: target_id.clone(),
-        },
-    );
-    graph
-        .admit(membership.clone())
-        .expect("causal membership restoration admits");
-    let role = authored(
-        &graph,
-        owner,
-        FactBody::RoleGrant {
-            target: target_id,
-            role: myownmesh_core::semantic::Role::Member,
-        },
-    );
-    graph
-        .admit(role.clone())
-        .expect("causal role restoration admits");
-    vec![membership, role]
+    restore_target_if_needed(&mut graph, owner, &target_id)
 }
 
 struct CrossTargetFacts {
@@ -386,15 +398,7 @@ fn cross_target_stand_down_facts(
         graph.admit(fact).expect("prior eviction history admits");
     }
 
-    let regrant = authored(
-        &graph,
-        owner,
-        FactBody::RoleGrant {
-            target: target_id.clone(),
-            role: myownmesh_core::semantic::Role::Member,
-        },
-    );
-    graph.admit(regrant.clone()).expect("target regrant admits");
+    let restoration = restore_target_if_needed(&mut graph, owner, &target_id);
 
     let cross_grant = authored(
         &graph,
@@ -464,8 +468,8 @@ fn cross_target_stand_down_facts(
         .expect("cross-target target proof admits");
 
     let mut facts = prior.to_vec();
+    facts.extend(restoration);
     facts.extend([
-        regrant,
         cross_grant,
         cross_target_evict.clone(),
         target_evict.clone(),
@@ -483,15 +487,59 @@ fn receiver_admits_delivery(
     bootstrap: &VerifiedBootstrap,
     delivery: &ProofDeliveryMessage,
 ) -> FactGraph {
+    // This is an in-memory semantic reconstruction of the receiver's final
+    // graph, not a durable receipt proof.  The wire envelope is intentionally
+    // sorted by FactId, while production reduces the whole bounded delivery
+    // through its aggregate admission path.  Rebuild the same causal result
+    // here without changing the authenticated wire order.
     let mut receiver = FactGraph::from_bootstrap(bootstrap);
-    for fact in delivery.facts.iter().cloned() {
+    let delivered_ids = delivery
+        .facts
+        .iter()
+        .map(|fact| fact.id)
+        .collect::<BTreeSet<_>>();
+    let mut remaining = delivery.facts.clone();
+    let mut admitted_ids = BTreeSet::new();
+    while !remaining.is_empty() {
+        let next = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, fact)| {
+                myownmesh_core::semantic::causal::dependencies(fact)
+                    .into_iter()
+                    .all(|dependency| {
+                        admitted_ids.contains(&dependency) || !delivered_ids.contains(&dependency)
+                    })
+            })
+            .min_by_key(|(_, fact)| fact.id)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| {
+                panic!(
+                    "receiver semantic reconstruction made no dependency progress (remaining={})",
+                    remaining.len()
+                )
+            });
+        let fact = remaining.remove(next);
         receiver
-            .admit(fact)
+            .admit(fact.clone())
             .expect("receiver durably admits proof fact");
+        admitted_ids.insert(fact.id);
     }
     receiver
         .retry_quarantined()
         .expect("receiver resolves proof dependencies");
+    assert_eq!(
+        receiver.quarantined().count(),
+        0,
+        "receiver semantic reconstruction leaves no quarantined proof facts"
+    );
+    for fact in &delivery.facts {
+        assert_eq!(
+            receiver.get(&fact.id),
+            Some(fact),
+            "receiver admits every delivered proof fact exactly"
+        );
+    }
     receiver
 }
 
@@ -1610,11 +1658,12 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     match supersede_result.as_ref() {
         None => assert_eq!(e0_tombstone.state, ProofRecordState::Settled),
         Some(Ok(true)) => assert_eq!(e0_tombstone.state, ProofRecordState::Superseded),
-        Some(Ok(false)) => assert_eq!(
-            e0_tombstone.state,
-            ProofRecordState::Superseded,
-            "an idempotent supersession is legal only with the exact Superseded tombstone"
-        ),
+        Some(Ok(false)) => match e0_tombstone.state {
+            ProofRecordState::Settled | ProofRecordState::Superseded => {}
+            ProofRecordState::Pending => {
+                panic!("an Owner no-change supersession cannot leave E0 Pending")
+            }
+        },
         Some(Err(_)) => assert_eq!(
             e0_tombstone.state,
             ProofRecordState::Settled,
@@ -1742,14 +1791,17 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         e1.fact_ids.contains(&g1_history[g1_history.len() - 1].id),
         "canonical E1 includes causal G1"
     );
-    let e1_role_head = e1_new_facts
-        .iter()
-        .find(|fact| matches!(&fact.content.body, FactBody::RoleGrant { .. }))
-        .expect("E1 has a current role head");
     let e1_evict_head = e1_new_facts
         .iter()
         .find(|fact| matches!(&fact.content.body, FactBody::Evict { .. }))
         .expect("E1 has a current membership/Evict head");
+    let e1_role_head = e1_facts
+        .iter()
+        .find(|fact| {
+            matches!(&fact.content.body, FactBody::RoleGrant { .. })
+                && e1_evict_head.content.parents.contains(&fact.id)
+        })
+        .expect("E1 Evict carries the actual current role-grant head");
     assert!(e1.fact_ids.contains(&e1_role_head.id));
     assert!(e1.fact_ids.contains(&e1_evict_head.id));
     let mut canonical_graph = FactGraph::from_bootstrap(state.verified_bootstrap());

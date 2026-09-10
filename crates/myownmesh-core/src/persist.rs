@@ -22,6 +22,75 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+impl DirectoryCapability {
+    /// Acquire an explicitly caller-selected storage root. Only its parent
+    /// namespace is selection input: Unix may resolve aliases there (for
+    /// example an OS temporary-directory ancestor). Never pass a managed
+    /// descendant such as mesh/rosters, a network id, or a transaction here.
+    /// The root leaf and all subsequently opened children remain no-follow.
+    /// After selection, even parent traversal uses the strict handle walker;
+    /// no pathname fallback follows a refused leaf or managed descendant.
+    pub(crate) fn open_selected_root(path: &Path, create: bool) -> std::io::Result<Self> {
+        if !path.is_absolute()
+            || path.file_name().is_none()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "selected storage root requires an absolute non-root path without traversal",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            // Validate the whole selected spelling before opening or creating
+            // anything, including a missing parent suffix.
+            for part in path.components() {
+                if let std::path::Component::Normal(name) = part {
+                    let name = name.to_str().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "directory component is not UTF-8",
+                        )
+                    })?;
+                    component(name)?;
+                }
+            }
+            let mut anchor = path.parent().expect("validated non-root absolute path");
+            loop {
+                match std::fs::symlink_metadata(anchor) {
+                    Ok(_) => break,
+                    Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                        anchor = anchor.parent().ok_or(error)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Canonicalize only the existing selected PARENT anchor, never
+            // the root leaf. A dangling alias fails here rather than falling
+            // back to creation through its target.
+            let selected_parent = std::fs::canonicalize(anchor)?;
+            let mut current = Self::open_path(&selected_parent, false)?;
+            let suffix = path
+                .strip_prefix(anchor)
+                .expect("anchor is a lexical ancestor");
+            for part in suffix.components() {
+                if let std::path::Component::Normal(name) = part {
+                    current = current.open_dir(name.to_str().expect("validated UTF-8"), create)?;
+                }
+            }
+            Ok(current)
+        }
+        #[cfg(not(unix))]
+        {
+            // Preserve the Windows reparse/relative-handle implementation
+            // and the unsupported-platform refusal without a new fallback.
+            Self::open_path(path, create)
+        }
+    }
+}
+
 /// A retained directory capability used by keyed roster persistence.
 ///
 /// The capability is deliberately narrower than a general filesystem API:
@@ -1547,11 +1616,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn selected_root_accepts_ancestor_alias_but_refuses_leaf_and_retains_handle() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().expect("selection sandbox");
+        let base = std::fs::canonicalize(sandbox.path()).expect("test namespace anchor");
+        let parent = base.join("physical-parent");
+        let alias = base.join("selected-parent");
+        let outside = base.join("outside");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+        symlink(&parent, &alias).unwrap();
+        let selected = alias.join("state");
+        assert_eq!(
+            DirectoryCapability::open_selected_root(&selected, false)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+        );
+        assert!(!parent.join("state").exists());
+        let held = DirectoryCapability::open_selected_root(&selected, true).expect("selected root");
+        held.write_new("before", b"original", 0o600).unwrap();
+        assert!(
+            DirectoryCapability::open_path(&selected, false).is_err(),
+            "the original strict walker must still reject the alias"
+        );
+        assert_eq!(
+            std::fs::read(parent.join("state/before")).unwrap(),
+            b"original"
+        );
+
+        // A symlink at the root leaf is never part of parent selection.
+        symlink(&outside, parent.join("linked-root")).unwrap();
+        for create in [false, true] {
+            assert!(
+                DirectoryCapability::open_selected_root(&alias.join("linked-root"), create,)
+                    .is_err()
+            );
+        }
+
+        // Swapping the selected ancestor after acquisition cannot redirect
+        // any operation on the already-retained directory.
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&outside, &alias).unwrap();
+        held.write_new("after-parent-swap", b"original", 0o600)
+            .unwrap();
+        assert!(parent.join("state/after-parent-swap").is_file());
+        assert!(!outside.join("state").exists());
+
+        // Nor can replacing the acquired root itself redirect that handle.
+        let original = parent.join("state-moved");
+        std::fs::rename(parent.join("state"), &original).unwrap();
+        symlink(&outside, parent.join("state")).unwrap();
+        assert!(DirectoryCapability::open_selected_root(&parent.join("state"), true).is_err());
+        held.write_new("after-root-swap", b"original", 0o600)
+            .unwrap();
+        assert!(original.join("after-root-swap").is_file());
+        assert!(!outside.join("after-root-swap").exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_root_missing_suffix_and_traversal_preserve_creation_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let sandbox = tempfile::tempdir().expect("selection sandbox");
+        let base = std::fs::canonicalize(sandbox.path()).unwrap();
+        let selected = base.join("missing-parent/also-missing/state");
+        assert_eq!(
+            DirectoryCapability::open_selected_root(&selected, false)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+        );
+        assert!(!base.join("missing-parent").exists());
+        let held = DirectoryCapability::open_selected_root(&selected, true).unwrap();
+        held.write_new("entry", b"owned", 0o600).unwrap();
+        assert_eq!(std::fs::read(selected.join("entry")).unwrap(), b"owned");
+
+        for invalid in [
+            PathBuf::from("relative-state/missing"),
+            base.join("must-not-create/../state"),
+        ] {
+            assert_eq!(
+                DirectoryCapability::open_selected_root(&invalid, true)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput,
+            );
+        }
+        assert!(!base.join("must-not-create").exists());
+        assert_eq!(
+            DirectoryCapability::open_selected_root(Path::new("/"), true)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput,
+        );
+
+        // A dangling selected parent alias is an error, not permission to
+        // create the absent target as an alternative namespace.
+        let absent = base.join("absent-target");
+        let dangling = base.join("dangling-parent");
+        symlink(&absent, &dangling).unwrap();
+        assert!(DirectoryCapability::open_selected_root(&dangling.join("state"), true).is_err());
+        assert!(!absent.exists());
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn directory_capability_rejects_zero_entry_bound_before_growth() {
         let root = tempfile::tempdir().expect("capability root");
-        let capability = DirectoryCapability::open_path(root.path(), true).expect("root handle");
+        let capability =
+            DirectoryCapability::open_selected_root(root.path(), true).expect("root handle");
         capability
             .write_new("entry.json", b"{}", 0o600)
             .expect("entry");
@@ -1596,7 +1783,8 @@ mod tests {
         let pipe = root.path().join("entry.pipe");
         let pipe_name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).expect("pipe name");
         assert_eq!(unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) }, 0);
-        let capability = DirectoryCapability::open_path(root.path(), false).expect("root handle");
+        let capability =
+            DirectoryCapability::open_selected_root(root.path(), false).expect("root handle");
         let result = capability.read_file("entry.pipe", 128);
         assert!(
             result.is_err(),

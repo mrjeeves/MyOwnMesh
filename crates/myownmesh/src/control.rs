@@ -4549,7 +4549,6 @@ mod terminal_shutdown_tests {
                 let request_id = setup
                     .data
                     .as_ref()
-                    .and_then(|data| data.get("rpc_stream_started"))
                     .and_then(|data| data.get("request_id"))
                     .and_then(serde_json::Value::as_str)
                     .expect("the setup response carries the stream request id");

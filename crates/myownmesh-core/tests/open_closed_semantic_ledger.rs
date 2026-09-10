@@ -133,6 +133,40 @@ fn db_footprint(root: &Path) -> DbFootprint {
     footprint
 }
 
+fn record_closed_footprint(
+    observed: DbFootprint,
+    active_baseline: DbFootprint,
+    closed_baseline: &mut Option<DbFootprint>,
+    label: &str,
+) {
+    if let Some(expected) = *closed_baseline {
+        assert_eq!(observed, expected, "{label}: closed footprint changed");
+        return;
+    }
+
+    assert_eq!(
+        observed.main_bytes, active_baseline.main_bytes,
+        "{label}: closed lifecycle changed persistent SQLite bytes"
+    );
+    assert_eq!(
+        observed.wal_bytes, 0,
+        "{label}: closed lifecycle left a WAL file"
+    );
+    assert_eq!(
+        observed.shm_bytes, 0,
+        "{label}: closed lifecycle left a SHM file"
+    );
+    assert_eq!(
+        observed.journal_bytes, 0,
+        "{label}: closed lifecycle left a rollback journal"
+    );
+    assert_eq!(
+        observed.temporary_bytes, 0,
+        "{label}: closed lifecycle left a temporary store"
+    );
+    *closed_baseline = Some(observed);
+}
+
 fn connector_policy() -> WebRtcConnectorCapablePolicy {
     let requested = ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
         (
@@ -177,6 +211,13 @@ async fn reopen_after_lifecycle(
     let started = Instant::now();
     let network = mesh.join(config.clone()).await?;
     let elapsed_ns = started.elapsed().as_nanos();
+    let identity_before_checkpoint = network.semantic_state_identity()?;
+    network.compact_semantic_state()?;
+    assert_eq!(
+        network.semantic_state_identity()?,
+        identity_before_checkpoint,
+        "{label}: checkpoint changed public semantic identity"
+    );
     assert_eq!(
         network.semantic_state_identity()?,
         identity,
@@ -229,10 +270,22 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         .semantic_state_identity()?;
     assert_eq!(open_identity.admitted_fact_count(), 0);
     assert_eq!(open_identity.unresolved_fact_count(), 0);
-    let open_baseline = db_footprint(home.path());
+    open.as_ref()
+        .expect("Open network exists for canonical checkpoint")
+        .compact_semantic_state()?;
+    assert_eq!(
+        open.as_ref()
+            .expect("Open network exists after canonical checkpoint")
+            .semantic_state_identity()?,
+        open_identity,
+        "Open checkpoint changed semantic identity"
+    );
+    let open_active_baseline = db_footprint(home.path());
+    let mut open_closed_baseline = None;
 
-    // Open has an empty/bootstrap SQLite baseline owned by the joined network;
-    // reconnect and awaited leave are topology operations, not ledger writes.
+    // Open has an empty/bootstrap SQLite baseline owned by the joined network.
+    // The explicit checkpoint makes the physical WAL layout canonical; leave
+    // may close SQLite and checkpoint it without changing semantic history.
     for cycle in 0..3 {
         let current = open
             .take()
@@ -246,14 +299,15 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         );
         assert_eq!(
             db_footprint(home.path()),
-            open_baseline,
+            open_active_baseline,
             "Open cycle {cycle}: presence changed durable store footprint"
         );
         current.leave().await?;
-        assert_eq!(
+        record_closed_footprint(
             db_footprint(home.path()),
-            open_baseline,
-            "Open cycle {cycle}: leave changed durable store footprint"
+            open_active_baseline,
+            &mut open_closed_baseline,
+            &format!("Open cycle {cycle}"),
         );
         if cycle != 2 {
             open = Some(
@@ -261,7 +315,7 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
                     &mesh,
                     &open_config,
                     open_identity.clone(),
-                    open_baseline,
+                    open_active_baseline,
                     "Open",
                 )
                 .await?,
@@ -281,7 +335,20 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         .semantic_state_identity()?;
     assert_eq!(closed_initial.admitted_fact_count(), 0);
     assert_eq!(closed_initial.unresolved_fact_count(), 0);
-    let closed_baseline = db_footprint(home.path());
+    closed
+        .as_ref()
+        .expect("Closed network exists for canonical checkpoint")
+        .compact_semantic_state()?;
+    assert_eq!(
+        closed
+            .as_ref()
+            .expect("Closed network exists after canonical checkpoint")
+            .semantic_state_identity()?,
+        closed_initial,
+        "Closed baseline checkpoint changed semantic identity"
+    );
+    let closed_active_baseline = db_footprint(home.path());
+    let mut closed_shutdown_baseline = None;
 
     // Closed takes the same topology path before any semantic admission.  The
     // baseline includes the existing Open store and the Closed store, so a
@@ -299,21 +366,22 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         );
         assert_eq!(
             db_footprint(home.path()),
-            closed_baseline,
+            closed_active_baseline,
             "Closed pre-ledger cycle {cycle}: topology changed durable store footprint"
         );
         current.leave().await?;
-        assert_eq!(
+        record_closed_footprint(
             db_footprint(home.path()),
-            closed_baseline,
-            "Closed pre-ledger cycle {cycle}: leave changed durable store footprint"
+            closed_active_baseline,
+            &mut closed_shutdown_baseline,
+            &format!("Closed pre-ledger cycle {cycle}"),
         );
         closed = Some(
             reopen_after_lifecycle(
                 &mesh,
                 &closed_config,
                 closed_initial.clone(),
-                closed_baseline,
+                closed_active_baseline,
                 "Closed pre-ledger",
             )
             .await?,
@@ -343,6 +411,12 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         "Closed admission must create one canonical fact"
     );
     let first_fact = exported_fact(&closed, first_id).await?;
+    closed.compact_semantic_state()?;
+    assert_eq!(
+        closed.semantic_state_identity()?,
+        after_first,
+        "Closed first-admission checkpoint changed semantic identity"
+    );
     let first_ledger = db_footprint(home.path());
 
     // The exact signed fact re-enters through the public verified import path.
@@ -386,6 +460,12 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
             .expect("Closed fact count fits u64"),
         "Closed second admission must create one additional canonical fact"
     );
+    closed.compact_semantic_state()?;
+    assert_eq!(
+        closed.semantic_state_identity()?,
+        closed_final,
+        "Closed final-admission checkpoint changed semantic identity"
+    );
     let closed_final_ledger = db_footprint(home.path());
     assert_ne!(
         closed_final, closed_initial,
@@ -405,6 +485,27 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
         "Closed post-ledger reconnect changed durable store footprint"
     );
     closed.leave().await?;
+    let closed_final_shutdown_baseline = db_footprint(home.path());
+    assert_eq!(
+        closed_final_shutdown_baseline.main_bytes, closed_final_ledger.main_bytes,
+        "Closed post-ledger shutdown changed persistent SQLite bytes"
+    );
+    assert_eq!(
+        closed_final_shutdown_baseline.wal_bytes, 0,
+        "Closed post-ledger shutdown left a WAL file"
+    );
+    assert_eq!(
+        closed_final_shutdown_baseline.shm_bytes, 0,
+        "Closed post-ledger shutdown left a SHM file"
+    );
+    assert_eq!(
+        closed_final_shutdown_baseline.journal_bytes, 0,
+        "Closed post-ledger shutdown left a rollback journal"
+    );
+    assert_eq!(
+        closed_final_shutdown_baseline.temporary_bytes, 0,
+        "Closed post-ledger shutdown left a temporary store"
+    );
     closed = reopen_after_lifecycle(
         &mesh,
         &closed_config,
@@ -416,11 +517,11 @@ async fn open_presence_is_empty_while_closed_ledger_survives_exact_lifecycle(
     closed.leave().await?;
     assert_eq!(
         db_footprint(home.path()),
-        closed_final_ledger,
-        "Closed final shutdown changed durable store footprint"
+        closed_final_shutdown_baseline,
+        "Closed final shutdown footprint changed"
     );
     println!(
-        "open_closed_semantic_ledger admissions first_ns={first_elapsed_ns} replay_ns={replay_elapsed_ns} second_ns={second_elapsed_ns} baseline={closed_baseline:?} first={first_ledger:?} final={closed_final_ledger:?}"
+        "open_closed_semantic_ledger admissions first_ns={first_elapsed_ns} replay_ns={replay_elapsed_ns} second_ns={second_elapsed_ns} active_baseline={closed_active_baseline:?} first={first_ledger:?} final={closed_final_ledger:?} closed_shutdown={closed_final_shutdown_baseline:?}"
     );
     Ok(())
 }

@@ -242,7 +242,22 @@ macro_rules! noop_inbound_and_correlation {
 }
 
 impl DeliveryProvider for AccountingProvider {
-    noop_inbound_and_correlation!();
+    fn reserve_inbound_frame(
+        &self,
+        _frame_bytes: usize,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_attempt_correlation(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
     fn reserve_admission_source(
         &self,
         _attempt: &str,

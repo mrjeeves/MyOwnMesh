@@ -672,10 +672,16 @@ async fn relay_emits_leave_when_member_disconnects() {
 
     let leave = parse(&next_text(&mut sub).await);
     assert_eq!(leave[0], "EVENT");
+    let signed_leave: myownmesh_signaling::nostr::event::NostrEvent =
+        serde_json::from_value(leave[2].clone()).expect("relay leave is a typed Nostr event");
+    assert!(signed_leave.verify(), "relay leave signature verifies");
+    assert_eq!(signed_leave.kind, 21077);
     let content: Value =
         serde_json::from_str(leave[2]["content"].as_str().expect("content is a string")).unwrap();
     assert_eq!(content["kind"], "leave");
     assert_eq!(content["peer_id"], "devA");
+    assert_eq!(content["from"], "devA");
+    assert_eq!(content["to"], "leaveroom");
 
     server
         .stop_and_wait()
@@ -756,8 +762,19 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let saw_leave = tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(ev) = in_rx_b.recv().await {
-            if matches!(ev, NostrInbound::PeerLeft { device_id, .. } if device_id == "device-aaa") {
-                return true;
+            if let NostrInbound::PeerLeft {
+                device_id,
+                attribution,
+            } = ev
+            {
+                if device_id == "device-aaa" {
+                    assert_eq!(
+                        attribution,
+                        myownmesh_signaling::CarrierAttribution::SenderClaimed,
+                        "relay departure remains a sender-claimed reachability hint"
+                    );
+                    return true;
+                }
             }
         }
         false

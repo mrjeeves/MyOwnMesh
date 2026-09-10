@@ -454,15 +454,14 @@ async fn closed_pair_case() {
             alice_chan.send_to(bob_id.public_id(), &"must not cross".to_string()),
         )
         .await?;
-        // The current send path filters unadmitted direct owners before
-        // lending, then routes over only usable canonical sessions. This
-        // two-node FullMesh has none before the grant: the precise refusal is
-        // NoRoute, not the direct lender's later no-live-session error. Do not
-        // accept pressure, an unknown write outcome, or arbitrary failure.
+        // Authentication alone does not admit a Closed application session.
+        // Before the canonical grant, the direct-session check refuses the
+        // send without an application relay fallback. Do not accept pressure,
+        // an unknown write outcome, or arbitrary failure.
         require(
             matches!(&refusal, Err(myownmesh_core::ChannelError::Transport(message))
-                if message == "network: routed frame refused: topology returned no usable next hop"),
-            &format!("pre-grant send lacked exact Closed no-route refusal: {refusal:?}"),
+                if message == "network: application peer has no authenticated direct WebRTC session"),
+            &format!("pre-grant send lacked exact Closed direct-session refusal: {refusal:?}"),
         )?;
         stage = "closed.pregrant.no_subscriber_delivery";
         require(

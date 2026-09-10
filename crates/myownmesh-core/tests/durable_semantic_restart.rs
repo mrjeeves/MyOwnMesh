@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::governance;
@@ -20,8 +20,8 @@ use myownmesh_core::engine::transport_lab::{
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::content::AuthorityUse;
 use myownmesh_core::semantic::{
-    DeviceId, FactBody, FactContent, FactDomain, Role, SemanticFactPageRequest,
-    SemanticRecentFactsRequest, SignedFact,
+    DeviceId, FactBody, FactContent, FactDomain, FactGraph, Role, SemanticError,
+    SemanticFactPageRequest, SemanticRecentFactsRequest, SignedFact,
 };
 use myownmesh_core::{
     ConnectorCallbackPolicy, FiniteResourceProvider, ResourceClaim, ResourceClass,
@@ -207,28 +207,6 @@ fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
     }
 }
 
-fn signed_role_grant(
-    context: myownmesh_core::semantic::MeshContextId,
-    signer: &Identity,
-    target: DeviceId,
-    parents: Vec<myownmesh_core::semantic::FactId>,
-) -> SignedFact {
-    SignedFact::sign(
-        FactContent::new(
-            FactDomain::Governance,
-            context,
-            FactBody::RoleGrant {
-                target,
-                role: myownmesh_core::semantic::Role::Member,
-            },
-            DeviceId::from_canonical_str(signer.public_id()).expect("signer id"),
-            parents,
-        ),
-        signer.signing_key(),
-    )
-    .expect("signed role grant")
-}
-
 fn signed_role_grant_with_authority(
     context: myownmesh_core::semantic::MeshContextId,
     signer: &Identity,
@@ -250,10 +228,125 @@ fn signed_role_grant_with_authority(
     SignedFact::sign(content, signer.signing_key()).expect("signed role grant")
 }
 
+fn authored_fact_with_support<I>(
+    graph: &FactGraph,
+    signer: &Identity,
+    body: FactBody,
+    support: I,
+) -> SignedFact
+where
+    I: IntoIterator<Item = myownmesh_core::semantic::FactId>,
+{
+    let author = DeviceId::from_canonical_str(signer.public_id()).expect("signer id");
+    let witness = graph.authoring_witness(&body, &author);
+    let content = FactContent::from_authoring_witness(graph, body, &witness, support);
+    SignedFact::sign(content, signer.signing_key()).expect("signed witnessed fact")
+}
+
+const CLOSED_RESTART_CHILD_SELECTOR: &str =
+    "closed_network_restart_restores_the_committed_semantic_graph";
+const SHUTDOWN_FENCES_CHILD_SELECTOR: &str =
+    "shutdown_fences_stale_state_before_same_slot_reopen_and_append";
+const CLOSED_RESTART_CHILD_SELECTOR_ENV: &str = "MYOWNMESH_DURABLE_RESTART_CHILD_SELECTOR";
+const CLOSED_RESTART_CHILD_HOME_ENV: &str = "MYOWNMESH_DURABLE_RESTART_CHILD_HOME";
+const CLOSED_RESTART_CHILD_COMPLETED: &str = "durable-restart-child-completed";
+
+fn durable_child_home(selector: &str) -> Option<std::path::PathBuf> {
+    let selected = std::env::var_os(CLOSED_RESTART_CHILD_SELECTOR_ENV)?;
+    assert_eq!(
+        selected,
+        std::ffi::OsStr::new(selector),
+        "wrong durable restart child selector"
+    );
+    let home = std::path::PathBuf::from(
+        std::env::var_os(CLOSED_RESTART_CHILD_HOME_ENV).expect("durable restart child home"),
+    );
+    assert!(
+        home.is_absolute() && home.is_dir(),
+        "durable restart child home must exist and be absolute"
+    );
+    assert_eq!(
+        std::env::var_os("MYOWNMESH_HOME"),
+        Some(home.clone().into_os_string())
+    );
+    Some(home)
+}
+
+async fn run_durable_child(selector: &str, home_path: &Path) -> myownmesh_core::Result<()> {
+    let _home = ScopedMeshHome::new(home_path);
+    match selector {
+        CLOSED_RESTART_CHILD_SELECTOR => run_closed_network_restart(home_path).await?,
+        SHUTDOWN_FENCES_CHILD_SELECTOR => run_shutdown_fences_body().await,
+        _ => panic!("unknown durable restart child selector: {selector}"),
+    }
+    fs::write(
+        home_path.join(CLOSED_RESTART_CHILD_COMPLETED),
+        selector.as_bytes(),
+    )
+    .expect("durable restart child completion marker");
+    Ok(())
+}
+
+async fn run_exact_durable_child(selector: &str) -> myownmesh_core::Result<()> {
+    let home = tempfile::tempdir().expect("isolated durable restart home");
+    let home_path = home.path().to_path_buf();
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("durable restart test executable"),
+    );
+    command
+        .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+        .env("MYOWNMESH_HOME", &home_path)
+        .env(CLOSED_RESTART_CHILD_SELECTOR_ENV, selector)
+        .env(CLOSED_RESTART_CHILD_HOME_ENV, &home_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .expect("spawn exact isolated durable restart");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = match tokio::time::timeout_at(deadline.into(), child.wait()).await {
+        Ok(status) => status.expect("reap durable restart child"),
+        Err(_) => {
+            let killed = child.start_kill();
+            let reaped = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+            panic!("durable restart child deadline expired; kill={killed:?}, reap={reaped:?}");
+        }
+    };
+    assert!(
+        Instant::now() <= deadline,
+        "durable restart child completed after deadline"
+    );
+    assert!(
+        status.success(),
+        "isolated durable restart failed: {status}"
+    );
+    assert_eq!(
+        fs::read(home_path.join(CLOSED_RESTART_CHILD_COMPLETED))
+            .expect("durable restart child completed, not zero selected tests"),
+        selector.as_bytes(),
+    );
+    Ok(())
+}
+
 #[tokio::test]
-async fn closed_network_restart_restores_the_committed_semantic_graph() {
-    let home = TempDir::new().expect("mesh home");
-    let _home = ScopedMeshHome::new(home.path());
+async fn closed_network_restart_restores_the_committed_semantic_graph() -> myownmesh_core::Result<()>
+{
+    if let Some(home_path) = durable_child_home(CLOSED_RESTART_CHILD_SELECTOR) {
+        run_durable_child(CLOSED_RESTART_CHILD_SELECTOR, &home_path).await?;
+        return Ok(());
+    }
+    run_exact_durable_child(CLOSED_RESTART_CHILD_SELECTOR).await?;
+    Ok(())
+}
+
+async fn run_closed_network_restart(home_path: &Path) -> myownmesh_core::Result<()> {
     let identity = Arc::new(Identity::ephemeral());
     let config = closed_config("r1-restart", "r1-wire-network");
     let target = Identity::ephemeral();
@@ -274,7 +367,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         .semantic_state_identity()
         .expect("read initial semantic identity");
     let context = initial_identity.context_id();
-    let pre_admission_footprint = durable_footprint(home.path());
+    let pre_admission_footprint = durable_footprint(home_path);
     let admission_started = Instant::now();
     let fact_id = network
         .propose_role_grant(target.public_id(), Role::Member, None)
@@ -284,7 +377,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
     let admitted_identity = network
         .semantic_state_identity()
         .expect("read admitted semantic identity");
-    let admitted_footprint = durable_footprint(home.path());
+    let admitted_footprint = durable_footprint(home_path);
     assert_ne!(
         admitted_identity, initial_identity,
         "the Closed admission changes the exact semantic identity"
@@ -344,7 +437,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         .compact_semantic_state()
         .expect("compact semantic snapshot");
     let checkpoint_ms = elapsed_millis(checkpoint_started);
-    let compacted_footprint = durable_footprint(home.path());
+    let compacted_footprint = durable_footprint(home_path);
     assert_eq!(
         network
             .semantic_state_identity()
@@ -366,7 +459,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         "duplicate admission is an exact semantic no-op"
     );
     assert_eq!(
-        durable_footprint(home.path()),
+        durable_footprint(home_path),
         compacted_footprint,
         "duplicate admission causes no durable DB/WAL/SHM/journal churn"
     );
@@ -395,7 +488,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         "restart restores the exact admitted graph through NetworkState"
     );
     assert_eq!(
-        durable_footprint(home.path()),
+        durable_footprint(home_path),
         compacted_footprint,
         "restart preserves the complete DB/WAL/SHM/journal footprint"
     );
@@ -434,6 +527,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
             },
         })
     );
+    Ok(())
 }
 
 #[tokio::test]
@@ -453,38 +547,48 @@ async fn quarantine_unrelated_commit_restart_then_parent_settles_exact_custody()
     )
     .await
     .expect("create Closed network");
-    let context = state.mesh_context_id();
-    let unrelated_fact = signed_role_grant(
-        context,
+    let mut signing_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
+    let unrelated_fact = authored_fact_with_support(
+        &signing_graph,
         identity.as_ref(),
-        DeviceId::from_canonical_str(unrelated.public_id()).expect("unrelated target id"),
+        FactBody::RoleGrant {
+            target: DeviceId::from_canonical_str(unrelated.public_id())
+                .expect("unrelated target id"),
+            role: Role::Member,
+        },
         Vec::new(),
     );
-    let root_device = DeviceId::from_canonical_str(identity.public_id()).expect("root id");
+    signing_graph
+        .admit(unrelated_fact.clone())
+        .expect("unrelated fact is a valid graph predecessor");
     let target_device = DeviceId::from_canonical_str(target.public_id()).expect("target id");
-    let mut parent_authority_uses = vec![
-        AuthorityUse {
-            subject: root_device,
-            predecessors: vec![unrelated_fact.id],
-        },
-        AuthorityUse {
-            subject: target_device.clone(),
-            predecessors: Vec::new(),
-        },
-    ];
-    parent_authority_uses.sort_by(|left, right| left.subject.cmp(&right.subject));
-    let parent = signed_role_grant_with_authority(
-        context,
+    let parent = authored_fact_with_support(
+        &signing_graph,
         identity.as_ref(),
-        target_device,
-        vec![unrelated_fact.id],
-        parent_authority_uses,
+        FactBody::MembershipAdmit {
+            target: target_device.clone(),
+        },
+        Vec::new(),
     );
-    let unresolved = signed_role_grant(
-        context,
+    signing_graph
+        .admit(parent.clone())
+        .expect("membership parent is a valid graph predecessor");
+    let unresolved = authored_fact_with_support(
+        &signing_graph,
         identity.as_ref(),
-        DeviceId::from_canonical_str(target.public_id()).expect("target id"),
-        vec![parent.id],
+        FactBody::RoleGrant {
+            target: target_device,
+            role: Role::Member,
+        },
+        [parent.id],
+    );
+    signing_graph
+        .admit(unresolved.clone())
+        .expect("positive F2 is admitted by the witnessed local graph");
+    assert_eq!(
+        signing_graph.get(&unresolved.id),
+        Some(&unresolved),
+        "positive F2 is present in the completed local signing graph"
     );
 
     ingest_semantic_fact(&state, unresolved).await;
@@ -532,7 +636,6 @@ async fn quarantine_unrelated_commit_restart_then_parent_settles_exact_custody()
 async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress() {
     let root = TempDir::new().expect("instance root");
     let identity = Arc::new(Identity::ephemeral());
-    let outsider = Identity::ephemeral();
     let config = closed_config("r1-rejected-quarantine", "r1-rejected-wire");
     let parent_target = Identity::ephemeral();
     let unrelated = Identity::ephemeral();
@@ -546,39 +649,55 @@ async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress(
     )
     .await
     .expect("create Closed network");
-    let context = state.mesh_context_id();
-    let unrelated_fact = signed_role_grant(
-        context,
+    let mut signing_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
+    let unrelated_fact = authored_fact_with_support(
+        &signing_graph,
         identity.as_ref(),
-        DeviceId::from_canonical_str(unrelated.public_id()).expect("unrelated target id"),
+        FactBody::RoleGrant {
+            target: DeviceId::from_canonical_str(unrelated.public_id())
+                .expect("unrelated target id"),
+            role: Role::Member,
+        },
         Vec::new(),
     );
-    let root_device = DeviceId::from_canonical_str(identity.public_id()).expect("root id");
+    signing_graph
+        .admit(unrelated_fact.clone())
+        .expect("unrelated fact is a valid graph predecessor");
     let target_device = DeviceId::from_canonical_str(parent_target.public_id()).expect("target id");
-    let mut parent_authority_uses = vec![
+    let parent = authored_fact_with_support(
+        &signing_graph,
+        identity.as_ref(),
+        FactBody::MembershipAdmit {
+            target: target_device.clone(),
+        },
+        Vec::new(),
+    );
+    signing_graph
+        .admit(parent.clone())
+        .expect("membership parent is a valid graph predecessor");
+    let mut rejected_authority_uses = vec![
         AuthorityUse {
-            subject: root_device,
-            predecessors: vec![unrelated_fact.id],
+            subject: DeviceId::from_canonical_str(identity.public_id()).expect("root id"),
+            predecessors: Vec::new(),
         },
         AuthorityUse {
-            subject: target_device.clone(),
+            subject: DeviceId::from_canonical_str(parent_target.public_id()).expect("target id"),
             predecessors: Vec::new(),
         },
     ];
-    parent_authority_uses.sort_by(|left, right| left.subject.cmp(&right.subject));
-    let parent = signed_role_grant_with_authority(
-        context,
+    rejected_authority_uses.sort_by(|left, right| left.subject.cmp(&right.subject));
+    let rejected = signed_role_grant_with_authority(
+        state.mesh_context_id(),
         identity.as_ref(),
         target_device,
-        vec![unrelated_fact.id],
-        parent_authority_uses,
-    );
-    let rejected = signed_role_grant(
-        context,
-        &outsider,
-        DeviceId::from_canonical_str(parent_target.public_id()).expect("target id"),
         vec![parent.id],
+        rejected_authority_uses,
     );
+    let mut validation_graph = signing_graph.clone();
+    assert!(matches!(
+        validation_graph.admit(rejected.clone()),
+        Err(SemanticError::UnauthorizedRoleGrant)
+    ));
 
     ingest_semantic_fact(&state, rejected).await;
     assert_eq!(state.semantic_fact_count(), 0);
@@ -628,8 +747,7 @@ async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress(
     restored_driver.await.expect("final driver shutdown");
 }
 
-#[tokio::test]
-async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
+async fn run_shutdown_fences_body() {
     let root = TempDir::new().expect("instance root");
     let identity = Arc::new(Identity::ephemeral());
     let config = closed_config("r1-stale-reopen", "r1-stale-reopen-wire");
@@ -646,24 +764,35 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     )
     .await
     .expect("create Closed network");
-    let context = state.mesh_context_id();
     governance::propose_role_grant(&state, preserved_target.public_id(), Role::Member, None)
         .await
         .expect("commit the fact preserved across reopen");
     let committed_count = state.semantic_fact_count();
+    assert!(committed_count > 0, "the pre-shutdown graph is nonempty");
     // Keep this Arc as the stale caller while its driver and original owner
     // are shut down. Shutdown releases the durable writer lease, but the
     // state-level fence must reject every later mutation through this stale
     // handle rather than allowing it to write the reopened slot.
     let stale = Arc::clone(&state);
-    let stale_fact = signed_role_grant(
-        context,
+    let mut retired_boundary_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
+    let stale_fact = authored_fact_with_support(
+        &retired_boundary_graph,
         identity.as_ref(),
-        DeviceId::from_canonical_str(stale_target.public_id()).expect("stale target id"),
+        FactBody::RoleGrant {
+            target: DeviceId::from_canonical_str(stale_target.public_id())
+                .expect("stale target id"),
+            role: Role::Member,
+        },
         Vec::new(),
     );
+    retired_boundary_graph
+        .admit(stale_fact.clone())
+        .expect("stale fact is valid against the retained bootstrap boundary");
     state.request_shutdown();
     driver.await.expect("first driver shutdown");
+    assert_eq!(stale.semantic_fact_count(), 0);
+    assert_eq!(stale.semantic_unresolved_count(), 0);
+    assert_eq!(stale.semantic_provisional_custody_count(), 0);
     assert!(
         stale.compact_semantic_state().is_err(),
         "a stale state cannot compact after shutdown"
@@ -671,8 +800,8 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     ingest_semantic_fact(&stale, stale_fact).await;
     assert_eq!(
         stale.semantic_fact_count(),
-        committed_count,
-        "a stale semantic admission cannot append after shutdown"
+        0,
+        "shutdown retires the stale live graph before rejecting admission"
     );
     assert_eq!(stale.semantic_unresolved_count(), 0);
     assert_eq!(stale.semantic_provisional_custody_count(), 0);
@@ -713,4 +842,17 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     reopened.request_shutdown();
     reopened_driver.await.expect("replacement driver shutdown");
     drop(stale);
+}
+
+#[tokio::test]
+async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
+    if let Some(home_path) = durable_child_home(SHUTDOWN_FENCES_CHILD_SELECTOR) {
+        run_durable_child(SHUTDOWN_FENCES_CHILD_SELECTOR, &home_path)
+            .await
+            .expect("isolated shutdown-fences child");
+        return;
+    }
+    run_exact_durable_child(SHUTDOWN_FENCES_CHILD_SELECTOR)
+        .await
+        .expect("isolated shutdown-fences parent");
 }

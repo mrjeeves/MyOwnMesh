@@ -1965,17 +1965,20 @@ mod tests {
                 || !witness
                     .cleanup_terminal
                     .load(std::sync::atomic::Ordering::SeqCst)
+                || !witness
+                    .cleanup_thread_joined
+                    .load(std::sync::atomic::Ordering::SeqCst)
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("drop observes roots and cleanup custodian reach terminal state");
+        .expect("drop observes terminal roots and joins the cleanup custodian");
         assert!(
             witness
                 .cleanup_thread_joined
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "drop cleanup terminal includes an observed OS-thread join"
+            "drop cleanup observes the custodian OS-thread join"
         );
         assert!(
             LocalSocketStream::connect(name).await.is_err(),
@@ -2079,12 +2082,13 @@ mod tests {
                 while !witness
                     .cleanup_terminal
                     .load(std::sync::atomic::Ordering::SeqCst)
+                    || !witness.cleanup_thread_joined.load(Ordering::SeqCst)
                 {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("the independent custodian reaches terminal cleanup");
+            .expect("the independent custodian reaches terminal cleanup and is joined");
         });
         drop(observer);
 

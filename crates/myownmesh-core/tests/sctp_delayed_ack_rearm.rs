@@ -51,14 +51,32 @@ struct FragmentedObservation {
 }
 
 fn representative_application_frame() -> Bytes {
-    let message = MeshMessage::ChannelSeq {
+    let message = |bytes: String| MeshMessage::ChannelSeq {
         stream: 1,
         seq: 1,
         channel: "sctp-fragment".to_owned(),
-        payload: serde_json::json!({"bytes": "x".repeat(1_040)}),
+        payload: serde_json::json!({"bytes": bytes}),
     };
-    let frame =
-        Bytes::from(serde_json::to_vec(&message).expect("the public application frame serializes"));
+    let overhead = serde_json::to_vec(&message(String::new()))
+        .expect("the empty public application frame serializes")
+        .len();
+    let frame_len = LOCKED_INITIAL_MTU
+        .checked_add(1)
+        .expect("the finite fragmented frame length is representable");
+    let payload_len = frame_len
+        .checked_sub(overhead)
+        .expect("the current encoder overhead fits the finite fragmented frame");
+    // ASCII x adds one encoded byte each. The locked DATA payload cap is
+    // 1228 - 12 - 16 = 1200 bytes, so this 1229-byte frame needs two chunks.
+    let frame = Bytes::from(
+        serde_json::to_vec(&message("x".repeat(payload_len)))
+            .expect("the public application frame serializes"),
+    );
+    assert_eq!(
+        frame.len(),
+        frame_len,
+        "measured encoder overhead must produce exactly MTU plus one byte"
+    );
     assert!(
         frame.len() > LOCKED_INITIAL_MTU,
         "the public application encoder must produce more than one locked SCTP DATA chunk"
@@ -534,7 +552,7 @@ fn normal_delayed_ack_rearms_after_expiry() {
 #[test]
 fn fragmented_routed_message_delivers_without_natural_retransmission() {
     // Build and validate the representative public wire shape before opening
-    // any association-owned task. Fixed public keys provide signatures only;
+    // any association-owned task. This is the current ChannelSeq encoder;
     // no home, stored identity or private runtime configuration is read.
     let frame = representative_application_frame();
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -2,13 +2,13 @@
 
 //! Production-path controls for the explicit shallow HubTree adapter.
 //!
-//! The fixture keeps the configured root and the preferred hub absent.  A's
-//! only live next hop is B, even though B is lower-ranked than the absent
-//! candidate under the same deterministic selector.  B and C therefore form
-//! the authenticated route that must remain usable without a tree-parent
-//! service or an accepted child relation.
+//! The fixtures exercise HubTree selection, parenting capacity and discovery.
+//! With the configured root and preferred hub absent, B remains A's selected
+//! live control next hop. Application payloads require a direct authenticated
+//! endpoint session: A-to-C delivery is checked only after installing that
+//! session, and sending is refused after its exact retirement.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -29,14 +29,21 @@ const NETWORK_ID: &str = "hub-tree-routing-production";
 const CHANNEL_NAME: &str = "hub-tree-route";
 
 fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
-    let grant = ResourceClaim::try_from_entries(
-        ResourceClass::ALL
-            .into_iter()
-            .map(|class| (class, FIXTURE_DIMENSION_GRANT)),
-    )
-    .expect("finite HubTree fixture grant is representable");
-    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
-        .expect("finite HubTree fixture provider is valid");
+    // Every fixture in this test process must reuse the installed provider's
+    // identity; cloning its port does not mint a separate grant.
+    static PROVIDER: OnceLock<ResourceProviderPort> = OnceLock::new();
+    let resources = PROVIDER
+        .get_or_init(|| {
+            let grant = ResourceClaim::try_from_entries(
+                ResourceClass::ALL
+                    .into_iter()
+                    .map(|class| (class, FIXTURE_DIMENSION_GRANT)),
+            )
+            .expect("finite HubTree fixture grant is representable");
+            ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+                .expect("finite HubTree fixture provider is valid")
+        })
+        .clone();
     WebRtcConnectorCapablePolicy::new(
         resources,
         WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
@@ -601,10 +608,11 @@ async fn hub_tree_routes_without_parent_service_and_fails_without_exit_path(
     let no_route = a_channel
         .send_to(&c_id, &"must not send without an A exit path".to_owned())
         .await
-        .expect_err("A has no pre-send route to C");
+        .expect_err("A has no authenticated direct session to C");
     assert!(
-        no_route.to_string().contains("no usable next hop"),
-        "the refusal is the typed pre-send no-route path, got: {no_route}"
+        matches!(&no_route, myownmesh_core::ChannelError::Transport(message)
+            if message == "network: application peer has no authenticated direct WebRTC session"),
+        "the refusal is the exact pre-send direct-session check, got: {no_route}"
     );
 
     let _ = b_c.retire().await;

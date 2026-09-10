@@ -2300,13 +2300,13 @@ fn presence_of(ev: &NostrEvent) -> Option<(String, String)> {
 }
 
 /// Build a signed `leave` event for a departed device in a room. Mirrors
-/// the envelope shape the driver expects: `{from, kind:"leave", peer_id}`
+/// the envelope shape the driver expects: `{from, to:room, kind:"leave", peer_id}`
 /// on the ephemeral kind. Tagged `["p", room]` — broadcast ephemerals are
 /// "addressed to the room" — so drivers whose subscription has narrowed
 /// to recipient-tagged events (see the driver's `desired_filters`) still
 /// hear the departure.
 fn build_leave_event(identity: &NostrIdentity, room: &str, device: &str) -> NostrEvent {
-    let envelope = json!({ "from": device, "kind": "leave", "peer_id": device });
+    let envelope = json!({ "from": device, "to": room, "kind": "leave", "peer_id": device });
     make_event(
         identity,
         SIGNALING_EPHEMERAL_KIND,
@@ -3187,11 +3187,13 @@ mod tests {
     fn build_leave_event_is_parseable_envelope() {
         let id = NostrIdentity::generate();
         let leave = build_leave_event(&id, "room-a", "devA");
+        assert!(leave.verify(), "synthetic leave retains a valid signature");
         assert_eq!(leave.kind, SIGNALING_EPHEMERAL_KIND);
         let content: Value = serde_json::from_str(&leave.content).unwrap();
         assert_eq!(content["kind"], "leave");
         assert_eq!(content["peer_id"], "devA");
         assert_eq!(content["from"], "devA");
+        assert_eq!(content["to"], "room-a");
         assert!(leave
             .tags
             .iter()
