@@ -290,7 +290,10 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     // contains no transaction or material, and the parked daemon is killed
     // before the client is restarted against the same custody root.
     let restart_network = "ctl-r2-restart-recovery";
-    daemon.shutdown().await;
+    daemon
+        .shutdown()
+        .await
+        .expect("shut down the in-process fixture before restart recovery");
 
     let barrier_listener = TcpListener::bind(("127.0.0.1", 0))
         .await
