@@ -4169,9 +4169,18 @@ impl NetworkState {
         if graph.evaluator().effective_membership(&target) != Some(false) {
             return Ok(None);
         }
-        let mut pending = graph.cell_heads(&crate::semantic::ExclusiveCell::role(target.clone()));
-        pending
-            .extend(graph.cell_heads(&crate::semantic::ExclusiveCell::membership(target.clone())));
+        // Eligibility still uses the current lineage/selector predicates, but
+        // its signed-parent comparisons must not mistake cold history for a
+        // missing causal edge. Supplemental rows never enter the live graph.
+        let mut pending = graph
+            .proof_cell_heads_with_history(
+                &[
+                    crate::semantic::ExclusiveCell::role(target.clone()),
+                    crate::semantic::ExclusiveCell::membership(target.clone()),
+                ],
+                |descendant| self.admitted_semantic_causal_history(vec![descendant]),
+            )
+            .map_err(|error| Error::Network(format!("durable proof ancestry: {error}")))?;
         if let Some(stand_down) = projection.stand_down(&target) {
             pending.push(stand_down.proof);
         }
@@ -4382,13 +4391,10 @@ impl NetworkState {
                 "durable eviction proof facts are not the recorded canonical set".to_string(),
             ));
         }
-        {
-            let graph = self.fact_graph.read();
-            if delivery
-                .facts
-                .iter()
-                .any(|fact| graph.get(&fact.id) != Some(fact))
-            {
+        // Durable admitted history owns the complete signed bodies; the live
+        // graph retains only a bounded continuation set after checkpointing.
+        for fact in &delivery.facts {
+            if self.admitted_semantic_fact(fact.id)?.as_ref() != Some(fact) {
                 return Err(Error::Network(
                     "durable eviction proof fact is absent or changed".to_string(),
                 ));

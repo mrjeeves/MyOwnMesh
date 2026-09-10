@@ -859,6 +859,15 @@ pub mod transport_lab {
             .is_some()
     }
 
+    /// Observe only the bounded live cache, not admission in durable history.
+    #[doc(hidden)]
+    pub fn semantic_fact_is_hot_for_lab(
+        state: &Arc<NetworkState>,
+        fact_id: crate::semantic::FactId,
+    ) -> bool {
+        state.fact_graph.read().get(&fact_id).is_some()
+    }
+
     /// Enumerate Pending records restored from this exact network's durable
     /// semantic slot. Settled and superseded records are not replayable.
     #[doc(hidden)]

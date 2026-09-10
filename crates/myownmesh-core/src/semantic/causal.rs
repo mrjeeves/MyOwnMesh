@@ -60,6 +60,23 @@ use super::{
     VerifiedProjectPolicy,
 };
 
+/// Failure to resolve canonical proof ancestry, never an authority-negative
+/// boolean that could select a partial frontier or the raw-conflict fallback.
+#[derive(Debug)]
+pub(crate) enum ProofAncestryError<E> {
+    Invalid(&'static str),
+    Read(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ProofAncestryError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(reason) => f.write_str(reason),
+            Self::Read(error) => write!(f, "ancestry read: {error}"),
+        }
+    }
+}
+
 /// Owner-selected aggregate semantic admission limits.  The daemon's
 /// `SemanticPolicyConfig` can be converted to this value at its boundary; the
 /// graph keeps the checked snapshot so admission never consults mutable global
@@ -5813,21 +5830,139 @@ impl FactGraph {
     }
 
     pub fn cell_heads(&self, cell: &super::ExclusiveCell) -> Vec<FactId> {
+        self.cell_heads_with_ancestry(cell, &mut |ancestor, descendant| {
+            Ok::<_, std::convert::Infallible>(self.is_ancestor(ancestor, descendant))
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn cell_heads_with_ancestry<E>(
+        &self,
+        cell: &ExclusiveCell,
+        ancestry: &mut impl FnMut(&FactId, &FactId) -> Result<bool, E>,
+    ) -> Result<Vec<FactId>, E> {
         let raw = self.raw_cell_heads(cell);
-        let authoritative = raw
-            .iter()
-            .copied()
-            .filter(|id| self.fact_is_authoritative(id))
-            .collect::<Vec<_>>();
+        let mut authoritative = Vec::new();
+        for id in &raw {
+            if self.fact_is_authoritative_with_ancestry(id, ancestry)? {
+                authoritative.push(*id);
+            }
+        }
         if authoritative.is_empty() && raw.len() > 1 {
             // A concurrent AuthorityUse fork may make each branch
             // individually ineligible; retain the raw incomparable set so
             // projection exposes an explicit conflict rather than silently
             // erasing the cell.
-            raw
+            Ok(raw)
         } else {
-            authoritative
+            Ok(authoritative)
         }
+    }
+
+    /// Select the same eligible cell heads as `cell_heads`, using bounded
+    /// durable rows only when signed-parent reachability leaves the hot cache.
+    /// The loader must enforce the owner's existing proof-link/byte limits.
+    /// Current indexes and selector provenance remain on this graph; the
+    /// supplemental rows never become a second graph or authority frontier.
+    pub(crate) fn proof_cell_heads_with_history<E>(
+        &self,
+        cells: &[ExclusiveCell],
+        mut load: impl FnMut(FactId) -> Result<Vec<SignedFact>, E>,
+    ) -> Result<Vec<FactId>, ProofAncestryError<E>> {
+        if !self.indexes_current() {
+            return Err(ProofAncestryError::Invalid("stale proof head index"));
+        }
+        // Check the entire candidate set before evaluating any eligibility or
+        // applying the ordinary multi-head conflict fallback.
+        for cell in cells {
+            for id in self.raw_cell_heads(cell) {
+                let fact = self
+                    .facts
+                    .get(&id)
+                    .ok_or(ProofAncestryError::Invalid("missing proof head"))?;
+                for parent in &fact.content.parents {
+                    if !self.facts.contains_key(parent) {
+                        return Err(ProofAncestryError::Invalid("missing direct proof parent"));
+                    }
+                }
+            }
+        }
+        let mut pool: Vec<SignedFact> = Vec::new();
+        let mut ancestry = |ancestor: &FactId, descendant: &FactId| {
+            if let Some(reachable) =
+                Self::parent_reachability(ancestor, descendant, |id| self.facts.get(id))
+            {
+                return Ok(reachable);
+            }
+            if pool
+                .binary_search_by_key(descendant, |fact| fact.id)
+                .is_err()
+            {
+                // Release the previous allocation before requesting another
+                // bounded pool. Reuse it for any descendant already covered.
+                drop(std::mem::take(&mut pool));
+                pool = load(*descendant).map_err(ProofAncestryError::Read)?;
+                pool.sort_unstable_by_key(|fact| fact.id);
+                if pool.windows(2).any(|pair| pair[0].id == pair[1].id) {
+                    return Err(ProofAncestryError::Invalid("duplicate ancestry row"));
+                }
+                for fact in &pool {
+                    if fact.content.mesh_context != self.context_id {
+                        return Err(ProofAncestryError::Invalid("foreign ancestry context"));
+                    }
+                    fact.verify().map_err(|_| {
+                        ProofAncestryError::Invalid("invalid ancestry signature or content")
+                    })?;
+                    if self.facts.get(&fact.id).is_some_and(|hot| hot != fact) {
+                        return Err(ProofAncestryError::Invalid(
+                            "ancestry differs from hot body",
+                        ));
+                    }
+                }
+            }
+            // This is the signed parents relation, NOT the broader dependency
+            // index used by the loader to supply a complete bounded pool.
+            Self::parent_reachability(ancestor, descendant, |id| {
+                pool.binary_search_by_key(id, |fact| fact.id)
+                    .ok()
+                    .map(|index| &pool[index])
+            })
+            .ok_or(ProofAncestryError::Invalid(
+                "incomplete signed-parent ancestry",
+            ))
+        };
+        let mut heads = Vec::new();
+        for cell in cells {
+            heads.extend(self.cell_heads_with_ancestry(cell, &mut ancestry)?);
+        }
+        // At most C*S*(P*(P-1)+L) reachability comparisons for C candidates,
+        // S subjects, P direct parents and L current lineage heads. These are
+        // bounded by existing semantic policy/index residency. Each cold query
+        // is bounded by the loader, not constant-cost; only one pool is retained.
+        Ok(heads)
+    }
+
+    /// None distinguishes missing bodies from a complete negative answer.
+    /// Inspect every reachable signed parent, even after finding a path, so a
+    /// used incomplete pool cannot masquerade as a verified positive answer.
+    fn parent_reachability<'a>(
+        ancestor: &FactId,
+        descendant: &FactId,
+        mut lookup: impl FnMut(&FactId) -> Option<&'a SignedFact>,
+    ) -> Option<bool> {
+        let mut pending = vec![*descendant];
+        let mut seen = BTreeSet::from([*descendant]);
+        let mut reachable = false;
+        while let Some(id) = pending.pop() {
+            let fact = lookup(&id)?;
+            for parent in &fact.content.parents {
+                reachable |= parent == ancestor;
+                if seen.insert(*parent) {
+                    pending.push(*parent);
+                }
+            }
+        }
+        Some(reachable)
     }
 
     pub fn authority_use_heads(&self, subject: &DeviceId) -> Vec<FactId> {
@@ -5943,8 +6078,19 @@ impl FactGraph {
     /// past, not receiver arrival order. Concurrent forks remain explicit
     /// conflicting heads and therefore fail closed in projection.
     pub(crate) fn fact_is_authoritative(&self, id: &FactId) -> bool {
+        self.fact_is_authoritative_with_ancestry(id, &mut |ancestor, descendant| {
+            Ok::<_, std::convert::Infallible>(self.is_ancestor(ancestor, descendant))
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn fact_is_authoritative_with_ancestry<E>(
+        &self,
+        id: &FactId,
+        ancestry: &mut impl FnMut(&FactId, &FactId) -> Result<bool, E>,
+    ) -> Result<bool, E> {
         let Some(fact) = self.facts.get(id) else {
-            return false;
+            return Ok(false);
         };
         for subject in fact
             .content
@@ -5958,7 +6104,7 @@ impl FactGraph {
             );
             let lineage = self.authority_lineage(&subject);
             if !payload_local && !self.selector_provenance_complete(&subject) {
-                return false;
+                return Ok(false);
             }
             if !payload_local
                 && self
@@ -5966,19 +6112,22 @@ impl FactGraph {
                     .len()
                     > 1
             {
-                return false;
+                return Ok(false);
             }
             if !payload_local && !lineage.is_singular() {
-                let common_ancestor = lineage
-                    .heads()
-                    .iter()
-                    .all(|head| fact.id == *head || self.is_ancestor(&fact.id, head));
+                let mut common_ancestor = true;
+                for head in lineage.heads() {
+                    if fact.id != *head && !ancestry(&fact.id, head)? {
+                        common_ancestor = false;
+                        break;
+                    }
+                }
                 if !common_ancestor {
                     // Concurrent signed uses are an explicit authority fork.
                     // A later Resolution can supersede the fork because it
                     // becomes the sole AuthorityUse head and cites both
                     // branches. Common causal ancestors remain authoritative.
-                    return false;
+                    return Ok(false);
                 }
             }
             let Some(use_) = fact
@@ -5987,16 +6136,17 @@ impl FactGraph {
                 .iter()
                 .find(|use_| use_.subject == subject)
             else {
-                return false;
+                return Ok(false);
             };
-            let expected = self.authority_use_heads_from_parents(fact, &subject);
+            let expected =
+                self.authority_use_heads_from_parents_with_ancestry(fact, &subject, ancestry)?;
             if use_.predecessors != expected {
-                return false;
+                return Ok(false);
             }
             if !payload_local {
                 let Some(selectors) = self.relevant_typed_selectors(&subject, lineage.heads())
                 else {
-                    return false;
+                    return Ok(false);
                 };
                 for selector in selectors {
                     if !self.selector_permits_fact(selector, fact.id) {
@@ -6005,12 +6155,12 @@ impl FactGraph {
                         // earlier typed exclusions disappeared. Compose all
                         // still-relevant selectors: raw ancestry through an
                         // old losing edge cannot resurrect that signed row.
-                        return false;
+                        return Ok(false);
                     }
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Return a branch selected by the unique latest typed lineage selector.
@@ -6146,11 +6296,28 @@ impl FactGraph {
         Some(relevant)
     }
 
+    #[cfg(test)]
     fn authority_use_heads_from_parents(
         &self,
         fact: &SignedFact,
         subject: &DeviceId,
     ) -> Vec<FactId> {
+        self.authority_use_heads_from_parents_with_ancestry(
+            fact,
+            subject,
+            &mut |ancestor, descendant| {
+                Ok::<_, std::convert::Infallible>(self.is_ancestor(ancestor, descendant))
+            },
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn authority_use_heads_from_parents_with_ancestry<E>(
+        &self,
+        fact: &SignedFact,
+        subject: &DeviceId,
+        ancestry: &mut impl FnMut(&FactId, &FactId) -> Result<bool, E>,
+    ) -> Result<Vec<FactId>, E> {
         // Authoring witnesses carry the current AuthorityUse heads directly
         // in the signed parent list. V4 has no ancestry-search compatibility
         // path: an incomplete signed witness is authority-negative.
@@ -6172,15 +6339,20 @@ impl FactGraph {
                 })
             })
             .collect::<Vec<_>>();
-        direct
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                !direct
-                    .iter()
-                    .any(|other| candidate != other && self.is_ancestor(candidate, other))
-            })
-            .collect()
+        let mut maxima = Vec::new();
+        for candidate in &direct {
+            let mut dominated = false;
+            for other in &direct {
+                if candidate != other && ancestry(candidate, other)? {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                maxima.push(*candidate);
+            }
+        }
+        Ok(maxima)
     }
 
     /// Return the maximal active stand-down evidence for one subject.  These
@@ -6889,6 +7061,495 @@ mod tests {
         .expect("witnessed fact signs")
     }
 
+    // Independent pre-change hot predicate, kept here to check the shared
+    // fallible implementation against the original short-circuit contract.
+    fn reference_hot_authoritative(graph: &FactGraph, id: &FactId) -> bool {
+        let Some(fact) = graph.facts.get(id) else {
+            return false;
+        };
+        for subject in fact
+            .content
+            .body
+            .authority_use_subjects(&fact.content.author)
+        {
+            let payload_local = FactGraph::is_payload_local_resolution(
+                &fact.content.body,
+                &fact.content.author,
+                &subject,
+            );
+            let lineage = graph.authority_lineage(&subject);
+            if !payload_local && !graph.selector_provenance_complete(&subject) {
+                return false;
+            }
+            if !payload_local
+                && graph
+                    .maximal_typed_selectors(&subject, lineage.heads())
+                    .len()
+                    > 1
+            {
+                return false;
+            }
+            if !payload_local
+                && !lineage.is_singular()
+                && !lineage
+                    .heads()
+                    .iter()
+                    .all(|head| fact.id == *head || graph.is_ancestor(&fact.id, head))
+            {
+                return false;
+            }
+            let Some(use_) = fact
+                .content
+                .authority_uses
+                .iter()
+                .find(|use_| use_.subject == subject)
+            else {
+                return false;
+            };
+            let direct = fact
+                .content
+                .parents
+                .iter()
+                .copied()
+                .filter(|id| {
+                    graph.facts.get(id).is_some_and(|parent| {
+                        parent.content.authority_uses.iter().any(|use_| {
+                            use_.subject == subject
+                                && !FactGraph::is_payload_local_resolution(
+                                    &parent.content.body,
+                                    &parent.content.author,
+                                    &subject,
+                                )
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let expected = direct
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    !direct
+                        .iter()
+                        .any(|other| candidate != other && graph.is_ancestor(candidate, other))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                graph.authority_use_heads_from_parents(fact, &subject),
+                expected
+            );
+            if use_.predecessors != expected {
+                return false;
+            }
+            if !payload_local {
+                let Some(selectors) = graph.relevant_typed_selectors(&subject, lineage.heads())
+                else {
+                    return false;
+                };
+                if selectors
+                    .into_iter()
+                    .any(|selector| !graph.selector_permits_fact(selector, fact.id))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn assert_warm_proof_head_parity(graph: &FactGraph) {
+        for id in graph.facts.keys() {
+            assert_eq!(
+                graph.fact_is_authoritative(id),
+                reference_hot_authoritative(graph, id)
+            );
+        }
+        for cell in graph.indexed_cells() {
+            let raw = graph.raw_cell_heads(&cell);
+            let eligible = raw
+                .iter()
+                .copied()
+                .filter(|id| reference_hot_authoritative(graph, id))
+                .collect::<Vec<_>>();
+            let expected = if eligible.is_empty() && raw.len() > 1 {
+                raw
+            } else {
+                eligible
+            };
+            assert_eq!(graph.cell_heads(&cell), expected);
+            assert_eq!(
+                graph
+                    .proof_cell_heads_with_history(
+                        &[cell],
+                        |_| -> Result<Vec<SignedFact>, &'static str> {
+                            panic!("complete warm ancestry must not load durable rows")
+                        }
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    fn cold_proof_fixture() -> (FactGraph, FactGraph, DeviceId, Vec<FactId>, FactId) {
+        let (bootstrap, root) = closed(221);
+        let target = device(&key(222));
+        let mut warm = FactGraph::from_bootstrap(&bootstrap);
+        for body in [
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            FactBody::MembershipAdmit {
+                target: target.clone(),
+            },
+        ] {
+            let fact = witnessed_fact(&warm, &root, body);
+            assert_eq!(warm.admit(fact).unwrap(), Admission::Inserted);
+        }
+        let mut roles = Vec::new();
+        for role in [
+            Role::Controller,
+            Role::Member,
+            Role::Controller,
+            Role::Member,
+        ] {
+            let fact = witnessed_fact(
+                &warm,
+                &root,
+                FactBody::RoleGrant {
+                    target: target.clone(),
+                    role,
+                },
+            );
+            roles.push(fact.id);
+            assert_eq!(warm.admit(fact).unwrap(), Admission::Inserted);
+        }
+        let evict = witnessed_fact(
+            &warm,
+            &root,
+            FactBody::Evict {
+                target: target.clone(),
+            },
+        );
+        let evict_id = evict.id;
+        assert_eq!(warm.admit(evict).unwrap(), Admission::Inserted);
+        let mut cold = warm.clone();
+        cold.seal_live_checkpoint();
+        assert!(
+            cold.get(&roles[1]).is_none(),
+            "middle C2 must actually be cold"
+        );
+        assert!(
+            cold.get(&roles[3]).is_some(),
+            "direct C4 endpoint stays hot"
+        );
+        assert!(cold.get(&evict_id).is_some());
+        assert_eq!(cold.evaluator().effective_membership(&target), Some(false));
+        (warm, cold, target, roles, evict_id)
+    }
+
+    fn proof_history_for_test(graph: &FactGraph, root: FactId) -> Vec<SignedFact> {
+        let mut pending = vec![root];
+        let mut ids = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if ids.insert(id) {
+                pending.extend(dependencies(graph.get(&id).unwrap()));
+            }
+        }
+        ids.into_iter()
+            .map(|id| graph.get(&id).unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn proof_ancestry_cold_four_role_chain_preserves_exact_eligible_closure() {
+        let (warm, cold, target, _, evict) = cold_proof_fixture();
+        assert_warm_proof_head_parity(&warm);
+        let cells = [
+            ExclusiveCell::role(target.clone()),
+            ExclusiveCell::membership(target.clone()),
+        ];
+        assert!(
+            cold.cell_heads(&cells[0]).is_empty(),
+            "old hot predicate reproduces missing edge"
+        );
+        let before = serde_json::to_vec(&cold.live_checkpoint()).unwrap();
+        let mut reads = Vec::new();
+        let heads = cold
+            .proof_cell_heads_with_history(&cells, |root| {
+                reads.push(root);
+                // Exact descendant closure; production supplies it through bounded SQL.
+                Ok::<_, &'static str>(proof_history_for_test(&warm, root))
+            })
+            .unwrap();
+        assert_eq!(heads, vec![evict, evict]);
+        assert!((1..=2).contains(&reads.len()));
+        assert_eq!(
+            reads.iter().copied().collect::<BTreeSet<_>>().len(),
+            reads.len(),
+            "one pool reuses already covered descendants across both cells"
+        );
+        let expected = warm.eviction_proof_bundle(&target).unwrap();
+        let mut pending = heads;
+        let mut ids = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if ids.insert(id) {
+                pending.extend(dependencies(warm.get(&id).unwrap()));
+            }
+        }
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            expected.iter().map(|fact| fact.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_vec(&cold.live_checkpoint()).unwrap(),
+            before,
+            "no hydration or mutation"
+        );
+    }
+
+    #[test]
+    fn proof_ancestry_complete_hot_negative_never_loads_history() {
+        let (warm, _, _, roles, _) = cold_proof_fixture();
+        assert_eq!(
+            FactGraph::parent_reachability(&roles[3], &roles[0], |id| warm.get(id)),
+            Some(false)
+        );
+        assert_warm_proof_head_parity(&warm);
+    }
+
+    #[test]
+    fn proof_ancestry_pool_membership_is_not_signed_parent_reachability() {
+        let (warm, _, _, roles, evict) = cold_proof_fixture();
+        let mut pool = warm.facts.values().cloned().collect::<Vec<_>>();
+        pool.sort_unstable_by_key(|fact| fact.id);
+        assert!(pool.binary_search_by_key(&evict, |fact| fact.id).is_ok());
+        for ancestor in [evict, roles[0]] {
+            let reachable = FactGraph::parent_reachability(&ancestor, &roles[0], |id| {
+                pool.binary_search_by_key(id, |fact| fact.id)
+                    .ok()
+                    .map(|index| &pool[index])
+            });
+            assert_eq!(
+                reachable,
+                Some(false),
+                "neither row presence nor self is an ancestor"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_ancestry_warm_fork_keeps_original_raw_conflict_fallback() {
+        let (bootstrap, root) = closed(223);
+        let target = device(&key(224));
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let first = witnessed_fact(
+            &graph,
+            &root,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+        );
+        let second = witnessed_fact(
+            &graph,
+            &root,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Controller,
+            },
+        );
+        assert_eq!(graph.admit(first.clone()).unwrap(), Admission::Inserted);
+        assert_eq!(graph.admit(second.clone()).unwrap(), Admission::Inserted);
+        assert!(!graph.fact_is_authoritative(&first.id));
+        assert!(!graph.fact_is_authoritative(&second.id));
+        let cell = ExclusiveCell::role(target);
+        assert_eq!(graph.cell_heads(&cell).len(), 2);
+        assert_warm_proof_head_parity(&graph);
+        assert_eq!(
+            graph.cell_heads_with_ancestry(&cell, &mut |_, _| {
+                Err::<bool, _>("unreadable ancestry")
+            }),
+            Err("unreadable ancestry"),
+            "error must not become the raw-conflict fallback"
+        );
+    }
+
+    #[test]
+    fn proof_ancestry_cold_common_ancestor_keeps_dynamic_fork_gate() {
+        let (mut warm, _, target, _, evict) = cold_proof_fixture();
+        let root = key(221);
+        let other = device(&key(225));
+        for role in [
+            Role::Member,
+            Role::Controller,
+            Role::Member,
+            Role::Controller,
+        ] {
+            let fact = witnessed_fact(
+                &warm,
+                &root,
+                FactBody::RoleGrant {
+                    target: other.clone(),
+                    role,
+                },
+            );
+            assert_eq!(warm.admit(fact).unwrap(), Admission::Inserted);
+        }
+        let branches = [226, 227].map(|seed| {
+            witnessed_fact(
+                &warm,
+                &root,
+                FactBody::RoleGrant {
+                    target: device(&key(seed)),
+                    role: Role::Member,
+                },
+            )
+        });
+        for fact in &branches {
+            assert_eq!(warm.admit(fact.clone()).unwrap(), Admission::Inserted);
+        }
+        assert!(warm.authority_lineage(&device(&root)).is_conflicted());
+        assert!(
+            warm.fact_is_authoritative(&evict),
+            "common ancestor is eligible under both branches"
+        );
+        let mut cold = warm.clone();
+        cold.seal_live_checkpoint();
+        assert!(!cold.is_ancestor(&evict, &branches[0].id));
+        let mut queried = Vec::new();
+        let heads = cold
+            .proof_cell_heads_with_history(&[ExclusiveCell::membership(target)], |descendant| {
+                queried.push(descendant);
+                Ok::<_, &'static str>(proof_history_for_test(&warm, descendant))
+            })
+            .unwrap();
+        assert_eq!(heads, vec![evict]);
+        assert!(
+            queried
+                .iter()
+                .any(|id| branches.iter().any(|fact| fact.id == *id)),
+            "dynamic lineage reachability, not only own-parent maxima, uses the resolver"
+        );
+    }
+
+    #[test]
+    fn proof_ancestry_missing_candidate_direct_parent_and_stale_index_refuse() {
+        let (_, cold, target, _, evict) = cold_proof_fixture();
+        let cell = ExclusiveCell::role(target);
+        for case in 0..3 {
+            let mut broken = cold.clone();
+            match case {
+                0 => {
+                    broken.facts.remove(&evict);
+                    broken.indexed_fact_count = broken.facts.len();
+                }
+                1 => {
+                    let parent = broken.get(&evict).unwrap().content.parents[0];
+                    broken.facts.remove(&parent);
+                    broken.indexed_fact_count = broken.facts.len();
+                }
+                _ => {
+                    broken.indexed_revision = broken.indexed_revision.wrapping_add(1);
+                }
+            }
+            let mut calls = 0;
+            let result = broken.proof_cell_heads_with_history(std::slice::from_ref(&cell), |_| {
+                calls += 1;
+                Ok::<_, &'static str>(Vec::new())
+            });
+            assert!(matches!(result, Err(ProofAncestryError::Invalid(_))));
+            assert_eq!(calls, 0, "reject before any partial frontier or lookup");
+        }
+    }
+
+    #[test]
+    fn proof_ancestry_invalid_supplemental_rows_and_read_limits_propagate() {
+        let (warm, cold, target, roles, _) = cold_proof_fixture();
+        let cell = ExclusiveCell::role(target);
+        for case in 0..7 {
+            let result = cold.proof_cell_heads_with_history(std::slice::from_ref(&cell), |root| {
+                let mut rows = warm.facts.values().cloned().collect::<Vec<_>>();
+                match case {
+                    0 => rows.retain(|fact| fact.id != root),
+                    1 => rows.retain(|fact| fact.id != roles[1]),
+                    2 => {
+                        rows[0].signature.push('x');
+                    }
+                    3 => {
+                        rows[0].content.mesh_context = MeshContextId::from_bytes([7; 32]);
+                    }
+                    4 => rows.push(rows[0].clone()),
+                    5 => return Err("proof history limit refusal"),
+                    _ => return Err("proof history read refusal"),
+                }
+                Ok(rows)
+            });
+            if case >= 5 {
+                let expected = if case == 5 {
+                    "proof history limit refusal"
+                } else {
+                    "proof history read refusal"
+                };
+                assert!(
+                    matches!(result, Err(ProofAncestryError::Read(error)) if error == expected)
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ProofAncestryError::Invalid(_))),
+                    "case {case}: {result:?}"
+                );
+            }
+        }
+        // Corrupt the live overlap only: the durable row still has a valid
+        // signature, so this specifically discriminates the exact-body gate.
+        for change_signature in [true, false] {
+            let mut changed = cold.clone();
+            let hot = changed.facts.get_mut(&roles[3]).unwrap();
+            if change_signature {
+                hot.signature.push('x');
+            } else if let FactBody::RoleGrant { role, .. } = &mut hot.content.body {
+                *role = Role::Owner;
+            } else {
+                panic!("C4 is a role grant");
+            }
+            let result = changed.proof_cell_heads_with_history(std::slice::from_ref(&cell), |_| {
+                Ok::<_, &'static str>(warm.facts.values().cloned().collect())
+            });
+            assert!(matches!(
+                result,
+                Err(ProofAncestryError::Invalid(
+                    "ancestry differs from hot body"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn proof_ancestry_quarantined_intermediate_is_not_admitted_history() {
+        let (warm, mut cold, target, roles, _) = cold_proof_fixture();
+        let intermediate = warm.get(&roles[1]).unwrap().clone();
+        cold.quarantined.insert(intermediate.id, intermediate);
+        let result =
+            cold.proof_cell_heads_with_history(&[ExclusiveCell::membership(target)], |_| {
+                // Model the existing admitted-only SQL reader: provisional custody
+                // cannot supply the missing admitted row.
+                Ok::<_, &'static str>(
+                    warm.facts
+                        .values()
+                        .filter(|fact| fact.id != roles[1])
+                        .cloned()
+                        .collect(),
+                )
+            });
+        assert!(matches!(
+            result,
+            Err(ProofAncestryError::Invalid(
+                "incomplete signed-parent ancestry"
+            ))
+        ));
+    }
+
     #[test]
     fn root_owner_fallback_stops_after_root_cell_advances() {
         let (bootstrap, root_key) = closed(41);
@@ -7005,6 +7666,7 @@ mod tests {
             },
             vec![first_resolution.id, third.id],
         );
+        let terminal_resolution = second_resolution.id;
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.facts.insert(first.id, first.clone());
         graph.facts.insert(second.id, second);
@@ -7019,6 +7681,30 @@ mod tests {
         );
         drop(evaluator);
         assert_eq!(graph.projection(), Projection::from_graph(&graph));
+        graph.rebuild_indexes();
+        assert_warm_proof_head_parity(&graph);
+        let roots = graph
+            .proof_cell_heads_with_history(&[ExclusiveCell::role(target)], |_| {
+                Err::<Vec<SignedFact>, _>("unexpected warm history read")
+            })
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![terminal_resolution],
+            "retain typed outer Resolution, not selected leaf"
+        );
+        let mut pending = roots;
+        let mut closure = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if closure.insert(id) {
+                pending.extend(dependencies(graph.get(&id).unwrap()));
+            }
+        }
+        assert_eq!(
+            closure,
+            graph.facts.keys().copied().collect(),
+            "both nested cited branches remain in the closure"
+        );
     }
 
     #[test]
@@ -8193,6 +8879,8 @@ mod tests {
             );
             assert_eq!(graph.admit(selector.clone()).unwrap(), Admission::Inserted);
             assert_eq!(graph.projection(), Projection::from_graph(&graph));
+            assert!(!graph.fact_is_authoritative(&operation.id));
+            assert_warm_proof_head_parity(&graph);
             {
                 let mut competing = graph.clone();
                 assert_eq!(
@@ -8215,6 +8903,7 @@ mod tests {
                 );
                 assert!(!competing.fact_is_authoritative(&operation.id));
                 assert_eq!(competing.projection(), Projection::from_graph(&competing));
+                assert_warm_proof_head_parity(&competing);
             }
             let regrant = witnessed_fact(
                 &graph,
@@ -8313,6 +9002,16 @@ mod tests {
                 Some(revoke.id)
             );
             assert_eq!(restored.projection(), Projection::from_graph(&restored));
+            assert!(
+                restored
+                    .proof_cell_heads_with_history(
+                        &[ExclusiveCell::role(old_target.clone())],
+                        |_| Ok::<_, &'static str>(canonical_history.clone()),
+                    )
+                    .unwrap()
+                    .is_empty(),
+                "complete historical rows never revive the selector's excluded operation"
+            );
             let mut omitted = checkpoint.clone();
             let omitted_bytes = graph
                 .authority_provenance

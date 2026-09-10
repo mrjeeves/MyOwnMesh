@@ -300,6 +300,11 @@ fn concurrent_evict_membership_resolution_facts(
     for fact in prior.iter().cloned() {
         base.admit(fact).expect("prior eviction history admits");
     }
+    assert_eq!(
+        base.evaluator().effective_membership(&target_id),
+        None,
+        "resolution siblings must start from an unselected membership cell"
+    );
 
     let resolver_grant = authored(
         &base,
@@ -325,6 +330,24 @@ fn concurrent_evict_membership_resolution_facts(
         FactBody::Evict {
             target: target_id.clone(),
         },
+    );
+    let mut membership_branch = base.clone();
+    membership_branch
+        .admit(membership_admit.clone())
+        .expect("MembershipAdmit is independently valid from the shared base");
+    assert_eq!(
+        membership_branch.get(&membership_admit.id),
+        Some(&membership_admit),
+        "the independent MembershipAdmit branch is retained"
+    );
+    let mut evict_branch = base.clone();
+    evict_branch
+        .admit(evict.clone())
+        .expect("Evict is independently valid from the shared base");
+    assert_eq!(
+        evict_branch.get(&evict.id),
+        Some(&evict),
+        "the independent Evict branch is retained"
     );
     let mut concurrent = base.clone();
     concurrent
@@ -546,6 +569,7 @@ fn receiver_admits_delivery(
 async fn create_fixture(
     root: &TempDir,
     id: &str,
+    include_initial_e0: bool,
 ) -> (
     Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     tokio::task::JoinHandle<()>,
@@ -619,8 +643,10 @@ async fn create_fixture(
     wait_for_approval(&mut state_events, target.public_id()).await;
     wait_for_approval(&mut target_events, identity.public_id()).await;
 
-    for fact in facts.iter().skip(2).cloned() {
-        ingest_semantic_fact(&state, fact).await;
+    if include_initial_e0 {
+        for fact in facts.iter().skip(2).cloned() {
+            ingest_semantic_fact(&state, fact).await;
+        }
     }
     state
         .compact_semantic_state()
@@ -633,7 +659,11 @@ async fn create_fixture(
         identity,
         target,
         member,
-        facts,
+        if include_initial_e0 {
+            facts
+        } else {
+            facts[..2].to_vec()
+        },
         context,
         config,
         broker,
@@ -698,10 +728,14 @@ async fn wait_for_replayed_proof(
 ) -> (ProofRecord, bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let target = previous.target.to_string();
+    let mut last_expected = None;
+    let mut last_current = None;
+    let mut last_owner_binding = None;
+    let mut owner_binding_changes = 0u32;
     loop {
         let Some(owner) = proof_owner_for_device(state, &target) else {
             if Instant::now() > deadline {
-                panic!("production proof replay did not expose a current owner");
+                panic!("production proof replay did not expose a current owner; owner_binding_changes={owner_binding_changes}; previous={previous:?}; expected={last_expected:?}; actual={last_current:?}");
             }
             tokio::task::yield_now().await;
             continue;
@@ -718,10 +752,18 @@ async fn wait_for_replayed_proof(
         assert_eq!(expected.fact_ids, previous.fact_ids);
         assert_eq!(expected.owner, previous.owner);
         assert_ne!(expected.binding, previous.binding);
+        if let Some(last_binding) = last_owner_binding.as_deref() {
+            if last_binding != expected.binding {
+                owner_binding_changes = owner_binding_changes.saturating_add(1);
+            }
+        }
+        last_owner_binding = Some(expected.binding.clone());
+        last_expected = Some(expected.clone());
         let current = durable_proof_records(state)
             .expect("replay durable records")
             .into_iter()
             .find(|record| record.delivery_id == previous.delivery_id);
+        last_current = current.clone();
         if let Some(current) = current {
             match current.state {
                 ProofRecordState::Pending => {
@@ -742,7 +784,39 @@ async fn wait_for_replayed_proof(
             }
         }
         if Instant::now() > deadline {
-            panic!("production proof replay did not expose Pending or an exact Settled tombstone");
+            let classification = match (&last_current, &last_expected) {
+                (None, _) => "record-absent",
+                (Some(current), Some(expected))
+                    if current.state == ProofRecordState::Pending
+                        && current.binding != expected.binding =>
+                {
+                    "pending-binding-mismatch"
+                }
+                (Some(current), Some(_)) if current.state == ProofRecordState::Pending => {
+                    "pending-metadata-mismatch"
+                }
+                _ => "record-state-not-classified",
+            };
+            let canonical =
+                myownmesh_core::engine::transport_lab::canonical_durable_eviction_proof_record(
+                    state, &owner,
+                );
+            let peer_observation = state
+                .peer_snapshot()
+                .into_iter()
+                .find(|peer| peer.device_id == target)
+                .map(|peer| {
+                    (
+                        peer.status,
+                        peer.tier,
+                        peer.authenticated,
+                        peer.local_approve_sent,
+                        peer.remote_approve_seen,
+                    )
+                });
+            panic!(
+                "production proof replay did not expose Pending or an exact Settled tombstone; classification={classification}; owner_binding_changes={owner_binding_changes}; previous={previous:?}; expected={last_expected:?}; actual={last_current:?}; canonical={canonical:?}; peer_observation={peer_observation:?}"
+            );
         }
         tokio::task::yield_now().await;
     }
@@ -755,19 +829,17 @@ async fn wait_for_durable_record_state(
 ) -> ProofRecord {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let record = durable_proof_records(state)
-            .expect("read exact durable replay state")
-            .into_iter()
+        let records = durable_proof_records(state).expect("read exact durable replay state");
+        let record = records
+            .iter()
             .find(|record| record.delivery_id == delivery_id)
-            .expect("durable delivery record remains observable");
+            .cloned()
+            .unwrap_or_else(|| panic!("durable delivery {delivery_id} disappeared before expected {expected:?}; actual_records={records:?}"));
         if record.state == expected {
             return record;
         }
         if Instant::now() > deadline {
-            panic!(
-                "durable delivery {delivery_id} remained {:?}, expected {expected:?}",
-                record.state
-            );
+            panic!("durable delivery {delivery_id} remained {:?}, expected {expected:?}; actual={record:?}", record.state);
         }
         tokio::task::yield_now().await;
     }
@@ -935,7 +1007,7 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-replay").await;
+    ) = create_fixture(&root, "r3-replay", true).await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
@@ -1092,7 +1164,7 @@ async fn r3_pending_approval_proof_delivery_sends_one_ack_and_settles_sender() {
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-pending-ack").await;
+    ) = create_fixture(&root, "r3-pending-ack", true).await;
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
         &state,
@@ -1214,7 +1286,7 @@ async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-cross-target").await;
+    ) = create_fixture(&root, "r3-cross-target", true).await;
     let cross_target = Identity::ephemeral();
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let cross = cross_target_stand_down_facts(
@@ -1354,6 +1426,14 @@ async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
 
 #[tokio::test]
 async fn r3_resolution_selected_evict_delivers_exact_pending_approval_closure() {
+    if std::env::var_os("MYOWNMESH_R3_DIAGNOSTICS").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "warn,myownmesh_core::engine::handshake=debug,myownmesh_core::engine::semantic_ingress=trace",
+            ))
+            .with_test_writer()
+            .try_init();
+    }
     let root = TempDir::new().expect("instance root");
     let (
         state,
@@ -1368,7 +1448,7 @@ async fn r3_resolution_selected_evict_delivers_exact_pending_approval_closure() 
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-resolution-pending").await;
+    ) = create_fixture(&root, "r3-resolution-pending", false).await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let scenario = concurrent_evict_membership_resolution_facts(
@@ -1524,7 +1604,7 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-supersede").await;
+    ) = create_fixture(&root, "r3-supersede", true).await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let e0 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
@@ -1709,6 +1789,14 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
 
 #[tokio::test]
 async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() {
+    if std::env::var_os("MYOWNMESH_R3_DIAGNOSTICS").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "warn,myownmesh_core::engine::handshake=debug,myownmesh_core::engine::semantic_ingress=trace",
+            ))
+            .with_test_writer()
+            .try_init();
+    }
     let root = TempDir::new().expect("instance root");
     let (
         state,
@@ -1718,22 +1806,55 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         identity,
         target,
         member,
-        facts,
+        prior_facts,
         context,
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-external-pause").await;
+    ) = create_fixture(&root, "r3-external-pause", false).await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
 
-    // External transport is paused at the exact boundary after E0 selection
-    // and materialization.  Until the final send admission below, E0 is only
-    // an in-memory typed delivery and cannot be emitted by a carrier.
+    // Establish the real offline boundary before adopting any E0 facts.  The
+    // grant-only fixture has an authenticated owner but no eviction closure;
+    // joining the original target's shutdown prevents it from receiving E0
+    // while the sender may still retain a disconnected or retrying peer entry.
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("offline target endpoint shutdown before E0 admission");
+    assert_eq!(target_state.semantic_fact_count(), 0);
+    target_state
+        .compact_semantic_state()
+        .expect_err("joined offline target cannot use its released semantic owner");
+    drop(target_state);
+    let e0_facts = stand_down_facts(
+        state.verified_bootstrap(),
+        state.identity.as_ref(),
+        &target,
+        &member,
+    );
+    assert_eq!(
+        e0_facts[..2],
+        prior_facts[..],
+        "grant-only setup rebuilds the exact original authenticated prefix"
+    );
+
+    // The sender is now genuinely offline while E0 is adopted.  Until the
+    // final send admission below, E0 is only an in-memory typed delivery and
+    // cannot be emitted by a carrier.
+    for fact in e0_facts.iter().skip(2).cloned() {
+        ingest_semantic_fact(&state, fact).await;
+    }
+    state
+        .compact_semantic_state()
+        .expect("durably commit E0 while target transport is offline");
     let e0 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
         &state,
         &owner,
-        &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+        &e0_facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
     )
     .expect("materialized E0 proof record");
     let e0_delivery = materialize_durable_proof_delivery(&state, &e0)
@@ -1752,7 +1873,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     // so its delivery identity cannot alias the materialized E0 identity.
     let g1_facts = regrant_after_eviction_facts(
         state.verified_bootstrap(),
-        &facts,
+        &e0_facts,
         state.identity.as_ref(),
         &target,
     );
@@ -1766,8 +1887,64 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         state.is_rostered(target.public_id()),
         "G1 clears the old stand-down before E1 is authored"
     );
-    let mut g1_history = facts.clone();
+    let g1_head_id = g1_facts
+        .last()
+        .expect("G1 restoration has an exact final fact")
+        .id;
+    let mut g1_history = e0_facts.clone();
     g1_history.extend(g1_facts.iter().cloned());
+
+    // Add a finite same-target role succession so the final E1 closure has
+    // ancestry deeper than shutdown's retained head plus one witness layer.
+    // Each transition is authored and admitted through the normal witness
+    // path; alternating tiers keeps every candidate non-redundant.
+    let mut role_history = FactGraph::from_bootstrap(state.verified_bootstrap());
+    for fact in g1_history.iter().cloned() {
+        role_history
+            .admit(fact)
+            .expect("G1 history admits for role-succession authoring");
+    }
+    let mut prior_role = role_history.evaluator().effective_role(&target_id);
+    let mut role_suffix = Vec::new();
+    for role in [
+        myownmesh_core::semantic::Role::Controller,
+        myownmesh_core::semantic::Role::Member,
+        myownmesh_core::semantic::Role::Controller,
+        myownmesh_core::semantic::Role::Member,
+    ] {
+        let fact = authored(
+            &role_history,
+            state.identity.as_ref(),
+            FactBody::RoleGrant {
+                target: target_id.clone(),
+                role,
+            },
+        );
+        role_history
+            .admit(fact.clone())
+            .expect("role succession fact admits from current witness");
+        assert_eq!(
+            role_history.get(&fact.id),
+            Some(&fact),
+            "role succession retains each exact local fact"
+        );
+        let next_role = role_history.evaluator().effective_role(&target_id);
+        assert_ne!(
+            next_role, prior_role,
+            "each role succession changes the effective target role"
+        );
+        prior_role = next_role;
+        role_suffix.push(fact);
+    }
+    let role_suffix_ids = role_suffix.iter().map(|fact| fact.id).collect::<Vec<_>>();
+    let c2_role_id = role_suffix_ids[1];
+    for fact in role_suffix.iter().cloned() {
+        ingest_semantic_fact(&state, fact).await;
+    }
+    state
+        .compact_semantic_state()
+        .expect("durably commit finite role succession before E1");
+    g1_history.extend(role_suffix);
     let e1_facts = reissued_stand_down_facts(
         state.verified_bootstrap(),
         &g1_history,
@@ -1788,7 +1965,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     .expect("current E1 eviction proof exists");
     let e1_new_facts = &e1_facts[g1_history.len()..];
     assert!(
-        e1.fact_ids.contains(&g1_history[g1_history.len() - 1].id),
+        e1.fact_ids.contains(&g1_head_id),
         "canonical E1 includes causal G1"
     );
     let e1_evict_head = e1_new_facts
@@ -1804,6 +1981,12 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         .expect("E1 Evict carries the actual current role-grant head");
     assert!(e1.fact_ids.contains(&e1_role_head.id));
     assert!(e1.fact_ids.contains(&e1_evict_head.id));
+    assert!(
+        role_suffix_ids
+            .iter()
+            .all(|fact_id| e1.fact_ids.contains(fact_id)),
+        "canonical E1 includes all four role-succession facts"
+    );
     let mut canonical_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
     for fact in e1_facts.iter().cloned() {
         canonical_graph
@@ -1843,27 +2026,20 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     assert_ne!(e0.delivery_id, e1.delivery_id);
     assert_eq!(e1_delivery.delivery_id, e1.delivery_id);
 
-    // Resume admits both records only after G1/E1 are durable.  Close both
-    // endpoint lifecycles at this pause boundary, then recreate the same
-    // target identity and root before the sender's next carrier attach.  The
-    // following attach is therefore the sole replay trigger: production must
-    // supersede stale E0 and send only the canonical E1.
+    // Resume admits both records only after G1/E1 are durable.  The target is
+    // already offline, and the sender now closes its own lifecycle before the
+    // same target identity/root is recreated.  The following attach is the
+    // sole replay trigger: production must supersede stale E0 and send only
+    // the canonical E1.
     admit_durable_proof(&state, e0.clone()).expect("admit paused E0 for replay fencing");
     admit_durable_proof(&state, e1.clone()).expect("admit exact E1 for replay");
     let pending_before_resume = pending_durable_proofs(&state).expect("pending E0/E1");
     assert!(pending_before_resume.iter().any(|record| record == &e0));
     assert!(pending_before_resume.iter().any(|record| record == &e1));
-    let target_signing_key = target.signing_key().clone();
-    let target_bootstrap = state.verified_bootstrap().record().clone();
     state.request_shutdown();
     driver.await.expect("paused sender shutdown");
-    target_state.request_shutdown();
-    target_driver
-        .await
-        .expect("paused target endpoint shutdown");
     drop(owner);
     drop(state);
-    drop(target_state);
 
     let restarted_target_identity =
         Arc::new(Identity::from_signing_key(target_signing_key, "r3-target"));
@@ -1877,7 +2053,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     )
     .await
     .expect("recreate target endpoint from the same identity");
-    for fact in facts.iter().take(2).cloned() {
+    for fact in prior_facts.iter().take(2).cloned() {
         ingest_semantic_fact(&restarted_target, fact).await;
     }
     restarted_target
@@ -1893,8 +2069,76 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     )
     .await
     .expect("resume sender after G1/E1 commit");
+
+    // Reopening restores the exact E1 bodies from the durable owner, while
+    // checkpoint loading intentionally keeps only a bounded hot continuation.
+    // Observe that boundary before attachment can trigger any replay work.
+    let reopened_records_before_attach =
+        durable_proof_records(&reopened).expect("read pending E0/E1 before carrier attach");
+    let reopened_e0_before_attach = reopened_records_before_attach
+        .iter()
+        .find(|record| record.delivery_id == e0.delivery_id)
+        .expect("reopened E0 remains durably observable before carrier attach");
+    let reopened_e1_before_attach = reopened_records_before_attach
+        .iter()
+        .find(|record| record.delivery_id == e1.delivery_id)
+        .expect("reopened E1 remains durably observable before carrier attach");
+    assert_eq!(
+        reopened_e0_before_attach.state,
+        ProofRecordState::Pending,
+        "reopened E0 remains Pending before the sole replay trigger"
+    );
+    assert_eq!(
+        reopened_e1_before_attach.state,
+        ProofRecordState::Pending,
+        "reopened E1 remains Pending before the sole replay trigger"
+    );
+    assert_exact_delivery_metadata(reopened_e0_before_attach, &e0);
+    assert_exact_delivery_metadata(reopened_e1_before_attach, &e1);
+    let reopened_e1_delivery = materialize_durable_proof_delivery(&reopened, &e1)
+        .expect("materialize exact durable E1 before carrier attach");
+    assert_eq!(
+        reopened_e1_delivery, e1_delivery,
+        "reopened E1 must retain the exact admitted durable delivery"
+    );
+    let cold_e1_ancestor = e1
+        .fact_ids
+        .iter()
+        .copied()
+        .filter(|fact_id| {
+            !myownmesh_core::engine::transport_lab::semantic_fact_is_hot_for_lab(
+                &reopened, *fact_id,
+            )
+        })
+        .min();
+    assert!(
+        cold_e1_ancestor.is_some(),
+        "reopened E1 must retain at least one durable ancestor outside hot history"
+    );
+    assert!(
+        !myownmesh_core::engine::transport_lab::semantic_fact_is_hot_for_lab(&reopened, c2_role_id,),
+        "the deterministic C2 E1 ancestor is outside reopened hot history"
+    );
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    let current_e1 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &reopened,
+        &reopened_owner,
+        &e1.fact_ids,
+    )
+    .expect("derive current-binding E1 identity after carrier attach");
+    assert_eq!(current_e1.context_id, e1.context_id);
+    assert_eq!(current_e1.target, e1.target);
+    assert_eq!(current_e1.delivery_id, e1.delivery_id);
+    assert_eq!(current_e1.fact_ids, e1.fact_ids);
+    let reopened_canonical_e1 =
+        myownmesh_core::engine::transport_lab::canonical_durable_eviction_proof_record(
+            &reopened,
+            &reopened_owner,
+        )
+        .expect("derive canonical E1 seed after carrier attach")
+        .expect("reopened sender retains a canonical E1 seed after carrier attach");
+    assert_exact_delivery_metadata(&reopened_canonical_e1, &current_e1);
     let e0_terminal =
         wait_for_durable_record_state(&reopened, e0.delivery_id, ProofRecordState::Superseded)
             .await;
@@ -1985,7 +2229,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         config,
         _broker,
         target_root,
-    ) = create_fixture(&root, "r3-regrant-race").await;
+    ) = create_fixture(&root, "r3-regrant-race", true).await;
     assert!(
         target_state.is_rostered(target.public_id()),
         "initial authenticated target has not received a stand-down proof"
@@ -2211,7 +2455,7 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-typed").await;
+    ) = create_fixture(&root, "r3-typed", true).await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
@@ -2335,7 +2579,7 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         config,
         broker,
         target_root,
-    ) = create_fixture(&root, "r3-restart").await;
+    ) = create_fixture(&root, "r3-restart", true).await;
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
     let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
         &state,
@@ -2481,7 +2725,7 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
         config,
         _broker,
         _target_root,
-    ) = create_fixture(&root, "r3-many-deliveries").await;
+    ) = create_fixture(&root, "r3-many-deliveries", true).await;
     let owner = wait_for_proof_owner(&state, _target.public_id()).await;
     let slot = discover_durable_slot(root.path());
 
