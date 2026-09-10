@@ -185,16 +185,7 @@ async fn resolve_probe(state: &Arc<NetworkState>, resolve_timeout_ms: u64) -> Op
             .next()
             .cloned()
     }?;
-    let bare = url
-        .strip_prefix("stun://")
-        .or_else(|| url.strip_prefix("stun:"))
-        .unwrap_or(&url);
-    let bare = bare.split('?').next().unwrap_or(bare);
-    let target = if bare.contains(':') {
-        bare.to_string()
-    } else {
-        format!("{bare}:3478")
-    };
+    let target = stun_probe_target(&url)?;
     tokio::time::timeout(
         Duration::from_millis(resolve_timeout_ms),
         tokio::net::lookup_host(target),
@@ -203,6 +194,57 @@ async fn resolve_probe(state: &Arc<NetworkState>, resolve_timeout_ms: u64) -> Op
     .ok()?
     .ok()?
     .next()
+}
+
+/// Convert the STUN URL shapes accepted by ICE into an unambiguous resolver
+/// target. In particular, a colon does not necessarily mean "port": it may be
+/// an IPv6 literal. Keeping this pure also prevents a malformed URL from
+/// silently steering the network watcher to a surprising host.
+fn stun_probe_target(url: &str) -> Option<String> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (rest, default_port) = if lower.starts_with("stuns:") {
+        (&raw[6..], 5349)
+    } else if lower.starts_with("stun:") {
+        (&raw[5..], 3478)
+    } else {
+        (raw, 3478)
+    };
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let authority = rest
+        .split(['?', '#', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.contains('@'))?;
+
+    if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let host = &authority[..=close];
+        let tail = &authority[close + 1..];
+        return match tail {
+            "" => Some(format!("{host}:{default_port}")),
+            _ if tail.strip_prefix(':').is_some_and(valid_port) => Some(authority.to_string()),
+            _ => None,
+        };
+    }
+
+    match authority.matches(':').count() {
+        0 => Some(format!("{authority}:{default_port}")),
+        1 => {
+            let (_, port) = authority.rsplit_once(':')?;
+            valid_port(port).then(|| authority.to_string())
+        }
+        // Non-standard but common raw IPv6 literal without brackets.
+        _ if authority.parse::<Ipv6Addr>().is_ok() => Some(format!("[{authority}]:{default_port}")),
+        _ => None,
+    }
+}
+
+fn valid_port(port: &str) -> bool {
+    port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 /// Hash of the usable local address set (+ its size): v4 addresses and v6
@@ -214,6 +256,7 @@ fn local_fingerprint() -> (u64, usize) {
         .map(|ifs| {
             ifs.into_iter()
                 .filter(|i| !i.is_loopback())
+                .filter(|i| !crate::transport::webrtc::is_virtual_interface(&i.name))
                 .filter_map(|i| match i.addr.ip() {
                     ip if crate::transport::webrtc::is_link_local_ip(&ip) => None,
                     IpAddr::V4(v4) => Some(v4.to_string()),
@@ -638,6 +681,37 @@ async fn fan_out_restart(state: &Arc<NetworkState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stun_probe_targets_cover_hostname_ports_tls_and_ipv6_shapes() {
+        for (input, expected) in [
+            ("stun:stun.example.com", "stun.example.com:3478"),
+            (
+                "STUN://stun.example.com:19302?transport=udp",
+                "stun.example.com:19302",
+            ),
+            ("stuns:relay.example.com", "relay.example.com:5349"),
+            ("stun:[2001:db8::1]", "[2001:db8::1]:3478"),
+            ("stuns:[2001:db8::1]:443", "[2001:db8::1]:443"),
+            ("2001:db8::1", "[2001:db8::1]:3478"),
+        ] {
+            assert_eq!(
+                stun_probe_target(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for invalid in [
+            "",
+            "stun:",
+            "stun:host:not-a-port",
+            "stun:[2001:db8::1",
+            "stun:user@host",
+            "stun:host:0",
+        ] {
+            assert_eq!(stun_probe_target(invalid), None, "{invalid}");
+        }
+    }
 
     #[test]
     fn snapshot_equality_compares_every_field() {

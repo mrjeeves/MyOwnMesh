@@ -2587,6 +2587,9 @@ fn dispatch_media_renegotiation(state: &Arc<NetworkState>, owner: &peer_registry
     if state.is_offline() {
         return;
     }
+    let Ok(registration) = state.reserve_shutdown_task_registration() else {
+        return;
+    };
     let Some(renegotiation) = state.peers.claim_renegotiation(
         owner,
         state.session_broker.as_ref(),
@@ -2594,7 +2597,7 @@ fn dispatch_media_renegotiation(state: &Arc<NetworkState>, owner: &peer_registry
     ) else {
         return;
     };
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_funded_shutdown_task(&shutdown_permit, registration, false, || {
         tokio::spawn(run_media_renegotiation(state.clone(), renegotiation))
     });
 }
@@ -3293,6 +3296,18 @@ async fn start_speculative_local_offer(
             reason: "the owner has no promoted session",
         });
     }
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "network shutdown refused the speculative attempt",
+        });
+    };
+    let Some(pump_registration) = state.begin_peer_event_pump_registration() else {
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "speculative pump registration was refused",
+        });
+    };
     let cfg = {
         let config = state.config.read();
         if config.validate_ice_servers().is_err() {
@@ -3402,13 +3417,6 @@ async fn start_speculative_local_offer(
     let device_id = owner.device_id().to_string();
     let task_observation = session.observe_owned_task();
     let pump_correlation = correlation.clone();
-    if !state.begin_peer_event_pump_registration() {
-        session.retire();
-        return Err(SpeculativeLocalOfferStartError {
-            correlation,
-            reason: "network shutdown began before speculative pump registration",
-        });
-    }
     let pump = tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(event) = rx.recv().await {
@@ -3449,7 +3457,7 @@ async fn start_speculative_local_offer(
         retire_speculative_terminal(&connector_state, &exact_owner, &pump_correlation, &session)
             .await;
     });
-    state.finish_peer_event_pump_registration(pump).await;
+    state.finish_peer_event_pump_registration(pump_registration, pump);
     Ok(correlation)
 }
 
@@ -3476,6 +3484,10 @@ async fn start_speculative_offer(
     // lifecycle admission across construction, installation, and pump
     // registration so shutdown cannot close the pump registry in the gap.
     let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        forget_dedup_owned(state, dedup.take());
+        return;
+    };
+    let Some(pump_registration) = state.begin_peer_event_pump_registration() else {
         forget_dedup_owned(state, dedup.take());
         return;
     };
@@ -3571,10 +3583,6 @@ async fn start_speculative_offer(
     let peer_id = device_id.to_string();
     let attempt = correlation.to_string();
     let task_observation = session.observe_owned_task();
-    if !state.begin_peer_event_pump_registration() {
-        session.retire();
-        return;
-    }
     let pump = tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(event) = rx.recv().await {
@@ -3614,7 +3622,7 @@ async fn start_speculative_offer(
         // owned by this attempt; a promoted replacement is already absent.
         retire_speculative_terminal(&connector_state, &exact_owner, &attempt, &session).await;
     });
-    state.finish_peer_event_pump_registration(pump).await;
+    state.finish_peer_event_pump_registration(pump_registration, pump);
 }
 
 async fn retire_speculative_exact(
@@ -3711,6 +3719,9 @@ async fn retire_speculative_terminal(
     let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    let Ok(registration) = state.reserve_shutdown_task_registration() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &DropReason::IceFailed);
     match state
         .peers
@@ -3759,7 +3770,7 @@ async fn retire_speculative_terminal(
                 let state = Arc::clone(state);
                 let task_state = Arc::clone(&state);
                 let device_id = owner.device_id().to_string();
-                state.register_shutdown_task(&shutdown_permit, || {
+                state.register_funded_shutdown_task(&shutdown_permit, registration, false, || {
                     tokio::spawn(async move {
                         finish_drop_peer_started_with_recovery(
                             &task_state,
@@ -4122,6 +4133,7 @@ fn introduction_witness_is_current(
 struct IntroductionConstruction<'a, 'permit> {
     state: &'a Arc<NetworkState>,
     permit: &'a state::ShutdownMutationPermit<'permit>,
+    cleanup_registration: Option<state::ShutdownTaskRegistration<'a>>,
     owner: peer_registry::PeerOwnerToken,
     ticket: hub_introduction::IntroductionTicket,
     armed: bool,
@@ -4171,11 +4183,16 @@ impl Drop for IntroductionConstruction<'_, '_> {
         if let Some(removed) = removed {
             let peer = removed;
             peer.retire_connector();
-            self.state.register_shutdown_task(self.permit, || {
-                tokio::spawn(async move {
-                    let _ = peer.retire_and_close().await;
-                })
-            });
+            let registration = self
+                .cleanup_registration
+                .take()
+                .expect("construction reserved cleanup before changing ownership");
+            self.state
+                .register_funded_shutdown_task(self.permit, registration, false, || {
+                    tokio::spawn(async move {
+                        let _ = peer.retire_and_close().await;
+                    })
+                });
         }
         if self
             .owner
@@ -4216,6 +4233,18 @@ async fn ensure_peer_session_with_introduction(
     let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    // Pump custody is fallible only here, before placeholder/slot binding,
+    // native construction, peer replacement or signaling publication.
+    let Some(pump_registration) = state.begin_peer_event_pump_registration() else {
+        return;
+    };
+    // One exclusive cleanup alternative: an introduced rollback OR a displaced
+    // ordinary installation. Reserve before native construction/map mutation,
+    // never in Drop or after removing the original owner.
+    let Ok(registration) = state.reserve_shutdown_task_registration() else {
+        return;
+    };
+    let mut cleanup_registration = Some(registration);
     // Introduction-specific correlation/configuration scratch is funded
     // before construction. Ordinary discovery retains its existing path.
     let _introduction_work = if introduction.is_some() {
@@ -4311,6 +4340,7 @@ async fn ensure_peer_session_with_introduction(
         construction_guard = Some(IntroductionConstruction {
             state,
             permit: &shutdown_permit,
+            cleanup_registration: cleanup_registration.take(),
             owner: owner.clone(),
             ticket,
             armed: true,
@@ -4404,7 +4434,14 @@ async fn ensure_peer_session_with_introduction(
     // Doing this is what keeps the ring from accumulating a record of every
     // attempt a long-lived reconnecting peer ever made.
     let replaced = if introduction_owner.is_none() {
-        install_peer_for_state_admitted(state, peer.clone(), &shutdown_permit)
+        install_peer_for_state_admitted(
+            state,
+            peer.clone(),
+            &shutdown_permit,
+            cleanup_registration
+                .take()
+                .expect("ordinary installation owns its cleanup reservation"),
+        )
     } else {
         None
     };
@@ -4463,13 +4500,13 @@ async fn ensure_peer_session_with_introduction(
             warn!(peer = %device_id, "offer refused: exact owner/worker/attempt witness unavailable");
             spawn_registered_peer_event_pump(
                 state,
+                pump_registration,
                 Arc::clone(state),
                 device_id.to_string(),
                 Arc::clone(&session),
                 rx,
                 pump_owner,
-            )
-            .await;
+            );
             return;
         };
         let Some(offer_budget) = introduction_phase_budget(
@@ -4548,13 +4585,13 @@ async fn ensure_peer_session_with_introduction(
     // connector worker identity that owns its callback source.
     spawn_registered_peer_event_pump(
         state,
+        pump_registration,
         Arc::clone(state),
         device_id.to_string(),
         Arc::clone(&session),
         rx,
         pump_owner,
-    )
-    .await;
+    );
     if let Some(guard) = construction_guard.as_mut() {
         guard.armed = false;
     }
@@ -4628,29 +4665,26 @@ fn spawn_peer_event_pump_with_terminal(
 /// Spawn and retain one production peer-event pump under its exact network
 /// lifecycle owner.  Test controls use [`spawn_peer_event_pump`] directly so
 /// they can own and await their fixture handle themselves.
-async fn spawn_registered_peer_event_pump(
+fn spawn_registered_peer_event_pump(
     state: &Arc<NetworkState>,
+    mut registration: state::PeerEventPumpRegistration<'_>,
     connector_state: Arc<NetworkState>,
     peer_id: String,
     pump_session: Arc<crate::transport::WebRtcConnectorWorker>,
     rx: crate::transport::webrtc::WebRtcConnectorEventReceiver,
     pump_owner: Option<peer_registry::PeerOwnerToken>,
 ) {
-    if !state.begin_peer_event_pump_registration() {
-        pump_session.retire();
-        return;
-    }
     let captured_owner = pump_owner.clone();
     let pump = spawn_peer_event_pump(connector_state, peer_id, pump_session, rx, pump_owner);
     let pump = if let Some(owner) = captured_owner.as_ref() {
-        match state.finish_introduced_pump_registration(owner, pump) {
+        match state.finish_introduced_pump_registration(&mut registration, owner, pump) {
             Ok(()) => return,
             Err(pump) => pump,
         }
     } else {
         pump
     };
-    state.finish_peer_event_pump_registration(pump).await;
+    state.finish_peer_event_pump_registration(registration, pump);
 }
 
 async fn apply_remote_sdp(
@@ -7506,6 +7540,22 @@ async fn on_rpc_request(
         // without pretending an answer was sent.
         None => return,
     };
+    // Retain a separately funded registry node through the final join, not
+    // merely through the invocation future. Refuse before spawning/user code.
+    let registration = match state.reserve_shutdown_task_registration() {
+        Ok(registration) => registration,
+        Err(error) => {
+            refuse_rpc_request(
+                state,
+                dispatch,
+                admitted.reply_id,
+                streaming,
+                format!("RPC task registration refused: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
     // Lock released. Consume the authority exactly once.
     let AdmittedRpcCall {
         handler,
@@ -7527,7 +7577,7 @@ async fn on_rpc_request(
             // and the session whose revocation cancels the run.
             let mut send_operation = Some(operation);
             let task_state = Arc::clone(state);
-            state.register_shutdown_task(&shutdown_permit, || {
+            state.register_funded_shutdown_task(&shutdown_permit, registration, false, || {
                 tokio::spawn(async move {
                     let state = task_state;
                     // **Declared before the lease so it is dropped after it.**
@@ -7638,7 +7688,7 @@ async fn on_rpc_request(
             // As in the unary arm.
             let mut send_operation = Some(operation);
             let task_state = Arc::clone(state);
-            state.register_shutdown_task(&shutdown_permit, || {
+            state.register_funded_shutdown_task(&shutdown_permit, registration, false, || {
                 tokio::spawn(async move {
                     let state = task_state;
                     // Before the lease, for the reason given in the unary arm.
@@ -9503,6 +9553,9 @@ async fn drop_peer_if_current_with_correlation(
     let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    let Ok(registration) = state.reserve_shutdown_task_registration() else {
+        return;
+    };
     if state.request_failed_introduction(owner, explicit_correlation, &reason) {
         return;
     }
@@ -9570,19 +9623,24 @@ async fn drop_peer_if_current_with_correlation(
                     let state = Arc::clone(state);
                     let task_state = Arc::clone(&state);
                     let device_id = owner.device_id().to_string();
-                    state.register_shutdown_task(&_shutdown_permit, || {
-                        tokio::spawn(async move {
-                            finish_drop_peer_started_with_recovery(
-                                &task_state,
-                                &device_id,
-                                reason,
-                                peer,
-                                opened_as,
-                                recovery,
-                            )
-                            .await;
-                        })
-                    });
+                    state.register_funded_shutdown_task(
+                        &_shutdown_permit,
+                        registration,
+                        false,
+                        || {
+                            tokio::spawn(async move {
+                                finish_drop_peer_started_with_recovery(
+                                    &task_state,
+                                    &device_id,
+                                    reason,
+                                    peer,
+                                    opened_as,
+                                    recovery,
+                                )
+                                .await;
+                            })
+                        },
+                    );
                     return;
                 }
                 peer_registry::ChannelTerminal::Stale => {}
@@ -9629,19 +9687,24 @@ async fn drop_peer_if_current_with_correlation(
                     let state = Arc::clone(state);
                     let task_state = Arc::clone(&state);
                     let device_id = owner.device_id().to_string();
-                    state.register_shutdown_task(&_shutdown_permit, || {
-                        tokio::spawn(async move {
-                            finish_drop_peer_started_with_recovery(
-                                &task_state,
-                                &device_id,
-                                reason,
-                                peer,
-                                opened_as,
-                                recovery,
-                            )
-                            .await;
-                        })
-                    });
+                    state.register_funded_shutdown_task(
+                        &_shutdown_permit,
+                        registration,
+                        false,
+                        || {
+                            tokio::spawn(async move {
+                                finish_drop_peer_started_with_recovery(
+                                    &task_state,
+                                    &device_id,
+                                    reason,
+                                    peer,
+                                    opened_as,
+                                    recovery,
+                                )
+                                .await;
+                            })
+                        },
+                    );
                 }
             }
             None => {
@@ -9783,6 +9846,9 @@ pub(super) fn drop_carrier_if_current_now(
     let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
         return;
     };
+    let Ok(registration) = state.reserve_shutdown_task_registration() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     let Some(worker) = owner
         .worker()
@@ -9853,7 +9919,7 @@ pub(super) fn drop_carrier_if_current_now(
                     if recovery.is_none() {
                         state.clear_reconnect_intent(owner.device_id());
                     }
-                    state.register_shutdown_task(&_shutdown_permit, || {
+                    state.register_funded_shutdown_task(&_shutdown_permit, registration, false, || {
                         tokio::spawn(async move {
                             if let Err(error) = peer.retire_and_close().await {
                                 warn!(%error, "carrier current-worker cleanup did not complete");
@@ -9984,6 +10050,7 @@ fn install_peer_for_state_admitted(
     state: &Arc<NetworkState>,
     peer: Arc<PeerConnection>,
     shutdown_permit: &state::ShutdownMutationPermit<'_>,
+    registration: state::ShutdownTaskRegistration<'_>,
 ) -> Option<connection::AttemptDisplacement> {
     let displaced = state.peers.install_with_displaced_owner(peer)?;
     state.retire_parenting_owner(&displaced.owner);
@@ -9992,7 +10059,7 @@ fn install_peer_for_state_admitted(
     let mut attempt = replaced.take_attempt_displacement();
     replaced.retire_connector();
     attempt.retired_dedup = replaced.take_retired_dedup();
-    state.register_shutdown_task(shutdown_permit, || {
+    state.register_funded_shutdown_task(shutdown_permit, registration, false, || {
         tokio::spawn(async move {
             if let Err(error) = replaced.retire_and_close().await {
                 warn!(%error, "replaced peer cleanup did not complete successfully");
@@ -11771,8 +11838,13 @@ pub(crate) fn legacy_test_has_authenticated_channel(
 mod tests {
     use super::*;
     use crate::resource::{PreAuthResourceFamily, ResourceFamilyReport, ResourceUse};
+    #[cfg(feature = "transport-lab")]
     use std::future::Future;
     use std::time::{Duration, Instant};
+
+    #[cfg(feature = "transport-lab")]
+    #[path = "task_lifetime.rs"]
+    mod task_lifetime;
 
     #[test]
     fn introduction_endpoint_policy_accepts_local_destination_without_self_connect() {
@@ -30908,6 +30980,12 @@ mod tests {
         let shutdown_permit = state
             .try_admit_shutdown_mutation()
             .expect("construction starts before shutdown linearization");
+        let cleanup_registration = state
+            .reserve_shutdown_task_registration()
+            .expect("construction reserves replacement cleanup before native work");
+        let pump_registration = state
+            .begin_peer_event_pump_registration()
+            .expect("construction reserves pump custody before native work");
         let (worker, events) = state
             .transport
             .open_connector_peer(
@@ -30933,7 +31011,8 @@ mod tests {
         );
         state.request_shutdown();
 
-        let displacement = install_peer_for_state_admitted(&state, peer, &shutdown_permit);
+        let displacement =
+            install_peer_for_state_admitted(&state, peer, &shutdown_permit, cleanup_registration);
         assert!(
             displacement.is_none(),
             "a fresh install has no displaced peer, not a shutdown refusal"
@@ -30945,13 +31024,13 @@ mod tests {
             .map(|owner| owner.for_worker(Arc::clone(&worker)));
         spawn_registered_peer_event_pump(
             &state,
+            pump_registration,
             Arc::clone(&state),
             "postconstruction-peer".to_owned(),
             worker,
             events,
             pump_owner,
-        )
-        .await;
+        );
         drop(shutdown_permit);
 
         tokio::time::timeout(Duration::from_secs(10), shutdown)

@@ -936,6 +936,21 @@ mod signaling_wire_tests {
     }
 }
 
+impl SignalingMessage {
+    /// Device ID claimed inside the signaling payload. Transport envelopes also
+    /// carry a sender; receivers must require the two to match before using
+    /// either value as a peer-map key.
+    pub fn peer_id(&self) -> &str {
+        match self {
+            Self::Announce { peer_id, .. }
+            | Self::Offer { peer_id, .. }
+            | Self::Answer { peer_id, .. }
+            | Self::Candidate { peer_id, .. }
+            | Self::Leave { peer_id } => peer_id,
+        }
+    }
+}
+
 /// Per-relay health snapshot. Diagnostic-only — surfaced via the
 /// mesh's [`crate::upstream::SIGNALING_HEALTH`] feed so the UI can
 /// show "5/5 relays open" or "2/5 relays open, 3 retrying".

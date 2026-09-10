@@ -1207,8 +1207,6 @@ dependencies = [
 [[package]]
 name = "interceptor"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac0781c825d602095113772e389ef0607afcb869ae0e68a590d8e0799cdcef8"
 dependencies = [
  "async-trait",
  "bytes",

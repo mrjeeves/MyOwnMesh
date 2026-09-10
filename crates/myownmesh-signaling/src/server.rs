@@ -3574,16 +3574,21 @@ mod tests {
         let hub = server.hub.clone();
         let connections = Arc::clone(&server.connections);
         let writers = Arc::clone(&server.writers);
-        let error = server
+        let writer_stop_timeout = server.writer_stop_timeout;
+        // The injection is a caught connection-handler panic. The actual
+        // writer is parked, not panicking; its configured abort-and-join
+        // timeout is a successful terminal settlement.
+        server
             .stop_and_wait()
             .await
-            .expect_err("the injected writer panic must reach the shutdown result");
+            .expect("caught handler panic and bounded writer cancellation settle cleanly");
         assert!(
-            error
-                .failures
-                .iter()
-                .any(|failure| failure.task == format!("writer:{writer_id}")),
-            "shutdown must identify the exact panicking writer: {error}"
+            !TEST_PANIC_AFTER_WRITER.load(Ordering::Acquire),
+            "the actual handler panic injection was consumed"
+        );
+        assert!(
+            !writers.lock().contains_key(&writer_id),
+            "the exact parked writer placeholder was retired"
         );
 
         assert!(
@@ -3593,6 +3598,20 @@ mod tests {
         assert!(connections.lock().is_empty());
         assert!(writers.lock().is_empty());
         assert_eq!(hub.snapshot().connections, 0);
+
+        // Keep the failure oracle distinct: an actually panicking writer
+        // must still fail the same production terminal-join helper. This
+        // task is joined here and uses the already selected stop interval.
+        let writer_error = await_writer_with_timeout(
+            tokio::spawn(async { panic!("injected writer panic negative control") }),
+            writer_stop_timeout,
+        )
+        .await
+        .expect_err("an actual writer panic must not be accepted as cancellation");
+        assert!(
+            writer_error.contains("injected writer panic negative control"),
+            "the terminal error must retain the actual writer panic: {writer_error}"
+        );
     }
 
     #[tokio::test]
@@ -3763,11 +3782,12 @@ mod tests {
         let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
         std::thread::spawn(move || abort_and_join(&full_sender, task, &fallback_for_thread))
             .join()
-            .expect("outside-runtime full fallback returns after joining");
+            .expect("outside-runtime full fallback returns after transferring custody");
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 3,
-            "a full no-runtime transfer synchronously observes the child"
+            "a full no-runtime transfer remains owned until its explicit observer joins"
         );
         let filler = full_receiver
             .try_recv()
@@ -3785,11 +3805,12 @@ mod tests {
         let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
         std::thread::spawn(move || abort_and_join(&closed_sender, task, &fallback_for_thread))
             .join()
-            .expect("outside-runtime closed fallback returns after joining");
+            .expect("outside-runtime closed fallback returns after transferring custody");
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 4,
-            "a closed no-runtime transfer synchronously observes the child"
+            "a closed no-runtime transfer remains owned until its explicit observer joins"
         );
     }
 

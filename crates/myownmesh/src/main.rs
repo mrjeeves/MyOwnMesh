@@ -114,12 +114,17 @@ fn main() -> ExitCode {
         "webrtc_media=error,",
         "interceptor=error,",
         "stun=error,",
-        // TURN client socket binds emit a `bind() failed: Network is
-        // unreachable` warning per candidate while the interface is down
-        // (a macOS wake drops the network for a second or two). The engine
-        // now holds ICE restarts off while offline so this is rare, but the
-        // `turn` target wasn't pinned to error like its `stun` sibling —
-        // pin it so any residual gather-during-outage stays quiet.
+        // The upstream TURN target reports normal, unrecoverable stale
+        // ChannelData as ERROR when a server has restarted and no longer has
+        // the sender's allocation. A client cannot receive an error response
+        // for ChannelData, so old peers may repeat it until their next ICE
+        // rebuild. On a public relay this can produce an unbounded syslog
+        // firehose even though fresh allocations and relaying are healthy.
+        // Our service layer still reports TURN startup/configuration failures.
+        // Suppress only the upstream server target so TURN client errors remain
+        // visible; operators can opt it back in with
+        // `MYOWNMESH_LOG_EXTRA=turn::server=debug` while tracing protocol flow.
+        "turn::server=off,",
         "turn=error,",
         "webrtc_turn=error",
     );

@@ -53,17 +53,20 @@ pub async fn tick(state: &Arc<NetworkState>) {
                 .expect("validated scheduler heartbeat interval is representable"),
         )
         .expect("validated scheduler stale cutoff is representable");
-    let stale: Vec<String> = state.peers.collect_map(|peer| {
+    let mut stale = Vec::new();
+    state.peers.visit_owners(|owner| {
+        let peer = owner.connection();
         let data = peer.state.read();
         if !matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) {
-            return None;
+            return;
         }
         let elapsed = data
             .last_recv_at
             .map(|t| now.duration_since(t).as_millis() as u64);
-        match elapsed {
-            Some(ms) if ms > stale_cutoff_ms => Some(peer.device_id.clone()),
-            _ => None,
+        let is_stale = matches!(elapsed, Some(ms) if ms > stale_cutoff_ms);
+        drop(data);
+        if is_stale {
+            stale.push(owner);
         }
     });
     // Silence past the ping/pong window means the *transport* is dead, not
@@ -75,19 +78,28 @@ pub async fn tick(state: &Arc<NetworkState>) {
     // Handshaking for minutes after a network change). Rebuild instead and
     // let discovery re-establish a fresh connection.
     if !stale.is_empty() {
-        for peer_id in &stale {
+        let mut any_retirement_attempted = false;
+        for owner in &stale {
+            let peer_id = owner.device_id();
+            if state.peers.get_if_current(owner).is_none() {
+                continue;
+            }
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
                 "heartbeat",
                 format!("peer silent past heartbeat timeout — rebuilding: {peer_id}"),
                 serde_json::json!({ "peer": peer_id }),
             );
-            super::drop_peer(state, peer_id, crate::events::DropReason::HeartbeatTimeout).await;
+            super::drop_peer_if_current(state, owner, crate::events::DropReason::HeartbeatTimeout)
+                .await;
+            any_retirement_attempted = true;
         }
         // Re-seed discovery so the rebuilt peers rediscover promptly rather
         // than waiting for their next scheduled announce. Rate-limited, so
         // a wave of timeouts collapses into one publish.
-        super::maybe_reactive_announce(state);
+        if any_retirement_attempted {
+            super::maybe_reactive_announce(state);
+        }
     }
 }
 

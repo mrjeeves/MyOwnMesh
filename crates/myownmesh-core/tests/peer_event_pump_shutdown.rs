@@ -48,7 +48,9 @@ async fn shutdown_joins_a_late_peer_event_pump() {
             .expect("spawn Open network");
     let baseline = state.resource_report();
 
-    assert!(state.begin_peer_event_pump_registration_for_lab());
+    let registration = state
+        .begin_peer_event_pump_registration_for_lab()
+        .expect("pump reservation");
     state.request_shutdown();
     let driver = tokio::spawn(driver);
     state.wait_peer_event_pump_shutdown_for_lab().await;
@@ -62,9 +64,7 @@ async fn shutdown_joins_a_late_peer_event_pump() {
         release_rx.await.expect("pump release");
     });
 
-    state
-        .finish_peer_event_pump_registration_for_lab(pump)
-        .await;
+    state.finish_peer_event_pump_registration_for_lab(registration, pump);
     start_tx.send(()).expect("start pump");
     entered_rx.await.expect("pump entered");
     assert!(!driver.is_finished(), "shutdown must own the blocked pump");

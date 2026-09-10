@@ -764,23 +764,37 @@ mod tests {
 
         let owner = DedicatedTaskCustodian::new(1).expect("emergency custodian starts");
         let mut emergency = owner.reserve(1).expect("emergency slot is pre-reserved");
+        let mut progress = owner.progress();
+        let baseline = *progress.borrow();
         let terminal = Arc::new(AtomicBool::new(false));
         let task_terminal = Arc::clone(&terminal);
         let task = tokio::spawn(async move {
             let _mark = DropMark(task_terminal);
         });
-        tokio::task::yield_now().await;
-        assert!(
-            task.is_finished(),
-            "the refusal control hands off a terminal task"
-        );
+        let completion = task.abort_handle();
         let task = submit_supervisor(task, None, None)
             .expect_err("the primary and fallback reservations both refuse");
         emergency
             .submit(task)
             .expect("the independent emergency observer accepts the exact handle");
+        // Refusal returns the same owned handle; the observer, not a yield
+        // count, proves its terminal while this runtime can still poll it.
+        while *progress.borrow() == baseline {
+            progress
+                .changed()
+                .await
+                .expect("emergency observer stays live");
+        }
+        let observed = *progress.borrow();
+        let finished = completion.is_finished();
         drop(emergency);
         owner.close();
+        assert_eq!(
+            observed,
+            baseline + 1,
+            "the refused exact handle was joined"
+        );
+        assert!(finished, "the externally joined task is terminal");
         assert!(
             terminal.load(Ordering::Acquire),
             "emergency custody observes the terminal task before owner close returns"
@@ -799,22 +813,37 @@ mod tests {
 
         let owner = DedicatedTaskCustodian::new(1).expect("emergency custodian starts");
         let mut emergency = owner.reserve(1).expect("emergency slot is pre-reserved");
+        let mut progress = owner.progress();
+        let baseline = *progress.borrow();
         let terminal = Arc::new(AtomicBool::new(false));
         let task_terminal = Arc::clone(&terminal);
         let task = tokio::spawn(async move {
             let _mark = DropMark(task_terminal);
             tokio::task::yield_now().await;
         });
-        tokio::task::yield_now().await;
-        assert!(
-            task.is_finished(),
-            "the current-thread control hands off a terminal task"
-        );
+        let completion = task.abort_handle();
         emergency
             .submit(task)
             .expect("external custody accepts the task from the current-thread runtime");
+        // Progress is published only after this sole submitted JoinHandle
+        // was awaited externally. Awaiting it keeps the origin runtime free
+        // to finish the yielding child; close must not provide that progress.
+        while *progress.borrow() == baseline {
+            progress
+                .changed()
+                .await
+                .expect("external observer stays live");
+        }
+        let observed = *progress.borrow();
+        let finished = completion.is_finished();
         drop(emergency);
         owner.close();
+        assert_eq!(
+            observed,
+            baseline + 1,
+            "the exact task was externally joined"
+        );
+        assert!(finished, "the joined task reached terminal");
         assert!(terminal.load(Ordering::Acquire));
     }
 }

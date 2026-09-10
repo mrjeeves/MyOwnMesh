@@ -12,6 +12,11 @@ This page describes device-wide hosted services. TURN is the application-data
 relay service. A Hub provides discovery and endpoint setup; it does not forward
 application payloads through mesh sessions.
 
+This V4 candidate's self-hosted TURN service is UDP-only. The new upstream
+TCP/TLS self-hosting bridge and Caddy TURN passthrough are not supported here;
+configured standard TURN endpoints remain available to endpoint WebRTC clients.
+Service advertisements provide URLs, not protected credential distribution.
+
 Hosted-service adverts, presence, joins, leaves, reconnects, and listener
 health are runtime transport observations. They never enter the semantic
 ledger or create Open participation or Closed authority. Closed governance

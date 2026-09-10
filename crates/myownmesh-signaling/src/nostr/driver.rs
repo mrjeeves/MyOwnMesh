@@ -19,7 +19,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -1051,6 +1051,17 @@ fn jittered_ms(base_ms: u64, jitter_percent: u64, seed: &str, salt: u64) -> u64 
     lower.saturating_add(offset).min(u128::from(u64::MAX)) as u64
 }
 
+fn relay_retry_salt(room: &str, relay: &str, attempt: u32) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for part in [room, relay] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    hash.update(attempt.to_le_bytes());
+    u64::from_le_bytes(hash.finalize()[..8].try_into().expect("eight digest bytes"))
+}
+
 fn reconnect_base_ms(attempt: u32, timing: &NostrTimingConfig) -> u64 {
     if attempt == 0 {
         return 0;
@@ -1195,23 +1206,6 @@ async fn run_relay(
         .await;
         match connect {
             RelayDialOutcome::Connected((stream, _)) => {
-                if consecutive_failures > 0 {
-                    info!(
-                        relay = %short(&url),
-                        attempts = consecutive_failures,
-                        "relay recovered after failed attempts"
-                    );
-                } else {
-                    info!(relay = %short(&url), "relay connected");
-                }
-                consecutive_failures = 0;
-                backoff_attempt = 0;
-                // Count this live session so the fallback supervisor can
-                // tell whether any primary relay is currently connected.
-                // `None` for fallback tasks (they don't gate themselves).
-                if let Some(c) = &live {
-                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
                 let (session, session_refusal, refused) =
                     shared.delivery.open_session_with_refusals();
                 if let Some(error) = session_refusal {
@@ -1220,16 +1214,10 @@ async fn run_relay(
                         ?error,
                         "relay-session custody refused by provider"
                     );
-                    if let Some(c) = &live {
-                        c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    }
                 } else {
-                    // Tell the engine a relay is freshly up only after this exact
-                    // session has provider custody. An incomplete profile must
-                    // not advertise readiness or enter the receive loop.
-                    shared
-                        .relay_connected
-                        .send_modify(|g| *g = g.checked_add(1).unwrap_or(u64::MAX));
+                    // Provider custody permits the session, but only an EOSE
+                    // for its exact subscription establishes relay readiness.
+                    let mut observation = RelaySessionObservation::new(live.as_deref());
                     for refusal in refused {
                         warn!(
                             relay = %short(&url),
@@ -1247,7 +1235,10 @@ async fn run_relay(
                         &inbound_tx,
                         &cancellation,
                         &mut force_rx,
-                        &session,
+                        RelaySessionContext {
+                            id: &session,
+                            observation: &mut observation,
+                        },
                     )
                     .await;
                     // The store removes only this relay's custody. Its
@@ -1257,9 +1248,15 @@ async fn run_relay(
                     shared
                         .delivery
                         .close_session(session, DeliveryTerminal::Cancelled);
-                    if let Some(c) = &live {
-                        c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if observation.stable_at(Instant::now()) {
+                        consecutive_failures = 0;
+                        backoff_attempt = 0;
+                    } else {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
                     }
+                    // Drop always balances an admitted live count, including
+                    // cancellation of this caller. It owns no task or payload.
+                    drop(observation);
                     trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
                     if matches!(outcome, RelaySessionOutcome::ConsumerClosed) {
                         let _ = shared.shutdown.send(true);
@@ -1322,7 +1319,7 @@ async fn run_relay(
             base_ms,
             shared.timing.jitter_percent,
             &shared.device_id,
-            backoff_attempt as u64,
+            relay_retry_salt(&shared.room_handle, &url, backoff_attempt),
         );
         debug!(relay = %short(&url), wait_ms, "relay backoff before reconnect");
         tokio::select! {
@@ -1488,6 +1485,65 @@ enum RelaySessionOutcome {
     ForcedReconnect,
     /// The engine-side inbound consumer is gone; do not reconnect this relay.
     ConsumerClosed,
+    /// A capacity NOTICE is a rejected subscription, not a stable session.
+    Rejected,
+}
+
+const ROOM_SUBSCRIPTION_ID: &str = "mom-sig-1";
+// Upstream relay-flap criterion, not a retry cadence or resource grant.
+const RELAY_STABLE_SESSION: Duration = Duration::from_secs(10);
+
+struct RelaySessionObservation<'a> {
+    live: Option<&'a std::sync::atomic::AtomicUsize>,
+    admitted_at: Option<Instant>,
+}
+
+impl<'a> RelaySessionObservation<'a> {
+    fn new(live: Option<&'a std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            live,
+            admitted_at: None,
+        }
+    }
+
+    fn admit(&mut self, now: Instant) -> bool {
+        if self.admitted_at.is_some() {
+            return false;
+        }
+        self.admitted_at = Some(now);
+        if let Some(live) = self.live {
+            live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        true
+    }
+
+    fn stable_at(&self, now: Instant) -> bool {
+        self.admitted_at
+            .and_then(|at| now.checked_duration_since(at))
+            .is_some_and(|age| age >= RELAY_STABLE_SESSION)
+    }
+}
+
+impl Drop for RelaySessionObservation<'_> {
+    fn drop(&mut self) {
+        if self.admitted_at.is_some() {
+            if let Some(live) = self.live {
+                live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+struct RelaySessionContext<'a, 'b> {
+    id: &'a RelaySessionId,
+    observation: &'a mut RelaySessionObservation<'b>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RelayControlFrame {
+    Other,
+    Eose,
+    Rejected,
 }
 
 /// The relay read loop listens to the driver-owned cancellation signal, so a
@@ -1592,8 +1648,12 @@ async fn run_relay_session(
     inbound_tx: &InboundSink<NostrInbound>,
     cancellation: &RelaySessionCancellation<'_>,
     force_rx: &mut watch::Receiver<u64>,
-    session: &RelaySessionId,
+    context: RelaySessionContext<'_, '_>,
 ) -> RelaySessionOutcome {
+    let RelaySessionContext {
+        id: session,
+        observation,
+    } = context;
     let (mut write, mut read) = stream.split();
     let mut shutdown_rx = shared.shutdown.subscribe();
 
@@ -1609,7 +1669,7 @@ async fn run_relay_session(
     // of the session: nothing a peer publishes can widen it. The relay owns
     // the replay result; this task retains only the current socket stream and
     // does not build a local replay queue.
-    let sub_id = "mom-sig-1";
+    let sub_id = ROOM_SUBSCRIPTION_ID;
     let req_text = build_req(shared, sub_id);
 
     match send_relay_frame(
@@ -1677,11 +1737,19 @@ async fn run_relay_session(
                     Ok(_) => continue,
                     Err(e) => return RelaySessionOutcome::Error(format!("ws read: {e}")),
                 };
-                if let Err(e) = handle_inbound_frame(url, &frame, shared, inbound_tx, session.clone()) {
-                    if e == INBOUND_SINK_CLOSED {
-                        return RelaySessionOutcome::ConsumerClosed;
+                match handle_inbound_frame_observed(url, &frame, shared, inbound_tx, session.clone()) {
+                    Ok(RelayControlFrame::Eose) => {
+                        if observation.admit(Instant::now()) {
+                            shared.relay_connected.send_modify(|generation| {
+                                *generation = generation.checked_add(1).unwrap_or(u64::MAX);
+                            });
+                            info!(relay = %short(url), "relay room subscription admitted");
+                        }
                     }
-                    trace!(relay = %short(url), "inbound frame parse: {e}");
+                    Ok(RelayControlFrame::Rejected) => return RelaySessionOutcome::Rejected,
+                    Ok(RelayControlFrame::Other) => {}
+                    Err(e) if e == INBOUND_SINK_CLOSED => return RelaySessionOutcome::ConsumerClosed,
+                    Err(e) => trace!(relay = %short(url), "inbound frame parse: {e}"),
                 }
             }
             _ = &mut delivery_notified => {
@@ -1823,6 +1891,7 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
     }
 }
 
+#[cfg(test)]
 fn handle_inbound_frame(
     url: &str,
     frame: &str,
@@ -1830,6 +1899,16 @@ fn handle_inbound_frame(
     inbound_tx: &InboundSink<NostrInbound>,
     session: RelaySessionId,
 ) -> Result<(), String> {
+    handle_inbound_frame_observed(url, frame, shared, inbound_tx, session).map(|_| ())
+}
+
+fn handle_inbound_frame_observed(
+    url: &str,
+    frame: &str,
+    shared: &Arc<DriverShared>,
+    inbound_tx: &InboundSink<NostrInbound>,
+    session: RelaySessionId,
+) -> Result<RelayControlFrame, String> {
     if frame.len() > MAX_INBOUND_FRAME_BYTES {
         return Err("inbound frame exceeds size cap".to_string());
     }
@@ -1860,9 +1939,17 @@ fn handle_inbound_frame(
                 .ok_or_else(|| "missing event body".to_string())?;
             let event: NostrEvent =
                 serde_json::from_value(std::mem::take(event_value)).map_err(|e| e.to_string())?;
+            if !event.verify()
+                || !event.tags.iter().any(|tag| {
+                    tag.first().map(String::as_str) == Some("r")
+                        && tag.get(1) == Some(&shared.room_handle)
+                })
+            {
+                return Ok(RelayControlFrame::Other);
+            }
             // Skip events we sent ourselves.
             if event.pubkey == shared.identity.pubkey_hex() {
-                return Ok(());
+                return Ok(RelayControlFrame::Other);
             }
             // No de-duplication here, deliberately. The relay fan-out
             // duplicate is real — one event published once arrives from
@@ -1888,6 +1975,10 @@ fn handle_inbound_frame(
             let envelope: SignalingEnvelope =
                 serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
 
+            if envelope.msg.peer_id() != envelope.from {
+                return Ok(RelayControlFrame::Other);
+            }
+
             // Enforce the presence/negotiation kind split on receive.
             // This is the receive-side half of the replay fix: a
             // stored-kind event can be replayed from history, so we
@@ -1900,7 +1991,7 @@ fn handle_inbound_frame(
             match envelope.msg {
                 SignalingMessage::Announce { peer_id } => {
                     if envelope.to != shared.room_handle {
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     if event.kind != SIGNALING_EVENT_KIND {
                         trace!(
@@ -1908,10 +1999,10 @@ fn handle_inbound_frame(
                             kind = event.kind,
                             "ignoring announce on non-presence kind"
                         );
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     if peer_id == shared.device_id {
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     // Sender-claimed, and deliberately still the body id: on
                     // a relay the envelope's own `from` is a second field the
@@ -1927,7 +2018,7 @@ fn handle_inbound_frame(
                 }
                 SignalingMessage::Leave { peer_id } => {
                     if envelope.to != shared.room_handle {
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     // Departure rides the ephemeral kind like the rest of
                     // the live negotiation traffic — a stored-kind "leave"
@@ -1938,10 +2029,10 @@ fn handle_inbound_frame(
                             kind = event.kind,
                             "ignoring leave on non-ephemeral kind"
                         );
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     if peer_id == shared.device_id {
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     inbound_tx
                         .send(NostrInbound::PeerLeft {
@@ -1952,7 +2043,7 @@ fn handle_inbound_frame(
                 }
                 other => {
                     if envelope.to != shared.device_id {
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     if event.kind != SIGNALING_EPHEMERAL_KIND {
                         trace!(
@@ -1960,7 +2051,7 @@ fn handle_inbound_frame(
                             kind = event.kind,
                             "dropping replayed/stored-kind negotiation message"
                         );
-                        return Ok(());
+                        return Ok(RelayControlFrame::Other);
                     }
                     inbound_tx
                         .send(NostrInbound::Message {
@@ -1994,17 +2085,22 @@ fn handle_inbound_frame(
             }
         }
         "EOSE" => {
-            trace!(relay = %short(url), "EOSE");
+            if arr.len() == 2 && arr.get(1).and_then(Value::as_str) == Some(ROOM_SUBSCRIPTION_ID) {
+                return Ok(RelayControlFrame::Eose);
+            }
         }
         "NOTICE" => {
             let body = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
             debug!(relay = %short(url), "relay notice: {body}");
+            if body.to_ascii_lowercase().contains("too many connections") {
+                return Ok(RelayControlFrame::Rejected);
+            }
         }
         _ => {
             trace!(relay = %short(url), "unhandled tag: {tag}");
         }
     }
-    Ok(())
+    Ok(RelayControlFrame::Other)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2941,11 +3037,27 @@ mod tests {
         let observer = observer_owner
             .reserve(1)
             .expect("terminal observer reservation");
+        let mut progress = observer_owner.progress();
+        let baseline = *progress.borrow();
         let mut primary: Option<CustodianReservation> = Some(Box::new(RefusingReservation));
         let mut independent = Some(observer);
-        let task = tokio::spawn(async {
-            std::future::pending::<()>().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let child_completed = Arc::clone(&completed);
+        let task = tokio::spawn(async move {
+            started_tx.send(()).expect("origin task signals startup");
+            release_rx.await.expect("fixture owner releases its task");
+            child_completed.store(true, Ordering::Release);
         });
+        let completion = task.abort_handle();
+        started_rx
+            .await
+            .expect("origin task is running before handoff");
+        assert!(
+            !completion.is_finished(),
+            "handoff exercises a live owned task"
+        );
         std::thread::spawn(move || {
             submit_to_terminal_custody(
                 &mut primary,
@@ -2956,7 +3068,31 @@ mod tests {
         })
         .join()
         .expect("current-thread Drop transfer must not block on its origin runtime");
+        // The observer only joins: the fixture still owns the stop signal.
+        // Keep this runtime polling until the external observer proves the
+        // exact transferred handle terminal, then join the observer thread.
+        release_tx
+            .send(())
+            .expect("transferred task remains owned until release");
+        while *progress.borrow() == baseline {
+            progress
+                .changed()
+                .await
+                .expect("terminal observer stays live");
+        }
+        let observed = *progress.borrow();
+        let finished = completion.is_finished();
         observer_owner.close();
+        assert_eq!(
+            observed,
+            baseline + 1,
+            "the sole transferred task was joined"
+        );
+        assert!(finished, "the exact origin task reached terminal");
+        assert!(
+            completed.load(Ordering::Acquire),
+            "owned release completed normally"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3034,6 +3170,12 @@ mod tests {
         let reaper_custodian = reaper_custodian_owner
             .reserve(1)
             .expect("the reaper custodian must reserve its own handle");
+        let observer_owner = Arc::clone(&custodian_owner);
+        let reaper_observer_owner = Arc::clone(&reaper_custodian_owner);
+        let mut terminal_progress = observer_owner.progress();
+        let terminal_target = *terminal_progress.borrow() + 2;
+        let mut reaper_progress = reaper_observer_owner.progress();
+        let reaper_target = *reaper_progress.borrow() + 1;
         let (fallback_shutdown, mut fallback_shutdown_rx) = watch::channel(false);
         let fallback_supervisor = tokio::spawn(async move {
             fallback_shutdown_rx
@@ -3045,10 +3187,17 @@ mod tests {
         let dropped_for_task = Arc::clone(&dropped);
         let dropped_wake = Arc::new(Notify::new());
         let dropped_wake_for_task = Arc::clone(&dropped_wake);
+        let (nested_started_tx, nested_started_rx) = tokio::sync::oneshot::channel();
         let nested = tokio::spawn(async move {
             let _mark = DropMark(dropped_for_task, dropped_wake_for_task);
+            nested_started_tx
+                .send(())
+                .expect("nested drop marker is installed");
             std::future::pending::<()>().await;
         });
+        nested_started_rx
+            .await
+            .expect("nested child starts before driver Drop");
         let handle = NostrDriverHandle {
             cancellers: vec![Arc::new(AtomicBool::new(false))],
             cancel_wakes: vec![Arc::new(Notify::new())],
@@ -3067,9 +3216,30 @@ mod tests {
         };
         drop(handle);
 
-        tokio::time::timeout(Duration::from_secs(2), dropped_wake.notified())
-            .await
-            .expect("external custody path must observe nested task cancellation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            dropped_wake.notified().await;
+            // The drop notification proves cancellation ran, not that the
+            // reaper has also observed its overflow filler. Join all three
+            // transferred handles within the existing terminal deadline.
+            while *terminal_progress.borrow() < terminal_target {
+                terminal_progress
+                    .changed()
+                    .await
+                    .expect("driver observer stays live");
+            }
+            while *reaper_progress.borrow() < reaper_target {
+                reaper_progress
+                    .changed()
+                    .await
+                    .expect("reaper observer stays live");
+            }
+        })
+        .await
+        .expect("external custody path must observe nested task cancellation");
+        observer_owner.close();
+        reaper_observer_owner.close();
+        assert_eq!(*terminal_progress.borrow(), terminal_target);
+        assert_eq!(*reaper_progress.borrow(), reaper_target);
         let supervisors = fallback.supervisors.lock().drain(..).collect::<Vec<_>>();
         assert_eq!(
             supervisors.len(),
@@ -3214,6 +3384,112 @@ mod tests {
     /// from a fixed peer. The event ID is whatever the signer
     /// produced; we wrap it the same way a relay would so
     /// `handle_inbound_frame` parses it exactly like in production.
+    #[test]
+    fn relay_admission_is_subscription_scoped_and_balanced() {
+        let shared = fixture_shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
+        for (frame, expected) in [
+            (r#"["EOSE","other"]"#, RelayControlFrame::Other),
+            (r#"["EOSE"]"#, RelayControlFrame::Other),
+            (r#"["EOSE","mom-sig-1",0]"#, RelayControlFrame::Other),
+            (r#"["EOSE","mom-sig-1"]"#, RelayControlFrame::Eose),
+            (
+                r#"["NOTICE","too many connections"]"#,
+                RelayControlFrame::Rejected,
+            ),
+        ] {
+            assert_eq!(
+                handle_inbound_frame_observed(
+                    "relay",
+                    frame,
+                    &shared,
+                    &tx,
+                    RelaySessionId::fresh()
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        let live = AtomicUsize::new(0);
+        let start = Instant::now();
+        {
+            let mut observation = RelaySessionObservation::new(Some(&live));
+            assert!(!observation.stable_at(start + RELAY_STABLE_SESSION));
+            assert!(observation.admit(start));
+            assert!(!observation.admit(start));
+            assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!observation.stable_at(start + RELAY_STABLE_SESSION - Duration::from_nanos(1)));
+            assert!(observation.stable_at(start + RELAY_STABLE_SESSION));
+        }
+        assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_ne!(
+            relay_retry_salt("room-a", "relay", 1),
+            relay_retry_salt("room-b", "relay", 1)
+        );
+        assert_ne!(
+            relay_retry_salt("room", "relay-a", 1),
+            relay_retry_salt("room", "relay-b", 1)
+        );
+    }
+
+    #[test]
+    fn inbound_integrity_room_and_envelope_mismatch_are_refused_before_delivery() {
+        let shared = fixture_shared();
+        let signer = NostrIdentity::generate();
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
+        let (valid, _) = announce_frame_for("peer", &signer);
+        let mut tampered: Value = serde_json::from_str(&valid).unwrap();
+        tampered[2]["content"] = Value::String("changed after signing".into());
+        let mismatch = SignalingEnvelope {
+            from: "sender".into(),
+            to: "test-room".into(),
+            msg: SignalingMessage::Announce {
+                peer_id: "different".into(),
+            },
+        };
+        for (room, content) in [
+            ("test-room", serde_json::to_string(&mismatch).unwrap()),
+            (
+                "other-room",
+                serde_json::to_string(&SignalingEnvelope {
+                    from: "peer".into(),
+                    to: "test-room".into(),
+                    msg: SignalingMessage::Announce {
+                        peer_id: "peer".into(),
+                    },
+                })
+                .unwrap(),
+            ),
+        ] {
+            let event = crate::nostr::event::make_event(
+                &signer,
+                SIGNALING_EVENT_KIND,
+                vec![vec!["r".into(), room.into()]],
+                content,
+                1_700_000_000,
+            );
+            let frame = serde_json::json!(["EVENT", "sub", event]).to_string();
+            handle_inbound_frame("relay", &frame, &shared, &tx, RelaySessionId::fresh()).unwrap();
+        }
+        handle_inbound_frame(
+            "relay",
+            &tampered.to_string(),
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+        handle_inbound_frame("relay", &valid, &shared, &tx, RelaySessionId::fresh()).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NostrInbound::PeerAnnounced { .. })
+        ));
+    }
+
     fn announce_frame_for(peer: &str, signer: &NostrIdentity) -> (String, String) {
         let envelope = SignalingEnvelope {
             from: peer.into(),

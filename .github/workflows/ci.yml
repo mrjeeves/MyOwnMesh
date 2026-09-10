@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main, "claude/**", "arc/**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -268,6 +267,52 @@ jobs:
             opaque_bytes_modes_reopen_bounds_and_stale_owner_use_real_session --features transport-lab
           run_exact myownmesh-services service_restart_custody \
             awaited_stun_stop_releases_exact_listener_for_immediate_restart
+
+      - name: V1 task ownership and introduction settlement controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          run_core_count() {
+            local expected="$1"
+            local selector="$2"
+            shift 2
+            cargo test --locked -p myownmesh-core --features transport-lab --lib \
+              "$selector" -- --test-threads=1 "$@" 2>&1 | tee "$log"
+            if [[ "$expected" == 1 ]]; then
+              grep -Fxq 'running 1 test' "$log"
+            else
+              grep -Fxq "running $expected tests" "$log"
+            fi
+            grep -Eq "^test result: ok\. ${expected} passed; 0 failed; 0 ignored;" "$log"
+          }
+          run_core_count 6 shutdown_task_registry_tests
+          run_core_count 3 engine::tests::task_lifetime::
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::v1_introduced_pump_pressure_precedes_placeholder_and_native_binding --exact
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::expired_introduction_joins_native_and_engine_pump_before_fallback --exact --ignored
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::canceled_introduction_settlement_restores_record_for_shutdown_drain --exact --ignored
+          run_core_count 1 \
+            engine::state::introduction_settlement_controls::authenticated_terminal_join_preserves_replacement_installation --exact --ignored
+
+      - name: Vendored RTP history correctness controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          trap 'rm -f "$log"' EXIT
+          for selector in \
+            nack::generator::generator_stream::test::stale_repair_does_not_acknowledge_newer_ring_alias \
+            nack::responder::responder_stream::test::retained_slot_must_match_exact_requested_sequence
+          do
+            cargo test --locked --manifest-path vendor/interceptor/Cargo.toml --lib \
+              "$selector" -- --exact --test-threads=1 2>&1 | tee "$log"
+            grep -Fxq 'running 1 test' "$log"
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
 
       - name: Exact ignored semantic-store purge control
         shell: bash

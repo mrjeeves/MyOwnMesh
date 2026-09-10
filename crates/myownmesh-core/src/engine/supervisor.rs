@@ -261,6 +261,8 @@ pub(crate) async fn run_driver(
         let mut connection_actor_done = false;
         loop {
             tokio::select! {
+                _ = std::future::poll_fn(|cx| state.poll_task_completions(cx)) => {}
+
                 _ = state.wait_for_shutdown() => {
                     break "shutdown requested";
                 }

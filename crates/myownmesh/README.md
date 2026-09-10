@@ -94,6 +94,10 @@ If `serve` lives in your home (e.g. a `cargo install` build), a
 `--system` install copies it to `/usr/local/lib/myownmesh/` so the
 service account can execute it. Follow logs with the printed hint
 (`journalctl -u myownmesh -f`, or `tail -f` the launchd log).
+Generated systemd units identify records as `myownmesh` and cap the daemon at
+100 records per five minutes. Normal operation is well below that ceiling; it
+prevents a dependency regression or hostile packet stream from filling the
+journal and `/var/log/syslog` before the host's normal rotation runs.
 
 Windows isn't wired to a service manager yet — `service` there points
 you at Task Scheduler / NSSM instead. On a headless / SSH-only Mac,

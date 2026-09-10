@@ -620,6 +620,14 @@ fn render_systemd_unit(exec: &Path, scope: Scope, env: &[(String, String)]) -> S
     s.push_str("Restart=on-failure\n");
     // Leave the restart delay to the operator's systemd policy/default. A
     // baked-in delay would silently override deployment-specific backoff.
+    // Keep a dependency regression or hostile packet stream from filling the
+    // host's journal and /var/log/syslog. The daemon's default filter removes
+    // the known stale-TURN noise at source; this per-service rate limit is a
+    // general second line of defence for any future log storm.
+    // `SyslogIdentifier` also makes the daemon easy to filter operationally.
+    s.push_str("SyslogIdentifier=myownmesh\n");
+    s.push_str("LogRateLimitIntervalSec=5min\n");
+    s.push_str("LogRateLimitBurst=100\n");
     // The daemon handles SIGTERM for a clean shutdown — systemd's default
     // stop signal, stated here for clarity.
     s.push_str("KillSignal=SIGTERM\n");
@@ -990,6 +998,9 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("RestartSec="));
         assert!(!unit.contains("TimeoutStopSec="));
+        assert!(unit.contains("SyslogIdentifier=myownmesh"));
+        assert!(unit.contains("LogRateLimitIntervalSec=5min"));
+        assert!(unit.contains("LogRateLimitBurst=100"));
         // User scope must not carry system-only directives.
         assert!(!unit.contains("DynamicUser"));
         assert!(!unit.contains("network-online.target"));

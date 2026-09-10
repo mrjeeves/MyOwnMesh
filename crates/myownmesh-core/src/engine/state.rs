@@ -111,9 +111,42 @@ pub(crate) type AttemptSettlement = Arc<
 >;
 
 struct PeerEventPumpRegistry {
-    handles: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    refused_registrations: usize,
+    handles: LeasedQueue<PeerEventPumpSlot>,
     pending_registrations: usize,
     closed: bool,
+    #[cfg(test)]
+    terminals: [usize; 3],
+}
+
+enum PeerEventPumpSlot {
+    Running(JoinHandle<()>),
+    Joined,
+}
+
+/// Move-only admission for one future pump. The exact node lease is acquired
+/// before native construction/publication and held until handle installation.
+/// An abandoned constructor releases its pending fence without spawning work.
+#[doc(hidden)]
+pub struct PeerEventPumpRegistration<'a> {
+    state: &'a NetworkState,
+    entry: Option<ResourceLease>,
+}
+
+impl Drop for PeerEventPumpRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            {
+                let mut registry = self.state.peer_event_pumps.lock();
+                assert!(registry.pending_registrations > 0 && !registry.closed);
+                registry.pending_registrations -= 1;
+            }
+            drop(entry);
+            self.state.peer_event_pump_ready.notify_waiters();
+            self.state.task_completion_waker.wake();
+        }
+    }
 }
 
 /// One exact child-side HubTree registration retained until its matching
@@ -127,48 +160,132 @@ struct PendingParentAttach {
     wire_request: crate::protocol::HubTreeAttachRequest,
 }
 
-/// Joinable tasks admitted by an exact shutdown mutation witness.  The
-/// witness keeps shutdown from closing this registry between the producer's
+/// Outstanding tasks admitted by an exact shutdown mutation witness. The
+/// driver polls terminal joins during normal operation; each queue node owns
+/// its registration funding until the exact handle has returned Poll::Ready.
+/// Empty queues retain no allocation or historical-capacity high water mark.
+///
+/// The witness keeps shutdown from closing this registry between the producer's
 /// admission check and its handle registration; once shutdown has drained
 /// those witnesses, `closed` makes the registry a permanent refusal point.
 struct ShutdownTaskRegistry {
-    handles: Vec<ShutdownTask>,
+    handles: LeasedQueue<ShutdownTask>,
     closed: bool,
+    #[cfg(test)]
+    terminals: [usize; 3],
 }
 
 struct ShutdownTask {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
     cancel_on_shutdown: bool,
 }
+
+/// A registry-node reservation, minted before spawn by this network owner.
+pub(crate) struct ShutdownTaskRegistration<'a>(ResourceLease, &'a NetworkState);
 
 impl ShutdownTaskRegistry {
     fn new() -> Self {
         Self {
-            handles: Vec::new(),
+            handles: LeasedQueue::new(),
             closed: false,
+            #[cfg(test)]
+            terminals: [0; 3],
         }
     }
 
-    fn push(&mut self, handle: JoinHandle<()>, cancel_on_shutdown: bool) {
-        self.handles.push(ShutdownTask {
-            handle,
-            cancel_on_shutdown,
-        });
+    fn push(&mut self, handle: JoinHandle<()>, cancel_on_shutdown: bool, entry: ResourceLease) {
+        self.handles.push(
+            ShutdownTask {
+                handle: Some(handle),
+                cancel_on_shutdown,
+            },
+            entry,
+        );
     }
 
-    fn take_for_shutdown(&mut self) -> Vec<ShutdownTask> {
+    fn close(&mut self) {
         self.closed = true;
-        std::mem::take(&mut self.handles)
+        for task in self.handles.iter_mut() {
+            if task.cancel_on_shutdown {
+                if let Some(handle) = &task.handle {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    fn poll_completed(&mut self, cx: &mut std::task::Context<'_>) -> usize {
+        use std::future::Future as _;
+        let mut completed = 0;
+        for task in self.handles.iter_mut() {
+            let Some(handle) = task.handle.as_mut() else {
+                continue;
+            };
+            if let std::task::Poll::Ready(result) = std::pin::Pin::new(handle).poll(cx) {
+                #[cfg(test)]
+                {
+                    self.terminals[terminal_index(&result)] += 1;
+                }
+                if let Err(error) = result {
+                    if !(self.closed && task.cancel_on_shutdown && error.is_cancelled()) {
+                        tracing::warn!(%error, "engine registered task failed");
+                    }
+                }
+                // Poll::Ready has observed this exact join, including panic or
+                // cancellation. Only now may its funded registration disappear.
+                task.handle = None;
+                completed += 1;
+            }
+        }
+        self.handles.retain(|task| task.handle.is_some());
+        completed
     }
 }
 
 impl PeerEventPumpRegistry {
     fn new() -> Self {
         Self {
-            handles: Vec::new(),
+            #[cfg(test)]
+            refused_registrations: 0,
+            handles: LeasedQueue::new(),
             pending_registrations: 0,
             closed: false,
+            #[cfg(test)]
+            terminals: [0; 3],
         }
+    }
+
+    fn poll_completed(&mut self, cx: &mut std::task::Context<'_>) -> usize {
+        use std::future::Future as _;
+        let mut completed = 0;
+        for slot in self.handles.iter_mut() {
+            let PeerEventPumpSlot::Running(handle) = slot else {
+                continue;
+            };
+            if let std::task::Poll::Ready(result) = std::pin::Pin::new(handle).poll(cx) {
+                #[cfg(test)]
+                {
+                    self.terminals[terminal_index(&result)] += 1;
+                }
+                if let Err(error) = result {
+                    tracing::warn!(%error, "peer event pump failed");
+                }
+                *slot = PeerEventPumpSlot::Joined;
+                completed += 1;
+            }
+        }
+        self.handles
+            .retain(|slot| !matches!(slot, PeerEventPumpSlot::Joined));
+        completed
+    }
+}
+
+#[cfg(test)]
+fn terminal_index(result: &std::result::Result<(), tokio::task::JoinError>) -> usize {
+    match result {
+        Ok(()) => 0,
+        Err(error) if error.is_panic() => 1,
+        Err(_) => 2,
     }
 }
 
@@ -1213,6 +1330,11 @@ pub struct NetworkState {
     shutdown_mutations: Mutex<usize>,
     shutdown_mutations_ready: Notify,
     shutdown_tasks: Mutex<Option<ShutdownTaskRegistry>>,
+    /// The existing driver polls exact handles; registration wakes that same
+    /// owner even when no transport/command/timer event follows the spawn.
+    task_completion_waker: futures::task::AtomicWaker,
+    #[cfg(test)]
+    task_join_observed: Notify,
     /// Set only after the shutdown path has released the durable writer
     /// owner. This is stronger than `shutdown_requested`: callers must not
     /// purge while teardown is still draining live state.
@@ -1990,6 +2112,9 @@ impl NetworkState {
             shutdown_mutations: Mutex::new(0),
             shutdown_mutations_ready: Notify::new(),
             shutdown_tasks: Mutex::new(Some(ShutdownTaskRegistry::new())),
+            task_completion_waker: futures::task::AtomicWaker::new(),
+            #[cfg(test)]
+            task_join_observed: Notify::new(),
             shutdown_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_ready: Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
@@ -5191,10 +5316,46 @@ impl NetworkState {
 
     fn register_shutdown_task_with_policy(
         &self,
-        _permit: &ShutdownMutationPermit<'_>,
+        permit: &ShutdownMutationPermit<'_>,
         cancel_on_shutdown: bool,
         start: impl FnOnce() -> JoinHandle<()>,
     ) -> bool {
+        let entry = match self.reserve_shutdown_task_registration() {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "engine task registration refused before spawn");
+                return false;
+            }
+        };
+        self.register_funded_shutdown_task(permit, entry, cancel_on_shutdown, start)
+    }
+
+    pub(crate) fn reserve_shutdown_task_registration(
+        &self,
+    ) -> Result<ShutdownTaskRegistration<'_>> {
+        let claim = LeasedQueue::<ShutdownTask>::entry_claim()
+            .map_err(|error| Error::Network(format!("task registration claim: {error}")))?;
+        Ok(ShutdownTaskRegistration(
+            self.local_resources.acquire(claim)?,
+            self,
+        ))
+    }
+
+    pub(crate) fn register_funded_shutdown_task(
+        &self,
+        permit: &ShutdownMutationPermit<'_>,
+        entry: ShutdownTaskRegistration<'_>,
+        cancel_on_shutdown: bool,
+        start: impl FnOnce() -> JoinHandle<()>,
+    ) -> bool {
+        assert!(
+            std::ptr::eq(permit.state, self),
+            "registration requires this network's witness"
+        );
+        assert!(
+            std::ptr::eq(entry.1, self),
+            "registration funding belongs to this network"
+        );
         let mut tasks = self.shutdown_tasks.lock();
         let Some(tasks) = tasks.as_mut() else {
             return false;
@@ -5202,31 +5363,59 @@ impl NetworkState {
         if tasks.closed {
             return false;
         }
-        tasks.push(start(), cancel_on_shutdown);
+        tasks.push(start(), cancel_on_shutdown, entry.0);
+        self.task_completion_waker.wake();
         true
     }
 
+    /// Completion-driven join barrier shared by the driver and shutdown. No
+    /// handle leaves its funded node while pending, so cancelling a polling
+    /// future cannot detach work. Polling Ready consumes the exact result once.
+    pub(crate) fn poll_task_completions(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        self.task_completion_waker.register(cx.waker());
+        let tasks = self
+            .shutdown_tasks
+            .lock()
+            .as_mut()
+            .map_or(0, |tasks| tasks.poll_completed(cx));
+        let pumps = self.peer_event_pumps.lock().poll_completed(cx);
+        if tasks + pumps > 0 {
+            #[cfg(test)]
+            self.task_join_observed.notify_waiters();
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+
     async fn await_shutdown_tasks(&self) {
-        let handles = {
+        {
             let mut tasks = self.shutdown_tasks.lock();
-            let Some(mut tasks) = tasks.take() else {
-                return;
-            };
-            tasks.take_for_shutdown()
-        };
-        for task in &handles {
-            if task.cancel_on_shutdown {
-                task.handle.abort();
+            if let Some(tasks) = tasks.as_mut() {
+                tasks.close();
             }
         }
-        for task in handles {
-            if let Err(error) = task.handle.await {
-                if task.cancel_on_shutdown && error.is_cancelled() {
-                    continue;
-                }
-                tracing::warn!(%error, "engine shutdown task failed");
+        self.join_registered_shutdown_tasks().await;
+    }
+
+    async fn join_registered_shutdown_tasks(&self) {
+        std::future::poll_fn(|cx| {
+            let _ = self.poll_task_completions(cx);
+            if self
+                .shutdown_tasks
+                .lock()
+                .as_ref()
+                .is_none_or(|tasks| tasks.handles.is_empty())
+            {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
             }
-        }
+        })
+        .await;
     }
 
     /// Run one local signaling attach while holding the registration fence.
@@ -8711,28 +8900,34 @@ impl NetworkState {
             .store(true, Ordering::Release);
         self.peer_event_pump_shutdown_waiting.notify_waiters();
         self.log_shutdown_phase("event-pump-begin");
-        let event_pumps = loop {
+        loop {
             let notified = self.peer_event_pump_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let drained = {
                 let mut registry = self.peer_event_pumps.lock();
                 if registry.pending_registrations == 0 {
                     registry.closed = true;
-                    Some(std::mem::take(&mut registry.handles))
+                    true
                 } else {
-                    None
+                    false
                 }
             };
-            if let Some(event_pumps) = drained {
-                break event_pumps;
+            if drained {
+                break;
             }
             notified.await;
-        };
-        for pump in event_pumps {
-            if let Err(error) = pump.await {
-                tracing::warn!(%error, "peer event pump failed during shutdown");
-            }
         }
-        // Original registration completion publishes either into that Vec or
+        std::future::poll_fn(|cx| {
+            let _ = self.poll_task_completions(cx);
+            if self.peer_event_pumps.lock().handles.is_empty() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        // Original registration completion publishes either into that queue or
         // directly into an exact demand record under its SAME lifecycle lock.
         // With registration now closed there can be no late record handoff.
         if let Some(pool) = self.demand_links.as_ref() {
@@ -8883,66 +9078,114 @@ impl NetworkState {
         }
     }
 
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) fn peer_event_pump_refusals_for_test(&self) -> usize {
+        self.peer_event_pumps.lock().refused_registrations
+    }
+
     #[cfg(test)]
     pub(super) fn peer_event_pump_counts_for_test(&self) -> (usize, usize) {
         let pumps = self.peer_event_pumps.lock();
         (pumps.pending_registrations, pumps.handles.len())
     }
 
-    /// Begin registering one production peer-event pump.  Shutdown closes the
-    /// registry only after all begun registrations have handed in their
-    /// handles, so a pump can never race into detached custody.
-    pub(crate) fn begin_peer_event_pump_registration(&self) -> bool {
+    #[cfg(test)]
+    pub(super) async fn join_registered_tasks_for_test(&self) {
+        self.join_registered_shutdown_tasks().await;
+    }
+
+    #[cfg(test)]
+    pub(super) fn task_registry_counts_for_test(&self) -> (usize, [usize; 3]) {
+        let tasks = self.shutdown_tasks.lock();
+        tasks
+            .as_ref()
+            .map_or((0, [0; 3]), |tasks| (tasks.handles.len(), tasks.terminals))
+    }
+
+    /// Observation only: this does not poll, remove or join any handle. A
+    /// native control must run the production driver to reach this barrier.
+    #[cfg(all(test, feature = "transport-lab"))]
+    pub(super) async fn wait_task_joins_for_test(&self, count: usize, pumps: bool) {
+        loop {
+            let notified = self.task_join_observed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let terminals = if pumps {
+                self.peer_event_pumps.lock().terminals
+            } else {
+                self.task_registry_counts_for_test().1
+            };
+            if terminals.into_iter().sum::<usize>() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Reserve before native construction, owner mutation or signaling. Pending
+    /// custody remains with the cancellable token, not an anonymous queue slot.
+    pub(crate) fn begin_peer_event_pump_registration(
+        &self,
+    ) -> Option<PeerEventPumpRegistration<'_>> {
         let mut pumps = self.peer_event_pumps.lock();
         if pumps.closed {
-            return false;
+            return None;
         }
-        let Some(pending) = pumps.pending_registrations.checked_add(1) else {
-            return false;
+        let pending = pumps.pending_registrations.checked_add(1)?;
+        let entry = match LeasedQueue::<PeerEventPumpSlot>::entry_claim()
+            .map_err(|error| Error::Network(format!("pump registration claim: {error}")))
+            .and_then(|claim| self.local_resources.acquire(claim).map_err(Error::from))
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                #[cfg(test)]
+                {
+                    pumps.refused_registrations += 1;
+                }
+                tracing::warn!(%error, "peer pump registration refused before construction");
+                return None;
+            }
         };
         pumps.pending_registrations = pending;
-        true
+        Some(PeerEventPumpRegistration {
+            state: self,
+            entry: Some(entry),
+        })
     }
 
-    /// Complete a previously begun registration.  If the lifecycle has
-    /// already closed, this method remains the exact runtime owner and awaits
-    /// the handle itself instead of aborting or dropping it.
-    pub(crate) async fn finish_peer_event_pump_registration(&self, pump: JoinHandle<()>) {
-        let mut pump = Some(pump);
-        let await_here = {
+    /// Synchronous, infallible custody handoff after pre-admission. There is no
+    /// await or further provider acquisition between spawn and installation.
+    pub(crate) fn finish_peer_event_pump_registration(
+        &self,
+        mut registration: PeerEventPumpRegistration<'_>,
+        pump: JoinHandle<()>,
+    ) {
+        assert!(std::ptr::eq(self, registration.state));
+        {
             let mut registry = self.peer_event_pumps.lock();
-            debug_assert!(registry.pending_registrations > 0);
-            registry.pending_registrations -= 1;
-            if registry.closed {
-                true
-            } else {
-                registry
-                    .handles
-                    .push(pump.take().expect("open registration owns its pump"));
-                false
-            }
-        };
-        self.peer_event_pump_ready.notify_waiters();
-        if await_here {
-            if let Err(error) = pump
+            assert!(registry.pending_registrations > 0 && !registry.closed);
+            let entry = registration
+                .entry
                 .take()
-                .expect("closed registration retains its pump")
-                .await
-            {
-                tracing::warn!(%error, "late peer event pump failed during registration");
-            }
+                .expect("unconsumed pump reservation");
+            registry
+                .handles
+                .push(PeerEventPumpSlot::Running(pump), entry);
+            registry.pending_registrations -= 1;
         }
+        self.peer_event_pump_ready.notify_waiters();
+        self.task_completion_waker.wake();
     }
 
-    /// Complete an introduced pump registration directly into its existing
-    /// demand record. The pending count is decremented under the SAME lifecycle
-    /// lock as this transfer; shutdown cannot miss both owners in between.
-    /// A non-introduced owner leaves the original registration unchanged.
+    /// Transfer to the existing exact demand record under the SAME lifecycle
+    /// lock. A refused transfer leaves both token and handle with the caller.
     pub(super) fn finish_introduced_pump_registration(
         &self,
+        registration: &mut PeerEventPumpRegistration<'_>,
         owner: &PeerOwnerToken,
         pump: JoinHandle<()>,
     ) -> std::result::Result<(), JoinHandle<()>> {
+        assert!(std::ptr::eq(self, registration.state));
         let (Some(pool), Ok(key)) = (
             self.demand_links.as_ref(),
             DeviceId::canonical_key_bytes(owner.device_id()),
@@ -8958,31 +9201,37 @@ impl NetworkState {
         else {
             return Err(pump);
         };
-        assert!(lifecycle.pending_registrations > 0);
-        assert!(
-            !lifecycle.closed,
-            "pending registration precedes lifecycle close"
-        );
+        assert!(lifecycle.pending_registrations > 0 && !lifecycle.closed);
+        let entry = registration
+            .entry
+            .take()
+            .expect("unconsumed pump reservation");
         link.pump = Some(pump);
         link.pump_registered = true;
         lifecycle.pending_registrations -= 1;
         drop(pool);
         drop(lifecycle);
+        // The existing funded demand record now owns the exact handle.
+        drop(entry);
         self.peer_event_pump_ready.notify_waiters();
         Ok(())
     }
 
-    /// Transport-lab-only access to the production peer-pump registration
-    /// fence. The integration control uses the same begin/finish ownership
-    /// path as the engine and cannot install an unregistered worker.
+    /// Lab access uses the same move-only cancellation and handle handoff.
     #[cfg(feature = "transport-lab")]
-    pub fn begin_peer_event_pump_registration_for_lab(&self) -> bool {
+    pub fn begin_peer_event_pump_registration_for_lab(
+        &self,
+    ) -> Option<PeerEventPumpRegistration<'_>> {
         self.begin_peer_event_pump_registration()
     }
 
     #[cfg(feature = "transport-lab")]
-    pub async fn finish_peer_event_pump_registration_for_lab(&self, pump: JoinHandle<()>) {
-        self.finish_peer_event_pump_registration(pump).await;
+    pub fn finish_peer_event_pump_registration_for_lab(
+        &self,
+        registration: PeerEventPumpRegistration<'_>,
+        pump: JoinHandle<()>,
+    ) {
+        self.finish_peer_event_pump_registration(registration, pump);
     }
 
     /// Wait until shutdown has reached its exact peer-pump drain barrier.
@@ -10533,6 +10782,77 @@ mod introduction_settlement_controls {
         Ok(ticket)
     }
 
+    /// Actual signed Request/Accept setup and the production introduced
+    /// constructor entry. Carrier authentication uses the existing local
+    /// fixture; this is not a claim of an end-to-end remote handshake.
+    #[tokio::test]
+    async fn v1_introduced_pump_pressure_precedes_placeholder_and_native_binding() {
+        let remote = crate::identity::Identity::ephemeral();
+        let hub = crate::identity::Identity::ephemeral();
+        let (state, signals, commands, provider, grant) =
+            super::super::build_test_state_parts_metered_with_application(
+                "v1-introduced-pump-pressure",
+                None,
+                2,
+                Some(retained_plan(remote.public_id())),
+                None,
+                Some(policy()),
+            );
+        state.park_command_receiver_for_test(commands);
+        let fixture = super::super::insert_promoted_peer(&state, hub.public_id()).await;
+        configure_carrier_topology(&state, hub.public_id());
+        let worker = fixture.peer.current_worker().unwrap();
+        let carrier = state
+            .peers
+            .owner(hub.public_id())
+            .unwrap()
+            .for_worker(Arc::clone(&worker));
+        let mut outbound = state.take_signaling_outbound_rx().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let ticket = prepare_reuse_ticket(&state, &remote, &hub, &carrier)?;
+            while outbound.try_recv().is_some() {}
+            let root = state.hub_introductions.as_ref().unwrap();
+            let before = root.lock().native_was_bound(ticket);
+            let refused = state.peer_event_pump_refusals_for_test();
+            let record =
+                FiniteResourceProvider::reservation_charge_for_test(ResourceClaim::ZERO).unwrap();
+            let remaining = grant
+                .checked_sub(provider.in_use())
+                .unwrap()
+                .checked_sub(record)
+                .unwrap();
+            let seal = state.cmd_tx.reserve_for_test(remaining).unwrap();
+            let sealed = provider.in_use();
+            super::super::ensure_peer_session_with_introduction(
+                &state,
+                remote.public_id(),
+                crate::transport::Role::Offerer,
+                Some(ticket),
+            )
+            .await;
+            let observed = before == Some(false)
+                && root.lock().native_was_bound(ticket) == before
+                && state.peer_event_pump_refusals_for_test() == refused + 1
+                && state.peer_event_pump_counts_for_test() == (0, 0)
+                && state.demand_links.as_ref().unwrap().lock().links.len() == 0
+                && !state.peers.contains_key(remote.public_id())
+                && state.peers.get_if_current(&carrier).is_some()
+                && worker.live_connector_incarnation().is_some()
+                && outbound.try_recv().is_none()
+                && sealed == grant
+                && provider.in_use() == sealed;
+            drop(seal);
+            Ok::<bool, Error>(observed)
+        })
+        .await;
+        state.shutdown().await;
+        drop((outbound, signals, fixture, carrier, worker));
+        assert!(
+            matches!(result, Ok(Ok(true))),
+            "introduced pump pressure: {result:?}"
+        );
+    }
+
     #[derive(Debug)]
     struct ProtectedReuseObservations {
         sticky: bool,
@@ -10648,19 +10968,19 @@ mod introduction_settlement_controls {
             state.add_sticky(remote.public_id());
             let sticky = state.is_sticky(remote.public_id());
             let pinned = state.config.read().pinned_peers.iter().any(|id| id == remote.public_id());
-            if !state.begin_peer_event_pump_registration() {
+            let Some(mut pump_registration) = state.begin_peer_event_pump_registration() else {
                 drop(events);
                 return Err(Error::Network("original pump registration setup refused".into()));
-            }
+            };
             let pump = super::super::spawn_peer_event_pump_with_terminal(
                 Arc::clone(&state), remote.public_id().to_owned(), Arc::clone(&worker),
                 events, Some(owner.clone()), hold_pump_terminal(terminal_gate.clone()),
             );
-            if let Err(pump) = state.finish_introduced_pump_registration(&owner, pump) {
+            if let Err(pump) = state.finish_introduced_pump_registration(&mut pump_registration, &owner, pump) {
                 gate.open();
                 terminal_gate.open();
                 let _ = worker.retire_and_close().await;
-                state.finish_peer_event_pump_registration(pump).await;
+                state.finish_peer_event_pump_registration(pump_registration, pump);
                 return Err(Error::Network("exact pump transfer setup refused".into()));
             }
             let registered = state.demand_links.as_ref().unwrap().lock().links.get(&key)
@@ -10968,13 +11288,15 @@ mod introduction_settlement_controls {
             state.add_sticky(remote.public_id());
             super::super::spawn_registered_peer_event_pump(
                 &state,
+                state
+                    .begin_peer_event_pump_registration()
+                    .expect("fixture pump reservation"),
                 Arc::clone(&state),
                 remote.public_id().to_owned(),
                 Arc::clone(&w0),
                 events0,
                 Some(owner0.clone()),
-            )
-            .await;
+            );
             super::super::handshake::on_deny(
                 &state,
                 &owner0,
@@ -11026,6 +11348,7 @@ mod introduction_settlement_controls {
                 drop(super::super::IntroductionConstruction {
                     state: &state,
                     permit: &permit,
+                    cleanup_registration: Some(state.reserve_shutdown_task_registration()?),
                     owner: unstarted_owner.clone(),
                     ticket: ticket0,
                     armed: true,
@@ -11064,13 +11387,15 @@ mod introduction_settlement_controls {
             )?;
             super::super::spawn_registered_peer_event_pump(
                 &state,
+                state
+                    .begin_peer_event_pump_registration()
+                    .expect("fixture pump reservation"),
                 Arc::clone(&state),
                 remote.public_id().to_owned(),
                 Arc::clone(&w1),
                 events1,
                 Some(owner1.clone()),
-            )
-            .await;
+            );
             state
                 .settle_failed_introduction(key, ticket0, generation0)
                 .await;
@@ -11304,7 +11629,7 @@ mod introduction_settlement_controls {
         let mut pump_boundary_observed = cancel_actor;
         let mut duplicate_observed = cancel_actor;
         if let Ok((owner, ticket, key, generation)) = &setup {
-            if state.begin_peer_event_pump_registration() {
+            if let Some(mut pump_registration) = state.begin_peer_event_pump_registration() {
                 let (pending, before_handles) = state.peer_event_pump_counts_for_test();
                 let held_terminal = terminal_gate.clone();
                 let pump = super::super::spawn_peer_event_pump_with_terminal(
@@ -11315,13 +11640,25 @@ mod introduction_settlement_controls {
                     Some(owner.clone()),
                     hold_pump_terminal(held_terminal),
                 );
-                let transferred = match state.finish_introduced_pump_registration(owner, pump) {
+                let transferred = match state.finish_introduced_pump_registration(
+                    &mut pump_registration,
+                    owner,
+                    pump,
+                ) {
                     Ok(()) => true,
                     Err(pump) => {
-                        state.finish_peer_event_pump_registration(pump).await;
+                        state.finish_peer_event_pump_registration(pump_registration, pump);
                         false
                     }
                 };
+                // Poll the production completion owner after transfer. The
+                // live introduced pump must remain exclusively in its exact
+                // demand record, not become a second registry-owned handle.
+                std::future::poll_fn(|cx| {
+                    let _ = state.poll_task_completions(cx);
+                    std::task::Poll::Ready(())
+                })
+                .await;
                 let (after_pending, after_handles) = state.peer_event_pump_counts_for_test();
                 registration_observed = transferred
                     && pending == 1
@@ -11338,13 +11675,15 @@ mod introduction_settlement_controls {
             } else {
                 super::super::spawn_registered_peer_event_pump(
                     &state,
+                    state
+                        .begin_peer_event_pump_registration()
+                        .expect("fixture pump reservation"),
                     Arc::clone(&state),
                     remote.public_id().to_owned(),
                     Arc::clone(&worker),
                     events,
                     Some(owner.clone()),
-                )
-                .await;
+                );
             }
             eprintln!(
                 "settlement-stage: pump-registration-complete observed={registration_observed}"
@@ -12023,7 +12362,9 @@ mod introduction_settlement_controls {
         );
         let mut observations = None;
         if let Ok((owner, ticket, key, generation)) = &setup {
-            let registered = if state.begin_peer_event_pump_registration() {
+            let registered = if let Some(mut pump_registration) =
+                state.begin_peer_event_pump_registration()
+            {
                 let pump = super::super::spawn_peer_event_pump(
                     Arc::clone(&state),
                     remote.public_id().to_owned(),
@@ -12031,10 +12372,11 @@ mod introduction_settlement_controls {
                     events,
                     Some(owner.clone()),
                 );
-                match state.finish_introduced_pump_registration(owner, pump) {
+                match state.finish_introduced_pump_registration(&mut pump_registration, owner, pump)
+                {
                     Ok(()) => true,
                     Err(pump) => {
-                        state.finish_peer_event_pump_registration(pump).await;
+                        state.finish_peer_event_pump_registration(pump_registration, pump);
                         false
                     }
                 }
@@ -12509,65 +12851,232 @@ mod opaque_control_funding_tests {
 
 #[cfg(test)]
 mod shutdown_task_registry_tests {
-    use super::ShutdownTaskRegistry;
-    use std::sync::{Arc, Mutex};
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    async fn drain(registry: &mut ShutdownTaskRegistry) {
+        std::future::poll_fn(|cx| {
+            registry.poll_completed(cx);
+            if registry.handles.is_empty() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn v4_shutdown_task_registry_joins_and_observes_each_terminal_result() {
-        let finished = Arc::new(Mutex::new(Vec::new()));
+        let state = crate::engine::build_test_state("task-registry-terminal");
+        let finished = Arc::new(AtomicUsize::new(0));
         let mut registry = ShutdownTaskRegistry::new();
         let first = Arc::clone(&finished);
         registry.push(
             tokio::spawn(async move {
-                first.lock().expect("test witness lock").push("completed");
+                first.fetch_add(1, Ordering::SeqCst);
             }),
             false,
+            state.reserve_shutdown_task_registration().unwrap().0,
         );
         registry.push(
             tokio::spawn(async { panic!("test panic is observed") }),
             false,
+            state.reserve_shutdown_task_registration().unwrap().0,
         );
-
-        let handles = registry.take_for_shutdown();
-        assert!(registry.closed);
-        assert!(registry.handles.is_empty());
-        let mut outcomes = Vec::new();
-        for task in handles {
-            outcomes.push(task.handle.await);
-        }
-        assert!(outcomes[0].is_ok());
-        assert!(outcomes[1]
-            .as_ref()
-            .expect_err("panic must be observed")
-            .is_panic());
-        assert_eq!(*finished.lock().expect("test witness lock"), ["completed"]);
+        drain(&mut registry).await;
+        let terminals = registry.terminals;
+        let empty = registry.handles.is_empty();
+        let joined_before_close = !registry.closed;
+        registry.close();
+        state.shutdown().await;
+        assert!(joined_before_close && registry.closed && empty);
+        assert_eq!(terminals, [1, 1, 0]);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn v4_shutdown_task_registry_cancels_and_observes_delayed_terminal() {
+        let state = crate::engine::build_test_state("task-registry-cancel");
         let mut registry = ShutdownTaskRegistry::new();
         registry.push(
-            tokio::spawn(async {
-                std::future::pending::<()>().await;
-            }),
+            tokio::spawn(std::future::pending::<()>()),
             true,
+            state.reserve_shutdown_task_registration().unwrap().0,
         );
+        registry.close();
+        drain(&mut registry).await;
+        let terminals = registry.terminals;
+        state.shutdown().await;
+        assert_eq!(terminals, [0, 0, 1]);
+        assert!(registry.handles.is_empty());
+    }
 
-        let tasks = registry.take_for_shutdown();
-        assert_eq!(tasks.len(), 1);
-        for task in &tasks {
-            if task.cancel_on_shutdown {
-                task.handle.abort();
+    #[tokio::test]
+    async fn v1_task_completion_poll_cancel_and_registration_close_keep_exact_handles() {
+        let state = crate::engine::build_test_state("task-registry-races");
+        let permit = state.try_admit_shutdown_mutation().unwrap();
+        let (release, wait) = oneshot::channel();
+        assert!(
+            state.register_shutdown_task(&permit, || tokio::spawn(async move {
+                let _ = wait.await;
+            }))
+        );
+        let mut barrier = Box::pin(state.join_registered_tasks_for_test());
+        let initially_pending = futures::poll!(&mut barrier).is_pending();
+        drop(barrier); // no handle moved to the cancelled polling future
+        let retained = state.task_registry_counts_for_test().0;
+        state.request_shutdown();
+        // This pre-admitted witness may still register after request_shutdown.
+        assert!(state.register_cancellable_shutdown_task(&permit, || {
+            tokio::spawn(std::future::pending::<()>())
+        }));
+        drop(permit);
+        let _ = release.send(());
+        state.shutdown().await;
+        let tasks = state.shutdown_tasks.lock();
+        let tasks = tasks.as_ref().unwrap();
+        assert!(initially_pending);
+        assert_eq!(retained, 1);
+        assert!(tasks.closed && tasks.handles.is_empty());
+        assert_eq!(tasks.terminals, [1, 0, 1]);
+        assert!(state.try_admit_shutdown_mutation().is_none());
+    }
+
+    #[tokio::test]
+    async fn v1_pump_completion_batches_and_pending_close_observe_each_join() {
+        let state = crate::engine::build_test_state("pump-registry-batches");
+        for batch in [1usize, 4, 8, 4] {
+            for _ in 0..batch {
+                let pump_registration = state
+                    .begin_peer_event_pump_registration()
+                    .expect("pump reservation");
+                state
+                    .finish_peer_event_pump_registration(pump_registration, tokio::spawn(async {}));
             }
+            std::future::poll_fn(|cx| {
+                let _ = state.poll_task_completions(cx);
+                if state.peer_event_pumps.lock().handles.is_empty() {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(state.peer_event_pump_counts_for_test(), (0, 0));
+            assert!(!state.peer_event_pumps.lock().closed);
         }
-        let error = tasks
-            .into_iter()
-            .next()
-            .expect("one delayed task")
-            .handle
-            .await
-            .expect_err("shutdown cancellation is observed");
-        assert!(error.is_cancelled());
+        let pump_registration = state
+            .begin_peer_event_pump_registration()
+            .expect("pump reservation");
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        state.finish_peer_event_pump_registration(pump_registration, cancelled);
+        let pump_registration = state
+            .begin_peer_event_pump_registration()
+            .expect("pump reservation");
+        let shutdown = state.shutdown();
+        tokio::pin!(shutdown);
+        let pending_registration_blocks = futures::poll!(&mut shutdown).is_pending();
+        state.finish_peer_event_pump_registration(
+            pump_registration,
+            tokio::spawn(async {
+                panic!("registered pump panic must be joined");
+            }),
+        );
+        shutdown.await;
+        let pumps = state.peer_event_pumps.lock();
+        assert!(pending_registration_blocks);
+        assert_eq!(pumps.terminals, [17, 1, 1]);
+        assert!(pumps.handles.is_empty() && pumps.closed);
+        drop(pumps);
+        assert!(state.begin_peer_event_pump_registration().is_none());
+    }
+
+    #[tokio::test]
+    async fn v1_abandoned_pump_reservation_releases_funding_and_shutdown_fence() {
+        let (state, signaling, commands, provider, _) =
+            crate::engine::build_test_state_parts_metered("v1-abandoned-pump", None, 2, None);
+        state.park_command_receiver_for_test(commands);
+        let baseline = (provider.in_use(), provider.active_reservations());
+        let first = state
+            .begin_peer_event_pump_registration()
+            .expect("first reservation");
+        let second = state
+            .begin_peer_event_pump_registration()
+            .expect("second reservation");
+        let two_pending = state.peer_event_pump_counts_for_test() == (2, 0);
+        drop(first);
+        let one_pending = state.peer_event_pump_counts_for_test() == (1, 0);
+        drop(second);
+        let released = baseline == (provider.in_use(), provider.active_reservations());
+        let last = state
+            .begin_peer_event_pump_registration()
+            .expect("last reservation");
+        let shutdown = state.shutdown();
+        tokio::pin!(shutdown);
+        let blocked = futures::poll!(&mut shutdown).is_pending();
+        drop(last);
+        shutdown.await;
+        let drained = state.peer_event_pump_counts_for_test() == (0, 0);
+        drop(signaling);
+        assert!(two_pending && one_pending && released && blocked && drained);
+        assert!(state.begin_peer_event_pump_registration().is_none());
+    }
+
+    #[tokio::test]
+    async fn v1_registration_node_funding_survives_cancelled_join_until_terminal() {
+        let (state, signaling, commands, provider, _) =
+            crate::engine::build_test_state_parts_metered("v1-registration-funding", None, 2, None);
+        state.park_command_receiver_for_test(commands);
+        let baseline = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let permit = state.try_admit_shutdown_mutation().unwrap();
+        let (release, wait) = oneshot::channel();
+        let started = state.register_shutdown_task(&permit, || {
+            tokio::spawn(async move {
+                let _ = wait.await;
+            })
+        });
+        let retained = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let mut joining = Box::pin(state.join_registered_tasks_for_test());
+        let pending = futures::poll!(&mut joining).is_pending();
+        drop(joining);
+        let after_cancel = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let _ = release.send(());
+        state.join_registered_tasks_for_test().await;
+        let after_join = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        drop(permit);
+        state.shutdown().await;
+        drop(signaling);
+        assert!(started && pending);
+        assert_ne!(
+            retained, baseline,
+            "the actual registration owns provider custody"
+        );
+        assert_eq!(
+            after_cancel, retained,
+            "cancelling the poll releases no registration"
+        );
+        assert_eq!(
+            after_join, baseline,
+            "exact terminal join frees the funded node"
+        );
     }
 }
 

@@ -179,7 +179,7 @@ pub use handle::{
     TransportLabIntroductionPhase, TransportLabIntroductionRecord,
     TransportLabIntroductionSnapshot, TransportLabPromotedPeer, TransportLabRetirableSession,
 };
-pub use identity::{generate_network_id, normalize_network_id, Identity};
+pub use identity::{generate_network_id, normalize_device_id, normalize_network_id, Identity};
 pub use myownmesh_signaling::local::LocalBroker;
 pub use protocol::CapabilityAdvert;
 pub use resource::{

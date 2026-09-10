@@ -826,7 +826,8 @@ impl JoinedNetwork {
     }
     /// Single-peer detail.
     pub fn peer(&self, device_id: &str) -> Option<PeerInfo> {
-        self.state.peer_info(device_id)
+        let device_id = crate::identity::normalize_device_id(device_id).ok()?;
+        self.state.peer_info(&device_id)
     }
 
     /// Return a fixed, read-only observation of this node's local HubTree
@@ -1195,6 +1196,13 @@ impl JoinedNetwork {
     /// re-adding the network. Fire-and-forget: the work runs on the engine
     /// driver so it's serialized with every other per-peer mutation.
     pub fn reconnect(&self, peer: Option<String>) {
+        let peer = match peer {
+            Some(peer) => match crate::identity::normalize_device_id(&peer) {
+                Ok(peer) => Some(peer),
+                Err(_) => return,
+            },
+            None => None,
+        };
         self.state.reconnect(peer);
     }
 
@@ -1215,9 +1223,9 @@ impl JoinedNetwork {
     /// presence. `Ok(())` means the command was queued, not that the peer
     /// connected — observe [`crate::PeerEvent`]s for the outcome.
     pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
-        let device_id = peer_registry_key(device_id);
+        let device_id = crate::identity::normalize_device_id(device_id)?;
         self.state
-            .request_connect_peer(device_id.to_string(), false, None)
+            .request_connect_peer(device_id, false, None)
             .map_err(|error| error.into_admission_error())?;
         Ok(())
     }
@@ -1237,8 +1245,9 @@ impl JoinedNetwork {
         sticky: bool,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        let device_id = peer_registry_key(device_id);
-        match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await {
+        let device_id = crate::identity::normalize_device_id(device_id)?;
+        match tokio::time::timeout(timeout, self.state.connect_peer_wait(&device_id, sticky)).await
+        {
             Ok(result) => result,
             Err(_) => Err(Error::Network(format!(
                 "connect to {device_id} still pending after {timeout:?} (the dial keeps going{})",
@@ -1262,7 +1271,9 @@ impl JoinedNetwork {
     /// being redialed on announce and its never-expiring intent is
     /// dropped. Does not tear down a live session.
     pub fn unpin_peer(&self, device_id: &str) {
-        self.state.remove_sticky(device_id);
+        if let Ok(device_id) = crate::identity::normalize_device_id(device_id) {
+            self.state.remove_sticky(&device_id);
+        }
     }
 
     /// Send an application frame with the acknowledged-delivery contract: the

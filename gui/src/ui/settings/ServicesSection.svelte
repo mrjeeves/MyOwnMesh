@@ -371,6 +371,27 @@
             />
             <span class="unit">0 = unlimited — a global QoS cap on every allocation</span>
           </label>
+          <label class="field">
+            <span>Relay port minimum</span>
+            <input
+              type="number"
+              min="0"
+              max="65535"
+              bind:value={draft.turn.relay_port_min}
+              oninput={markDirty}
+            />
+            <span class="unit">0 = OS ephemeral range</span>
+          </label>
+          <label class="field">
+            <span>Relay port maximum</span>
+            <input
+              type="number"
+              min="0"
+              max="65535"
+              bind:value={draft.turn.relay_port_max}
+              oninput={markDirty}
+            />
+          </label>
         </div>
 
         <div class="creds">
