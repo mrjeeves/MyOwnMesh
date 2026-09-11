@@ -280,7 +280,19 @@ fn ensure_valid_config_for_transaction(config_path: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("read config {}", config_path.display()));
         }
     }
-    Ok(())
+
+    // `transaction_at` uses the complete loader validation path, including
+    // the current schema version, TURN policy, and every configured network
+    // policy.  Return a private sentinel from the mutation closure so the
+    // validated snapshot is never committed or reformatted.
+    const VALIDATION_SENTINEL: &str = "caddy config validation complete";
+    match MeshConfig::transaction_at::<()>(config_path, |_| {
+        Err(myownmesh_core::Error::Config(VALIDATION_SENTINEL.into()))
+    }) {
+        Err(myownmesh_core::Error::Config(message)) if message == VALIDATION_SENTINEL => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error)).context("validate config"),
+        Ok(()) => unreachable!("Caddy validation transaction must return its sentinel"),
+    }
 }
 
 fn persist_public_services_at(
@@ -1368,6 +1380,34 @@ mod tests {
             Some("203.0.113.8"),
         )
         .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).expect("read preserved config"), before);
+        remove_test_config(&path);
+    }
+
+    #[tokio::test]
+    async fn install_caller_rejects_unsupported_version_before_side_effects() {
+        let path = test_config_path("unsupported-version");
+        let mut config = MeshConfig::default();
+        config.version = myownmesh_core::config::CONFIG_VERSION + 1;
+        let before = serde_json::to_vec_pretty(&config).expect("serialize unsupported config");
+        std::fs::write(&path, &before).expect("write unsupported config");
+
+        let result = install_and_configure_at(&path, "turn.example.com", None, None).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).expect("read preserved config"), before);
+        remove_test_config(&path);
+    }
+
+    #[tokio::test]
+    async fn install_caller_rejects_semantic_invalid_config_before_side_effects() {
+        let path = test_config_path("semantic-invalid");
+        let mut config = MeshConfig::default();
+        config.services.turn.tcp_auth_timeout_ms = 0;
+        let before = serde_json::to_vec_pretty(&config).expect("serialize invalid config");
+        std::fs::write(&path, &before).expect("write invalid config");
+
+        let result = install_and_configure_at(&path, "turn.example.com", None, None).await;
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).expect("read preserved config"), before);
         remove_test_config(&path);

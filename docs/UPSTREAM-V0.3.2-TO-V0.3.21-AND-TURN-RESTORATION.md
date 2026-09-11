@@ -439,27 +439,31 @@ V4-exact. Existing V4 mDNS/native controls must supply any runtime claim.
 
 ## Deliberate security adaptations beyond upstream
 
-These are manager-selected restoration requirements. **Both remain pending
-source freeze, tests and independent audit in this ledger.**
+These manager-selected restoration requirements are **implemented and locally
+tested** under the source binding and run records in final rows T10–T11 below.
+**Independent final audit remains pending; local PASS does not close that gate.**
 
-- **T10 — trusted proxy admission:** managed Caddy TLS sends PROXYv2 to a distinct
-  **loopback-only backend port 3479**, allowing bridge quotas to use the original
-  client IP. Public direct TCP must never trust PROXY headers. A TLS-only install
-  leaves public plaintext direct TCP disabled. This replaces the upstream
-  same-control-port backend plan; it does not generalize trust to arbitrary
-  loopback callers, XFF headers or Internet senders. Exact managed-proxy provenance,
-  bounded header parsing and missing/malformed/untrusted rejection must be
-  independently qualified. The configuration and deployment owners must document
-  the actual trust boundary; this inventory does not assert that loopback alone
-  authenticates a Caddy process.
-- **T11 — nonce retention:** replace abandoned per-challenge retained nonce
-  accumulation with **one reusable live nonce**, plus expiry sweep/release.
-  The manager reports a reproduced abandoned nonce-lease exhaustion; this is the
-  selected correction, not a tested outcome here. Relevant existing source is
+- **T10 — trusted proxy admission:** managed Caddy TLS is configured to send
+  PROXYv2 to a distinct **loopback-only backend port 3479**, allowing bridge quotas
+  to use the original client IP. Public direct TCP rejects PROXY headers, and
+  TLS-only configuration leaves public plaintext direct TCP disabled. This
+  replaces the upstream same-control-port backend plan; it does not generalize
+  trust to arbitrary loopback callers, XFF headers or Internet senders.
+  Workspace `922b6658` passed all 16 service TCP/TLS controls, including original-IP
+  quotas, direct-PROXY spoof and missing-header refusal, proxy-only mode and
+  authenticated TLS/proxy UDP relay. Caddy `8ab78917` passed 14/14 rendering and
+  installer controls. The local test TLS front end is not deployed Caddy,
+  ACME, firewall or cloud evidence; loopback is not process identity.
+  Native forced TLS and RFC 6062 TCP peer allocation are not proven.
+- **T11 — nonce retention:** abandoned per-challenge retained nonce accumulation
+  is replaced with **one reusable live nonce**, plus expiry sweep/release, in
   `vendor/turn-0.10.0/src/server/request.rs` and server-owned nonce state/lifecycle.
-  Qualification must retain authentication/integrity behavior, live-nonce reuse,
-  expiry and lease-release checks, pressure/refusal behavior and terminal cleanup.
-  No larger nonce quota or authentication bypass is a substitute.
+  Full vendor TURN `ed6bc516` passed 70/70 controls, including abandoned/concurrent
+  challenge reuse, legitimate authentication, expiry/stale replacement and
+  close/drop lease release. This is a locally tested resource correction, not a
+  larger nonce quota or authentication bypass. Independent final review of nonce
+  authorization, retention and terminal cleanup remains pending; these local
+  results do not establish deployment or physical-network qualification.
 
 These extra V4 adaptations are additional action rows, not fictitious upstream
 commits. They do not alter any tag/release metadata above or retroactively change
