@@ -26,7 +26,6 @@ system-dnssd = []
 
 [dependencies]
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }

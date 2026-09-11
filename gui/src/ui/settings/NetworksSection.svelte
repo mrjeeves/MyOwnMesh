@@ -7,8 +7,8 @@
    *                  auto-approve, export, and remove
    *    Connections — live per-peer table (connections only; pending
    *                  approvals live in the top-level Approvals tab)
-   *    Roster      — approved devices + role assignment + pre-authorise
-   *    Governance  — open/closed kind + propose / sign / deny / split
+   *    Roster      — read-only approved devices + exact role operations
+   *    Governance  — config kind plus transactional MFA custody
    *
    *  Status / Settings / Roster / Governance reuse the per-network panels
    *  that used to live in a floating overlay over the graph — that
@@ -23,7 +23,6 @@
   import NetworkSettingsPanel from "../network/NetworkSettingsPanel.svelte";
   import NetworkRosterPanel from "../network/NetworkRosterPanel.svelte";
   import NetworkGovernancePanel from "../network/NetworkGovernancePanel.svelte";
-  import { governance } from "../../network-governance.svelte";
 
   const {
     focusedConfigId,
@@ -77,10 +76,6 @@
     selected ? meshClient.peersByNetwork[selected.config_id] ?? [] : [],
   );
 
-  const pendingProposals = $derived(
-    selected ? governance.stateFor(selected.config_id).pending.length : 0,
-  );
-
   function shortId(id: string): string {
     if (id.length <= 16) return id;
     return id.slice(0, 8) + "…" + id.slice(-6);
@@ -110,9 +105,6 @@
       onclick={() => (tab = "governance")}
     >
       Governance
-      {#if pendingProposals > 0}
-        <span class="badge">{pendingProposals}</span>
-      {/if}
     </button>
   </div>
 

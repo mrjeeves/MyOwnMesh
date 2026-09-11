@@ -10,74 +10,108 @@ instead: `cargo install --path crates/myownmesh` then
 
 ## 1. Dependencies
 
-The library crates aren't on crates.io yet — pin them to a release
-tag via git:
+Depend on the exact `myownmesh-core` release tag selected for your deployment.
+The repository tag is the source distribution; replace `vX.Y.Z` below with the
+chosen tag:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.3" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.3.3" }  # only if you want the Nostr driver
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX.Y.Z" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-`tag = "v0.3.3"` gets reproducible builds; switch to
-`branch = "main"` if you're tracking the latest work. Both crates
-resolve out of the same checkout because cargo dedupes git deps by
-URL. See [`../RELEASE.md`](../RELEASE.md) for the published-artifact
-catalogue.
+For a workspace checkout, use the corresponding path dependencies instead.
 
 ## 2. Open the mesh
 
-`Mesh::open` loads (or generates on first call) this device's
-long-lived ed25519 identity from
-`~/.myownmesh/.secrets/identity.json` and constructs the shared
-WebRTC API.
+`Mesh::open_connector_capable` loads (or generates on first call) this device's
+long-lived ed25519 identity from `~/.myownmesh/.secrets/identity.json` and
+constructs the shared WebRTC API with the caller's explicit connector policy.
+Use `Mesh::open_infrastructure_only` only for a runtime that does not join a
+network. The connector-capable path is intentionally not given a library
+capacity default: the application/process owner supplies a real
+`ResourceProvider` grant and a WebRTC profile.
 
 ```rust
-use myownmesh_core::{Mesh, MeshConfig};
+use myownmesh_core::{
+    ConnectorCallbackPolicy, Mesh, MeshConfig, MeshHandle, ResourceProvider,
+    ResourceProviderPort, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+};
 
-let mesh = Mesh::open(MeshConfig::default()).await?;
+async fn open_mesh(
+    provider: impl ResourceProvider,
+    config: MeshConfig,
+) -> myownmesh_core::Result<MeshHandle> {
+// `provider` (and its finite grant) is selected by the application owner. It
+// is not inferred by MyOwnMesh and this guide does not prescribe its size.
+let resources = ResourceProviderPort::new(provider)?;
+let webrtc = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_realtime());
+let connector_policy = WebRtcConnectorCapablePolicy::new(resources, webrtc);
+let mesh = Mesh::open_connector_capable(config, connector_policy).await?;
 println!("device id: {}", mesh.identity().display_id());
+Ok(mesh)
+}
 ```
 
-The returned `MeshHandle` is cheap to clone — multiple subsystems in
+The connector-capable constructor takes an explicit provider policy. Resource
+ownership and transport admission stay inside the runtime; applications do not
+need to reproduce internal resource formulas in this guide.
+
+`ConnectorCallbackPolicy::elastic_data_only()` supports ordinary typed channels,
+RPC, and reliable messages, but disables generic opaque bytes and RTP flow
+admission. Generic opaque flows use
+`ConnectorCallbackPolicy::elastic_realtime()` and need no codec profile. For
+RTP, use that same realtime policy, build a validated `WebRtcRealtimeProfile`
+with `WebRtcRealtimeProfile::new(...)`, and apply it with
+`WebRtcConnectorProfile::with_realtime_profile(...)` before opening the mesh
+and before creating peers. The exact codec/profile inputs are application
+policy and must be registered before peer connections exist. An
+infrastructure-only mesh or a connector policy without caller-owned resource
+provider admission cannot open opaque flows.
+
+The returned `MeshHandle` is cheap to clone. Multiple subsystems in
 your app can hold one.
 
 ## 3. Join a network
 
 ```rust
-use myownmesh_core::{NetworkConfig, TopologyMode};
+use myownmesh_core::{NetworkConfig, NetworkKind, SemanticPolicyConfig, TopologyMode};
 
-let net = mesh.join(NetworkConfig {
-    id: "home".into(),                          // local config record id
-    network_id: "my-cool-mesh".into(),          // wire-level rendezvous handle
-    label: "Home mesh".into(),
-    kind: Default::default(),                   // Open governance
-    topology: TopologyMode::default(),          // Ring
-    signaling: Default::default(),
-    stun_servers: Default::default(),
-    turn_servers: Default::default(),
-    roster_path: None,
-    auto_approve: false,
-}).await?;
+// Fragment inside an application configuration loader: production requires
+// the complete owner-selected semantic policy. Load it from the deployment's
+// persisted configuration or construct every field deliberately;
+// SemanticPolicyConfig has no production Default.
+// The same owner-supplied configuration provides the TURN list and optional
+// introduction policy used below.
+let semantic_policy: SemanticPolicyConfig = load_owner_policy()?;
+let mut network = NetworkConfig::from_network_id_with_semantic_policy(
+    "home",
+    "my-cool-mesh",
+    semantic_policy,
+);
+network.label = "Home mesh".into();
+network.kind = NetworkKind::Open;
+network.topology = TopologyMode::default();
+let net = mesh.join(network).await?;
 ```
 
-Then attach a signaling driver. For production, use Nostr:
+Then attach a signaling driver with `JoinedNetwork::attach_signaling()`. Retain
+the returned `Option<SignalingDrivers>` while the network runs. If it is
+`Some`, shut that owner down before shutting down the joined network; `None`
+means another in-process owner already took the outbound receiver:
 
 ```rust
-let nostr_handle = myownmesh_core::engine::attach_nostr(&net.state());
+let drivers = net.attach_signaling()?;
+// ... use `net` ...
+if let Some(drivers) = drivers {
+    drivers.shutdown().await;
+}
+net.shutdown().await?;
 ```
 
-For in-process testing (single-process app with multiple
-`MeshHandle`s), use the local broker:
-
-```rust
-use myownmesh_signaling::local::LocalBroker;
-
-let broker = LocalBroker::new();
-myownmesh_core::engine::attach_local(&net.state(), &broker);
-```
+`attach_local` and `LocalBroker` are `transport-lab` test seams, not advertised
+production carriers and not part of this guide's application deployment path.
 
 ## 4. Subscribe to events
 
@@ -110,7 +144,8 @@ carries every state transition the engine emits (`Sighted`,
 ## 5. Typed channels
 
 `Channel<T>` is a typed publish/subscribe channel keyed by name. The
-same name on two peers binds their senders to receivers.
+same name on two peers binds their senders to receivers. `T` must implement
+`Serialize + DeserializeOwned + Send + Sync + 'static`.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -120,7 +155,15 @@ struct Greeting { from: String, text: String }
 
 let chan = net.channel::<Greeting>("greetings");
 
-// Send to one peer
+// Send to one peer and wait for the peer engine to hand it to the application layer.
+// This is not application processing or durable persistence acknowledgement.
+chan.send_to_acked(&peer_id, &Greeting {
+    from: "alice".into(),
+    text: "peer acknowledged".into(),
+}).await?;
+
+// A non-acknowledged dispatch is also available when that is the intended
+// application contract:
 chan.send_to(&peer_id, &Greeting {
     from: "alice".into(),
     text: "hi bob".into(),
@@ -134,9 +177,9 @@ let delivered = chan.broadcast(&Greeting {
 println!("sent to {delivered} peers");
 
 // Receive
-let mut sub = chan.subscribe();
+let mut sub = chan.subscribe()?;
 while let Some(Ok(msg)) = sub.recv().await {
-    println!("{} says: {}", msg.from, msg.body.text);
+    println!("{} says: {}", msg.from(), msg.body().text);
 }
 ```
 
@@ -152,7 +195,7 @@ let rpc = net.rpc();
 // Server side
 rpc.serve("echo", |call| async move {
     Ok(myownmesh_core::RpcResponse::from_value(call.payload))
-});
+})?;
 
 // Client side
 let resp = rpc.call(
@@ -163,55 +206,73 @@ let resp = rpc.call(
 println!("got back: {:?}", resp.body);
 ```
 
-Streaming responses use `serve_stream` + `call_stream`:
+Streaming responses use the resource-backed `serve_stream` and `call_stream`
+APIs. Their handler returns the core crate's funded mailbox receiver, so a
+plain Tokio `mpsc::Receiver` is not a replacement. A successful streaming
+producer must send `RpcStreamItem::End(Ok(()))`; bare EOF is a failed stream.
+For replacement-safe registration, use `prepare_serve` or
+`prepare_serve_stream`, then commit the returned `PreparedRegistration`; its
+`OwnedMethodRegistration` removes only the registration it installed unless
+you explicitly call `detach`.
+
+## 7. Governance
+
+Runtime authority is represented by signed semantic facts. Use the named
+proposal methods on `JoinedNetwork`; do not mutate a roster as a substitute for
+granting, revoking, or evicting a device.
 
 ```rust
-use tokio::sync::mpsc;
+use myownmesh_core::semantic::Role;
 
-rpc.serve_stream("count", |call| async move {
-    let (tx, rx) = mpsc::channel(8);
-    let n = call.payload.get("n").and_then(|v| v.as_u64()).unwrap_or(5);
-    tokio::spawn(async move {
-        for i in 0..n {
-            let _ = tx.send(serde_json::json!({ "i": i })).await;
-        }
-    });
-    Ok(rx)
-});
-
-let mut stream = rpc.call_stream(&peer_id, "count", serde_json::json!({"n": 3})).await?;
-while let Some(chunk) = stream.recv().await {
-    println!("{chunk:?}");
-}
+let grant_id = net
+    .propose_role_grant(&peer_id, Role::Member, None)
+    .await?;
+let revoke_id = net.propose_role_revoke(&peer_id, None).await?;
+let eviction_id = net.propose_evict(&peer_id, None).await?;
+println!("grant={grant_id}, revoke={revoke_id}, eviction={eviction_id}");
 ```
 
-## 7. Roster
+Each method returns the resulting semantic `FactId` after the current
+authority and exact network context have been checked. The optional MFA value
+is passed as the final argument when the deployment requires it.
 
-Per-network approved-peers list, persisted at
-`~/.myownmesh/mesh/rosters/{network_id}.json`. Approved peers
-auto-allow on reconnect without prompting.
+The base ledger is durable Closed authority/governance only. Open networks
+have zero base durable semantic facts: an exact-context handshake and Device
+key possession authenticate ephemeral participation. Join, leave, presence,
+and reconnect are runtime observations for both Open and Closed and never
+become semantic history. The owner-selected ledger limits (fact count, bytes,
+causal edges, per-author usage, proof work, and indexed database bytes) are
+checked before mutation; the exact `N+1` request is refused without changing
+the graph, projection, ACK, identity, or authority.
 
-```rust
-net.roster_approve(&peer_id, "Alice's Laptop").await?;
-let peers = net.roster_list().await?;
-for entry in peers {
-    println!("{}: {}", entry.device_id, entry.label);
-}
-net.roster_remove(&peer_id).await?;
-```
+## 8. Direct connections and TURN
 
-`auto_approve = true` in `NetworkConfig` skips the user prompt for
-new peers; the engine adds every authenticating peer to the roster
-automatically. Useful for headless fleet members.
+Application channels, RPC and native opaque flows use authenticated WebRTC
+connections between the actual endpoints. ICE uses a direct path when viable
+and configured TURN when a relay is needed. A Hub may introduce endpoints but
+never forwards their application payloads.
 
-## 8. Topology
+Configure `NetworkConfig.turn_servers` using `TurnServer` with `urls`,
+`username` and `credential`. The existing reference TURN default applies when
+the field is omitted; an explicit empty list disables TURN. Hosting TURN is a
+separate opt-in device service described in [Services](SERVICES.md). Service
+advertisements contain URLs, not passwords; credentials remain local config.
+
+For bounded Hub-assisted connection setup, set `NetworkConfig.introduction`
+to `Some(HubIntroductionPolicyConfig { ... })` with owner-selected setup and
+demand limits. Removed `closed_relay`, `application_transport` and
+`routing_policy` keys are rejected. No application bytes are carried by
+discovery or signaling.
+
+## 9. Topology
 
 The selector is configured per-network and can be changed at runtime:
 
 ```rust
 use myownmesh_core::TopologyMode;
 
-// Default: ring with 3 preferred neighbors
+// FullMesh is the default. Choose Ring explicitly when you want shaped
+// signaling/control connectivity.
 net.set_topology(TopologyMode::Ring { n_preferred: Some(3) }).await?;
 
 // Star with a fixed hub
@@ -223,26 +284,31 @@ net.set_topology(TopologyMode::Star {
 net.set_topology(TopologyMode::FullMesh).await?;
 ```
 
-The engine re-runs the selector synchronously and emits
-`Shelved` / `Unshelved` events for affected peers.
+The command is queued to the engine; observe the resulting
+`Shelved` / `Unshelved` events for affected peers rather than treating command
+completion as proof that every connection has already converged.
 
-## 9. Clean shutdown
+## 10. Clean shutdown
 
 ```rust
-net.leave().await?;
+// If attach_signaling returned Some(drivers), await drivers.shutdown() first.
+net.shutdown().await?;
 ```
 
 `leave()` signals the driver to stop, tears down every peer session,
-and aborts the event-fanout task. Subsequent calls on the same
-`JoinedNetwork` will fail with `Error::Network`.
+and stops the event-fanout task. Use `shutdown()` when shared ownership means
+the handle cannot be consumed; it is idempotent and awaits driver retirement.
 
-The `MeshHandle` itself doesn't need explicit cleanup — drop it.
+The `MeshHandle` itself doesn't need explicit cleanup. Drop it.
 
 ## More
 
-- `docs/PROTOCOL.md` — wire-level frame reference.
-- `CONNECTION-ENGINE.md` — the graduated recovery ladder, all
-  tunables, every edge case.
-- `examples/` — runnable demos.
-- `tests/two_peer_handshake.rs` — the end-to-end integration test
+- [`PROTOCOL.md`](PROTOCOL.md): wire-level frame reference.
+- [`APPLICATION-API.md`](APPLICATION-API.md): source-linked production API
+  reference and ownership rules.
+- [`application_bootstrap.rs`](../crates/myownmesh-core/examples/application_bootstrap.rs):
+  startup/signaling ownership pattern.
+- [`application_patterns.rs`](../crates/myownmesh-core/examples/application_patterns.rs):
+  channels, RPC, streaming, and exact-handle realtime patterns.
+- `../crates/myownmesh-core/tests/two_peer_handshake.rs`: the end-to-end integration test
   doubles as an executable spec for the full handshake stack.

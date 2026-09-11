@@ -2,7 +2,8 @@
 
 A field runbook for the connection-reliability work. The engine is
 heavily layered — a graduated recovery ladder, an ICE watchdog, a wake
-detector, a network watcher (see [`CONNECTION-ENGINE.md`](../CONNECTION-ENGINE.md)).
+detector, a network watcher (see the retained
+[`CONNECTION-ENGINE-FIELD-NOTES.md`](../CONNECTION-ENGINE-FIELD-NOTES.md)).
 When node connection state is nonetheless unreliable, the cause is
 almost never a missing tier. It's one of two structural things:
 
@@ -156,6 +157,67 @@ myownmesh ctl trace home > "trace-$env:COMPUTERNAME.jsonl"
 ```
 
 (`just serve-trace` sets exactly these for you.)
+
+### Measuring establishment latency (real machines only)
+
+`silent_area_scale` is a same-process functional control.  Its `LocalBroker`
+and loopback ICE deliberately remove the network, so its timing must not be
+reported as field connection latency.
+
+For timing, run production daemons on two different machines.  Join the same
+fresh Silent network on both, enable `auto_approve` for the unattended test,
+and configure the signaling/STUN/TURN policy being evaluated.  Then run this on
+the dialing machine (repeat `--network` with a different fresh network for each
+sample):
+
+```sh
+python3 scripts/benchmark-connections.py \
+  --binary ./target/release/myownmesh \
+  --peer-host remote-hostname \
+  --peer REMOTE_DEVICE_ID \
+  --peer-binary-sha256 REMOTE_NATIVE_EXECUTABLE_SHA256 \
+  --local-source-revision EXACT_GIT_REVISION \
+  --peer-source-revision EXACT_SAME_GIT_REVISION \
+  --scenario baseline \
+  --network connection-bench-001 \
+  --network connection-bench-002
+```
+
+The harness refuses a same-host peer label, duplicate network samples, and any
+peer that was already admitted/approved or already had an ICE pair before the
+dial. It requires both daemons to come from the same exact source revision and
+records each native executable's SHA-256 independently (cross-platform native
+artifacts need not be byte-identical). It consumes the daemon's exact
+`{"peers": [...]}` response shape rather than a test-only API. It
+times the public waited `connect_peer` operation, then requires the public peer
+snapshot to show all of the following before accepting a sample:
+
+- authenticated `active`/`shelved` state;
+- local and remote approval observed;
+- a nominated ICE pair classifiable as LAN, STUN, or TURN.
+
+It prints one JSONL record for every attempt, including failures, plus success
+rate, nearest-rank p50/p95/max/mean, connection-phase serial capacity, observed
+whole-run attempt rate, executable SHA-256, host, OS, CPU count, and route
+counts. Discovery is reported separately from
+establishment. Use `--scenario semantic-admission-load` for a separately
+controlled loaded run and record the load generator/rate with the artifact;
+never mix baseline and loaded samples in one summary. Capture `ctl trace` on
+both machines at the same time when stage attribution or cross-side confirmation
+is required. Fewer than 20 successful attempts (the minimum that leaves one
+whole observation in a nearest-rank p95 upper tail) or any failed attempt marks
+the summary statistically unqualified instead of hiding that limitation. A
+network that already has a live session is not a sample:
+`connect_peer` is intentionally idempotent, so every `--network` must be fresh.
+
+To prove a TURN path rather than merely making TURN available, build the
+daemon with the explicit `transport-lab` feature and start **both** endpoints
+with `MYOWNMESH_TRANSPORT_LAB_ICE_POLICY=relay`. This selects the WebRTC
+standard relay-only ICE policy; it does not alter signaling, credentials, or
+the configured TURN server list. Add `--require-route turn` to the harness so
+any nominated host or reflexive pair is retained as a failed sample. The
+environment value is unavailable in a normal build, accepts only `all` or
+`relay`, and fails startup on any other value.
 
 If you'd rather not keep a `ctl trace` shell open, set
 `MYOWNMESH_CONN_TRACE=1` on the daemon and the transitions land in the

@@ -171,9 +171,14 @@ pub struct PeerDiag {
     /// Number of times the engine called `restart_ice()` on this
     /// peer's connection.
     pub ice_restarts: u32,
-    /// Number of hello frames sent to this peer (incremented per
-    /// send, not per handshake — multiple retries within one
-    /// handshake count separately).
+    /// Number of hello *send attempts* made for this peer. Incremented per
+    /// attempt rather than per handshake, so retries within one handshake
+    /// count separately.
+    ///
+    /// Named for attempts because that is what it counts: the increment
+    /// happens before the send and is not undone when the send fails, so a
+    /// hello that never reached the wire is included here. Read it as what
+    /// this endpoint tried to do, never as what the peer received.
     pub hellos_sent: u32,
     /// Total bytes received over the data channel.
     pub bytes_in: u64,

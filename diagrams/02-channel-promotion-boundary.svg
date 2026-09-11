@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="600" viewBox="0 0 1360 600" role="img" aria-labelledby="title desc">
+  <title id="title">Production channel promotion boundary</title>
+  <desc id="desc">Speculative connector objects remain below the promotion boundary until endpoint authentication and current semantic policy create an exact live peer session.</desc>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0L10 4L0 8z" fill="#304f66"/></marker>
+    <style>.title{font:700 24px sans-serif;fill:#173143}.zone{stroke-width:2;rx:15}.pre{fill:#fff8ec;stroke:#aa6b16}.post{fill:#eef8ed;stroke:#36753e}.box{fill:white;stroke:#304f66;stroke-width:1.7;rx:8}.h{font:700 15px sans-serif;fill:#173143}.t{font:12px monospace;fill:#213c4f}.s{font:11px sans-serif;fill:#465f70}.edge{fill:none;stroke:#304f66;stroke-width:2;marker-end:url(#a)}.gate{fill:#e9f2fa;stroke:#245d87;stroke-width:3;rx:8}</style>
+  </defs>
+  <rect width="1360" height="600" fill="white"/>
+  <text class="title" x="680" y="38" text-anchor="middle">The production promotion boundary is a typed ownership transfer</text>
+  <rect class="zone pre" x="30" y="65" width="590" height="475"/>
+  <text class="h" x="325" y="94" text-anchor="middle">PRE-PROMOTION — bounded speculative transport work</text>
+  <rect class="box" x="65" y="125" width="520" height="80"/>
+  <text class="h" x="325" y="151" text-anchor="middle">Typed hints and candidate admission</text>
+  <text class="t" x="325" y="173" text-anchor="middle">engine/signaling_ingress.rs → engine/connection.rs</text>
+  <text class="s" x="325" y="192" text-anchor="middle">no durable authority; refusal constructs no unowned attempt</text>
+  <rect class="box" x="65" y="245" width="520" height="80"/>
+  <text class="h" x="325" y="271" text-anchor="middle">Working WebRTC data channel</text>
+  <text class="t" x="325" y="293" text-anchor="middle">transport/ice.rs + transport/webrtc.rs</text>
+  <text class="s" x="325" y="312" text-anchor="middle">current transport owner; no application delivery permission</text>
+  <rect class="box" x="65" y="365" width="520" height="100"/>
+  <text class="h" x="325" y="391" text-anchor="middle">Fresh channel-bound Device proof</text>
+  <text class="t" x="325" y="413" text-anchor="middle">endpoint_auth/transcript.rs + endpoint_auth/task.rs</text>
+  <text class="t" x="325" y="433" text-anchor="middle">engine/handshake.rs</text>
+  <text class="s" x="325" y="452" text-anchor="middle">proof names the channel that actually passed packets</text>
+  <path class="edge" d="M325 205V245"/><path class="edge" d="M325 325V365"/>
+
+  <rect class="gate" x="645" y="185" width="190" height="235"/>
+  <text class="h" x="740" y="220" text-anchor="middle">PROMOTION</text>
+  <text class="t" x="740" y="251" text-anchor="middle">runtime/</text>
+  <text class="t" x="740" y="271" text-anchor="middle">session_broker/</text>
+  <text class="t" x="740" y="291" text-anchor="middle">mod.rs</text>
+  <text class="s" x="740" y="326" text-anchor="middle">verified Device</text>
+  <text class="s" x="740" y="344" text-anchor="middle">+ current Open/Closed</text>
+  <text class="s" x="740" y="362" text-anchor="middle">semantic policy</text>
+  <text class="s" x="740" y="390" text-anchor="middle">→ exact live slot</text>
+  <path class="edge" d="M585 415L645 350"/>
+  <path class="edge" d="M585 165C630 165 630 220 645 240"/>
+
+  <rect class="zone post" x="860" y="65" width="470" height="475"/>
+  <text class="h" x="1095" y="94" text-anchor="middle">POST-PROMOTION — application-capable session</text>
+  <rect class="box" x="895" y="135" width="400" height="90"/>
+  <text class="h" x="1095" y="162" text-anchor="middle">Exact current peer-session slot</text>
+  <text class="t" x="1095" y="184" text-anchor="middle">runtime/peer_session/slot.rs</text>
+  <text class="s" x="1095" y="205" text-anchor="middle">dies on replacement, policy revocation, or shutdown</text>
+  <rect class="box" x="895" y="280" width="400" height="110"/>
+  <text class="h" x="1095" y="307" text-anchor="middle">Application Gateway</text>
+  <text class="t" x="1095" y="329" text-anchor="middle">application_gateway/channels.rs</text>
+  <text class="t" x="1095" y="349" text-anchor="middle">application_gateway/rpc.rs</text>
+  <text class="s" x="1095" y="372" text-anchor="middle">every operation rechecks the live slot</text>
+  <rect class="box" x="895" y="435" width="400" height="65"/>
+  <text class="h" x="1095" y="462" text-anchor="middle">Local client delivery</text>
+  <text class="t" x="1095" y="484" text-anchor="middle">myownmesh/src/ipc/bridge.rs</text>
+  <path class="edge" d="M835 302H895"/><path class="edge" d="M1095 225V280"/><path class="edge" d="M1095 390V435"/>
+<text class="s" x="680" y="575" text-anchor="middle">Beyond this LAN path: Hub hints allow bounded pre-promotion demand, not authority; data uses endpoint-authenticated WebRTC, direct or configured standard TURN, otherwise refused.</text>
+  <text class="s" x="680" y="590" text-anchor="middle">A carrier replacement returns left and repeats endpoint proof; a serialized route or peer ID cannot cross this boundary.</text>
+</svg>

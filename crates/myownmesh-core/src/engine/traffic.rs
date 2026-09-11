@@ -23,7 +23,7 @@ pub enum FrameClass {
     /// Handshake + topology negotiation (`hello`, `auth_response`,
     /// `approve`, `deny`, `shelve`, `unshelve`, capabilities).
     Control,
-    /// Roster + governance anti-entropy.
+    /// Governance anti-entropy.
     Gossip,
     /// Application frames: typed channels (plain and acked) + RPC.
     App,
@@ -41,14 +41,21 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::Deny(_)
         | MeshMessage::Shelve(_)
         | MeshMessage::Unshelve(_)
-        | MeshMessage::CapabilitiesUpdate(_) => FrameClass::Control,
-        MeshMessage::NetworkState(_)
-        | MeshMessage::NetworkStatePropose(_)
-        | MeshMessage::NetworkStateAck(_)
-        | MeshMessage::NetworkStateSplit(_)
-        | MeshMessage::RosterSummary(_)
-        | MeshMessage::RosterRequest(_)
-        | MeshMessage::RosterEntries(_) => FrameClass::Gossip,
+        | MeshMessage::SessionControl(_)
+        | MeshMessage::CapabilitiesUpdate(_)
+        | MeshMessage::HubAdvertisement(_)
+        | MeshMessage::HubDiscoveryRequest(_)
+        | MeshMessage::HubDiscoveryResponse(_)
+        | MeshMessage::HubTreeAttachRequest(_)
+        | MeshMessage::HubTreeAttachResponse(_)
+        | MeshMessage::HubIntroduction(_)
+        | MeshMessage::ApplicationFlowControl(_) => FrameClass::Control,
+        MeshMessage::Fact(_)
+        | MeshMessage::FactPage(_)
+        | MeshMessage::FactInventory(_)
+        | MeshMessage::FactRequest(_)
+        | MeshMessage::ProofDelivery(_)
+        | MeshMessage::ProofAck(_) => FrameClass::Gossip,
         MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
@@ -56,7 +63,6 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)
         | MeshMessage::RpcStreamEnd(_) => FrameClass::App,
-        MeshMessage::Unknown => FrameClass::Other,
     }
 }
 
@@ -94,10 +100,6 @@ pub struct TrafficCounters {
     app_rx: Lane,
     other_tx: Lane,
     other_rx: Lane,
-    /// Routed envelopes we re-forwarded for someone else (already
-    /// counted under `app` at the wire; this names the forwarding duty
-    /// itself so hubs can see the load they carry).
-    relayed_forwarded: AtomicU64,
     /// Signaling events, by discovery vs pairwise negotiation.
     announces_rx: AtomicU64,
     negotiation_rx: AtomicU64,
@@ -129,10 +131,6 @@ impl TrafficCounters {
         self.lane(class, false).record(bytes);
     }
 
-    pub fn record_forwarded(&self) {
-        self.relayed_forwarded.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn record_signaling_rx(&self, announce: bool) {
         if announce {
             self.announces_rx.fetch_add(1, Ordering::Relaxed);
@@ -162,7 +160,6 @@ impl TrafficCounters {
             app_rx: self.app_rx.read(),
             other_tx: self.other_tx.read(),
             other_rx: self.other_rx.read(),
-            relayed_forwarded: self.relayed_forwarded.load(Ordering::Relaxed),
             announces_rx: self.announces_rx.load(Ordering::Relaxed),
             negotiation_rx: self.negotiation_rx.load(Ordering::Relaxed),
             announces_tx: self.announces_tx.load(Ordering::Relaxed),
@@ -193,8 +190,6 @@ pub struct TrafficSnapshot {
     pub app_rx: LaneSnapshot,
     pub other_tx: LaneSnapshot,
     pub other_rx: LaneSnapshot,
-    /// Envelopes this node carried onward for other members.
-    pub relayed_forwarded: u64,
     /// Signaling: presence announces seen / published.
     pub announces_rx: u64,
     pub announces_tx: u64,
@@ -210,6 +205,7 @@ pub struct TrafficSnapshot {
 mod tests {
     use super::*;
     use crate::protocol::keepalive::PingMessage;
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn classes_cover_the_wire() {
@@ -224,8 +220,125 @@ mod tests {
             }),
             FrameClass::App
         );
-        assert_eq!(class_of(&MeshMessage::Unknown), FrameClass::Other);
     }
+
+    // BEGIN hub topology accounting controls
+    fn hub_topology_frames() -> [MeshMessage; 5] {
+        use crate::protocol::{hub, parenting};
+        use crate::semantic::{DeviceId, MeshContextId};
+
+        let parent_key = SigningKey::from_bytes(&[41; 32]);
+        let child_key = SigningKey::from_bytes(&[42; 32]);
+        let parent = DeviceId::from_public_key_bytes(parent_key.verifying_key().to_bytes())
+            .expect("canonical parent");
+        let child = DeviceId::from_public_key_bytes(child_key.verifying_key().to_bytes())
+            .expect("canonical child");
+        let context = MeshContextId::from_bytes([43; 32]);
+        let trickle = hub::HubTrickleProfile::new(100, 10_000, 3, 60_000, 4);
+        let hubs = [parent.clone()];
+        // These session-local DTOs have no embedded signature. Checked
+        // construction does not replace their authenticated carrier gate.
+        let advertisement = hub::HubAdvertisement::new(
+            context,
+            parent.clone(),
+            1,
+            hub::configuration_digest(&hubs, 1, trickle),
+        )
+        .expect("checked advertisement");
+        let discovery =
+            hub::HubDiscoveryRequest::new(context, 1, None, 1).expect("checked discovery request");
+        let discovered =
+            hub::HubDiscoveryResponse::for_request(&discovery, vec![child.clone()], None)
+                .expect("checked discovery response");
+        let digest = parenting::hub_tree_configuration_digest(
+            context,
+            parenting::HubTreeTopologyKind::ShallowV1,
+            &parent,
+            &hubs,
+            0,
+            trickle,
+        );
+        let attach = parenting::HubTreeAttachRequest::new(context, digest, 1, child, parent)
+            .expect("checked distinct child and parent");
+        let attached = parenting::HubTreeAttachResponse::accepted(&attach, 1)
+            .expect("checked accepted relation");
+        [
+            MeshMessage::HubAdvertisement(advertisement),
+            MeshMessage::HubDiscoveryRequest(discovery),
+            MeshMessage::HubDiscoveryResponse(discovered),
+            MeshMessage::HubTreeAttachRequest(attach),
+            MeshMessage::HubTreeAttachResponse(attached),
+        ]
+    }
+
+    #[test]
+    fn hub_topology_counts_as_control_without_changing_application_admission() {
+        for message in hub_topology_frames() {
+            let wire = serde_json::to_vec(&message).expect("complete Hub wire");
+            let decoded: MeshMessage = serde_json::from_slice(&wire).expect("valid Hub wire");
+            assert_eq!(class_of(&decoded), FrameClass::Control);
+            assert!(matches!(
+                super::super::message_admission(&decoded),
+                super::super::Admission::Application,
+            ));
+            let counters = TrafficCounters::default();
+            counters.record_tx(class_of(&decoded), wire.len());
+            counters.record_rx(class_of(&decoded), wire.len());
+            let expected_lane = LaneSnapshot {
+                frames: 1,
+                bytes: wire.len() as u64,
+            };
+            assert_eq!(
+                counters.snapshot(),
+                TrafficSnapshot {
+                    control_tx: expected_lane,
+                    control_rx: expected_lane,
+                    ..TrafficSnapshot::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn channel_and_rpc_keep_application_accounting() {
+        for message in [
+            MeshMessage::Channel {
+                channel: "accounting".into(),
+                payload: serde_json::json!([0, 255]),
+            },
+            MeshMessage::RpcRequest(crate::protocol::RpcRequestMessage {
+                request_id: "accounting-1".into(),
+                method: "echo".into(),
+                payload: serde_json::json!({"value": 1}),
+                streaming: false,
+            }),
+        ] {
+            assert_eq!(class_of(&message), FrameClass::App);
+            assert!(matches!(
+                super::super::message_admission(&message),
+                super::super::Admission::Application,
+            ));
+            let bytes = serde_json::to_vec(&message)
+                .expect("complete application wire")
+                .len();
+            let counters = TrafficCounters::default();
+            counters.record_tx(class_of(&message), bytes);
+            counters.record_rx(class_of(&message), bytes);
+            let expected_lane = LaneSnapshot {
+                frames: 1,
+                bytes: bytes as u64,
+            };
+            assert_eq!(
+                counters.snapshot(),
+                TrafficSnapshot {
+                    app_tx: expected_lane,
+                    app_rx: expected_lane,
+                    ..TrafficSnapshot::default()
+                }
+            );
+        }
+    }
+    // END hub topology accounting controls
 
     #[test]
     fn counters_accumulate_and_snapshot() {
@@ -235,7 +348,6 @@ mod tests {
         t.record_rx(FrameClass::Keepalive, 10);
         t.record_signaling_rx(true);
         t.record_signaling_tx(false);
-        t.record_forwarded();
         let s = t.snapshot();
         assert_eq!(
             s.app_tx,
@@ -247,6 +359,5 @@ mod tests {
         assert_eq!(s.keepalive_rx.frames, 1);
         assert_eq!(s.announces_rx, 1);
         assert_eq!(s.negotiation_tx, 1);
-        assert_eq!(s.relayed_forwarded, 1);
     }
 }

@@ -16,8 +16,21 @@
 //! - [`defaults`] — built-in default relay URLs.
 
 pub mod defaults;
+// Delivery owns provider-funded per-event state and its order-independent
+// relay-carrier aggregate. `DeliveryRetention` exposes one canonical exact
+// entry size for each production map node.
+pub mod delivery;
 pub mod denylist;
 pub mod driver;
 pub mod event;
 pub mod handle;
 pub mod shuffle;
+
+// Stable top-level names for the provider-owned delivery boundary. Adapters
+// can depend on these names without reaching through the implementation
+// layout.
+pub use delivery::{
+    AdmissionRefusal, AdmissionReport, AdmissionSource, CarrierAggregate, DeliveryLease,
+    DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryStore, DeliveryTerminal,
+    RelaySessionId, SessionRetention,
+};

@@ -1,3 +1,8 @@
+> Historical upstream investigation retained from `59143cb`. This is not a
+> current V4 contract or candidate qualification result. Legacy media APIs,
+> diagnostic hooks and resource/recovery designs described below may be
+> deliberately superseded; see [integration disposition](UPSTREAM-INTEGRATION-59143cb.md).
+
 # Discovery departure incorrectly becomes transport teardown
 
 ## Confirmed code defect

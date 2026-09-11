@@ -1,12 +1,13 @@
 <script lang="ts">
   /** Settings → Updates. Surfaces the daemon's self-updater: current
-   *  version, the auto-update policy, and — the white-labelling hook — an
-   *  editable release-feed URL so a vendor can point this build at their
-   *  own release host without rebuilding.
+   *  version, the auto-update policy, and an editable release-feed URL.
+   *  The URL override must serve compatible GitHub-shaped release metadata
+   *  and artifacts signed by this build's embedded release key; changing the
+   *  signing trust root requires a rebuild.
    *
-   *  The daemon owns the actual check / stage / apply (it's the process
-   *  whose binary gets swapped; the GUI is updated in lockstep beside it),
-   *  so everything here is a thin pass-through to `update_*` commands. */
+   *  The daemon is updated first. GUI staging/application is best effort, and
+   *  a failed staged GUI remains pending for recovery or retry. This component
+   *  is a thin pass-through to the daemon's `update_*` commands. */
 
   import { meshClient } from "../../mesh-client.svelte";
   import type { UpdateStatus, UpdateCheckOutcome, UpdatePrefs } from "../../types";
@@ -282,8 +283,9 @@
       </div>
       <div class="hint subtle">
         Where {status.channel === "beta" ? "beta" : "stable"} releases are
-        fetched from. Point this at your own release host to white-label
-        the app for your fleet; clear it to fall back to the project
+        fetched from. Point this at a compatible release host for your fleet;
+        the embedded signing trust root stays fixed, so changing signing
+        authority requires rebuilding. Clear it to fall back to the project
         default. The feed is a GitHub-releases-shaped JSON endpoint.
       </div>
       <div class="add-row">

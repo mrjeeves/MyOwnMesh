@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/interceptor", "vendor/webrtc-util"]
 members = [
     "crates/myownmesh-core",
     "crates/myownmesh-signaling",
@@ -8,9 +7,16 @@ members = [
     "crates/myownmesh-updater",
     "crates/myownmesh",
 ]
+exclude = [
+    "vendor/interceptor",
+    "vendor/turn-0.10.0",
+    "vendor/webrtc-0.13.0",
+    "vendor/webrtc-ice-0.13.0",
+    "vendor/webrtc-sctp-0.12.0",
+]
 
 [workspace.package]
-version = "0.3.21"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.88.0"
 license = "MIT"
@@ -18,27 +24,19 @@ authors = ["Chris Paul"]
 repository = "https://github.com/mrjeeves/MyOwnMesh"
 description = "Pure-Rust peer-to-peer mesh networking on webrtc-rs."
 
-# Diagnostic branch: narrow fixes to NACK repair and an opt-in real UDP
-# socket configuration hook. Dependency versions remain unchanged.
-[patch.crates-io]
-interceptor = { path = "vendor/interceptor" }
-webrtc-util = { path = "vendor/webrtc-util" }
-
 [workspace.dependencies]
 # Internal crates
-myownmesh-core = { path = "crates/myownmesh-core", version = "0.3.21" }
-myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "0.3.21" }
-myownmesh-services = { path = "crates/myownmesh-services", version = "0.3.21" }
-myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.3.21" }
+myownmesh-core = { path = "crates/myownmesh-core", version = "1.0.0" }
+myownmesh-signaling = { path = "crates/myownmesh-signaling", version = "1.0.0" }
+myownmesh-services = { path = "crates/myownmesh-services", version = "1.0.0" }
+myownmesh-updater = { path = "crates/myownmesh-updater", version = "1.0.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal", "process"] }
-tokio-util = { version = "0.7", features = ["rt", "codec"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 futures = "0.3"
 futures-util = "0.3"
 async-trait = "0.1"
-pin-project-lite = "0.2"
 
 # WebRTC transport
 webrtc = "0.13"
@@ -51,11 +49,14 @@ stun = "0.8"
 turn = "0.10"
 webrtc-util = "0.11"
 
+# TURN-over-TLS stream transport
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+rcgen = "0.13"
+
 # WebSocket (Nostr signaling)
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
 
 # DNS-SD / mDNS (LAN signaling). Pure Rust — no avahi/bonjour binding, so it
 # cross-compiles for the riscv64-musl NanoKVM target and coexists with an
@@ -64,10 +65,13 @@ mdns-sd = "0.20"
 
 # Cross-platform local IPC (control socket)
 interprocess = { version = "2", features = ["tokio"] }
+widestring = "1.2"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 # Concurrent data structures
 dashmap = "6"
 parking_lot = "0.12"
+rusqlite = { version = "=0.39.0", features = ["bundled", "hooks"] }
 
 # Crypto + encoding
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
@@ -83,7 +87,12 @@ bytes = "1"
 
 # Serde
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+bincode = "1.3"
+# `raw_value` is required by the funded peers snapshot: it retains each peer's
+# already-canonical encoded advertisement and serializes those exact bytes,
+# rather than decoding a `CapabilityAdvert` whose nested `serde_json::Value`
+# has no exactly measurable retention. See `PreparedPeerSnapshot`.
+serde_json = { version = "1", features = ["raw_value"] }
 
 # Errors + logging
 thiserror = "1"
@@ -100,7 +109,6 @@ secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 # Bin
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
-which = "6"
 # Effective-uid check for `service --system` (Unix only). Already in the
 # tree transitively via the webrtc stack; promoting it to a direct dep
 # adds nothing.
@@ -116,14 +124,12 @@ lto = true
 opt-level = "s"
 strip = true
 
-# A debug daemon must still *stream*. AllMyStuff's `just dev` (and this
-# repo's own) runs `target/debug/myownmesh` as the sidecar, which used to
-# push every media byte — DTLS-SRTP encryption, RTP packetization, H.264
-# access-unit reassembly, the base64/JSON control-socket framing — through
-# opt-level 0. On a 20+ Mbps screen stream that read as "the app is slow"
-# when it was the dev profile. The daemon's own code stays unoptimized for
-# fast iteration; the per-packet hot path below gets real codegen, the
-# same targeted-override trick AllMyStuff uses for its pixel loops.
+# A debug daemon must still *stream*. `just dev` runs `target/debug/myownmesh`,
+# which used to push every media byte — DTLS-SRTP encryption, RTP packetization,
+# access-unit reassembly, control-socket framing — through opt-level 0. On a
+# 20+ Mbps screen stream that reads as "the application is slow" when it is the
+# dev profile. The daemon's own code stays unoptimized for fast iteration; the
+# per-packet hot path below gets real codegen.
 [profile.dev.package.webrtc]
 opt-level = 3
 [profile.dev.package.webrtc-srtp]
@@ -169,3 +175,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.bytes]
 opt-level = 3
+
+[patch.crates-io]
+interceptor = { path = "vendor/interceptor" }
+turn = { path = "vendor/turn-0.10.0" }
+webrtc = { path = "vendor/webrtc-0.13.0" }
+webrtc-ice = { path = "vendor/webrtc-ice-0.13.0" }
+webrtc-sctp = { path = "vendor/webrtc-sctp-0.12.0" }

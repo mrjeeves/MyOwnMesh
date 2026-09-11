@@ -49,6 +49,34 @@ pub enum Error {
     #[error("transport: {0}")]
     Transport(String),
 
+    /// A network-capable operation was attempted through a Mesh runtime that
+    /// was deliberately opened without a connector resource owner.
+    #[error("a process resource provider is required for network-capable mesh operations")]
+    ConnectorPolicyRequired,
+
+    #[error("process resource provider: {0}")]
+    ResourceProvider(#[from] crate::resource::ResourceProviderConflict),
+
+    #[error("resource unavailable: {0}")]
+    ResourceUnavailable(#[from] crate::resource::ResourceUnavailable),
+
+    #[error("mesh connector resource scope: {0}")]
+    MeshConnectorResourceScope(
+        #[from] crate::runtime::attempt::MeshConnectorResourceScopeIssueError,
+    ),
+
+    #[error("local application resource scope: {0}")]
+    LocalApplicationResourceScope(#[from] crate::resource::LocalApplicationResourceScopeIssueError),
+
+    #[error("resource mailbox: {0}")]
+    ResourceMailbox(#[from] crate::resource::ResourceMailboxCreateError),
+
+    #[error("resource mailbox admission: {0}")]
+    ResourceMailboxAdmission(#[from] crate::resource::ResourceMailboxAdmissionError),
+
+    #[error("application gateway: {0}")]
+    ApplicationGateway(#[from] crate::application_gateway::GatewayRefusal),
+
     #[error("network: {0}")]
     Network(String),
 

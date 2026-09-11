@@ -14,9 +14,89 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  prepare-release:
+    name: Prepare exact draft release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Refuse public/repointed tags and establish draft
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python scripts/verify-release-artifact.py
+          --preflight-release
+          --tag "$TAG"
+          --commit "$GITHUB_SHA"
+          --repository "$GITHUB_REPOSITORY"
+
+  release-gates:
+    name: Verify release source and policy gates
+    needs: prepare-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Verify V4 hard-cutover boundary
+        run: python scripts/verify-v4-cutover.py
+
+      - name: Verify release workflow and feature boundary
+        run: >-
+          python scripts/verify-release-artifact.py
+          --workflow .github/workflows/release.yml
+          --manifest crates/myownmesh/Cargo.toml
+
   bundles:
     name: Build (${{ matrix.platform.name }})
+    needs: [prepare-release, release-gates]
     strategy:
       fail-fast: false
       matrix:
@@ -34,8 +114,26 @@ jobs:
           - { name: macos-x86_64,   os: macos-14,         target: x86_64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.platform.os }}
+    env:
+      # The updater embeds this exact publication trust anchor at compile time.
+      MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+      MYOWNMESH_RELEASE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
 
       # Guard against the "tag says v0.2.0, binary reports 0.1.5"
       # trap. The daemon binary embeds CARGO_PKG_VERSION (via
@@ -79,6 +177,11 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       # Two separate Cargo workspaces in this repo — the headless
       # daemon at the root, and the Tauri GUI under `gui/src-tauri`.
       # Each gets its own cache scope so they don't stomp each other.
@@ -118,25 +221,52 @@ jobs:
       # Build the headless daemon first. The bundle step below will
       # ship it alongside the GUI installer so users get one
       # download per platform that contains both halves.
-      - name: Build daemon
-        run: cargo build --release --bin myownmesh --target ${{ matrix.platform.target }}
+      - name: Build daemon (without transport-lab)
+        run: cargo build --release --no-default-features --bin myownmesh --target ${{ matrix.platform.target }}
 
-      # Build the Tauri GUI bundle. tauri-action runs `pnpm tauri
-      # build` under the hood and uploads the resulting installers
-      # (.deb / .AppImage / .dmg / .msi / .exe) to the named
-      # release. `projectPath: gui` points it at the GUI's own
-      # workspace so it doesn't try to build the daemon as a Tauri
-      # crate.
+      - name: Verify daemon excludes transport-lab
+        shell: bash
+        run: |
+          set -e
+          BIN=target/${{ matrix.platform.target }}/release/myownmesh
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          python scripts/verify-release-artifact.py \
+            --binary "$BIN" \
+            --release-public-key "$MINISIGN_PUBLIC_KEY"
+
+      - name: Prove Tauri publication-key binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$MYOWNMESH_RELEASE_PUBKEY"
+          test -n "$MINISIGN_PUBLIC_KEY"
+          test "$MYOWNMESH_RELEASE_PUBKEY" = "$MINISIGN_PUBLIC_KEY"
+
+      # Build the GUI-only Tauri bundle. These installers contain the GUI,
+      # not the separately shipped daemon binary; the portable GUI archive
+      # below is the scanner-covered GUI artifact. `projectPath: gui` points
+      # the action at the GUI workspace so it does not build the daemon as a
+      # Tauri crate.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+          MYOWNMESH_RELEASE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
         with:
           projectPath: gui
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: ${{ inputs.tag || github.ref_name }}
-          releaseDraft: false
+          # Keep the release unpublished until the final signing job has
+          # verified every uploaded payload, including these installers.
+          releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.platform.target }}
+
+      - name: Verify every Tauri installer payload
+        run: >-
+          python scripts/verify-release-artifact.py
+          --tree
+          gui/src-tauri/target/${{ matrix.platform.target }}/release/bundle
 
       # Package the portable daemon binary as a tarball / zip so
       # users who don't want the GUI installer can `curl | tar` it.
@@ -151,16 +281,19 @@ jobs:
           if [[ ! -f "$BIN" ]]; then
             echo "daemon binary not found at $BIN"; exit 1
           fi
+
           mkdir -p dist-bin
           NAME="myownmesh-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/myownmesh.exe"
             (cd dist-bin && 7z a "${NAME}.zip" myownmesh.exe)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.zip" --member myownmesh.exe
           else
             cp "$BIN" "dist-bin/myownmesh"
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
           fi
 
       # Package the portable GUI binary the same way, so the curl|sh
@@ -185,16 +318,31 @@ jobs:
             cp "$BIN" "dist-bin/myownmesh-gui.exe"
             (cd dist-bin && 7z a "${NAME}.zip" myownmesh-gui.exe)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.zip" --member myownmesh-gui.exe
             rm -f dist-bin/myownmesh-gui.exe
           else
             cp "$BIN" "dist-bin/myownmesh-gui"
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh-gui
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh-gui
             rm -f dist-bin/myownmesh-gui
           fi
 
+      - name: Write build-owned release asset manifest
+        run: >-
+          python scripts/verify-release-artifact.py
+          --tree gui/src-tauri/target/${{ matrix.platform.target }}/release/bundle
+          --tree dist-bin
+          --write-asset-manifest "$RUNNER_TEMP/release-assets-${{ matrix.platform.name }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-manifest-${{ matrix.platform.name }}
+          path: ${{ runner.temp }}/release-assets-${{ matrix.platform.name }}.json
+
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist-bin/myownmesh-*
@@ -211,13 +359,36 @@ jobs:
   # matrix also builds the GUI, which has no riscv64 target.
   daemon-riscv64:
     name: Build (linux-riscv64)
+    needs: [prepare-release, release-gates]
     runs-on: ubuntu-22.04
+    env:
+      MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+      MYOWNMESH_RELEASE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
 
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: riscv64gc-unknown-linux-musl
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - name: Cache (daemon workspace)
         uses: Swatinem/rust-cache@v2
@@ -247,7 +418,13 @@ jobs:
       - name: Build daemon (riscv64 musl)
         run: |
           zig version
-          cargo zigbuild --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+          MYOWNMESH_RELEASE_PUBKEY="$MYOWNMESH_RELEASE_PUBKEY" cargo zigbuild --release --no-default-features --bin myownmesh --target riscv64gc-unknown-linux-musl
+
+      - name: Verify daemon trust anchor (riscv64 musl)
+        run: >-
+          python scripts/verify-release-artifact.py
+          --binary target/riscv64gc-unknown-linux-musl/release/myownmesh
+          --release-public-key "$MINISIGN_PUBLIC_KEY"
 
       - name: Package portable daemon binary
         shell: bash
@@ -261,9 +438,22 @@ jobs:
           tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
           (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           rm -f dist-bin/myownmesh
+          python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
+
+      - name: Write build-owned release asset manifest
+        run: >-
+          python scripts/verify-release-artifact.py
+          --tree dist-bin
+          --write-asset-manifest "$RUNNER_TEMP/release-assets-linux-riscv64.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-manifest-linux-riscv64
+          path: ${{ runner.temp }}/release-assets-linux-riscv64.json
 
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist-bin/myownmesh-*
@@ -282,13 +472,36 @@ jobs:
   # with it. See .cargo/config.toml and docs/NANOKVM.md.
   daemon-aarch64-musl:
     name: Build (linux-aarch64-musl)
+    needs: [prepare-release, release-gates]
     runs-on: ubuntu-22.04
+    env:
+      MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+      MYOWNMESH_RELEASE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
 
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: aarch64-unknown-linux-musl
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - name: Cache (daemon workspace)
         uses: Swatinem/rust-cache@v2
@@ -313,7 +526,13 @@ jobs:
       - name: Build daemon (aarch64 musl)
         run: |
           zig version
-          cargo zigbuild --release --bin myownmesh --target aarch64-unknown-linux-musl
+          MYOWNMESH_RELEASE_PUBKEY="$MYOWNMESH_RELEASE_PUBKEY" cargo zigbuild --release --no-default-features --bin myownmesh --target aarch64-unknown-linux-musl
+
+      - name: Verify daemon trust anchor (aarch64 musl)
+        run: >-
+          python scripts/verify-release-artifact.py
+          --binary target/aarch64-unknown-linux-musl/release/myownmesh
+          --release-public-key "$MINISIGN_PUBLIC_KEY"
 
       - name: Package portable daemon binary
         shell: bash
@@ -327,75 +546,177 @@ jobs:
           tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
           (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           rm -f dist-bin/myownmesh
+          python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
+
+      - name: Write build-owned release asset manifest
+        run: >-
+          python scripts/verify-release-artifact.py
+          --tree dist-bin
+          --write-asset-manifest "$RUNNER_TEMP/release-assets-linux-aarch64-musl.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-manifest-linux-aarch64-musl
+          path: ${{ runner.temp }}/release-assets-linux-aarch64-musl.json
 
       - uses: softprops/action-gh-release@v2
         with:
+          draft: true
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist-bin/myownmesh-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Detached Ed25519 (minisign) signatures over the portable archives, so the
-  # self-updater can prove provenance, not just integrity. Runs once after all
-  # platform bundles upload, and is a NO-OP until the maintainer configures the
-  # MINISIGN_SECRET_KEY secret (and bakes MYOWNMESH_RELEASE_PUBKEY into the
-  # shipped build) — see RELEASE-SIGNING.md. Gating means an unconfigured repo
-  # still releases exactly as before.
+  # Detached Ed25519 (minisign) signatures over every uploaded release payload,
+  # so provenance is verified before a draft becomes public. A missing key is a
+  # hard failure: no published release is allowed without this evidence.
   sign:
     name: Sign release artifacts (minisign)
-    needs: [bundles, daemon-riscv64, daemon-aarch64-musl]
+    needs: [prepare-release, release-gates, bundles, daemon-riscv64, daemon-aarch64-musl]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - name: Gate on signing key
-        id: gate
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and repository binding
+        shell: bash
         env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          if [ -n "$MINISIGN_SECRET_KEY" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::MINISIGN_SECRET_KEY not configured — skipping signing; artifacts ship SHA-256-only. See RELEASE-SIGNING.md."
-          fi
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" HEAD
+          test "$(git remote get-url origin)" = "https://github.com/$GITHUB_REPOSITORY.git"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - name: Install minisign
-        if: steps.gate.outputs.enabled == 'true'
         run: |
-          set -e
-          curl -fsSL -o minisign.tar.gz \
-            https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz
-          tar -xzf minisign.tar.gz
+          set -euo pipefail
+          minisign_archive="minisign-0.11-linux.tar.gz"
+          minisign_archive_sha256="F0A0954413DF8531BEFED169E447A66DA6868D79052ED7E892E50A4291AF7AE0"
+          curl -fsSL -o "$minisign_archive" \
+            "https://github.com/jedisct1/minisign/releases/download/0.11/$minisign_archive"
+          printf '%s  %s\n' "$minisign_archive_sha256" "$minisign_archive" | sha256sum --check
+          tar -xzf "$minisign_archive"
+          test -x minisign-linux/x86_64/minisign
           sudo install -m 0755 minisign-linux/x86_64/minisign /usr/local/bin/minisign
 
+      - name: Gate on signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+          MYOWNMESH_RELEASE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MINISIGN_SECRET_KEY" || { echo "::error::MINISIGN_SECRET_KEY is required"; exit 1; }
+          test -n "$MINISIGN_PUBLIC_KEY" || { echo "::error::MINISIGN_PUBLIC_KEY is required"; exit 1; }
+          test "$MYOWNMESH_RELEASE_PUBKEY" = "$MINISIGN_PUBLIC_KEY"
+
       - name: Download release artifacts
-        if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -e
           mkdir -p signing
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir signing \
-            --pattern 'myownmesh-*.tar.gz' --pattern 'myownmesh-*.zip'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir signing
+
+      - name: Download build-owned asset allowlists
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-asset-manifest-*
+          path: allowlists
+          merge-multiple: true
+
+      - name: Refuse stale or tampered draft assets before signing
+        run: >-
+          python "$GITHUB_WORKSPACE/scripts/verify-release-artifact.py"
+          --tree "$GITHUB_WORKSPACE/signing"
+          --asset-allowlist "$GITHUB_WORKSPACE/allowlists"
 
       - name: Sign and upload signatures
-        if: steps.gate.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -e
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > signing/minisign.key
+          SIGNING_KEY="$RUNNER_TEMP/myownmesh-minisign.key"
+          trap 'rm -f "$SIGNING_KEY"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$SIGNING_KEY"
           cd signing
-          shopt -s nullglob
+          mapfile -t payloads < <(find . -maxdepth 1 -type f \
+            ! -name '*.minisig' ! -name '*.sha256' -print | sort)
+          ((${#payloads[@]} > 0)) || { echo "no release payloads downloaded"; exit 1; }
           # Password-less CI key (see RELEASE-SIGNING.md): no prompt, </dev/null
           # guards against ever hanging on one.
-          for f in myownmesh-*.tar.gz myownmesh-*.zip; do
-            minisign -S -s minisign.key -m "$f" -x "$f.minisig" </dev/null
+          for f in "${payloads[@]}"; do
+            minisign -S -s "$SIGNING_KEY" -m "$f" -x "$f.minisig" </dev/null
           done
-          rm -f minisign.key
-          gh release upload "$TAG" myownmesh-*.minisig --repo "$GITHUB_REPOSITORY" --clobber
+          python "$GITHUB_WORKSPACE/scripts/verify-release-artifact.py" \
+             --signature-tree "$GITHUB_WORKSPACE/signing" \
+             --public-key "$MINISIGN_PUBLIC_KEY" \
+             --asset-allowlist "$GITHUB_WORKSPACE/allowlists"
+          mapfile -t signatures < <(find . -maxdepth 1 -type f -name '*.minisig' -print | sort)
+          gh release upload "$TAG" "${signatures[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Recheck uploaded payload/signature set while draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_dir="$RUNNER_TEMP/remote-release-assets"
+          rm -rf "$remote_dir"
+          mkdir -p "$remote_dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$remote_dir" --clobber
+          python "$GITHUB_WORKSPACE/scripts/verify-release-artifact.py" \
+            --verify-release-assets \
+            --signature-tree "$GITHUB_WORKSPACE/signing" \
+            --remote-tree "$remote_dir" \
+            --public-key "$MINISIGN_PUBLIC_KEY" \
+            --asset-allowlist "$GITHUB_WORKSPACE/allowlists" \
+            --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Publish signed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_dir="$RUNNER_TEMP/final-release-assets"
+          rm -rf "$remote_dir"
+          mkdir -p "$remote_dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$remote_dir" --clobber
+          python "$GITHUB_WORKSPACE/scripts/verify-release-artifact.py" \
+            --verify-release-assets \
+            --signature-tree "$GITHUB_WORKSPACE/signing" \
+            --remote-tree "$remote_dir" \
+            --public-key "$MINISIGN_PUBLIC_KEY" \
+            --asset-allowlist "$GITHUB_WORKSPACE/allowlists" \
+            --tag "$TAG" \
+            --repository "$GITHUB_REPOSITORY"
+          python "$GITHUB_WORKSPACE/scripts/verify-release-artifact.py" \
+            --preflight-release \
+            --tag "$TAG" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -2,17 +2,17 @@
 
 A NanoKVM (Sophgo **SG2002**, single T-Head **C906** riscv64 core, ~256 MB
 RAM, musl userland) can run a real MyOwnMesh node so the KVM appears as a
-first-class device on an AllMyStuff mesh. The split is deliberate:
+first-class device on a mesh. The split is deliberate:
 
 - **The `myownmesh` daemon runs natively on the device.** It holds the
   device's ed25519 identity, does the NAT-traversed WebRTC mesh + Nostr
   signaling, and exposes the local control socket at
   `$MYOWNMESH_HOME/daemon.sock`. This is the only Rust artifact on the KVM.
-- **The AllMyStuff node logic lives in the NanoKVM Go server** (`NanoKVM-Server`,
-  package `service/mesh`), as a *client* of that socket — exactly the sidecar
-  pattern the desktop app uses, but with KVM-native backends (its own web UI
-  tunneled over the mesh, `/dev/hidg*` and `libkvm` reused in-process). See the
-  NanoKVM repo's `docs/MESH.md`.
+- **The application logic lives in the NanoKVM Go server** (`NanoKVM-Server`,
+  package `service/mesh`), as a *client* of that socket — the same sidecar
+  pattern a desktop application would use, but with KVM-native backends (its own
+  web UI tunneled over the mesh, `/dev/hidg*` and `libkvm` reused in-process).
+  See the NanoKVM repo's `docs/MESH.md`.
 
 Only the daemon needs cross-compiling, and it is the easy half: `myownmesh-core`
 is pure Rust on `ring` + `rustls` (no OpenSSL, no C system libraries), so the
@@ -94,9 +94,9 @@ The NanoKVM repo adds an init script (`kvmapp/system/init.d/S94myownmesh`) that
 does this. The identity (`$MYOWNMESH_HOME/.secrets/identity.json`, 0600) is
 generated once on first boot and persists across updates.
 
-The KVM ships joined to the `cec-backend-client-mesh` network on the standard
-public venue and advertises itself as **claimable**, so the machine it is wired
-to adopts it into that owner's fleet (the NanoKVM bridge drives the claim).
+The KVM ships joined to its operator's configured network on the standard public
+venue and advertises itself as **claimable**, so the machine it is wired to
+adopts it into that owner's fleet (the NanoKVM bridge drives the claim).
 
 ## Released artifact
 

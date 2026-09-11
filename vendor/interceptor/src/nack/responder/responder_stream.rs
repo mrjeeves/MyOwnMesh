@@ -1,4 +1,3 @@
-use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,10 +12,6 @@ struct ResponderStreamInternal {
     size: u16,
     last_added: u16,
     started: bool,
-    repairs: VecDeque<u16>,
-    pending_repairs: HashSet<u16>,
-    repair_worker: Option<tokio::task::JoinHandle<()>>,
-    closed: bool,
 }
 
 impl ResponderStreamInternal {
@@ -26,10 +21,6 @@ impl ResponderStreamInternal {
             size: 1 << log2_size,
             last_added: 0,
             started: false,
-            repairs: VecDeque::new(),
-            pending_repairs: HashSet::new(),
-            repair_worker: None,
-            closed: false,
         }
     }
 
@@ -95,67 +86,6 @@ impl ResponderStream {
         let internal = self.internal.lock().await;
         internal.get(seq).cloned()
     }
-
-    /// One immediate repair worker per SSRC. Repeated feedback coalesces
-    /// only while a sequence is queued/in flight; after completion a new
-    /// NACK can retry it immediately. Fresh RTP never waits on this worker.
-    pub(super) async fn request_repairs(
-        self: &Arc<Self>,
-        nack: &rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack,
-    ) {
-        let mut internal = self.internal.lock().await;
-        if internal.closed {
-            return;
-        }
-        for seq in nack.nacks.iter().flat_map(|pair| pair.into_iter()) {
-            if internal.pending_repairs.len() < usize::from(internal.size)
-                && internal.get(seq).is_some()
-                && internal.pending_repairs.insert(seq)
-            {
-                internal.repairs.push_back(seq);
-            }
-        }
-        if internal.repair_worker.is_none() && !internal.repairs.is_empty() {
-            let stream = Arc::clone(self);
-            internal.repair_worker = Some(tokio::spawn(async move {
-                loop {
-                    let (seq, packet) = {
-                        let mut state = stream.internal.lock().await;
-                        let Some(seq) = state.repairs.pop_front() else {
-                            state.repair_worker = None;
-                            return;
-                        };
-                        // Recheck retention when serviced; never replay a
-                        // packet that aged out while its writer was blocked.
-                        (seq, state.get(seq).cloned())
-                    };
-                    if let Some(packet) = packet {
-                        if let Err(err) = stream
-                            .next_rtp_writer
-                            .write(&packet, &Attributes::new())
-                            .await
-                        {
-                            log::warn!("failed resending nacked packet: {}", err);
-                        }
-                    }
-                    stream.internal.lock().await.pending_repairs.remove(&seq);
-                    // Repairs share the socket/runtime with current video,
-                    // audio and control. Yield, but add no timer or delay.
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-    }
-
-    pub(super) async fn close(&self) {
-        let mut internal = self.internal.lock().await;
-        internal.closed = true;
-        internal.repairs.clear();
-        internal.pending_repairs.clear();
-        if let Some(worker) = internal.repair_worker.take() {
-            worker.abort();
-        }
-    }
 }
 
 /// RTPWriter is used by Interceptor.bind_local_stream.
@@ -172,6 +102,22 @@ impl RTPWriter for ResponderStream {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn retained_slot_must_match_exact_requested_sequence() {
+        let mut stream = ResponderStreamInternal::new(3);
+        let packet = |sequence_number| rtp::packet::Packet {
+            header: rtp::header::Header { sequence_number, ..Default::default() },
+            ..Default::default()
+        };
+        stream.add(&packet(9));
+        stream.add(&packet(1));
+        // Model a ring alias that otherwise passes the distance checks.
+        stream.last_added = 9;
+        assert!(stream.get(9).is_none());
+        stream.add(&packet(10));
+        assert_eq!(stream.get(10).unwrap().header.sequence_number, 10);
+    }
 
     #[test]
     fn test_responder_stream() -> Result<()> {

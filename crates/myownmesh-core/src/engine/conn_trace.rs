@@ -119,8 +119,6 @@ fn tier_kind(t: &ConnectionTier) -> &'static str {
         ConnectionTier::WakeProbe => "wake_probe",
         ConnectionTier::IceWatchdog { .. } => "ice_watchdog",
         ConnectionTier::IceRestart { .. } => "ice_restart",
-        ConnectionTier::Rehandshake { .. } => "rehandshake",
-        ConnectionTier::RoomRejoin { .. } => "room_rejoin",
         ConnectionTier::StopStart => "stop_start",
     }
 }
@@ -220,24 +218,22 @@ impl ConnTracer {
 
         let mut seen: HashSet<String> = HashSet::with_capacity(state.peers.len());
 
-        for entry in state.peers.iter() {
-            let device_id = entry.key().clone();
+        for peer in state.peers.values_snapshot() {
+            let device_id = peer.device_id.clone();
             seen.insert(device_id.clone());
-            let peer = entry.value();
             let epoch = peer.epoch;
 
             // Transport-derived states — sync reads, lock released
             // before we touch the per-peer RwLock below.
-            let (ice_state, pc_state) = {
-                let guard = peer.session.lock();
-                match guard.as_ref() {
-                    Some(s) => (
-                        Some(format!("{:?}", s.ice_connection_state())),
-                        Some(format!("{:?}", s.connection_state())),
-                    ),
-                    None => (None, None),
-                }
-            };
+            let (ice_state, pc_state) = peer
+                .current_worker()
+                .map(|session| {
+                    (
+                        Some(format!("{:?}", session.ice_connection_state())),
+                        Some(format!("{:?}", session.connection_state())),
+                    )
+                })
+                .unwrap_or((None, None));
 
             let (snap, last_recv_age_ms, rtt_ms) = {
                 let data = peer.state.read();
@@ -380,13 +376,6 @@ mod tests {
                 since: Instant::now()
             }),
             "ice_watchdog"
-        );
-        assert_eq!(
-            tier_kind(&ConnectionTier::Rehandshake {
-                attempt: 1,
-                next_at: Instant::now()
-            }),
-            "rehandshake"
         );
         assert_eq!(tier_kind(&ConnectionTier::StopStart), "stop_start");
     }

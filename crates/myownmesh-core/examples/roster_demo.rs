@@ -4,36 +4,66 @@
 //! cargo run --example roster_demo -p myownmesh-core
 //! ```
 //!
-//! Demonstrates: building two peers with `auto_approve = false` so
-//! the second peer needs explicit user approval, then approving
-//! it programmatically and watching the connection transition to
-//! `Active`.
-
-use std::sync::Arc;
-
+//! Demonstrates: building two peers with semantic admission enabled,
+//! observing the authenticated peer, and watching the connection transition
+//! to `Active` before listing the canonical roster projection.
+#[cfg(feature = "transport-lab")]
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+#[cfg(feature = "transport-lab")]
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::Transport;
-use myownmesh_core::{MeshEvent, PeerEvent};
+#[cfg(feature = "transport-lab")]
+use myownmesh_core::resource::{
+    FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort,
+};
+#[cfg(feature = "transport-lab")]
+use myownmesh_core::{
+    ConnectorCallbackPolicy, Mesh, MeshConfig, MeshEvent, PeerEvent, WebRtcConnectorCapablePolicy,
+    WebRtcConnectorProfile,
+};
+#[cfg(feature = "transport-lab")]
 use myownmesh_signaling::local::LocalBroker;
 
+#[cfg(feature = "transport-lab")]
 fn cfg(label: &str, auto_approve: bool) -> NetworkConfig {
     NetworkConfig {
         id: label.into(),
         network_id: "roster-demo".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.into(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
+        hub: None,
+        local_observations: None,
+        introduction: None,
+        tree: None,
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve,
     }
 }
 
+#[cfg(feature = "transport-lab")]
+fn connector_policy() -> WebRtcConnectorCapablePolicy {
+    let grant = ResourceClaim::try_from_entries(
+        ResourceClass::ALL
+            .into_iter()
+            .map(|class| (class, 100_000_000)),
+    )
+    .expect("example resource grant is representable");
+    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("example resource provider is valid");
+    WebRtcConnectorCapablePolicy::new(
+        resources,
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
+    )
+}
+
+#[cfg(feature = "transport-lab")]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -44,37 +74,38 @@ async fn main() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     let broker = LocalBroker::new();
-    let transport = Transport::new().unwrap();
+    let host = Identity::ephemeral();
+    let guest = Identity::ephemeral();
+    let host_device = host.public_id().to_string();
+    let guest_device = guest.public_id().to_string();
+    let policy = connector_policy();
+    let host_mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        std::sync::Arc::new(host),
+        policy.clone(),
+    )
+    .await
+    .unwrap();
+    let guest_mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        std::sync::Arc::new(guest),
+        policy,
+    )
+    .await
+    .unwrap();
 
-    let host = Arc::new(Identity::ephemeral());
-    let guest = Arc::new(Identity::ephemeral());
+    // Both peers use the configured semantic admission path.
+    let host_net = host_mesh.join(cfg("host", true)).await.unwrap();
+    let guest_net = guest_mesh.join(cfg("guest", true)).await.unwrap();
+    let mut host_events = host_mesh.events();
+    host_net.attach_local(&broker);
+    guest_net.attach_local(&broker);
 
-    // Host requires explicit approval; guest auto-approves.
-    let (host_net, _hd) = spawn_network(cfg("host", false), host.clone(), transport.clone())
-        .await
-        .unwrap();
-    let (guest_net, _gd) = spawn_network(cfg("guest", true), guest.clone(), transport.clone())
-        .await
-        .unwrap();
+    println!("Host pubkey: {host_device}\nGuest pubkey: {guest_device}\n");
 
-    let mut host_events = host_net.events_tx.subscribe();
-    attach_local(&host_net, &broker);
-    attach_local(&guest_net, &broker);
-
-    println!(
-        "Host pubkey: {}\nGuest pubkey: {}\n",
-        host.public_id(),
-        guest.public_id()
-    );
-
-    // Wait for the guest to authenticate. We'll see them in
-    // `PendingApproval` first because host.auto_approve = false.
-    // The `verification_code` field on the event is the eyeball-
-    // check code surfaced to the user before they click approve.
-    // (Note: depending on which order the hello/auth_response
-    // frames arrive in on this side, the code field can be empty
-    // for the very first emission — the production UI reads it
-    // from PeerInfo.capabilities or re-fetches it via the engine.)
+    // Wait for the guest to authenticate and then become active through the
+    // semantic admission path. The verification code remains observable for
+    // deployments that choose to add an out-of-band policy gate.
     let mut guest_pubkey = None;
     while let Ok(event) = host_events.recv().await {
         if let MeshEvent::Peer(PeerEvent::Authenticated {
@@ -93,19 +124,6 @@ async fn main() {
     }
     let guest_pubkey = guest_pubkey.expect("authenticated event");
 
-    // The user "confirms" the code over an out-of-band channel
-    // and approves. Two steps:
-    //   1. Persist the approval to the roster so future reconnects
-    //      auto-allow without prompting.
-    //   2. Emit the `approve` frame for the current session so the
-    //      connection transitions to Active.
-    println!("Host: approving guest into roster...");
-    host_net
-        .approve_roster(&guest_pubkey, "Guest's laptop")
-        .await
-        .unwrap();
-    myownmesh_core::engine::handshake::send_local_approve(&host_net, &guest_pubkey).await;
-
     while let Ok(event) = host_events.recv().await {
         if let MeshEvent::Peer(PeerEvent::Approved {
             device_id, label, ..
@@ -118,9 +136,13 @@ async fn main() {
         }
     }
 
-    let roster = myownmesh_core::roster::load(&host_net.network_id).unwrap();
-    println!("\nRoster ({}):", host_net.network_id);
+    let roster = myownmesh_core::roster::load(host_net.network_id()).unwrap();
+    println!("\nRoster ({}):", host_net.network_id());
     for entry in roster.authorized_devices {
         println!("  - {} ({})", entry.label, entry.device_id);
     }
+}
+#[cfg(not(feature = "transport-lab"))]
+fn main() {
+    eprintln!("run this demo with --features transport-lab");
 }

@@ -1,0 +1,4042 @@
+{
+  "schema_version": 1,
+  "expected_head": "f70689e1d64883458ad204d8d0b9f9b76bee9666",
+  "expected_ref": "macro/02-authority-durability-relay",
+  "build_timeout_seconds": 1800,
+  "max_output_bytes": 16777216,
+  "acceptance_contract": {
+    "path": "docs/qualification/graph-hub-acceptance-contract.md",
+    "sha256": "3C60B328A6B0C7696063F84437209484428AEEF5D5B5B6A52B2DB2563E8D05D5"
+  },
+  "required_selectors": [
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::historical_membership_exclusion_survives_later_selectors_and_cold_journals"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authority_lineage_selection_round_trips_and_regrant_is_future_only"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_authority_selection_durability",
+      "selector": "selected_authority_branch_survives_compact_reopen_and_cold_hydration"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::selector_provenance_continuations_cold_restore_and_rollback"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::checkpoint_ancestry_resolver_checks_signed_closure_in_one_snapshot"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::selector_checkpoint_valid_checksum_tampering_falls_back_to_canonical_history"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::clean_live_checkpoint_restores_without_history_replay"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::candidate_relative_noops_preserve_concurrent_role_operations_across_journals"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "effective_membership_restoration_supersedes_stand_down_in_any_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "finite_authority_fork_projection_converges_for_every_arrival_permutation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "second_order_payload_fork_converges_without_authority_join"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "self_authored_membership_resolution_is_order_independent_after_role_regrant"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "incomparable_heads_fail_closed_until_full_head_resolution"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authority_use_resolution_only_keeps_the_selected_subject_branch_effective"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "conflict_projection_does_not_depend_on_arrival_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "recursive_resolution_selects_a_terminal_head"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "stale_recursive_resolution_fails_closed"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_tier"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "controller_can_resolve_member_revoke_using_its_candidate_causal_tier"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selector": "authoring_witness_supports_controller_to_member_demotion"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::root_owner_fallback_stops_after_root_cell_advances"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::authoring_witness_carries_root_revoke_into_later_root_authored_fact"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::projection_follows_nested_same_cell_resolutions"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::shared_nested_controller_resolution_dag_is_path_local_and_accepted"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::conflicted_root_role_cell_fails_closed"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::controller_can_grant_controller_but_not_owner"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::authorization_uses_candidate_causal_past_not_later_target_role"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::resolution_authority_uses_selected_controller_proposition"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::ordinary_role_resolution_cannot_join_cross_cell_authority_heads"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::payload_resolution_does_not_join_a_transitive_role_fork"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::self_authored_membership_keeps_a_role_authority_fork_explicit"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::authority_resolution_tracks_distinct_membership_and_stand_down_branches"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::membership_resolution_does_not_select_authority_lineage_branch"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::eviction_removes_closed_session_admission"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::membership_admit_restores_membership_but_not_role"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::membership_admit_rejects_self_and_open_profile_facts"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::evaluator_derives_decision_from_the_selected_attestation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::open_profile_has_no_durable_fact_domain"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::admission_budget_refuses_n_plus_one_but_replays_duplicates"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::dependency_waiters_wake_only_after_their_parent_arrives"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::admitted_parent_is_ready_but_absent_parent_quarantines_exactly"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::retained_author_budget_spans_quarantine_and_promotion"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::semantic_noops_and_ineligible_quarantine_do_not_retain"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::journal_rolls_back_only_touched_rows_and_bounds_ready_promotions"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::journal_retries_transitive_waiters_with_one_cumulative_bound"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::preflight_token_rejects_changed_fact_and_stale_graph"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::rollback_cache_fence_preserves_root_without_projection_map_clone"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::journal_records_terminal_ready_waiter_without_rolling_back_parent"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::journal_terminally_removes_member_signed_unauthorized_owner_waiter"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::candidate_authorization_taxonomy_is_role_independent"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::journal_projection_capacity_refusal_restores_parent_and_ready_waiter"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::indexed_projection_matches_reference_and_rollback_restores_indexes"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::rebuild_reconciles_loader_mutated_scalar_accounting"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::current_head_role_admission_uses_borrowed_causal_graph"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::warm_current_head_admission_is_sparse_over_an_unrelated_tail"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::direct_projection_capacity_refusal_restores_exact_graph_state"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::bulk_restore_error_restores_the_committed_prefix"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::retry_projection_capacity_refusal_restores_quarantine_and_waiters"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::authority_impact_stays_sparse_and_matches_full_projection"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::bulk_restore_is_deterministic_and_matches_incremental_projection"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::canonical_dependencies_include_declared_authority_predecessors"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::cold_history_retirement_keeps_constant_live_state_and_hydrates_exact_dependencies"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::aggregate_preplanning_work_tracks_ready_frontier_without_extra_promotion"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::aggregate_retry_budget_is_cumulative_across_inputs"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::aggregate_journal_is_ordered_and_isolates_input_refusal"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::aggregate_journal_evolves_graph_and_attributes_promotions"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "config::tests::hub_tree_scheduler_policy_accepts_valid_tree_and_refuses_invalid_policy"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::hub::tests::parent_attempt_is_minimum_jittered_and_interval_paced"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::hub::tests::parent_attempt_jitter_rejection_progresses_in_two_draws"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::hub::tests::parent_attempt_rejects_backward_clock_and_fences_overflow"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::local_observation::tests::aggregate_updates_are_bounded_and_provider_funded"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::local_observation::tests::expired_records_are_filtered_before_bounded_purge"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::local_observation::tests::expiry_regression_overflow_and_stale_ticket_are_refused"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::child_binds_remote_parent_and_rejects_directly_expired_response"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::child_pending_requires_exact_response_and_cancellation_releases_node"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::parent_accept_is_idempotent_and_peer_retire_releases_exact_node"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::parent_accept_reack_preserves_generation_and_rejects_replacements"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::pending_expiry_is_bounded_and_old_ticket_cannot_bind_successor"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::reconcile::tests::local_observation_policy_requires_replacement"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::reconcile::tests::tree_owner_policy_and_topology_require_replacement"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::dispatch_controls::first_success_stops_new_scheduling"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::dispatch_controls::generic_failure_is_conservatively_uncertain"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::dispatch_controls::refused_best_hop_backfills_later_hop"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::dispatch_controls::started_parallel_futures_are_drained_with_bounded_activity"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::dispatch_controls::uncertain_result_stops_new_fallback_scheduling"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::replay_controls::exact_cap_replay_eviction_progresses_and_duplicate_does_not_churn"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::replay_controls::production_admission_allows_signed_leaf_origin_but_refuses_transit"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::replay_controls::serialized_size_refuses_before_replay_and_after_hop_growth"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::tests::leaf_origination_bypasses_forwarder_gate_but_transit_does_not"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::tests::plan_is_best_first_deduplicated_and_bounded"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::tests::policy_and_expired_ttl_refuse_before_routing_work"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::backwards_clock_and_retirement_fence_mutation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::clock_overflow_is_rejected_before_start"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::interval_doubles_and_caps_without_deadline_spin"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::k_controls_transmit_and_suppress_once"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::local_change_resets_even_at_imin_without_using_attack_budget"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::policy_rejects_unbounded_or_zero_dimensions"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::rejection_sampling_progresses_after_one_bounded_rejection"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::reset_budget_and_minimum_preserve_repair_need"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::trickle::tests::start_samples_half_open_range_and_separate_deadlines"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::advertisement_has_stable_strict_wire_shape_and_round_trips"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::advertisement_is_application_not_control_or_durable_fact"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::advertisement_rejects_zero_sequence_noncanonical_identity_and_unknown_fields"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::digest_is_canonical_over_sorted_unique_hubs_and_redundancy"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::discovery_frames_are_application_not_privileged_control"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::discovery_rejects_oversized_or_noncanonical_pages_and_sequences"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::hub::tests::discovery_request_and_response_round_trip_with_strict_cursor"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::parenting::tests::attach_frames_are_application_not_privileged_control"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::parenting::tests::attach_rejects_zero_or_self_relation_and_preserves_typed_refusal"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::parenting::tests::attach_request_has_stable_shape_and_typed_response_round_trip"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "protocol::parenting::tests::tree_digest_binds_context_root_hubs_backup_count_profile_and_domain"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::digest_writer_preserves_json_bytes_and_propagates_serializer_errors"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::store::tests::pending_proof_read_is_bounded_and_refuses_selected_corruption"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::aliases_are_deduplicated_and_surviving_hubs_are_ranked_for_failover"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::canonical_5000_member_plan_is_symmetric_bounded_and_stable"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::edge_is_symmetric_and_deterministic"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::hub_departure_only_rehomes_its_own_spokes"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::hubs_full_mesh_and_spokes_attach_to_ranked_hubs"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::large_hub_prefix_matches_reference_without_large_retained_ranking"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::large_peer_selection_computes_one_spoke_assignment"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::next_hops_are_bounded_stable_and_self_free_with_duplicate_input"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::next_hops_respects_explicit_limit_without_growing_with_connected_input"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::only_hubs_forward"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::preferred_matches_edges"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::preferred_selection_score_work_is_bounded_by_hub_count"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::redundancy_clamps_to_hub_count"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::hubs::tests::spoke_routes_via_destinations_hubs_first"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::aliases_are_self_free_deduplicated_and_limit_bounded"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::five_thousand_member_planner_bounds_work_and_preserves_roster_order"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::five_thousand_member_primary_tree_is_bounded"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::next_hops_use_destination_candidates_at_root_and_root_at_hub"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::parent_successor_matches_rendezvous_order_and_wraps"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::root_hub_leaf_shape_has_no_peer_or_root_leaf_edges"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::single_parent_candidate_remains_retryable_after_wrap"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::tests::preferred_tree_parent_is_connected_preference_only"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::routing::tests::real_hub_tree_accepts_connected_parent_outside_static_prefix"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "topology::tree::tests::preferred_parent_is_shape_checked_for_leaf_and_hub"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::governance::governance_projection_controls::projection_persistence_failure_is_returned_before_roster_commit"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::governance::governance_projection_controls::role_projection_skips_persistence_and_metadata_failure_is_returned"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::closed_relay::tests::fixture_grant_components_are_checked_and_charge_each_reservation_once"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::tests::v4_transport_lab_retire_facade_is_exact_across_real_replacement"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selector": "exported_reconstruction_is_ordered_and_set_checked"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selector": "exported_reconstruction_retains_legitimate_unresolved_custody"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selector": "exported_reconstruction_rejects_missing_extra_duplicate_and_mismatch"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selector": "semantic_project_and_incremental_compaction_converge"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "one_page_uses_one_durable_commit_without_readmission"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "concurrent_unrelated_admissions_converge_and_exact_replay_is_a_noop"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "mixed_valid_duplicate_and_invalid_page_is_refused_before_mutation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "bounded_envelope_refusal_preserves_identity_and_provider_baseline"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "precommit_failure_rolls_back_nonempty_group_and_consumes_one_shot"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "ambiguous_commit_reconciles_and_reopens_exact_group_state"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selector": "restart_restores_exact_committed_group_identity"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "identity_rotation_isolation",
+      "selector": "a_new_key_cannot_reauthor_or_replace_retained_history"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "identity_rotation_isolation",
+      "selector": "new_identity_authors_only_after_canonical_authority_grant"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_opaque_relay",
+      "selector": "resource_report_baseline_helpers_distinguish_live_and_history"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_opaque_relay",
+      "selector": "closed_members_exchange_opaque_payloads_only_through_relay"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_relay_production",
+      "selector": "closed_members_relay_through_production_local_broker"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selector": "hub_tree_routes_without_parent_service_and_fails_without_exit_path"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selector": "hub_tree_real_wire_parenting_route_capacity_and_discovery"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selector": "hub_tree_connected_full_prefix_uses_live_out_of_prefix_parent"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "durable_proof_delivery_r3",
+      "selector": "r3_many_pending_deliveries_preserve_unrelated_links_and_footprints"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "durable_proof_delivery_r3",
+      "selector": "r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "topology_routing",
+      "selector": "bounded_route_fails_over_and_preserves_exact_once_delivery"
+    },
+    {
+      "package": "myownmesh",
+      "target_kind": "lib",
+      "target_name": "myownmesh",
+      "selector": "registry::tests::v4_r3_daemon_prepared_rows_follow_the_canonical_config_order"
+    },
+    {
+      "package": "myownmesh",
+      "target_kind": "lib",
+      "target_name": "myownmesh",
+      "selector": "registry::tests::v4_r3_daemon_the_networks_work_ceiling_covers_every_fixed_field"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::tests::shutdown_rejects_peer_construction_before_allocation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::tests::shutdown_waits_for_admitted_postconstruction_install"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::aggregate_ready_leaf_rollback_and_drop_preserve_seed_ownership"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "semantic::causal::tests::ordinary_authority_fork_invalidation_is_order_independent_and_journaled"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::accepted_relation_expires_and_reaccepts_with_new_generation"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::accepted_expiry_maintenance_is_bounded_and_child_reattaches"
+    },
+    {
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selector": "engine::parenting::tests::child_backup_adoption_does_not_consume_child_capacity_and_expires"
+    }
+  ],
+  "cells": [
+    {
+      "id": "gate-175",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::historical_membership_exclusion_survives_later_selectors_and_cold_journals"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-154",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authority_lineage_selection_round_trips_and_regrant_is_future_only"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-155",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_authority_selection_durability",
+      "selectors": [
+        "selected_authority_branch_survives_compact_reopen_and_cold_hydration"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-170",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::selector_provenance_continuations_cold_restore_and_rollback"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-171",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::checkpoint_ancestry_resolver_checks_signed_closure_in_one_snapshot"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-172",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::selector_checkpoint_valid_checksum_tampering_falls_back_to_canonical_history"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-173",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::clean_live_checkpoint_restores_without_history_replay"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-174",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::candidate_relative_noops_preserve_concurrent_role_operations_across_journals"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-156",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "effective_membership_restoration_supersedes_stand_down_in_any_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-157",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "finite_authority_fork_projection_converges_for_every_arrival_permutation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-158",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-159",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "second_order_payload_fork_converges_without_authority_join"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-160",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "self_authored_membership_resolution_is_order_independent_after_role_regrant"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 240
+    },
+    {
+      "id": "gate-161",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-162",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "incomparable_heads_fail_closed_until_full_head_resolution"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-163",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authority_use_resolution_only_keeps_the_selected_subject_branch_effective"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-164",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "conflict_projection_does_not_depend_on_arrival_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-165",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "recursive_resolution_selects_a_terminal_head"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-166",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "stale_recursive_resolution_fails_closed"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-167",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_tier"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-168",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "controller_can_resolve_member_revoke_using_its_candidate_causal_tier"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-169",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_controls",
+      "selectors": [
+        "authoring_witness_supports_controller_to_member_demotion"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-001",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::root_owner_fallback_stops_after_root_cell_advances"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-002",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::authoring_witness_carries_root_revoke_into_later_root_authored_fact"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-003",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::projection_follows_nested_same_cell_resolutions"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-004",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::shared_nested_controller_resolution_dag_is_path_local_and_accepted"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-005",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::conflicted_root_role_cell_fails_closed"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-006",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::controller_can_grant_controller_but_not_owner"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-007",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::authorization_uses_candidate_causal_past_not_later_target_role"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-008",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::resolution_authority_uses_selected_controller_proposition"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-009",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-010",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::ordinary_role_resolution_cannot_join_cross_cell_authority_heads"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-011",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::payload_resolution_does_not_join_a_transitive_role_fork"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-012",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::self_authored_membership_keeps_a_role_authority_fork_explicit"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-013",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::authority_resolution_tracks_distinct_membership_and_stand_down_branches"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-014",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::membership_resolution_does_not_select_authority_lineage_branch"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-015",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::eviction_removes_closed_session_admission"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-016",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::membership_admit_restores_membership_but_not_role"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-017",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::membership_admit_rejects_self_and_open_profile_facts"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-018",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::evaluator_derives_decision_from_the_selected_attestation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-019",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::open_profile_has_no_durable_fact_domain"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-020",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::admission_budget_refuses_n_plus_one_but_replays_duplicates"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-021",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::dependency_waiters_wake_only_after_their_parent_arrives"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-022",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::admitted_parent_is_ready_but_absent_parent_quarantines_exactly"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-023",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::retained_author_budget_spans_quarantine_and_promotion"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-024",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::semantic_noops_and_ineligible_quarantine_do_not_retain"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-025",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::journal_rolls_back_only_touched_rows_and_bounds_ready_promotions"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-026",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::journal_retries_transitive_waiters_with_one_cumulative_bound"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-027",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::preflight_token_rejects_changed_fact_and_stale_graph"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-028",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::rollback_cache_fence_preserves_root_without_projection_map_clone"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-029",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::journal_records_terminal_ready_waiter_without_rolling_back_parent"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-030",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::journal_terminally_removes_member_signed_unauthorized_owner_waiter"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-031",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::candidate_authorization_taxonomy_is_role_independent"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-032",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::journal_projection_capacity_refusal_restores_parent_and_ready_waiter"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-033",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::indexed_projection_matches_reference_and_rollback_restores_indexes"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-034",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::rebuild_reconciles_loader_mutated_scalar_accounting"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-035",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::current_head_role_admission_uses_borrowed_causal_graph"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-036",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::warm_current_head_admission_is_sparse_over_an_unrelated_tail"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-037",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::direct_projection_capacity_refusal_restores_exact_graph_state"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-038",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::bulk_restore_error_restores_the_committed_prefix"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-039",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::retry_projection_capacity_refusal_restores_quarantine_and_waiters"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-040",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::authority_impact_stays_sparse_and_matches_full_projection"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-041",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::bulk_restore_is_deterministic_and_matches_incremental_projection"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-042",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::canonical_dependencies_include_declared_authority_predecessors"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-043",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::cold_history_retirement_keeps_constant_live_state_and_hydrates_exact_dependencies"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-044",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::aggregate_preplanning_work_tracks_ready_frontier_without_extra_promotion"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-045",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::aggregate_retry_budget_is_cumulative_across_inputs"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-046",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::aggregate_journal_is_ordered_and_isolates_input_refusal"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-047",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::aggregate_journal_evolves_graph_and_attributes_promotions"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-048",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "config::tests::hub_tree_scheduler_policy_accepts_valid_tree_and_refuses_invalid_policy"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-049",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::hub::tests::parent_attempt_is_minimum_jittered_and_interval_paced"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-050",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::hub::tests::parent_attempt_jitter_rejection_progresses_in_two_draws"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-051",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::hub::tests::parent_attempt_rejects_backward_clock_and_fences_overflow"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-052",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::local_observation::tests::aggregate_updates_are_bounded_and_provider_funded"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-053",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::local_observation::tests::expired_records_are_filtered_before_bounded_purge"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-054",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::local_observation::tests::expiry_regression_overflow_and_stale_ticket_are_refused"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-055",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::child_binds_remote_parent_and_rejects_directly_expired_response"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-056",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::child_pending_requires_exact_response_and_cancellation_releases_node"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-057",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::parent_accept_is_idempotent_and_peer_retire_releases_exact_node"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-058",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::parent_accept_reack_preserves_generation_and_rejects_replacements"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-059",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::pending_expiry_is_bounded_and_old_ticket_cannot_bind_successor"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-060",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::reconcile::tests::local_observation_policy_requires_replacement"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-061",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::reconcile::tests::tree_owner_policy_and_topology_require_replacement"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-062",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::dispatch_controls::first_success_stops_new_scheduling"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-063",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::dispatch_controls::generic_failure_is_conservatively_uncertain"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-064",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::dispatch_controls::refused_best_hop_backfills_later_hop"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-065",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::dispatch_controls::started_parallel_futures_are_drained_with_bounded_activity"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-066",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::dispatch_controls::uncertain_result_stops_new_fallback_scheduling"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-067",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::replay_controls::exact_cap_replay_eviction_progresses_and_duplicate_does_not_churn"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-068",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::replay_controls::production_admission_allows_signed_leaf_origin_but_refuses_transit"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-069",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::replay_controls::serialized_size_refuses_before_replay_and_after_hop_growth"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-070",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::tests::leaf_origination_bypasses_forwarder_gate_but_transit_does_not"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-071",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::tests::plan_is_best_first_deduplicated_and_bounded"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-072",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::tests::policy_and_expired_ttl_refuse_before_routing_work"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-073",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::backwards_clock_and_retirement_fence_mutation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-074",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::clock_overflow_is_rejected_before_start"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-075",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::interval_doubles_and_caps_without_deadline_spin"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-076",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::k_controls_transmit_and_suppress_once"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-077",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::local_change_resets_even_at_imin_without_using_attack_budget"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-078",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::policy_rejects_unbounded_or_zero_dimensions"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-079",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::rejection_sampling_progresses_after_one_bounded_rejection"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-080",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::reset_budget_and_minimum_preserve_repair_need"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-081",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::trickle::tests::start_samples_half_open_range_and_separate_deadlines"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-082",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::advertisement_has_stable_strict_wire_shape_and_round_trips"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-083",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::advertisement_is_application_not_control_or_durable_fact"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-084",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::advertisement_rejects_zero_sequence_noncanonical_identity_and_unknown_fields"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-085",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::digest_is_canonical_over_sorted_unique_hubs_and_redundancy"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-086",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::discovery_frames_are_application_not_privileged_control"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-087",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::discovery_rejects_oversized_or_noncanonical_pages_and_sequences"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-088",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::hub::tests::discovery_request_and_response_round_trip_with_strict_cursor"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-089",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::parenting::tests::attach_frames_are_application_not_privileged_control"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-090",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::parenting::tests::attach_rejects_zero_or_self_relation_and_preserves_typed_refusal"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-091",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::parenting::tests::attach_request_has_stable_shape_and_typed_response_round_trip"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-092",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "protocol::parenting::tests::tree_digest_binds_context_root_hubs_backup_count_profile_and_domain"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-093",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::digest_writer_preserves_json_bytes_and_propagates_serializer_errors"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-094",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::store::tests::pending_proof_read_is_bounded_and_refuses_selected_corruption"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-095",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::aliases_are_deduplicated_and_surviving_hubs_are_ranked_for_failover"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-096",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::canonical_5000_member_plan_is_symmetric_bounded_and_stable"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-097",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::edge_is_symmetric_and_deterministic"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-098",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::hub_departure_only_rehomes_its_own_spokes"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-099",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::hubs_full_mesh_and_spokes_attach_to_ranked_hubs"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-100",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::large_hub_prefix_matches_reference_without_large_retained_ranking"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-101",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::large_peer_selection_computes_one_spoke_assignment"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-102",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::next_hops_are_bounded_stable_and_self_free_with_duplicate_input"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-103",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::next_hops_respects_explicit_limit_without_growing_with_connected_input"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-104",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::only_hubs_forward"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-105",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::preferred_matches_edges"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-106",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::preferred_selection_score_work_is_bounded_by_hub_count"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-107",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::redundancy_clamps_to_hub_count"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-108",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::hubs::tests::spoke_routes_via_destinations_hubs_first"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-109",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::aliases_are_self_free_deduplicated_and_limit_bounded"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-110",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::five_thousand_member_planner_bounds_work_and_preserves_roster_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-111",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::five_thousand_member_primary_tree_is_bounded"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-112",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::next_hops_use_destination_candidates_at_root_and_root_at_hub"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-113",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::parent_successor_matches_rendezvous_order_and_wraps"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-114",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::root_hub_leaf_shape_has_no_peer_or_root_leaf_edges"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-115",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::single_parent_candidate_remains_retryable_after_wrap"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-116",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::tests::preferred_tree_parent_is_connected_preference_only"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-117",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::routing::tests::real_hub_tree_accepts_connected_parent_outside_static_prefix"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-118",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "topology::tree::tests::preferred_parent_is_shape_checked_for_leaf_and_hub"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-119",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::governance::governance_projection_controls::projection_persistence_failure_is_returned_before_roster_commit"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-120",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::governance::governance_projection_controls::role_projection_skips_persistence_and_metadata_failure_is_returned"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-121",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::closed_relay::tests::fixture_grant_components_are_checked_and_charge_each_reservation_once"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-122",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::tests::v4_transport_lab_retire_facade_is_exact_across_real_replacement"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120,
+      "ignored": true
+    },
+    {
+      "id": "gate-123",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selectors": [
+        "exported_reconstruction_is_ordered_and_set_checked"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-124",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selectors": [
+        "exported_reconstruction_retains_legitimate_unresolved_custody"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-125",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selectors": [
+        "exported_reconstruction_rejects_missing_extra_duplicate_and_mismatch"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-126",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_projection_compaction_differential",
+      "selectors": [
+        "semantic_project_and_incremental_compaction_converge"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-127",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "one_page_uses_one_durable_commit_without_readmission"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-128",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "concurrent_unrelated_admissions_converge_and_exact_replay_is_a_noop"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-129",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "mixed_valid_duplicate_and_invalid_page_is_refused_before_mutation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-130",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "bounded_envelope_refusal_preserves_identity_and_provider_baseline"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-131",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "precommit_failure_rolls_back_nonempty_group_and_consumes_one_shot"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-132",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "ambiguous_commit_reconciles_and_reopens_exact_group_state"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-133",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "semantic_group_commit_controls",
+      "selectors": [
+        "restart_restores_exact_committed_group_identity"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-134",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "identity_rotation_isolation",
+      "selectors": [
+        "a_new_key_cannot_reauthor_or_replace_retained_history"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-135",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "identity_rotation_isolation",
+      "selectors": [
+        "new_identity_authors_only_after_canonical_authority_grant"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-136",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_opaque_relay",
+      "selectors": [
+        "resource_report_baseline_helpers_distinguish_live_and_history"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-137",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_opaque_relay",
+      "selectors": [
+        "closed_members_exchange_opaque_payloads_only_through_relay"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-138",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "closed_member_relay_production",
+      "selectors": [
+        "closed_members_relay_through_production_local_broker"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-139",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selectors": [
+        "hub_tree_routes_without_parent_service_and_fails_without_exit_path"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-140",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selectors": [
+        "hub_tree_real_wire_parenting_route_capacity_and_discovery"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-141",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "hub_tree_routing",
+      "selectors": [
+        "hub_tree_connected_full_prefix_uses_live_out_of_prefix_parent"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-142",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "durable_proof_delivery_r3",
+      "selectors": [
+        "r3_many_pending_deliveries_preserve_unrelated_links_and_footprints"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-143",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "durable_proof_delivery_r3",
+      "selectors": [
+        "r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-144",
+      "package": "myownmesh-core",
+      "target_kind": "integration",
+      "target_name": "topology_routing",
+      "selectors": [
+        "bounded_route_fails_over_and_preserves_exact_once_delivery"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 180
+    },
+    {
+      "id": "gate-145",
+      "package": "myownmesh",
+      "target_kind": "lib",
+      "target_name": "myownmesh",
+      "selectors": [
+        "registry::tests::v4_r3_daemon_prepared_rows_follow_the_canonical_config_order"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-146",
+      "package": "myownmesh",
+      "target_kind": "lib",
+      "target_name": "myownmesh",
+      "selectors": [
+        "registry::tests::v4_r3_daemon_the_networks_work_ceiling_covers_every_fixed_field"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-147",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::tests::shutdown_rejects_peer_construction_before_allocation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-148",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::tests::shutdown_waits_for_admitted_postconstruction_install"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120,
+      "ignored": true
+    },
+    {
+      "id": "gate-149",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::aggregate_ready_leaf_rollback_and_drop_preserve_seed_ownership"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-150",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "semantic::causal::tests::ordinary_authority_fork_invalidation_is_order_independent_and_journaled"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-151",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::accepted_relation_expires_and_reaccepts_with_new_generation"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-152",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::accepted_expiry_maintenance_is_bounded_and_child_reattaches"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "gate-153",
+      "package": "myownmesh-core",
+      "target_kind": "lib",
+      "target_name": "myownmesh_core",
+      "selectors": [
+        "engine::parenting::tests::child_backup_adoption_does_not_consume_child_capacity_and_expires"
+      ],
+      "expected_running": 1,
+      "expected_summary": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "measured": 0
+      },
+      "timeout_seconds": 120
+    }
+  ]
+}

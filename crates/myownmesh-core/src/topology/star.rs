@@ -56,20 +56,43 @@ impl Topology for StarSelector {
         signing::pubkey_part(self_id) == signing::pubkey_part(&self.hub)
     }
 
-    fn next_hops(&self, self_id: &str, _dest: &str, connected: &[String]) -> Vec<String> {
+    fn next_hops(
+        &self,
+        self_id: &str,
+        _dest: &str,
+        connected: &[String],
+        limit: usize,
+    ) -> Vec<String> {
         // A spoke's only road is the hub. The hub itself has no next
         // hop: it is directly connected to every reachable member by
         // construction, so an unreachable destination is genuinely
         // unreachable.
-        if signing::pubkey_part(self_id) == signing::pubkey_part(&self.hub) {
+        if limit == 0 {
             return Vec::new();
         }
-        let hub = signing::pubkey_part(&self.hub);
-        connected
-            .iter()
-            .filter(|c| signing::pubkey_part(c) == hub)
-            .cloned()
-            .collect()
+        let self_pubkey = signing::pubkey_part(self_id);
+        let hub_pubkey = signing::pubkey_part(&self.hub);
+        if self_pubkey == hub_pubkey {
+            return Vec::new();
+        }
+        // There is only one eligible pubkey in a star. Keep its canonical
+        // lexicographically-smallest display representative while scanning
+        // once, so duplicate observations cannot change the result or grow
+        // candidate state with the connected set.
+        let mut selected: Option<&String> = None;
+        for peer in connected {
+            if signing::pubkey_part(peer) != hub_pubkey || signing::pubkey_part(peer) == self_pubkey
+            {
+                continue;
+            }
+            if selected
+                .as_ref()
+                .is_none_or(|current| peer.as_str() < current.as_str())
+            {
+                selected = Some(peer);
+            }
+        }
+        selected.into_iter().cloned().collect()
     }
 
     fn flood_ttl(&self) -> u8 {
@@ -81,6 +104,7 @@ impl Topology for StarSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -128,8 +152,11 @@ mod tests {
     fn spoke_routes_everything_via_hub() {
         let sel = StarSelector { hub: "hub".into() };
         let connected = s(&["hub"]);
-        assert_eq!(sel.next_hops("spoke1", "spoke2", &connected), s(&["hub"]));
-        assert!(sel.next_hops("hub", "spoke2", &connected).is_empty());
+        assert_eq!(
+            sel.next_hops("spoke1", "spoke2", &connected, 1),
+            s(&["hub"])
+        );
+        assert!(sel.next_hops("hub", "spoke2", &connected, 1).is_empty());
     }
 
     #[test]
@@ -143,5 +170,26 @@ mod tests {
         let peers = s(&["hubpubkey-AB123", "spoke1"]);
         let got = sel.select_preferred("spoke2", &peers);
         assert_eq!(got, HashSet::from(["hubpubkey-AB123".into()]));
+    }
+
+    #[test]
+    fn spoke_next_hop_is_one_deterministic_hub_and_excludes_self_duplicates() {
+        let sel = StarSelector { hub: "hub".into() };
+        let first = s(&["hub-9XY78", "hub-1AB23", "hub-1AB23", "spoke1-SELF1"]);
+        let mut reordered = first.clone();
+        reordered.reverse();
+        let a = sel.next_hops("spoke1", "spoke2", &first, 1);
+        let b = sel.next_hops("spoke1", "spoke2", &reordered, 1);
+        assert_eq!(a, b);
+        assert_eq!(a, s(&["hub-1AB23"]));
+        assert!(sel.next_hops("spoke1", "spoke2", &first, 0).is_empty());
+        assert!(a.iter().all(|hop| signing::pubkey_part(hop) != "spoke1"));
+        assert_eq!(
+            a.iter()
+                .map(|hop| signing::pubkey_part(hop))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            a.len()
+        );
     }
 }

@@ -1,10 +1,9 @@
 //! ed25519 signing and verification for the mesh.
 //!
-//! Used by the auth handshake: when a new peer connects, both ends
-//! sign a challenge with their private key, and the receiving side
-//! verifies the signature against the claimed Device ID. This proves
-//! the peer actually owns the keypair that produces their advertised
-//! pubkey, not just that they know it.
+//! Endpoint authentication builds the one accepted transcript in its own
+//! module and uses these primitives to sign and verify it. Keeping framing out
+//! of this module prevents an old payload constructor from becoming an
+//! accidental second authentication profile.
 //!
 //! Signing operations live in Rust so the private key never leaves
 //! the anchor file — callers send a message to sign and get back a
@@ -18,50 +17,9 @@ use ed25519_dalek::{
 use crate::error::{Error, Result};
 use crate::identity;
 
-/// Construct the signed payload for the handshake. The receiving side
-/// must produce an identical byte string from its perspective (with
-/// `my_device_id` and `their_device_id` swapped) and verify the
-/// signature against the sender's pubkey. The `|` separators ensure
-/// no `nonce` can be reinterpreted as part of a device id when the
-/// concatenation is parsed back — defense in depth on top of the
-/// domain tag itself.
-///
-/// `channel_binding` ties the signature to the DTLS channel the
-/// handshake runs over: the *signer* passes the fingerprint of the
-/// certificate it presents on that channel (its local `a=fingerprint:`),
-/// and the *verifier* passes the fingerprint it observes on its end (its
-/// remote `a=fingerprint:`). WebRTC verifies the presented certificate
-/// against the fingerprint in the remote SDP, so on an un-intercepted
-/// connection the signer's local fingerprint equals the verifier's remote
-/// fingerprint and the signature checks out. A signaling-path
-/// man-in-the-middle that terminates DTLS on each leg must present its own
-/// certificate to each side, so the verifier's observed fingerprint no
-/// longer matches what the peer signed — the signature fails and the peer
-/// is dropped. Without this, the proven ed25519 identity was never bound
-/// to the transport carrying it, so the handshake could be relayed
-/// unmodified across an interceptor.
-pub fn handshake_payload(
-    nonce: &str,
-    my_device_id: &str,
-    their_device_id: &str,
-    channel_binding: &str,
-) -> Vec<u8> {
-    format!(
-        "{}{nonce}|{my}|{their}|{cb}",
-        crate::SIGN_DOMAIN_TAG,
-        nonce = nonce,
-        my = my_device_id,
-        their = their_device_id,
-        cb = channel_binding,
-    )
-    .into_bytes()
-}
-
 /// Sign an arbitrary message with this device's private key. Returns
 /// the 64-byte signature, base32-lowercase encoded. The caller is
-/// responsible for whatever protocol-level framing wraps the message
-/// — handshakes use [`handshake_payload`], which prefixes the domain
-/// tag and binds in both Device IDs.
+/// responsible for the protocol-level framing around the message.
 pub fn sign(message: &[u8]) -> Result<String> {
     let identity = identity::load_or_create()?;
     Ok(sign_with(identity.signing_key(), message))
@@ -195,53 +153,5 @@ mod tests {
         assert_eq!(pubkey_part("abc-defghij"), "abc-defghij");
         // 5-char tail with non-alphanumerics — leave alone.
         assert_eq!(pubkey_part("abc-xy!12"), "abc-xy!12");
-    }
-
-    #[test]
-    fn handshake_payload_includes_domain_tag() {
-        let payload = handshake_payload("nonce123", "deviceA", "deviceB", "sha-256 ab:cd");
-        let s = String::from_utf8(payload).unwrap();
-        assert!(s.starts_with(crate::SIGN_DOMAIN_TAG));
-        assert!(s.contains("nonce123"));
-        assert!(s.contains("deviceA"));
-        assert!(s.contains("deviceB"));
-        assert!(s.contains("sha-256 ab:cd"));
-    }
-
-    #[test]
-    fn handshake_payload_is_order_sensitive() {
-        // Swapping my/their device ids produces a different payload, so
-        // a peer can't reuse a signature from the opposite direction of
-        // the handshake.
-        let a = handshake_payload("n", "alice", "bob", "fp");
-        let b = handshake_payload("n", "bob", "alice", "fp");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn handshake_payload_binds_channel() {
-        // The channel-binding fingerprint is part of the signed bytes, so a
-        // signature made over one DTLS channel does not verify over another —
-        // this is what a signaling-path MITM cannot forge, because the
-        // fingerprint the victim observes is the interceptor's cert, not the
-        // one the real peer signed.
-        let (sk, pubkey) = fixture_key();
-        let honest = handshake_payload("n", &pubkey, "peer", "sha-256 aa:aa");
-        let sig = sign_with(&sk, &honest);
-        assert!(verify(&pubkey, &honest, &sig).unwrap());
-        // Same nonce and ids, different observed channel fingerprint → reject.
-        let intercepted = handshake_payload("n", &pubkey, "peer", "sha-256 bb:bb");
-        assert!(!verify(&pubkey, &intercepted, &sig).unwrap());
-    }
-
-    #[test]
-    fn round_trip_with_handshake_payload() {
-        let (sk, pubkey) = fixture_key();
-        let payload = handshake_payload("noncexyz", &pubkey, "peerXyz", "sha-256 aa:bb");
-        let sig = sign_with(&sk, &payload);
-        assert!(verify(&pubkey, &payload, &sig).unwrap());
-        // Tampering with any field invalidates the signature.
-        let other = handshake_payload("noncexyy", &pubkey, "peerXyz", "sha-256 aa:bb");
-        assert!(!verify(&pubkey, &other, &sig).unwrap());
     }
 }

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
+  <title id="title">MyOwnMesh production end-to-end path</title>
+  <desc id="desc">Two production daemons discover through mDNS, establish direct WebRTC, authenticate endpoints, promote an exact live session, and deliver a typed channel payload.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="#24445f"/></marker>
+    <style>
+      .title{font:700 24px sans-serif;fill:#162b3b}.lane{fill:#f8fbfd;stroke:#58738a;stroke-width:2}.box{fill:#fff;stroke:#24445f;stroke-width:1.6;rx:9}.carrier{fill:#eaf6ff;stroke:#2176a5;stroke-width:2;rx:9}.app{fill:#eef8ed;stroke:#3f7d45;stroke-width:2;rx:9}.h{font:700 15px sans-serif;fill:#162b3b}.t{font:12px monospace;fill:#1d3445}.small{font:11px sans-serif;fill:#425a6c}.edge{stroke:#24445f;stroke-width:2;fill:none;marker-end:url(#arrow)}.both{stroke:#2176a5;stroke-width:3;fill:none;marker-start:url(#arrow);marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1400" height="720" fill="white"/>
+  <text class="title" x="700" y="38" text-anchor="middle">Production path: discovery → channel → proof → promotion → payload</text>
+  <rect class="lane" x="35" y="65" width="640" height="595" rx="16"/>
+  <rect class="lane" x="725" y="65" width="640" height="595" rx="16"/>
+  <text class="h" x="355" y="92" text-anchor="middle">Daemon A — crates/myownmesh/src/cli/serve.rs</text>
+  <text class="h" x="1045" y="92" text-anchor="middle">Daemon B — crates/myownmesh/src/cli/serve.rs</text>
+
+  <rect class="box" x="70" y="115" width="570" height="72"/>
+  <text class="h" x="355" y="140" text-anchor="middle">Typed signaling bridge</text>
+  <text class="t" x="355" y="160" text-anchor="middle">myownmesh-core/src/engine/signaling_bridge.rs</text>
+  <text class="small" x="355" y="177" text-anchor="middle">durable facts and ephemeral SDP/ICE remain distinct lanes</text>
+  <rect class="box" x="760" y="115" width="570" height="72"/>
+  <text class="h" x="1045" y="140" text-anchor="middle">Typed signaling bridge</text>
+  <text class="t" x="1045" y="160" text-anchor="middle">myownmesh-core/src/engine/signaling_bridge.rs</text>
+  <text class="small" x="1045" y="177" text-anchor="middle">durable facts and ephemeral SDP/ICE remain distinct lanes</text>
+
+  <rect class="carrier" x="410" y="215" width="580" height="75"/>
+  <text class="h" x="700" y="240" text-anchor="middle">Production LAN signaling carrier</text>
+  <text class="t" x="700" y="260" text-anchor="middle">myownmesh-signaling/src/mdns/driver.rs</text>
+  <text class="small" x="700" y="278" text-anchor="middle">selected mdns/discovery/{embedded,system}.rs backend; bounded announce/resolve/exchange</text>
+  <path class="edge" d="M355 187 L535 215"/><path class="edge" d="M1045 187 L865 215"/>
+
+  <rect class="box" x="70" y="320" width="570" height="77"/>
+  <text class="h" x="355" y="345" text-anchor="middle">Connector attempt owner</text>
+  <text class="t" x="355" y="365" text-anchor="middle">engine/connection.rs + transport/{ice,webrtc}.rs</text>
+  <text class="small" x="355" y="383" text-anchor="middle">candidate admission, WebRTC data channel, exact cleanup owner</text>
+  <rect class="box" x="760" y="320" width="570" height="77"/>
+  <text class="h" x="1045" y="345" text-anchor="middle">Connector attempt owner</text>
+  <text class="t" x="1045" y="365" text-anchor="middle">engine/connection.rs + transport/{ice,webrtc}.rs</text>
+  <text class="small" x="1045" y="383" text-anchor="middle">candidate admission, WebRTC data channel, exact cleanup owner</text>
+  <path class="edge" d="M535 290 L425 320"/><path class="edge" d="M865 290 L975 320"/>
+  <path class="both" d="M640 358 L760 358"/>
+  <text class="small" x="700" y="345" text-anchor="middle">direct WebRTC packets</text>
+
+  <rect class="box" x="70" y="430" width="570" height="82"/>
+  <text class="h" x="355" y="455" text-anchor="middle">Endpoint proof and policy promotion</text>
+  <text class="t" x="355" y="475" text-anchor="middle">endpoint_auth/task.rs + engine/handshake.rs</text>
+  <text class="t" x="355" y="493" text-anchor="middle">runtime/session_broker/mod.rs + peer_session/slot.rs</text>
+  <rect class="box" x="760" y="430" width="570" height="82"/>
+  <text class="h" x="1045" y="455" text-anchor="middle">Endpoint proof and policy promotion</text>
+  <text class="t" x="1045" y="475" text-anchor="middle">endpoint_auth/task.rs + engine/handshake.rs</text>
+  <text class="t" x="1045" y="493" text-anchor="middle">runtime/session_broker/mod.rs + peer_session/slot.rs</text>
+  <path class="edge" d="M355 397 L355 430"/><path class="edge" d="M1045 397 L1045 430"/>
+
+  <rect class="app" x="70" y="550" width="570" height="75"/>
+  <text class="h" x="355" y="575" text-anchor="middle">Application A — acknowledged send</text>
+  <text class="t" x="355" y="595" text-anchor="middle">control/dispatch/channel.rs → application_gateway/channels.rs</text>
+  <text class="small" x="355" y="613" text-anchor="middle">ChannelSendReliable consumes the exact promoted peer session</text>
+  <rect class="app" x="760" y="550" width="570" height="75"/>
+  <text class="h" x="1045" y="575" text-anchor="middle">Application B — subscribed delivery</text>
+  <text class="t" x="1045" y="595" text-anchor="middle">application_gateway/channels.rs → ipc/bridge.rs</text>
+  <text class="small" x="1045" y="613" text-anchor="middle">ChannelInbound reaches the capability-bound EventsSubscribe client</text>
+  <path class="edge" d="M355 512 L355 550"/><path class="edge" d="M1045 512 L1045 550"/>
+  <path class="both" d="M640 587 L760 587"/>
+<text class="small" x="700" y="650" text-anchor="middle">Beyond this LAN path: bounded Hub setup only; data uses endpoint-authenticated WebRTC, direct or configured standard TURN, otherwise refused.</text>
+
+  <text class="small" x="700" y="690" text-anchor="middle">Executable binding: scripts/run-production-e2e.py — shipped binaries, isolated homes, typed delivery, graceful owned shutdown</text>
+</svg>

@@ -9,9 +9,14 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-/// Capability advertisement broadcast in [`super::handshake::HelloMessage`]
-/// and refreshed via [`CapabilitiesUpdateMessage`]. The mesh treats
-/// every field opaquely; the embedder interprets them.
+/// What a node offers, as its embedder describes it. The mesh treats every
+/// field opaquely; the embedder interprets them.
+///
+/// It crosses on [`CapabilitiesUpdateMessage`] and nowhere else. That frame is
+/// application traffic, so it is sent only to a peer with a live session and
+/// applied only under the session that will own the record — an advertisement
+/// is not something an unauthenticated endpoint may place into this node, or
+/// learn from it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CapabilityAdvert {
     /// Free-form capability tag strings the embedder uses to gate
@@ -24,11 +29,6 @@ pub struct CapabilityAdvert {
     /// "running 0.3.1" beside each peer.
     #[serde(default)]
     pub app_version: Option<String>,
-    /// Hint about how many concurrent connections the peer can
-    /// service. Feeds the topology selector when scaling out — peers
-    /// that can hold more get more preferred slots.
-    #[serde(default)]
-    pub max_connections: Option<u32>,
     /// Embedder-defined structured advertisement. JSON-encoded so
     /// the mesh stays type-agnostic; downstream apps deserialize
     /// into their own type.

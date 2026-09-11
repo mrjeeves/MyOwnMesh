@@ -1,68 +1,88 @@
 //! Engine half of closed-network governance.
 //!
-//! Owns the proposal lifecycle:
+//! Canonical governance ingress and projection.
 //!
-//!   1. **Propose** — the local device floats a transition. The
-//!      engine signs the canonical payload with the local identity,
-//!      appends a `Proposal` to the persisted state's pending list,
-//!      and broadcasts a `NetworkStatePropose` to every active peer.
-//!
-//!   2. **Inbound propose** — a peer's signed proposal arrives. The
-//!      engine verifies the signature (and rejects the frame if it
-//!      fails), then records the proposal in pending. The local
-//!      user surfaces it via the GUI's Approvals tab and chooses
-//!      sign / deny.
-//!
-//!   3. **Sign / deny** — the local device authors an
-//!      `NetworkStateAck`. Sign signatures accumulate; deny is a
-//!      single-shot kill switch. When the accumulated signer set
-//!      satisfies the quorum table for the variant (see
-//!      [`crate::network_state::verify_quorum`]), the engine
-//!      builds the final `Transition`, applies it to the state via
-//!      `apply_transition`, persists, and emits an authoritative
-//!      `NetworkState` broadcast so peers learn the new shape.
-//!
-//!   4. **Withdraw / split** — the proposer can withdraw before
-//!      ratification or, after `STATE_PROPOSAL_TIMEOUT_S`, fire a
-//!      proposer-initiated split that spawns a derived closed
-//!      network from the signers it has.
-//!
-//! All mutations go through here (rather than directly into
-//! `NetworkState.governance_state`) so persistence + ack-emission
-//! stay co-located with the state mutation that motivates them.
+//! Signed V4 facts are admitted into the one bootstrap-bound `FactGraph` and
+//! broadcast with their exact content address. Compatibility carriers never
+//! provide authority; all governance decisions come from the semantic graph.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-
-use rand::Rng;
 
 use crate::error::{Error, Result};
 use crate::events::DropReason;
-use crate::network_state::{self, NetworkKind, Proposal, Role, Transition, TransitionVariant};
 use crate::protocol::{
-    AckDecision, MeshMessage, NetworkStateAckMessage, NetworkStateBroadcast,
-    NetworkStateProposeMessage, NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry,
-    RosterRequestMessage, RosterSummaryMessage,
+    FactInventory, FactPageMessage, FactRequest, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
+use crate::semantic::{DeviceId, FactBody, FactContent, FactId, SignedFact};
 
 use super::connection::PeerStatus;
-use super::state::{NetworkCmd, NetworkState as EngineState};
+use super::peer_registry::{LogicalSessionOperation, PeerOwnerToken};
+use super::state::NetworkState as EngineState;
 
 // ---- helpers --------------------------------------------------------
 
-fn now_unix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn canonical_device(value: &str) -> Result<DeviceId> {
+    DeviceId::from_canonical_str(value)
+        .map_err(|error| Error::Other(format!("noncanonical DeviceId: {error}")))
 }
 
-fn new_proposal_id() -> String {
-    // 16 hex chars of entropy ≈ 64 bits. Collisions across a single
-    // network would require ~2^32 proposals, which the engine
-    // doesn't admit; sufficient.
-    let suffix: u64 = rand::thread_rng().gen();
-    format!("prop_{suffix:016x}")
+fn signed_fact(
+    state: &Arc<EngineState>,
+    body: FactBody,
+    extra_parents: Vec<FactId>,
+) -> Result<SignedFact> {
+    #[cfg(feature = "transport-lab")]
+    let _author_witness_sign_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::AuthorWitnessSign,
+    );
+    let author = canonical_device(state.identity.public_id())?;
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let witness = graph.authoring_witness(&body, &author);
+    // Keep the authoring path explicit about the typed AuthorityLineage.  The
+    // witness currently derives these same parents, but carrying the heads
+    // here makes it impossible for a future ordinary-cell-only witness to
+    // omit a cross-cell authority fork or selected branch.
+    let mut authority_parents = extra_parents;
+    for subject in body.authority_use_subjects(&author) {
+        authority_parents.extend(graph.authority_lineage(&subject).heads().iter().copied());
+    }
+    let content = FactContent::from_authoring_witness(&graph, body, &witness, authority_parents);
+    SignedFact::sign(content, state.identity.signing_key())
+        .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))
+}
+
+async fn admit_authored_fact(
+    state: &Arc<EngineState>,
+    fact: &SignedFact,
+) -> Result<crate::semantic::SemanticDelta> {
+    let (admission, _, delta) = state
+        .admit_fact_durably_with_delta_async(fact.clone())
+        .await?;
+    if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
+        return Err(Error::Other(
+            "authored semantic fact is missing a causal parent".into(),
+        ));
+    }
+    Ok(delta)
+}
+
+/// Return the complete causal proof for the current closed-network eviction of
+/// `target`.  The inventory/request exchange can discover these identifiers,
+/// but an evicted reconnect is denied before it can become an ordinary active
+/// peer, so that first delivery must carry the proof itself.  Starting from
+/// both exclusive cells is intentional: an eviction advances role and
+/// membership together, while a later causal restoration can advance only one
+/// of them.
+fn current_eviction_proof_bundle(
+    state: &Arc<EngineState>,
+    target: &str,
+) -> Option<Vec<SignedFact>> {
+    let target = canonical_device(target).ok()?;
+    let graph = state.authoritative_fact_graph();
+    let bundle = graph.read().eviction_proof_bundle(&target);
+    bundle
 }
 
 /// Strip the display suffix (`-XXXXX`) from a Device ID. The
@@ -71,52 +91,905 @@ fn pk(device_id: &str) -> String {
     crate::signing::pubkey_part(device_id).to_string()
 }
 
-/// Legacy CEC clients and current clients deliberately use the same network
-/// id but disagree on its original kind (`Open/0` vs `Silent/0`). With no
-/// signed transitions on either side this is a stable compatibility fact, not
-/// convergence progress, so it should be reported once rather than on every
-/// signaling heartbeat.
-fn stable_open_silent_drift(
-    local_kind: NetworkKind,
-    local_count: u32,
-    remote_kind: NetworkKind,
-    remote_count: u32,
+/// Canonical policy admission for registry and handshake fences. The bootstrap
+/// binding and the shared FactGraph are the only authority inputs.
+/// The decision itself is always delegated to the graph's sealed semantic
+/// evaluator so every consumer uses one projection and one conflict rule.
+pub(super) fn canonical_policy_admits_from(
+    bootstrap: &crate::semantic::VerifiedBootstrap,
+    graph: &crate::semantic::FactGraph,
+    local_device_id: &str,
+    remote_device_id: &str,
 ) -> bool {
-    local_count == 0
-        && remote_count == 0
-        && matches!(
-            (local_kind, remote_kind),
-            (NetworkKind::Open, NetworkKind::Silent) | (NetworkKind::Silent, NetworkKind::Open)
-        )
+    let Ok(local) = crate::semantic::DeviceId::from_canonical_str(local_device_id) else {
+        return false;
+    };
+    let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
+        return false;
+    };
+    canonical_policy_admits_devices(bootstrap, graph, &local, &remote)
+}
+
+/// Evaluate already-owned canonical identities without interning or retaining
+/// them. The caller supplies the same bootstrap and graph policy fence.
+pub(super) fn canonical_policy_admits_devices(
+    bootstrap: &crate::semantic::VerifiedBootstrap,
+    graph: &crate::semantic::FactGraph,
+    local: &DeviceId,
+    remote: &DeviceId,
+) -> bool {
+    if graph.context_id() != bootstrap.context_id() {
+        return false;
+    }
+    if local == remote {
+        return false;
+    }
+    let evaluator = graph.evaluator();
+    if evaluator.is_stood_down(local) || evaluator.is_stood_down(remote) {
+        return false;
+    }
+    match bootstrap.policy() {
+        crate::semantic::VerifiedProjectPolicy::Open => true,
+        crate::semantic::VerifiedProjectPolicy::Closed(_) => {
+            evaluator.admits_closed_session(local, remote)
+        }
+    }
+}
+
+#[derive(Default)]
+struct CanonicalProjection {
+    roles: BTreeMap<String, crate::semantic::Role>,
+    evicted: BTreeSet<String>,
+    stood_down: BTreeSet<String>,
+}
+
+/// Convert the sealed semantic projection into the read-only roster shape. The
+/// graph, evaluator, and typed projection decide every value; this projection
+/// performs only key conversion and has no independent governance rules.
+fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjection {
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let evaluator = graph.evaluator();
+    let projection = evaluator.projection();
+    let mut result = CanonicalProjection::default();
+
+    let mut subjects = BTreeSet::new();
+    for root in state.verified_bootstrap().authority_roots().iter() {
+        subjects.insert(root.clone());
+    }
+    for (cell, _) in projection.cells() {
+        match cell {
+            crate::semantic::ExclusiveCell::Role { subject }
+            | crate::semantic::ExclusiveCell::Membership { subject } => {
+                subjects.insert(subject.clone());
+            }
+            crate::semantic::ExclusiveCell::Decision { .. } => {}
+        }
+    }
+    subjects.extend(projection.stand_down_targets().cloned());
+
+    for subject in subjects {
+        let subject_string = subject.to_string();
+        // Role(C) remains a normal exclusive-cell projection.  The typed
+        // AuthorityLineage is an independent currentness fence for the
+        // authority that may author that projection; it is not a replacement
+        // for Role-cell Resolution semantics.
+        let role = evaluator.effective_authorized_role(&subject);
+        let membership = evaluator.effective_membership(&subject);
+        let stood_down = evaluator.is_stood_down(&subject);
+        if membership == Some(false) {
+            result.evicted.insert(subject_string.clone());
+        }
+        if stood_down {
+            result.stood_down.insert(subject_string.clone());
+        }
+        if let Some(role) = role {
+            if membership != Some(false) && !stood_down {
+                result.roles.insert(
+                    subject_string,
+                    match role {
+                        crate::semantic::Role::Member => crate::semantic::Role::Member,
+                        crate::semantic::Role::Controller => crate::semantic::Role::Controller,
+                        crate::semantic::Role::Owner => crate::semantic::Role::Owner,
+                    },
+                );
+            }
+        }
+    }
+    result
+}
+
+fn canonical_projection_for_subjects(
+    state: &Arc<EngineState>,
+    subjects: &BTreeSet<DeviceId>,
+) -> CanonicalProjection {
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let evaluator = graph.evaluator();
+    let mut result = CanonicalProjection::default();
+    for subject in subjects {
+        let subject_string = subject.to_string();
+        let role = evaluator.effective_authorized_role(subject);
+        let membership = evaluator.effective_membership(subject);
+        let stood_down = evaluator.is_stood_down(subject);
+        if membership == Some(false) {
+            result.evicted.insert(subject_string.clone());
+        }
+        if stood_down {
+            result.stood_down.insert(subject_string.clone());
+        }
+        if let Some(role) = role {
+            if membership != Some(false) && !stood_down {
+                result.roles.insert(subject_string, role);
+            }
+        }
+    }
+    result
+}
+
+pub(crate) fn apply_canonical_projection_checked(state: &Arc<EngineState>) -> Result<bool> {
+    apply_canonical_projection_with(state, |candidate, affected| {
+        crate::roster::save_affected(candidate, affected)
+    })
+}
+
+fn apply_canonical_projection_with<F>(state: &Arc<EngineState>, save: F) -> Result<bool>
+where
+    F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
+{
+    #[cfg(feature = "transport-lab")]
+    let _projection_roster_publish_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::ProjectionRosterPublish,
+    );
+    let projection = canonical_projection_snapshot(state);
+    let CanonicalProjection {
+        roles,
+        evicted,
+        stood_down,
+        ..
+    } = projection;
+    let roster_changed = {
+        let mut roster = state.roster.write();
+        let previous_keys = roster
+            .authorized_devices
+            .iter()
+            .map(|peer| peer.device_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut candidate = roster.clone();
+        let mut desired = previous_keys
+            .iter()
+            .cloned()
+            .map(|key| (key, None))
+            .collect::<BTreeMap<_, _>>();
+        for (pubkey, role) in &roles {
+            if !evicted.contains(pubkey) && !stood_down.contains(pubkey) {
+                desired.insert(pubkey.clone(), Some(*role));
+            }
+        }
+        let changed = crate::roster::apply_projected_roles_in(&mut candidate, &desired);
+        if changed {
+            let affected_keys = previous_keys
+                .into_iter()
+                .chain(
+                    candidate
+                        .authorized_devices
+                        .iter()
+                        .map(|peer| peer.device_id.clone()),
+                )
+                .collect::<BTreeSet<_>>();
+            // The role is a derived in-memory field and is intentionally not
+            // part of RosterEntryRecord. Persist only membership or metadata
+            // changes; the canonical graph still updates the live role below.
+            if !crate::roster::persisted_metadata_equal(&roster, &candidate, &affected_keys) {
+                save(&candidate, &affected_keys)?;
+            }
+            *roster = candidate;
+        }
+        Ok(changed)
+    };
+    roster_changed
+}
+
+/// Apply only the exact roster subjects returned by a journal delta. The
+/// roster remains a projection cache: unaffected rows are retained, while an
+/// affected subject is inserted, updated, or removed from its current typed
+/// semantic result. This avoids enumerating the full projection per fact.
+pub(crate) fn apply_canonical_projection_delta_checked(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) -> Result<bool> {
+    apply_canonical_projection_delta_with_projection(state, delta).map(|(changed, _)| changed)
+}
+
+fn apply_canonical_projection_delta_with_projection(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) -> Result<(bool, CanonicalProjection)> {
+    apply_canonical_projection_delta_with_projection_and_save(
+        state,
+        delta,
+        crate::roster::save_affected,
+    )
+}
+
+fn apply_canonical_projection_delta_with_projection_and_save<F>(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+    save: F,
+) -> Result<(bool, CanonicalProjection)>
+where
+    F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
+{
+    #[cfg(feature = "transport-lab")]
+    let _projection_roster_publish_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::ProjectionRosterPublish,
+    );
+    let projection = canonical_projection_for_subjects(state, delta.affected_subjects());
+    let CanonicalProjection {
+        roles,
+        evicted,
+        stood_down,
+    } = projection;
+    let mut roster = state.roster.write();
+    let affected_keys = delta
+        .affected_subjects()
+        .iter()
+        .map(|subject| pk(subject))
+        .collect::<BTreeSet<_>>();
+    let before = roster.authorized_devices.snapshot_keys(&affected_keys);
+    let desired = delta
+        .affected_subjects()
+        .iter()
+        .map(|subject| {
+            let subject_string = subject.to_string();
+            let role = roles.get(&subject_string).copied().filter(|_| {
+                !evicted.contains(&subject_string) && !stood_down.contains(&subject_string)
+            });
+            (pk(subject), role)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let changed = crate::roster::apply_projected_roles_in(&mut roster, &desired);
+    if changed {
+        // Semantic roles are an in-memory/UI projection and are deliberately
+        // absent from RosterEntryRecord. Skip filesystem work when only that
+        // non-persisted field changed; membership or metadata changes still
+        // cross the exact save fence.
+        let persisted_changed =
+            !crate::roster::persisted_metadata_matches_snapshot(&before, &roster, &affected_keys);
+        if persisted_changed {
+            if let Err(error) = save(&roster, &affected_keys) {
+                roster
+                    .authorized_devices
+                    .restore_snapshot(&affected_keys, &before);
+                return Err(error);
+            }
+        }
+    }
+    Ok((
+        changed,
+        CanonicalProjection {
+            roles,
+            evicted,
+            stood_down,
+        },
+    ))
 }
 
 /// Iterate active peers — those whose data channel is ACTIVE +
 /// authenticated. Used to broadcast governance frames.
 fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
-    state
-        .peers
-        .iter()
-        .filter_map(|entry| {
-            let peer = entry.value();
-            let data = peer.state.read();
-            if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated
-            {
-                Some(entry.key().clone())
-            } else {
-                None
-            }
-        })
-        .collect()
+    state.peers.collect_map(|peer| {
+        let data = peer.state.read();
+        if matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.authenticated {
+            Some(peer.device_id.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn inventory_peer_owners(state: &Arc<EngineState>) -> Vec<PeerOwnerToken> {
+    state.peers.owners_snapshot(|peer| {
+        let data = peer.state.read();
+        inventory_owner_is_eligible(
+            data.status,
+            data.authenticated,
+            peer.current_worker().is_some(),
+        )
+    })
+}
+
+fn inventory_owner_is_eligible(status: PeerStatus, authenticated: bool, has_worker: bool) -> bool {
+    authenticated && has_worker && matches!(status, PeerStatus::Active | PeerStatus::Shelved)
 }
 
 async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
     for peer_id in active_peer_ids(state) {
+        let result = super::send_to_peer(state, &peer_id, &msg).await;
         // Best-effort: a failure to send to one peer doesn't block
-        // delivery to the others. The next peer's `NetworkState`
-        // broadcast on its own ACTIVE transition will catch them up.
-        if let Err(e) = super::send_to_peer(state, &peer_id, &msg).await {
+        // delivery to the others. The next fact inventory pass will repair
+        // any advertisement lost while this channel was unavailable.
+        if let Err(e) = result {
             tracing::debug!(peer = %peer_id, err = %e, "governance broadcast send failed");
         }
+    }
+}
+
+/// Broadcast only while the exact peer installation that justified the
+/// broadcast remains current.
+///
+/// Replacement is checked before every send. A send already started before
+/// replacement may finish, but no later send is initiated by the retired
+/// owner. This keeps the activation trigger local without changing ordinary
+/// governance broadcasts that originate from durable governance mutations.
+async fn broadcast_for_owner(
+    state: &Arc<EngineState>,
+    owner: &PeerOwnerToken,
+    msg: MeshMessage,
+) -> bool {
+    if state.peers.get_if_current(owner).is_none() {
+        return false;
+    }
+    for peer_id in active_peer_ids(state) {
+        if state.peers.get_if_current(owner).is_none() {
+            return false;
+        }
+        if let Err(e) = super::send_to_peer(state, &peer_id, &msg).await {
+            tracing::debug!(peer = %peer_id, err = %e, "owner-bound governance broadcast send failed");
+        }
+    }
+    state.peers.get_if_current(owner).is_some()
+}
+
+struct FactInventoryCursor {
+    source: FactInventorySource,
+    context_id: crate::semantic::MeshContextId,
+    cursor: Option<FactId>,
+    finished: bool,
+    invalid: bool,
+    #[cfg(test)]
+    visited_candidates: usize,
+}
+
+enum FactInventorySource {
+    Durable(Arc<EngineState>),
+    #[cfg(test)]
+    Graph(Arc<parking_lot::RwLock<crate::semantic::FactGraph>>),
+}
+
+impl FactInventoryCursor {
+    fn next_page(&mut self) -> Option<FactInventory> {
+        if self.finished || self.invalid {
+            return None;
+        }
+        // The empty envelope establishes the exact fixed overhead, including
+        // the context encoding and the two array delimiters. Each FactId is
+        // then serialized once and added to one checked running total; this
+        // avoids cloning and re-encoding the entire candidate page for every
+        // graph entry while the graph read guard is held.
+        let empty_len = match serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+            self.context_id,
+            std::iter::empty(),
+        ))) {
+            Ok(encoded) => encoded.len(),
+            Err(_) => {
+                self.invalid = true;
+                return None;
+            }
+        };
+        let fact_ids = {
+            let mut fact_ids = Vec::new();
+            let mut encoded_len = empty_len;
+            let maximum_ids = crate::protocol::RECEIVE_FRAME_BYTES
+                .saturating_sub(empty_len)
+                .checked_div(53)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let candidates = match &self.source {
+                FactInventorySource::Durable(state) => {
+                    match state.admitted_semantic_fact_ids_after(self.cursor, maximum_ids) {
+                        Ok(ids) => ids,
+                        Err(_) => {
+                            self.invalid = true;
+                            return None;
+                        }
+                    }
+                }
+                #[cfg(test)]
+                FactInventorySource::Graph(graph) => graph
+                    .read()
+                    .ids_after(self.cursor)
+                    .take(maximum_ids)
+                    .copied()
+                    .collect(),
+            };
+            for fact_id in candidates {
+                #[cfg(test)]
+                {
+                    self.visited_candidates = self.visited_candidates.saturating_add(1);
+                }
+                let id_len = match serde_json::to_vec(&fact_id) {
+                    Ok(encoded) => encoded.len(),
+                    Err(_) => {
+                        self.invalid = true;
+                        return None;
+                    }
+                };
+                let separator_len = if fact_ids.is_empty() { 0 } else { 1 };
+                let candidate_len = encoded_len
+                    .checked_add(separator_len)
+                    .and_then(|length| length.checked_add(id_len));
+                let Some(candidate_len) = candidate_len else {
+                    self.invalid = true;
+                    return None;
+                };
+                if candidate_len > crate::protocol::RECEIVE_FRAME_BYTES {
+                    if fact_ids.is_empty() {
+                        self.invalid = true;
+                        return None;
+                    }
+                    break;
+                }
+                fact_ids.push(fact_id);
+                encoded_len = candidate_len;
+            }
+            fact_ids
+        };
+        if fact_ids.is_empty() {
+            self.finished = true;
+            return None;
+        }
+        self.cursor = fact_ids.last().copied();
+        Some(FactInventory::new(self.context_id, fact_ids))
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.invalid
+    }
+
+    #[cfg(test)]
+    fn visited_candidates(&self) -> usize {
+        self.visited_candidates
+    }
+}
+
+fn local_fact_inventory_cursor(state: &Arc<EngineState>) -> FactInventoryCursor {
+    FactInventoryCursor {
+        source: FactInventorySource::Durable(Arc::clone(state)),
+        context_id: state.mesh_context_id(),
+        cursor: None,
+        finished: false,
+        invalid: false,
+        #[cfg(test)]
+        visited_candidates: 0,
+    }
+}
+
+/// Advertise the exact canonical graph inventory to active peers.  The
+/// inventory contains identifiers only; it is a repair hint, never authority.
+pub async fn broadcast_fact_inventory(state: &Arc<EngineState>) {
+    let owners = inventory_peer_owners(state);
+    for owner in owners {
+        let mut inventory = local_fact_inventory_cursor(state);
+        while let Some(page) = inventory.next_page() {
+            let result =
+                super::send_to_peer_owner(state, &owner, &MeshMessage::FactInventory(page)).await;
+            if let Err(error) = result {
+                tracing::debug!(peer = %owner.device_id(), %error, "fact inventory broadcast send failed");
+            }
+        }
+        if !inventory.is_valid() {
+            tracing::debug!(peer = %owner.device_id(), "fact inventory cannot fit the exact receive-safe frame boundary");
+        }
+    }
+}
+
+fn delta_inventory_pages(
+    context_id: crate::semantic::MeshContextId,
+    delta: &crate::semantic::SemanticDelta,
+) -> Option<Vec<FactInventory>> {
+    let mut ids = BTreeSet::new();
+    for row in delta.rows() {
+        if row.status() == crate::semantic::SemanticFactStatus::Admitted {
+            ids.insert(row.fact().id);
+        }
+    }
+    ids.extend(delta.promoted().iter().copied());
+
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    let empty_len = serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+        context_id,
+        std::iter::empty(),
+    )))
+    .ok()?
+    .len();
+    let mut encoded_len = empty_len;
+    for id in ids {
+        let id_len = serde_json::to_vec(&id).ok()?.len();
+        let separator_len = if current.is_empty() { 0 } else { 1 };
+        let candidate_len = encoded_len
+            .checked_add(separator_len)
+            .and_then(|length| length.checked_add(id_len))?;
+        if candidate_len > crate::protocol::RECEIVE_FRAME_BYTES {
+            if current.is_empty() {
+                return None;
+            }
+            pages.push(FactInventory::new(context_id, std::mem::take(&mut current)));
+            encoded_len = empty_len;
+            let single_len = encoded_len.checked_add(id_len)?;
+            if single_len > crate::protocol::RECEIVE_FRAME_BYTES {
+                return None;
+            }
+            current.push(id);
+            encoded_len = single_len;
+        } else {
+            current.push(id);
+            encoded_len = candidate_len;
+        }
+    }
+    if !current.is_empty() {
+        pages.push(FactInventory::new(context_id, current));
+    }
+    Some(pages)
+}
+
+async fn broadcast_fact_inventory_delta(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) {
+    let Some(pages) = delta_inventory_pages(state.mesh_context_id(), delta) else {
+        tracing::debug!("semantic delta inventory exceeds the exact receive-safe frame boundary");
+        return;
+    };
+    if pages.is_empty() {
+        return;
+    }
+    for owner in inventory_peer_owners(state) {
+        for page in &pages {
+            if let Err(error) =
+                super::send_to_peer_owner(state, &owner, &MeshMessage::FactInventory(page.clone()))
+                    .await
+            {
+                tracing::debug!(
+                    peer = %owner.device_id(),
+                    %error,
+                    "fact delta inventory broadcast send failed"
+                );
+            }
+        }
+    }
+}
+
+/// Activation-bound inventory advertisement.  The exact owner fence is held
+/// for each send, so a replacement cannot make an old installation advertise
+/// on behalf of its successor.
+pub(super) async fn broadcast_fact_inventory_for_owner(
+    state: &Arc<EngineState>,
+    owner: &PeerOwnerToken,
+) -> bool {
+    if state.peers.get_if_current(owner).is_none() {
+        return false;
+    }
+    let mut inventory = local_fact_inventory_cursor(state);
+    while let Some(page) = inventory.next_page() {
+        if !broadcast_for_owner(state, owner, MeshMessage::FactInventory(page)).await {
+            return false;
+        }
+    }
+    if !inventory.is_valid() {
+        tracing::debug!(peer = %owner.device_id(), "owner-bound fact inventory exceeds the exact receive-safe frame boundary");
+        return false;
+    }
+    true
+}
+
+/// Ask the exact logical sender for canonical facts absent from our graph.
+pub(super) async fn on_fact_inventory(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    inventory: FactInventory,
+) {
+    if inventory.context_id() != state.mesh_context_id() {
+        return;
+    }
+    // A page is only a one-way repair hint. Do not answer it with a partial
+    // reciprocal inventory: that would echo every page back and keep two
+    // incomparable inventories alive indefinitely. The periodic/event-driven
+    // full inventory pass repairs lost pages and converges once missing ids
+    // have been admitted.
+    let mut missing = Vec::new();
+    for id in inventory.fact_ids() {
+        match state.admitted_semantic_fact(*id) {
+            Ok(Some(_)) => {}
+            Ok(None) => missing.push(*id),
+            Err(error) => {
+                tracing::debug!(%error, "durable fact inventory lookup failed");
+                return;
+            }
+        }
+    }
+    if !missing.is_empty() {
+        let request = FactRequest::new(state.mesh_context_id(), missing);
+        let mut pages = request.pages();
+        for fact_ids in pages.by_ref() {
+            let page = FactRequest::new(request.context_id(), fact_ids);
+            let result =
+                super::send_logical_reply(state, route, &MeshMessage::FactRequest(page)).await;
+            if let Err(error) = result {
+                tracing::debug!(
+                    peer = %route.owner().device_id(),
+                    %error,
+                    "fact inventory request send failed"
+                );
+                break;
+            }
+        }
+        if !pages.is_valid() {
+            tracing::debug!(peer = %route.owner().device_id(), "fact inventory request exceeds the exact receive-safe frame boundary");
+        }
+    }
+}
+
+/// Reply on the captured logical route with only the requested facts known by
+/// this exact graph.  Unknown IDs are ignored and the sorted request order is
+/// retained by `FactRequest`'s canonical constructor.
+pub(super) async fn on_fact_request(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    request: FactRequest,
+) {
+    if request.context_id() != state.mesh_context_id() {
+        return;
+    }
+    let mut page_facts = Vec::new();
+    for id in request.fact_ids() {
+        let Ok(Some(fact)) = state.admitted_semantic_fact(*id) else {
+            continue;
+        };
+        page_facts.push(fact);
+        let Some(encoded_len) = fact_page_encoded_len(state.mesh_context_id(), &page_facts, false)
+        else {
+            tracing::debug!(peer = %route.owner().device_id(), "fact page could not be sized");
+            return;
+        };
+        if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
+            let last = page_facts.pop().expect("the just-added fact is present");
+            if page_facts.is_empty() {
+                match send_single_fact_page(state, route, last).await {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        tracing::debug!(peer = %route.owner().device_id(), "fact page and single fact exceed the exact receive-safe frame boundary");
+                        // This exact fact cannot cross the receive boundary.
+                        // It is not a transport failure: continue the request
+                        // so later individually transmittable facts are not
+                        // starved behind it.
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %route.owner().device_id(), %error, "single fact reply send failed");
+                        return;
+                    }
+                }
+            }
+            if send_fact_page(state, route, std::mem::take(&mut page_facts), false)
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    peer = %route.owner().device_id(),
+                    "fact page reply send failed"
+                );
+                return;
+            }
+            page_facts.push(last);
+            if fact_page_encoded_len(state.mesh_context_id(), &page_facts, false)
+                .is_none_or(|length| length > crate::protocol::RECEIVE_FRAME_BYTES)
+            {
+                let last = page_facts.pop().expect("the just-added fact is present");
+                match send_single_fact_page(state, route, last).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(peer = %route.owner().device_id(), "fact page and single fact exceed the exact receive-safe frame boundary");
+                        // Skip only this untransmittable fact. A later
+                        // request item still deserves its own exact attempt.
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %route.owner().device_id(), %error, "single fact reply send failed");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if !page_facts.is_empty()
+        && send_fact_page(state, route, page_facts, true)
+            .await
+            .is_err()
+    {
+        tracing::debug!(peer = %route.owner().device_id(), "fact page reply send failed");
+    }
+}
+
+async fn send_fact_page(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    facts: Vec<crate::semantic::SignedFact>,
+    complete: bool,
+) -> Result<()> {
+    let next_cursor = (!complete)
+        .then(|| facts.last().map(|fact| fact.id))
+        .flatten();
+    let page = FactPageMessage::new(state.mesh_context_id(), facts, next_cursor, complete)
+        .map_err(Error::Other)?;
+    super::send_logical_reply(state, route, &MeshMessage::FactPage(page)).await
+}
+
+fn fact_page_encoded_len(
+    context_id: crate::semantic::MeshContextId,
+    facts: &[crate::semantic::SignedFact],
+    complete: bool,
+) -> Option<usize> {
+    let next_cursor = (!complete)
+        .then(|| facts.last().map(|fact| fact.id))
+        .flatten();
+    FactPageMessage::new(context_id, facts.to_vec(), next_cursor, complete)
+        .ok()?
+        .encoded_len()
+}
+
+/// Send one canonical fact when its one-item page envelope would be too
+/// large. The standalone `fact` frame has a different envelope and may still
+/// fit the exact receive boundary; refusing only after checking that frame
+/// preserves later requested IDs instead of abandoning the whole request.
+async fn send_single_fact_page(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    fact: crate::semantic::SignedFact,
+) -> Result<bool> {
+    let message = MeshMessage::Fact(fact);
+    let encoded_len = serde_json::to_vec(&message)
+        .map(|encoded| encoded.len())
+        .map_err(Error::Serde)?;
+    if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
+        return Ok(false);
+    }
+    super::send_logical_reply(state, route, &message).await?;
+    Ok(true)
+}
+
+/// Verify that any eviction material in a reduced page agrees with the
+/// canonical projection before it can be acknowledged.  Ordinary governance
+/// ordinary governance pages have no target-level acknowledgement condition;
+/// eviction closures do.  In particular, a signed proof is not acknowledged
+/// merely because its bytes entered the graph: the exact target must be stood
+/// down by the resulting authoritative projection.  The plain `Evict` closure
+/// used during a denied handshake is checked against the corresponding
+/// membership tombstone instead.
+pub(super) fn fact_page_projection_is_verified(
+    state: &Arc<EngineState>,
+    facts: &[SignedFact],
+) -> bool {
+    state
+        .authoritative_fact_graph()
+        .read()
+        .bundle_projection_is_verified(facts)
+}
+
+/// Verify the target-bound projection condition for one typed proof delivery.
+/// The wire identity is checked by `ProofDeliveryMessage::validate`; this
+/// predicate adds the receiver's exact mesh-context fence and requires the
+/// delivery target itself to be represented by the resulting canonical
+/// stand-down/eviction projection. A valid page for some other target can
+/// therefore never settle this delivery.
+pub(super) fn proof_delivery_projection_is_verified(
+    state: &Arc<EngineState>,
+    delivery: &ProofDeliveryMessage,
+) -> bool {
+    if delivery.context_id != state.mesh_context_id() {
+        return false;
+    }
+    let graph = state.authoritative_fact_graph();
+    let verified = graph
+        .read()
+        .proof_bundle_is_verified(&delivery.target, &delivery.facts);
+    verified
+}
+
+/// A FactPage acknowledgement is the receiver's exact current inventory on
+/// the same logical route that requested the page.  It is deliberately an
+/// inventory rather than a new authority fact: the sender learns which signed
+/// facts actually entered our graph and can request any remaining causal
+/// dependencies, while the route only selects where the coordination reply is
+/// sent.  This also works for a disconnected/offline proof source when the
+/// next exact session is established; no heartbeat or carrier observation is
+/// treated as acknowledgement.
+pub(super) async fn acknowledge_fact_page(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+) {
+    let mut inventory = local_fact_inventory_cursor(state);
+    while let Some(page) = inventory.next_page() {
+        if let Err(error) =
+            super::send_logical_reply(state, route, &MeshMessage::FactInventory(page)).await
+        {
+            tracing::debug!(
+                peer = %route.owner().device_id(),
+                %error,
+                "fact page acknowledgement send failed"
+            );
+            break;
+        }
+    }
+    if !inventory.is_valid() {
+        tracing::debug!(peer = %route.owner().device_id(), "fact page acknowledgement exceeds the exact receive-safe frame boundary");
+    }
+}
+
+/// Emit the only verified receipt for a typed proof delivery. The exact
+/// context, target, and content-derived delivery identity are copied from the
+/// validated wire envelope; no generic inventory can settle this proof.
+pub(super) async fn acknowledge_proof_delivery(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    delivery: &ProofDeliveryMessage,
+) {
+    let ack = MeshMessage::ProofAck(ProofAckMessage::for_delivery(delivery));
+    if let Err(error) = super::send_logical_reply(state, route, &ack).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            %error,
+            "proof delivery acknowledgement send failed"
+        );
+    }
+}
+
+/// Carry the bootstrap root's initial member grant to the exact authenticated
+/// installation that is still waiting for approval.  This is deliberately a
+/// governance-only pre-admission seam: a pending peer receives one
+/// self-authenticating canonical fact in an exact-context FactPage, never
+/// application, inventory, request, or realtime traffic. The captured owner
+/// and worker use the admitted pending semantic lane and its bounded send claim.
+/// This is one send attempt, not a remote ACK; failure neither retries the
+/// write nor undoes the committed grant or its local approval reevaluation.
+async fn send_pending_role_grant(
+    state: &Arc<EngineState>,
+    target: &str,
+    fact: &SignedFact,
+) -> Option<PeerOwnerToken> {
+    let owner = state.peers.owner(target)?;
+    let owner = state
+        .peers
+        .with_current(&owner, |peer| {
+            let data = peer.state.read();
+            if !data.authenticated || !matches!(data.status, PeerStatus::PendingApproval) {
+                return None;
+            }
+            let worker = peer.current_worker()?;
+            Some(owner.for_worker(worker))
+        })
+        .flatten()?;
+    state.peers.get_if_current(&owner)?;
+    if let Err(error) =
+        super::send_pending_semantic_facts(state, &owner, std::slice::from_ref(fact)).await
+    {
+        tracing::debug!(peer = %target, %error, "pending RoleGrant send failed");
+    }
+    Some(owner)
+}
+
+/// Ask the exact current pending installation to run the ordinary approval
+/// send/recheck after its canonical RoleGrant projection has committed.
+async fn request_pending_approval(state: &Arc<EngineState>, peer_id: &str) {
+    let Some(owner) = state.peers.owner(peer_id) else {
+        return;
+    };
+    let pending = state.peers.with_current(&owner, |peer| {
+        let data = peer.state.read();
+        data.authenticated && matches!(data.status, PeerStatus::PendingApproval)
+    });
+    if pending == Some(true) {
+        super::handshake::reevaluate_after_role_grant(state, &owner).await;
     }
 }
 
@@ -124,774 +997,186 @@ fn diag(state: &Arc<EngineState>, level: crate::events::DiagLevel, msg: impl Int
     state.log_diag(level, "governance", msg);
 }
 
-// ---- snapshot -------------------------------------------------------
-
-/// Read-only copy of the current governance state — kind, roles,
-/// transitions, pending proposals, splits. Used by the control
-/// protocol to surface live state to clients.
-pub fn snapshot(state: &Arc<EngineState>) -> network_state::NetworkState {
-    state.governance_state.read().clone()
-}
-
 // ---- local proposals ------------------------------------------------
 
-/// Float a new signed transition from this device. Signs with the
-/// local identity, persists to pending, broadcasts to peers.
-pub async fn propose(
+/// Admit, project, and publish one already-typed canonical governance fact.
+/// The read-only roster projection is refreshed only after durable graph
+/// admission.
+async fn commit_proposal(
     state: &Arc<EngineState>,
-    variant: TransitionVariant,
+    body: FactBody,
     mfa_code: Option<&str>,
-) -> Result<String> {
-    // Idempotency short-circuit — placed *before* the custody gate, because
-    // re-asserting an already-applied grant authorizes nothing and must never
-    // spend an MFA code. A `RoleGrant` whose target already sits at that exact
-    // role in the signed state is a no-op: signing it again would append a
-    // redundant transition and grow the log on every re-assertion. (The owner
-    // re-signs its fleet members on each startup to keep the signed roster
-    // authoritative; with closed-network membership now riding the log, that
-    // re-assertion has to be free.) We check the *explicit* role map, not
-    // `role_of` — an absent target reads as the default `Member` there but is
-    // NOT yet signed into the log, so granting it Member is meaningful and must
-    // proceed (this is exactly how a not-yet-signed member gets admitted).
-    if let TransitionVariant::RoleGrant { target, role } = &variant {
-        if state.governance_state.read().roles.get(target).copied() == Some(*role) {
-            return Ok(String::new());
-        }
-    }
-    // Custody lock: authoring a governance transition is a custody-affecting
-    // act. If this device enrolled a second factor for this network, a fresh
-    // code is required here; otherwise this is a no-op. Composes with — does
-    // not replace — the cryptographic owner-quorum checked at ratification.
+) -> Result<FactId> {
     crate::custody::require(&state.network_id, mfa_code)?;
-    let self_pubkey = state.identity.public_id().to_string();
-    let signature =
-        network_state::sign_transition(&state.network_id, &variant, state.identity.signing_key());
-    let id = new_proposal_id();
-    let proposal = Proposal {
-        id: id.clone(),
-        created_at: member_tier_timestamp(state, &variant),
-        proposer: self_pubkey.clone(),
-        variant: variant.clone(),
-        signers: vec![self_pubkey.clone()],
-        signatures: vec![signature.clone()],
-        deniers: Vec::new(),
-        split_spawned: false,
-    };
-
-    {
-        let mut gov = state.governance_state.write();
-        gov.pending.push(proposal);
-        network_state::save(&gov)?;
+    let fact = signed_fact(state, body, Vec::new())?;
+    let delta = admit_authored_fact(state, &fact).await?;
+    let (_, projected) = apply_canonical_projection_delta_with_projection(state, &delta)?;
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
+    broadcast_fact_inventory_delta(state, &delta).await;
+    broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
+    if let FactBody::RoleGrant { target, role } = &fact.content.body {
+        if *role == crate::semantic::Role::Member
+            && projected.roles.get(&pk(target)) == Some(&crate::semantic::Role::Member)
+        {
+            if let Some(owner) = send_pending_role_grant(state, target, &fact).await {
+                super::handshake::reevaluate_after_role_grant(state, &owner).await;
+            }
+        }
     }
-
-    let msg = MeshMessage::NetworkStatePropose(NetworkStateProposeMessage {
-        proposal_id: id.clone(),
-        variant,
-        proposer: self_pubkey,
-        created_at: now_unix(),
-        signature,
-    });
-    broadcast(state, msg).await;
-
-    // After every governance-mutating step that wrote to pending or
-    // transitions, broadcast a fresh state snapshot so peers
-    // catch up without waiting for their own ACTIVE transition.
-    broadcast_state(state).await;
-
-    // The proposer may have all the signatures they need already
-    // (e.g. a single-signer founder self-election on an empty
-    // network, or a sole-owner closed→open transition). Try to
-    // ratify immediately.
-    let _ = try_ratify(state, &id).await;
-
-    Ok(id)
+    Ok(fact.id)
 }
 
-/// Sign an existing pending proposal authored elsewhere (or
-/// re-sign — a no-op if the local pubkey is already in the signer
-/// list). Broadcasts the signed ack. If the signature satisfies the
-/// quorum, ratifies the transition in the same step.
-pub async fn sign_proposal(
+/// Author and publish an exact canonical role grant.
+pub async fn propose_role_grant(
     state: &Arc<EngineState>,
-    proposal_id: &str,
+    target: &str,
+    role: crate::semantic::Role,
     mfa_code: Option<&str>,
-) -> Result<()> {
-    let self_pubkey = state.identity.public_id().to_string();
-    let (variant, signature) = {
-        let mut gov = state.governance_state.write();
-        let idx = gov
-            .pending
-            .iter()
-            .position(|p| p.id == proposal_id)
-            .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
-        if !gov.pending[idx].deniers.is_empty() {
-            return Err(Error::Other("proposal has been denied".into()));
-        }
-        if gov.pending[idx].signers.iter().any(|s| s == &self_pubkey) {
-            return Err(Error::Other("already signed".into()));
-        }
-        // Custody lock: co-signing is authoring. Gate here — after the
-        // proposal is known valid and unsigned by us — so a one-time recovery
-        // code is never spent on a sign that wouldn't have happened anyway.
-        crate::custody::require(&state.network_id, mfa_code)?;
-        let variant = gov.pending[idx].variant.clone();
-        let signature = network_state::sign_transition(
-            &state.network_id,
-            &variant,
-            state.identity.signing_key(),
-        );
-        gov.pending[idx].signers.push(self_pubkey.clone());
-        gov.pending[idx].signatures.push(signature.clone());
-        network_state::save(&gov)?;
-        (variant, signature)
-    };
-
-    let msg = MeshMessage::NetworkStateAck(NetworkStateAckMessage {
-        proposal_id: proposal_id.to_string(),
-        signer: self_pubkey,
-        decision: AckDecision::Sign,
-        at: now_unix(),
-        signature,
-    });
-    broadcast(state, msg).await;
-
-    let _ = try_ratify(state, proposal_id).await;
-    let _ = variant; // silence unused if try_ratify path doesn't read it
-    Ok(())
-}
-
-/// Deny a pending proposal. Signs a deny payload (so a deny can't
-/// be forged) and broadcasts. Any single deny invalidates the
-/// proposal.
-pub async fn deny_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
-    let self_pubkey = state.identity.public_id().to_string();
-    let signature = {
-        let mut gov = state.governance_state.write();
-        let idx = gov
-            .pending
-            .iter()
-            .position(|p| p.id == proposal_id)
-            .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
-        if gov.pending[idx].deniers.iter().any(|s| s == &self_pubkey) {
-            return Err(Error::Other("already denied".into()));
-        }
-        // Deny payload is a distinct byte string so a sign signature
-        // can't be repurposed as a deny. We bind to (network_id,
-        // proposal_id, signer) — the proposal id is unique within
-        // the network so this is replay-safe.
-        let payload = format!(
-            "{}deny|{}|{}|{}",
-            network_state::SIGN_DOMAIN_TAG_STATE,
-            state.network_id,
-            proposal_id,
-            self_pubkey
-        );
-        let sig = crate::signing::sign_with(state.identity.signing_key(), payload.as_bytes());
-        gov.pending[idx].deniers.push(self_pubkey.clone());
-        network_state::save(&gov)?;
-        sig
-    };
-
-    let msg = MeshMessage::NetworkStateAck(NetworkStateAckMessage {
-        proposal_id: proposal_id.to_string(),
-        signer: self_pubkey,
-        decision: AckDecision::Deny,
-        at: now_unix(),
-        signature,
-    });
-    broadcast(state, msg).await;
-    // Symmetric with `sign_proposal`: call try_ratify so the
-    // denier's own pending list drops the proposal right away
-    // (the inbound ack handler does this for receivers, but the
-    // denier herself wouldn't otherwise clean up until the next
-    // mutation).
-    let _ = try_ratify(state, proposal_id).await;
-    broadcast_state(state).await;
-    diag(
+) -> Result<FactId> {
+    commit_proposal(
         state,
-        crate::events::DiagLevel::Info,
-        format!("proposal {proposal_id} denied"),
-    );
-    Ok(())
+        FactBody::RoleGrant {
+            target: canonical_device(target)?,
+            role,
+        },
+        mfa_code,
+    )
+    .await
 }
 
-/// Withdraw a proposal authored by the local device. No broadcast —
-/// peers see the proposal disappear via the next state snapshot.
-pub async fn withdraw_proposal(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
-    let self_pubkey = state.identity.public_id().to_string();
-    {
-        let mut gov = state.governance_state.write();
-        let idx = gov
-            .pending
-            .iter()
-            .position(|p| p.id == proposal_id)
-            .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
-        if gov.pending[idx].proposer != self_pubkey {
-            return Err(Error::Other(
-                "only the proposer can withdraw a proposal".into(),
-            ));
-        }
-        gov.pending.remove(idx);
-        network_state::save(&gov)?;
-    }
-    broadcast_state(state).await;
-    Ok(())
-}
-
-/// Fire the proposer-initiated split fallback. Spawns a derived
-/// closed network from the signers the proposal has so far; the
-/// local device becomes founder-owner of the new network.
-pub async fn spawn_split(state: &Arc<EngineState>, proposal_id: &str) -> Result<String> {
-    let self_pubkey = state.identity.public_id().to_string();
-    let (new_network_id, signers, split_signature) = {
-        let mut gov = state.governance_state.write();
-        let idx = gov
-            .pending
-            .iter()
-            .position(|p| p.id == proposal_id)
-            .ok_or_else(|| Error::Other(format!("proposal not found: {proposal_id}")))?;
-        let p = &gov.pending[idx];
-        if p.proposer != self_pubkey {
-            return Err(Error::Other("only the proposer can spawn a split".into()));
-        }
-        if p.split_spawned {
-            return Err(Error::Other("split already spawned".into()));
-        }
-        if !matches!(
-            &p.variant,
-            TransitionVariant::KindChange {
-                to: NetworkKind::Closed
-            }
-        ) {
-            return Err(Error::Other(
-                "splits only apply to stuck open→closed proposals".into(),
-            ));
-        }
-
-        // Derived network id is deterministic from the parent + signer
-        // set, so the same signers always land in the same network
-        // (idempotent retry-safe). The signed payload binds the new
-        // network's id + members; the proposer is the lone signer
-        // since the split's quorum is single-signer (the would-be
-        // founder owner).
-        let signers = p.signers.clone();
-        let new_network_id = network_state::derive_split_network_id(&state.network_id, &signers);
-        let split_variant = TransitionVariant::Split {
-            new_network_id: new_network_id.clone(),
-            members: signers.clone(),
-        };
-        let split_signature = network_state::sign_transition(
-            &state.network_id,
-            &split_variant,
-            state.identity.signing_key(),
-        );
-
-        // Record the split on the parent's transition log + splits
-        // index. The parent's kind stays Open — the split is
-        // additive, not a kind change on the parent.
-        let transition = Transition {
-            at: now_unix(),
-            variant: split_variant,
-            signers: vec![self_pubkey.clone()],
-            signatures: vec![split_signature.clone()],
-        };
-        let after = network_state::apply_transition(gov.clone(), &transition);
-        *gov = after;
-        gov.pending[idx].split_spawned = true;
-        network_state::save(&gov)?;
-
-        (new_network_id, signers, split_signature)
-    };
-
-    let msg = MeshMessage::NetworkStateSplit(NetworkStateSplitMessage {
-        parent_proposal_id: proposal_id.to_string(),
-        new_network_id: new_network_id.clone(),
-        members: signers,
-        proposer: self_pubkey,
-        at: now_unix(),
-        signature: split_signature,
-    });
-    broadcast(state, msg).await;
-    broadcast_state(state).await;
-    diag(
-        state,
-        crate::events::DiagLevel::Info,
-        format!("spawned split → {new_network_id}"),
-    );
-    Ok(new_network_id)
-}
-
-// ---- inbound dispatch -----------------------------------------------
-
-/// A peer asks us to consider their proposal. Verify the proposer's
-/// signature; if valid + not already known, add to pending so the
-/// local user can sign or deny.
-pub async fn on_propose(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateProposeMessage) {
-    // Reject if the claimed proposer's pubkey isn't the one that
-    // actually owns the data channel. A peer can't author a
-    // proposal "as" someone else.
-    let peer_pubkey = pk(peer_id);
-    if msg.proposer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!(
-                "rejecting proposal claiming proposer={} from peer={}",
-                &msg.proposer[..msg.proposer.len().min(12)],
-                &peer_pubkey[..peer_pubkey.len().min(12)]
-            ),
-        );
-        return;
-    }
-    // Verify the proposer actually signed the canonical payload.
-    let payload = network_state::transition_payload(&state.network_id, &msg.variant);
-    let ok = crate::signing::verify(&msg.proposer, &payload, &msg.signature).unwrap_or(false);
-    if !ok {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!("rejecting unsigned/forged proposal {}", msg.proposal_id),
-        );
-        return;
-    }
-
-    let added = {
-        let mut gov = state.governance_state.write();
-        if gov.pending.iter().any(|p| p.id == msg.proposal_id) {
-            false
-        } else {
-            gov.pending.push(Proposal {
-                id: msg.proposal_id.clone(),
-                created_at: msg.created_at,
-                proposer: msg.proposer.clone(),
-                variant: msg.variant.clone(),
-                signers: vec![msg.proposer.clone()],
-                signatures: vec![msg.signature.clone()],
-                deniers: Vec::new(),
-                split_spawned: false,
-            });
-            if let Err(e) = network_state::save(&gov) {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!("persist after inbound propose failed: {e}"),
-                );
-            }
-            true
-        }
-    };
-    if added {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "inbound proposal {} from {}",
-                msg.proposal_id,
-                &msg.proposer[..msg.proposer.len().min(12)]
-            ),
-        );
-    }
-    let _ = try_ratify(state, &msg.proposal_id).await;
-}
-
-/// A peer's sign or deny response to a proposal we already have.
-/// Verify the ack-signature, fold the decision into the pending
-/// record, ratify if the new signer set satisfies the quorum.
-pub async fn on_ack(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateAckMessage) {
-    let peer_pubkey = pk(peer_id);
-    if msg.signer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!(
-                "rejecting ack claiming signer={} from peer={}",
-                &msg.signer[..msg.signer.len().min(12)],
-                &peer_pubkey[..peer_pubkey.len().min(12)]
-            ),
-        );
-        return;
-    }
-
-    let variant = {
-        let gov = state.governance_state.read();
-        match gov.pending.iter().find(|p| p.id == msg.proposal_id) {
-            Some(p) => p.variant.clone(),
-            None => {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Debug,
-                    format!("ack for unknown proposal {}", msg.proposal_id),
-                );
-                return;
-            }
-        }
-    };
-
-    let payload = match msg.decision {
-        AckDecision::Sign => network_state::transition_payload(&state.network_id, &variant),
-        AckDecision::Deny => format!(
-            "{}deny|{}|{}|{}",
-            network_state::SIGN_DOMAIN_TAG_STATE,
-            state.network_id,
-            msg.proposal_id,
-            msg.signer
-        )
-        .into_bytes(),
-    };
-    let ok = crate::signing::verify(&msg.signer, &payload, &msg.signature).unwrap_or(false);
-    if !ok {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!("rejecting forged ack on {}", msg.proposal_id),
-        );
-        return;
-    }
-
-    {
-        let mut gov = state.governance_state.write();
-        let Some(idx) = gov.pending.iter().position(|p| p.id == msg.proposal_id) else {
-            return;
-        };
-        match msg.decision {
-            AckDecision::Sign => {
-                if !gov.pending[idx].signers.iter().any(|s| s == &msg.signer) {
-                    gov.pending[idx].signers.push(msg.signer.clone());
-                    gov.pending[idx].signatures.push(msg.signature.clone());
-                }
-            }
-            AckDecision::Deny => {
-                if !gov.pending[idx].deniers.iter().any(|s| s == &msg.signer) {
-                    gov.pending[idx].deniers.push(msg.signer.clone());
-                }
-            }
-        }
-        if let Err(e) = network_state::save(&gov) {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!("persist after ack failed: {e}"),
-            );
-        }
-    }
-
-    let _ = try_ratify(state, &msg.proposal_id).await;
-}
-
-/// A peer spawned a split from a proposal we were tracking. Verify
-/// the proposer's signature over the new network's `Split`
-/// payload, then record the split in our parent network's state.
-pub async fn on_split(state: &Arc<EngineState>, peer_id: &str, msg: NetworkStateSplitMessage) {
-    let peer_pubkey = pk(peer_id);
-    if msg.proposer != peer_pubkey {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            "rejecting split with mismatched proposer",
-        );
-        return;
-    }
-    let split_variant = TransitionVariant::Split {
-        new_network_id: msg.new_network_id.clone(),
-        members: msg.members.clone(),
-    };
-    let payload = network_state::transition_payload(&state.network_id, &split_variant);
-    let ok = crate::signing::verify(&msg.proposer, &payload, &msg.signature).unwrap_or(false);
-    if !ok {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            "rejecting unsigned split",
-        );
-        return;
-    }
-
-    // Idempotency: if we already have this exact split recorded,
-    // skip — a redelivered frame shouldn't append twice.
-    {
-        let mut gov = state.governance_state.write();
-        if gov
-            .splits
-            .iter()
-            .any(|s| s.new_network_id == msg.new_network_id)
-        {
-            return;
-        }
-        let transition = Transition {
-            at: msg.at,
-            variant: split_variant,
-            signers: vec![msg.proposer.clone()],
-            signatures: vec![msg.signature.clone()],
-        };
-        let after = network_state::apply_transition(gov.clone(), &transition);
-        *gov = after;
-        // Mark the parent proposal as split-spawned if we still
-        // have it in pending.
-        if let Some(p) = gov
-            .pending
-            .iter_mut()
-            .find(|p| p.id == msg.parent_proposal_id)
-        {
-            p.split_spawned = true;
-        }
-        if let Err(e) = network_state::save(&gov) {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!("persist after split failed: {e}"),
-            );
-        }
-    }
-    diag(
-        state,
-        crate::events::DiagLevel::Info,
-        format!(
-            "split → {} spawned by {}",
-            msg.new_network_id,
-            &msg.proposer[..msg.proposer.len().min(12)]
-        ),
-    );
-}
-
-/// A peer broadcasts their view of the network's governance state.
-/// We diag-log governance drift, and — because the broadcast carries the
-/// sender's roster membership root — drive roster convergence off it too:
-/// if their roster membership differs from ours, pull the delta. This
-/// makes the post-mutation `NetworkState` broadcast double as a roster
-/// summary, so a peer learns of new members the moment any governance
-/// frame lands, not just on its own ACTIVE transition.
-pub async fn on_state_broadcast(
+/// Author and publish an exact canonical role revoke.
+pub async fn propose_role_revoke(
     state: &Arc<EngineState>,
-    peer_id: &str,
-    msg: NetworkStateBroadcast,
-) {
-    let (local_kind, local_count, local_member_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
-    if local_kind != msg.kind || local_count != msg.transitions_count {
-        let stable_legacy =
-            stable_open_silent_drift(local_kind, local_count, msg.kind, msg.transitions_count);
-        let first = !stable_legacy
-            || state.stable_governance_drifts.lock().insert((
-                peer_id.to_string(),
-                local_kind,
-                msg.kind,
-            ));
-        if first {
-            diag(
-                state,
-                crate::events::DiagLevel::Info,
-                format!(
-                    "governance drift with {}: local {:?}/{} vs theirs {:?}/{}",
-                    &peer_id[..peer_id.len().min(12)],
-                    local_kind,
-                    local_count,
-                    msg.kind,
-                    msg.transitions_count
-                ),
-            );
-        }
-    }
-    // Pull the peer's roster — which now carries the signed governance log —
-    // when *either* our membership root differs or the peer's log is ahead of
-    // ours. The log half is what converges roles (who the owner is) fleet-wide:
-    // a role grant (or the founder election) bumps `transitions_count` without
-    // necessarily changing membership, so a membership-only check would miss it.
-    let membership_differs =
-        crate::roster::membership_root(&state.roster.read()) != msg.roster_root;
-    if membership_differs
-        || msg.transitions_count > local_count
-        || msg.member_log_count > local_member_count
-    {
-        request_roster(state, peer_id).await;
-    }
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    commit_proposal(
+        state,
+        FactBody::RoleRevoke {
+            target: canonical_device(target)?,
+        },
+        mfa_code,
+    )
+    .await
 }
 
-// ---- roster gossip --------------------------------------------------
-//
-// Anti-entropy over the per-network roster. The contract (see
-// `docs/NETWORK-TYPES.md`): once a peer is *mutually* confirmed (the
-// bilateral approve handshake completes and the link goes ACTIVE) it is
-// persisted into the local roster and advertised to the rest of the
-// network so every member converges on the same membership.
-//
-// "Advertise, don't flood": we broadcast a compact membership *summary*
-// (a 52-char root, not the entries) to active peers. A peer whose root
-// disagrees pulls the full roster with one targeted `RosterRequest`; the
-// responder replies peer-to-peer with `RosterEntries`. Each node that
-// learns a new member re-summarises to ITS active peers, so an update
-// ripples hop-by-hop along whatever shape the network actually has — a
-// ring forwards it neighbour-to-neighbour, a star through the hub —
-// reaching members we have no direct link to, instead of every node
-// blasting its whole roster at every other node.
-//
-// Merges are additive and idempotent: gossip only ever *adds* members it
-// was missing, never rewrites or removes existing entries. That is the
-// correct membership model for an `open` network (a member is anyone any
-// current member has vouched for) and keeps the protocol convergent —
-// removals on an open network are local, and authority changes on a
-// `closed` network ride the signed transition log, not roster gossip.
-
-/// Broadcast our roster membership summary to every active peer. Cheap —
-/// one small frame per peer carrying a root, not the roster itself.
-/// Called when our roster changes (a peer is confirmed / approved) and on
-/// each ACTIVE transition so a freshly-connected peer reconciles at once.
-pub async fn broadcast_roster_summary(state: &Arc<EngineState>) {
-    // Silent networks never gossip membership — every connection is
-    // deliberate, so there is nothing to converge. Presence and the per-peer
-    // handshake are unaffected; only this anti-entropy advertise is suppressed.
-    if !state.gossip_roster_enabled() {
-        return;
-    }
-    let summary = crate::roster::summary(&state.roster.read());
-    broadcast(state, MeshMessage::RosterSummary(summary)).await;
-}
-
-/// Inbound roster summary. If the sender's membership root differs from
-/// ours, ask for their full roster so we can merge what we're missing.
-pub async fn on_roster_summary(state: &Arc<EngineState>, peer_id: &str, msg: RosterSummaryMessage) {
-    maybe_request_roster(state, peer_id, &msg.root).await;
-}
-
-/// Inbound roster request. Reply peer-to-peer (not broadcast) with our
-/// full roster as entries. v1 always sends everything (`include_all`); a
-/// subtree-walk can ship later without changing the frame kind.
-pub async fn on_roster_request(
+/// Author and publish an exact canonical eviction.
+pub async fn propose_evict(
     state: &Arc<EngineState>,
-    peer_id: &str,
-    _msg: RosterRequestMessage,
-) {
-    // A Silent network never emits roster entries — membership is not gossiped
-    // in either direction. (It also never sends summaries, so a well-behaved
-    // peer won't request; this guards the unsolicited case.)
-    if !state.gossip_roster_enabled() {
-        return;
-    }
-    let entries: Vec<RosterEntry> = state
-        .roster
-        .read()
-        .authorized_devices
-        .iter()
-        .map(RosterEntry::from)
-        .collect();
-    // Carry the signed governance log with the roster so roles converge with
-    // membership: the requester verifies it from genesis and re-derives who is
-    // owner/controller, instead of trusting a gossiped role tag. Empty on an
-    // open network (no signed log).
-    let (transitions, member_log) = {
-        let gov = state.governance_state.read();
-        (gov.transitions.clone(), gov.member_log.clone())
-    };
-    let msg = MeshMessage::RosterEntries(RosterEntriesMessage {
-        entries,
-        transitions,
-        member_log,
-    });
-    if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
-        tracing::debug!(peer = %peer_id, err = %e, "roster entries reply send failed");
-    }
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    commit_proposal(
+        state,
+        FactBody::Evict {
+            target: canonical_device(target)?,
+        },
+        mfa_code,
+    )
+    .await
 }
 
-/// Inbound roster entries. Additively merge any members we were missing,
-/// persist if the roster changed, and — if it did — re-summarise to our
-/// peers so the new member propagates onward (gossip convergence).
-pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: RosterEntriesMessage) {
-    // Membership trust is split by network kind:
-    //
-    //   * `open` network — permissionless gossip: "a member is anyone any
-    //     current member has vouched for" (see the module note). The unsigned
-    //     `entries` are merged additively.
-    //   * `closed` network — owner-**signed** only. Membership rides the signed
-    //     transition log (a ratified `RoleGrant`) and is derived from the
-    //     verified log in `adopt_transition_log` below. The unsigned `entries`
-    //     are NOT a trust input here — not even from a Controller/Owner. The
-    //     stance is deliberately the strong form of MOM-01: the *data* must be
-    //     signed by an authority, not merely vouched for by an authenticated
-    //     sender. An authenticated peer (a freshly-approved Member, or an
-    //     attacker who cleared one approval) gossiping `entries` can no longer
-    //     conscript anyone into a closed network — there is simply no unsigned
-    //     path in. A closed network's roster is exactly the verified,
-    //     owner-signed log: complete, self-sufficient, and identical on every
-    //     member that has adopted the log.
-    let kind = { state.governance_state.read().kind };
-    // Silent is governance-identical to Open (permissionless, additive merge).
-    // In practice a Silent network suppresses outbound gossip so this rarely
-    // fires, but if a peer does send entries we merge them the open way rather
-    // than treating Silent like a signed-authority closed network.
-    if kind.is_open_governance() {
-        let self_pk = state.identity.public_id().to_string();
-        let added = {
-            let mut roster = state.roster.write();
-            let mut added = 0usize;
-            for entry in &msg.entries {
-                let pubkey = crate::signing::pubkey_part(&entry.device_id).to_string();
-                // Our own entry is locally authoritative; never let a peer's
-                // gossip rewrite how we see ourselves.
-                if pubkey == self_pk {
-                    continue;
-                }
-                // Additive only — skip members we already hold so a stale
-                // label / timestamp from a peer can't clobber ours and a local
-                // removal can't be undone by a no-op rewrite.
-                if crate::roster::is_authorized(&roster, &pubkey) {
-                    continue;
-                }
-                crate::roster::add_peer_in(&mut roster, &pubkey, &entry.label);
-                // On an open network the role tag is cosmetic; adopt whatever
-                // the gossip carried.
-                if entry.role != Role::Member {
-                    crate::roster::set_role_in(&mut roster, &pubkey, entry.role);
-                }
-                added += 1;
-            }
-            if added > 0 {
-                if let Err(e) = crate::roster::save(&roster) {
-                    diag(
-                        state,
-                        crate::events::DiagLevel::Warn,
-                        format!("persist after roster merge failed: {e}"),
-                    );
-                }
-            }
-            added
-        };
-        if added > 0 {
-            diag(
-                state,
-                crate::events::DiagLevel::Info,
-                format!(
-                    "roster: merged {added} member(s) from {}",
-                    &peer_id[..peer_id.len().min(12)]
-                ),
-            );
-            broadcast_roster_summary(state).await;
-        }
-    } else if !msg.entries.is_empty() {
-        // A closed network ignores unsigned membership gossip outright. Surface
-        // it at debug so a pre-signed-membership peer (or a probe) is visible
-        // without alarming — any legitimate membership it carries arrives
-        // signed in the log below.
+/// Author and broadcast the owner-signed membership restoration fact used
+/// after a Closed eviction. Membership admission and the role grant remain
+/// separate canonical cells; callers must issue the causal RoleGrant(Member)
+/// afterward when session authority is also being restored.
+pub async fn propose_membership_admit(
+    state: &Arc<EngineState>,
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    crate::custody::require(&state.network_id, mfa_code)?;
+    let fact = signed_fact(
+        state,
+        FactBody::MembershipAdmit {
+            target: canonical_device(target)?,
+        },
+        Vec::new(),
+    )?;
+    let delta = admit_authored_fact(state, &fact).await?;
+    apply_canonical_projection_delta_checked(state, &delta)?;
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
+    broadcast_fact_inventory_delta(state, &delta).await;
+    broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
+    Ok(fact.id)
+}
+
+/// Publish one already-durable semantic delta without passing its facts back
+/// through admission. A group commit may include both the requested fact and
+/// quarantine promotions; the sparse projection is applied once, and every
+/// changed fact gets the same post-commit lifecycle handling as an ordinary
+/// single admission.
+pub(super) async fn on_committed_facts(
+    state: &Arc<EngineState>,
+    facts: Vec<SignedFact>,
+    delta: crate::semantic::SemanticDelta,
+) {
+    if facts.is_empty() {
+        return;
+    }
+    if let Err(error) = apply_canonical_projection_delta_checked(state, &delta) {
         diag(
             state,
-            crate::events::DiagLevel::Debug,
-            format!(
-                "roster: ignored {} unsigned entry(ies) on a closed network from {} \
-                 (membership is owner-signed; deriving from the log)",
-                msg.entries.len(),
-                &peer_id[..peer_id.len().min(12)]
-            ),
+            crate::events::DiagLevel::Warn,
+            format!("rejecting semantic fact projection: {error}"),
         );
+        return;
     }
-    // Roles AND closed-network membership ride the signed log: verify the
-    // peer's log, adopt it when it extends ours, and re-derive the roster from
-    // it. On a closed network this is the *only* membership source — every
-    // member is a ratified `RoleGrant` authored by an owner/controller.
-    adopt_transition_log(state, peer_id, &msg.transitions, &msg.member_log).await;
+    // Fact admission is the explicit lifecycle boundary for terminal recovery.
+    // Refresh the local stand-down cache, then reconcile only the subject whose
+    // canonical cell may have changed. Recovery never waits for a ticker to
+    // discover that signed policy has become negative.
+    refresh_self_evicted(state);
+    for fact in &facts {
+        match &fact.content.body {
+            FactBody::RoleGrant { target, .. }
+            | FactBody::RoleRevoke { target }
+            | FactBody::Evict { target }
+            | FactBody::MembershipAdmit { target }
+            | FactBody::EvictionProof { target, .. }
+            | FactBody::Attestation { target, .. } => {
+                super::reconcile_terminal_recovery_policy(state, target);
+            }
+            FactBody::SelfStandDown { device_id, .. } => {
+                super::reconcile_terminal_recovery_policy(state, device_id);
+            }
+            FactBody::Resolution { cell, .. } => match cell {
+                crate::semantic::ExclusiveCell::Role { subject }
+                | crate::semantic::ExclusiveCell::Membership { subject } => {
+                    super::reconcile_terminal_recovery_policy(state, subject);
+                }
+                crate::semantic::ExclusiveCell::Decision { .. } => {}
+            },
+            FactBody::AuthorityLineageResolution { subject, .. } => {
+                super::reconcile_terminal_recovery_policy(state, subject);
+            }
+        }
+    }
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
+    broadcast_fact_inventory_delta(state, &delta).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
+    for fact in facts {
+        match &fact.content.body {
+            FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
+                request_pending_approval(state, &fact.content.author).await;
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---- eviction enforcement -------------------------------------------
@@ -907,25 +1192,20 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, peer_id: &str, msg: Ros
 // deny-with-proof at the handshake, and the self-evicted quiescence.
 
 /// Whether `device_id`'s pubkey is explicitly evicted by this network's
-/// signed state. Only meaningful on closed governance (open networks
-/// have no signed membership); false there. The verdict is the same
-/// [`network_state::member_log_removed`] the roster mirror prunes by,
-/// with a guard: a pubkey the governance log currently seats as
-/// owner/controller is never "evicted" (a stale member-tier entry can't
-/// outrank the governance tier).
+/// signed state. Only meaningful on closed governance (open networks have no
+/// signed membership); false there. The verdict is derived from the sealed
+/// semantic membership projection, so roster data cannot outrank the canonical
+/// graph.
 pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
-    let pubkey = pk(device_id);
-    let gov = state.governance_state.read();
-    if gov.kind.is_open_governance() {
-        return false;
-    }
     if matches!(
-        gov.roles.get(&pubkey),
-        Some(Role::Owner) | Some(Role::Controller)
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
     ) {
         return false;
     }
-    network_state::member_log_removed(&gov, &gov.member_log, &state.network_id).contains(&pubkey)
+    canonical_projection_snapshot(state)
+        .evicted
+        .contains(&pk(device_id))
 }
 
 /// Recompute and cache whether the signed state has evicted THIS device
@@ -945,6 +1225,12 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
     let verdict = log_evicted(state, state.identity.public_id());
     let was = state.self_evicted.swap(verdict, Ordering::SeqCst);
     if verdict && !was {
+        // Ratification and adopted-log refreshes can reach this edge without
+        // passing through the mod.rs subject reconciler.  Detach the current
+        // exact carrier guards before clearing recovery custody so a stale
+        // source cannot retain or settle an emission after self-eviction.
+        state.detach_signaling_guards();
+        state.cancel_all_recovery_demands();
         state.reconnect_intents.lock().clear();
         state.sticky_peers.lock().clear();
         state.log_diag_with(
@@ -967,20 +1253,21 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
 }
 
 /// The handshake gate: if the authenticated `device_id` is evicted by
-/// our signed state, deny it WITH PROOF (the signed logs ride the deny)
+/// our signed state and deny it.
 /// and drop the session. Returns true when the peer was denied — the
 /// caller must stop the admission flow (no pending-approval, no
-/// auto-approve; those were exactly the resurrection engine). The proof
-/// costs nothing to trust: the denied device verifies it independently
-/// through strict-extension adoption, so a spoofed deny changes nothing.
-pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
+/// auto-approve; those were exactly the resurrection engine). The signed
+/// eviction closure is sent over the durable semantic lane before the denial,
+/// so the denied device can verify it independently through causal admission;
+/// a spoofed transport deny still changes nothing.
+pub(super) async fn deny_if_evicted(
+    state: &Arc<EngineState>,
+    owner: &super::peer_registry::PeerOwnerToken,
+) -> bool {
+    let device_id = owner.device_id();
     if !log_evicted(state, device_id) {
         return false;
     }
-    let (transitions, member_log) = {
-        let gov = state.governance_state.read();
-        (gov.transitions.clone(), gov.member_log.clone())
-    };
     state.log_diag_with(
         crate::events::DiagLevel::Info,
         "governance",
@@ -990,935 +1277,839 @@ pub(super) async fn deny_if_evicted(state: &Arc<EngineState>, device_id: &str) -
         ),
         serde_json::json!({ "peer": device_id, "reason": "evicted" }),
     );
+    // Deliver the signed eviction closure before ending this installation.
+    // Pending peers use the narrow semantic lane; an already-active test/lab
+    // installation uses the ordinary application lane. Both are owner-bound,
+    // provider-funded writes, and either refusal leaves the proof available for
+    // the next inventory/request exchange rather than changing the decision.
+    if let Some(bundle) = current_eviction_proof_bundle(state, device_id) {
+        let message = FactPageMessage::new(state.mesh_context_id(), bundle.clone(), None, true)
+            .map(MeshMessage::FactPage);
+        let proof_result = match super::send_pending_semantic_facts(state, owner, &bundle).await {
+            Ok(()) => Ok(()),
+            Err(_) => match message {
+                Ok(message) => super::send_to_peer_owner(state, owner, &message).await,
+                Err(error) => Err(Error::Other(format!(
+                    "eviction proof fact page refused: {error}"
+                ))),
+            },
+        };
+        if let Err(error) = proof_result {
+            tracing::debug!(
+                peer = %device_id,
+                %error,
+                "eviction proof bundle delivery failed"
+            );
+        }
+    }
     let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
         reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
-        transitions,
-        member_log,
     });
-    if let Err(e) = super::send_to_peer(state, device_id, &deny).await {
+    // One attempt, and the attempt's return is the boundary. The proof is
+    // best-effort diagnostic material rather than authority — the peer is
+    // already denied by the current policy projection — so nothing here waits
+    // for it to be received, acknowledged, or retried, and no elapsed duration
+    // participates in the drop.
+    if let Err(e) = super::send_to_peer_owner(state, owner, &deny).await {
         tracing::debug!(peer = %device_id, err = %e, "eviction deny send failed");
     }
-    // Do NOT tear the session down in the same breath: the data channel's
-    // send is buffered, and closing the connection here reliably discards
-    // the deny before it flushes — the device never gets its proof and
-    // redials forever (observed: every retry denied, zero adoptions). The
-    // receiving side drops the link itself the moment the deny lands
-    // (`on_deny`); this delayed drop is only the janitor for a peer that
-    // never processes it. Until then the peer sits unauthenticated-for-
-    // app-traffic (never approved), so nothing rides the grace window.
-    let janitor = state.clone();
-    let dev = device_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        super::drop_peer(&janitor, &dev, DropReason::Denied).await;
-    });
+    // Owner-bound, so a peer that was already replaced under the same Device ID
+    // keeps its successor: `drop_peer_if_current` drops nothing when this token
+    // is no longer the current one.
+    super::drop_peer_if_current(state, owner, DropReason::Denied).await;
     true
 }
 
-/// Feed a deny's attached logs through the standard strict-extension
-/// adoption. Nothing about the *sender* is trusted: a forged or foreign
-/// log fails verification inside [`adopt_transition_log`] and changes
-/// nothing; a genuine one converges our state, and the adoption tail's
-/// [`refresh_self_evicted`] flips this engine to stood-down if the
-/// verified verdict really does evict us.
-pub(super) async fn adopt_deny_proof(
-    state: &Arc<EngineState>,
-    peer_id: &str,
-    transitions: &[Transition],
-    member_log: &[Transition],
-) {
-    adopt_transition_log(state, peer_id, transitions, member_log).await;
-    // The adoption tail refreshes only when something changed; a repeat
-    // deny carrying a log we already hold must still settle the verdict
-    // (e.g. first boot after the log was persisted by a previous run).
-    refresh_self_evicted(state);
-}
-
-/// Re-derive the full role projection from both logs: owners and managers from
-/// the verified **governance** log, plus the union-merged **member** set as
-/// `Member`. With a member tier, the governance log alone no longer carries
-/// members, so this is the single source of truth for `gov.roles`. A governance
-/// log that fails to verify (never expected for our own ratified state) falls
-/// back to no governance roles rather than panicking.
-fn project_roles(
-    network_id: &str,
-    transitions: &[Transition],
-    member_log: &[Transition],
-) -> std::collections::BTreeMap<String, Role> {
-    let gov = network_state::verify_log(network_id, transitions)
-        .unwrap_or_else(|_| network_state::NetworkState::empty_for(network_id));
-    let mut roles = gov.roles.clone();
-    for m in network_state::verify_member_log(&gov, member_log, network_id) {
-        roles.entry(m).or_insert(Role::Member);
-    }
-    roles
-}
-
-/// The operative roster is a cache of the closed network's verified signed
-/// state, plus any not-yet-signed/manual approvals. A crash or failed write can
-/// leave that cache behind the governance log, so every load and governance
-/// exchange reconciles these invariants:
-///
-/// * every effective signed role is rostered with the same role;
-/// * every effective signed tombstone is absent (except our own local row);
-/// * unrelated roster-only approvals are preserved.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct RosterProjectionRepair {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub roles_updated: Vec<String>,
-    pub governance_roles_updated: bool,
-}
-
-impl RosterProjectionRepair {
-    pub fn roster_changed(&self) -> bool {
-        !self.added.is_empty() || !self.removed.is_empty() || !self.roles_updated.is_empty()
-    }
-}
-
-fn verified_projection(
-    network_id: &str,
-    governance: &network_state::NetworkState,
-) -> Result<(
-    std::collections::BTreeMap<String, Role>,
-    std::collections::BTreeSet<String>,
-)> {
-    let verified = network_state::verify_log(network_id, &governance.transitions)?;
-    let mut roles = verified.roles.clone();
-    for member in network_state::verify_member_log(&verified, &governance.member_log, network_id) {
-        roles.entry(member).or_insert(Role::Member);
-    }
-    let removed = network_state::member_log_removed(&verified, &governance.member_log, network_id);
-    Ok((roles, removed))
-}
-
-/// Whether `device_id` is an active member of a closed network's verified
-/// signed projection. Callers use this before applying any legacy/local roster
-/// mutation: the cache may add manual approvals, but it may never subtract a
-/// membership the signed log still grants.
-pub(super) fn signed_projection_contains(
-    network_id: &str,
-    governance: &network_state::NetworkState,
-    device_id: &str,
-) -> Result<bool> {
-    let (roles, _) = verified_projection(network_id, governance)?;
-    Ok(roles.contains_key(&pk(device_id)))
-}
-
-/// Session keys may carry a display suffix while signed membership always uses
-/// the bare public key. Keep the live-session projection on that same identity
-/// surface so a tombstoned device cannot survive merely because its connection
-/// key is decorated for display.
-fn matches_tombstone(removed: &std::collections::BTreeSet<String>, device_id: &str) -> bool {
-    removed.contains(&pk(device_id))
-}
-
-/// Rebuild the derived governance-role and operative-roster projections from
-/// the signed logs. Verification happens before either cache is touched: an
-/// invalid log can never add, remove, or re-role a roster entry.
-pub(super) fn reconcile_signed_projection(
-    network_id: &str,
-    governance: &mut network_state::NetworkState,
-    roster: &mut crate::roster::Roster,
-    self_pubkey: &str,
-) -> Result<RosterProjectionRepair> {
-    let (roles, removed) = verified_projection(network_id, governance)?;
-    let governance_roles_updated = governance.roles != roles;
-    if governance_roles_updated {
-        governance.roles = roles.clone();
-    }
-    let mut repair = mirror_roles_to_roster(&roles, roster, &removed, self_pubkey);
-    repair.governance_roles_updated = governance_roles_updated;
-    Ok(repair)
-}
-
-/// Adopt a peer's two signed logs, converging both tiers of the cert chain.
-///
-/// The **governance** log (kind changes, owner/manager grants and removals,
-/// splits) is verified from genesis ([`crate::network_state::verify_log`]) and
-/// adopted only when it **extends** ours — shares our prefix and is strictly
-/// longer — so a peer can add a grant or the founder election we hadn't seen
-/// but can never rewrite our genesis (and the owner it elected) out from under
-/// us. A divergent log is rejected whole, leaving our state untouched.
-///
-/// The **member** log (per-member admits/removals) is **union-merged**
-/// ([`crate::network_state::merge_member_logs`]) — commutative, so two
-/// managers' concurrent offline admissions both survive instead of forking the
-/// way a strict-prefix log would. Either tier may change independently; if
-/// either does we reproject the full role map from both logs, mirror it into
-/// the roster, and re-gossip so it ripples on. We keep our in-flight pending
-/// proposals throughout.
-async fn adopt_transition_log(
-    state: &Arc<EngineState>,
-    peer_id: &str,
-    incoming_gov: &[Transition],
-    incoming_members: &[Transition],
-) {
-    // Governance log: decide adoption (verified, fork-guarded) without holding
-    // the write lock across verify_log.
-    let rebuilt: Option<network_state::NetworkState> = {
-        let extends = {
-            let gov = state.governance_state.read();
-            let longer = incoming_gov.len() > gov.transitions.len();
-            let shares_prefix = incoming_gov
-                .iter()
-                .zip(gov.transitions.iter())
-                .all(|(a, b)| a.variant == b.variant && same_signer_set(a, b));
-            if longer && !shares_prefix {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!(
-                        "rejecting forked governance log from {}",
-                        &peer_id[..peer_id.len().min(12)]
-                    ),
-                );
-            }
-            longer && shares_prefix
-        };
-        if extends {
-            match network_state::verify_log(&state.network_id, incoming_gov) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    diag(
-                        state,
-                        crate::events::DiagLevel::Warn,
-                        format!(
-                            "rejecting invalid governance log from {}: {e}",
-                            &peer_id[..peer_id.len().min(12)]
-                        ),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    };
-
-    // Apply both tiers under the write lock; reproject + mirror if either moved.
-    let (changed, roles, removed, adopted_topology) = {
-        let mut gov = state.governance_state.write();
-        let mut changed = false;
-        let mut adopted_topology = None;
-
-        if let Some(rebuilt) = rebuilt {
-            // Re-check length in case it raced another adopter.
-            if rebuilt.transitions.len() > gov.transitions.len() {
-                gov.kind = rebuilt.kind;
-                gov.transitions = rebuilt.transitions;
-                gov.splits = rebuilt.splits;
-                // A prefix-extending log can only carry topology forward
-                // (our Some came from our own prefix), so None never
-                // clobbers Some here; surface a real change so the
-                // runtime selector follows the adopted governance.
-                if rebuilt.topology != gov.topology {
-                    adopted_topology = rebuilt.topology.clone();
-                }
-                gov.topology = rebuilt.topology;
-                changed = true;
-            }
-        }
-
-        if !incoming_members.is_empty() {
-            let merged = network_state::merge_member_logs(&gov.member_log, incoming_members);
-            // Union only ever grows; a longer result means new entries.
-            if merged.len() > gov.member_log.len() {
-                gov.member_log = merged;
-                changed = true;
-            }
-        }
-
-        let (projected, removed) = match verified_projection(&state.network_id, &gov) {
-            Ok(projection) => projection,
-            Err(e) => {
-                drop(gov);
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!("refusing to reconcile an invalid signed state: {e}"),
-                );
-                return;
-            }
-        };
-        let roles_changed = gov.roles != projected;
-        if roles_changed {
-            gov.roles = projected.clone();
-        }
-        if changed || roles_changed {
-            if let Err(e) = network_state::save(&gov) {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!("persist after adopting logs failed: {e}"),
-                );
-            }
-        }
-        (changed, projected, removed, adopted_topology)
-    };
-
-    if let Some(mode) = adopted_topology {
-        // Governance carried a topology this node hadn't applied yet —
-        // follow it live, exactly like a local ratification does.
-        *state.topology.write() = mode.clone();
-        *state.topology_impl.write() = crate::topology::from_mode(&mode);
-        super::ladder::reevaluate_topology(state).await;
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!("governed topology adopted: {mode:?}"),
-        );
-    }
-
-    // Mirror the converged roles into the roster: add role-bearers, update tags,
-    // and delete only the devices the signed log explicitly evicted/revoked
-    // (`removed`). This is how an eviction learned via gossip de-authorises the
-    // target on this node, matching the local-ratify path — without over-pruning
-    // devices that are simply not (yet) in the signed projection.
-    let repair = {
-        let mut roster = state.roster.write();
-        let self_pk = state.identity.public_id().to_string();
-        let repair = mirror_roles_to_roster(&roles, &mut roster, &removed, &self_pk);
-        if repair.roster_changed() {
-            if let Err(e) = crate::roster::save(&roster) {
-                diag(
-                    state,
-                    crate::events::DiagLevel::Warn,
-                    format!("persist roster after role mirror failed: {e}"),
-                );
-            }
-        }
-        repair
-    };
-    if repair.roster_changed() {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "repaired signed roster projection: added={} removed={} roles_updated={}",
-                repair.added.len(),
-                repair.removed.len(),
-                repair.roles_updated.len()
-            ),
-        );
-    }
-    // A valid signed member may already be authenticated and waiting only for
-    // our approval. Complete the existing bilateral handshake in place; the
-    // send path is idempotent, so active or disconnected members are no-ops.
-    for device_id in roles.keys() {
-        super::handshake::send_local_approve(state, device_id).await;
-    }
-    // A newly learned/repaired tombstone must terminate any session admitted
-    // under stale state, even if its roster row had already disappeared. Route
-    // it through the existing deny-with-proof path: data-channel sends are
-    // buffered, so an immediate drop here can discard the signed proof before
-    // the evicted device learns it must stand down. The delayed janitor in
-    // `deny_if_evicted` still guarantees teardown. Gate this work on a real
-    // change/repair so identical steady-state gossip cannot repeatedly deny or
-    // schedule drops, and compare canonical pubkeys because live peer keys may
-    // carry display suffixes.
-    if changed || repair.roster_changed() {
-        let tombstoned_sessions: Vec<String> = state
-            .peers
-            .iter()
-            .filter_map(|entry| {
-                matches_tombstone(&removed, entry.key()).then(|| entry.key().clone())
-            })
-            .collect();
-        for device_id in tombstoned_sessions {
-            deny_if_evicted(state, &device_id).await;
-        }
-    }
-    if changed {
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!(
-                "adopted converged logs from {}",
-                &peer_id[..peer_id.len().min(12)]
-            ),
-        );
-    }
-    // The adopted logs may have evicted (or re-admitted) THIS device —
-    // settle the cached verdict before telling anyone anything.
-    refresh_self_evicted(state);
-    // Tell our own peers — both the new membership and the new governance
-    // counts — so it ripples on.
-    if changed || repair.roster_changed() {
-        broadcast_roster_summary(state).await;
-    }
-    if changed {
-        broadcast_state(state).await;
-    }
-}
-
-/// Mirror the converged signed state into the roster. Role-bearing pubkeys
-/// missing from the roster are added (so the owner shows up even before
-/// membership gossip reaches us) and role tags are updated. Returns whether the
-/// roster changed (to gate the disk write).
-///
-/// `removed` is the set of devices the signed member log has **explicitly
-/// tombstoned** (an `Evict`/`RoleRevoke`). Those — and only those — are deleted
-/// from the roster (never this device, `self_pubkey`), so an eviction learned
-/// only through gossip actually de-authorises the target, matching the
-/// local-ratify path. Crucially we do **not** prune "anyone not in the signed
-/// projection": a device added by `roster_approve` (or one whose signed admit
-/// this node can't verify yet) is left in place rather than silently dropped —
-/// that over-pruning is what made members vanish and re-appear.
-fn mirror_roles_to_roster(
-    roles: &std::collections::BTreeMap<String, Role>,
-    roster: &mut crate::roster::Roster,
-    removed: &std::collections::BTreeSet<String>,
-    self_pubkey: &str,
-) -> RosterProjectionRepair {
-    let mut repair = RosterProjectionRepair::default();
-    for (pubkey, role) in roles {
-        if !crate::roster::is_authorized(roster, pubkey) {
-            crate::roster::add_peer_in(roster, pubkey, "");
-            repair.added.push(pubkey.clone());
-        }
-        if crate::roster::set_role_in(roster, pubkey, *role) {
-            repair.roles_updated.push(pubkey.clone());
-        }
-    }
-    // Drop only the explicitly-evicted, and never ourselves.
-    let self_pk = crate::signing::pubkey_part(self_pubkey);
-    repair.removed.extend(
-        roster
-            .authorized_devices
-            .iter()
-            .filter(|entry| entry.device_id != self_pk && removed.contains(&entry.device_id))
-            .map(|entry| entry.device_id.clone()),
-    );
-    roster
-        .authorized_devices
-        .retain(|e| e.device_id == self_pk || !removed.contains(&e.device_id));
-    // Clear a stale role tag on any entry the signed roles no longer cover.
-    for entry in roster.authorized_devices.iter_mut() {
-        if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
-            entry.role = Role::Member;
-            repair.roles_updated.push(entry.device_id.clone());
-        }
-    }
-    repair
-}
-
-/// If `their_root` (a membership root) differs from ours, send a targeted
-/// request for the peer's full roster. We only ever *pull* on a mismatch —
-/// the side that's behind asks — so two peers don't both dump their whole
-/// rosters at each other. Idempotent and convergent: once memberships
-/// agree the roots match and no request fires.
-async fn maybe_request_roster(state: &Arc<EngineState>, peer_id: &str, their_root: &str) {
-    let our_root = crate::roster::membership_root(&state.roster.read());
-    if our_root == their_root {
-        return;
-    }
-    request_roster(state, peer_id).await;
-}
-
-/// Send a targeted full-roster request to one peer. The reply
-/// ([`on_roster_request`]) carries both the membership entries and the signed
-/// governance log, so this is the single pull that converges *both* membership
-/// and roles.
-async fn request_roster(state: &Arc<EngineState>, peer_id: &str) {
-    let msg = MeshMessage::RosterRequest(RosterRequestMessage {
-        include_all: true,
-        subtree_hashes: Vec::new(),
-    });
-    if let Err(e) = super::send_to_peer(state, peer_id, &msg).await {
-        tracing::debug!(peer = %peer_id, err = %e, "roster request send failed");
-    }
-}
-
-// ---- ratification ---------------------------------------------------
-
-/// Reorder a transition's `(signer, signature)` pairs into a canonical,
-/// peer-independent order: the proposer first, then every other signer sorted
-/// by pubkey, each signature carried with its signer. Signatures are matched to
-/// signers positionally by [`network_state::verify_transition_signatures`], so
-/// the two vectors are permuted together.
-///
-/// Ratification runs the assembled transition through this so that two peers
-/// which gathered the same co-signatures in different ack-arrival orders record
-/// the *byte-identical* entry. That is what the shared-prefix fork guard in
-/// [`adopt_transition_log`] — and any future hash over the log — depend on.
-/// ed25519 signatures are deterministic, so once the signer order agrees the
-/// whole entry agrees. Keeping the proposer first preserves the
-/// `signers.first() == founder/proposer` convention `apply_transition` relies
-/// on (genesis and splits are single-signer, so this is a no-op for them).
-fn canonicalize_signers(
-    proposer: &str,
-    signers: &[String],
-    signatures: &[String],
-) -> (Vec<String>, Vec<String>) {
-    // A malformed pending record with mismatched lengths is left as-is so the
-    // downstream signature check rejects it cleanly rather than mis-pairing.
-    if signers.len() != signatures.len() {
-        return (signers.to_vec(), signatures.to_vec());
-    }
-    let mut pairs: Vec<(&String, &String)> = signers.iter().zip(signatures.iter()).collect();
-    pairs.sort_by(|a, b| {
-        let ka = (if a.0 == proposer { 0 } else { 1 }, a.0);
-        let kb = (if b.0 == proposer { 0 } else { 1 }, b.0);
-        ka.cmp(&kb)
-    });
-    pairs
-        .into_iter()
-        .map(|(s, g)| (s.clone(), g.clone()))
-        .unzip()
-}
-
-/// The pubkey a member-tier transition acts on, if it is one.
-fn member_entry_target(t: &Transition) -> Option<&str> {
-    match &t.variant {
-        TransitionVariant::RoleGrant { target, .. }
-        | TransitionVariant::RoleRevoke { target }
-        | TransitionVariant::Evict { target } => Some(target.as_str()),
-        _ => None,
-    }
-}
-
-/// Timestamp to stamp on a newly-authored transition. Member-tier entries
-/// (member admit/remove) converge by last-writer-wins on `at`
-/// ([`network_state::verify_member_log`]), so a re-admit that follows an evict
-/// of the same device must carry a **strictly-later** `at` — otherwise the
-/// evict tombstone keeps winning and the re-admit silently no-ops. We stamp one
-/// past the newest existing member-log entry for that target (across every
-/// author, since the member log is union-merged), never earlier than the wall
-/// clock. Governance-tier transitions order by log position, not `at`, so they
-/// just take the wall clock.
-fn member_tier_timestamp(state: &Arc<EngineState>, variant: &TransitionVariant) -> u64 {
-    let now = now_unix();
-    let gov = state.governance_state.read();
-    let target = match variant {
-        TransitionVariant::RoleGrant {
-            target,
-            role: Role::Member,
-        } => target.as_str(),
-        // A revoke rides the member log (and needs the monotonic stamp) only when
-        // it targets a plain member; a revoke of an owner/manager stays governance
-        // tier and just demotes, so it takes the wall clock below.
-        TransitionVariant::RoleRevoke { target } if gov.role_of(target) == Role::Member => {
-            target.as_str()
-        }
-        // An evict is tombstoned in the member log at *either* tier (see
-        // `try_ratify`) — to suppress the target's member-tier admit — so it must
-        // ALWAYS be stamped strictly past the target's newest member-log entry.
-        // Otherwise a same-second admit wins the last-writer-wins tie and the
-        // evicted device survives: a promoted owner/manager keeps the plain-member
-        // admit it was given before promotion, and re-appears fleet-wide.
-        TransitionVariant::Evict { target } => target.as_str(),
-        _ => return now,
-    };
-    let newest = gov
-        .member_log
-        .iter()
-        .filter(|t| member_entry_target(t) == Some(target))
-        .map(|t| t.at)
-        .max()
-        .unwrap_or(0);
-    now.max(newest.saturating_add(1))
-}
-
-/// Whether two transitions carry the same signer *set*, order-independent.
-/// The shared-prefix fork guard uses this so the same ratified transition,
-/// recorded with its co-signers in different orders on two peers, is recognised
-/// as the same entry rather than a fork. New ratifications are canonicalised by
-/// [`canonicalize_signers`]; this also tolerates logs written before that.
-fn same_signer_set(a: &Transition, b: &Transition) -> bool {
-    if a.signers.len() != b.signers.len() {
-        return false;
-    }
-    let a_set: std::collections::BTreeSet<&str> = a.signers.iter().map(String::as_str).collect();
-    let b_set: std::collections::BTreeSet<&str> = b.signers.iter().map(String::as_str).collect();
-    a_set == b_set
-}
-
-/// If `proposal_id`'s pending entry has gathered enough signatures
-/// to satisfy the quorum table for its variant — and hasn't been
-/// denied — fold it into the signed transition log, apply, persist,
-/// and broadcast a fresh state snapshot.
-async fn try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Result<()> {
-    let (transition, applied) = {
-        let mut gov = state.governance_state.write();
-        let Some(idx) = gov.pending.iter().position(|p| p.id == proposal_id) else {
-            return Ok(());
-        };
-        if !gov.pending[idx].deniers.is_empty() {
-            // Denied — drop from pending and bail.
-            gov.pending.remove(idx);
-            network_state::save(&gov)?;
-            return Ok(());
-        }
-        let p = &gov.pending[idx];
-
-        // Fold the (signer, signature) pairs into a canonical order —
-        // proposer first, then the rest sorted by signer pubkey — so that two
-        // peers who collected the same co-signatures in different ack-arrival
-        // orders record the *byte-identical* transition. Without this, the
-        // shared-prefix fork guard in `adopt_transition_log` would see two
-        // orderings of the same multi-signer transition as divergent logs and
-        // refuse to converge. ed25519 signatures are deterministic, so once the
-        // signer order agrees the whole entry agrees. Genesis and splits are
-        // single-signer, so `first()` still resolves to the founder/proposer
-        // (canonicalisation is a no-op there).
-        let (signers, signatures) = canonicalize_signers(&p.proposer, &p.signers, &p.signatures);
-        let candidate = Transition {
-            at: p.created_at,
-            variant: p.variant.clone(),
-            signers,
-            signatures,
-        };
-        if network_state::verify_transition_signatures(&state.network_id, &candidate).is_err() {
-            // Should never happen — we verified each at intake.
-            return Ok(());
-        }
-
-        // Quorum check. Authority is read entirely off the signed state
-        // (`gov.roles`), reconstructed from the log — no external roster is
-        // consulted, so this matches what a converging peer's `verify_log`
-        // will re-derive.
-        if network_state::verify_quorum(&gov, &candidate).is_err() {
-            return Ok(());
-        }
-
-        let transition = candidate;
-        // Route by tier: a member admit/removal rides the union-merged member
-        // log (so two managers' concurrent offline admissions don't fork);
-        // everything else (kind change, owner/manager grant or removal, split)
-        // extends the strict governance log. A removal is member-tier iff its
-        // target is currently a plain member.
-        let member_tier = match &transition.variant {
-            TransitionVariant::RoleGrant {
-                role: Role::Member, ..
-            } => true,
-            TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
-                gov.role_of(target) == Role::Member
-            }
-            _ => false,
-        };
-        if member_tier {
-            gov.member_log.push(transition.clone());
-            gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
-        } else {
-            // Apply to the governance log (also advances `gov.roles`).
-            let after = network_state::apply_transition(gov.clone(), &transition);
-            *gov = after;
-            // Evicting a device promoted past plain member (an owner or manager)
-            // still leaves its *original* member-tier admit in the member log.
-            // On its own the governance-log evict removes the role but not that
-            // admit, so any peer that re-derives membership from the signed logs
-            // — the gossip-adoption path a co-owner runs after being offline for
-            // the kick — folds the stale admit back in and resurrects the evicted
-            // device as a plain member: it lingers in the roster, still
-            // authorised, and nobody but the evicting owner sees it gone. Record
-            // the evict in the union-merged member log too, so it tombstones that
-            // admit; the removal then converges network-wide and survives
-            // concurrent authors, exactly like a plain-member evict.
-            if matches!(&transition.variant, TransitionVariant::Evict { .. }) {
-                gov.member_log.push(transition.clone());
-                gov.roles = project_roles(&state.network_id, &gov.transitions, &gov.member_log);
-            }
-        }
-        gov.pending.retain(|p| p.id != proposal_id);
-        network_state::save(&gov)?;
-        (transition, true)
-    };
-
-    if applied {
-        // Mirror role grants into the on-disk roster's `role`
-        // projection so peers' rows render with the new authority
-        // without re-reading the state log.
-        if let TransitionVariant::RoleGrant { target, role } = &transition.variant {
-            let mut roster = state.roster.write();
-            if !crate::roster::is_authorized(&roster, target) {
-                // Granting a role to a non-member is allowed — we
-                // add them to the roster too so the local peer
-                // list reflects reality.
-                crate::roster::add_peer_in(&mut roster, target, "");
-            }
-            crate::roster::set_role_in(&mut roster, target, *role);
-            crate::roster::save(&roster)?;
-        }
-        if let TransitionVariant::RoleRevoke { target } = &transition.variant {
-            // Withdrawal back to a plain member: unlike an evict the device stays
-            // in the roster, but its cached authority tag has to drop to `member`
-            // so this node's peer rows — and everything that reads the roster role,
-            // including the fleet UI's grant/withdraw controls — reflect the
-            // demotion at once. The gossip-adoption path already reprojects the
-            // whole role map onto the roster; the local ratify path open-codes
-            // per-variant mirrors and previously skipped revoke entirely, so on the
-            // very device that authored the withdrawal the role never "took".
-            let mut roster = state.roster.write();
-            if crate::roster::set_role_in(&mut roster, target, Role::Member) {
-                crate::roster::save(&roster)?;
-            }
-        }
-        if let TransitionVariant::KindChange {
-            to: NetworkKind::Closed,
-        } = &transition.variant
-        {
-            // Founder self-election promoted the local identity to
-            // Owner; mirror onto the local roster entry.
-            let self_pk = state.identity.public_id().to_string();
-            let mut roster = state.roster.write();
-            if !crate::roster::is_authorized(&roster, &self_pk) {
-                let label = state.identity.label();
-                crate::roster::add_peer_in(&mut roster, &self_pk, &label);
-            }
-            crate::roster::set_role_in(&mut roster, &self_pk, Role::Owner);
-            crate::roster::save(&roster)?;
-        }
-        if let TransitionVariant::Evict { target } = &transition.variant {
-            // The evict's whole purpose: drop the target from the roster
-            // projection so it loses authorisation here. Because every
-            // peer that ratifies this transition runs the same mirror,
-            // the removal propagates across the closed network (unlike a
-            // bare roster remove, which is local + additive-gossip only).
-            let removed = {
-                let mut roster = state.roster.write();
-                let was = crate::roster::is_authorized(&roster, target);
-                if was {
-                    crate::roster::remove_peer_in(&mut roster, target);
-                    crate::roster::save(&roster)?;
-                }
-                was
-            };
-            if removed {
-                // Tear down any live session to the evicted device so it
-                // can't keep riding an already-open data channel.
-                let _ = state.cmd_tx.send(NetworkCmd::DropPeer {
-                    device_id: target.clone(),
-                    reason: DropReason::Denied,
-                });
-            }
-        }
-        if let TransitionVariant::TopologyChange { to } = &transition.variant {
-            // The governed shape goes live the moment it ratifies —
-            // the same effect as `NetworkCmd::SetTopology`, run inline
-            // since ratification already happens on the driver.
-            *state.topology.write() = to.clone();
-            *state.topology_impl.write() = crate::topology::from_mode(to);
-            super::ladder::reevaluate_topology(state).await;
-        }
-
-        diag(
-            state,
-            crate::events::DiagLevel::Info,
-            format!("ratified transition: {:?}", transition.variant),
-        );
-        // A ratified Evict may target THIS device (the online-eviction
-        // case: we hold the network's log and just applied our own
-        // removal), and a ratified member grant may be our re-admit —
-        // settle the cached verdict either way.
-        refresh_self_evicted(state);
-        // Membership/roles may have changed — summarise so peers reconcile (a
-        // member admit shows up as a roster-root + member-log-count bump).
-        broadcast_roster_summary(state).await;
-        broadcast_state(state).await;
-    }
-
-    Ok(())
-}
-
-// ---- state broadcast ------------------------------------------------
-
-/// Emit a `NetworkState` snapshot to every active peer. Called
-/// after every mutation to keep peers in sync without waiting on
-/// the next ACTIVE transition.
-pub async fn broadcast_state(state: &Arc<EngineState>) {
-    let (kind, transitions_count, member_log_count) = {
-        let gov = state.governance_state.read();
-        (
-            gov.kind,
-            gov.transitions.len() as u32,
-            gov.member_log.len() as u32,
-        )
-    };
-    // Membership root (not the full merkle root) so peers reconcile on
-    // *who is in the network*, not on per-node label / timestamp churn —
-    // see `roster::membership_root`.
-    let roster_root = crate::roster::membership_root(&state.roster.read());
-    let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-        kind,
-        transitions_count,
-        member_log_count,
-        roster_root,
-    });
-    broadcast(state, msg).await;
-}
-
+/// Controls for semantic proof forwarding.
 #[cfg(test)]
-mod tests {
+mod governance_projection_controls {
     use super::*;
 
+    fn policy_device(key: &ed25519_dalek::SigningKey) -> DeviceId {
+        let canonical = data_encoding::BASE32_NOPAD
+            .encode(key.verifying_key().as_bytes())
+            .to_ascii_lowercase();
+        DeviceId::from_canonical_str_uninterned(&canonical).expect("frame-owned canonical identity")
+    }
+
+    fn assert_policy_parity(
+        bootstrap: &crate::semantic::VerifiedBootstrap,
+        graph: &crate::semantic::FactGraph,
+        local: &DeviceId,
+        remote: &DeviceId,
+        expected: bool,
+    ) {
+        // Exercise borrowed frame-owned identities before the compatibility
+        // wrapper performs its intentionally unchanged ordinary interning.
+        assert_eq!(
+            canonical_policy_admits_devices(bootstrap, graph, local, remote),
+            expected
+        );
+        assert_eq!(
+            canonical_policy_admits_from(bootstrap, graph, local, remote),
+            expected
+        );
+    }
+
+    fn signed_policy_fact(
+        graph: &crate::semantic::FactGraph,
+        key: &ed25519_dalek::SigningKey,
+        body: FactBody,
+    ) -> SignedFact {
+        let author = policy_device(key);
+        let witness = graph.authoring_witness(&body, &author);
+        let content =
+            FactContent::from_authoring_witness(graph, body, &witness, std::iter::empty());
+        SignedFact::sign(content, key).expect("real policy fact signs")
+    }
+
+    fn admit_policy_fact(
+        graph: &mut crate::semantic::FactGraph,
+        key: &ed25519_dalek::SigningKey,
+        body: FactBody,
+    ) -> FactId {
+        let fact = signed_policy_fact(graph, key, body);
+        let id = fact.id;
+        assert_eq!(graph.admit(fact), Ok(crate::semantic::Admission::Inserted));
+        id
+    }
+
     #[test]
-    fn roster_projection_repairs_only_verified_requirements_and_tombstones() {
-        let mut roster = crate::roster::empty_for("projection-repair");
-        crate::roster::add_peer_in(&mut roster, "owner", "Owner label");
-        crate::roster::add_peer_in(&mut roster, "manual", "Manual approval");
-        crate::roster::add_peer_in(&mut roster, "removed", "Removed member");
-        let owner_approved_at = roster.authorized_devices[0].approved_at;
+    fn canonical_policy_typed_open_parity_and_string_validation() {
+        let bootstrap = crate::semantic::VerifiedBootstrap::open("typed-policy-open").unwrap();
+        let graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        let local = policy_device(&ed25519_dalek::SigningKey::from_bytes(&[0xb1; 32]));
+        let remote = policy_device(&ed25519_dalek::SigningKey::from_bytes(&[0xb2; 32]));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, true);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, true);
+        assert_policy_parity(&bootstrap, &graph, &local, &local, false);
+        let foreign = crate::semantic::VerifiedBootstrap::open("typed-policy-foreign").unwrap();
+        assert_ne!(bootstrap.context_id(), foreign.context_id());
+        assert_policy_parity(&foreign, &graph, &local, &remote, false);
+        for invalid in [
+            String::new(),
+            local.to_ascii_uppercase(),
+            format!("{local}-label"),
+        ] {
+            assert!(!canonical_policy_admits_from(
+                &bootstrap, &graph, &invalid, &remote
+            ));
+            assert!(!canonical_policy_admits_from(
+                &bootstrap, &graph, &remote, &invalid
+            ));
+        }
+        // Open has no durable fact domain; do not manufacture an Open graph
+        // stand-down projection through a test-only authority bypass.
+    }
 
-        let roles = std::collections::BTreeMap::from([
-            ("owner".to_string(), Role::Owner),
-            ("signed-member".to_string(), Role::Member),
-        ]);
-        let removed = std::collections::BTreeSet::from(["removed".to_string()]);
+    #[test]
+    fn canonical_policy_typed_closed_parity_role_and_stand_down() {
+        let root_key = ed25519_dalek::SigningKey::from_bytes(&[0xb3; 32]);
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&[0xb4; 32]);
+        let member_key = ed25519_dalek::SigningKey::from_bytes(&[0xb5; 32]);
+        let local = policy_device(&root_key);
+        let remote = policy_device(&other_key);
+        let member = policy_device(&member_key);
+        let bootstrap = crate::semantic::VerifiedBootstrap::create_closed(
+            "typed-policy-closed",
+            vec![root_key.clone()],
+            [0xb6; 32],
+        )
+        .unwrap();
+        let mut graph = crate::semantic::FactGraph::from_bootstrap(&bootstrap);
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::RoleGrant {
+                target: remote.clone(),
+                role: crate::semantic::Role::Member,
+            },
+        );
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, true);
+        assert_policy_parity(&bootstrap, &graph, &local, &local, false);
+        assert_policy_parity(&bootstrap, &graph, &local, &member, false);
+        assert_policy_parity(&bootstrap, &graph, &member, &local, false);
+        let foreign = crate::semantic::VerifiedBootstrap::create_closed(
+            "typed-policy-closed",
+            vec![root_key.clone()],
+            [0xb7; 32],
+        )
+        .unwrap();
+        assert_ne!(bootstrap.context_id(), foreign.context_id());
+        assert_policy_parity(&foreign, &graph, &local, &remote, false);
+        admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::RoleGrant {
+                target: member.clone(),
+                role: crate::semantic::Role::Member,
+            },
+        );
+        assert_policy_parity(&bootstrap, &graph, &local, &member, true);
+        assert_policy_parity(&bootstrap, &graph, &member, &local, true);
+        assert!(!graph.evaluator().is_stood_down(&remote));
 
-        assert!(matches_tombstone(&removed, "removed-A1234"));
-        assert!(!matches_tombstone(&removed, "another-A1234"));
+        // Match the real causal evaluator proof chain: same-target eviction,
+        // authorized member attestation, root-authored proof, then the
+        // target's own acknowledgement of that proof. Empty or invented
+        // evidence cannot reach signing/admission.
+        let proposal = admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::Evict {
+                target: remote.clone(),
+            },
+        );
+        let attestation = admit_policy_fact(
+            &mut graph,
+            &member_key,
+            FactBody::Attestation {
+                target: remote.clone(),
+                proposal,
+                decision: crate::semantic::AttestationDecision::Evict,
+                signer: member.clone(),
+                contributions: Vec::new(),
+            },
+        );
+        let proof = admit_policy_fact(
+            &mut graph,
+            &root_key,
+            FactBody::EvictionProof {
+                target: remote.clone(),
+                evidence: vec![attestation],
+            },
+        );
+        // The proof already stands the target down; SelfStandDown does not
+        // newly revoke an otherwise admitted endpoint.
+        assert!(graph.evaluator().is_stood_down(&remote));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, false);
+        assert!(matches!(
+            &graph.get(&proof).expect("eviction proof was admitted").content.body,
+            FactBody::EvictionProof { target, evidence }
+                if target == &remote && evidence.as_slice() == [attestation]
+        ));
+        let stand_down = signed_policy_fact(
+            &graph,
+            &other_key,
+            FactBody::SelfStandDown {
+                device_id: remote.clone(),
+                evidence: vec![proof],
+            },
+        );
+        let stand_down_id = stand_down.id;
+        assert!(graph.get(&stand_down_id).is_none());
+        // Compare the complete existing persistence representation, including
+        // signed bodies, quarantine, indexes, counters, revisions, generation
+        // and projection. This in-memory fixture performs no SQLite writes.
+        let before = serde_json::to_vec(&graph.live_checkpoint()).expect("checkpoint encodes");
+        assert_eq!(
+            graph.admit(stand_down),
+            Err(crate::semantic::SemanticError::NoOp(
+                "stand-down is already effective"
+            ))
+        );
+        assert!(graph.get(&stand_down_id).is_none());
+        assert_eq!(
+            serde_json::to_vec(&graph.live_checkpoint()).expect("checkpoint encodes"),
+            before
+        );
+        assert!(!graph.evaluator().is_stood_down(&local));
+        assert!(graph.evaluator().is_stood_down(&remote));
+        assert_policy_parity(&bootstrap, &graph, &local, &remote, false);
+        assert_policy_parity(&bootstrap, &graph, &remote, &local, false);
+        assert_policy_parity(&bootstrap, &graph, &local, &member, true);
+    }
 
-        let repair = mirror_roles_to_roster(&roles, &mut roster, &removed, "owner-A1234");
+    static CONCURRENT_LANE_FIXTURE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
-        assert_eq!(repair.added, vec!["signed-member"]);
-        assert_eq!(repair.removed, vec!["removed"]);
-        assert_eq!(repair.roles_updated, vec!["owner"]);
-        assert!(crate::roster::is_authorized(&roster, "signed-member-Z9999"));
-        assert!(crate::roster::is_authorized(&roster, "manual"));
-        assert!(!crate::roster::is_authorized(&roster, "removed"));
-        let owner = roster
+    #[tokio::test]
+    async fn concurrent_role_grants_use_one_bounded_durable_lane() {
+        let fixture_id = CONCURRENT_LANE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = crate::engine::build_test_closed_state(
+            &format!(
+                "concurrent-role-grant-lane-{}-{fixture_id}",
+                std::process::id()
+            ),
+            [0x43; 32],
+        );
+        let target_a = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target_b = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+
+        let (grant_a, grant_b) = tokio::join!(
+            propose_role_grant(&state, &target_a, crate::semantic::Role::Member, None),
+            propose_role_grant(&state, &target_b, crate::semantic::Role::Member, None),
+        );
+        assert!(
+            grant_a.is_ok(),
+            "first concurrent grant failed: {grant_a:?}"
+        );
+        assert!(
+            grant_b.is_ok(),
+            "second concurrent grant failed: {grant_b:?}"
+        );
+        assert_eq!(
+            state.durable_admission_max_for_test(),
+            1,
+            "the blocking admission lane must never run two workers at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_proof_bundle_contains_the_exact_causal_closure() {
+        let state = crate::engine::build_test_closed_state("eviction-proof-bundle", [10; 32]);
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let evict_id = propose_evict(&state, &target, None)
+            .await
+            .expect("the verified root can author an eviction");
+
+        let bundle = current_eviction_proof_bundle(&state, &target)
+            .expect("a current eviction has a deliverable proof closure");
+        let bundle_ids: BTreeSet<_> = bundle.iter().map(|fact| fact.id).collect();
+        assert!(bundle_ids.contains(&evict_id));
+        assert!(
+            bundle.iter().all(|fact| {
+                crate::semantic::causal::dependencies(fact)
+                    .into_iter()
+                    .all(|dependency| bundle_ids.contains(&dependency))
+            }),
+            "an offline proof bundle must carry every causal dependency"
+        );
+    }
+
+    #[test]
+    fn projection_persistence_failure_is_returned_before_roster_commit() {
+        let state = crate::engine::build_test_closed_state("projection-save-failure", [0x2a; 32]);
+        state.roster.write().authorized_devices.clear();
+
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted_by_save = Arc::clone(&attempted);
+        let error = apply_canonical_projection_with(&state, move |_, _| {
+            attempted_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Roster(
+                "injected projection persistence failure".into(),
+            ))
+        })
+        .expect_err("projection persistence failure must reach the caller");
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(error, Error::Roster(_)));
+        assert!(state.roster.read().authorized_devices.is_empty());
+
+        let changed = apply_canonical_projection_with(&state, |_, _| Ok(()))
+            .expect("a successful persistence boundary must commit the projection");
+        assert!(changed);
+        assert!(!state.roster.read().authorized_devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn role_projection_skips_persistence_and_metadata_failure_is_returned() -> Result<()> {
+        let state = crate::engine::build_test_closed_state("indexed-roster-delta", [0x2c; 32]);
+        let first_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let second_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        propose_role_grant(&state, &first_target, crate::semantic::Role::Member, None)
+            .await
+            .expect("first target grant admits");
+        propose_role_grant(&state, &second_target, crate::semantic::Role::Member, None)
+            .await
+            .expect("second target grant admits");
+        {
+            let mut roster = state.roster.write();
+            for index in 0..2_048 {
+                crate::roster::add_peer_in(
+                    &mut roster,
+                    &format!("unrelated-{index:04}"),
+                    "unrelated",
+                );
+            }
+        }
+
+        let second_fact = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: canonical_device(&first_target).expect("first target is canonical"),
+                role: crate::semantic::Role::Controller,
+            },
+            Vec::new(),
+        )?;
+        let (_, _, second_delta) = state
+            .admit_fact_durably_with_delta_async(second_fact)
+            .await
+            .expect("second target role change admits");
+        crate::roster::AuthorizedDevices::reset_test_counters();
+        let roster_role = |target: &str| -> Option<crate::semantic::Role> {
+            let pubkey = crate::signing::pubkey_part(target);
+            let roster = state.roster.read();
+            let entries: &[crate::roster::AuthorizedPeer] =
+                std::ops::Deref::deref(&roster.authorized_devices);
+            entries
+                .iter()
+                .find(|peer| peer.device_id == pubkey)
+                .map(|peer| peer.role)
+        };
+        let before_success = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        let role_save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let role_save_calls_by_save = Arc::clone(&role_save_calls);
+        let (changed, _) = apply_canonical_projection_delta_with_projection_and_save(
+            &state,
+            &second_delta,
+            move |_, _| {
+                role_save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Error::Roster(
+                    "role-only projection must not persist".into(),
+                ))
+            },
+        )
+        .expect("indexed existing-subject role projection succeeds without persistence");
+        assert!(changed);
+        assert_eq!(
+            role_save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "role-only projection must not enter the persistence path"
+        );
+        assert_eq!(
+            crate::roster::AuthorizedDevices::test_counters(),
+            (0, 0),
+            "existing-subject role change must not scan or rebuild the roster"
+        );
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before_success,
+            "role-only projection metadata is intentionally not serialized"
+        );
+        assert_eq!(
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Controller),
+            "the role change updates the keyed in-memory row"
+        );
+
+        // A second role-only projection must remain on the same no-persistence
+        // path.  This catches an implementation that skips the first write but
+        // accidentally rewrites the advisory row on a later role transition.
+        let third_fact = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: canonical_device(&first_target).expect("first target is canonical"),
+                role: crate::semantic::Role::Owner,
+            },
+            Vec::new(),
+        )?;
+        let (_, _, third_delta) = state
+            .admit_fact_durably_with_delta_async(third_fact)
+            .await
+            .expect("repeated role-only change admits");
+        let repeated_role_save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repeated_role_save_calls_by_save = Arc::clone(&repeated_role_save_calls);
+        let (changed, _) = apply_canonical_projection_delta_with_projection_and_save(
+            &state,
+            &third_delta,
+            move |_, _| {
+                repeated_role_save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Error::Roster(
+                    "repeated role-only projection must not persist".into(),
+                ))
+            },
+        )
+        .expect("repeated role-only projection remains persistence-free");
+        assert!(changed);
+        assert_eq!(
+            repeated_role_save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "repeated role-only projection must not enter the persistence path"
+        );
+        assert_eq!(
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Owner),
+            "the repeated role change updates the keyed in-memory row"
+        );
+
+        let stale_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(&mut state.roster.write(), &stale_target, "stale");
+        let before_failure = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        crate::roster::AuthorizedDevices::reset_test_counters();
+        let error = match apply_canonical_projection_with(&state, |_, _| {
+            Err(Error::Roster(
+                "injected projection persistence failure".into(),
+            ))
+        }) {
+            Ok(_) => panic!("injected save failure must reach the caller"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Roster(_)));
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before_failure,
+            "a real persisted-byte refusal preserves exact serialized bytes"
+        );
+        assert_eq!(
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Owner),
+            "a metadata persistence refusal does not disturb the live role projection"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_projection_rebuilds_role_from_graph_without_roster_write() {
+        let state = crate::engine::build_test_closed_state("projection-restart-role", [0x2d; 32]);
+        let root = state.identity.public_id().to_string();
+        assert!(crate::roster::is_authorized(&state.roster.read(), &root));
+        crate::roster::set_role_in(
+            &mut state.roster.write(),
+            &root,
+            crate::semantic::Role::Member,
+        );
+        let before = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        let save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let save_calls_by_save = Arc::clone(&save_calls);
+        let changed = apply_canonical_projection_with(&state, move |_, _| {
+            save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Roster(
+                "startup role reconstruction must not persist".into(),
+            ))
+        })
+        .expect("startup projection rebuilds the role from canonical state");
+        assert!(changed);
+        assert_eq!(
+            save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "canonical role restoration must not rewrite advisory metadata"
+        );
+        let root_pubkey = crate::signing::pubkey_part(&root);
+        let role = state
+            .roster
+            .read()
             .authorized_devices
             .iter()
-            .find(|entry| entry.device_id == "owner")
-            .expect("owner preserved");
-        assert_eq!(owner.label, "Owner label");
-        assert_eq!(owner.approved_at, owner_approved_at);
-        assert_eq!(owner.role, Role::Owner);
-
-        let second = mirror_roles_to_roster(&roles, &mut roster, &removed, "owner-A1234");
-        assert!(
-            !second.roster_changed(),
-            "a converged projection must not write or gossip again"
+            .find(|peer| peer.device_id == root_pubkey)
+            .map(|peer| peer.role);
+        assert_eq!(
+            role,
+            Some(crate::semantic::Role::Owner),
+            "restart projection must derive the authority tier from the graph"
         );
-    }
-
-    #[tokio::test]
-    async fn unchanged_signed_snapshot_repairs_a_divergent_live_roster() {
-        let state = crate::engine::build_test_state("unchanged-roster-repair");
-        let member = crate::identity::Identity::ephemeral();
-
-        propose(
-            &state,
-            TransitionVariant::KindChange {
-                to: NetworkKind::Closed,
-            },
-            None,
-        )
-        .await
-        .expect("found closed network");
-        propose(
-            &state,
-            TransitionVariant::RoleGrant {
-                target: member.public_id().to_string(),
-                role: Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("sign member grant");
-
-        {
-            let mut roster = state.roster.write();
-            crate::roster::remove_peer_in(&mut roster, member.public_id());
-            crate::roster::save(&roster).expect("persist intentionally stale roster");
-        }
-        assert!(!state.is_rostered(member.public_id()));
-
-        let (transitions, member_log) = {
-            let governance = state.governance_state.read();
-            (
-                governance.transitions.clone(),
-                governance.member_log.clone(),
-            )
-        };
-        adopt_transition_log(&state, "already-converged-peer", &transitions, &member_log).await;
-
-        assert!(
-            state.is_rostered(member.public_id()),
-            "an identical signed snapshot must still repair its derived roster"
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before,
+            "rebuilding a derived role leaves persisted roster bytes unchanged"
         );
-    }
-
-    #[tokio::test]
-    async fn local_remove_cannot_override_signed_closed_membership() {
-        let state = crate::engine::build_test_state("signed-roster-remove-guard");
-        let member = crate::identity::Identity::ephemeral();
-
-        propose(
-            &state,
-            TransitionVariant::KindChange {
-                to: NetworkKind::Closed,
-            },
-            None,
-        )
-        .await
-        .expect("found closed network");
-        propose(
-            &state,
-            TransitionVariant::RoleGrant {
-                target: member.public_id().to_string(),
-                role: Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("sign member grant");
-
-        let display_id = format!("{}-ABCDE", member.public_id());
-        let error = state
-            .remove_roster(&display_id)
-            .await
-            .expect_err("local removal must not subtract signed membership");
-        assert!(
-            error.to_string().contains("active signed member"),
-            "the refusal should identify the source-of-truth collision: {error}"
-        );
-        assert!(
-            state.is_rostered(member.public_id()),
-            "the signed member must remain authorized"
-        );
-
-        // A local/manual approval is outside the signed projection and remains
-        // locally removable. The guard protects authority without turning the
-        // roster cache into an append-only store.
-        let manual = crate::identity::Identity::ephemeral();
-        {
-            let mut roster = state.roster.write();
-            crate::roster::add_peer_in(&mut roster, manual.public_id(), "manual");
-        }
-        state
-            .remove_roster(manual.public_id())
-            .await
-            .expect("manual approval remains locally removable");
-        assert!(!state.is_rostered(manual.public_id()));
     }
 
     #[test]
-    fn only_zero_transition_open_silent_drift_is_stable() {
-        assert!(stable_open_silent_drift(
-            NetworkKind::Silent,
-            0,
-            NetworkKind::Open,
-            0
+    fn full_projection_reconciliation_includes_removed_disk_keys() {
+        let state = crate::engine::build_test_closed_state("projection-stale-key", [0x2b; 32]);
+        let stale = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(&mut state.roster.write(), &stale, "stale");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_by_save = Arc::clone(&captured);
+        let changed = apply_canonical_projection_with(&state, move |_, affected| {
+            *captured_by_save.lock().unwrap() = Some(affected.clone());
+            Ok(())
+        })
+        .expect("projection reconciliation succeeds");
+        assert!(
+            changed,
+            "the stale advisory row is removed from the candidate"
+        );
+        assert!(captured
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&crate::signing::pubkey_part(&stale).to_string())));
+        assert!(!crate::roster::is_authorized(&state.roster.read(), &stale));
+    }
+
+    #[test]
+    fn fact_inventory_cursor_streams_receive_safe_pages_and_reaches_quiescence() {
+        let state = crate::engine::build_test_state("fact-inventory-cursor-controls");
+        let context_id = state.mesh_context_id();
+        let author = DeviceId::from_canonical_str(state.identity.public_id())
+            .expect("fixture identity is canonical");
+        let mut graph = crate::semantic::FactGraph::from_bootstrap(state.verified_bootstrap());
+
+        // Use valid signed facts in a real graph, while varying only the
+        // causal parent so the producer sees a large deterministic key set.
+        // The cursor itself retains no graph-wide collection.
+        for index in 0..2_048u64 {
+            let mut parent = [0u8; 32];
+            parent[..8].copy_from_slice(&index.to_be_bytes());
+            let content = FactContent::new(
+                crate::semantic::FactDomain::Governance,
+                context_id,
+                FactBody::RoleGrant {
+                    target: author.clone(),
+                    role: crate::semantic::Role::Member,
+                },
+                author.clone(),
+                vec![FactId::from_bytes(parent)],
+            );
+            let fact = SignedFact::sign(content, state.identity.signing_key())
+                .expect("fixture fact signs");
+            graph.facts.insert(fact.id, fact);
+        }
+        let expected_ids = graph.ids().count();
+        let graph = Arc::new(parking_lot::RwLock::new(graph));
+        let mut cursor = FactInventoryCursor {
+            source: FactInventorySource::Graph(graph),
+            context_id,
+            cursor: None,
+            finished: false,
+            invalid: false,
+            visited_candidates: 0,
+        };
+        let mut page_count = 0;
+        let mut observed = BTreeSet::new();
+        let mut first_page = None;
+
+        while let Some(page) = cursor.next_page() {
+            page_count += 1;
+            if first_page.is_none() {
+                first_page = Some(page.clone());
+            }
+            let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                .expect("inventory page serializes");
+            assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+            assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+            observed.extend(page.fact_ids().iter().copied());
+        }
+
+        assert!(cursor.is_valid());
+        assert!(page_count >= 2, "control must exercise multiple pages");
+        assert_eq!(observed.len(), expected_ids);
+        assert!(
+            cursor.visited_candidates() >= expected_ids
+                && cursor.visited_candidates() <= expected_ids + page_count,
+            "inventory sizing visits each candidate once plus at most one lookahead per page"
+        );
+        let first_page = first_page.expect("the nonempty graph produces a first page");
+        let first_len = serde_json::to_vec(&MeshMessage::FactInventory(first_page.clone()))
+            .expect("the exact-boundary page serializes")
+            .len();
+        let next_id = {
+            let FactInventorySource::Graph(graph) = &cursor.source else {
+                panic!("unit cursor uses the graph source");
+            };
+            let graph = graph.read();
+            let candidate = graph
+                .ids_after(first_page.fact_ids().last().copied())
+                .next()
+                .copied()
+                .expect("the control has a max-plus-one candidate");
+            candidate
+        };
+        let mut max_plus_one_ids = first_page.fact_ids().to_vec();
+        max_plus_one_ids.push(next_id);
+        let max_plus_one_len = serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+            context_id,
+            max_plus_one_ids,
+        )))
+        .expect("the max-plus-one candidate serializes")
+        .len();
+        assert!(
+            first_len <= crate::protocol::RECEIVE_FRAME_BYTES,
+            "the exact maximum page fits the receive-safe boundary"
+        );
+        assert!(
+            max_plus_one_len > crate::protocol::RECEIVE_FRAME_BYTES,
+            "the max-plus-one candidate is refused before page construction"
+        );
+        assert!(
+            cursor.next_page().is_none(),
+            "a drained cursor is quiescent"
+        );
+    }
+
+    #[test]
+    fn delta_inventory_splits_bounded_pages_without_unrelated_ids() {
+        let state = crate::engine::build_test_state("delta-inventory-page-controls");
+        let mut delta = crate::semantic::SemanticDelta::default();
+        let expected = (0..2_048u64)
+            .map(|index| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(index + 1).to_be_bytes());
+                let id = FactId::from_bytes(bytes);
+                delta.push_promoted_for_test(id);
+                id
+            })
+            .collect::<BTreeSet<_>>();
+
+        let pages = delta_inventory_pages(state.mesh_context_id(), &delta)
+            .expect("all fixed-size IDs fit in bounded pages");
+        assert!(
+            pages.len() > 1,
+            "control must exercise multiple delta pages"
+        );
+        let observed = pages
+            .iter()
+            .flat_map(|page| {
+                let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                    .expect("inventory page serializes");
+                assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+                assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+                page.fact_ids().iter().copied()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn delta_inventory_excludes_authenticated_pending_owners() {
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::PendingApproval,
+            true,
+            true
         ));
-        assert!(stable_open_silent_drift(
-            NetworkKind::Open,
-            0,
-            NetworkKind::Silent,
-            0
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::Active,
+            false,
+            true
         ));
-        assert!(!stable_open_silent_drift(
-            NetworkKind::Closed,
-            4,
-            NetworkKind::Closed,
-            3
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::Active,
+            true,
+            false
         ));
-        assert!(!stable_open_silent_drift(
-            NetworkKind::Silent,
-            1,
-            NetworkKind::Open,
-            0
-        ));
+        assert!(inventory_owner_is_eligible(PeerStatus::Active, true, true));
+        assert!(inventory_owner_is_eligible(PeerStatus::Shelved, true, true));
+    }
+
+    /// Exercise the real registry snapshot rather than testing the eligibility
+    /// predicate in isolation.  The promoted fixtures retain their native
+    /// workers and event receivers, so `current_worker()` is the same live
+    /// worker the production inventory path observes.
+    #[cfg(test)]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated harness"]
+    async fn inventory_peer_owners_snapshots_only_live_authenticated_workers() {
+        let state = crate::engine::build_test_state("inventory-owner-registry-control");
+
+        let active = crate::engine::insert_promoted_peer(&state, "inventory-active").await;
+        let shelved = crate::engine::insert_promoted_peer(&state, "inventory-shelved").await;
+        shelved.peer.state.write().status = PeerStatus::Shelved;
+
+        let pending = crate::engine::insert_promoted_peer(&state, "inventory-pending").await;
+        pending.peer.state.write().status = PeerStatus::PendingApproval;
+
+        let unauthenticated =
+            crate::engine::insert_promoted_peer(&state, "inventory-unauthenticated").await;
+        unauthenticated.peer.state.write().authenticated = false;
+
+        crate::engine::insert_session_less_peer(&state, "inventory-no-worker", None);
+        let no_worker = state
+            .peers
+            .get("inventory-no-worker")
+            .expect("the connector-less peer was installed");
+        {
+            let mut data = no_worker.state.write();
+            data.status = PeerStatus::Active;
+            data.authenticated = true;
+        }
+
+        let mut observed = inventory_peer_owners(&state)
+            .into_iter()
+            .map(|owner| owner.device_id().to_string())
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                "inventory-active".to_string(),
+                "inventory-shelved".to_string()
+            ]
+        );
+
+        // Keep every owner and receiver alive through the snapshot.  Dropping
+        // one here would retire the native worker and make the control pass for
+        // the wrong reason.
+        drop((active, shelved, pending, unauthenticated, no_worker));
+    }
+
+    #[tokio::test]
+    async fn delta_inventory_mixes_admitted_rows_and_promoted_ids() {
+        let state =
+            crate::engine::build_test_closed_state("delta-inventory-mixed-control", [0x42; 32]);
+        let target_a = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target_b = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let fact_a = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: DeviceId::from_canonical_str(&target_a).expect("target A is canonical"),
+                role: crate::semantic::Role::Member,
+            },
+            Vec::new(),
+        )
+        .expect("fact A signs");
+        let fact_b = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: DeviceId::from_canonical_str(&target_b).expect("target B is canonical"),
+                role: crate::semantic::Role::Member,
+            },
+            Vec::new(),
+        )
+        .expect("fact B signs");
+        let admitted_a = fact_a.id;
+        let admitted_b = fact_b.id;
+        let delta_a = admit_authored_fact(&state, &fact_a)
+            .await
+            .expect("fact A admits");
+        let delta_b = admit_authored_fact(&state, &fact_b)
+            .await
+            .expect("fact B admits");
+        let promoted_a = FactId::from_bytes([0xa1; 32]);
+        let promoted_b = FactId::from_bytes([0xb2; 32]);
+        assert_ne!(admitted_a, promoted_a);
+        assert_ne!(admitted_b, promoted_b);
+
+        let mut delta = crate::semantic::SemanticDelta::default();
+        // Use rows returned by real durable admissions, then deliberately
+        // reverse them and repeat/reorder the promoted IDs.  The page builder
+        // must canonicalize the union rather than preserve producer insertion
+        // order or emit duplicates.
+        for row in delta_b.rows().iter().chain(delta_a.rows().iter()) {
+            delta.push_row_for_test(row.clone());
+        }
+        delta.push_promoted_for_test(promoted_b);
+        delta.push_promoted_for_test(admitted_a);
+        delta.push_promoted_for_test(promoted_a);
+        delta.push_promoted_for_test(admitted_b);
+        delta.push_promoted_for_test(promoted_b);
+        delta.push_promoted_for_test(admitted_a);
+
+        let pages = delta_inventory_pages(state.mesh_context_id(), &delta)
+            .expect("the mixed bounded delta fits");
+        let observed = pages
+            .iter()
+            .flat_map(|page| {
+                let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                    .expect("inventory page serializes");
+                assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+                assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+                page.fact_ids().iter().copied()
+            })
+            .collect::<Vec<_>>();
+        let expected = BTreeSet::from([admitted_a, admitted_b, promoted_a, promoted_b]);
+        assert_eq!(observed, expected.iter().copied().collect::<Vec<_>>());
+        assert_eq!(observed.iter().copied().collect::<BTreeSet<_>>(), expected);
+        assert!(!observed.contains(&FactId::from_bytes([0xc3; 32])));
     }
 }

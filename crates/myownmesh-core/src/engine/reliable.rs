@@ -1,512 +1,409 @@
-//! Acknowledged channel delivery — the engine's queue-until-delivered
-//! contract for application frames.
+//! Acknowledged channel delivery — the engine's drive loop over state a
+//! promoted session owns.
 //!
-//! The plain send path ([`super::send_to_peer`]) is best-effort by
-//! design: "send now or error". Every embedder that needed more built
-//! its own retransmit loop on top (a 2 s connect-request beat, presence
-//! re-beacons, re-assert-on-reconnect phases). This module is that
-//! contract, built once where the connection state actually lives:
+//! The plain send path ([`super::send_to_peer`]) is best-effort: "send now or
+//! error". This is the acknowledged contract: a frame is retained until the
+//! peer's engine says it arrived, and the caller's wait resolves on that rather
+//! than on a local write succeeding.
 //!
-//! * **Enqueue any time.** A send to a peer whose link isn't up yet —
-//!   or that just dropped — parks in the per-peer outbox instead of
-//!   erroring.
-//! * **Flush on link-up.** The moment a peer goes ACTIVE the outbox
-//!   drains in order. A session rebuild marks in-flight entries unsent,
-//!   so they retransmit on the next ACTIVE — the entry, not the caller,
-//!   survives the reconnect.
-//! * **Exactly-once delivery.** Frames ride a `(stream, seq)` pair;
-//!   the receiver drops seqs at or below its high-water mark and acks
-//!   cumulatively, so a retransmit can't double-deliver. `stream` is
-//!   minted per outbox lifetime, so a daemon restart (fresh seq=1) is
-//!   distinguishable from a replay.
-//! * **Bounded.** Outboxes cap at [`OUTBOX_CAP`] entries and every
-//!   entry carries a TTL ([`DEFAULT_TTL_MS`] unless the caller picks);
-//!   expiry resolves the caller's wait with an error instead of
-//!   pretending.
+//! **This module is a driver and holds no state.** Everything retained lives in
+//! [`PeerSessionState`](peer_session::PeerSessionState), a field of the peer's
+//! promoted session. Each operation resolves an owner, enters the registry
+//! fence, and acts on the record the fence lends it.
 //!
-//! Peers that don't advertise [`Feature::RELIABLE_CHANNELS`] get the
-//! best available degradation: entries still queue until the link is
-//! up, then ride a plain `channel` frame — the caller's wait resolves
-//! on successful *send* rather than acknowledged *delivery*.
+//! The contract that follows:
 //!
-//! Everything here runs on the engine driver task (via the command
-//! queue and the state-watch tick), so outbox mutation is serial; the
-//! mutexes only guard against snapshot readers.
+//! * **Submission acquires the current session first.** A caller whose peer has
+//!   no live session, or whose frame the provider will not fund retaining, is
+//!   refused with that reason. A frame is retained under a session or not at
+//!   all.
+//! * **A frame ends on acknowledgement, with its caller, or with its session.**
+//!   A caller that stops waiting takes its frame with it wherever dropping the
+//!   frame leaves the wire contiguous — the session record's own
+//!   `release_abandoned` decides where that is, because it is the only thing
+//!   that knows what the peer has already been shown. Session end
+//!   resolves the caller with the truth and the application decides whether the
+//!   payload still means anything — which it is in a position to know and this
+//!   layer is not.
+//! * **Revocation and replacement need no code here.** Both drop the promoted
+//!   session; the record goes with it and answers every wait on the way out.
+//!
+//! Delivery is exactly-once within a session: frames ride a `(stream, seq)`
+//! pair, the receiver drops seqs at or below its high-water mark and
+//! acknowledges cumulatively, so a retransmit cannot double-deliver. `stream` is
+//! minted per session, which is what lets a late acknowledgement for a replaced
+//! session be recognised and discarded rather than applied to the replacement's
+//! frames.
+//!
+//! **This module is not the record's only writer, and nothing here may assume
+//! it is.** Submission and flushing run on the engine driver task, through the
+//! command queue and the state-watch tick. Inbound frames do not: each peer's
+//! connector events are pumped by their own spawned task, which reaches
+//! [`super::handle_inbound_frame_from`] and from there this session's
+//! acknowledgement path. The two are concurrent.
+//!
+//! What orders them is the registry fence, per entry — and only per entry.
+//! [`flush_owner`] deliberately releases it for the write, so the record can be
+//! entered and mutated by the inbound task while a frame of this one's is on
+//! the wire. That interval is real and is the reason `sent` is not a safe proxy
+//! for "the peer has not seen this": it is set on a later acquisition than the
+//! write it describes. An earlier version of the retention sweep read it that
+//! way and could roll back a sequence the peer already held.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
-use tracing::{debug, trace, warn};
+use tracing::trace;
 
-use crate::error::{Error, Result};
-use crate::protocol::{features, MeshMessage};
+use crate::error::Result;
+use crate::protocol::MeshMessage;
+use crate::runtime::peer_session;
 
-use super::connection::PeerStatus;
+use super::peer_registry::PeerOwnerToken;
 use super::state::NetworkState;
+use super::traffic;
 
-/// Default time an entry may wait for acknowledged delivery before its
-/// caller is told the truth. Long enough to ride out a reconnect (ICE
-/// rebuild lands well inside it), short enough that "the peer is gone"
-/// isn't discovered minutes later.
-pub const DEFAULT_TTL_MS: u64 = 60_000;
-
-/// Per-peer outbox ceiling. A caller that outruns delivery this far is
-/// backpressured with an error instead of growing memory unboundedly.
-pub const OUTBOX_CAP: usize = 256;
-
-/// One queued frame awaiting acknowledged delivery.
-struct Pending {
-    seq: u64,
-    channel: String,
-    payload: serde_json::Value,
-    /// When the entry lapses; expiry resolves `reply` with an error.
-    expires_at: Instant,
-    /// Whether the frame is on the wire for the *current* session.
-    /// Reset to `false` on session rebuild so the retransmit happens.
-    sent: bool,
-    /// The caller's wait, resolved on ack (or send, for a fallback
-    /// peer), TTL expiry, or terminal peer failure.
-    reply: Option<oneshot::Sender<Result<()>>>,
-}
-
-/// The per-peer send side: one stream id for this outbox's lifetime and
-/// the in-order queue of pending entries.
-pub(crate) struct Outbox {
-    stream: u64,
-    next_seq: u64,
-    entries: VecDeque<Pending>,
-}
-
-impl Outbox {
-    fn new() -> Self {
-        use rand::Rng;
-        Self {
-            // Random per outbox lifetime — a daemon restart mints a new
-            // stream, which is what lets the receiver treat "seq went
-            // backwards" as a reset instead of a replay.
-            stream: rand::thread_rng().gen::<u64>() | 1,
-            next_seq: 0,
-            entries: VecDeque::new(),
-        }
-    }
-
-    /// Entries currently queued (sent-but-unacked included).
-    pub(crate) fn depth(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-/// Receiver-side high-water mark for one peer's inbound stream.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct InboundMark {
-    stream: u64,
-    last_seq: u64,
-}
-
-/// Queue a frame for acknowledged delivery to `peer`, then try to flush
-/// immediately (a no-op if the link isn't up — the ACTIVE transition
-/// and the state-watch tick pick it up later).
-pub(crate) async fn enqueue(
+/// Retain one frame for acknowledged delivery to `peer`, or tell the caller why
+/// not, then try once to put it on the wire.
+///
+/// The caller's wait is answered by exactly one place: the session record it is
+/// handed to. Every refusal here happens *before* that hand-off and answers it
+/// directly, so there is no arm on which a caller is answered twice or not at
+/// all.
+///
+/// Nothing here asks whether the peer speaks the acknowledged contract. It is
+/// current-profile behaviour of every build that can promote a session, so there
+/// is no negotiated fact to read and no advertisement to be stale, wrong, or
+/// withheld. Every fact that authorizes the retention is read inside the fence,
+/// at the moment of use.
+pub(crate) async fn submit(
     state: &Arc<NetworkState>,
     peer: &str,
     channel: &str,
     payload: serde_json::Value,
-    ttl_ms: Option<u64>,
     reply: oneshot::Sender<Result<()>>,
 ) {
-    {
-        let mut out = state.reliable_out.lock();
-        let outbox = out.entry(peer.to_string()).or_insert_with(Outbox::new);
-        if outbox.entries.len() >= OUTBOX_CAP {
-            drop(out);
-            let _ = reply.send(Err(Error::Transport(format!(
-                "reliable outbox for {peer} is full ({OUTBOX_CAP} frames pending)"
-            ))));
+    let Some(owner) = state.peers.owner(peer) else {
+        let _ = reply.send(Err(peer_session::no_session_error(peer)));
+        return;
+    };
+    // Both the payload and the caller's wait are lent to the closure through
+    // `Option`s rather than moved into it. A fence that refuses never runs the
+    // closure, and a `oneshot::Sender` that is merely dropped resolves its
+    // caller with a bare receive error that names nothing — so the values have
+    // to come back out on that arm to be answered here. The closure runs at most
+    // once, so each `take` is unconditional when it does.
+    let mut handoff = Some((payload, reply));
+    state.peers.with_live_session_state(
+        &owner,
+        state.session_broker.as_ref(),
+        &state.mesh_context_id().to_string(),
+        |session, record| {
+            let (payload, reply) = handoff
+                .take()
+                .expect("the fence runs this closure at most once");
+            record.submit(session, channel, payload, reply);
+        },
+    );
+    if let Some((_payload, reply)) = handoff {
+        let _ = reply.send(Err(peer_session::no_session_error(peer)));
+        return;
+    }
+    flush_owner(state, &owner).await;
+}
+
+/// Drain the frames the peer's live session still owes the wire, in order.
+///
+/// One frame per fence entry, deliberately. The write leaves the fence, so a
+/// batch collected under one acquisition would be a list of frames authorized by
+/// a session that may not be current by the time the second one goes out.
+/// Re-entering per frame re-proves the session per frame, and the cost of that
+/// is a mutex acquisition against a write that already crosses the network.
+///
+/// Stops at the first failure rather than skipping ahead: the receiver's
+/// contract is in-order, and a gap would stall its high-water mark behind a
+/// frame that never arrives. Whatever is left stays retained until the peer
+/// acknowledges it or the session ends.
+pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    loop {
+        let next = state
+            .peers
+            .with_live_session_state(
+                owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+                |session, record| record.next_unsent(session),
+            )
+            .flatten();
+        // `None` is either "nothing owed" or "the provider would not fund the
+        // copy this write needs". Both stop the flush and neither loses
+        // anything: the frame stays retained and unsent, and the next tick asks
+        // again.
+        let Some(unsent) = next else {
+            return;
+        };
+        let seq = unsent.seq;
+        if let Err(e) = super::send_application_bytes(
+            state,
+            owner,
+            unsent.bytes.clone(),
+            traffic::FrameClass::App,
+        )
+        .await
+        {
+            trace!(
+                peer = %super::short_peer(owner.device_id()),
+                "reliable flush paused: {e}"
+            );
             return;
         }
-        outbox.next_seq += 1;
-        let seq = outbox.next_seq;
-        let ttl = Duration::from_millis(ttl_ms.unwrap_or(DEFAULT_TTL_MS));
-        outbox.entries.push_back(Pending {
-            seq,
-            channel: channel.to_string(),
-            payload,
-            expires_at: Instant::now() + ttl,
-            sent: false,
-            reply: Some(reply),
+        // Recorded through the fence again rather than on a handle held across
+        // the send: if the session was replaced during the write, there is no
+        // record to mark, and the frame that was written belonged to a session
+        // that has since resolved its callers. Marking through a stale handle
+        // would set `sent` on a replacement's frame that was never sent.
+        state.peers.with_live_session_state(
+            owner,
+            state.session_broker.as_ref(),
+            &state.mesh_context_id().to_string(),
+            |_session, record| record.mark_sent(seq),
+        );
+        // The copy and the lease that funded it die together, here, once the
+        // write that borrowed them has returned.
+        drop(unsent);
+    }
+}
+
+/// Settle the frames one inbound acknowledgement covers, **inside the registry
+/// admission fence** and through the logical-session lender.
+///
+/// Called from the fence rather than after it because an acknowledgement
+/// admitted for installation A and applied after A was replaced would settle
+/// frames installation B retained. It cannot do that now — B's session has a
+/// different stream and the record is not shared — but the ordering is what
+/// makes the acknowledgement and the release one act, so no reader observes
+/// frames released for an acknowledgement that was refused.
+///
+/// The caller waits are resolved **here**, inside the fence, rather than carried
+/// out to be answered later. Each is answered while its frame and that frame's
+/// entry lease are still together, so the oneshot the retained claim paid for
+/// never outlives the lease that paid for it. That is safe under the locks the
+/// fence holds for the same reason the abandon-drop is: sending on a oneshot
+/// stores the value and wakes the waiting task, it does not run the caller's
+/// continuation and it re-enters neither the registry nor the session record.
+///
+/// A `ChannelSeq` is deliberately not handled here. Its receive-side effect is
+/// two things that must be indivisible — advancing the high-water mark and
+/// handing the payload to the subscribers — and the payload leaves this fence
+/// with the frame, so the dispatch side runs both, together, under its own
+/// fence.
+pub(super) fn admit_inbound_reliable(
+    admitted: &super::peer_registry::LogicalSessionOperation,
+    msg: &MeshMessage,
+) {
+    if let MeshMessage::ChannelAck { stream, up_to } = msg {
+        admitted.with_logical_state(|operation| {
+            operation.state().acknowledge(*stream, *up_to);
         });
     }
-    flush_peer(state, peer).await;
 }
 
-/// Whether `peer`'s link can carry frames right now, and whether it
-/// speaks the acked contract. `None` = not sendable yet.
-fn link_ready(state: &Arc<NetworkState>, peer: &str) -> Option<bool> {
-    let entry = state.peers.get(peer)?;
-    let data = entry.state.read();
-    let up =
-        matches!(data.status, PeerStatus::Active | PeerStatus::Shelved) && data.data_channel_open;
-    if !up {
-        return None;
-    }
-    Some(features::peer_supports(
-        &data.features,
-        features::Feature::RELIABLE_CHANNELS,
-    ))
+/// The four fields one decoded `ChannelSeq` carries, kept together.
+///
+/// One value rather than four parameters because they are one frame. The mark
+/// and the delivery below are only truthful about parts that arrived together:
+/// a caller that could pass the sequence of one frame with the payload of
+/// another would be describing a frame no peer sent, and this side would record
+/// having received it.
+pub(super) struct InboundChannelSeq {
+    pub(super) stream: u64,
+    pub(super) seq: u64,
+    pub(super) channel: String,
+    pub(super) payload: serde_json::Value,
 }
 
-/// Drain `peer`'s unsent entries onto the wire, in order. Safe to call
-/// any time; does nothing when the link is down. Called on the ACTIVE
-/// transition, after each enqueue, on inbound acks, and from the
-/// state-watch tick.
-pub(crate) async fn flush_peer(state: &Arc<NetworkState>, peer: &str) {
-    let Some(acked_peer) = link_ready(state, peer) else {
-        return;
-    };
-
-    // Collect what needs sending without holding the lock across awaits.
-    let (stream, to_send): (u64, Vec<(u64, String, serde_json::Value)>) = {
-        let mut out = state.reliable_out.lock();
-        let Some(outbox) = out.get_mut(peer) else {
-            return;
-        };
-        let stream = outbox.stream;
-        let batch: Vec<_> = outbox
-            .entries
-            .iter()
-            .filter(|p| !p.sent)
-            .map(|p| (p.seq, p.channel.clone(), p.payload.clone()))
-            .collect();
-        (stream, batch)
-    };
-    if to_send.is_empty() {
-        return;
-    }
-
-    for (seq, channel, payload) in to_send {
-        let msg = if acked_peer {
-            MeshMessage::ChannelSeq {
-                stream,
-                seq,
-                channel: channel.clone(),
-                payload: payload.clone(),
-            }
-        } else {
-            // Fallback peer: plain frame, no ack coming. The entry
-            // resolves on send success below.
-            MeshMessage::Channel {
-                channel: channel.clone(),
-                payload: payload.clone(),
-            }
-        };
-        match super::send_to_peer(state, peer, &msg).await {
-            Ok(()) => {
-                let mut out = state.reliable_out.lock();
-                let Some(outbox) = out.get_mut(peer) else {
-                    return;
-                };
-                if acked_peer {
-                    if let Some(p) = outbox.entries.iter_mut().find(|p| p.seq == seq) {
-                        p.sent = true;
-                    }
-                } else {
-                    // Best-effort degradation: sent == delivered as far
-                    // as we can ever know for this peer.
-                    if let Some(pos) = outbox.entries.iter().position(|p| p.seq == seq) {
-                        if let Some(reply) = outbox.entries.remove(pos).and_then(|p| p.reply) {
-                            let _ = reply.send(Ok(()));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                // Link wobbled mid-flush — leave the entry unsent; the
-                // tick or the next ACTIVE retries. In-order delivery
-                // means we stop rather than skip ahead.
-                trace!(peer = %super::short_peer(peer), "reliable flush paused: {e}");
-                break;
-            }
-        }
-    }
-}
-
-/// Inbound `channel_seq`: deliver exactly once, ack cumulatively.
-pub(crate) async fn on_channel_seq(
+/// Receive one inbound `channel_seq`: move the high-water mark, deliver,
+/// acknowledge.
+///
+/// The first two are one fenced step, and now one *borrow*: the mark lives in
+/// the same record the delivery is authorized by, so they are reached together
+/// or not at all. Combined with
+/// [`PeerSessionState::receive`](peer_session::PeerSessionState::receive)'s
+/// own biconditional, this session's mark records a seq exactly when its payload
+/// was handed to the subscribers.
+///
+/// Both sides of the ordering against replacement are truthful:
+///
+/// * A replacement landing **before** the fence refuses the closure outright.
+///   Nothing is marked, delivered or acknowledged — so the sender retransmits
+///   and the frame is still fresh when it arrives.
+/// * A replacement landing **after** it may make the owner-bound acknowledgement
+///   fail, since the send refuses to go through a replacement under the same
+///   device id. The sender then retransmits, and that retransmit really is a
+///   duplicate: the payload was already delivered under the installation it was
+///   admitted for.
+///
+/// A duplicate is re-acknowledged and not re-delivered, which is what stops a
+/// sender whose earlier acknowledgement was lost. A gap is neither delivered nor
+/// advanced, and answers the current contiguous mark, which tells the sender
+/// exactly how far this side actually is. A frame on an unbound stream is
+/// answered with nothing at all.
+pub(super) async fn on_channel_seq_admitted(
     state: &Arc<NetworkState>,
-    peer: &str,
+    dispatch: &super::peer_registry::AdmittedInboundDispatch,
+    claim: crate::resource::ResourceClaim,
+    retention: crate::resource::ResourceLease,
+    frame: InboundChannelSeq,
+) {
+    let InboundChannelSeq {
+        stream,
+        seq,
+        channel,
+        payload,
+    } = frame;
+    let owner = dispatch.owner();
+    // Delivery is an application effect whose escape is visible outside the
+    // engine: a subscriber reads `from` as a device identity, so a payload
+    // admitted for one installation and delivered after that installation was
+    // replaced is attributed to whoever holds the id now. Both the attribution
+    // and the mark are therefore settled inside the fence.
+    //
+    // Gateway acceptance is a resource-backed fan-out: it never blocks on a
+    // subscriber and never re-enters the registry, so it is safe under the
+    // mutation lock.
+    let Some(outcome) = dispatch.with_captured_logical_state(&state.peers, |operation| {
+        // Keep the logical funding witness independent of the mutable state
+        // borrow held by `try_receive`; the witness is the retention authority
+        // for this admitted effect and does not select a carrying channel.
+        let validity = operation.validity().clone();
+        let outcome = operation
+            .state()
+            .try_receive(stream, seq, payload, |payload| {
+                state
+                    .application_gateway
+                    .accept_channel(
+                        &validity,
+                        claim,
+                        retention,
+                        &channel,
+                        owner.device_id(),
+                        payload,
+                    )
+                    .map(|_accepted| ())
+            });
+        outcome
+    }) else {
+        // Superseded installation, or one holding no live session: the frame
+        // moved nothing and reached nobody, so there is nothing to acknowledge
+        // either. Acknowledging here would tell the sender a payload had been
+        // received that no subscriber ever saw.
+        return;
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(refusal) => {
+            // The same two refusals that end a session on the unreliable path,
+            // for the same reason: they are facts about this session that will
+            // hold for the next frame too. `NoReceiver` is not one of them —
+            // nobody having subscribed yet is an ordinary state of a healthy
+            // session. Nothing is acknowledged on any of these arms, so a
+            // refused frame is never reported to the sender as received.
+            let terminal = match refusal {
+                crate::application_gateway::GatewayRefusal::Pressure(_) => {
+                    Some("would not fund the reliable frame it delivered")
+                }
+                crate::application_gateway::GatewayRefusal::Malformed => {
+                    Some("delivered a reliable frame that is not representable")
+                }
+                _ => None,
+            };
+            // Reached only on the arms that are about to retire. The dispatch's
+            // logical operation names the session admitted for this frame, so a
+            // replacement promoted in the interval fails the identity check and
+            // remains untouched.
+            if terminal.is_some() {
+                state.reach_exact_retirement_barrier();
+            }
+            match terminal {
+                Some(reason)
+                    if state
+                        .peers
+                        .retire_exact_session(dispatch.logical_reply_operation()) =>
+                {
+                    trace!(
+                        peer = %super::short_peer(owner.device_id()),
+                        channel,
+                        %reason,
+                        "retiring a session whose reliable frame could not be admitted"
+                    );
+                }
+                _ => trace!(
+                    peer = %super::short_peer(owner.device_id()),
+                    channel,
+                    "reliable frame refused by Application Gateway"
+                ),
+            }
+            return;
+        }
+    };
+    let Some(ack_up_to) = outcome.acknowledge() else {
+        // A stream this session is not bound to. Answering would put a mark on
+        // *our* bound stream in reply to a frame that was never part of it,
+        // which is the sender-visible half of letting a peer reset our state.
+        trace!(
+            peer = %super::short_peer(owner.device_id()),
+            "reliable frame on an unbound stream refused"
+        );
+        return;
+    };
+    let msg = MeshMessage::ChannelAck {
+        stream,
+        up_to: ack_up_to,
+    };
+    // Test observation only, taken here because this is the point past every
+    // refusal above: reaching it *is* the decision to acknowledge, whatever the
+    // wire then does with it. See `NetworkState::channel_ack_attempts`.
+    #[cfg(test)]
+    state
+        .channel_ack_attempts
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = super::send_to_peer_owner(state, owner, &msg).await {
+        trace!(
+            peer = %super::short_peer(owner.device_id()),
+            "channel_ack send failed: {e}"
+        );
+    }
+}
+
+/// State-watch tick: re-attempt flushes for peers whose session still holds
+/// unsent frames.
+///
+/// Flush only, and there is nothing here to expire against: a retained frame
+/// ends when the peer acknowledges it or when the session retaining it ends, and
+/// this loop is the arbiter of neither. A deadline enforced here would report a
+/// choice this process made as though it were a fact about the peer.
+pub(crate) async fn tick(state: &Arc<NetworkState>) {
+    for owner in state.peers.owners_with_unsent_reliable_frames() {
+        flush_owner(state, &owner).await;
+    }
+}
+
+/// The exact encoded frame one submission retains, for controls that must send
+/// or size a frame the record would actually accept.
+#[cfg(all(test, feature = "transport-lab"))]
+pub(super) fn encoded_frame_for_test(
     stream: u64,
     seq: u64,
-    channel: String,
-    payload: serde_json::Value,
-) {
-    let deliver = {
-        let mut marks = state.reliable_in.lock();
-        let mark = marks.entry(peer.to_string()).or_default();
-        if mark.stream != stream {
-            // New outbox lifetime on the sender (restart) — adopt it.
-            *mark = InboundMark {
-                stream,
-                last_seq: 0,
-            };
-        }
-        if seq <= mark.last_seq {
-            false // duplicate of something we already delivered
-        } else {
-            mark.last_seq = seq;
-            true
-        }
-    };
-    if deliver {
-        super::on_channel_frame(state, peer, channel, payload).await;
-    }
-    // Ack our high-water mark either way — a duplicate usually means
-    // our previous ack was lost, and re-acking is what stops the
-    // retransmits.
-    let up_to = state
-        .reliable_in
-        .lock()
-        .get(peer)
-        .map(|m| m.last_seq)
-        .unwrap_or(seq);
-    if let Err(e) =
-        super::send_to_peer(state, peer, &MeshMessage::ChannelAck { stream, up_to }).await
-    {
-        trace!(peer = %super::short_peer(peer), "channel_ack send failed: {e}");
-    }
-}
-
-/// Inbound cumulative ack: resolve and drop every entry of `stream`
-/// with `seq <= up_to`.
-pub(crate) fn on_channel_ack(state: &NetworkState, peer: &str, stream: u64, up_to: u64) {
-    let resolved: Vec<oneshot::Sender<Result<()>>> = {
-        let mut out = state.reliable_out.lock();
-        let Some(outbox) = out.get_mut(peer) else {
-            return;
-        };
-        if outbox.stream != stream {
-            // Ack for a previous outbox lifetime — nothing it can settle.
-            return;
-        }
-        let mut done = Vec::new();
-        while let Some(front) = outbox.entries.front() {
-            if front.seq > up_to {
-                break;
-            }
-            if let Some(reply) = outbox.entries.pop_front().and_then(|p| p.reply) {
-                done.push(reply);
-            }
-        }
-        if outbox.entries.is_empty() {
-            out.remove(peer);
-        }
-        done
-    };
-    for reply in resolved {
-        let _ = reply.send(Ok(()));
-    }
-}
-
-/// Session rebuild for `peer`: everything on the wire for the old
-/// session may or may not have landed — mark it unsent so the next
-/// ACTIVE retransmits, and let the receiver's high-water mark absorb
-/// any double.
-pub(crate) fn mark_unsent(state: &NetworkState, peer: &str) {
-    let mut out = state.reliable_out.lock();
-    if let Some(outbox) = out.get_mut(peer) {
-        for p in outbox.entries.iter_mut() {
-            p.sent = false;
-        }
-    }
-}
-
-/// Terminal failure for `peer` (denied, auth failure, deliberate
-/// removal): the queue has no future — resolve every pending wait with
-/// the reason and drop the outbox.
-pub(crate) fn fail_peer(state: &NetworkState, peer: &str, reason: &str) {
-    let entries: Vec<Pending> = {
-        let mut out = state.reliable_out.lock();
-        match out.remove(peer) {
-            Some(outbox) => outbox.entries.into_iter().collect(),
-            None => return,
-        }
-    };
-    let n = entries.len();
-    for p in entries {
-        if let Some(reply) = p.reply {
-            let _ = reply.send(Err(Error::Transport(format!(
-                "reliable send to {peer} abandoned: {reason}"
-            ))));
-        }
-    }
-    if n > 0 {
-        debug!(peer = %super::short_peer(peer), dropped = n, reason, "reliable outbox abandoned");
-    }
-}
-
-/// State-watch tick: expire lapsed entries (their callers get an error,
-/// not silence) and re-attempt flushes for peers holding unsent frames.
-pub(crate) async fn tick(state: &Arc<NetworkState>) {
-    let now = Instant::now();
-    // Expiry pass.
-    let mut expired: Vec<(String, oneshot::Sender<Result<()>>)> = Vec::new();
-    let mut flush_candidates: Vec<String> = Vec::new();
-    {
-        let mut out = state.reliable_out.lock();
-        out.retain(|peer, outbox| {
-            let mut i = 0;
-            while i < outbox.entries.len() {
-                if outbox.entries[i].expires_at <= now {
-                    if let Some(p) = outbox.entries.remove(i) {
-                        if let Some(reply) = p.reply {
-                            expired.push((peer.clone(), reply));
-                        }
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            if outbox.entries.iter().any(|p| !p.sent) {
-                flush_candidates.push(peer.clone());
-            }
-            !outbox.entries.is_empty()
-        });
-    }
-    for (peer, reply) in expired {
-        warn!(peer = %super::short_peer(&peer), "reliable send expired before delivery");
-        let _ = reply.send(Err(Error::Transport(format!(
-            "reliable send to {peer} expired before delivery"
-        ))));
-    }
-    for peer in flush_candidates {
-        flush_peer(state, &peer).await;
-    }
-}
-
-/// Total frames awaiting delivery across all peers — surfaced in the
-/// network's traffic/status snapshot.
-pub(crate) fn pending_total(state: &NetworkState) -> usize {
-    state.reliable_out.lock().values().map(Outbox::depth).sum()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::{build_test_state, insert_session_less_peer};
-
-    fn recv_now(rx: &mut oneshot::Receiver<Result<()>>) -> Option<Result<()>> {
-        rx.try_recv().ok()
-    }
-
-    #[tokio::test]
-    async fn enqueue_parks_when_link_is_down_and_expires_on_tick() {
-        let state = build_test_state("rel-park");
-        let (tx, mut rx) = oneshot::channel();
-        enqueue(
-            &state,
-            "peer-a",
-            "app.control",
-            serde_json::json!({"n": 1}),
-            Some(0), // expire immediately on the next tick
-            tx,
-        )
-        .await;
-        assert_eq!(pending_total(&state), 1, "entry parked, nothing to send to");
-        assert!(recv_now(&mut rx).is_none(), "caller still waiting");
-
-        tick(&state).await;
-        assert_eq!(pending_total(&state), 0, "expired entry removed");
-        match recv_now(&mut rx) {
-            Some(Err(_)) => {}
-            other => panic!("expected expiry error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn outbox_cap_backpressures() {
-        let state = build_test_state("rel-cap");
-        for _ in 0..OUTBOX_CAP {
-            let (tx, _rx) = oneshot::channel();
-            enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx).await;
-        }
-        let (tx, mut rx) = oneshot::channel();
-        enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx).await;
-        match recv_now(&mut rx) {
-            Some(Err(e)) => assert!(e.to_string().contains("full"), "got: {e}"),
-            other => panic!("expected outbox-full error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn inbound_dedup_delivers_once_and_reacks() {
-        let state = build_test_state("rel-dedup");
-        insert_session_less_peer(&state, "peer-b", None);
-        // First delivery: routes to the channel layer and records seq 1.
-        on_channel_seq(&state, "peer-b", 7, 1, "c".into(), serde_json::json!(1)).await;
-        {
-            let marks = state.reliable_in.lock();
-            let m = marks.get("peer-b").copied().unwrap();
-            assert_eq!(m.last_seq, 1);
-        }
-        // Duplicate: high-water mark unchanged (no double delivery).
-        on_channel_seq(&state, "peer-b", 7, 1, "c".into(), serde_json::json!(1)).await;
-        assert_eq!(state.reliable_in.lock().get("peer-b").unwrap().last_seq, 1);
-        // New stream (sender restarted): mark resets and seq 1 delivers.
-        on_channel_seq(&state, "peer-b", 9, 1, "c".into(), serde_json::json!(2)).await;
-        let m = *state.reliable_in.lock().get("peer-b").unwrap();
-        assert_eq!((m.stream, m.last_seq), (9, 1));
-    }
-
-    #[tokio::test]
-    async fn ack_resolves_callers_in_order() {
-        let state = build_test_state("rel-ack");
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-        enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx1).await;
-        enqueue(&state, "peer-a", "c", serde_json::json!(2), None, tx2).await;
-        let stream = state.reliable_out.lock().get("peer-a").unwrap().stream;
-
-        on_channel_ack(&state, "peer-a", stream, 1);
-        assert!(matches!(recv_now(&mut rx1), Some(Ok(()))), "seq 1 acked");
-        assert!(recv_now(&mut rx2).is_none(), "seq 2 still pending");
-
-        on_channel_ack(&state, "peer-a", stream, 2);
-        assert!(matches!(recv_now(&mut rx2), Some(Ok(()))), "seq 2 acked");
-        assert_eq!(pending_total(&state), 0, "outbox drained and removed");
-    }
-
-    #[tokio::test]
-    async fn stale_stream_ack_settles_nothing() {
-        let state = build_test_state("rel-stale-ack");
-        let (tx, mut rx) = oneshot::channel();
-        enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx).await;
-        let stream = state.reliable_out.lock().get("peer-a").unwrap().stream;
-        on_channel_ack(&state, "peer-a", stream.wrapping_add(1), 1);
-        assert!(recv_now(&mut rx).is_none(), "wrong-stream ack ignored");
-        assert_eq!(pending_total(&state), 1);
-    }
-
-    #[tokio::test]
-    async fn rebuild_marks_entries_for_retransmit_and_terminal_failure_resolves() {
-        let state = build_test_state("rel-rebuild");
-        let (tx, mut rx) = oneshot::channel();
-        enqueue(&state, "peer-a", "c", serde_json::json!(1), None, tx).await;
-        {
-            let mut out = state.reliable_out.lock();
-            out.get_mut("peer-a").unwrap().entries[0].sent = true;
-        }
-        mark_unsent(&state, "peer-a");
-        assert!(
-            !state.reliable_out.lock().get("peer-a").unwrap().entries[0].sent,
-            "rebuild resets in-flight entries for retransmit"
-        );
-
-        fail_peer(&state, "peer-a", "denied");
-        match recv_now(&mut rx) {
-            Some(Err(e)) => assert!(e.to_string().contains("denied")),
-            other => panic!("expected terminal failure, got {other:?}"),
-        }
-        assert_eq!(pending_total(&state), 0);
-    }
+    channel: &str,
+    payload: &str,
+) -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&MeshMessage::ChannelSeq {
+            stream,
+            seq,
+            channel: channel.to_string(),
+            payload: serde_json::json!(payload),
+        })
+        .expect("a control frame of owned strings serializes"),
+    )
 }

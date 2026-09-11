@@ -3,6 +3,8 @@ mod responder_stream;
 mod responder_test;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -62,7 +64,30 @@ impl ResponderInternal {
             }
         };
 
-        stream.request_repairs(&nack).await;
+        for n in &nack.nacks {
+            // can't use n.range() since this callback is async fn,
+            // instead, use NackPair into_iter()
+            let stream2 = Arc::clone(&stream);
+            let f = Box::new(
+                move |seq: u16| -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
+                    let stream3 = Arc::clone(&stream2);
+                    Box::pin(async move {
+                        if let Some(p) = stream3.get(seq).await {
+                            let a = Attributes::new();
+                            if let Err(err) = stream3.next_rtp_writer.write(&p, &a).await {
+                                log::warn!("failed resending nacked packet: {}", err);
+                            }
+                        }
+                        true
+                    })
+                },
+            );
+            for packet_id in n.into_iter() {
+                if !f(packet_id).await {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -83,9 +108,9 @@ impl RTCPReader for ResponderRtcpReader {
             if let Some(nack) = p.as_any().downcast_ref::<TransportLayerNack>() {
                 let nack = nack.clone();
                 let streams = Arc::clone(&self.internal.streams);
-                // Reserve/coalesce before returning to the RTCP drain;
-                // spawning per feedback lets identical jobs accumulate.
-                ResponderInternal::resend_packets(streams, nack).await;
+                tokio::spawn(async move {
+                    ResponderInternal::resend_packets(streams, nack).await;
+                });
             }
         }
 
@@ -150,10 +175,8 @@ impl Interceptor for Responder {
 
     /// unbind_local_stream is called when the Stream is removed. It can be used to clean up any data related to that track.
     async fn unbind_local_stream(&self, info: &StreamInfo) {
-        let stream = self.internal.streams.lock().await.remove(&info.ssrc);
-        if let Some(stream) = stream {
-            stream.close().await;
-        }
+        let mut streams = self.internal.streams.lock().await;
+        streams.remove(&info.ssrc);
     }
 
     /// bind_remote_stream lets you modify any incoming RTP packets. It is called once for per RemoteStream. The returned method
@@ -171,17 +194,6 @@ impl Interceptor for Responder {
 
     /// close closes the Interceptor, cleaning up any data if necessary.
     async fn close(&self) -> Result<()> {
-        let streams: Vec<_> = self
-            .internal
-            .streams
-            .lock()
-            .await
-            .drain()
-            .map(|(_, stream)| stream)
-            .collect();
-        for stream in streams {
-            stream.close().await;
-        }
         Ok(())
     }
 }

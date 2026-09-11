@@ -14,19 +14,17 @@ categories = ["command-line-utilities", "network-programming"]
 # Releases matrix (`myownmesh-<platform>.{tar.gz,zip}`); see RELEASE.md.
 publish = false
 
+[features]
+# Keep the shipped daemon feature-free by default; transport-lab is reserved
+# for the explicit integration controls and never enters release artifacts.
+default = []
+transport-lab = ["myownmesh-core/transport-lab"]
+# Forward the opt-in system DNS-SD backend through core to signaling.
+system-dnssd = ["myownmesh-core/system-dnssd"]
+
 [[bin]]
 name = "myownmesh"
 path = "src/main.rs"
-
-# Build alongside a running Windows diagnostic binary, then launch a versioned
-# copy outside Cargo's output directory. Not part of ordinary release builds.
-[[bin]]
-name = "myownmesh-diag"
-path = "src/main.rs"
-required-features = ["diagnostic-cycle"]
-
-[features]
-diagnostic-cycle = []
 
 # Embeds the VERSIONINFO resource into the Windows exe (see build.rs).
 # Host-gated: build scripts compile for the host, and the Windows zip is
@@ -43,16 +41,18 @@ myownmesh-updater = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
 data-encoding = { workspace = true }
+getrandom = { workspace = true }
 
 interprocess = { workspace = true }
 parking_lot = { workspace = true }
-dashmap = { workspace = true }
 dirs = { workspace = true }
 
 # `service --system` needs an effective-uid check to fail fast without
@@ -61,6 +61,11 @@ dirs = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+widestring = { workspace = true }
+windows-sys = { workspace = true }
+
 [dev-dependencies]
+myownmesh-core = { workspace = true, features = ["transport-lab"] }
 myownmesh-signaling = { workspace = true }
 tempfile = { workspace = true }

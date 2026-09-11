@@ -1,330 +1,736 @@
-# Architecture
+# MyOwnMesh fundamental hybrid networking architecture
 
-MyOwnMesh is a pure-Rust peer-to-peer mesh networking stack. It ships
-as both a binary (daemon + CLI) and a library (`myownmesh-core`) so
-other apps embed the mesh without inheriting a GUI or HTTP updater.
+> Current normative cutover (2026-09-09): application data uses endpoint-authenticated WebRTC, directly or through configured standard TURN. Hubs provide discovery/introduction only, never application plaintext or ciphertext transit. This supersedes custom encrypted Hub and Closed-member payload relay requirements. Open/Closed governance is unchanged. Historical exact-head evidence below remains historical; this edit is not an implementation, runtime, or release PASS.
 
-## Lineage from MyOwnLLM
+In the current model, packet-relay allocation means configured standard TURN, not a mesh-member payload service. Nostr/signaling relay terminology refers only to its bounded control carrier. Existing accounting-dimension names do not grant payload-forwarding authority.
 
-The code was extracted from
-[MyOwnLLM](https://github.com/mrjeeves/MyOwnLLM)'s mesh substrate
-once the substrate had outgrown "one app's plumbing":
+Status: owner-adopted V4 architecture, as amended by owner review.
 
-| MyOwnLLM module (origin) | MyOwnMesh module (here) |
+This document defines the smallest common architecture for MyOwnMesh discovery, durable mesh semantics, signaling, transport path construction, endpoint authentication, session recovery, and application data delivery.
+
+MyOwnMesh is a **transport-independent hybrid networking system**. Transport independence means that a durable fact does not gain or lose authority because of the medium that carried it. It does not mean that transport is optional, external to the system, or operationally interchangeable. Discovery, signaling, candidate gathering, connectivity checks, relay allocation, congestion behavior, packet carriage, recovery, and reachability remain first-class parts of MyOwnMesh.
+
+The mathematical model is in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md). Concrete constraints and invariants are in [`IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md`](IMPLEMENTATION-CONSTRAINTS-AND-INVARIANTS.md). The application boundary is in [`APPLICATION-INTEGRATION.md`](APPLICATION-INTEGRATION.md).
+The existing-repository migration is governed by [`TRANSITION-PLAYBOOK.md`](TRANSITION-PLAYBOOK.md) and [`ARCHITECTURE-OWNERSHIP.md`](ARCHITECTURE-OWNERSHIP.md).
+
+## 1. Canonical end-to-end architecture
+
+![MyOwnMesh end-to-end hybrid networking architecture](diagrams/01-end-to-end-hybrid.svg)
+
+The diagram names production owners, not conceptual placeholders. Its executable
+left-to-right path is:
+
+| Diagram stage | Production module |
 |---|---|
-| `src-tauri/src/mesh/identity.rs` | `crates/myownmesh-core/src/identity.rs` |
-| `src-tauri/src/mesh/signing.rs` | `crates/myownmesh-core/src/signing.rs` |
-| `src-tauri/src/mesh/roster.rs` | `crates/myownmesh-core/src/roster.rs` |
-| `src/mesh-client.svelte.ts` (engine half) | `crates/myownmesh-core/src/engine/` |
-| `src/mesh-protocol.ts` | `crates/myownmesh-core/src/protocol/` |
-| `patches/@trystero-p2p__core@0.24.0.patch` | `crates/myownmesh-signaling/src/upstream.rs` + the Nostr driver |
-| `src/self_update.rs` (mesh-relevant fraction) | `crates/myownmesh-updater/` |
+| daemon and local application boundary | `crates/myownmesh/src/cli/serve.rs`, `control.rs`, `control/dispatch/channel.rs`, `ipc/bridge.rs` |
+| typed signaling and LAN discovery | `crates/myownmesh-core/src/engine/signaling_bridge.rs`, `crates/myownmesh-signaling/src/mdns/driver.rs`, and the selected `mdns/discovery/{embedded,system}.rs` backend |
+| candidate construction and packet carriage | `crates/myownmesh-core/src/engine/connection.rs`, `transport/webrtc.rs`, and `transport/ice.rs` |
+| channel-bound endpoint proof | `crates/myownmesh-core/src/endpoint_auth/task.rs`, `endpoint_auth/transcript.rs`, and `engine/handshake.rs` |
+| policy promotion and exact live-session ownership | `crates/myownmesh-core/src/runtime/session_broker/mod.rs`, `runtime/peer_session/slot.rs`, and `engine/state.rs` |
+| application delivery | `crates/myownmesh-core/src/application_gateway/channels.rs` and `crates/myownmesh/src/ipc/bridge.rs` |
 
-The rewrite generalised every embedder-specific bit:
-`~/.myownllm/` becomes `~/.myownmesh/` (overridable via
-`MYOWNMESH_HOME`), the Trystero app-id moves from
-`myownllm-cloud-mesh-v1` to `myownmesh-cloud-mesh-v1`, and the
-signing domain tag is `myownmesh-mesh-auth-v1:` rather than
-`myownllm-mesh-auth-v1:` — so a MyOwnLLM peer and a bare-MyOwnMesh
-peer don't land in the same Nostr room or accept each other's
-signatures by accident. Downstream forks change those three
-constants (env vars at build time for the URL/app-id; a one-line
-edit in `lib.rs` for the domain tag) to non-interop with upstream
-on purpose.
+[`scripts/run-production-e2e.py`](scripts/run-production-e2e.py) executes one
+concrete instance of that path with two shipped daemon processes: production
+mDNS discovery, direct WebRTC construction, fresh endpoint authentication,
+bilateral automatic promotion on an Open network, and acknowledged typed-channel
+delivery, followed by owned graceful shutdown of both daemon processes. It
+requires an existing binary and an owner-selected finite resource grant; it
+neither builds the product nor substitutes `LocalBroker`. A forced child-process
+termination or nonzero daemon exit fails the executable contract. Its output is
+raw characterization material, not a release-evidence assertion.
 
-## Crates
+The architecture has five cooperating mechanisms:
 
-```
-crates/
-├── myownmesh-core         # lib  — runtime, engine, transport, protocol, topology, RPC, channels, service roles + relay
-├── myownmesh-signaling    # lib  — Nostr driver + in-process LocalBroker + self-hosted NIP-01 relay server
-├── myownmesh-services     # lib  — self-hosted STUN + TURN servers (webrtc-rs stun/turn)
-├── myownmesh-updater      # lib  — self-update with configurable release feed
-└── myownmesh              # bin  — daemon + CLI + control-socket IPC + service manager
-```
+1. **Durable semantic state** stores and derives long-lived Closed governance meaning. Open participation is runtime-only and does not enter this ledger; any reviewed application contract domain is separate from the base ledger.
+2. **Signaling** moves durable facts and ephemeral transport-control messages through any suitable signaling medium.
+3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. Configured Hub hints may introduce bounded endpoint demand, with native direct WebRTC preferred and configured standard TURN as the indirect packet carrier; Hubs never carry application payload. The current remote-candidate planner is not a claim of automatic cross-family racing.
+4. **Endpoint authentication and the session broker** promote a working channel into an application-usable peer session only after exact Device authentication and current mesh policy checks.
+5. **Applications** exchange payload only through a live authenticated session capability.
 
-Embedders depend on `myownmesh-core` (and optionally
-`myownmesh-signaling` if they want the Nostr driver, or
-`myownmesh-services` if they want to host STUN / TURN). They don't pull
-in `myownmesh-updater` or the bin. The heavyweight STUN / TURN
-dependency tree lives in `myownmesh-services` precisely so a core-only
-embedder doesn't inherit it.
+The causal sequence is:
 
-The desktop GUI (`gui/`) is a Tauri + Svelte 5 **client** of the
-daemon — it talks to `myownmesh serve` over the local control socket
-and never embeds `myownmesh-core`, so it lives in its own Cargo
-workspace and a `cargo build --workspace` at the root stays fast
-(no Tauri compile).
-
-## Module map (`myownmesh-core`)
-
-```
-src/
-├── lib.rs                  # public re-exports + crate docs
-├── identity.rs             # ed25519 keypair, base32 device id, display suffix
-├── signing.rs              # sign / verify / domain-tag handshake payload
-├── roster.rs               # per-network approved-peers file (0600)
-├── verification.rs         # 6-char OOB verification codes
-├── config.rs               # MeshConfig + NetworkConfig + TopologyMode
-├── dirs.rs                 # ~/.myownmesh layout
-├── error.rs                # crate-wide Error + Result
-├── events.rs               # MeshEvent / PeerEvent / DiagEntry surfaced to embedders
-├── network_state.rs        # per-network signed governance log (open/closed kind, roles, splits)
-├── protocol/               # wire-level MeshMessage variants
-├── topology/               # Ring / Star / FullMesh selectors
-├── transport/              # webrtc-rs wrapper, ICE config, diag counters
-├── services/               # hosted infra: relay / signaling / STUN / TURN config + runtime
-├── engine/                 # the connection engine (see below)
-├── channels.rs             # typed pub/sub Channel<T>
-├── rpc.rs                  # generic Rpc — single-shot + streaming
-└── handle.rs               # Mesh / MeshHandle / JoinedNetwork facade
+```text
+Durable semantic state and typed signaling
+        -> bounded connector work
+        -> a channel that actually passes packets
+        -> fresh endpoint authentication over that channel
+        -> Open or Closed policy and local-principal checks
+        -> live AuthenticatedPeerSession
+        -> application payload
 ```
 
-## The engine
+No route must become a durable ledger object before the connector may try it.
 
-The connection engine turns the protocol + transport + topology
-primitives into a working mesh. One driver task per joined network.
+## 2. Transport independence, not transport removal
 
-```
-src/engine/
-├── mod.rs                  # driver loop — fans in commands, signaling, transport events
-├── state.rs                # NetworkState shared between subsystems
-├── connection.rs           # per-peer status / tier / diag watermarks
-├── handshake.rs            # hello → auth_response state machine + watchdog
-├── heartbeat.rs            # ping / pong + silent-peer detection
-├── ladder.rs               # connection-tier enum + topology selector pass
-├── ice_watchdog.rs         # Tier 2.5 — restart_ice() before Trystero's 5s timeout
-├── wake.rs                 # tick-gap → wake event coalescing
-├── network_watch.rs        # OS network-change detection → fast rejoin
-├── reconcile.rs            # Tier 6 — config edit triggers stop+start
-├── governance.rs           # closed-network state log: proposals / transitions / splits
-├── scheduler.rs            # every tunable constant, named ticks
-├── phase.rs                # MeshPhase rollup (Joining / Alone / Discovering / Active / Degraded / Stopped)
-└── signaling_bridge.rs     # adapters: attach_local / attach_nostr
-```
+![Transport independence without transport removal](diagrams/03-transport-independence.svg)
 
-See `CONNECTION-ENGINE.md` for the recovery model, every tunable
-constant, and the edge cases the engine handles.
+The upper lane in the diagram is implemented by
+`semantic/{fact,verify,store,projection}.rs` and receives typed carrier inputs
+through `engine/{signaling_ingress,semantic_ingress}.rs`. The lower lane is
+implemented by `engine/signaling_bridge.rs`, `engine/connection.rs`,
+`transport/{ice,webrtc}.rs`, `endpoint_auth/task.rs`, and
+`runtime/session_broker/mod.rs`. Only the upper lane may create durable
+authority; only the lower lane can establish current packet reachability. The
+promotion edge between them consumes verified semantic policy without turning a
+carrier observation into authority.
 
-## Trust model
+For durable semantic facts, equivalent accepted inputs produce equivalent durable state regardless of whether the bytes arrived through Nostr, mDNS, WebSocket, a signaling cache, a file, serial transport, shared storage, removable media, an optical encoding, or another suitable medium.
 
-Each device owns a long-lived ed25519 keypair persisted at
-`~/.myownmesh/.secrets/identity.json` (mode 0600 on Unix). The
-public key — base32-lowercase, 52 chars — is the Device ID surfaced
-on the wire.
+Formally, if two deliveries produce the same accepted durable fact set under the same context, domain rules, and verified basis, they produce the same durable derived state.
 
-Authentication is mutual: when two peers meet, each `hello` carries
-a random 32-byte nonce. The other side responds with an
-`auth_response` containing
-`ed25519_sign(SIGN_DOMAIN_TAG || nonce || my_device_id || their_device_id)`,
-verified against the claimed Device ID's pubkey. Domain separation
-by `SIGN_DOMAIN_TAG = "myownmesh-mesh-auth-v1:"` prevents a
-signature obtained for one protocol step from being replayed in
-another.
+This guarantee does not claim that all media can perform every networking operation. A removable drive can convey a governance fact but cannot provide an interactive endpoint channel. A UDP path can carry real-time packets but may require additional machinery for reliable semantic exchange. Each operation uses a medium or connector profile capable of the liveness, directionality, ordering, latency, and packet behavior that operation requires.
 
-A 6-char `[a-z0-9]` verification code travels in each `hello`. The
-code is not load-bearing for security — the ed25519 signatures are
-— but it's the eyeball-check users perform over voice / video at
-first meeting (`"my code is k3m2pq"`). After approval, the peer's
-pubkey lands in the per-network roster
-(`~/.myownmesh/mesh/rosters/{network_id}.json`) and auto-approves
-on subsequent reconnects.
+Transport properties affect:
 
-## Topology
+- availability and latency;
+- NAT and firewall traversal;
+- congestion and loss behavior;
+- packet size and fragmentation;
+- addressability and multicast capability;
+- relay and migration support;
+- metadata exposure;
+- cost, power, and resource use.
 
-Three selectable topologies, all built on the same shelving
-primitive:
+They do not, by themselves, establish Device identity, ephemeral Open participation, Closed authorization, or application authority.
 
-- **Ring** (default). Sorted-lex ring; each peer keeps its two
-  immediate neighbors + `(n_preferred − 2)` shortcuts active.
-- **Star**. Spokes keep only the configured hub active. Hub
-  Device ID is named in config; auto-elect is a follow-up.
-- **FullMesh**. Every peer keeps every other peer active. N²
-  channels — intended for small fixed-size deployments.
+## 3. Durable semantic state
 
-Selectors are pure functions. Both sides of any peer pair run the
-same algorithm over the same sorted input and arrive at the same
-answer — that's what makes shelving safe without coordination.
+The durable semantic subsystem stores only facts whose meaning must survive transport loss, process restart, reordering, duplication, and delayed delivery.
 
-## Wire protocol
+The base ledger is a durable Closed authority/governance ledger. Its retained
+fact classes are:
 
-JSON-framed messages on a WebRTC data channel, each tagged by
-`kind`. See `docs/PROTOCOL.md` for the full reference; the source
-of truth is `src/protocol/`. Receivers silently drop unknown
-`kind`s; embedders gate optional traffic per-peer via the
-`features` capability matrix.
-
-Alongside the data channel, every connection provisions one **H.264
-video track lane** (a sendrecv media transceiver) in the same
-offer/answer — negotiated once at setup, so no renegotiation path
-exists or is needed. An idle lane sends nothing and costs nothing;
-embedders write encoded access units with
-`NetworkState::send_video_sample` and subscribe to assembled inbound
-units with `subscribe_video` (the daemon mirrors both as `video_send`
-/ `video_subscribe` control ops). For the high-rate H.264/Opus path the
-daemon also exposes two **dedicated binary media pipes** over the control
-socket, so the bitstream crosses the IPC with no base64 or per-frame JSON:
-`media_track_pipe` (a client streams length-prefixed access units in) and
-`media_source_pipe` (the daemon pushes a subscribed client's inbound frames
-out). The base64 `video_send` / `video_inbound` ops remain for clients that
-don't open the binary pipes. Media rides RTP/UDP with the default
-interceptors (NACK retransmission, reports) — lossy-fresh semantics, unlike
-the reliable-ordered data channel; the engine neither encodes nor decodes,
-it moves Annex-B access units.
-
-## Signaling
-
-The remote production strategy is Nostr (5 relays by default,
-deterministic shuffle per app-id). The Trystero v0.24 wire format
-is preserved on the room-handle derivation so a future hybrid
-deployment with JS Trystero peers is possible if they share an
-app-id. By default the app-ids differ
-(`myownmesh-cloud-mesh-v1` vs `myownllm-cloud-mesh-v1`) so the
-two ecosystems never meet on the wire.
-
-Alongside whatever the remote strategy is, every network also runs
-**mDNS/DNS-SD signaling on the local network by default**
-(`signaling.mdns`, on unless set `false`): each joined network
-registers a `_myownmesh._tcp.local.` instance carrying the room
-handle in TXT, browses for peers in the same room, and exchanges
-the SDP/candidate traffic over a unicast TCP port advertised in
-SRV. Co-located devices therefore discover each other and keep
-meshing even when every relay/venue is unreachable — and a network
-with `signaling.strategy = "none"` is fully LAN-local, touching no
-remote infrastructure at all (the shape local-only device claiming
-rides). The mDNS driver is clock-free (no TLS, no timestamps), so
-it works on devices that boot with an unset RTC. When both drivers
-are attached, the engine bridge fans each outbound signal to both
-and dedupes the cross-transport duplicate deliveries by content —
-applying the same offer twice would wedge WebRTC
-(`engine::signaling_bridge`). An unknown `signaling.strategy` value
-attaches NO remote driver, loudly — never a silent Nostr fallback.
-
-A further strategy — `local::LocalBroker` — runs entirely
-in-process for tests and for embedders that don't need network
-signaling.
-
-The Nostr driver bakes in every upstream-Trystero fix catalogued
-in `crates/myownmesh-signaling/src/upstream.rs` natively — no
-patches required.
-
-A device can also **host** signaling itself:
-`myownmesh-signaling::server` is a minimal NIP-01 relay that the
-Nostr driver speaks to unchanged. Point a network's
-`signaling.servers` at `ws://that-host:port` and the fleet runs
-with no dependency on public Nostr at all.
-
-## Hosted services
-
-Beyond consuming signaling / STUN / TURN, a device can host them for
-the rest of the mesh — relay routing, a signaling relay, a STUN
-server, and a TURN server. All off by default and configured
-device-wide under `services` in `config.json`, activatable from the
-GUI (Settings → Services), the CLI (`myownmesh ctl services …`), and
-config edits.
-
-```
-config.services
-├── node         # participate as a mesh member; off = pure-infra box (default on)
-├── relay        # forwards roster traffic on a reserved channel (core::services::RelayService)
-├── signaling    # intelligent NIP-01 relay — live presence, instant leave, flood limits (myownmesh-signaling::server)
-├── stun         # RFC 5389 binding (myownmesh-services::stun)
-└── turn         # RFC 5766 relay + per-connection bandwidth cap (myownmesh-services::turn)
+```text
+DurableFact =
+    RoleGrant
+    | RoleRevoke
+    | Evict
+    | MembershipAdmit
+    | EvictionProof
+    | SelfStandDown
+    | Attestation
+    | Resolution
+    | AuthorityLineageResolution
 ```
 
-The signaling relay is stateful: it tracks live presence from the
-connection lifecycle and emits a `leave` ([`SignalingMessage::Leave`])
-the instant a member's socket drops, so the engine's reconnection ladder
-reacts immediately instead of waiting out a heartbeat timeout. It stays
-plain NIP-01 on the wire and degrades gracefully — an optional
-accelerator, never a coordinator the mesh depends on. `node` is itself a
-toggle, so a device can be pure infrastructure (signaling / STUN / TURN
-with no mesh membership).
+`RoleGrant` and `RoleRevoke` retain the governed role state; `MembershipAdmit`
+and `Evict` retain the member decision; `EvictionProof` retains the evidence
+that makes an eviction admissible; `SelfStandDown` and `Attestation` retain
+explicitly typed governance evidence; and `Resolution` plus
+`AuthorityLineageResolution` retain the cited heads needed to resolve an
+exclusive cell or its complete cross-cell lineage. A concrete Closed profile
+may select a smaller set, but every selected class needs an adopted typed
+definition. Reviewed application contract facts, if enabled, use a separate
+explicitly selected domain and are not base Closed authority. There is no
+arbitrary opaque fact body in the base ledger.
 
-The daemon's `ServiceManager` (`crates/myownmesh/src/services.rs`)
-owns the running handles, reconciles them against config on demand,
-and advertises a [`ServiceRole`](crates/myownmesh-core/src/services/mod.rs)
-to peers via the capability matrix (`service:relay`,
-`service:signaling`, `service:stun`, `service:turn`) plus an optional
-`ServiceAdvert` carrying concrete endpoint URLs. That advertisement is
-what lets a peer discover and adopt a host — making a fully
-internet-isolated network trivial to stand up. See
-[`docs/SERVICES.md`](docs/SERVICES.md) for the operator guide.
+Open has zero base durable semantic facts. An Open device participates
+ephemerally only after an exact-context handshake proves possession of the
+corresponding Device key. Presence, join, leave, reconnect, candidate, and
+session observations for both Open and Closed are runtime evidence and never
+become semantic history. They may update a local read-only reachability or
+roster projection, but they cannot create authority.
 
-## Persistent state
+Every durable fact has:
 
-```
-~/.myownmesh/
-├── config.json                  # user-editable
-├── .secrets/identity.json       # 0600 — ed25519 keypair
-├── mesh/rosters/{net}.json      # 0600 each — per-network approved peers
-├── daemon.sock                  # Unix-domain socket for `myownmesh ctl …`
-└── updates/                     # staging area for self-update
-```
+- one canonical encoding;
+- one content-derived identifier;
+- an exact author and signature;
+- one exact mesh or contract context;
+- exact causal dependencies where required;
+- domain-defined conflict and projection rules;
+- bounded shape and verification cost.
 
-Override the root via `MYOWNMESH_HOME`.
+Durable state is derived by a pure function:
 
-## API surface
-
-The public re-exports from `myownmesh_core` are the embedder's
-working set:
-
-```rust
-// Construction
-Mesh, MeshHandle, MeshConfig, NetworkConfig, TopologyMode
-
-// Identity
-Identity, DeviceId
-generate_network_id, normalize_network_id
-
-// Wire data
-MeshEvent, PeerEvent, MeshPhase, DiagEntry
-CapabilityAdvert
-ConnectionTier
-
-// Application surface
-JoinedNetwork
-Channel, ChannelMessage, ChannelError
-Rpc, RpcCall, RpcResponse, RpcError
-
-// Roster
-Roster, AuthorizedPeer
+```text
+Project(
+    mesh_context,
+    projection_scope,
+    verified_basis,
+    accepted_durable_facts
+) -> DerivedDurableState
 ```
 
-The engine internals (`engine::*`) are public so the bin can
-attach signaling drivers and so embedders can run sophisticated
-custom integrations, but the recommended surface for typical use
-is the `Mesh` → `MeshHandle` → `JoinedNetwork` flow.
+In this specification, **projection means deterministic semantic derivation**. It is not forecasting, route construction, topology advertisement, physical reachability, or a networking operation.
 
-## Out of scope for v1
+`Project` may derive:
 
-- MyOwnLLM migration to depend on `myownmesh-core` at the source
-  level — staged. The publishing path (git tag, README copy-paste
-  block, version-pin discipline) is in place from this end;
-  MyOwnLLM's `src-tauri/Cargo.toml` will wire the git dep and
-  `src-tauri/src/mesh/{identity,signing,roster,commands}.rs` will
-  delegate to `myownmesh-core` once the field-tested behavior here
-  is audited against MyOwnLLM's user-visible mesh UX. The migration
-  PR lands once that audit clears.
-- Onion / payload-layer encryption above DTLS — explicitly
-  declined.
-- Star auto-elect topology — explicit hub only.
-- Additional *consumer* signaling strategies beyond Nostr
-  (BitTorrent trackers, MQTT, IPFS, Firebase) — sibling crates
-  later. (A device can now *host* signaling via the built-in
-  NIP-01 relay; see [Hosted services](#hosted-services).)
-- Transparent relay fallback — the relay service forwards roster
-  traffic on an explicit channel today; automatic per-peer routing
-  through a relay when ICE can't punch through is a follow-up.
-- Built-in audio / file / LLM RPCs — embedders define their own
-  message types over `Channel<T>` or the generic `Rpc`.
+- the local Closed authorization view;
+- durable capability state;
+- explicit ambiguity in an exclusive durable semantic cell;
+- optional application contract state.
 
-Now in (was out of scope before service hosting landed):
+It does not derive a live route, a working socket, a current relay allocation, a congestion state, or an `Online` boolean.
+The local Open runtime-participant view is maintained outside `Project`; Open
+topology, join/leave/reconnect, and session lifecycle never create or churn
+semantic ledger facts.
 
-- **Built-in STUN / TURN servers** — `myownmesh-services` hosts both;
-  user-configured external STUN / TURN still works as before.
-- **Self-hosted signaling** — `myownmesh-signaling::server` is a
-  NIP-01 relay usable in place of public Nostr.
-- crates.io publish for the library crates — gated on a public-API
-  freeze. Until then embedders pull from git pinned to a release
-  tag; see [`RELEASE.md`](RELEASE.md).
+### 3.1 Open
+
+Open is permissionless ephemeral self-participation. It has no base-ledger
+fact or durable admission record.
+
+```text
+Valid exact-context handshake with Device-key possession
+    -> the endpoint may participate in the local Open runtime
+```
+
+No sponsor, founder, quorum, pair grant, signaling service, application,
+identity-count vote, proof of work, or existing participant approves the
+Device ID. A live Open session, presence observation, leave, or reconnect is
+not written to semantic history and is not an authority input.
+
+Resource pressure may refuse or evict local work. That is a typed resource or availability result, not an authorization denial.
+
+### 3.2 Closed
+
+Closed adds the exact authorization proof selected by the Closed mesh context. Closed may be fully locked down.
+
+The Closed governance commitment may describe a threshold rule, delegation graph, multisignature policy, causal governance rule, or another reviewed decentralized proof system. It does not inherently identify a central server or online authority.
+
+A Closed operation has authority only when the locally accepted Closed governance state proves it. A valid Device signature alone is not Closed admission.
+
+### 3.3 Causality and conflict
+
+Durable causality is a partial order. Two facts may be causally unrelated. Causal concurrency is not itself a conflict.
+
+Each adopted fact domain separately classifies relevant concurrent facts as:
+
+- **Independent**, when they affect different semantic cells.
+- **Joinable**, when the domain defines an associative, commutative, and idempotent join.
+- **Exclusive**, when incomparable facts compete for one singular semantic cell.
+
+Only exclusive same-cell competitors are a no-go for singular authority. They remain explicit and fail closed until the domain-defined resolution cites the required heads.
+
+### 3.4 Retention and compaction
+
+The Closed ledger retains exact history by default. It may delete semantic
+history only after an archive or an authority-ratified checkpoint provides a
+verified, independently reopenable basis. A checkpoint must preserve:
+
+- current durable state;
+- unresolved exclusive conflicts;
+- exact continuation validation required by the adopted domain;
+- evidence still required by live guards or pending durable effects.
+
+Facts continue to reference facts. A compaction base is verification evidence,
+not an author or causal event. The shipped compaction boundary is bounded
+checkpointing only: it may checkpoint or truncate WAL within the owner-funded
+StorageBytes claim, but it does not claim a full-copy SQLite `VACUUM`. A full
+copy or rewrite requires separately funded custody for its temporary copy,
+metadata, and cleanup. Checkpointing is not silent time-based eviction or
+semantic pruning, and no wall-clock age alone expires, removes, or rewrites a
+fact.
+
+### 3.5 Ledger admission, quarantine, and growth
+
+The owner selects finite ledger limits independently for fact count, encoded
+fact bytes, causal-edge count, per-author count/bytes, proof-verification
+work, and indexed database bytes. The selected limits are configuration and
+are recorded with the store; they are not hidden protocol constants and are
+not inferred from an Open or Closed default.
+
+Before every semantic mutation, the reducer computes the complete delta,
+including the candidate fact, its encoded bytes, every new causal edge,
+author-specific usage, proof work, indexes, and database pages. The exact
+`N+1` request is refused before any graph, projection, ACK, identity, or
+authority change when any owner-selected limit would be crossed. Refusal is
+typed and leaves the prior state unchanged; it cannot be converted into an
+identity change or a successful acknowledgement.
+
+A fact whose dependencies are not present enters a finite,
+dependency-indexed quarantine only after its own shape and author checks pass.
+Quarantine entries and reverse dependency indexes consume the same count,
+byte, edge, per-author, proof, and database claims. Duplicate delivery is
+idempotent; a dependency failure or proof failure releases that exact
+quarantine custody. There is no unbounded retry queue, global event cache, or
+timer-based eviction.
+
+The persistent implementation is a local-only indexed SQLite store with one
+semantic writer on one dedicated blocking thread and one ordinary SQLite
+connection using SQLite's default VFS, WAL journaling, and `FULL` synchronous
+durability. SQLite owns file locking, recovery, WAL reuse, and automatic
+checkpointing; MyOwnMesh owns semantic admission, quotas, and the writer
+lifetime. For the
+StorageBytes dimension, one process-accounted claim is `B = M + W + S + R`:
+main database bytes, WAL bytes, shared-memory/sidecar bytes, and explicit
+reserve. Named-file containment or VFS accounting does not establish backing
+disk capacity, filesystem metadata capacity, or ENOSPC behavior; those remain
+unobservable or residual until an exact provider contract proves them. Readers
+may inspect snapshots, but only the single writer mutates the graph,
+quarantine indexes, checkpoint metadata, or retention boundary. A deployment
+may choose smaller owner limits, but it may not claim more than the configured
+database budget.
+
+For selected limits `C` (facts), `B` (encoded bytes), `E` (edges), `A` (per
+author), `P` (proof work), and `D` (database bytes), the worst admitted live
+ledger is bounded by the corresponding finite claim vector; an operational
+growth estimate is the sum of `C` fact/index records, `B` payload bytes, `E`
+edge/index records, and the selected SQLite/WAL/checkpoint overhead inside
+`D`. Failure spam is bounded by the same pre-mutation vector and per-author
+limits: rejected `N+1` attempts allocate no semantic record, no ACK, and no
+new authority. A failed cleanup retains the exact charged claim until an
+owner-observed terminal path settles it.
+
+Opening stored durable state never recreates live sockets, channels, keys, reachability observations, connector objects, session handles, or resource reservations from a prior runtime.
+
+## 4. Typed signaling
+
+Signaling is a first-class networking mechanism. It is not merely file movement, and it is not the application data path.
+
+Signaling carries two disjoint categories:
+
+```text
+Durable semantic exchange:
+    durable signed facts
+    inventories and exact dependency requests
+    compacted-basis proofs where adopted
+
+Ephemeral transport control:
+    connect intent
+    offers and answers
+    candidates and candidate updates
+    bounded Hub introduction requests and responses; standard ICE setup control
+    cancellation and recovery hints
+```
+
+Ephemeral transport control is typed, bounded, context-associated where known, and unavailable to ordinary application payload APIs. It is not required to be content-addressed, retained forever, compacted, or projected as durable state.
+
+A signaling message may be authenticated early, late, or not at all depending on its type and connector profile. Lack of early authentication limits the effect to bounded speculative work. It cannot create durable authority or an application session.
+
+Signaling carriers may cache, delay, duplicate, reorder, censor, or reveal control information. Those behaviors affect availability and metadata exposure. They do not replace durable fact validation or endpoint authentication.
+
+## 5. Connector runtime and speculative transport work
+
+The connector owns pathfinding and packet transport. It may start useful work before endpoint identity and Closed authorization are fully proven.
+
+![Usability-first pathfinding with a strict channel-promotion boundary](diagrams/02-channel-promotion-boundary.svg)
+
+The diagram's pre-promotion objects are owned by
+`engine/connection.rs` and `transport/webrtc.rs`. The proof task is
+`endpoint_auth/task.rs`; its transcript is fixed by
+`endpoint_auth/transcript.rs`. `engine/handshake.rs` delivers the verified
+result to `runtime/session_broker/mod.rs`, whose exact current slot lives in
+`runtime/peer_session/slot.rs`. Application entry points in
+`application_gateway/{channels,rpc}.rs` can consume only that promoted slot.
+Carrier replacement returns to connector work and must cross the same proof and
+promotion boundary again.
+
+An untrusted hint or partially authenticated signal may create only lease-backed speculative state, such as:
+
+```text
+ConnectorCandidateCapability
+TransportHandle
+TurnAllocationToken
+ConnectedChannelCapability
+TransportObservation
+```
+
+The connector may:
+
+- gather local and remote candidates;
+- probe addresses;
+- open or accept sockets;
+- allocate bounded standard TURN state;
+- apply admitted queued remote ICE candidates through the bounded connector
+  planner;
+- perform a transport handshake;
+- measure whether packets pass;
+- detect failure and clean up.
+
+Those actions are real networking work. Preventing them until the full semantic proof completes would make the network slower and less usable without strengthening endpoint identity.
+
+Before promotion, speculative work may not:
+
+- mutate Open or Closed durable authority;
+- expose an authenticated peer-session handle;
+- deliver application payload to a consumer;
+- send application payload as an authenticated peer;
+- select arbitrary relay destinations;
+- retain protected state or schedule protected work without a live resource lease.
+
+MyOwnMesh does not maintain a parallel global route table. A connector may keep local ephemeral candidate and channel indexes for operation and diagnostics. Those local identifiers are not ledger facts, peer identity, application authority, or cross-runtime route identifiers.
+
+### 5.1 Attempt, connector, and resource cardinality
+
+One connection attempt is a cancellation and aggregate-resource owner. It may
+own several connector candidates, but the current remote-ICE application
+planner is not evidence of cross-connector racing. One WebRTC connector
+candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE
+agent may gather, receive, and check many internal ICE candidates and candidate
+pairs.
+
+These relationships describe ownership, not product-wide maximum counts. Basal MyOwnMesh defines no fixed semantic ceiling for Mesh runtimes, peers, attempts, sessions, or real-time flows. A finite host still has finite resources, so creating any of these objects is fallible. Admission succeeds only when the applicable resource provider grants the object's finite composite claim. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result.
+
+```text
+host or process resource provider
+    -> grants finite ResourceLease for an exact ResourceClaim
+    -> process resource root
+        -> Mesh resource scope
+            -> attempt, candidate, callback, cleanup, and flow owners
+
+sum of live and failed-cleanup-retained claims in each resource dimension
+    <= resource grant currently assigned to the process
+```
+
+Mesh scopes attribute use to one finite process grant. Creating another Mesh scope does not create capacity.
+
+Basal MyOwnMesh constrains the finite provider by property, not by algorithm. Any conforming provider must preserve:
+
+```text
+P1 Domain conservation
+    the sum of live and failed-cleanup-retained claims in each resource
+    dimension never exceeds the grant actually assigned to the process;
+    a claim never exceeds the provider domain it is drawn from
+
+P2 Cleanup ownership
+    only the exact owner releases a claim, and only after cleanup; no
+    provider, peer, message, or timer can forge a release, and resources
+    a cleanup path requires stay retained until that cleanup completes
+
+P3 No minting
+    no scope, child scope, or identity creates capacity
+
+P4 Work conservation
+    capacity that is neither live nor reserved for an in-flight
+    admission is borrowable by any scope that can use it. A provider
+    may return immediate typed pressure instead of retaining a demand
+    only when the claim does not currently fit. A claim that does fit
+    is admitted, unless the refusal is justified by a proven structural
+    limit of the provider, by an explicit isolation policy or optional
+    local ceiling under P5, or by accounting that is unavailable,
+    poisoned, or otherwise unable to prove the admission safe. Every
+    such reason is declared. Arbitrary refusal is prohibited and can
+    never stand as a hidden limit
+
+P5 Explicit isolation
+    every partition, reserved share, or isolation ceiling is explicit
+    local policy, never a basal guarantee
+
+P6 Partition non-amplification
+    subdividing a fairness root's attribution into more child scopes
+    must not increase that root's cumulative selections, or its
+    cumulative admitted quantity in any dimension, at any point of the
+    provider's decision sequence, and must not move any competing
+    root's selection later. One-way only: no equality of outcome is
+    implied
+
+P7 Pressure is not authorization
+    refusal, pressure, and unavailability are typed resource results,
+    never an Open or Closed authorization outcome in either direction
+
+P8 Time is not resource truth
+    elapsed duration alone creates, releases, expires, and validates
+    nothing
+```
+
+P6 is stated over fairness roots and attribution child scopes. Both are closed architectural definitions:
+
+```text
+FairnessRoot
+    the unit of scheduling attribution that a provider serves
+    selected locally by the trusted provider or ingress owner that
+        installs the grant
+    process-local and opaque: never transmitted, never compared across
+        processes
+    not mintable by the claimant it attributes: no unverified claimant,
+        peer, or wire assertion may name, select, split, rotate, or
+        multiply one
+    not a semantic or durable identity, and not an authentication or
+        authorization root or capability; holding one grants nothing
+
+AttributionChildScope
+    an accounting and attribution refinement beneath exactly one
+        FairnessRoot
+    may divide, label, and measure use within that root
+    carries no independent scheduling entitlement, and adds no share,
+        turn, or service weight to the root beneath which it sits
+```
+
+**P6, partition non-amplification.** Subdividing a fairness root's attribution into more child scopes must not increase that root's cumulative selections, or its cumulative admitted quantity in any resource dimension, at any point of the provider's decision sequence, and must not move any competing root's selection to a later decision. The requirement is one-way: a ceiling on what subdivision can gain, not a guarantee that subdivision is free. It implies no equality of outcome, permits the subdivided root to fare worse and a competitor to fare better, and constrains nothing else. The exact model, comparisons, and conformance controls are in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
+
+P6 is silent about who a claimant is. It binds no apparent ingress source to a real-world actor, is not Sybil resistance, and does not decide how many roots an actor receives. It is equally not a progress property: it says nothing about progress, throughput, latency, backpressure, or behavior under hostile ingress, which are separate obligations of the ingress path.
+
+Selection order, rotation rule, and pending-demand cardinality are concrete provider policy, not basal architecture. This architecture selects no scheduler, no fairness-root taxonomy, no weights or quotas, and no mapping from roots to service turns. A resource-provider implementation chooses them and may replace them with any policy preserving P1 through P8. No other subsystem may depend on a particular choice.
+
+A conforming provider satisfies P1 through P8. Whether any particular provider does so is recorded in the implementation and transition documents, not here.
+
+**The committed grant is an accounting commitment.** It is not proof that substrate capacity exists, and not a promise that an allocation will succeed. Containment and reservation are separate premises, each proved per resource dimension, and a provider never presents unproved containment or backing as established. An accounting-only commitment is a coherent basis for admission, and it is not by itself sufficient for final production closure.
+
+**Grant change never forges a release.** The committed grant is not required to be constant. A provider may raise it, and may lower it, but never below committed use, which includes both the charges already held and any reservation held for an admission in flight. No grant change ever releases, revokes, reduces, or reattributes a live claim or a reservation. Only the exact owner releases, after its own cleanup, exactly as P2 requires. A provider may request retirement from an owner whose contract declares that lease reclaimable; the request is sticky, carries no timer, and alters no claim. A measurement never becomes a grant by being taken. The exact treatment of observation, target, containment, backing, committed grant, charged sum, in-flight reservation, capacity, and admission fit is in [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md).
+
+No cooperative mechanism guarantees admission. Capacity held by nonreclaimable admitted work, an ignored retirement request, and failed-cleanup retention can each prevent admission indefinitely. An explicit named P5 local isolation domain, partition or reserved share, or optional local ceiling or cost boundary may impose stricter restrictions for a locked-down appliance, Closed deployment, carrier cost boundary, or test. That wrapper is explicitly optional, is never required for ordinary construction, and is not basal mesh semantics.
+
+Resource limits have four distinct sources:
+
+```text
+Protocol-shape bound
+    canonical parser or wire validity
+
+Provider structural limit
+    actual transport, codec, kernel, or hardware constraint
+
+Runtime resource availability
+    currently granted memory, handles, sockets, tasks, storage, and work
+
+Optional local policy ceiling
+    explicit administrator, cost, isolation, or compatibility restriction
+```
+
+One category cannot be presented as another. Measurements characterize cost and may inform selection of an explicit named P5 restriction; they do not themselves narrow accounting capacity. They do not establish a universal peer, Mesh, attempt, session, or flow count.
+
+An exact lease is exact only for the resource units named by its claim. Native WebRTC, allocator, runtime, kernel, driver, and external relay state that the adapter cannot count remains an explicit residual. A conforming implementation must conservatively claim, isolate, or report that residual. It must not describe a visible Rust allocation or a connector-count proxy as complete native or OS accounting.
+
+```text
+one connection attempt
+    -> multiple connector candidates
+
+one WebRTC connector candidate
+    -> one RTCPeerConnection and ICE agent
+    -> multiple internal ICE candidates and candidate pairs
+
+DataChannelOpen for that exact live WebRTC connector candidate
+    -> ConnectedChannelCapability
+    -> not endpoint authentication or session authority
+```
+
+An internal `LocalIceCandidate` is typed transport-control input to a WebRTC connector candidate. It is not a connector candidate, an attempt, or an authority capability.
+
+### 5.2 Connector profiles
+
+A connector profile defines the transport-specific work it performs, including:
+
+- candidate discovery and accepted hints;
+- connectivity checks and nomination;
+- relay allocation;
+- packet and stream behavior;
+- congestion and flow control;
+- migration and recovery;
+- live observations and failure reports;
+- resource claims.
+
+Current application carriage is native WebRTC: direct LAN/ICE connectivity or
+configured standard TURN. STUN assists candidate discovery; it is not the
+indirect application-packet carrier.
+
+Transport-independent semantics leave future connector research possible, but
+QUIC-native, serial/radio, and non-IP profiles are not implemented or authorized
+by this cutover. A common connector interface does not erase operational
+differences or admit an alternative custom payload tunnel.
+
+## 6. Channel promotion and endpoint session
+
+A working channel is not yet an authenticated peer session.
+
+A channel may be promoted only when:
+
+```text
+MayPromoteChannel(channel) :=
+    ChannelCurrentlyWorks(channel)
+    and FreshMutualDeviceAuthentication(channel)
+    and ExactMeshContextBinding(channel)
+    and ApplicableOpenOrClosedPolicyAllowsPeer
+    and AuthenticatedLocalPrincipalAllowsUse
+    and PostAuthenticationResourcesReserved
+```
+
+Fresh endpoint authentication binds both Device identities and the exact mesh context to the channel that actually passed traffic. The selected endpoint-authentication profile must prevent replay of an old transcript onto another channel and must derive fresh traffic protection for that channel or session.
+
+The result is a local opaque capability:
+
+```text
+AuthenticatedPeerSession {
+    opaque_handle_capability,
+    mesh_context,
+    local_device_id,
+    remote_device_id
+}
+```
+
+Internally, the capability is bound to:
+
+- the authenticated channel or authenticated live-channel set;
+- the endpoint-authentication transcript;
+- the authenticated local principal;
+- current Open or Closed policy state;
+- current resource reservations;
+- one live runtime incarnation.
+
+It is not reconstructed from stored records, a session number, a route identifier, or a serialized handle.
+
+Every application send, receive, callback, and recovery action rechecks the live capability and current guards.
+
+## 7. Endpoint carriers and Hub introduction
+
+The current application-data path is native endpoint-authenticated WebRTC:
+direct where possible, otherwise configured standard TURN. Both preserve the
+same `AuthenticatedPeerSession(A, C)` relationship. TURN packet carriage
+changes latency, availability, cost, and metadata exposure; it does not make
+the TURN server the remote Device or application authority.
+
+Hubs consolidate discovery and bounded introduction. They do not carry
+application plaintext or ciphertext and cannot create an application session
+by introducing two endpoints. No custom encrypted route, Hub transit fallback,
+or Closed-member payload relay is permitted. If no authenticated direct/TURN
+path is usable, return the bounded unavailable/no-path result; never tunnel
+application data over signaling.
+
+### 7.1 Configuration and infrastructure boundary
+
+The new optional configuration is
+`introduction: Option<HubIntroductionPolicyConfig>`. The removed fields
+`closed_relay`, `application_transport`, `endpoint_cipher`, and
+`routing_policy`, and removed wire messages, must refuse rather than
+silently retain old forwarding semantics.
+
+TURN remains a distinct standard service when colocated with a Hub. Current
+service advertisements are URL-only; credentials are configured locally.
+Protected TURN credential distribution is not implemented. Bounded signaling
+setup/control and existing typed semantic-control remain permitted, but are
+not an application plaintext or ciphertext bus. Open/Closed governance,
+endpoint authentication, native opaque channels, realtime flows, and RPC
+retain their existing separation of authority.
+
+## 8. Endpoint close and infrastructure cleanup
+
+Endpoint channels and their native WebRTC/TURN work retain exact local
+ownership through shutdown. Cancellation or an expired wait does not prove
+native tasks joined, callbacks quiesced, or external TURN allocations released.
+Retire local endpoint capabilities and observe the owned terminal cleanup
+boundary before reporting completion; retain/report failures honestly.
+
+The former route-bound Open/Offer/Accept/Close, opaque member allocation, and
+custom route cipher requirements are superseded, not a new cleanup mechanism.
+A new owned-native-runtime proposal is not adopted here: necessity, ownership,
+and qualification must be established before any such implementation claim.
+Historical relay runs remain records of their exact source, not tests of this
+cutover.
+
+## 9. Reachability and freshness
+
+Reachability is a local evidence vector, not a durable global fact.
+
+A useful view may include:
+
+```text
+PeerReachabilityView {
+    durable_closed_authorization_projection,
+    signaling_response_observation,
+    candidate_and_channel_observations,
+    authenticated_session_state,
+    local_observation_ages
+}
+```
+
+Evidence strength for current application reachability is approximately:
+
+```text
+fresh authenticated session traffic
+    stronger than
+fresh endpoint-authenticated channel confirmation
+    stronger than
+fresh transport connectivity check
+    stronger than
+fresh signed presence response
+    stronger than
+receipt of cached durable state
+```
+
+Freshness is computed from local monotonic observation time. A remote or carrier timestamp does not establish local freshness.
+
+A failed probe or expired observation means `Unknown` or `FailedObservation`. It does not synthesize withdrawal, removal, or application denial.
+
+## 10. Signaling and application payload boundary
+
+The signaling and payload message spaces are disjoint.
+
+- Durable facts contain no application-payload variant.
+- Ephemeral transport-control messages contain no generic application bytes.
+- Signaling caches do not forward application packets.
+- A connector callback cannot directly deliver application payload before channel promotion.
+- Application payload requires a live `AuthenticatedPeerSession` capability.
+
+Physical multiplexing does not alter this rule. Signaling setup/control, endpoint authentication, and application packets may share a process, host, socket, or lower transport where a profile permits it, but immutable message classification, parser dispatch, keys, capabilities, queues, and effects remain non-substitutable.
+
+An intentional application intermediary is different. If B terminates an A-B application session, processes plaintext, and authors a new B-C application operation, B is an explicit application endpoint. That is not transparent MyOwnMesh relay behavior.
+
+## 11. Application and session-data-plane boundary
+
+Applications request an exact mesh context and remote Device ID. They do not construct durable facts, transport-control messages, candidates, routes, relay allocations, or endpoint-authentication transcripts.
+
+MyOwnMesh returns:
+
+- a derived roster view;
+- bounded reachability observations;
+- a live authenticated peer-session capability;
+- typed session lifecycle and diagnostics;
+- optional connector-native data-plane capabilities bound to that live session.
+
+The basal architecture does not define a `MediaLane`, video lane, audio lane, fixed codec, or fixed lane count. A connector may provide a native real-time flow mechanism, such as WebRTC RTP tracks, because transport-specific low-latency delivery is part of useful networking. MyOwnMesh owns binding that flow to the authenticated session, lifecycle, resource limits, backpressure, and safe delivery. The application owns codec choice, frame format, media purpose, track naming, screen/camera/audio meaning, composition, and product policy.
+
+A connector may provision native track objects before promotion under the bounded speculative-work rules. No encoded frame reaches an application, and no application frame is sent, until the associated session capability is live. Connector-native flow support is optional. A data-only connector remains conforming.
+
+Application authorization begins after session promotion. A mesh session proves the exact peer and context. It does not automatically grant a screen, file, camera, terminal, command, or other application capability.
+
+## 12. Optional causal contracts
+
+The durable semantic subsystem may host reviewed typed application contract domains. Those domains may add consensus, total ordering, blocks, replicated execution, threshold authorization, or economic mechanisms when their application semantics require them.
+
+Those mechanisms remain optional and domain-confined. They do not serialize ordinary pathfinding, reachability, relay allocation, packet carriage, or unrelated mesh facts.
+
+MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shaped network base. It is a usable hybrid network whose durable semantic component can also support causal contracts.
+
+## 13. Hard architectural invariants
+
+1. **Transport does work but does not create authority.** Transport hints and channels may drive bounded networking work. Device identity and mesh authority still require their exact proofs.
+2. **Security gates promotion, not path discovery.** A candidate may be attempted before endpoint authentication. Application use may not.
+3. **Open remains open.** Any authentic Device ID may self-participate under the Open rules.
+4. **Closed alone adds governance authorization.** Closed can be fully locked down under its selected proof system.
+5. **Durable facts and ephemeral transport control are distinct.** Only genuinely persistent meaning enters the durable semantic store.
+6. **Projection is durable semantic derivation only.** It does not create or forecast routes.
+7. **No route ledger is required.** Candidate, route, channel, and handoff state are live connector state unless a separate application domain explicitly chooses otherwise.
+8. **A working socket is not a session.** Endpoint authentication, mesh policy, local principal, and resources are required for promotion.
+9. **Carrier is not peer identity.** Direct and configured standard TURN WebRTC preserve the same authenticated endpoint relationship.
+10. **No custom member payload relay.** Hubs and Open/Closed members do not forward application plaintext or ciphertext.
+11. **No infrastructure-authorized handoff.** TURN and Hub services cannot promote an application-usable endpoint channel.
+12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
+13. **Reachability is positive local evidence.** Absence or expiry is not revocation.
+14. **Work owns resources before use.** Every protected allocation, retained value, task, queue entry, native object, and scheduled work unit holds a live finite lease from the applicable provider.
+15. **Semantic cardinality remains open.** Basal MyOwnMesh has no fixed maximum Mesh, peer, attempt, session, or flow count. Admission follows actual resource claims and current provider availability. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result in either direction.
+16. **Resource scopes do not mint capacity.** Child scopes share one finite process grant with no basal weights, quotas, shares, or partitions. The basal guarantees are properties, not an algorithm: claims never exceed the actual provider domain; only the exact owner releases a claim after cleanup, so no forged release exists and cleanup keeps the resources it needs; no scope mints capacity; unused capacity is work-conservingly borrowable; any isolation or reserved share is explicit local policy; and subdividing attribution beneath a fixed fairness root cannot increase that root's cumulative selections or cumulative admitted quantity in any dimension, and cannot move a competing root's selection later, because attribution child scopes refine accounting beneath one fairness root without creating another share or turn. The selection order, rotation rule, and pending-demand cardinality that satisfy those properties are concrete provider policy, not architecture. Capacity becomes reusable only after owner Drop following cleanup. Failed cleanup transfers the exact charge into retention. Nonreclaimable admitted pressure, ignored retirement, and failed cleanup can still prevent admission.
+17. **Time is not resource truth.** A slow operation may retain its finite lease indefinitely. Elapsed time alone cannot create, release, or invalidate resources or authority.
+18. **One reducer and session broker own promotion and semantic effects.** Adapters and callbacks cannot bypass the guards.
+19. **Complete eclipse is not claimed solved.** A carrier can withhold information and deny availability, but cannot forge the missing proofs.
+
+## 14. Owner decisions that remain explicit
+
+Owner review must select and test:
+
+1. Device ID, Mesh ID, and exact mesh-context encodings.
+2. Canonical durable-fact encoding, hash, signature profile, and test vectors.
+3. The Closed governance proof, conflict, recovery, and compaction rules.
+4. The durable fact families and optional application contract domains in each profile.
+5. The supported signaling carriers and ephemeral transport-control schemas.
+6. Connector profiles and required egress environments.
+7. Endpoint-authentication and channel-binding protocols.
+8. Direct/configured standard TURN WebRTC and Hub discovery/introduction-only requirements.
+9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
+10. Reachability observation and local path-selection policies.
+11. Session-handle sharing, recovery, and application lifecycle behavior.
+12. Measurements used for performance characterization, provider-cost estimation, regression detection, opaque-allocation discovery, and optional deployment policy.
+
+Required measurable evidence is separate from these owner selections. Before
+architecture compliance is called complete, durable runs must exercise: scale
+and exact `N+1` refusal for Open and Closed paths; Open/Closed separation with
+no runtime lifecycle fact; duplicate/no-op delivery with unchanged projection
+and storage usage; restart reconstruction of the exact Closed projection with
+no revived live handles; bounded checkpoint/reopen behavior; and terminal
+provider/resource baselines after success, refusal, failure, and shutdown.
+Source inspection or a unit result alone is not a compliance PASS, and this
+document records no final PASS without those durable runs.
+
+Item 9 is delivered as a provider and integration report, not as a dossier of chosen numbers. For each provider and deployment form, that report names which resource dimensions the provider exposes exactly, which are conservatively claimable, which are isolatable in a host-enforced domain, and which remain unobservable residuals. It records the concrete scheduling policy that provider implements, together with the evidence that the policy preserves the basal properties in section 5.1.
+
+No numeric product cardinality is inferred from a plausible default. Any numeric protocol or provider limit must be proven by that protocol or provider. Any optional local ceiling requires explicit owner selection and is never assumed present by basal conformance.

@@ -1,11 +1,10 @@
 # MyOwnMesh — one-command operations.
 # Install `just` (https://just.systems) then run `just setup` to get going.
 #
-# Mirrors the AllMyStuff Justfile (the shared porcelain: dev / kill / pull /
-# checkout / go / check) so every repo in the family drives the same way. The
-# differences here are the daemon-first extras: foreground `serve` with tuned
-# logging, connection tracing, and the static-musl appliance cross-builds
-# (NanoKVM riscv64, NanoKVM-Pro aarch64).
+# The common porcelain (dev / kill / pull / checkout / go / check) is kept to a
+# conventional shape so this repo drives like any other. The extras here are
+# daemon-first: foreground `serve` with tuned logging, connection tracing, and
+# the static-musl appliance cross-builds (NanoKVM riscv64, NanoKVM-Pro aarch64).
 #
 # `set shell` is used on Linux/macOS. On Windows the global
 # `windows-shell` override routes recipes through PowerShell so they find
@@ -283,9 +282,10 @@ check: fmt-check lint test gui-check
 # committed. The old `gh workflow run release.yml` used workflow_dispatch,
 # which resolves `main` at dispatch time and raced the preceding `git push`:
 # GitHub could still see the pre-bump HEAD, check that out, build the old
-# version, and fail the "Verify tag matches manifest versions" gate (this
-# bit AllMyStuff's v0.1.21 release). release.yml keeps its workflow_dispatch
-# trigger as a manual escape hatch for re-running an existing tag.
+# version, and fail the "Verify tag matches manifest versions" gate — a
+# failure mode observed in practice, not a theoretical one. release.yml keeps
+# its workflow_dispatch trigger as a manual escape hatch for re-running an
+# existing tag.
 [unix]
 [doc("Cut a release: bump versions, commit, push, tag to trigger the workflow.")]
 release VERSION:

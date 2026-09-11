@@ -41,7 +41,7 @@ myownmesh update status    # version, channel, policy, staged update
 myownmesh update check     # check the feed now and stage if permitted
 myownmesh config path      # print ~/.myownmesh/config.json
 myownmesh config edit      # open in $EDITOR
-myownmesh install caddy <domain>    # signaling WSS + TURN TCP/TLS + firewall setup
+myownmesh install caddy <domain>    # signaling WSS + TURN TLS on 5349 (isolated loopback backend)
 myownmesh caddy path       # print the Caddyfile location to edit
 ```
 
@@ -112,7 +112,7 @@ a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "auto_update": {
     "enabled": true,
     "channel": "stable",
@@ -127,14 +127,57 @@ a network issue. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md).
       "id": "home",
       "network_id": "my-cool-mesh",
       "label": "Home",
+      "kind": "open",
+      "semantic_policy": {
+        "max_fact_encoded_bytes": 65535,
+        "max_dependencies_per_fact": 64,
+        "max_authority_uses_per_fact": 32,
+        "max_authority_predecessors_per_use": 64,
+        "max_admitted_facts": 100000,
+        "max_admitted_bytes": 134217728,
+        "max_quarantined_facts": 4096,
+        "max_quarantined_bytes": 16777216,
+        "max_quarantined_facts_per_author": 256,
+        "max_quarantined_bytes_per_author": 4194304,
+        "max_retained_facts_per_author": 10000,
+        "max_retained_bytes_per_author": 16777216,
+        "max_dependency_edges": 1000000,
+        "max_ready_batch": 256,
+        "max_pending_proofs": 10000,
+        "max_pending_proof_bytes": 16777216,
+        "max_proof_records": 100000,
+        "max_proof_bytes": 67108864,
+        "max_proof_links": 100000,
+        "max_author_usage_rows": 100000,
+        "max_provisional_rows": 100000,
+        "max_transaction_dirty_main_pages": 1024,
+        "max_uncheckpointed_wal_frames": 1018,
+        "max_freelist_pages": 1024,
+        "max_fragmented_pages": 1024,
+        "max_main_journal_bytes": 8388608,
+        "max_database_bytes": 2147483648,
+        "max_wal_bytes": 8413072,
+        "wal_checkpoint_threshold_bytes": 4194192,
+        "emergency_reserve_bytes": 8388608
+      },
       "topology": { "kind": "ring", "n_preferred": 3 },
       "signaling": { "strategy": "nostr", "redundancy": 5 },
       "stun_servers": [{ "urls": ["stun:stun.myownmesh.com:3478"] }],
       "turn_servers": [
-        { "urls": ["turn:turn.myownmesh.com:3478", "turn:turn.myownmesh.com:3478?transport=tcp", "turns:turn.myownmesh.com:5349?transport=tcp"], "username": "guest", "credential": "theguestpassword" }
+        { "urls": ["turn:turn.myownmesh.com:3478"], "username": "guest", "credential": "theguestpassword" }
       ],
       "auto_approve": false
     }
   ]
 }
 ```
+
+`semantic_policy` is the complete owner-selected semantic storage policy.
+Its database and lifecycle limits are logical named-file reservations: they
+bound the main database, WAL/SHM, journal, provisional, checkpoint frames, proof,
+and dirty-page footprints that the process may retain. `max_wal_bytes` is the
+funded WAL envelope (retained frames plus one bounded transaction), while
+`wal_checkpoint_threshold_bytes` selects SQLite's automatic-checkpoint frame
+count. SQLite's default VFS owns locking, recovery, WAL reuse, and checkpoint
+execution. Neither setting guarantees physical disk space or prevents an
+operating-system `ENOSPC`.

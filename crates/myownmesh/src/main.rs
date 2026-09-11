@@ -49,7 +49,7 @@ enum Command {
     /// Install/start/stop/uninstall MyOwnMesh as a background OS service
     /// (systemd on Linux, launchd on macOS). Manages the daemon process
     /// lifecycle — distinct from `ctl services`, which toggles the mesh's
-    /// own hosted relay/STUN/TURN/signaling roles.
+    /// own hosted signaling relay/STUN/TURN roles.
     Service {
         /// Manage the system-wide service (root, starts at boot) instead
         /// of the default per-user service (no root, starts at login).
@@ -195,20 +195,10 @@ fn main() -> ExitCode {
         return cli::gui::launch();
     };
 
-    // Floor the worker-thread count. tokio defaults `worker_threads` to the CPU
-    // core count, which is 1 on constrained single-core devices (e.g. the
-    // NanoKVM's Sophgo SG2002 — one T-Head C906). With a single worker, one
-    // CPU-bound engine task (ICE / crypto during peer connection) monopolizes the
-    // only thread and starves everything else — most visibly the control socket,
-    // which then never answers `events_subscribe` and wedges the local IPC. A
-    // small floor lets the OS time-share the threads so the control socket and
-    // the ICE state machine keep making progress even while a peer is connecting.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(4);
+    // Tokio derives its worker count from host parallelism and honors the
+    // explicit TOKIO_WORKER_THREADS deployment override. MyOwnMesh does not
+    // manufacture a process worker floor before the resource provider exists.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
         .enable_all()
         .build()
     {
@@ -238,5 +228,33 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `serve` takes no compatibility flags, and the absence is the assertion.
+    ///
+    /// There were three: `--legacy-v1`, `--legacy-media`, and both together.
+    /// Each admitted a retired authority — pre-V4 application routing, and a
+    /// fixed H.264/Opus lane provider — so a build that still parses one can
+    /// still be asked to install it. Rejecting them at the CLI is the cheapest
+    /// place to prove the authority is gone rather than merely unused.
+    #[test]
+    fn serve_admits_no_compatibility_authority_flags() {
+        for flag in ["--legacy-v1", "--legacy-media"] {
+            assert!(
+                Cli::try_parse_from(["myownmesh", "serve", flag]).is_err(),
+                "`serve {flag}` must not parse: the authority it selected no longer exists"
+            );
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["myownmesh", "serve"])
+                .expect("plain serve still parses")
+                .command,
+            Some(Command::Serve)
+        ));
     }
 }

@@ -27,7 +27,6 @@ pub struct GeneratorBuilder {
     log2_size_minus_6: Option<u8>,
     skip_last_n: Option<u16>,
     interval: Option<Duration>,
-    max_nacks_per_tick: Option<usize>,
 }
 
 impl GeneratorBuilder {
@@ -50,13 +49,6 @@ impl GeneratorBuilder {
         self.interval = Some(interval);
         self
     }
-
-    /// Bound feedback work independently of the receive history. Truncating
-    /// one request does not mark or forget the remaining missing sequences.
-    pub fn with_max_nacks_per_tick(mut self, maximum: usize) -> GeneratorBuilder {
-        self.max_nacks_per_tick = Some(maximum.max(1));
-        self
-    }
 }
 
 impl InterceptorBuilder for GeneratorBuilder {
@@ -66,7 +58,6 @@ impl InterceptorBuilder for GeneratorBuilder {
             internal: Arc::new(GeneratorInternal {
                 log2_size_minus_6: self.log2_size_minus_6.unwrap_or(13 - 6), // 8192 = 1 << 13
                 skip_last_n: self.skip_last_n.unwrap_or_default(),
-                max_nacks_per_tick: self.max_nacks_per_tick.unwrap_or(usize::MAX),
                 interval: if let Some(interval) = self.interval {
                     interval
                 } else {
@@ -86,7 +77,6 @@ impl InterceptorBuilder for GeneratorBuilder {
 struct GeneratorInternal {
     log2_size_minus_6: u8,
     skip_last_n: u16,
-    max_nacks_per_tick: usize,
     interval: Duration,
 
     streams: Mutex<HashMap<u32, Arc<GeneratorStream>>>,
@@ -117,8 +107,6 @@ impl Generator {
         internal: Arc<GeneratorInternal>,
     ) -> Result<()> {
         let mut ticker = tokio::time::interval(internal.interval);
-        // Feedback describes the current holes, not historical timer ticks.
-        // After scheduler delay send once, then resume the normal cadence.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut close_rx = {
             let mut close_rx = internal.close_rx.lock().await;
@@ -137,8 +125,7 @@ impl Generator {
                         let mut nacks = vec![];
                         let streams = internal.streams.lock().await;
                         for (ssrc, stream) in streams.iter() {
-                            let mut missing = stream.missing_seq_numbers(internal.skip_last_n);
-                            missing.truncate(internal.max_nacks_per_tick);
+                            let missing = stream.missing_seq_numbers(internal.skip_last_n);
                             if missing.is_empty(){
                                 continue;
                             }

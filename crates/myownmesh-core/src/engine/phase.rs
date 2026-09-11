@@ -24,8 +24,8 @@ fn current(state: &Arc<NetworkState>) -> MeshPhase {
     let mut any_authenticated = false;
     let mut any_sighted = false;
     let mut any_reconnecting = false;
-    for entry in state.peers.iter() {
-        let data = entry.value().state.read();
+    state.peers.visit(|peer| {
+        let data = peer.state.read();
         match data.status {
             PeerStatus::Active | PeerStatus::Shelved => any_active = true,
             PeerStatus::PendingApproval => any_authenticated = true,
@@ -33,7 +33,7 @@ fn current(state: &Arc<NetworkState>) -> MeshPhase {
             PeerStatus::Reconnecting => any_reconnecting = true,
             PeerStatus::Offline | PeerStatus::Error => {}
         }
-    }
+    });
     if any_active {
         MeshPhase::Active
     } else if any_authenticated || any_sighted {

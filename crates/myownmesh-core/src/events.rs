@@ -110,12 +110,17 @@ pub enum PeerEvent {
     },
     /// Peer sent a valid `hello` + `auth_response`; signatures
     /// verify. The user has not yet been asked to approve them.
+    ///
+    /// It carries no capability advertisement, and deliberately not an empty
+    /// one either. Authentication happens before promotion, so at this point no
+    /// session owns anything the peer has said about itself; a field here could
+    /// only report a default nobody sent. What a peer offers arrives later, on
+    /// [`Self::CapabilitiesChanged`].
     Authenticated {
         network_id: String,
         device_id: DeviceId,
         label: String,
         verification_code: String,
-        capabilities: CapabilityAdvert,
         /// True when the peer is in the roster and will auto-approve
         /// without prompting.
         rostered: bool,
@@ -195,7 +200,6 @@ pub enum MeshEvent {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
-    use crate::protocol::CapabilityAdvert;
 
     /// Pin the outer tag name so adding a new event family doesn't
     /// silently collide with the inner `kind` tag again. The GUI's
@@ -254,20 +258,29 @@ mod wire_tests {
     /// Authenticated carries the verification code the GUI shows in
     /// the approval tile. Pin its presence so dropping the field
     /// from PeerEvent is caught here.
+    ///
+    /// The same serialization pins the *absence* of a capability
+    /// advertisement. Authentication precedes promotion, so an advert on this
+    /// event could only be a default no peer sent — and a consumer that read it
+    /// would be reading application metadata from a point where no session
+    /// owns any.
     #[test]
-    fn authenticated_carries_verification_code() {
+    fn authenticated_carries_verification_code_and_no_capabilities() {
         let ev = MeshEvent::Peer(PeerEvent::Authenticated {
             network_id: "home".into(),
             device_id: "abc".into(),
             label: "Phone".into(),
             verification_code: "ab12cd".into(),
-            capabilities: CapabilityAdvert::default(),
             rostered: false,
         });
         let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
         assert_eq!(
             v.get("verification_code").and_then(|v| v.as_str()),
             Some("ab12cd")
+        );
+        assert!(
+            v.get("capabilities").is_none(),
+            "an authenticated-but-unpromoted peer has advertised nothing: {v}"
         );
     }
 }

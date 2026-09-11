@@ -70,6 +70,36 @@ function Install-GuiFromZip([string]$zipPath) {
     Log "Installed: $exe"
 }
 
+function Assert-Sha256Sidecar([string]$payloadPath, [string]$sidecarPath, [string]$assetName) {
+    if (-not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
+        throw "Checksum payload is missing: $assetName"
+    }
+    if (-not (Test-Path -LiteralPath $sidecarPath -PathType Leaf)) {
+        throw "SHA256 sidecar is missing for $assetName"
+    }
+    $lines = @(Get-Content -LiteralPath $sidecarPath)
+    if ($lines.Count -ne 1 -or [string]::IsNullOrWhiteSpace($lines[0])) {
+        throw "Malformed or orphaned SHA256 sidecar for $assetName"
+    }
+    $parts = $lines[0].Trim() -split '\s+'
+    if ($parts.Count -ne 2) {
+        throw "Malformed or orphaned SHA256 sidecar for $assetName"
+    }
+    $expected = $parts[0]
+    $namedAsset = $parts[1]
+    if ($namedAsset.StartsWith('*')) {
+        $namedAsset = $namedAsset.Substring(1)
+    }
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$' -or $namedAsset -cne $assetName) {
+        throw "Malformed or orphaned SHA256 sidecar for $assetName"
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadPath).Hash
+    if ($expected.ToLowerInvariant() -cne $actual.ToLowerInvariant()) {
+        throw "SHA256 mismatch for $assetName"
+    }
+    Log "SHA256 OK"
+}
+
 function Try-Release {
     $api = "https://api.github.com/repos/$Repo/releases/latest"
     Log "Looking up latest release: $api"
@@ -96,14 +126,10 @@ function Try-Release {
         try {
             $shaFile = "$zip.sha256"
             Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
-            $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
-            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-            if ($expected -ne $actual) {
-                throw "SHA256 mismatch: expected $expected, got $actual"
-            }
-            Log "SHA256 OK"
+            Assert-Sha256Sidecar $zip $shaFile $asset
         } catch {
-            Warn "No SHA256 sidecar or check failed; skipping integrity check."
+            Warn "Release checksum verification failed: $($_.Exception.Message)"
+            return $false
         }
         Install-FromZip $zip
         return $true
@@ -138,18 +164,9 @@ function Try-ReleaseGui {
         $zip = Join-Path $tmp $guiAsset
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
         $shaUrl = "$url.sha256"
-        try {
-            $shaFile = "$zip.sha256"
-            Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
-            $expected = (Get-Content $shaFile -Raw).Split()[0].Trim().ToLower()
-            $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-            if ($expected -ne $actual) {
-                throw "SHA256 mismatch: expected $expected, got $actual"
-            }
-            Log "SHA256 OK"
-        } catch {
-            Warn "No SHA256 sidecar or check failed for GUI; skipping integrity check."
-        }
+        $shaFile = "$zip.sha256"
+        Invoke-WebRequest -Uri $shaUrl -OutFile $shaFile -UseBasicParsing
+        Assert-Sha256Sidecar $zip $shaFile $guiAsset
         Install-GuiFromZip $zip
         return $true
     } catch {

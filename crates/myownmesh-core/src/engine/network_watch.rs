@@ -55,7 +55,6 @@ use tracing::{debug, info};
 use crate::events::{DiagEntry, DiagLevel, MeshEvent};
 
 use super::ice_watchdog;
-use super::scheduler::NETWORK_CHANGE_RESTART_COOLDOWN_MS;
 use super::state::NetworkState;
 
 /// Snapshot of the OS's chosen primary outbound IPs **plus a fingerprint of
@@ -177,7 +176,7 @@ async fn probe_source(addr: SocketAddr) -> Option<IpAddr> {
 /// server is what makes the "primary source" answer meaningful on a
 /// multi-homed box: the interface that routes to *this mesh's* relays is
 /// the one whose changes matter here.
-async fn resolve_probe(state: &Arc<NetworkState>) -> Option<SocketAddr> {
+async fn resolve_probe(state: &Arc<NetworkState>, resolve_timeout_ms: u64) -> Option<SocketAddr> {
     let url = {
         let cfg = state.config.read();
         cfg.stun_servers
@@ -187,11 +186,14 @@ async fn resolve_probe(state: &Arc<NetworkState>) -> Option<SocketAddr> {
             .cloned()
     }?;
     let target = stun_probe_target(&url)?;
-    tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(target))
-        .await
-        .ok()?
-        .ok()?
-        .next()
+    tokio::time::timeout(
+        Duration::from_millis(resolve_timeout_ms),
+        tokio::net::lookup_host(target),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .next()
 }
 
 /// Convert the STUN URL shapes accepted by ICE into an unambiguous resolver
@@ -288,7 +290,7 @@ pub struct NetworkWatch {
     /// When we last fired a change-triggered ICE-restart fan-out. Used
     /// to coalesce the burst of primary-IP flips a Wi-Fi→cellular
     /// handoff produces into a single restart (see
-    /// `NETWORK_CHANGE_RESTART_COOLDOWN_MS`).
+    /// the configured network-change restart cooldown).
     last_restart_at: Option<Instant>,
     /// The mesh's own probe target (its first configured STUN host),
     /// resolved lazily and re-resolved on a slow TTL — never per tick.
@@ -310,7 +312,7 @@ impl NetworkWatch {
 
     /// Sample, compare, and fire the change handler if the primary
     /// outbound IPs moved — but at most once per
-    /// `NETWORK_CHANGE_RESTART_COOLDOWN_MS`. We always adopt the new
+    /// the configured network-change restart cooldown. We always adopt the new
     /// snapshot so further moves are still detected; we just don't pile
     /// a second restart onto the first one's in-flight gather while the
     /// network is still settling. Leading-edge: the first change in a
@@ -318,13 +320,17 @@ impl NetworkWatch {
     pub async fn poll(&mut self, state: &Arc<NetworkState>) {
         // Keep the probe target fresh on a slow TTL: the config's STUN host
         // can change, DNS can move — but a lookup per tick would be waste.
-        const PROBE_TTL: Duration = Duration::from_secs(300);
+        let policy = state
+            .config
+            .read()
+            .scheduler_policy()
+            .expect("scheduler policy is validated before engine side effects");
         if self
             .probe_checked_at
-            .is_none_or(|t| t.elapsed() >= PROBE_TTL)
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(policy.probe_ttl_ms))
         {
             self.probe_checked_at = Some(Instant::now());
-            self.probe = resolve_probe(state).await;
+            self.probe = resolve_probe(state, policy.probe_resolve_timeout_ms).await;
         }
         let current = NetworkSnapshot::sample(self.probe).await;
         let Some(last) = &self.last else {
@@ -372,7 +378,12 @@ impl NetworkWatch {
         // and-rebuild path.
         let now_offline = current.offline();
         let is_offline_edge = now_offline || state.is_offline();
-        if cooldown_coalesces(is_offline_edge, self.last_restart_at, now) {
+        if cooldown_coalesces_with_interval(
+            is_offline_edge,
+            self.last_restart_at,
+            now,
+            policy.network_change_restart_cooldown_ms,
+        ) {
             debug!(
                 network = %state.network_id,
                 prev_v4 = ?prev.v4, next_v4 = ?current.v4,
@@ -415,17 +426,32 @@ fn is_benign_secondary_churn(prev: &NetworkSnapshot, current: &NetworkSnapshot) 
 /// Whether a network change should be coalesced (skipped) under the
 /// restart cooldown. Offline edges — going down, or returning from down —
 /// are never coalesced; only an online→online primary-IP flip within
-/// [`NETWORK_CHANGE_RESTART_COOLDOWN_MS`] of the last restart is.
+/// the configured network-change restart cooldown of the last restart is.
+#[cfg(test)]
 fn cooldown_coalesces(
     is_offline_edge: bool,
     last_restart_at: Option<Instant>,
     now: Instant,
 ) -> bool {
+    cooldown_coalesces_with_interval(
+        is_offline_edge,
+        last_restart_at,
+        now,
+        crate::config::SchedulerPolicyConfig::DEFAULT.network_change_restart_cooldown_ms,
+    )
+}
+
+fn cooldown_coalesces_with_interval(
+    is_offline_edge: bool,
+    last_restart_at: Option<Instant>,
+    now: Instant,
+    cooldown_ms: u64,
+) -> bool {
     if is_offline_edge {
         return false;
     }
     last_restart_at
-        .map(|t| now.duration_since(t) < Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS))
+        .map(|t| now.duration_since(t) < Duration::from_millis(cooldown_ms))
         .unwrap_or(false)
 }
 
@@ -520,6 +546,9 @@ async fn on_network_change(
 /// not timed — if signaling never returns there is nothing to offer into
 /// anyway, and the moment it does, this fires.
 async fn redial_then_fan_out(state: &Arc<NetworkState>) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let mut connected_rx = state.relay_connected_rx();
     if let Some(rx) = connected_rx.as_mut() {
         rx.borrow_and_update();
@@ -534,17 +563,25 @@ async fn redial_then_fan_out(state: &Arc<NetworkState>) {
     // if the redial didn't take, fan out inline as before.
     if redialing {
         if let Some(mut rx) = connected_rx {
-            let state = state.clone();
-            tokio::spawn(async move {
-                // Wakes when a relay establishes a fresh session; errs only if
-                // the driver shut down (nothing left to renegotiate).
-                if rx.changed().await.is_ok() {
-                    debug!(
-                        network = %state.network_id,
-                        "relay reconnected — renegotiating"
-                    );
-                    fan_out_restart(&state).await;
-                }
+            let task_state = state.clone();
+            state.register_shutdown_task(&shutdown_permit, || {
+                tokio::spawn(async move {
+                    // Wakes when a relay establishes a fresh session; errs only if
+                    // the driver shut down (nothing left to renegotiate).
+                    tokio::select! {
+                        biased;
+                        _ = task_state.wait_for_shutdown() => {}
+                        result = rx.changed() => {
+                            if result.is_ok() {
+                                debug!(
+                                    network = %task_state.network_id,
+                                    "relay reconnected — renegotiating"
+                                );
+                                fan_out_restart(&task_state).await;
+                            }
+                        }
+                    }
+                })
             });
             return;
         }
@@ -611,7 +648,7 @@ pub(crate) async fn reconnect_peer_in_place(state: &Arc<NetworkState>, device_id
     // the link is quiet despite what ICE reports, the same reason the
     // network-change watcher passes `force = true`. A no-op if we hold no
     // session for the peer.
-    super::renegotiate_ice(state, device_id, true, "manual-reconnect", None).await;
+    super::renegotiate_ice(state, device_id, true, "manual-reconnect").await;
     // If we'd lost the peer entirely, nudge discovery (and flush any owed
     // offer) so it rebuilds rather than waiting for its own announce schedule.
     super::try_reoffer(state, device_id).await;
@@ -623,15 +660,6 @@ pub(crate) async fn reconnect_peer_in_place(state: &Arc<NetworkState>, device_id
 /// relay is confirmed back (see [`on_network_change`]).
 async fn fan_out_restart(state: &Arc<NetworkState>) {
     ice_watchdog::force_ice_restart_all(state).await;
-    // `force_ice_restart_all` coalesces active peers into the pressure-
-    // deferred set while the circuit is open. Do not flush reconnect intents
-    // now: `flush_reconnect_intents` advances their backoff, while every
-    // `try_reoffer` would be suppressed — a lost-wakeup collision. The
-    // successful capacity probe replays deferred restarts and the normal
-    // supervisor services still-due reconnect intents afterward.
-    if state.local_socket_recovery_active() {
-        return;
-    }
     // Re-offer every peer we owe an offer to (offerer-role peers dropped on
     // the way down). A fresh relay session after a handoff is exactly when a
     // dropped peer's offer can finally cross — flush them all at once here,
@@ -683,21 +711,6 @@ mod tests {
         ] {
             assert_eq!(stun_probe_target(invalid), None, "{invalid}");
         }
-    }
-
-    #[tokio::test]
-    async fn pressure_deferred_fanout_does_not_consume_reconnect_intents() {
-        let state = crate::engine::build_test_state("pressure-network-fanout");
-        state.record_reconnect_intent("peer-a", false);
-        assert!(state.note_local_socket_pressure());
-
-        fan_out_restart(&state).await;
-
-        assert_eq!(
-            state.due_reconnect_intents(),
-            vec!["peer-a".to_string()],
-            "a fan-out suppressed by pressure must leave the intent immediately due"
-        );
     }
 
     #[test]
@@ -842,8 +855,10 @@ mod tests {
     #[test]
     fn online_flip_coalesces_only_within_the_window() {
         let base = Instant::now();
-        let within = base + Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS / 2);
-        let after = base + Duration::from_millis(NETWORK_CHANGE_RESTART_COOLDOWN_MS + 1);
+        let cooldown_ms =
+            crate::config::SchedulerPolicyConfig::DEFAULT.network_change_restart_cooldown_ms;
+        let within = base + Duration::from_millis(cooldown_ms / 2);
+        let after = base + Duration::from_millis(cooldown_ms + 1);
         assert!(
             cooldown_coalesces(false, Some(base), within),
             "a flip inside the window coalesces onto the in-flight restart"

@@ -30,6 +30,7 @@ pub mod fullmesh;
 pub mod hubs;
 pub mod ring;
 pub mod star;
+pub mod tree;
 
 /// Strategy for the local shape decisions. Implementations MUST be
 /// pure: given the same inputs they must return the same answer on
@@ -68,11 +69,37 @@ pub trait Topology: Send + Sync {
     }
 
     /// Where `self_id` should send a frame destined for `dest` when
-    /// `dest` isn't directly connected: the next hop(s) to try, best
-    /// first, drawn from `connected`. Empty = no route (the caller
-    /// surfaces the delivery failure honestly rather than guessing).
-    fn next_hops(&self, _self_id: &str, _dest: &str, _connected: &[String]) -> Vec<String> {
+    /// `dest` isn't directly connected: at most `limit` next hop(s) to
+    /// try, best first, drawn from `connected`. `limit == 0` always
+    /// returns an empty list. Empty = no route (the caller surfaces the
+    /// delivery failure honestly rather than guessing).
+    ///
+    /// Implementations must retain only O(`limit`) candidate state while
+    /// scanning `connected`; they must not materialize or sort the whole
+    /// connected set merely to apply the bound.
+    fn next_hops(
+        &self,
+        _self_id: &str,
+        _dest: &str,
+        _connected: &[String],
+        _limit: usize,
+    ) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whether an authenticated current primary parent may be placed first
+    /// in the route plan. This is only a topology preference: the caller
+    /// must already have included the exact parent in its authenticated
+    /// connected snapshot, and all ordinary route checks still apply.
+    /// Legacy selectors keep their existing behavior by declining it.
+    fn preferred_next_hop(
+        &self,
+        _self_id: &str,
+        _dest: &str,
+        _connected: &[String],
+        _preferred_parent: &str,
+    ) -> bool {
+        false
     }
 
     /// Hop budget for forwarded frames under this mode. Loop safety
@@ -98,6 +125,15 @@ pub fn from_mode(mode: &TopologyMode) -> Box<dyn Topology> {
             spoke_redundancy: spoke_redundancy
                 .unwrap_or(TopologyMode::DEFAULT_SPOKE_REDUNDANCY)
                 .max(1),
+        }),
+        TopologyMode::HubTree {
+            root,
+            hubs,
+            backup_candidates,
+        } => Box::new(tree::HubTreeSelector {
+            root: root.clone(),
+            hubs: hubs.clone(),
+            backup_candidates: *backup_candidates,
         }),
         TopologyMode::FullMesh => Box::new(fullmesh::FullMeshSelector),
     }

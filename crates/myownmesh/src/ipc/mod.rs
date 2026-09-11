@@ -11,7 +11,8 @@
 //!   synthetic `Rpc::serve` that routes inbound peer calls to
 //!   the claiming client's event socket as `RpcInbound` events.
 //!   The client posts `RpcRespond` / `RpcStreamChunk` /
-//!   `RpcStreamEnd` requests back over the same connection;
+//!   `RpcStreamEnd` requests over command connections carrying the exact
+//!   capability minted for that event connection;
 //!   those resolve the engine-side `oneshot` / `mpsc` the
 //!   library handler returned.
 //!
@@ -38,9 +39,37 @@
 
 pub mod bridge;
 pub mod clients;
-pub mod media_queue;
+/// Cleanup storage whose funding and whose allocation are the same value's.
+///
+/// Crate-private: nothing outside this daemon hands a caller a funded
+/// collection, and an embedder that could build one could push into it
+/// without a lease.
+mod leased;
 pub mod wire;
 
+#[cfg(test)]
+pub use clients::{FanoutBarrier, RegistryResidue};
+/// Channel-route lifecycle machinery, which is this daemon's own and not an
+/// embedder's authority.
+///
+/// Crate-visible rather than public, and the distinction is real: an embedder
+/// that could name a [`clients::RouteReady`] could wait on an install it does
+/// not own, and one that could name a [`clients::RouteCancellation`] could stop
+/// a pump the daemon is accounting for. Nothing outside this crate has a reason
+/// to hold either. Their owners -- [`clients::ChannelJoin`] and
+/// [`clients::RetiredRoute`] -- travel with them for the same reason and to keep
+/// their effective visibility matched, which is what stops a public signature
+/// naming a crate-private type.
+pub(crate) use leased::LeasedList;
+
 #[allow(unused_imports)]
-pub use clients::{ClientHandle, ClientId, ClientRegistry};
+pub(crate) use clients::{
+    ChannelFanout, ChannelFanoutStep, ChannelJoin, RetiredRoute, RouteCancellation, RouteOwner,
+    RouteReady,
+};
+#[allow(unused_imports)]
+pub use clients::{
+    ClientHandle, ClientId, ClientRegistry, ForgottenMethod, HandlerGeneration, Lifecycle,
+    MethodRelease, RealtimeFlowCapability, TaskAdmission, UnregisteredClient, WeakClientRegistry,
+};
 pub use wire::ServerOut;

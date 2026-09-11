@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
+use crate::config::SchedulerPolicyConfig;
 use crate::protocol::{keepalive::PingMessage, MeshMessage};
 
 use super::connection::PeerStatus;
-use super::scheduler::{WAKE_COALESCE_MS, WAKE_DETECTION_THRESHOLD_MS, WAKE_PROBE_DELAY_MS};
 use super::state::{NetworkState, SignalingOutbound};
 
 /// Local detector — tracks the last observed tick instant and
@@ -37,16 +37,31 @@ impl WakeDetector {
     /// `interval_ms`. If the gap to the previous tick exceeds
     /// `WAKE_DETECTION_THRESHOLD_MS` the next call to
     /// [`Self::take_wake_event`] returns `true`.
+    #[cfg(test)]
     pub fn observe(&mut self, now: Instant, interval_ms: u64) {
+        self.observe_with_policy(now, interval_ms, &SchedulerPolicyConfig::default());
+    }
+
+    /// Observe with the checked per-network scheduler policy.
+    pub fn observe_with_policy(
+        &mut self,
+        now: Instant,
+        interval_ms: u64,
+        policy: &SchedulerPolicyConfig,
+    ) {
         if let Some(prev) = self.last_tick_at {
             let gap = now.saturating_duration_since(prev).as_millis() as u64;
-            let threshold = WAKE_DETECTION_THRESHOLD_MS.max(interval_ms * 2);
+            let threshold = policy
+                .heartbeat_interval_ms
+                .checked_mul(2)
+                .expect("validated scheduler heartbeat interval is representable")
+                .max(interval_ms.saturating_mul(2));
             if gap > threshold {
                 let stale_window = self
                     .last_wake_at
                     .map(|t| now.saturating_duration_since(t).as_millis() as u64)
                     .unwrap_or(u64::MAX);
-                if stale_window > WAKE_COALESCE_MS {
+                if stale_window > policy.wake_coalesce_ms {
                     self.pending = true;
                     self.last_wake_at = Some(now);
                 }
@@ -73,6 +88,18 @@ impl Default for WakeDetector {
 /// schedule a follow-up sweep after `WAKE_PROBE_DELAY_MS` to see
 /// who responded.
 pub async fn on_wake(state: &Arc<NetworkState>) {
+    // Linearize the entire wake operation before any announce, reconnect,
+    // peer timestamp, ping, or delayed-task registration.  A caller arriving
+    // after shutdown has requested its terminal transition must be silent;
+    // an admitted caller keeps this witness until all wake work is complete.
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
+    let policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     debug!(network = %state.network_id, "tier 2 wake probe");
 
     // Re-advertise immediately on resume. While this node was paused
@@ -84,8 +111,9 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
     // (see `handle_signaling_inbound`) makes neighbors re-announce
     // within ~1 s, so the round-trip rebuild lands in seconds. One
     // send per wake event — wake events are coalesced upstream by
-    // WAKE_COALESCE_MS, and reflected announces are rate-limited by
-    // REACTIVE_ANNOUNCE_MIN_INTERVAL_MS, so this can't storm the relay.
+    // the configured wake-coalescing interval, and reflected announces are
+    // rate-limited by the configured reactive-announce interval, so this
+    // can't storm the relay.
     let _ = state.signaling_tx.send(SignalingOutbound::Announce);
 
     // The announce above is useless if it's written to a dead socket.
@@ -102,71 +130,94 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
         debug!(network = %state.network_id, "wake — forcing relay reconnect");
     }
 
-    let active: Vec<(String, u64)> = state
-        .peers
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.value().state.read().status,
-                PeerStatus::Active | PeerStatus::Shelved
-            )
-        })
-        .map(|e| (e.key().clone(), e.value().epoch))
-        .collect();
+    let active: Vec<_> = state.peers.collect_map(|peer| {
+        matches!(
+            peer.state.read().status,
+            PeerStatus::Active | PeerStatus::Shelved
+        )
+        .then(|| state.peers.owner(&peer.device_id))
+        .flatten()
+    });
     let now = monotonic_ms();
-    for (peer_id, _) in &active {
-        if let Some(peer) = state.peers.get(peer_id) {
+    for owner in &active {
+        let peer_id = owner.device_id();
+        if let Some(peer) = state.peers.get_if_current(owner) {
             peer.state.write().last_ping_t = Some(now);
         }
         if let Err(e) =
-            super::send_to_peer(state, peer_id, &MeshMessage::Ping(PingMessage { t: now })).await
+            super::send_to_peer_owner(state, owner, &MeshMessage::Ping(PingMessage { t: now }))
+                .await
         {
             tracing::trace!(peer = %peer_id, "wake-probe ping failed: {e}");
         }
     }
 
     // Wait the probe delay then check who responded. Anyone still
-    // silent is escalated.
-    let state_clone = state.clone();
-    let peers = active;
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(WAKE_PROBE_DELAY_MS)).await;
-        let now = Instant::now();
-        let mut any_rebuilt = false;
-        for (peer_id, epoch) in peers {
-            let stale = {
-                let Some(peer) = state_clone.peers.get(&peer_id) else {
+    // silent is escalated. The delayed probe owns no state, peer, or worker
+    // while asleep: promotion or shutdown makes its weak witness fail closed.
+    let weak_state = Arc::downgrade(state);
+    let peers: Vec<_> = active
+        .into_iter()
+        .filter_map(|owner| {
+            let peer = state.peers.get_if_current(&owner)?;
+            let worker = peer.current_worker()?;
+            Some(owner.for_worker(worker).downgrade())
+        })
+        .collect();
+    state.register_cancellable_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(policy.wake_probe_delay_ms)).await;
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            if shutdown_requested_now(&state).await {
+                return;
+            }
+            let now = Instant::now();
+            let mut any_rebuilt = false;
+            for weak_owner in peers {
+                let Some(owner) = weak_owner.upgrade() else {
                     continue;
                 };
-                if peer.epoch != epoch {
-                    continue;
+                let peer_id = owner.device_id().to_string();
+                let stale = {
+                    let Some(peer) = state.peers.get_if_current(&owner) else {
+                        continue;
+                    };
+                    let data = peer.state.read();
+                    data.last_recv_at
+                        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                        .unwrap_or(u64::MAX)
+                        > policy.wake_probe_delay_ms
+                };
+                if stale {
+                    // The peer didn't answer the wake probe — its transport
+                    // didn't survive the suspend. Re-handshaking over a dead
+                    // channel can't work; rebuild and let discovery
+                    // re-establish it (same reasoning as the heartbeat path).
+                    debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
+                    super::drop_peer_if_current(
+                        &state,
+                        &owner,
+                        crate::events::DropReason::HeartbeatTimeout,
+                    )
+                    .await;
+                    any_rebuilt = true;
                 }
-                let data = peer.state.read();
-                data.last_recv_at
-                    .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                    .unwrap_or(u64::MAX)
-                    > WAKE_PROBE_DELAY_MS
-            };
-            if stale {
-                // The peer didn't answer the wake probe — its transport
-                // didn't survive the suspend. Re-handshaking over a dead
-                // channel can't work; rebuild and let discovery
-                // re-establish it (same reasoning as the heartbeat path).
-                debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
-                let dropped = super::drop_peer_if_epoch(
-                    &state_clone,
-                    &peer_id,
-                    epoch,
-                    crate::events::DropReason::HeartbeatTimeout,
-                )
-                .await;
-                any_rebuilt |= dropped;
             }
-        }
-        if any_rebuilt {
-            super::maybe_reactive_announce(&state_clone);
-        }
+            if any_rebuilt && !shutdown_requested_now(&state).await {
+                super::maybe_reactive_announce(&state);
+            }
+        })
     });
+}
+
+async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
+    tokio::select! {
+        biased;
+        _ = state.wait_for_shutdown() => true,
+        _ = std::future::ready(()) => false,
+    }
 }
 
 fn monotonic_ms() -> i64 {
@@ -192,7 +243,12 @@ mod tests {
             .expect("outbound signaling rx should be available");
         on_wake(&state).await;
         assert!(
-            matches!(rx.try_recv(), Ok(SignalingOutbound::Announce)),
+            matches!(
+                rx.try_recv()
+                    .as_ref()
+                    .map(crate::resource::ResourceMailboxDelivery::value),
+                Some(SignalingOutbound::Announce)
+            ),
             "on_wake must emit a fresh announce"
         );
     }
@@ -217,6 +273,48 @@ mod tests {
             rx.has_changed().unwrap(),
             "on_wake must bump the relay-reconnect signal"
         );
+    }
+
+    #[tokio::test]
+    async fn on_wake_after_shutdown_is_silent_and_registers_no_probe() {
+        let state = crate::engine::build_test_state("wake-after-shutdown");
+        let mut outbound = state
+            .take_signaling_outbound_rx()
+            .expect("outbound signaling rx should be available");
+        let peer = std::sync::Arc::new(crate::engine::connection::PeerConnection::new(
+            "wake-shutdown-peer".to_string(),
+            None,
+        ));
+        peer.state.write().status = PeerStatus::Active;
+        peer.state.write().last_ping_t = Some(17);
+        assert!(state.peers.install(peer).is_none());
+        let before = state
+            .peers
+            .get("wake-shutdown-peer")
+            .expect("test peer should be installed")
+            .state
+            .read()
+            .last_ping_t;
+
+        // Closing the state before entry must make the wake a no-op.  The
+        // entry permit is also the witness that prevents a delayed probe
+        // registration; shutdown then drains the registry without a task.
+        state.request_shutdown();
+        on_wake(&state).await;
+
+        let after = state
+            .peers
+            .get("wake-shutdown-peer")
+            .expect("shutdown does not remove this control peer yet")
+            .state
+            .read()
+            .last_ping_t;
+        assert_eq!(after, before, "late wake must not mutate last_ping_t");
+        assert!(
+            outbound.try_recv().is_none(),
+            "late wake must not publish announce or ping traffic"
+        );
+        state.shutdown().await;
     }
 
     #[test]

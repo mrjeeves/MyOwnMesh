@@ -4,8 +4,7 @@
 //! every boundary, so the wedge — invisible in the daemon because nothing in
 //! the window logs — names its own stage. Run on the device:
 //!
-//!   scp spin_probe root@<device>:/tmp/ && ssh root@<device> \
-//!     'MYOWNMESH_MEDIA_LANES=1 /tmp/spin_probe'
+//!   scp spin_probe root@<device>:/tmp/ && ssh root@<device> '/tmp/spin_probe'
 //!
 //! Stage D runs with empty ICE servers, stage F with the public-venue
 //! STUN+TURN defaults (what the daemon actually passes) — if only F wedges,
@@ -14,6 +13,36 @@
 //! spun. Primitives are sanity-checked first so a codegen-level failure in
 //! the arithmetic the window depends on would show before any webrtc code.
 use std::time::Duration;
+
+fn callback_grant() -> myownmesh_core::TransportLabCallbackGrant {
+    let raw = std::env::var("MYOWNMESH_LAB_CALLBACK_CAPACITY")
+        .expect("set MYOWNMESH_LAB_CALLBACK_CAPACITY for this transport-lab probe");
+    let capacity = std::num::NonZeroUsize::new(
+        raw.parse::<usize>()
+            .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be an integer"),
+    )
+    .expect("MYOWNMESH_LAB_CALLBACK_CAPACITY must be nonzero");
+    // Same reason as `spin_min`: this probe's transport installs no connector
+    // resource policy, so the connector funds itself from this grant and every
+    // number in it has to be stated by the probe.
+    myownmesh_core::TransportLabCallbackGrant {
+        control_slots: capacity,
+        endpoint_slots: capacity,
+        control_payload_bytes: std::num::NonZeroUsize::new(4_096)
+            .expect("the probe control payload ceiling is nonzero"),
+        endpoint_payload_bytes: std::num::NonZeroUsize::new(4_096)
+            .expect("the probe endpoint payload ceiling is nonzero"),
+        // The reserved open and close plus the three pending observations this
+        // probe can produce. Stated here for the same reason every other number
+        // in this grant is.
+        observation_slots: std::num::NonZeroUsize::new(5)
+            .expect("the probe lifecycle slot count is nonzero"),
+    }
+}
+
+fn callback_policy() -> myownmesh_core::ConnectorCallbackPolicy {
+    myownmesh_core::ConnectorCallbackPolicy::elastic_data_only()
+}
 
 fn jiffies() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
@@ -65,7 +94,7 @@ async fn main() {
         jiffies() - j0
     );
 
-    // B. transport (lane count from env, like the daemon).
+    // B. transport, constructed exactly as the daemon does.
     let Some(Ok(t)) = staged("B Transport::new", async {
         myownmesh_core::transport::Transport::new()
     })
@@ -77,7 +106,14 @@ async fn main() {
     // C+D. open_peer + create_offer with EMPTY ICE servers.
     if let Some(Ok((session, _rx))) = staged(
         "C open_peer(Offerer, no ICE servers)",
-        t.open_peer(myownmesh_core::transport::Role::Offerer, &[], &[]),
+        myownmesh_core::engine::transport_lab::open_peer(
+            &t,
+            myownmesh_core::transport::Role::Offerer,
+            &[],
+            &[],
+            callback_policy(),
+            callback_grant(),
+        ),
     )
     .await
     {
@@ -93,7 +129,14 @@ async fn main() {
     let turn = myownmesh_core::config::default_turn_servers();
     if let Some(Ok((session, _rx))) = staged(
         "E open_peer(Offerer, public-venue STUN+TURN)",
-        t.open_peer(myownmesh_core::transport::Role::Offerer, &stun, &turn),
+        myownmesh_core::engine::transport_lab::open_peer(
+            &t,
+            myownmesh_core::transport::Role::Offerer,
+            &stun,
+            &turn,
+            callback_policy(),
+            callback_grant(),
+        ),
     )
     .await
     {

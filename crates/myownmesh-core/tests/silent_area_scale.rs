@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! A silent area at scale, measured: one operator node and N member
 //! boxes on a **Silent** mesh, over the real engine + WebRTC transport
 //! (in-process `LocalBroker` signaling, loopback ICE). This is the
@@ -30,29 +32,39 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::state::NetworkState;
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::config::{NetworkConfig, NetworkKind, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::connection::PeerStatus;
+use myownmesh_core::engine::transport_lab::NetworkState;
+use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
-use myownmesh_core::NetworkKind;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 
 const CHANNEL: &str = "area-probe";
 const NETWORK_ID: &str = "silent-area-scale";
+const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
+const REDIAL_INTERVAL: Duration = Duration::from_secs(4);
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn silent_cfg(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: NETWORK_ID.into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        semantic_policy: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        hub: None,
+        local_observations: None,
+        tree: None,
+        introduction: None,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -79,11 +91,96 @@ async fn spawn_node(label: &str, transport: &Transport, broker: &LocalBroker) ->
     }
 }
 
-fn authenticated(state: &Arc<NetworkState>, peer: &str) -> bool {
-    state
-        .peer_info(peer)
-        .map(|p| p.authenticated)
-        .unwrap_or(false)
+fn admitted(state: &Arc<NetworkState>, peer: &str) -> bool {
+    state.peer_info(peer).is_some_and(|peer| {
+        peer.authenticated && matches!(peer.status, PeerStatus::Active | PeerStatus::Shelved)
+    })
+}
+
+/// One side's view of a peer, or the absence of a record for it.
+///
+/// Read from the existing `PeerInfo` snapshot; nothing new is exposed. Called
+/// only from the failure path, so an ordinary passing run never evaluates it.
+///
+/// **These describe whichever peer record exists under this device id at the
+/// instant of the read, and nothing else.** A record that was rebuilt has
+/// already replaced the one before it, so `hello_sent`, `local_approve_sent`,
+/// `remote_approve_seen` and `selected_pair` carry no evidence about an attempt
+/// that was abandoned first and must not be read as if they did.
+fn peer_state(state: &Arc<NetworkState>, peer: &str) -> String {
+    match state.peer_info(peer) {
+        Some(info) => format!(
+            "authenticated={} status={:?} local_shelved={} remote_shelved={} hello_sent={} local_approve_sent={} remote_approve_seen={} selected_pair={}",
+            info.authenticated,
+            info.status,
+            info.local_shelved,
+            info.remote_shelved,
+            info.verification_code_sent.is_some(),
+            info.local_approve_sent,
+            info.remote_approve_seen,
+            info.selected_pair.is_some(),
+        ),
+        None => "no peer record".to_string(),
+    }
+}
+
+/// Both sides' admission state for every member, plus the provider's own
+/// capacity, at the instant a wait gave up.
+///
+/// Built only on a failing path, so a passing run pays nothing for it. Both
+/// directions are reported because `admitted` is a conjunction over them: a
+/// member the operator still holds but which no longer holds the operator is a
+/// different fault from one that never came up. The two provider reports
+/// separate a refusal on capacity from a refusal with capacity to spare.
+fn admission_diagnostic(operator: &Node, spokes: &[Node], transport: &Transport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, spoke) in spokes.iter().enumerate() {
+        let _ = write!(
+            out,
+            "\n  member-{i}: operator sees [{}] · member sees [{}]",
+            peer_state(&operator.state, &spoke.id),
+            peer_state(&spoke.state, &operator.id),
+        );
+    }
+    let _ = write!(
+        out,
+        "\n  process resources: {:?}\n  mesh resources: {:?}",
+        transport.connector_resource_report(),
+        transport.mesh_connector_resource_report(),
+    );
+    out
+}
+
+async fn converge_all_operator_sessions(operator: &Node, spokes: &[Node], transport: &Transport) {
+    let deadline = Instant::now() + DIAL_TIMEOUT;
+    let mut next_dial = Instant::now();
+    loop {
+        let admitted_count = spokes
+            .iter()
+            .filter(|spoke| {
+                admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id)
+            })
+            .count();
+        if admitted_count == spokes.len() {
+            return;
+        }
+        if Instant::now() >= next_dial {
+            for spoke in spokes.iter().filter(|spoke| {
+                !admitted(&operator.state, &spoke.id) || !admitted(&spoke.state, &operator.id)
+            }) {
+                operator.state.connect_peer(&spoke.id);
+            }
+            next_dial = Instant::now() + REDIAL_INTERVAL;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {admitted_count}/{} operator sessions were concurrently admitted before the existing dial deadline{}",
+            spokes.len(),
+            admission_diagnostic(operator, spokes, transport)
+        );
+        tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
+    }
 }
 
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
@@ -108,7 +205,7 @@ fn report(label: &str, mut samples_ms: Vec<f64>) {
 async fn run_area(n_spokes: usize) {
     let started = Instant::now();
     let broker = LocalBroker::new();
-    let transport = Transport::new().expect("transport");
+    let transport = support::test_transport();
 
     let operator = spawn_node("operator", &transport, &broker).await;
     let mut spokes = Vec::with_capacity(n_spokes);
@@ -146,14 +243,14 @@ async fn run_area(n_spokes: usize) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     for (i, spoke) in spokes.iter().enumerate() {
         assert!(
-            !authenticated(&spoke.state, &operator.id),
-            "member-{i} authenticated to the operator without a deliberate dial"
+            !admitted(&spoke.state, &operator.id),
+            "member-{i} was admitted to the operator without a deliberate dial"
         );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
-                    "member-{i} authenticated to member-{j} on a silent mesh"
+                    !admitted(&spoke.state, &other.id),
+                    "member-{i} was admitted to member-{j} on a silent mesh"
                 );
             }
         }
@@ -169,35 +266,44 @@ async fn run_area(n_spokes: usize) {
     let mut dial_ms = Vec::with_capacity(n_spokes);
     for spoke in &spokes {
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_secs(60);
+        let deadline = t0 + DIAL_TIMEOUT;
         let mut next_dial = Instant::now();
         loop {
             if Instant::now() >= next_dial {
                 operator.state.connect_peer(&spoke.id);
-                next_dial = Instant::now() + Duration::from_secs(4);
+                next_dial = Instant::now() + REDIAL_INTERVAL;
             }
-            if authenticated(&operator.state, &spoke.id)
-                && authenticated(&spoke.state, &operator.id)
-            {
+            if admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id) {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "operator dial to {} did not come up in 60s",
-                spoke.id
+                "operator dial to {} did not come up in 60s{}",
+                spoke.id,
+                admission_diagnostic(&operator, &spokes, &transport)
             );
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
         }
         dial_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     report("dial connect→session", dial_ms);
 
+    // Sequential latency sampling can leave an early session stale while a
+    // slow runner brings up later sessions. Re-drive only missing pairs and
+    // require one simultaneous admitted snapshot before testing N-session
+    // shape or application delivery.
+    converge_all_operator_sessions(&operator, &spokes, &transport).await;
+
     // ---- the area shape holds under N sessions --------------------------
     for (i, spoke) in spokes.iter().enumerate() {
+        assert!(
+            admitted(&operator.state, &spoke.id) && admitted(&spoke.state, &operator.id),
+            "member-{i} is not mutually admitted to the operator"
+        );
         for (j, other) in spokes.iter().enumerate() {
             if i != j {
                 assert!(
-                    !authenticated(&spoke.state, &other.id),
+                    !admitted(&spoke.state, &other.id),
                     "member-{i} ↔ member-{j} session appeared — spokes must only see the operator"
                 );
             }
@@ -210,18 +316,38 @@ async fn run_area(n_spokes: usize) {
     // trip. This is the Phase B acked path end to end: queue → wire →
     // deliver → echo → wire → deliver.
     for spoke in &spokes {
-        let mut rx = spoke.state.subscribe_channel(CHANNEL);
+        // One resource-backed mailbox per member, held by its echo task for the
+        // run. `recv` separates the two endings the old receiver merged: `None`
+        // is the channel going away with the network, `Err` is one frame that
+        // did not decode.
+        let mut rx = channel::<serde_json::Value>(CHANNEL.to_owned(), spoke.state.clone())
+            .subscribe()
+            .expect("member subscription admitted");
         let echo_state = spoke.state.clone();
         let operator_id = operator.id.clone();
+        let member = spoke.id.clone();
         tokio::spawn(async move {
-            while let Ok(frame) = rx.recv().await {
-                let _ = echo_state
-                    .send_channel_frame(&operator_id, CHANNEL, frame.payload)
-                    .await;
+            while let Some(next) = rx.recv().await {
+                match next {
+                    Ok(frame) => {
+                        let _ = echo_state
+                            .send_channel_frame(&operator_id, CHANNEL, frame.body().clone())
+                            .await;
+                    }
+                    // Reported and survivable, which is the truthful shape here.
+                    // A panic would be swallowed by a `JoinHandle` nobody awaits
+                    // and ending the loop would stop every later echo, so both
+                    // would reach the operator as nothing but a timeout. Saying
+                    // it keeps the real fault visible while the run still
+                    // measures the sessions that are working.
+                    Err(e) => eprintln!("member {member} dropped an undecodable probe frame: {e}"),
+                }
             }
         });
     }
-    let mut echo_rx = operator.state.subscribe_channel(CHANNEL);
+    let mut echo_rx = channel::<serde_json::Value>(CHANNEL.to_owned(), operator.state.clone())
+        .subscribe()
+        .expect("operator subscription admitted");
     let pings_per_spoke: usize = 10;
     let mut rtt_ms = Vec::with_capacity(n_spokes * pings_per_spoke);
     for (i, spoke) in spokes.iter().enumerate() {
@@ -241,9 +367,15 @@ async fn run_area(n_spokes: usize) {
                     "echo from member-{i} seq {seq} never arrived"
                 );
                 match tokio::time::timeout(remaining, echo_rx.recv()).await {
-                    Ok(Ok(frame)) if frame.payload == payload => break,
-                    Ok(Ok(_)) => {} // stale/other frame — keep draining
-                    Ok(Err(e)) => panic!("operator echo stream closed: {e}"),
+                    Ok(Some(Ok(frame))) if frame.body() == &payload => break,
+                    Ok(Some(Ok(_))) => {} // stale/other frame — keep draining
+                    // The old receiver reported both of these as "stream
+                    // closed". They are different faults and only one of them
+                    // has an error to name.
+                    Ok(Some(Err(e))) => panic!("operator echo frame did not decode: {e}"),
+                    Ok(None) => panic!(
+                        "operator echo channel closed while member-{i} seq {seq} was outstanding"
+                    ),
                     Err(_) => panic!("echo from member-{i} seq {seq} timed out"),
                 }
             }
@@ -301,3 +433,4 @@ async fn silent_area_soak() {
         .unwrap_or(24);
     run_area(n).await;
 }
+mod support;
