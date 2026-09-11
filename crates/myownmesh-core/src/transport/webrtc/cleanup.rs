@@ -58,8 +58,13 @@ fn record_join_result(result: std::result::Result<(), tokio::task::JoinError>) {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "complete move-only bridge custody crosses the bounded terminal channel without a new unaccounted allocation"
+)]
 enum LateTransportCommand {
     Batch(Vec<tokio::task::JoinHandle<()>>),
+    TurnBridges(crate::transport::turn_stream::TurnStreamBridges),
 }
 
 /// A single, pre-created terminal owner for tasks admitted after the normal
@@ -99,6 +104,12 @@ impl LateTransportCustodian {
                 let _funding = funding;
                 while let Ok(command) = receiver.recv() {
                     match command {
+                        LateTransportCommand::TurnBridges(bridges) => {
+                            bridges.close_blocking(
+                                |task| record_join_result(join_task_without_runtime(task)),
+                                |failure| record_join_result(Err(failure)),
+                            );
+                        }
                         LateTransportCommand::Batch(tasks) => {
                             for task in tasks {
                                 let result = join_task_without_runtime(task);
@@ -132,6 +143,12 @@ impl LateTransportCustodian {
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
                     match command {
+                        LateTransportCommand::TurnBridges(bridges) => {
+                            bridges.close_blocking(
+                                |task| record_join_result(join_task_without_runtime(task)),
+                                |failure| record_join_result(Err(failure)),
+                            );
+                        }
                         LateTransportCommand::Batch(tasks) => {
                             for task in tasks {
                                 let result = join_task_without_runtime(task);
@@ -162,22 +179,35 @@ impl LateTransportCustodian {
         if tasks.is_empty() {
             return Ok(());
         }
+        match self.submit_command(LateTransportCommand::Batch(tasks)) {
+            Ok(()) => Ok(()),
+            Err(LateTransportCommand::Batch(tasks)) => Err(tasks),
+            Err(LateTransportCommand::TurnBridges(_)) => unreachable!("same command returned"),
+        }
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "refusal returns the complete command with task handles and leases; boxing would allocate on the refusal path"
+    )]
+    fn submit_command(
+        &self,
+        command: LateTransportCommand,
+    ) -> std::result::Result<(), LateTransportCommand> {
         let sender = self.sender.lock();
         let Some(sender_ref) = sender.as_ref() else {
-            return Err(tasks);
+            return Err(command);
         };
         // A full channel is backpressured only until the already-admitted
         // batch is consumed. Sending the enum moves the complete batch, so no
         // task can be detached between the full and retry observations.
-        match sender_ref.try_send(LateTransportCommand::Batch(tasks)) {
+        match sender_ref.try_send(command) {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(command)) => match sender_ref.send(command) {
                 Ok(()) => Ok(()),
-                Err(std::sync::mpsc::SendError(LateTransportCommand::Batch(tasks))) => Err(tasks),
+                Err(std::sync::mpsc::SendError(command)) => Err(command),
             },
-            Err(std::sync::mpsc::TrySendError::Disconnected(LateTransportCommand::Batch(
-                tasks,
-            ))) => Err(tasks),
+            Err(std::sync::mpsc::TrySendError::Disconnected(command)) => Err(command),
         }
     }
 
@@ -746,6 +776,33 @@ impl Drop for NativeCloseGateHandle {
 }
 
 /// Single cleanup owner for one native peer connection.
+/// An interrupted cleanup transfers the complete bridge owner, including leases,
+/// to the existing funded terminal thread. No future is spawned from Drop.
+struct TurnBridgeCustody {
+    bridges: Option<crate::transport::turn_stream::TurnStreamBridges>,
+    // Keep the pre-existing terminal receiver reachable even if fail_cleanup
+    // seals ordinary task submissions before this custody guard is dropped.
+    sender: std::sync::mpsc::SyncSender<LateTransportCommand>,
+}
+
+impl Drop for TurnBridgeCustody {
+    fn drop(&mut self) {
+        if let Some(mut bridges) = self.bridges.take() {
+            bridges.cancel();
+            if let Err(std::sync::mpsc::SendError(LateTransportCommand::TurnBridges(bridges))) =
+                self.sender.send(LateTransportCommand::TurnBridges(bridges))
+            {
+                // Matches the existing late-task terminal fallback. The complete
+                // owner remains local if the already-funded custodian is sealed.
+                bridges.close_blocking(
+                    |task| record_join_result(join_task_without_runtime(task)),
+                    |failure| record_join_result(Err(failure)),
+                );
+            }
+        }
+    }
+}
+
 pub(super) struct ConnectorCloseOwner {
     pub(super) ownership: ConnectorOwnership,
     late_transport_custodian: Arc<LateTransportCustodian>,
@@ -755,6 +812,8 @@ pub(super) struct ConnectorCloseOwner {
     /// independently of any worker `Arc` retained by a caller after close.
     transport_observation: SyncMutex<Option<ObservationLease>>,
     native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
+    turn_bridges: SyncMutex<Option<TurnBridgeCustody>>,
+    turn_bridge_join: tokio::sync::Mutex<()>,
     remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
     realtime_flows: SyncMutex<Option<Arc<RealtimeFlowRegistry>>>,
     native_allocation_started: AtomicBool,
@@ -824,6 +883,8 @@ impl ConnectorCloseOwner {
             cleanup_capability: SyncMutex::new(Some(cleanup_capability)),
             transport_observation: SyncMutex::new(transport_observation),
             native: SyncMutex::new(None),
+            turn_bridges: SyncMutex::new(None),
+            turn_bridge_join: tokio::sync::Mutex::new(()),
             remote_candidates: SyncMutex::new(None),
             realtime_flows: SyncMutex::new(None),
             native_allocation_started: AtomicBool::new(false),
@@ -850,6 +911,41 @@ impl ConnectorCloseOwner {
 
     pub(super) fn attach_native(self: &Arc<Self>, native: Arc<RTCPeerConnection>) -> bool {
         self.attach_native_port(Arc::new(WebRtcNativeClosePort { peer: native }))
+    }
+
+    pub(super) fn attach_turn_bridges(
+        &self,
+        bridges: crate::transport::turn_stream::TurnStreamBridges,
+    ) -> bool {
+        let _transition = self.status_transition.lock();
+        let mut slot = self.turn_bridges.lock();
+        if self.started.load(Ordering::Acquire) || slot.is_some() {
+            // Preparation has not spawned tasks, so refusal closes listeners
+            // synchronously before returning their exact funding.
+            return false;
+        }
+        let Some(sender) = self.late_transport_custodian.sender.lock().clone() else {
+            return false;
+        };
+        *slot = Some(TurnBridgeCustody {
+            bridges: Some(bridges),
+            sender,
+        });
+        slot.as_mut().unwrap().bridges.as_mut().unwrap().start();
+        true
+    }
+
+    async fn close_turn_bridges(&self) {
+        let _join = self.turn_bridge_join.lock().await;
+        let custody = self.turn_bridges.lock().take();
+        if let Some(mut custody) = custody {
+            let result = custody.bridges.as_mut().unwrap().close().await;
+            // close retained every handle through await, including on error.
+            custody.bridges.take();
+            if let Err(error) = result {
+                self.fail_cleanup(format!("TURN stream task join: {error}"));
+            }
+        }
     }
 
     /// Marks the point after which dependency-owned constructor work may have
@@ -1007,6 +1103,11 @@ impl ConnectorCloseOwner {
 
     pub(super) fn retire_local(&self) {
         self.ownership.retire();
+        if let Some(custody) = self.turn_bridges.lock().as_mut() {
+            if let Some(bridges) = custody.bridges.as_mut() {
+                bridges.cancel();
+            }
+        }
         if let Some(candidates) = self.remote_candidates.lock().as_ref() {
             drain_remote_candidates(candidates);
         }
@@ -1125,6 +1226,9 @@ impl ConnectorCloseOwner {
     }
 
     async fn run(self: Arc<Self>) {
+        // Includes failed-open (no native close port) and partial stream reads.
+        // Cancellation precedes all retained transport joins/native close.
+        self.close_turn_bridges().await;
         #[cfg(test)]
         if self.panic_cleanup_future.load(Ordering::Acquire) {
             panic!("injected cleanup future panic");
@@ -1293,6 +1397,7 @@ impl ConnectorCloseOwner {
         let status = self.status.subscribe();
         self.start();
         let result = wait_on_status(status).await;
+        self.close_turn_bridges().await;
         self.wait_for_transport_tasks().await;
         let _ = self.join_late_transport_custodian().await;
         result

@@ -1037,6 +1037,7 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
             services.turn.relay_port_min,
             services.turn.relay_port_max,
             services.turn.public_ip.clone(),
+            services.turn.tcp_enabled,
         ))
     } else {
         None
@@ -1045,46 +1046,71 @@ async fn set_service(service: &str, enabled: bool) -> Result<()> {
     let ok = response.ok;
     print_response(response)?;
     if ok {
-        if let Some((port, relay_min, relay_max, public_ip)) = turn_help {
-            print_turn_firewall_help(port, relay_min, relay_max, &public_ip);
+        if let Some((port, relay_min, relay_max, public_ip, tcp_enabled)) = turn_help {
+            print!(
+                "{}",
+                turn_firewall_help(port, relay_min, relay_max, &public_ip, tcp_enabled)
+            );
         }
     }
     Ok(())
 }
 
-/// Spell out the UDP ports a freshly-enabled TURN server needs reachable.
+/// Spell out control and relay ports without claiming external TLS readiness.
 /// The #1 reason a self-hosted TURN "doesn't work" is that only the
 /// control port (or nothing) is open — every relayed allocation flows
 /// through a separate port in the relay range, and a cloud security group
 /// blocks them even when the host firewall is off.
-fn print_turn_firewall_help(port: u16, relay_min: u16, relay_max: u16, public_ip: &str) {
-    println!();
-    println!("TURN is on. For NAT'd peers to actually relay, these UDP ports must be");
-    println!("reachable — at the host firewall AND your cloud/provider security group");
-    println!("(a host firewall being inactive does NOT mean the provider lets them in):");
-    println!("  • udp {port}  — STUN/TURN control");
+fn turn_firewall_help(
+    port: u16,
+    relay_min: u16,
+    relay_max: u16,
+    public_ip: &str,
+    tcp_enabled: bool,
+) -> String {
+    let mut text = format!(
+        "\nTURN is on. Required ports must be reachable at BOTH the host firewall\n\
+         and cloud/provider security group; an inactive host firewall is not proof.\n\
+           • udp {port} — STUN/TURN control\n"
+    );
+    if tcp_enabled {
+        text.push_str(&format!(
+            "  • tcp {port} — TURN TCP control\n  sudo ufw allow {port}/tcp\n"
+        ));
+    }
+    text.push_str(
+        "  • tcp 5349 — only when a separate Caddy TURN TLS listener is configured\n\
+                   TLS 5349 is not a daemon listener or a readiness claim.\n\
+                   Never expose the loopback-only PROXYv2 backend port publicly.\n\
+                   TCP/TLS client control still requires the UDP relay allocation range.\n",
+    );
     if relay_min == 0 {
         // Unbounded (default): relay sockets come from the OS ephemeral
         // range — open that whole range.
-        println!("  • udp <OS ephemeral range>  — relay allocations (one port per active peer)");
-        println!("    find your range:  sysctl net.ipv4.ip_local_port_range   (e.g. 32768 60999)");
-        println!("ufw, if that's what you run (substitute your range):");
-        println!("  sudo ufw allow {port}/udp");
-        println!("  sudo ufw allow 32768:60999/udp");
-        println!("(Want a smaller firewall rule? Pin services.turn.relay_port_min/max.)");
+        text.push_str(
+            "  • udp <OS ephemeral range> — relay allocations (one port per active peer)\n\
+                       Find your range: sysctl net.ipv4.ip_local_port_range (e.g. 32768 60999)\n\
+                       ufw, if that is what you run (substitute your actual range):\n",
+        );
+        text.push_str(&format!(
+            "  sudo ufw allow {port}/udp\n  sudo ufw allow 32768:60999/udp\n"
+        ));
+        text.push_str("Pin services.turn.relay_port_min/max for a smaller firewall rule.\n");
     } else {
-        println!("  • udp {relay_min}:{relay_max}  — relay allocations (one port per active peer)");
-        println!("ufw, if that's what you run:");
-        println!("  sudo ufw allow {port}/udp");
-        println!("  sudo ufw allow {relay_min}:{relay_max}/udp");
+        text.push_str(&format!(
+            "  • udp {relay_min}:{relay_max} — relay allocations (one port per active peer)\n\
+                               ufw, if that is what you run:\n  sudo ufw allow {port}/udp\n\
+                                 sudo ufw allow {relay_min}:{relay_max}/udp\n"
+        ));
     }
     if public_ip.trim().is_empty() {
-        println!(
+        text.push_str(
             "Set services.turn.public_ip to this box's routable IP, too — TURN won't \
-             start without it on a wildcard bind."
+             start without it on a wildcard bind.\n",
         );
     }
-    println!("And point your stun./turn. DNS records at this box.");
+    text.push_str("And point your stun./turn. DNS records at this box.\n");
+    text
 }
 
 /// Put the signaling relay behind a reverse proxy: enable it and bind it
@@ -1316,6 +1342,31 @@ fn verify_local_server(_stream: &LocalSocketStream) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turn_firewall_help_separates_tcp_tls_and_udp_allocations() {
+        let text = super::turn_firewall_help(4444, 50000, 50100, "203.0.113.7", true);
+        assert!(text.contains("udp 4444"));
+        assert!(text.contains("tcp 4444"));
+        assert!(text.contains("udp 50000:50100"));
+        assert!(text.contains("separate Caddy TURN TLS listener"));
+        assert!(text.contains("not a daemon listener or a readiness claim"));
+        assert!(!text.contains("udp 5349"));
+        assert!(!text.contains("3479"));
+        assert!(text.contains("Never expose the loopback-only PROXYv2 backend"));
+        assert!(!text.contains("203.0.113.7"));
+    }
+
+    #[test]
+    fn turn_udp_only_help_preserves_ephemeral_range_and_no_tcp_control_claim() {
+        let text = super::turn_firewall_help(3478, 0, 0, "", false);
+        assert!(text.contains("udp 3478"));
+        assert!(text.contains("<OS ephemeral range>"));
+        assert!(text.contains("sysctl net.ipv4.ip_local_port_range"));
+        assert!(!text.contains("tcp 3478"));
+        assert!(text.contains("Set services.turn.public_ip"));
+        assert!(text.contains("only when a separate Caddy"));
+    }
+
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

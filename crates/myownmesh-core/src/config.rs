@@ -427,7 +427,12 @@ pub fn default_stun_servers() -> Vec<StunServer> {
 /// explicit empty array (`"turn_servers": []`).
 pub fn default_turn_servers() -> Vec<TurnServer> {
     vec![TurnServer {
-        urls: vec!["turn:turn.myownmesh.com:3478".to_string()],
+        // This is an ordered configuration list, not a promise of ICE fallback order.
+        urls: vec![
+            "turn:turn.myownmesh.com:3478?transport=udp".to_string(),
+            "turn:turn.myownmesh.com:3478?transport=tcp".to_string(),
+            "turns:turn.myownmesh.com:5349?transport=tcp".to_string(),
+        ],
         username: Some("guest".to_string()),
         credential: Some("theguestpassword".to_string()),
     }]
@@ -444,6 +449,81 @@ pub struct TurnServer {
     /// the field name they expect.
     #[serde(default)]
     pub credential: Option<String>,
+}
+
+/// Validate TURN URL syntax without resolving names, opening sockets, or
+/// echoing credentials/URLs into errors. `turns` means TLS over TCP; DTLS TURN
+/// and arbitrary query parameters are not supported by this transport.
+pub fn validate_turn_url(value: &str) -> Result<()> {
+    let invalid = || Error::Config("invalid or unsupported TURN URL".into());
+    let (secure, rest) = if let Some(rest) = value.strip_prefix("turns:") {
+        (true, rest)
+    } else if let Some(rest) = value.strip_prefix("turn:") {
+        (false, rest)
+    } else {
+        return Err(invalid());
+    };
+    let authority = if let Some((authority, query)) = rest.split_once('?') {
+        match query {
+            "transport=tcp" => {}
+            "transport=udp" if !secure => {}
+            _ => return Err(invalid()),
+        }
+        authority
+    } else {
+        rest
+    };
+    if authority.is_empty() || !authority.is_ascii() {
+        return Err(invalid());
+    }
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let (host, suffix) = ipv6.split_once(']').ok_or_else(invalid)?;
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| invalid())?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
+        };
+        (host, port)
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        let dns = host.strip_suffix('.').unwrap_or(host);
+        if dns.contains('.')
+            && dns.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            && dns.parse::<std::net::Ipv4Addr>().is_err()
+        {
+            return Err(invalid());
+        }
+        if dns.is_empty()
+            || dns.len() > 253
+            || dns.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+        {
+            return Err(invalid());
+        }
+        (host, port)
+    };
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    if let Some(port) = port {
+        if port.is_empty()
+            || !port.bytes().all(|c| c.is_ascii_digit())
+            || port.parse::<u16>().ok().filter(|p| *p != 0).is_none()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 /// Owner-selected finite mDNS policy. Durations are integer milliseconds in
@@ -1899,6 +1979,7 @@ impl NetworkConfig {
             }
             for url in &server.urls {
                 validate_ice_text("TURN URL", url, &mut retained_bytes)?;
+                validate_turn_url(url)?;
             }
             if let Some(username) = &server.username {
                 validate_ice_text("TURN username", username, &mut retained_bytes)?;
@@ -2294,6 +2375,19 @@ impl Default for StunServiceConfig {
 #[serde(default)]
 pub struct TurnServiceConfig {
     pub enabled: bool,
+    /// Opt-in RFC 8656 TCP listener on the UDP control port. TLS is terminated
+    /// separately by Caddy, not by this listener.
+    pub tcp_enabled: bool,
+    /// Separate loopback-only PROXYv2 backend for Caddy's external TLS listener.
+    /// This is independent of the public plaintext TCP listener.
+    pub tls_proxy_enabled: bool,
+    pub tls_proxy_port: u16,
+    pub tcp_max_connections: usize,
+    pub tcp_max_connections_per_ip: usize,
+    /// Absolute accepted-stream deadline until a successful TURN Allocate
+    /// response is observed. Incoming frames do not extend this deadline.
+    pub tcp_auth_timeout_ms: u64,
+    pub tcp_idle_timeout_ms: u64,
     pub bind: String,
     pub port: u16,
     /// Public IP the server hands out in relay allocations. TURN can't
@@ -2330,6 +2424,13 @@ impl Default for TurnServiceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            tcp_enabled: false,
+            tls_proxy_enabled: false,
+            tls_proxy_port: 3479,
+            tcp_max_connections: 256,
+            tcp_max_connections_per_ip: 64,
+            tcp_auth_timeout_ms: 30_000,
+            tcp_idle_timeout_ms: 600_000,
             bind: "0.0.0.0".to_string(),
             port: DEFAULT_STUN_TURN_PORT,
             public_ip: String::new(),
@@ -2354,6 +2455,56 @@ impl Default for TurnServiceConfig {
             relay_port_max: 0,
         }
     }
+}
+
+impl TurnServiceConfig {
+    /// Validate even while disabled, so a later enable cannot activate invalid
+    /// persisted limits. Consumers must check before changing running services.
+    pub fn validate_tcp(&self) -> Result<()> {
+        if self.tls_proxy_port == 0 || (self.tls_proxy_enabled && self.tls_proxy_port == self.port)
+        {
+            return Err(Error::Config("invalid TURN TLS proxy backend port".into()));
+        }
+        if self.tcp_max_connections == 0
+            || self.tcp_max_connections > isize::MAX as usize
+            || self.tcp_max_connections_per_ip == 0
+            || self.tcp_max_connections_per_ip > self.tcp_max_connections
+        {
+            return Err(Error::Config("invalid TURN TCP connection limits".into()));
+        }
+        // Direct and proxy listeners each retain a non-borrowable share of
+        // both limits; floor/remainder splitting must leave both positive.
+        if self.tcp_enabled
+            && self.tls_proxy_enabled
+            && (self.tcp_max_connections < 2 || self.tcp_max_connections_per_ip < 2)
+        {
+            return Err(Error::Config(
+                "dual TURN TCP listeners require at least two total and per-IP connections".into(),
+            ));
+        }
+        self.tcp_idle_timeout()?;
+        self.tcp_auth_timeout()?;
+        Ok(())
+    }
+
+    pub fn tcp_auth_timeout(&self) -> Result<Duration> {
+        checked_turn_duration(self.tcp_auth_timeout_ms, "authentication")
+    }
+
+    pub fn tcp_idle_timeout(&self) -> Result<Duration> {
+        checked_turn_duration(self.tcp_idle_timeout_ms, "idle")
+    }
+}
+
+fn checked_turn_duration(millis: u64, phase: &str) -> Result<Duration> {
+    if millis == 0 || millis > i64::MAX as u64 {
+        return Err(Error::Config(format!("invalid TURN TCP {phase} timeout")));
+    }
+    let duration = Duration::from_millis(millis);
+    std::time::Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| Error::Config(format!("TURN TCP {phase} deadline overflows")))?;
+    Ok(duration)
 }
 
 /// One username / password pair the TURN server accepts. Plaintext in
@@ -2408,12 +2559,29 @@ impl Default for MeshConfig {
     }
 }
 
-fn require_current_version(cfg: MeshConfig) -> Result<MeshConfig> {
+fn require_current_version(mut cfg: MeshConfig) -> Result<MeshConfig> {
     if cfg.version != CONFIG_VERSION {
         return Err(Error::Config(format!(
             "config version {} is not the current hard-alpha version {}",
             cfg.version, CONFIG_VERSION
         )));
+    }
+    cfg.services.turn.validate_tcp()?;
+    for network in &mut cfg.networks {
+        // In-version normalization only: this exact previously persisted
+        // reference service opted into the project default, not a custom relay.
+        // No other URL list or credential is rewritten, and schema 3 stays refused.
+        if network.turn_servers.len() == 1 {
+            let server = &network.turn_servers[0];
+            if server.urls.len() == 1
+                && server.urls[0] == "turn:turn.myownmesh.com:3478"
+                && server.username.as_deref() == Some("guest")
+                && server.credential.as_deref() == Some("theguestpassword")
+            {
+                network.turn_servers = default_turn_servers();
+            }
+        }
+        network.validate_ice_servers()?;
     }
     Ok(cfg)
 }
@@ -2486,6 +2654,10 @@ fn load_config_locked(path: &Path) -> Result<(MeshConfig, Option<Vec<u8>>)> {
 }
 
 fn save_config_locked(path: &Path, config: &MeshConfig) -> Result<()> {
+    config.services.turn.validate_tcp()?;
+    for network in &config.networks {
+        network.validate_ice_servers()?;
+    }
     let parent = path
         .parent()
         .ok_or_else(|| Error::Config(format!("config path has no parent: {}", path.display())))?;
@@ -4243,6 +4415,241 @@ mod tests {
         assert_eq!(turn.credentials.len(), 1);
         assert!(!turn.credentials[0].username.is_empty());
         assert!(!turn.credentials[0].password.is_empty());
+    }
+
+    #[test]
+    fn turn_tcp_defaults_roundtrip_and_legacy_omission_preserve_schema_two() {
+        let config: TurnServiceConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.tcp_enabled);
+        assert!(!config.tls_proxy_enabled);
+        assert_eq!(config.tls_proxy_port, 3479);
+        assert_eq!(config.tcp_max_connections, 256);
+        assert_eq!(config.tcp_max_connections_per_ip, 64);
+        assert_eq!(
+            config.tcp_auth_timeout().unwrap(),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            config.tcp_idle_timeout().unwrap(),
+            Duration::from_millis(600_000)
+        );
+        assert!(config.validate_tcp().is_ok());
+        let mut enabled = config;
+        enabled.tcp_enabled = true;
+        enabled.tls_proxy_enabled = true;
+        enabled.tcp_max_connections = 7;
+        enabled.tcp_max_connections_per_ip = 7;
+        enabled.tcp_idle_timeout_ms = 1;
+        enabled.tcp_auth_timeout_ms = 1;
+        assert!(enabled.validate_tcp().is_ok());
+        let encoded = serde_json::to_string(&enabled).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TurnServiceConfig>(&encoded).unwrap(),
+            enabled
+        );
+        assert_eq!(CONFIG_VERSION, 2);
+    }
+
+    #[test]
+    fn turn_tcp_refuses_zero_overflow_and_per_ip_excess_before_config_use() {
+        for bad in 0..10 {
+            let mut config = MeshConfig::default();
+            match bad {
+                0 => config.services.turn.tcp_max_connections = 0,
+                1 => config.services.turn.tcp_max_connections_per_ip = 0,
+                2 => config.services.turn.tcp_max_connections_per_ip = 257,
+                3 => config.services.turn.tcp_idle_timeout_ms = 0,
+                4 => config.services.turn.tcp_idle_timeout_ms = u64::MAX,
+                5 => config.services.turn.tcp_max_connections = usize::MAX,
+                6 => config.services.turn.tls_proxy_port = 0,
+                7 => {
+                    config.services.turn.tls_proxy_enabled = true;
+                    config.services.turn.tls_proxy_port = config.services.turn.port;
+                }
+                8 => config.services.turn.tcp_auth_timeout_ms = 0,
+                _ => config.services.turn.tcp_auth_timeout_ms = u64::MAX,
+            }
+            assert!(config.services.turn.validate_tcp().is_err(), "case {bad}");
+            assert!(require_current_version(config).is_err(), "case {bad}");
+        }
+    }
+
+    #[test]
+    fn turn_dual_listeners_require_positive_capacity_for_each_class() {
+        for (total, per_ip, accepted) in [(1, 1, false), (2, 1, false), (2, 2, true), (3, 3, true)]
+        {
+            let mut config = MeshConfig::default();
+            config.services.turn.tcp_enabled = true;
+            config.services.turn.tls_proxy_enabled = true;
+            config.services.turn.tcp_max_connections = total;
+            config.services.turn.tcp_max_connections_per_ip = per_ip;
+            assert_eq!(config.services.turn.validate_tcp().is_ok(), accepted);
+            assert_eq!(require_current_version(config).is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn turn_single_listener_preserves_one_connection_limits() {
+        for (direct, proxy) in [(true, false), (false, true), (false, false)] {
+            let mut config = MeshConfig::default();
+            config.services.turn.tcp_enabled = direct;
+            config.services.turn.tls_proxy_enabled = proxy;
+            config.services.turn.tcp_max_connections = 1;
+            config.services.turn.tcp_max_connections_per_ip = 1;
+            assert!(config.services.turn.validate_tcp().is_ok());
+            assert!(require_current_version(config).is_ok());
+        }
+    }
+
+    #[test]
+    fn turn_tls_proxy_can_be_enabled_without_public_plaintext_tcp() {
+        let mut config = TurnServiceConfig {
+            tls_proxy_enabled: true,
+            ..TurnServiceConfig::default()
+        };
+        assert!(!config.tcp_enabled);
+        assert!(config.validate_tcp().is_ok());
+        config.tls_proxy_enabled = false;
+        config.tls_proxy_port = config.port;
+        assert!(
+            config.validate_tcp().is_ok(),
+            "disabled backend binds no conflicting port"
+        );
+    }
+
+    #[test]
+    fn invalid_turn_update_preserves_persisted_config_bytes() {
+        let path = transaction_test_path("invalid-turn-update");
+        let mut config = MeshConfig::default();
+        save_config_locked(&path, &config).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        config.services.turn.tcp_auth_timeout_ms = 0;
+        assert!(save_config_locked(&path, &config).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        config.services.turn.tcp_auth_timeout_ms = 30_000;
+        let mut network = NetworkConfig::from_network_id("local", "context");
+        network.turn_servers[0].urls = vec!["turns:relay.example?transport=udp".into()];
+        config.networks.push(network);
+        assert!(save_config_locked(&path, &config).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        remove_transaction_test_files(&path);
+    }
+
+    #[test]
+    fn turn_url_validation_accepts_only_supported_stream_and_datagram_shapes() {
+        for url in [
+            "turn:relay.example:3478",
+            "turn:relay.example?transport=udp",
+            "turn:relay.example:3478?transport=tcp",
+            "turns:relay.example",
+            "turns:relay.example:5349?transport=tcp",
+            "turn:[::1]:3478?transport=tcp",
+            "turns:[2001:db8::1]:5349",
+            "turn:127.0.0.1:65535",
+        ] {
+            assert!(validate_turn_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "",
+            "stun:relay.example",
+            "https://relay.example",
+            "turn://relay.example",
+            "turn:",
+            "turn:relay.example:0",
+            "turn:relay.example:65536",
+            "turn:relay.example:",
+            "turn:relay.example:+3478",
+            "turn:relay.example/path",
+            "turn:relay.example#fragment",
+            "turn:user:password@relay.example",
+            "turns:relay.example?transport=udp",
+            "turn:relay.example?transport=sctp",
+            "turn:relay.example?transport=tcp&transport=udp",
+            "turn:relay.example?x=tcp",
+            "turn:relay.example?",
+            "turn:[invalid]:3478",
+            "turn:::1",
+            "turn:[::1]tail",
+            "turn:bad host",
+            "turn:relay..example",
+            "turn:999.1.1.1:3478",
+        ] {
+            assert!(validate_turn_url(url).is_err(), "{url}");
+        }
+        let mut network = NetworkConfig::from_network_id("local", "context");
+        network.turn_servers[0].urls = vec!["turn:private:password@host".into()];
+        let error = network.validate_ice_servers().unwrap_err().to_string();
+        assert!(!error.contains("private"));
+        assert!(!error.contains("password"));
+        let mut config = MeshConfig::default();
+        config.networks.push(network);
+        assert!(require_current_version(config).is_err());
+    }
+
+    #[test]
+    fn turn_reference_trio_preserves_opt_out_and_custom_client_choices() {
+        let default = default_turn_servers();
+        assert_eq!(
+            default[0].urls,
+            [
+                "turn:turn.myownmesh.com:3478?transport=udp",
+                "turn:turn.myownmesh.com:3478?transport=tcp",
+                "turns:turn.myownmesh.com:5349?transport=tcp",
+            ]
+        );
+        for servers in [
+            Vec::new(),
+            vec![TurnServer {
+                urls: vec!["turn:turn.myownmesh.com:3478".into()],
+                username: Some("custom".into()),
+                credential: default[0].credential.clone(),
+            }],
+            vec![TurnServer {
+                urls: vec!["turn:turn.myownmesh.com:3478".into()],
+                username: default[0].username.clone(),
+                credential: Some("custom".into()),
+            }],
+            vec![TurnServer {
+                urls: vec!["turn:turn.myownmesh.com:3478?transport=udp".into()],
+                username: default[0].username.clone(),
+                credential: default[0].credential.clone(),
+            }],
+            vec![TurnServer {
+                urls: vec!["turns:operator.example:4443?transport=tcp".into()],
+                username: Some("operator".into()),
+                credential: Some("fixture-only".into()),
+            }],
+        ] {
+            let mut network = NetworkConfig::from_network_id("local", "context");
+            network.turn_servers = servers.clone();
+            let mut config = MeshConfig::default();
+            config.networks.push(network);
+            let decoded: MeshConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                require_current_version(decoded).unwrap().networks[0].turn_servers,
+                servers
+            );
+        }
+    }
+
+    #[test]
+    fn exact_reference_turn_upgrade_is_in_version_and_idempotent() {
+        let mut network = NetworkConfig::from_network_id("local", "context");
+        network.turn_servers[0].urls = vec!["turn:turn.myownmesh.com:3478".into()];
+        let mut config = MeshConfig::default();
+        config.networks.push(network);
+        let encoded = serde_json::to_string(&config).unwrap();
+        let normalized = require_current_version(serde_json::from_str(&encoded).unwrap()).unwrap();
+        assert_eq!(normalized.version, 2);
+        assert_eq!(normalized.networks[0].turn_servers, default_turn_servers());
+        assert_eq!(
+            require_current_version(normalized.clone()).unwrap(),
+            normalized
+        );
+        let mut wrong_version = config;
+        wrong_version.version = 3;
+        assert!(require_current_version(wrong_version).is_err());
     }
 
     #[test]

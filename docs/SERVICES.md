@@ -12,9 +12,10 @@ This page describes device-wide hosted services. TURN is the application-data
 relay service. A Hub provides discovery and endpoint setup; it does not forward
 application payloads through mesh sessions.
 
-This V4 candidate's self-hosted TURN service is UDP-only. The new upstream
-TCP/TLS self-hosting bridge and Caddy TURN passthrough are not supported here;
-configured standard TURN endpoints remain available to endpoint WebRTC clients.
+This V4 candidate supports the bounded TURN-over-TCP bridge and Caddy TURN TLS.
+The public TLS listener is Caddy on TCP 5349; Caddy terminates TLS and sends
+PROXY protocol v2 to the daemon's loopback-only TCP 3479 backend. The daemon's
+plaintext TCP listener remains off unless an operator explicitly enables it.
 Service advertisements provide URLs, not protected credential distribution.
 
 Hosted-service adverts, presence, joins, leaves, reconnects, and listener
@@ -175,6 +176,29 @@ each allocation's relay socket; because the data is UDP, exceeding the
 cap creates backpressure and drops rather than unbounded buffering, which
 is the honest QoS behaviour for a relay.
 
+#### TURN TCP/TLS
+
+The TURN service also has a bounded RFC 8656 TCP bridge. `tcp_enabled` is
+an explicit plaintext TCP listener on the configured TURN port and should
+remain `false` when using the Caddy TLS path. The Caddy installer enables
+`tls_proxy_enabled` and binds a private `127.0.0.1:3479` backend; Caddy
+terminates TLS for `turns:turn.example.com:5349`, emits PROXY protocol v2,
+and forwards to that backend. Port 3479 is never a public firewall rule.
+
+The bridge enforces `tcp_max_connections` globally and
+`tcp_max_connections_per_ip` per source IP. `tcp_auth_timeout_ms` defaults
+to 30 seconds and is an absolute deadline until a successful TURN Allocate
+response; incoming frames do not extend it. `tcp_idle_timeout_ms` applies
+only after Allocate succeeds. These are independent of Caddy's TLS work and
+of UDP relay allocation capacity.
+
+For the Caddy-managed path, open TCP 80 and 443 for signaling ACME/HTTPS,
+TCP 5349 for TURN TLS, UDP 3478 for TURN/STUN control, and the configured
+UDP relay range at both the host firewall and cloud/provider security group.
+Only enable public plaintext TCP 3478 when that is an intentional separate
+deployment. Verify the certificate trust name matches the TURN hostname/SNI;
+an IP address or mismatched name will fail normal TLS verification.
+
 ## Configuration
 
 Services live under `services` in `~/.myownmesh/config.json`:
@@ -200,6 +224,13 @@ Services live under `services` in `~/.myownmesh/config.json`:
     "stun":      { "enabled": true, "bind": "0.0.0.0", "port": 3478 },
     "turn": {
       "enabled": true,
+      "tcp_enabled": false,
+      "tls_proxy_enabled": true,
+      "tls_proxy_port": 3479,
+      "tcp_max_connections": 256,
+      "tcp_max_connections_per_ip": 64,
+      "tcp_auth_timeout_ms": 30000,
+      "tcp_idle_timeout_ms": 600000,
       "bind": "0.0.0.0",
       "port": 3478,
       "public_ip": "203.0.113.7",
@@ -350,6 +381,23 @@ relay.example.com {
 }
 ```
 
+The same command also manages a global Caddy Layer 4 block for TURN TLS.
+Pass `--turn-domain turn.example.com` when the TURN name differs from the
+signaling name, and pass `--public-ip` when DNS should not be used for the
+allocation address:
+
+```
+myownmesh install caddy relay.example.com \
+  --turn-domain turn.example.com --public-ip 203.0.113.7
+```
+
+The generated `turn.example.com:5349` route terminates TLS and uses
+`proxy_protocol v2` to forward to `127.0.0.1:3479`. It never forwards to
+the public `3478` listener. The daemon's `tls_proxy_enabled` setting is
+persisted and `tcp_enabled` stays false; restart the daemon after install.
+The Caddy Layer 4 module is required. Caddy's certificate must be trusted
+for the exact TURN hostname sent as TLS SNI.
+
 Doing it by hand with nginx instead:
 
 ```
@@ -367,6 +415,9 @@ and 443** at the firewall (Caddy needs 80 for the ACME challenge) and keep
 the relay's own port (4848) on loopback. `install caddy` sets
 `services.signaling.bind` to `127.0.0.1` for you, so the only public door
 is the TLS one.
+
+For TURN TLS, also open TCP 5349 and UDP 3478 plus the relay allocation
+range in both host and provider firewalls. Do not open loopback TCP 3479.
 
 ### 2. Give it its own hostname
 

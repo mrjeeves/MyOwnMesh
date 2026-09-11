@@ -40,6 +40,7 @@ fn turn_config(port: u16) -> TurnServiceConfig {
         max_bps_per_connection: 0,
         relay_port_min: 0,
         relay_port_max: 0,
+        ..Default::default()
     }
 }
 

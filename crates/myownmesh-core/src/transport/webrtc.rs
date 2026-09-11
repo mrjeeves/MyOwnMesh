@@ -7203,6 +7203,7 @@ impl Transport {
         callback_policy: ConnectorCallbackPolicy,
         callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
+        super::ice::validate_turn_stream_urls(turn)?;
         let mut config = build_rtc_configuration(stun, turn);
         config.ice_transport_policy = self.ice_transport_policy;
         self.open_peer_with_config(role, config, callback_policy, callback_grant)
@@ -7218,6 +7219,7 @@ impl Transport {
         turn: &[crate::config::TurnServer],
         resource_scope: PeerConnectionResourceScope,
     ) -> Result<(WebRtcConnectorWorker, WebRtcConnectorEventReceiver)> {
+        super::ice::validate_turn_stream_urls(turn)?;
         let resource_owner = self
             .connector_resource_scope
             .clone()
@@ -7414,7 +7416,7 @@ impl Transport {
     async fn open_peer_with_config_observed(
         &self,
         role: Role,
-        config: RTCConfiguration,
+        mut config: RTCConfiguration,
         ownership: PeerOpenOwnership,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
         let PeerOpenOwnership {
@@ -7432,6 +7434,20 @@ impl Transport {
             realtime_profile,
             close_owner,
         } = ownership;
+        let bridges = super::turn_stream::TurnStreamBridges::prepare(
+            &mut config,
+            work_resource_scope.as_ref(),
+        )
+        .await
+        .map_err(Error::from)?;
+        if let Some(bridges) = bridges {
+            let owner = close_owner.as_ref().ok_or(Error::ConnectorPolicyRequired)?;
+            if !owner.attach_turn_bridges(bridges) {
+                return Err(Error::Transport(
+                    "connector retired before TURN stream installation".into(),
+                ));
+            }
+        }
         let api = Arc::clone(&self.api);
         if let Some(owner) = close_owner.as_ref() {
             owner.mark_native_allocation_started();
@@ -12769,6 +12785,61 @@ mod tests {
         assert_eq!(owner.report().active_candidates, 0);
         assert_eq!(owner.report().failed_cleanup_candidates, 0);
         assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[tokio::test]
+    async fn turn_stream_exact_connector_failed_open_joins_endpoint_before_release() {
+        use crate::transport::turn_stream::{
+            endpoint_claim, endpoint_node_claim, TurnStreamBridges,
+        };
+        let additional =
+            FiniteResourceProvider::reservation_planning_charge(endpoint_claim(9).unwrap())
+                .unwrap()
+                .checked_add(
+                    FiniteResourceProvider::reservation_planning_charge(
+                        endpoint_node_claim().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        let (provider, owner) = test_resource_owner_with_provider(1, 1, additional);
+        let baseline_sockets = provider
+            .in_use()
+            .amount(crate::resource::ResourceClass::SocketOrHandle);
+        let (close_owner, _lifetime) = close_owner_fixture(&owner);
+        let scope = close_owner.ownership.work_resource_scope().unwrap();
+        // No client capacity is supplied here: the endpoint/task itself must
+        // still be joined on a failed open that never acquired a native port.
+        let mut config = build_rtc_configuration(
+            &[],
+            &[crate::config::TurnServer {
+                urls: vec!["turn:127.0.0.1:3478?transport=tcp".into()],
+                username: None,
+                credential: None,
+            }],
+        );
+        let bridges = TurnStreamBridges::prepare(&mut config, Some(&scope))
+            .await
+            .unwrap()
+            .unwrap();
+        let addr: std::net::SocketAddr = config.ice_servers[0].urls[0]
+            .strip_prefix("turn:")
+            .unwrap()
+            .strip_suffix("?transport=udp")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(close_owner.attach_turn_bridges(bridges));
+        close_owner.wait().await.unwrap();
+        assert_eq!(owner.report().active_candidates, 0);
+        assert_eq!(
+            provider
+                .in_use()
+                .amount(crate::resource::ResourceClass::SocketOrHandle),
+            baseline_sockets
+        );
+        let rebound = tokio::net::UdpSocket::bind(addr).await.unwrap();
+        drop(rebound);
     }
 
     #[tokio::test]

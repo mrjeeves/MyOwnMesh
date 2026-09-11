@@ -227,6 +227,13 @@ pub struct EndpointReport {
     pub running: bool,
     /// The address the listener bound, when running.
     pub listen: Option<String>,
+    /// Actual TURN TCP listener, never inferred from requested configuration.
+    /// TLS termination belongs to Caddy and is not reported as daemon readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_listen: Option<String>,
+    /// Bound loopback PROXYv2 backend, not external Caddy TLS readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_proxy_listen: Option<String>,
     /// Live activity, for the signaling relay only (None for STUN/TURN).
     /// Lets an operator see at a glance whether peers are reaching it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +260,8 @@ struct CapturedEndpoint {
     enabled: bool,
     running: bool,
     listen: Option<std::net::SocketAddr>,
+    tcp_listen: Option<std::net::SocketAddr>,
+    tls_proxy_listen: Option<std::net::SocketAddr>,
     activity: Option<RelayStatsSnapshot>,
 }
 
@@ -308,6 +317,10 @@ struct EndpointReportView {
     running: bool,
     listen: Option<SocketDisplay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tcp_listen: Option<SocketDisplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_proxy_listen: Option<SocketDisplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     activity: Option<RelayStatsSnapshot>,
 }
 
@@ -336,6 +349,10 @@ impl ServiceManager {
         &self,
         desired: &ServicesConfig,
     ) -> Result<(), ServicePolicyError> {
+        desired
+            .turn
+            .validate_tcp()
+            .map_err(|error| ServicePolicyError::Reconciliation(error.to_string()))?;
         if desired.node.enabled && self.mesh.connector_resource_report().is_none() {
             return Err(ServicePolicyError::ConnectorPolicyRequired);
         }
@@ -713,6 +730,8 @@ impl ManagerState {
                 enabled: self.config.signaling.enabled,
                 running: self.signaling.is_some(),
                 listen: self.signaling.as_ref().map(|handle| handle.local_addr()),
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: self.signaling.as_ref().map(|handle| handle.stats()),
             },
             stun: CapturedEndpoint {
@@ -723,12 +742,22 @@ impl ManagerState {
                     .as_ref()
                     .map(|handle| handle.local_addr())
                     .or_else(|| folded.then_some(turn_addr).flatten()),
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: None,
             },
             turn: CapturedEndpoint {
                 enabled: self.config.turn.enabled,
                 running: self.turn.is_some(),
                 listen: turn_addr,
+                tcp_listen: self
+                    .turn
+                    .as_ref()
+                    .and_then(|handle| handle.tcp_local_addr()),
+                tls_proxy_listen: self
+                    .turn
+                    .as_ref()
+                    .and_then(|handle| handle.tls_proxy_local_addr()),
                 activity: None,
             },
         }
@@ -753,18 +782,24 @@ impl CapturedServicesReport {
                     enabled: self.signaling.enabled,
                     running: self.signaling.running,
                     listen: self.signaling.listen.map(SocketDisplay),
+                    tcp_listen: self.signaling.tcp_listen.map(SocketDisplay),
+                    tls_proxy_listen: self.signaling.tls_proxy_listen.map(SocketDisplay),
                     activity: self.signaling.activity,
                 },
                 stun: EndpointReportView {
                     enabled: self.stun.enabled,
                     running: self.stun.running,
                     listen: self.stun.listen.map(SocketDisplay),
+                    tcp_listen: self.stun.tcp_listen.map(SocketDisplay),
+                    tls_proxy_listen: self.stun.tls_proxy_listen.map(SocketDisplay),
                     activity: self.stun.activity,
                 },
                 turn: EndpointReportView {
                     enabled: self.turn.enabled,
                     running: self.turn.running,
                     listen: self.turn.listen.map(SocketDisplay),
+                    tcp_listen: self.turn.tcp_listen.map(SocketDisplay),
+                    tls_proxy_listen: self.turn.tls_proxy_listen.map(SocketDisplay),
                     activity: self.turn.activity,
                 },
             },
@@ -871,6 +906,8 @@ impl CapturedServicesReport {
                 enabled: value.enabled,
                 running: value.running,
                 listen: value.listen.map(|address| address.to_string()),
+                tcp_listen: value.tcp_listen.map(|address| address.to_string()),
+                tls_proxy_listen: value.tls_proxy_listen.map(|address| address.to_string()),
                 activity: value.activity,
             }
         }
@@ -1768,6 +1805,8 @@ mod tests {
                 enabled: true,
                 running: true,
                 listen: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7447)),
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: Some(RelayStatsSnapshot {
                     connections: 12,
                     connections_total: 345,
@@ -1779,12 +1818,16 @@ mod tests {
                 enabled: true,
                 running: true,
                 listen: Some(turn),
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: None,
             },
             turn: CapturedEndpoint {
                 enabled: true,
                 running: true,
                 listen: Some(turn),
+                tcp_listen: Some(turn),
+                tls_proxy_listen: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3479)),
                 activity: None,
             },
         };
@@ -1793,6 +1836,8 @@ mod tests {
         config.signaling.enabled = true;
         config.stun.enabled = true;
         config.turn.enabled = true;
+        config.turn.tcp_enabled = true;
+        config.turn.tls_proxy_enabled = true;
 
         let measured = serde_json::to_vec(&captured.view(&config)).expect("borrowed view encodes");
         let report = captured.build();
@@ -1841,6 +1886,12 @@ mod tests {
             report.stun.listen, report.turn.listen,
             "non-vacuity: folded STUN reports the captured TURN endpoint"
         );
+        assert_eq!(report.turn.tcp_listen.as_deref(), Some("127.0.0.1:3478"));
+        assert!(report.stun.tcp_listen.is_none());
+        assert_eq!(
+            report.turn.tls_proxy_listen.as_deref(),
+            Some("127.0.0.1:3479")
+        );
 
         let absent = CapturedServicesReport {
             node_enabled: true,
@@ -1849,24 +1900,33 @@ mod tests {
                 enabled: true,
                 running: false,
                 listen: None,
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: None,
             },
             stun: CapturedEndpoint {
                 enabled: true,
                 running: false,
                 listen: None,
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: None,
             },
             turn: CapturedEndpoint {
                 enabled: true,
                 running: false,
                 listen: None,
+                tcp_listen: None,
+                tls_proxy_listen: None,
                 activity: None,
             },
         };
         let absent_measured =
             serde_json::to_vec(&absent.view(&config)).expect("borrowed null-listen view encodes");
         let absent_report = absent.build();
+        assert!(!absent_report.turn.running);
+        assert!(absent_report.turn.tcp_listen.is_none());
+        assert!(absent_report.turn.tls_proxy_listen.is_none());
         let absent_built = serde_json::to_vec(&Data {
             status: &absent_report,
             config: &config,

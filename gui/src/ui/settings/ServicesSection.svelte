@@ -321,8 +321,8 @@
       <p class="svc-hint">
         Relays media / data for peers behind symmetric NAT. Needs a public
         IP to advertise and at least one credential — mirror a credential
-        into each peer's TURN config. Enabled without these, it shows as
-        "not running".
+        into each peer's TURN config. Caddy's public TURN TLS listener uses
+        a private PROXYv2 backend; it does not enable plaintext TCP.
       </p>
       {#if draft.turn.enabled}
         <div class="fields">
@@ -352,6 +352,33 @@
               bind:value={draft.turn.public_ip}
               oninput={markDirty}
             />
+          </label>
+          <label class="field">
+            <span>Plaintext TCP</span>
+            <input
+              type="checkbox"
+              bind:checked={draft.turn.tcp_enabled}
+              onchange={markDirty}
+            />
+            <span class="unit">Explicit public TURN TCP only; Caddy TLS uses the private proxy</span>
+          </label>
+          <label class="field">
+            <span>TCP connection limit</span>
+            <input type="number" min="1" bind:value={draft.turn.tcp_max_connections} oninput={markDirty} />
+          </label>
+          <label class="field">
+            <span>TCP connections / IP</span>
+            <input type="number" min="1" bind:value={draft.turn.tcp_max_connections_per_ip} oninput={markDirty} />
+          </label>
+          <label class="field">
+            <span>TCP auth deadline (ms)</span>
+            <input type="number" min="1" bind:value={draft.turn.tcp_auth_timeout_ms} oninput={markDirty} />
+            <span class="unit">Absolute until Allocate succeeds; traffic does not extend it</span>
+          </label>
+          <label class="field">
+            <span>TCP idle timeout (ms)</span>
+            <input type="number" min="1" bind:value={draft.turn.tcp_idle_timeout_ms} oninput={markDirty} />
+            <span class="unit">Applies after successful Allocate</span>
           </label>
           <label class="field">
             <span>Realm</span>

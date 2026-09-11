@@ -12,6 +12,7 @@ description = "Self-hosted STUN / TURN servers for MyOwnMesh."
 myownmesh-core = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -21,6 +22,9 @@ turn = { workspace = true }
 webrtc-util = { workspace = true }
 
 [dev-dependencies]
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
 turn = { workspace = true, features = ["custody-lab"] }
 myownmesh-core = { workspace = true, features = ["transport-lab"] }
 myownmesh-signaling = { workspace = true }

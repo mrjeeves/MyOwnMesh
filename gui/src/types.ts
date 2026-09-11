@@ -317,6 +317,19 @@ export interface TurnCredential {
 
 export interface TurnServiceConfig {
   enabled: boolean;
+  /** Opt-in plaintext TURN-over-TCP on `port`; Caddy TLS uses the separate loopback proxy. */
+  tcp_enabled: boolean;
+  /** Separate loopback-only PROXYv2 backend for Caddy's public TURN TLS listener. */
+  tls_proxy_enabled: boolean;
+  tls_proxy_port: number;
+  /** Maximum simultaneously accepted TURN TCP streams. */
+  tcp_max_connections: number;
+  /** Maximum simultaneously accepted streams from one source IP. */
+  tcp_max_connections_per_ip: number;
+  /** Absolute pre-Allocate authentication deadline in milliseconds. */
+  tcp_auth_timeout_ms: number;
+  /** Idle timeout after successful TURN Allocate, in milliseconds. */
+  tcp_idle_timeout_ms: number;
   bind: string;
   port: number;
   public_ip: string;
@@ -355,6 +368,10 @@ export interface EndpointReport {
   enabled: boolean;
   running: boolean;
   listen: string | null;
+  /** Actual plaintext TURN TCP listener, if explicitly enabled. */
+  tcp_listen?: string | null;
+  /** Actual loopback PROXYv2 backend; this is not public TLS readiness. */
+  tls_proxy_listen?: string | null;
   activity?: RelayStatsSnapshot | null;
 }
 

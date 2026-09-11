@@ -369,6 +369,9 @@ async fn coalesced_hub_introduction_creates_one_direct_endpoint_path() {
         require_no_current_direct(destination, destination_id, &leaf_ids[0])?;
 
         let remaining = stage_deadline.saturating_duration_since(Instant::now());
+        // TODO(hub-introduction): replace this bounded timer completion with
+        // an event-driven terminal that carries the exact authenticated native
+        // owner through endpoint authentication and Active promotion.
         let (first, second) = within(stage_deadline, async {
             tokio::join!(
                 source.connect_peer_wait(destination_id, false, remaining),
@@ -402,6 +405,14 @@ async fn coalesced_hub_introduction_creates_one_direct_endpoint_path() {
             source_key,
             destination_key,
         );
+        if first.is_err() || second.is_err() {
+            let source_direct = direct_observation(source, destination_id);
+            let destination_direct = direct_observation(destination, &leaf_ids[0]);
+            eprintln!(
+                "hub-introduction-failure-telemetry first={first:?} second={second:?} \
+                 source_direct={source_direct:?} destination_direct={destination_direct:?}"
+            );
+        }
         first.map_err(|error| format!("first coalesced demand failed: {error}"))?;
         second.map_err(|error| format!("second coalesced demand failed: {error}"))?;
         wait_for_bilateral_current_active(

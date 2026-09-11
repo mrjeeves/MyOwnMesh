@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{
@@ -14,7 +14,9 @@ use myownmesh_core::engine::transport_lab::{
     spawn_network,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::transport::{IceCandidateKind, Transport};
+use myownmesh_core::transport::{
+    transport_lab_turn_stream_fixture_grant, IceCandidateKind, Transport,
+};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
     transport_lab_remote_description_fixture_grant, ConnectorCallbackPolicy,
@@ -27,17 +29,19 @@ use myownmesh_signaling::local::LocalBroker;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn service_scope() -> LocalApplicationResourceScope {
+fn service_scope() -> (FiniteResourceProvider, LocalApplicationResourceScope) {
     let grant = ResourceClaim::try_from_entries(
         ResourceClass::ALL
             .into_iter()
             .map(|class| (class, 1_000_000)),
     )
     .expect("TURN service fixture grant is representable");
-    let port = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+    let provider = FiniteResourceProvider::new(grant);
+    let port = ResourceProviderPort::new(provider.clone())
         .expect("TURN service fixture provider is valid");
-    LocalApplicationResourceScope::transport_lab_child_of(&port)
-        .expect("TURN service fixture scope is valid")
+    let scope = LocalApplicationResourceScope::transport_lab_child_of(&port)
+        .expect("TURN service fixture scope is valid");
+    (provider, scope)
 }
 
 fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkConfig {
@@ -67,7 +71,7 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
     }
 }
 
-fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
+fn test_connector_resource_policy(bridge_grant: ResourceClaim) -> WebRtcConnectorCapablePolicy {
     let four = std::num::NonZeroUsize::new(4)
         .expect("the four-connector fixture candidate bound is nonzero");
     let callback = std::num::NonZeroUsize::new(16).expect("fixture callback bound is nonzero");
@@ -214,10 +218,35 @@ fn test_connector_resource_policy() -> WebRtcConnectorCapablePolicy {
             );
             claim.checked_add(storage_grant)
         })
+        .and_then(|claim| claim.checked_add(bridge_grant))
         .expect("the fixture provider grant is representable");
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
         .expect("the fixture provider accounts for its process scope");
     WebRtcConnectorCapablePolicy::new(resources, webrtc)
+}
+
+fn shared_connector_resource_policy(
+    turn_servers: &[IceTurnServer],
+) -> WebRtcConnectorCapablePolicy {
+    // Both selectors install the same process-owned provider. The enclosing
+    // fixture mutex serializes their Mesh owners and MYOWNMESH_HOME changes.
+    // Price the TCP increment explicitly even when the UDP selector runs first;
+    // it is the envelope for this two-selector fixture, not borrowed grant slack.
+    static POLICY: OnceLock<(ResourceClaim, WebRtcConnectorCapablePolicy)> = OnceLock::new();
+    // Two connectors overlap: Alice/Bob drivers are joined and their states
+    // dropped before Carol/Dave start, so the second pair reuses the same
+    // endpoint/client capacity. No ICE restart is requested. Native relay
+    // gathering binds one local UDP source per URL per initial gather
+    // (agent_gather.rs).
+    let bridge_grant = transport_lab_turn_stream_fixture_grant(turn_servers, 2, 1)
+        .expect("actual TURN stream owners have a representable fixture plan");
+    let (installed_grant, policy) =
+        POLICY.get_or_init(|| (bridge_grant, test_connector_resource_policy(bridge_grant)));
+    assert_eq!(
+        *installed_grant, bridge_grant,
+        "both selectors use the same planned stream workload"
+    );
+    policy.clone()
 }
 
 fn relay_only_test_transport(policy: &WebRtcConnectorCapablePolicy) -> Transport {
@@ -326,7 +355,21 @@ async fn wait_for_reported_relay_pair(
 
 #[test]
 fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
-    with_service_cleanup(Some(4), |cleanup| async move {
+    selected_session_authenticates_endpoints_before_bidirectional_data(false);
+}
+
+#[test]
+fn turn_tcp_selected_session_authenticates_endpoints_before_bidirectional_data() {
+    selected_session_authenticates_endpoints_before_bidirectional_data(true);
+}
+
+fn selected_session_authenticates_endpoints_before_bidirectional_data(tcp: bool) {
+    static FIXTURE: Mutex<()> = Mutex::new(());
+    let _fixture = FIXTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (service_provider, service_scope) = service_scope();
+    with_service_cleanup(Some(4), &service_provider, |cleanup| async move {
         let observed_at = std::time::Instant::now();
         let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
         std::env::set_var("MYOWNMESH_HOME", home.path());
@@ -345,15 +388,36 @@ fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
                 max_bps_per_connection: 0,
                 relay_port_min: 0,
                 relay_port_max: 0,
+                tcp_enabled: tcp,
+                tls_proxy_enabled: false,
+                ..TurnServiceConfig::default()
             },
-            service_scope(),
+            service_scope,
             cleanup.clone(),
         )
         .await
         .expect("real TURN server starts");
-        let turn_url = format!("turn:{}?transport=udp", turn.local_addr());
+        assert!(turn.tls_proxy_local_addr().is_none());
+        let tcp_url = format!("turn:{}?transport=tcp", turn.local_addr());
+        let turn_url = if tcp {
+            let tcp_addr = turn
+                .tcp_local_addr()
+                .expect("direct TURN TCP listener is ready");
+            assert_eq!(
+                tcp_addr,
+                turn.local_addr(),
+                "TCP control and UDP engine share the configured address/port"
+            );
+            tcp_url.clone()
+        } else {
+            assert!(turn.tcp_local_addr().is_none());
+            format!("turn:{}?transport=udp", turn.local_addr())
+        };
 
-        let test_resources = test_connector_resource_policy();
+        // Plan the TCP variant using this fixture's actual server host. Port
+        // values do not change the owning planner's retained host byte count.
+        let planned_config = network_config("tcp-plan", tcp_url, true);
+        let test_resources = shared_connector_resource_policy(&planned_config.turn_servers);
         let alice_id = Arc::new(Identity::ephemeral());
         let bob_id = Arc::new(Identity::ephemeral());
         let (alice, alice_driver) = spawn_network(
@@ -535,8 +599,11 @@ fn turn_selected_session_authenticates_endpoints_before_bidirectional_data() {
     });
 }
 
-fn with_service_cleanup<F, Fut>(workers: Option<usize>, body: F)
-where
+fn with_service_cleanup<F, Fut>(
+    workers: Option<usize>,
+    service_provider: &FiniteResourceProvider,
+    body: F,
+) where
     F: FnOnce(myownmesh_services::ServiceCleanupPort) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
@@ -571,6 +638,15 @@ where
     assert_eq!(provider.in_use(), ResourceClaim::ZERO);
     assert_eq!(
         provider.retained_after_failed_cleanup(),
+        ResourceClaim::ZERO
+    );
+    assert_eq!(
+        service_provider.in_use(),
+        ResourceClaim::ZERO,
+        "TURN service and TCP client backing released after outside joins"
+    );
+    assert_eq!(
+        service_provider.retained_after_failed_cleanup(),
         ResourceClaim::ZERO
     );
     if let Err(error) = outcome {

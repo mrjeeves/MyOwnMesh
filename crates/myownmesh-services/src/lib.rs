@@ -37,6 +37,7 @@
 mod cleanup;
 pub mod stun;
 pub mod turn;
+mod turn_stream;
 
 pub use cleanup::{
     ServiceCleanupError, ServiceCleanupOwner, ServiceCleanupPort, ServiceCleanupReport,

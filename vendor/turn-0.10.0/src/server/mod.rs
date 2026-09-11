@@ -450,6 +450,9 @@ impl Server {
             probe.mark_read_joined();
         }
 
+        // All request-producing read tasks have joined. Release challenge
+        // leases even when the server object remains alive after close.
+        self.nonces.lock().await.clear();
         first_error.map_or_else(|| self.cleanup.result(), Err)
     }
 }

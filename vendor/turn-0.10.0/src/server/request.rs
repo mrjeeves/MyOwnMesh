@@ -241,17 +241,25 @@ impl Request {
         }
     }
 
-    async fn respond_with_nonce(
-        &mut self,
-        m: &Message,
-        calling_method: Method,
-        response_code: ErrorCode,
-    ) -> Result<()> {
+    async fn current_nonce(&self) -> Result<String> {
+        // One server challenge, not one retained entry per anonymous request.
+        // Sweep, selection and funding are serialized; there is no await after
+        // acquiring the lock, and reuse never extends the original lifetime.
+        let mut nonces = self.nonces.lock().await;
+        let now = Instant::now();
+        nonces.retain(|_, (created, _)| {
+            now.checked_duration_since(*created)
+                .unwrap_or(Duration::ZERO)
+                < NONCE_LIFETIME
+        });
+        if let Some(nonce) = nonces.keys().next() {
+            return Ok(nonce.clone());
+        }
+
         let nonce = build_nonce()?;
         let nonce_bytes =
             u64::try_from(nonce.capacity()).map_err(|_| Error::ErrResourceAdmission)?;
-
-        let nonce_lease = self
+        let lease = self
             .resource_admission
             .as_ref()
             .ok_or(Error::ErrResourceAdmission)?
@@ -260,15 +268,17 @@ impl Request {
                 ResourceCharge::with_bytes(1, nonce_bytes),
             )
             .map_err(|_| Error::ErrResourceAdmission)?;
+        nonces.insert(nonce.clone(), (now, lease));
+        Ok(nonce)
+    }
 
-        {
-            // Nonce has already been taken
-            let mut nonces = self.nonces.lock().await;
-            if nonces.contains_key(&nonce) {
-                return Err(Error::ErrDuplicatedNonce);
-            }
-            nonces.insert(nonce.clone(), (Instant::now(), nonce_lease));
-        }
+    async fn respond_with_nonce(
+        &mut self,
+        m: &Message,
+        calling_method: Method,
+        response_code: ErrorCode,
+    ) -> Result<()> {
+        let nonce = self.current_nonce().await?;
 
         let msg = build_msg(
             m.transaction_id,

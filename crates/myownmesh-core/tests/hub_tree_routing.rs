@@ -891,6 +891,10 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
     let discovery_before = l2
         .hub_discovery_diagnostics_for_lab()
         .expect("L2 has a hub controller");
+    // TODO: replace timer-based discovery completion polling with an
+    // exact-owner, event-driven terminal for accepted bounded pages and cursor
+    // continuation. Preserve this failure bound until that terminal exists;
+    // extending deadlines is not a substitute for observing actual progress.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if l2
@@ -908,7 +912,33 @@ async fn hub_tree_real_wire_parenting_route_capacity_and_discovery() -> myownmes
         }
     })
     .await
-    .expect("healthy-parent discovery reaches two bounded pages");
+    .unwrap_or_else(|elapsed| {
+        // Failure-only observations: do not retain exact worker witnesses
+        // across the panic or treat these cross-node snapshots as atomic.
+        // Rejection counters are aggregate; the facade does not expose an
+        // inbound rate-refusal counter or identify a particular expiry cause.
+        let l2_discovery = l2.hub_discovery_diagnostics_for_lab();
+        let h2_discovery = h2.hub_discovery_diagnostics_for_lab();
+        let root_discovery = root.hub_discovery_diagnostics_for_lab();
+        let l2_parent = l2.parenting_snapshot_for_lab();
+        let h2_parent = h2.parenting_snapshot_for_lab();
+        let l2_h2_peer = l2.peer(&h2_id);
+        let h2_root_peer = h2.peer(&root_id);
+        let h2_l2_peer = h2.peer(&l2_id);
+        let l2_h2_selected = l2.capture_transport_channel_for_lab(&h2_id).is_some();
+        let h2_root_selected = h2.capture_transport_channel_for_lab(&root_id).is_some();
+        let h2_l2_selected = h2.capture_transport_channel_for_lab(&l2_id).is_some();
+        panic!(
+            "healthy-parent discovery reaches two bounded pages: {elapsed}; \
+             exploration_interval_ms=20 outer_bound_s=5; \
+             L2.before={discovery_before:?}; L2.discovery={l2_discovery:?}; \
+             H2.discovery={h2_discovery:?}; R.discovery={root_discovery:?}; \
+             L2.parent={l2_parent:?}; H2.parent={h2_parent:?}; \
+             L2->H2 selected_worker={l2_h2_selected} peer={l2_h2_peer:?}; \
+             H2->R selected_worker={h2_root_selected} peer={h2_root_peer:?}; \
+             H2->L2 selected_worker={h2_l2_selected} peer={h2_l2_peer:?}"
+        );
+    });
     let discovery = l2
         .hub_discovery_diagnostics_for_lab()
         .expect("L2 retains fixed discovery diagnostics");

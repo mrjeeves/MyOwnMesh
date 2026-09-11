@@ -11,6 +11,7 @@
 //! [`docs/NETWORK-TYPES.md`](../../../docs/NETWORK-TYPES.md) end
 //! to end.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +56,81 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
 
 fn node_root() -> TempDir {
     tempfile::tempdir().expect("per-node persistence root")
+}
+
+/// Instance-owned network stores do not select custody's process-wide home.
+/// Each exact case runs in a fresh child-owned home so the real custody gate
+/// never reads or repairs the operator's store. The parent environment is unchanged.
+async fn isolated_native_case(selector: &str, work: impl Future<Output = ()>) {
+    const CHILD_SELECTOR: &str = "MYOWNMESH_CLOSED_GOVERNANCE_CHILD_SELECTOR";
+    const CHILD_HOME: &str = "MYOWNMESH_CLOSED_GOVERNANCE_CHILD_HOME";
+    const COMPLETED: &str = "native-case-completed";
+    if let Some(selected) = std::env::var_os(CHILD_SELECTOR) {
+        assert_eq!(
+            selected,
+            std::ffi::OsStr::new(selector),
+            "wrong child selector"
+        );
+        let home =
+            std::path::PathBuf::from(std::env::var_os(CHILD_HOME).expect("child-owned home"));
+        assert!(
+            home.is_absolute() && home.is_dir(),
+            "child home must exist and be absolute"
+        );
+        assert_eq!(
+            std::env::var_os("MYOWNMESH_HOME"),
+            Some(home.clone().into_os_string())
+        );
+        // The lazy body is polled only here, after the child has inherited its
+        // isolated home. Missing enrollment follows normal custody::require.
+        work.await;
+        std::fs::write(home.join(COMPLETED), selector.as_bytes()).expect("child completion marker");
+        return;
+    }
+
+    let home = tempfile::tempdir().expect("isolated process home");
+    let home_path = home
+        .path()
+        .canonicalize()
+        .expect("absolute isolated process home");
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--exact", selector, "--nocapture", "--test-threads=1"])
+        .env("MYOWNMESH_HOME", &home_path)
+        .env(CHILD_SELECTOR, selector)
+        .env(CHILD_HOME, &home_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().expect("spawn exact isolated native case");
+    // Outer process backstop only: no inner deadline, assertion or cleanup is
+    // extended or reset. Timeout kills and reaps the exact owned child.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(status) => status.expect("reap native case"),
+        Err(_) => {
+            let killed = child.start_kill();
+            let reaped = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+            panic!("native child deadline expired; kill={killed:?}, reap={reaped:?}");
+        }
+    };
+    assert!(
+        Instant::now() <= deadline,
+        "native child completed after deadline"
+    );
+    assert!(status.success(), "isolated native case failed: {status}");
+    assert_eq!(
+        std::fs::read(home_path.join(COMPLETED))
+            .expect("native body completed, not zero selected tests"),
+        selector.as_bytes(),
+    );
 }
 
 async fn spawn_shared_closed_pair(
@@ -223,6 +299,14 @@ async fn onboard_member(
 
 #[tokio::test]
 async fn shared_closed_bootstrap_onboards_root_signed_member() {
+    isolated_native_case(
+        "shared_closed_bootstrap_onboards_root_signed_member",
+        shared_closed_bootstrap_onboards_root_signed_member_body(),
+    )
+    .await;
+}
+
+async fn shared_closed_bootstrap_onboards_root_signed_member_body() {
     let alice_root = node_root();
     let bob_root = node_root();
 
@@ -329,6 +413,14 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
 
 #[tokio::test]
 async fn owner_signed_member_grant_converges_via_canonical_signed_facts() {
+    isolated_native_case(
+        "owner_signed_member_grant_converges_via_canonical_signed_facts",
+        owner_signed_member_grant_converges_via_canonical_signed_facts_body(),
+    )
+    .await;
+}
+
+async fn owner_signed_member_grant_converges_via_canonical_signed_facts_body() {
     // Closed-network membership is owner-**signed**: an owner admits a member
     // by authoring a ratified `RoleGrant`, and that membership converges to
     // every other member through the verified signed fact set — NOT through
@@ -419,6 +511,14 @@ async fn owner_signed_member_grant_converges_via_canonical_signed_facts() {
 
 #[tokio::test]
 async fn evict_converges_and_drops_the_member_on_a_fact_exchange_peer() {
+    isolated_native_case(
+        "evict_converges_and_drops_the_member_on_a_fact_exchange_peer",
+        evict_converges_and_drops_the_member_on_a_fact_exchange_peer_body(),
+    )
+    .await;
+}
+
+async fn evict_converges_and_drops_the_member_on_a_fact_exchange_peer_body() {
     // The lost/stolen-device kick must propagate. When the owner evicts a
     // member, every peer that learned that member through canonical fact
     // exchange (not by ratifying the evict locally) has to drop it from its
@@ -518,6 +618,14 @@ async fn evict_converges_and_drops_the_member_on_a_fact_exchange_peer() {
 
 #[tokio::test]
 async fn controller_admits_a_member_which_converges_via_canonical_facts() {
+    isolated_native_case(
+        "controller_admits_a_member_which_converges_via_canonical_facts",
+        controller_admits_a_member_which_converges_via_canonical_facts_body(),
+    )
+    .await;
+}
+
+async fn controller_admits_a_member_which_converges_via_canonical_facts_body() {
     // The two-key model end to end: an owner promotes a peer to Controller,
     // and that controller — not just the owner — admits a member.
     // The admission rides a controller-authored canonical RoleGrant and converges
@@ -622,6 +730,14 @@ async fn controller_admits_a_member_which_converges_via_canonical_facts() {
 
 #[tokio::test]
 async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
+    isolated_native_case(
+        "plain_member_role_grant_is_rejected_without_canonical_mutation",
+        plain_member_role_grant_is_rejected_without_canonical_mutation_body(),
+    )
+    .await;
+}
+
+async fn plain_member_role_grant_is_rejected_without_canonical_mutation_body() {
     let broker = LocalBroker::new();
     let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
@@ -698,6 +814,14 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
 
 #[tokio::test]
 async fn causally_re_admitting_an_evicted_member_restores_membership() {
+    isolated_native_case(
+        "causally_re_admitting_an_evicted_member_restores_membership",
+        causally_re_admitting_an_evicted_member_restores_membership_body(),
+    )
+    .await;
+}
+
+async fn causally_re_admitting_an_evicted_member_restores_membership_body() {
     // The explicit Closed creator supplies the verified root. Each governance
     // mutation cites the current exclusive-cell head, so this is a causal
     // replacement sequence rather than an arrival-order test.
@@ -761,6 +885,14 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
 
 #[tokio::test]
 async fn evicting_a_promoted_member_tombstones_its_member_admit() {
+    isolated_native_case(
+        "evicting_a_promoted_member_tombstones_its_member_admit",
+        evicting_a_promoted_member_tombstones_its_member_admit_body(),
+    )
+    .await;
+}
+
+async fn evicting_a_promoted_member_tombstones_its_member_admit_body() {
     // Regression for "I removed an owner/controller, but it stays controllable and
     // the other owners still see it in the fleet."
     //
@@ -834,6 +966,14 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
 
 #[tokio::test]
 async fn withdrawing_a_role_updates_the_local_roster_tag() {
+    isolated_native_case(
+        "withdrawing_a_role_updates_the_local_roster_tag",
+        withdrawing_a_role_updates_the_local_roster_tag_body(),
+    )
+    .await;
+}
+
+async fn withdrawing_a_role_updates_the_local_roster_tag_body() {
     // Regression: withdrawing a peer's role (owner/controller → plain member) must
     // update the *authoring* device's cached roster tag, not just the projected
     // `roles` map. The fact-adoption path reprojects the whole role map onto
@@ -915,6 +1055,14 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
 /// admission. No roster hint, presence signal, or elapsed time participates.
 #[tokio::test]
 async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
+    isolated_native_case(
+        "evicted_offline_device_learns_on_reconnect_and_stands_down",
+        evicted_offline_device_learns_on_reconnect_and_stands_down_body(),
+    )
+    .await;
+}
+
+async fn evicted_offline_device_learns_on_reconnect_and_stands_down_body() {
     // The "offline and lost devices just keep showing back up" loop, killed
     // end to end. Carol is admitted to the closed network and then evicted
     // while OFFLINE — she never receives the eviction fact. When she comes back she
@@ -1116,6 +1264,14 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
 
 #[tokio::test]
 async fn two_owners_converge_their_rosters() {
+    isolated_native_case(
+        "two_owners_converge_their_rosters",
+        two_owners_converge_their_rosters_body(),
+    )
+    .await;
+}
+
+async fn two_owners_converge_their_rosters_body() {
     // The reported symptom, inverted into a guarantee: a fleet with two owners
     // where the rosters never converge and only one behaves like the "real"
     // owner. With flat peer authority (any owner is a full owner), an
@@ -1265,6 +1421,14 @@ async fn two_owners_converge_their_rosters() {
 
 #[tokio::test]
 async fn local_topology_control_does_not_enter_canonical_governance() {
+    isolated_native_case(
+        "local_topology_control_does_not_enter_canonical_governance",
+        local_topology_control_does_not_enter_canonical_governance_body(),
+    )
+    .await;
+}
+
+async fn local_topology_control_does_not_enter_canonical_governance_body() {
     let broker = LocalBroker::new();
     let transport = support::test_transport();
 

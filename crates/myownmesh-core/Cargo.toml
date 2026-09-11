@@ -42,11 +42,15 @@ required-features = ["transport-lab"]
 myownmesh-signaling = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
 
 webrtc = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
@@ -74,6 +78,7 @@ if-addrs = "0.15"
 libc = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

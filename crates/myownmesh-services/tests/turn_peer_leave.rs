@@ -257,6 +257,7 @@ fn authenticated_depart_observed_over_actual_turn() {
                 max_bps_per_connection: 0,
                 relay_port_min: 0,
                 relay_port_max: 0,
+                ..TurnServiceConfig::default()
             },
             service_scope(),
             cleanup.clone(),

@@ -432,6 +432,10 @@ struct RosterData<'a> {
     roster: &'a [myownmesh_core::AuthorizedPeer],
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "inline funded payloads preserve the dispatch admission and drop boundary; boxing would add an unpriced allocation"
+)]
 pub(super) enum FundedVariableReply {
     UpdaterStatus(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::UpdateStatus>),
     UpdaterCheck(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>),
@@ -441,6 +445,10 @@ pub(super) enum FundedVariableReply {
     Operation(FundedOperationReply),
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "inline response-owner payloads preserve the handwritten wire path and funded ownership boundary; boxing would add an unpriced allocation"
+)]
 pub(super) enum OperationReplyData {
     Removed(String),
     Topology(String),

@@ -11,6 +11,17 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 
 use crate::config::{StunServer, TurnServer};
 
+/// Reject unsupported stream endpoints before connector/native admission. UDP
+/// configuration remains untouched; the owned adapter rewrites streams later.
+pub(crate) fn validate_turn_stream_urls(servers: &[TurnServer]) -> crate::Result<()> {
+    for server in servers {
+        for url in &server.urls {
+            super::turn_stream::parse_stream_url(url).map_err(crate::Error::from)?;
+        }
+    }
+    Ok(())
+}
+
 /// The transport-only identity and metadata used when ordering candidate
 /// paths.  `id` is an opaque caller-owned path handle; no application data or
 /// data-channel capability is carried by this type.

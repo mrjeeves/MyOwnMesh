@@ -16,6 +16,7 @@
 
 pub mod diag;
 pub mod ice;
+pub(crate) mod turn_stream;
 pub(crate) mod webrtc;
 
 pub use diag::{
@@ -23,6 +24,8 @@ pub use diag::{
     SelectedCandidatePair,
 };
 pub use ice::{build_rtc_configuration, classify_candidate_sdp};
+#[cfg(feature = "transport-lab")]
+pub use turn_stream::transport_lab_turn_stream_fixture_grant;
 #[cfg(not(feature = "transport-lab"))]
 pub(crate) use webrtc::TransportEvent;
 #[cfg(feature = "transport-lab")]

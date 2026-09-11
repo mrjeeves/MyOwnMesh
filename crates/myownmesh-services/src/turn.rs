@@ -448,6 +448,9 @@ struct StartRequest {
     relay_port_max: u16,
     max_bps: u64,
     scope: LocalApplicationResourceScope,
+    tcp: Option<myownmesh_core::FundedArc<crate::turn_stream::BridgeState>>,
+    tcp_enabled: bool,
+    tls_proxy_port: Option<u16>,
 }
 
 // The password-bearing Box is freed before releasing its transient lease.
@@ -477,6 +480,7 @@ pub(crate) struct TurnBacking {
     control: myownmesh_core::FundedArc<TurnControl>,
     runtime: ResourceLease,
     derived: ResourceLease,
+    tcp: Option<myownmesh_core::FundedArc<crate::turn_stream::BridgeState>>,
 }
 
 impl TurnBacking {
@@ -485,7 +489,19 @@ impl TurnBacking {
             control,
             runtime,
             derived,
+            tcp,
         } = self;
+        // Even a lifecycle panic cannot release client/task backing before
+        // private runtime destruction and the outside worker join.
+        if unobserved && tcp.is_some() {
+            // There is no safe detach/refund fallback for an unobserved runtime.
+            std::process::abort();
+        } else {
+            if let Some(state) = &tcp {
+                state.join_after_runtime_destroyed();
+            }
+            drop(tcp);
+        }
         drop(control);
         for lease in [runtime, derived] {
             if unobserved {
@@ -550,6 +566,8 @@ pub struct TurnServerHandle {
     custody: crate::cleanup::ServiceCustody,
     local_addr: SocketAddr,
     relay_ip: IpAddr,
+    tcp_local_addr: Option<SocketAddr>,
+    tls_proxy_local_addr: Option<SocketAddr>,
 }
 
 impl TurnServerHandle {
@@ -558,6 +576,16 @@ impl TurnServerHandle {
     }
     pub fn relay_ip(&self) -> IpAddr {
         self.relay_ip
+    }
+
+    /// Successfully bound TCP control listener, when explicitly enabled.
+    pub fn tcp_local_addr(&self) -> Option<SocketAddr> {
+        self.tcp_local_addr
+    }
+
+    /// Loopback-only PROXYv2 backend; not evidence of external TLS readiness.
+    pub fn tls_proxy_local_addr(&self) -> Option<SocketAddr> {
+        self.tls_proxy_local_addr
     }
 
     pub async fn stop(mut self) -> Result<()> {
@@ -710,6 +738,9 @@ async fn run_turn_lifecycle(control: myownmesh_core::FundedArc<TurnControl>) -> 
         relay_port_max,
         max_bps,
         scope,
+        tcp,
+        tcp_enabled,
+        tls_proxy_port,
     } = *request;
     let bind_addr = format!("{bind}:{port}");
     drop(bind);
@@ -756,7 +787,9 @@ async fn run_turn_lifecycle(control: myownmesh_core::FundedArc<TurnControl>) -> 
         channel_bind_timeout: Duration::from_secs(0),
         alloc_close_notify: None,
     };
-    let admission = Arc::new(TurnResourceAdmission { scope });
+    let admission = Arc::new(TurnResourceAdmission {
+        scope: scope.clone(),
+    });
     #[cfg(test)]
     let server = match &control.probe {
         Some(probe) => {
@@ -768,6 +801,26 @@ async fn run_turn_lifecycle(control: myownmesh_core::FundedArc<TurnControl>) -> 
     #[cfg(not(test))]
     let server = Server::new_with_resource_admission(config, admission).await;
     let server = server.map_err(|error| Error::Turn(error.to_string()))?;
+    let bridge = match tcp {
+        Some(state) => match crate::turn_stream::TurnTcpBridge::bind(
+            local_addr,
+            state,
+            scope,
+            tcp_enabled,
+            tls_proxy_port,
+        )
+        .await
+        {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                // Retain the first bind error, but close the already-running
+                // UDP server before publishing failed startup.
+                let _ = server.close().await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
     info!(
         %local_addr, %relay_ip, realm = %log_realm, credentials = credential_count,
         relay_ports = %relay_ports,
@@ -793,14 +846,21 @@ async fn run_turn_lifecycle(control: myownmesh_core::FundedArc<TurnControl>) -> 
         state.startup_finished = true;
     }
     control.ready.notify_waiters();
-    control.stopped().await;
-    server
+    let bridge_result = match bridge {
+        Some(bridge) => bridge.run(control.stopped()).await,
+        None => {
+            control.stopped().await;
+            Ok(())
+        }
+    };
+    let udp_result = server
         .close()
         .await
-        .map_err(|error| Error::Turn(error.to_string()))
+        .map_err(|error| Error::Turn(error.to_string()));
+    bridge_result.and(udp_result)
 }
 
-fn claim_bytes(
+pub(crate) fn claim_bytes(
     bytes: usize,
     residual: u64,
 ) -> std::result::Result<ResourceClaim, crate::ServiceCleanupError> {
@@ -813,7 +873,7 @@ fn claim_bytes(
     ])?)
 }
 
-fn byte_overflow() -> crate::ServiceCleanupError {
+pub(crate) fn byte_overflow() -> crate::ServiceCleanupError {
     myownmesh_core::ResourceClaimArithmeticError::Overflow {
         dimension: ResourceClass::AccountedMemoryBytes,
     }
@@ -938,7 +998,7 @@ impl TurnServer {
         use crate::cleanup::{planned, record_claim};
         let cleanup_charge =
             turn::resource::CleanupStatus::charge().map_err(|_| byte_overflow())?;
-        let ready_retained = planned(turn_startup_claim())?
+        let mut ready_retained = planned(turn_startup_claim())?
             .checked_add(crate::ServiceCleanupPort::entry_planning_charge()?)?
             .checked_add(planned(record_claim::<TurnControl>()?)?)?
             .checked_add(planned(runtime_claim()?)?)?
@@ -955,6 +1015,13 @@ impl TurnServer {
                 ResourceKind::CommandLoop,
                 ResourceCharge::units(1),
             )?)?)?;
+        if config.tcp_enabled || config.tls_proxy_enabled {
+            ready_retained =
+                ready_retained.checked_add(planned(crate::turn_stream::root_claim(
+                    config.tcp_max_connections,
+                    u64::from(config.tcp_enabled) + u64::from(config.tls_proxy_enabled),
+                )?)?)?;
+        }
         let transient_peak = planned(transient_claim(config)?)?;
         let startup_peak = ready_retained.checked_add(transient_peak)?;
         Ok(TurnStartupResourcePlan {
@@ -968,6 +1035,13 @@ impl TurnServer {
         config: &TurnServiceConfig,
     ) -> std::result::Result<ResourceClaim, crate::ServiceCleanupError> {
         Ok(Self::startup_resource_plan(config)?.startup_peak)
+    }
+
+    /// Normalized custody for one TCP client, excluding the shared bridge root
+    /// and any independently admitted TURN allocations created by its traffic.
+    pub fn tcp_client_planning_charge(
+    ) -> std::result::Result<ResourceClaim, crate::ServiceCleanupError> {
+        crate::cleanup::planned(crate::turn_stream::client_claim()?)
     }
 
     /// Unscoped startup remains nonbinding; no implicit root or grant exists.
@@ -999,12 +1073,31 @@ impl TurnServer {
         cleanup: crate::ServiceCleanupPort,
         #[cfg(test)] probe: Option<turn::resource::CleanupProbe>,
     ) -> Result<TurnServerHandle> {
+        config
+            .validate_tcp()
+            .map_err(|error| Error::TurnConfig(error.to_string()))?;
         if config.credentials.is_empty() {
             return Err(Error::TurnConfig(
                 "TURN requires at least one username/password credential".into(),
             ));
         }
         let relay_ip = resolve_relay_ip(config)?;
+        let tcp = if config.tcp_enabled || config.tls_proxy_enabled {
+            Some(crate::turn_stream::reserve(
+                &scope,
+                config.tcp_max_connections,
+                config.tcp_max_connections_per_ip,
+                config
+                    .tcp_idle_timeout()
+                    .map_err(|error| Error::TurnConfig(error.to_string()))?,
+                config
+                    .tcp_auth_timeout()
+                    .map_err(|error| Error::TurnConfig(error.to_string()))?,
+                u64::from(config.tcp_enabled) + u64::from(config.tls_proxy_enabled),
+            )?)
+        } else {
+            None
+        };
         // Every acquisition precedes the allocations it protects and the
         // outstanding-node registration; normalization is per acquisition.
         let service_lease = scope
@@ -1033,6 +1126,9 @@ impl TurnServer {
                 relay_port_max: config.relay_port_max.max(config.relay_port_min),
                 max_bps: config.max_bps_per_connection,
                 scope: scope.clone(),
+                tcp: tcp.clone(),
+                tcp_enabled: config.tcp_enabled,
+                tls_proxy_port: config.tls_proxy_enabled.then_some(config.tls_proxy_port),
             }),
             lease: transient_lease,
         };
@@ -1059,6 +1155,7 @@ impl TurnServer {
             control: control.clone(),
             runtime: runtime_lease,
             derived: derived_lease,
+            tcp,
         });
         let mut guard = TurnStartGuard {
             control: control.clone(),
@@ -1102,6 +1199,10 @@ impl TurnServer {
             custody,
             local_addr,
             relay_ip,
+            tcp_local_addr: config.tcp_enabled.then_some(local_addr),
+            tls_proxy_local_addr: config
+                .tls_proxy_enabled
+                .then_some(SocketAddr::from(([127, 0, 0, 1], config.tls_proxy_port))),
         })
     }
 }
@@ -2205,6 +2306,7 @@ mod tests {
             max_bps_per_connection: 0,
             relay_port_min: 49152,
             relay_port_max: 50151,
+            ..Default::default()
         }
     }
 
@@ -2233,6 +2335,7 @@ mod tests {
                 max_bps_per_connection: 0,
                 relay_port_min: 49152,
                 relay_port_max: 50151,
+                ..Default::default()
             };
             assert!(matches!(
                 start_with_scope(&cleanup, &cfg).await,
